@@ -568,6 +568,14 @@ window._watchedItemIds = new Set();
 // History, only its episodes are. Computed by updateContinueWatching
 // below whenever it can't find a next unwatched, aired episode.
 window._fullyWatchedShowIds = new Set();
+// Shows with at least one watched episode but still an unwatched, aired
+// episode waiting -- i.e. currently sitting in Continue Watching. Gets the
+// amber "in progress" badge instead of the blue checkmark; a show moves
+// out of this set and into _fullyWatchedShowIds the moment its last
+// episode is watched. Derived the same way _fullyWatchedShowIds is
+// (initWatchHistory on load, updateContinueWatching as things change), so
+// the two sets are always mutually exclusive for a given showId.
+window._inProgressShowIds = new Set();
 
 // Finds the position:relative box a watched-checkmark badge should be
 // inserted into for a given .clickable-poster/.clickable-episode element.
@@ -586,12 +594,40 @@ function findWatchBadgeWrap(el) {
   return el;
 }
 
+// Returns 'full' (blue checkmark), 'partial' (amber circle), or null (no
+// badge) for a given poster/episode element's id+type. A show's own
+// poster (data-type="series") is checked against the two show-level sets
+// instead of the regular per-item watched set, since the show's id itself
+// never lands in Watch History -- only its episodes do. Episodes/movies
+// have no data-type "series", so they fall through to the plain
+// watched-item check same as always.
+function computeWatchBadgeState(id, type) {
+  if (type === 'series') {
+    if (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(id)) return 'full';
+    if (window._inProgressShowIds && window._inProgressShowIds.has(id)) return 'partial';
+    return null;
+  }
+  return (window._watchedItemIds && window._watchedItemIds.has(id)) ? 'full' : null;
+}
+
+// Builds the badge markup for a given state -- shared by the observer and
+// refreshWatchBadge below so the two can never drift out of sync on markup.
+function watchBadgeHtml(state) {
+  return state === 'partial'
+    ? '<div class="watch-indicator-overlay watch-indicator-partial">&#x25D0;</div>'
+    : '<div class="watch-indicator-overlay">&#x2713;</div>';
+}
+
 function initWatchHistory() {
   if (typeof loadLocalCustomLists === 'function') {
     const map = loadLocalCustomLists();
     if (map['watch-history']) {
       const items = map['watch-history'].items || [];
       items.forEach(it => window._watchedItemIds.add(String(it.id)));
+    }
+    if (map['continue-watching']) {
+      const items = map['continue-watching'].items || [];
+      items.forEach(it => { if (it.showId) window._inProgressShowIds.add(String(it.showId)); });
     }
   }
   try {
@@ -607,15 +643,8 @@ function initWatchHistory() {
     document.querySelectorAll('.clickable-poster, .clickable-episode').forEach(el => {
       const id = el.dataset.id;
       if (!id) return;
-      // A show's own poster (data-type="series") is checked against the
-      // fully-watched set instead of the regular watched-item set, since
-      // the show's id itself never lands in Watch History -- only its
-      // episodes do. Episodes have no data-type, so they fall through to
-      // the regular check same as movies always have.
-      const isWatched = el.dataset.type === 'series'
-        ? (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(id))
-        : window._watchedItemIds.has(id);
-      if (!isWatched) return;
+      const state = computeWatchBadgeState(id, el.dataset.type);
+      if (!state) return;
       const wrap = findWatchBadgeWrap(el);
       if (!wrap) return;
       // Checking wrap (not el) for an existing badge matters: when el is
@@ -626,7 +655,7 @@ function initWatchHistory() {
       // observed, immediately re-trigger this same callback -- an
       // unbounded loop that floods the DOM and freezes the tab.
       if (!wrap.querySelector('.watch-indicator-overlay')) {
-        wrap.insertAdjacentHTML('beforeend', '<div class="watch-indicator-overlay">&#x2713;</div>');
+        wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
       }
     });
   });
@@ -634,25 +663,31 @@ function initWatchHistory() {
 }
 setTimeout(initWatchHistory, 500);
 
-// Adds/removes the blue "watched" checkmark badge on every currently
-// on-screen poster/episode card matching this id. Called right after
-// toggling something, so the change shows up immediately rather than
-// waiting on the MutationObserver above (which only reacts to new DOM
-// nodes appearing, not to _watchedItemIds/_fullyWatchedShowIds changing
-// underneath content that's already on screen).
+// Adds/removes/updates the watched badge on every currently on-screen
+// poster/episode card matching this id. Called right after toggling
+// something, so the change shows up immediately rather than waiting on
+// the MutationObserver above (which only reacts to new DOM nodes
+// appearing, not to the watch-state sets changing underneath content
+// that's already on screen).
 function refreshWatchBadge(id, type) {
   const strId = String(id);
-  const isWatched = type === 'series'
-    ? (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(strId))
-    : (window._watchedItemIds && window._watchedItemIds.has(strId));
+  const state = computeWatchBadgeState(strId, type);
   document.querySelectorAll('.clickable-poster[data-id="' + escapeAttr(strId) + '"], .clickable-episode[data-id="' + escapeAttr(strId) + '"]').forEach(el => {
     const wrap = findWatchBadgeWrap(el);
     if (!wrap) return;
     // See the matching comment in initWatchHistory's observer above -- this
     // has to check wrap, not el, for the same reason.
     const overlay = wrap.querySelector('.watch-indicator-overlay');
-    if (isWatched) {
-      if (!overlay) wrap.insertAdjacentHTML('beforeend', '<div class="watch-indicator-overlay">&#x2713;</div>');
+    if (state) {
+      if (!overlay) {
+        wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
+      } else {
+        // Swap in place (rather than remove+reinsert) when a show flips
+        // straight from partial to full on its last episode -- keeps the
+        // existing badge element instead of a flicker of removal.
+        overlay.className = 'watch-indicator-overlay' + (state === 'partial' ? ' watch-indicator-partial' : '');
+        overlay.innerHTML = state === 'partial' ? '&#x25D0;' : '&#x2713;';
+      }
     } else if (overlay) {
       overlay.remove();
     }
@@ -661,18 +696,40 @@ function refreshWatchBadge(id, type) {
 
 // Updates the fully-watched set for one show (persisting it so the badge
 // survives a refresh) and immediately refreshes that show's badge
-// wherever its poster is currently on screen.
+// wherever its poster is currently on screen. Fully watched and in
+// progress are mutually exclusive, so marking one clears the other.
 function setShowFullyWatched(showId, isFullyWatched) {
   if (!window._fullyWatchedShowIds) window._fullyWatchedShowIds = new Set();
   const had = window._fullyWatchedShowIds.has(showId);
-  if (isFullyWatched) window._fullyWatchedShowIds.add(showId);
-  else window._fullyWatchedShowIds.delete(showId);
+  if (isFullyWatched) {
+    window._fullyWatchedShowIds.add(showId);
+    if (window._inProgressShowIds) window._inProgressShowIds.delete(showId);
+  } else {
+    window._fullyWatchedShowIds.delete(showId);
+  }
   if (had !== isFullyWatched) {
     try {
       localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify([...window._fullyWatchedShowIds]));
     } catch (e) {
       // non-critical
     }
+  }
+  refreshWatchBadge(showId, 'series');
+}
+
+// Companion to setShowFullyWatched above -- marks a show as having an
+// unwatched-but-aired episode waiting (the amber badge) or clears that
+// state. Not persisted to its own localStorage key the way
+// fullyWatchedShows is: it's fully derivable from the Continue Watching
+// list itself, which initWatchHistory already re-reads on every page
+// load, so a second persisted copy would just be one more place for the
+// two to drift out of sync.
+function setShowInProgress(showId, isInProgress) {
+  if (!window._inProgressShowIds) window._inProgressShowIds = new Set();
+  if (isInProgress) {
+    window._inProgressShowIds.add(showId);
+  } else {
+    window._inProgressShowIds.delete(showId);
   }
   refreshWatchBadge(showId, 'series');
 }
@@ -815,6 +872,48 @@ window.toggleBatchWatchStatus = function(items) {
   return { added: added, removed: removed, nowWatched: !allWatched };
 };
 
+// One-way add to Watch History as watched -- unlike toggleBatchWatchStatus
+// above (which flips a fully-watched batch back to unwatched, since it's a
+// toggle), this only ever adds and skips anything already present. Used by
+// the Trakt Export / Letterboxd Export importers' "mark as watched"
+// option: re-running an import over the same export file (or one that
+// overlaps an earlier one) should never accidentally unmark something that
+// was already logged as watched, which a toggle-based call would risk the
+// moment every item in a batch happened to already be watched.
+window.addItemsToWatchHistory = async function(items) {
+  if (!items || !items.length) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
+  const map = loadLocalCustomLists();
+  const list = getOrCreateWatchHistoryList();
+  const existingIds = new Set(list.items.map(it => String(it.id)));
+  let added = 0;
+  items.forEach(it => {
+    const id = String(it.id);
+    if (existingIds.has(id)) return;
+    list.items.unshift({
+      id: id, type: it.type, name: it.name, poster: it.poster,
+      showId: it.showId || null, showTitle: it.showTitle || null, showPoster: it.showPoster || '',
+      seasonNum: it.seasonNum != null ? it.seasonNum : null, episodeNum: it.episodeNum != null ? it.episodeNum : null,
+    });
+    existingIds.add(id);
+    window._watchedItemIds.add(id);
+    added++;
+  });
+  if (!added) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
+  list.updatedAt = Date.now();
+  map['watch-history'] = list;
+  saveLocalCustomListsMap(map);
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  // Awaited (unlike toggleBatchWatchStatus's own fire-and-forget call
+  // above) -- this is what a bulk importer processing dozens or hundreds
+  // of shows actually needs: the caller's own "done" message shouldn't
+  // fire while most of the batch is still mid-flight, and cwSucceeded/
+  // cwTotal below let it report real numbers instead of assuming success.
+  const cwResult = await updateContinueWatchingForBatch(items);
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  items.forEach(it => refreshWatchBadge(it.id, it.type));
+  return { added: added, cwSucceeded: cwResult.succeeded, cwTotal: cwResult.total };
+};
+
 // --- Continue Watching --------------------------------------------------------
 
 function getOrCreateContinueWatchingList() {
@@ -839,7 +938,7 @@ function getOrCreateContinueWatchingList() {
 }
 
 async function updateContinueWatching(showId) {
-  if (!showId) return;
+  if (!showId) return { ok: false };
 
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
@@ -861,7 +960,8 @@ async function updateContinueWatching(showId) {
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     setShowFullyWatched(showId, false);
-    return;
+    setShowInProgress(showId, false);
+    return { ok: true };
   }
 
   const latest = watchedEps.reduce((best, ep) => {
@@ -872,7 +972,12 @@ async function updateContinueWatching(showId) {
 
   // Whether every currently-aired episode has been watched -- stays null
   // if a fetch below fails, so a network hiccup can't flip the badge one
-  // way or the other; it just leaves whatever was already known.
+  // way or the other; it just leaves whatever was already known. Also
+  // doubles as this function's own success signal (see the "ok" returned
+  // below) -- a caller processing many shows at once (see
+  // updateContinueWatchingForBatch) needs to tell "genuinely fully
+  // watched" apart from "the fetch failed", since both leave no Continue
+  // Watching entry behind but only one of them should be retried.
   let showFullyWatched = null;
 
   try {
@@ -903,6 +1008,7 @@ async function updateContinueWatching(showId) {
         episodeNum: nextInSeason.episode_number
       });
       showFullyWatched = false;
+      setShowInProgress(showId, true);
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
       const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
@@ -924,6 +1030,7 @@ async function updateContinueWatching(showId) {
             episodeNum: firstNext.episode_number
           });
           showFullyWatched = false;
+          setShowInProgress(showId, true);
         } else {
           // TMDB knows about the next season but it hasn't started airing
           // yet -- nothing unwatched-and-aired remains right now.
@@ -945,12 +1052,43 @@ async function updateContinueWatching(showId) {
   if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
+  return { ok: showFullyWatched !== null };
 }
 
+// Runs updateContinueWatching for every distinct show in a batch, a few at
+// a time rather than strictly one-at-a-time -- a large batch (e.g. a
+// fresh Trakt/Letterboxd "mark as watched" import, which can easily span
+// dozens to hundreds of distinct shows) doing one full TMDB round trip per
+// show in sequence was slow enough, and any one transient failure (rate
+// limit, network blip) silently dropped that show from Continue Watching
+// forever with no visibility, that it looked like the feature just "didn't
+// add all shows it should have" -- which it didn't, but not because
+// anything was actually broken beyond not reporting the gap. Tracks real
+// success/failure (via updateContinueWatching's own return value, since it
+// swallows its own network errors internally rather than throwing) so a
+// caller doing a large bulk operation can report honest numbers instead of
+// assuming everything worked.
 async function updateContinueWatchingForBatch(items) {
   const showIds = [...new Set(items.map(it => it.showId).filter(Boolean))];
-  for (const showId of showIds) {
-    await updateContinueWatching(showId).catch(() => {});
+  if (!showIds.length) return { succeeded: 0, total: 0 };
+  const CONCURRENCY = 3;
+  let nextIdx = 0;
+  let succeeded = 0;
+  async function worker() {
+    while (nextIdx < showIds.length) {
+      const showId = showIds[nextIdx++];
+      try {
+        const result = await updateContinueWatching(showId);
+        if (result && result.ok) succeeded++;
+      } catch (e) {
+        // updateContinueWatching doesn't normally throw (see its own
+        // try/catch), but guard anyway so one unexpected error can't abort
+        // the rest of the batch.
+      }
+    }
   }
+  const workers = Array(Math.min(CONCURRENCY, showIds.length)).fill(0).map(worker);
+  await Promise.all(workers);
+  return { succeeded: succeeded, total: showIds.length };
 }
 

@@ -988,7 +988,7 @@ function formatWatchItemLabel(it) {
 function buildLocalListCardHtml(l) {
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
   const itemCount = (l.items || []).length;
-  const allPosters = (l.items || []).slice(0, 9).filter((it) => (l.slug === 'continue-watching' && it.showPoster) ? it.showPoster : it.poster);
+  const allPosters = (l.items || []).slice(0, 9).filter((it) => (l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster)));
   const totalCount = itemCount || allPosters.length;
   const posterThumbs = allPosters.map((it, i) => {
     const isMobileEnd = (i === 2 && allPosters.length > 3);
@@ -1015,7 +1015,7 @@ function buildLocalListCardHtml(l) {
     const removeBtn = (l.slug === 'continue-watching' && it.showId)
       ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;)" title="Remove from Continue Watching">&times;</button>'
       : '';
-    const itemPoster = (l.slug === 'continue-watching' && it.showPoster) ? it.showPoster : it.poster;
+    const itemPoster = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
@@ -1136,7 +1136,7 @@ if (_creatorDashEl) {
         type: it.showId ? 'series' : (list.type || 'movie'),
         name: label.title,
         subtitle: label.subtitle,
-        poster: (list.slug === 'continue-watching' && it.showPoster) ? it.showPoster : it.poster,
+        poster: list.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
         year: it.year,
         // Only Continue Watching's own grid gets a remove button -- see
         // buildLocalListCardHtml's matching comment for why.

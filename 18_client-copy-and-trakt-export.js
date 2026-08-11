@@ -292,6 +292,14 @@ document.getElementById('traktExportFileInput').addEventListener('change', async
       ? '<div style="margin-left:24px; margin-top:4px;"><small>' +
         '<label><input type="radio" name="traktExportHistoryMode" value="shows" checked> Shows only</label>' +
         ' &nbsp; <label><input type="radio" name="traktExportHistoryMode" value="episodes"> Individual episodes</label>' +
+        '</small></div>' +
+        // Deliberately independent of the Shows/Episodes radio above --
+        // that radio only controls how the *Custom List* folds rows for
+        // display; Watch History always needs the real per-episode
+        // identifiers regardless, which mapTraktExportEntryToWatchHistoryItem
+        // reads straight off each raw row.
+        '<div style="margin-left:24px; margin-top:4px;"><small>' +
+        '<label><input type="checkbox" id="traktExportMarkWatchedCheck" checked> Also add these to Watch History &amp; Continue Watching (marks them watched)</label>' +
         '</small></div>'
       : '';
     return '<div class="row searchresult-row" style="flex-direction:column; align-items:flex-start;">' +
@@ -346,54 +354,122 @@ function mapTraktExportEntry(it, category, historyMode) {
   return { imdbId: obj.ids.imdb, title: obj.title, year: obj.year || '', type: it.movie ? 'movie' : 'series' };
 }
 
+// Maps one raw History row to the shape addItemsToWatchHistory expects --
+// used by the "Also add these to Watch History" checkbox. An episode row
+// needs a real TMDB episode id (the same id space Watch History uses
+// everywhere else in this add-on, e.g. toggleWatchStatus/markSeasonWatched)
+// to key on; Trakt's own export includes one at it.episode.ids.tmdb, so a
+// row missing that (older export format, or an episode TMDB has since
+// delisted) is skipped rather than guessed at with a Trakt-specific id
+// that nothing else in this app would recognize.
+function mapTraktExportEntryToWatchHistoryItem(it) {
+  if (it.type === 'episode' && it.show && it.show.ids && it.show.ids.imdb && it.episode) {
+    const epId = it.episode.ids && it.episode.ids.tmdb ? String(it.episode.ids.tmdb) : null;
+    if (!epId) return null;
+    const showPoster = 'https://images.metahub.space/poster/medium/' + it.show.ids.imdb + '/img';
+    return {
+      id: epId,
+      type: 'episode',
+      name: it.episode.title || '',
+      // Trakt's export carries no per-episode still image -- fall back to
+      // the show poster (see this function's own comment above).
+      poster: showPoster,
+      showId: it.show.ids.imdb,
+      showTitle: it.show.title || '',
+      showPoster: showPoster,
+      seasonNum: it.episode.season,
+      episodeNum: it.episode.number,
+    };
+  }
+  const obj = it.movie;
+  if (!obj || !obj.ids || !obj.ids.imdb) return null;
+  return {
+    id: obj.ids.imdb,
+    type: 'movie',
+    name: obj.title || '',
+    poster: 'https://images.metahub.space/poster/medium/' + obj.ids.imdb + '/img',
+  };
+}
+
 async function runTraktExportImport() {
   const btn = document.getElementById('traktExportImportBtn');
-  const checked = Array.from(document.querySelectorAll('.traktExportCatCheck:checked')).map((c) => c.value);
-  if (!checked.length) { alert('Pick at least one category first.'); return; }
+  const catChecked = new Set(Array.from(document.querySelectorAll('.traktExportCatCheck:checked')).map((c) => c.value));
   const historyModeEl = document.querySelector('input[name="traktExportHistoryMode"]:checked');
   const historyMode = historyModeEl ? historyModeEl.value : 'shows';
+  const markWatchedEl = document.getElementById('traktExportMarkWatchedCheck');
+  const markWatched = !!(markWatchedEl && markWatchedEl.checked);
+  // A category is worth processing here if either its own "create a
+  // Custom List" checkbox is on, or (History only) "mark as watched" is on
+  // -- these are independent choices, not one gating the other, so
+  // someone can mark History as watched without also wanting a redundant
+  // "Trakt Watch History" Custom List cluttering their Custom Lists tab.
+  const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
+  if (!relevantCats.length) { alert('Pick at least one category first.'); return; }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
 
   const created = [];
   const failed = [];
-  for (const catKey of checked) {
-    const cat = TRAKT_EXPORT_CATEGORIES.filter((c) => c.key === catKey)[0];
-    if (!cat) continue;
+  let watchedAdded = 0;
+  let cwSucceeded = 0;
+  let cwTotal = 0;
+  for (const cat of relevantCats) {
+    const catKey = cat.key;
     const rawItems = readTraktExportJsonFiles(cat.filePattern).items;
-    const byType = { movie: new Map(), series: new Map() };
-    rawItems.forEach((it) => {
-      const mapped = mapTraktExportEntry(it, cat.key, historyMode);
-      if (!mapped) return;
-      // Dedupe within each type -- unlike the live "Watch History" catalog
-      // row (which deliberately keeps every rewatch as its own tile), a
-      // Custom List is a browsable collection, not a rewatch log. Shows
-      // mode dedupes by show id (a title watched several times only
-      // appears once); Episodes mode dedupes by the finer-grained
-      // dedupeKey mapTraktExportEntry attaches instead, so distinct
-      // episodes of the same show still both appear.
-      byType[mapped.type].set(mapped.dedupeKey || mapped.imdbId, mapped);
-    });
-    for (const type of ['movie', 'series']) {
-      const items = Array.from(byType[type].values()).map((m) => ({
-        imdbId: m.imdbId,
-        title: m.title,
-        year: m.year,
-        // The export carries no poster art of its own -- same metahub
-        // fallback mapTraktItems already uses for every other Trakt source.
-        poster: 'https://images.metahub.space/poster/medium/' + m.imdbId + '/img',
-      }));
-      if (!items.length) continue;
-      const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
-      const listName = 'Trakt ' + cat.label + ' (' + typeLabel + ')';
-      // Debug aid: if a list still silently doesn't appear after this,
-      // devtools console will show exactly which save call failed and why.
-      console.log('Trakt export import: saving', listName, '-', items.length, 'items\u2026');
-      const result = await saveItemsAsNewCustomList(listName, type, items, 'private');
-      console.log('Trakt export import: result for', listName, '->', result);
-      if (result.ok) {
-        created.push({ name: listName, count: items.length });
-      } else {
-        failed.push({ name: listName, error: result.error });
+
+    if (catChecked.has(catKey)) {
+      const byType = { movie: new Map(), series: new Map() };
+      rawItems.forEach((it) => {
+        const mapped = mapTraktExportEntry(it, cat.key, historyMode);
+        if (!mapped) return;
+        // Dedupe within each type -- unlike the live "Watch History" catalog
+        // row (which deliberately keeps every rewatch as its own tile), a
+        // Custom List is a browsable collection, not a rewatch log. Shows
+        // mode dedupes by show id (a title watched several times only
+        // appears once); Episodes mode dedupes by the finer-grained
+        // dedupeKey mapTraktExportEntry attaches instead, so distinct
+        // episodes of the same show still both appear.
+        byType[mapped.type].set(mapped.dedupeKey || mapped.imdbId, mapped);
+      });
+      for (const type of ['movie', 'series']) {
+        const items = Array.from(byType[type].values()).map((m) => ({
+          imdbId: m.imdbId,
+          title: m.title,
+          year: m.year,
+          // The export carries no poster art of its own -- same metahub
+          // fallback mapTraktItems already uses for every other Trakt source.
+          poster: 'https://images.metahub.space/poster/medium/' + m.imdbId + '/img',
+        }));
+        if (!items.length) continue;
+        const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
+        const listName = 'Trakt ' + cat.label + ' (' + typeLabel + ')';
+        // Debug aid: if a list still silently doesn't appear after this,
+        // devtools console will show exactly which save call failed and why.
+        console.log('Trakt export import: saving', listName, '-', items.length, 'items\u2026');
+        const result = await saveItemsAsNewCustomList(listName, type, items, 'private');
+        console.log('Trakt export import: result for', listName, '->', result);
+        if (result.ok) {
+          created.push({ name: listName, count: items.length });
+        } else {
+          failed.push({ name: listName, error: result.error });
+        }
+      }
+    }
+
+    if (catKey === 'history' && markWatched) {
+      const whItems = [];
+      const seenIds = new Set();
+      rawItems.forEach((it) => {
+        const mapped = mapTraktExportEntryToWatchHistoryItem(it);
+        if (!mapped || seenIds.has(mapped.id)) return; // a rewatch logs one row per play -- Watch History only needs one entry per item
+        seenIds.add(mapped.id);
+        whItems.push(mapped);
+      });
+      if (whItems.length && typeof addItemsToWatchHistory === 'function') {
+        if (btn) btn.textContent = 'Checking Continue Watching for ' + new Set(whItems.filter((it) => it.showId).map((it) => it.showId)).size + ' show(s)\u2026';
+        const whResult = await addItemsToWatchHistory(whItems);
+        watchedAdded += whResult.added;
+        cwSucceeded += whResult.cwSucceeded || 0;
+        cwTotal += whResult.cwTotal || 0;
       }
     }
   }
@@ -405,6 +481,13 @@ async function runTraktExportImport() {
   if (created.length) {
     msg += 'Created ' + created.map((c) => '"' + c.name + '" (' + c.count + ' item' + (c.count === 1 ? '' : 's') + ')').join(', ') +
       ' in your Custom Lists \u2014 find them under the Custom Lists tab to add them to your lists.';
+  }
+  if (watchedAdded) {
+    msg += (msg ? '\\n\\n' : '') + 'Marked ' + watchedAdded + ' item' + (watchedAdded === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
+    if (cwTotal) {
+      msg += ' Continue Watching checked for ' + cwSucceeded + ' of ' + cwTotal + ' show' + (cwTotal === 1 ? '' : 's') +
+        (cwSucceeded < cwTotal ? ' \u2014 the rest hit a network hiccup or TMDB rate limit; reopening one of those shows will retry it, or just run this import again.' : '.');
+    }
   }
   if (failed.length) {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
@@ -523,8 +606,18 @@ document.getElementById('letterboxdExportFileInput')?.addEventListener('change',
       diagnostics.push(cat.label + ': found ' + result.matchedFiles + ' file(s) but couldn\u2019t read any entries \u2014 ' + result.errors.slice(0, 2).join('; '));
       return '';
     }
+    // "Watched" and "Diary" are the two categories that represent movies
+    // the person has actually seen (Watchlist is explicitly the opposite,
+    // and Ratings alone doesn't reliably imply a watch date/event) -- only
+    // those two get the option to also mark them watched in this add-on.
+    const markWatchedToggle = (cat.key === 'watched' || cat.key === 'diary')
+      ? '<div style="margin-left:24px; margin-top:4px;"><small>' +
+        '<label><input type="checkbox" class="letterboxdExportMarkWatchedCheck" value="' + cat.key + '" checked> Also add these to Watch History (marks them watched)</label>' +
+        '</small></div>'
+      : '';
     return '<div class="row searchresult-row" style="flex-direction:column; align-items:flex-start;">' +
       '<div><label><input type="checkbox" class="letterboxdExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
+      markWatchedToggle +
       '</div>';
   }).join('');
   
@@ -544,23 +637,23 @@ document.getElementById('letterboxdExportFileInput')?.addEventListener('change',
 window.runLetterboxdExportImport = async function() {
   const btn = document.getElementById('letterboxdExportImportBtn');
   const progressLine = document.getElementById('letterboxdImportProgress');
-  const checks = document.querySelectorAll('.letterboxdExportCatCheck:checked');
-  if (!checks.length) {
+  const catChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportCatCheck:checked')).map((c) => c.value));
+  const markWatchedChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportMarkWatchedCheck:checked')).map((c) => c.value));
+  // Same independence as the Trakt Export importer -- a category matters
+  // here if either its own "create a Custom List" checkbox is on, or its
+  // "mark as watched" checkbox is on, not only when both are.
+  const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
+  if (!relevantCats.length) {
     alert('Please select at least one category to import.');
-    return;
-  }
-  if (!activeCreator) {
-    alert('You must be signed in to create custom lists.');
     return;
   }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
   
   const created = [];
   const failed = [];
+  let watchedAdded = 0;
   
-  for (const check of checks) {
-    const cat = LETTERBOXD_EXPORT_CATEGORIES.find((c) => c.key === check.value);
-    if (!cat) continue;
+  for (const cat of relevantCats) {
     const result = readLetterboxdExportCsvFiles(cat.filePattern);
     if (!result.items.length) continue;
     
@@ -605,15 +698,24 @@ window.runLetterboxdExportImport = async function() {
       failed.push({ name: 'Letterboxd ' + cat.label, error: 'Could not resolve any items.' });
       continue;
     }
-    
-    const listName = 'Letterboxd ' + cat.label;
-    if (progressLine) progressLine.textContent = 'Saving ' + listName + ' (' + resolvedItems.length + ' items)...';
-    
-    const saveResult = await saveItemsAsNewCustomList(listName, 'movie', resolvedItems, 'private');
-    if (saveResult.ok) {
-      created.push({ name: listName, count: resolvedItems.length });
-    } else {
-      failed.push({ name: listName, error: saveResult.error });
+
+    if (catChecked.has(cat.key)) {
+      const listName = 'Letterboxd ' + cat.label;
+      if (progressLine) progressLine.textContent = 'Saving ' + listName + ' (' + resolvedItems.length + ' items)...';
+
+      const saveResult = await saveItemsAsNewCustomList(listName, 'movie', resolvedItems, 'private');
+      if (saveResult.ok) {
+        created.push({ name: listName, count: resolvedItems.length });
+      } else {
+        failed.push({ name: listName, error: saveResult.error });
+      }
+    }
+
+    if (markWatchedChecked.has(cat.key) && typeof addItemsToWatchHistory === 'function') {
+      if (progressLine) progressLine.textContent = 'Marking ' + cat.label + ' as watched...';
+      const whItems = resolvedItems.map((it) => ({ id: it.imdbId, type: 'movie', name: it.title, poster: it.poster }));
+      const whResult = await addItemsToWatchHistory(whItems);
+      watchedAdded += whResult.added;
     }
   }
   
@@ -624,6 +726,9 @@ window.runLetterboxdExportImport = async function() {
   let msg = '';
   if (created.length) {
     msg += 'Successfully created:\\n' + created.map((c) => c.name + ' (' + c.count + ' items)').join('\\n');
+  }
+  if (watchedAdded) {
+    msg += (msg ? '\\n\\n' : '') + 'Marked ' + watchedAdded + ' item' + (watchedAdded === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
   }
   if (failed.length) {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
