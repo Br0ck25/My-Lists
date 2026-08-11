@@ -6550,7 +6550,7 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Auto-Track Playback (Stremio/wako)</h2>
+      <h2 class="panel-title">Auto-Track Playback</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them in Stremio or wako &mdash; from any addon, not just this one. Works by declaring a subtitles resource that Stremio/wako call whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
       <div id="trackPlaybackSection"></div>
     </div>
@@ -12429,6 +12429,7 @@ async function loadCreatorSync() {
     applyCollapsedPanelsState(synced.collapsedPanels);
     if (typeof synced.trackPlayback === 'boolean') {
       try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
+      if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
     }
     if (Array.isArray(synced.likedLists)) {
       try {

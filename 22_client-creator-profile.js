@@ -566,6 +566,7 @@ async function loadCreatorSync() {
     applyCollapsedPanelsState(synced.collapsedPanels);
     if (typeof synced.trackPlayback === 'boolean') {
       try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
+      if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
     }
     if (Array.isArray(synced.likedLists)) {
       try {
