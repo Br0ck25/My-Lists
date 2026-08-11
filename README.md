@@ -131,7 +131,3 @@ Your KV data (saved lists, accounts, stats) and your environment variables/secre
 ## A note on API keys
 
 Every key above is a personal credential tied to a free developer account on that service. This add-on never ships with anyone's key baked in — you're always using your own. None of these services charge for the tier this add-on needs for personal use.
-
-## License
-
-*(Add your preferred license here — e.g. MIT — before publishing, if you'd like others to be clear on how they can use and modify this.)*
