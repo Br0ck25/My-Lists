@@ -1,0 +1,956 @@
+// --- Custom Lists ---------------------------------------------------------------
+//
+// A hand-picked list of movies OR shows (not both -- see customListDraftType):
+// each pick is saved as-is, no episode-picker step, and the resulting shelf is
+// just multiple normal catalog tiles rather than one synthetic item -- see
+// fetchCustomListCatalog server-side for why that's the deliberate design.
+let customListDraftItems = [];
+let customListDraftType = 'movie'; // 'movie' or 'series', set by user toggle
+
+// Skips the search-and-pick draft entirely -- copyListToCustomList already
+// does exactly "fetch this list's items and save them as a Custom List"
+// (splitting into "(Movies)"/"(Shows)" lists on its own if the source turns
+// out to be mixed), same machinery the My Lists/Search Lists panels' own
+// "Copy to Custom List" buttons use, just fed a freely-pasted link and a
+// name instead of a link the client already had metadata for.
+async function importCustomListFromLink(btn) {
+  const urlInput = document.getElementById('customListImportUrlInput');
+  const nameInput = document.getElementById('customListImportNameInput');
+  const listUrl = urlInput.value.trim();
+  if (!listUrl) {
+    alert('Paste a list URL first.');
+    return;
+  }
+  const name = nameInput.value.trim() || guessNameFromUrl(listUrl);
+  await copyListToCustomList(name, listUrl, 'unknown', btn);
+  urlInput.value = '';
+  nameInput.value = '';
+}
+
+async function runCustomListSearch() {
+  const q = document.getElementById('customListSearchInput').value.trim();
+  const searchType = document.getElementById('customListSearchType').value; // 'movie' or 'tv'
+  const box = document.getElementById('customListSearchResult');
+  if (!q) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = '<p><small>Searching\u2026</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=' + searchType, { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Search failed.') + '</p>';
+      return;
+    }
+    renderCustomListSearchResults(data.results, searchType);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error while searching.</p>';
+  }
+}
+
+function renderCustomListSearchResults(results, searchType) {
+  const box = document.getElementById('customListSearchResult');
+  if (!results.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
+    return;
+  }
+  const cardsHtml = results.map((r) => {
+    const posterImg = r.poster
+      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
+      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
+    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
+      posterImg +
+      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
+        escapeHtml(r.title) +
+      '</div>' +
+      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
+      '<button type="button" class="lc-btn secondary customListAddBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
+      ' data-tmdbid="' + r.tmdbId + '" data-searchtype="' + searchType + '"' +
+      ' data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '"' +
+      ' data-poster="' + escapeAttr(r.poster || '') + '">+ Add</button>' +
+      '</div>';
+  }).join('');
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+}
+
+document.getElementById('customListSearchResult').addEventListener('click', (e) => {
+  const btn = e.target.closest('.customListAddBtn');
+  if (!btn) return;
+  addToCustomListDraft(btn.dataset.searchtype, btn.dataset.tmdbid, btn.dataset.title, btn.dataset.year, btn.dataset.poster, btn);
+});
+
+async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
+  const itemType = searchType === 'tv' ? 'series' : 'movie';
+  if (customListDraftType && customListDraftType !== itemType) {
+    alert('This list is set to ' + (customListDraftType === 'movie' ? 'Movies' : 'Shows') + ' -- start a new list (or save/clear this one first) to add a ' + (itemType === 'movie' ? 'movie' : 'show') + '.');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding\u2026';
+  }
+  try {
+    const endpoint = itemType === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
+    const res = await fetch(ORIGIN + endpoint + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      alert('Could not add "' + title + '": ' + (data.error || 'unknown error'));
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '+ Add';
+      }
+      return;
+    }
+    customListDraftItems.push({
+      imdbId: data.imdbId,
+      title: title,
+      year: year || undefined,
+      poster: poster || undefined,
+    });
+    customListDraftType = itemType;
+    updateCustomListTypeRadio(itemType);
+    renderCustomListDraftList();
+    if (btn) btn.textContent = 'Added \u2713';
+  } catch (e) {
+    alert('Network error adding "' + title + '".');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '+ Add';
+    }
+  }
+}
+
+function renderCustomListDraftList() {
+  const box = document.getElementById('customListDraftList');
+  const badge = document.getElementById('customListDraftCountBadge');
+  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+  if (!customListDraftItems.length) {
+    box.innerHTML = '<p><small>Nothing added yet -- search above to get started.</small></p>';
+    return;
+  }
+  box.innerHTML = customListDraftItems.map((it, i) => {
+    const label = escapeHtml(it.title || it.name || 'Untitled') + (it.year ? ' (' + escapeHtml(it.year) + ')' : '');
+    const idStr = it.imdbId || it.id || '';
+    const onClickStr = idStr ? ' onclick="showItemDetails(&quot;' + escapeAttr(idStr) + '&quot;, &quot;' + escapeAttr(customListDraftType || 'movie') + '&quot;)"' : '';
+    const posterImg = it.poster
+      ? '<img src="' + escapeAttr(it.poster) + '" alt="" loading="lazy" class="custom-list-pick-poster"' + onClickStr + '>'
+      : '<span class="custom-list-pick-poster empty-poster"></span>';
+    return '<div class="custom-list-pick" data-idx="' + i + '" style="display:flex; flex-direction:row; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px; width:100%;">' +
+      '<span class="drag-handle" draggable="true" style="cursor:grab; touch-action:none; padding:6px; flex:none;">\u2630</span>' +
+      '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" style="width:50px; flex:none; text-align:center;" title="Type a position to move this pick there">' +
+      posterImg +
+      '<span style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="' + escapeAttr(label) + '">' + label + '</span>' +
+      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="-1"' + (i === 0 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2191</button>' +
+      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="1"' + (i === customListDraftItems.length - 1 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2193</button>' +
+      '<button type="button" class="secondary customListRemovePickBtn" style="flex:none; padding:8px 12px;">Remove</button>' +
+      '</div>';
+  }).join('');
+  document.querySelectorAll('#customListDraftList .drag-handle').forEach((h) => initCustomListTouchDrag(h));
+}
+
+document.getElementById('customListDraftList').addEventListener('click', (e) => {
+  const removeBtn = e.target.closest('.customListRemovePickBtn');
+  if (removeBtn) {
+    const row = removeBtn.closest('.custom-list-pick');
+    const idx = parseInt(row.dataset.idx, 10);
+    customListDraftItems.splice(idx, 1);
+    renderCustomListDraftList();
+    return;
+  }
+  const moveBtn = e.target.closest('.customListMoveBtn');
+  if (moveBtn) {
+    const row = moveBtn.closest('.custom-list-pick');
+    const idx = parseInt(row.dataset.idx, 10);
+    const swapWith = idx + parseInt(moveBtn.dataset.dir, 10);
+    if (swapWith < 0 || swapWith >= customListDraftItems.length) return;
+    const tmp = customListDraftItems[idx];
+    customListDraftItems[idx] = customListDraftItems[swapWith];
+    customListDraftItems[swapWith] = tmp;
+    renderCustomListDraftList();
+  }
+});
+
+// Lets someone type a new position directly into a pick's number box
+// instead of clicking the up arrow repeatedly -- same idea as movePosTo()
+// for the main list, adapted for this array-backed draft.
+document.getElementById('customListDraftList').addEventListener('change', (e) => {
+  const posInput = e.target.closest('.customListPosInput');
+  if (!posInput) return;
+  const row = posInput.closest('.custom-list-pick');
+  const from = parseInt(row.dataset.idx, 10);
+  const typed = parseInt(posInput.value, 10);
+  if (!typed || isNaN(typed)) {
+    renderCustomListDraftList();
+    return;
+  }
+  const to = Math.min(Math.max(typed, 1), customListDraftItems.length) - 1;
+  if (to === from) {
+    renderCustomListDraftList();
+    return;
+  }
+  const [item] = customListDraftItems.splice(from, 1);
+  customListDraftItems.splice(to, 0, item);
+  renderCustomListDraftList();
+});
+
+// Mouse drag-and-drop -- same live-DOM-reorder-then-read-back-order
+// technique the main list's drag uses, adapted for this array-backed
+// draft rather than persistent .entry elements: rows move around freely
+// during the drag, and the final DOM order (via each row's data-idx,
+// which still points at its ORIGINAL array index) gets read back into
+// customListDraftItems once the drag ends.
+let customListDragRow = null;
+
+document.getElementById('customListDraftList').addEventListener('dragstart', (e) => {
+  const handle = e.target.closest('.drag-handle');
+  if (!handle) { e.preventDefault(); return; }
+  customListDragRow = handle.closest('.custom-list-pick');
+  customListDragRow.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+});
+
+document.getElementById('customListDraftList').addEventListener('dragend', () => {
+  if (customListDragRow) customListDragRow.classList.remove('dragging');
+  customListDragRow = null;
+  const container = document.getElementById('customListDraftList');
+  const newOrder = [...container.querySelectorAll('.custom-list-pick')].map((r) => customListDraftItems[parseInt(r.dataset.idx, 10)]);
+  customListDraftItems = newOrder;
+  renderCustomListDraftList();
+});
+
+document.getElementById('customListDraftList').addEventListener('dragover', (e) => {
+  if (!customListDragRow) return;
+  e.preventDefault();
+  const container = document.getElementById('customListDraftList');
+  const afterEl = getCustomListDragAfterElement(container, e.clientY);
+  if (afterEl == null) {
+    container.appendChild(customListDragRow);
+  } else if (afterEl !== customListDragRow) {
+    container.insertBefore(customListDragRow, afterEl);
+  }
+});
+
+function getCustomListDragAfterElement(container, y) {
+  const els = [...container.querySelectorAll('.custom-list-pick:not(.dragging)')];
+  return els.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+    return closest;
+  }, { offset: -Infinity, element: null }).element;
+}
+
+// position number both still work fine on touch regardless.
+let customListTouchDragRow = null;
+
+function initCustomListTouchDrag(handle) {
+  if (!handle) return;
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    e.preventDefault();
+    customListTouchDragRow = handle.closest('.custom-list-pick');
+    customListTouchDragRow.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    document.addEventListener('pointermove', onCustomListTouchDragMove);
+    document.addEventListener('pointerup', onCustomListTouchDragEnd, { once: true });
+    document.addEventListener('pointercancel', onCustomListTouchDragEnd, { once: true });
+  });
+}
+
+function onCustomListTouchDragMove(e) {
+  if (!customListTouchDragRow) return;
+  const container = document.getElementById('customListDraftList');
+  const afterEl = getCustomListDragAfterElement(container, e.clientY);
+  if (afterEl == null) {
+    container.appendChild(customListTouchDragRow);
+  } else if (afterEl !== customListTouchDragRow) {
+    container.insertBefore(customListTouchDragRow, afterEl);
+  }
+}
+
+function onCustomListTouchDragEnd() {
+  document.removeEventListener('pointermove', onCustomListTouchDragMove);
+  if (customListTouchDragRow) customListTouchDragRow.classList.remove('dragging');
+  customListTouchDragRow = null;
+  reorderCustomListDraftFromDom();
+}
+
+function shuffleCustomListDraft() {
+  if (customListDraftItems.length < 2) return;
+  for (let i = customListDraftItems.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = customListDraftItems[i];
+    customListDraftItems[i] = customListDraftItems[j];
+    customListDraftItems[j] = tmp;
+  }
+  renderCustomListDraftList();
+}
+
+// Set by editCustomList below while an existing Custom List's picks are
+// loaded into the draft for editing; null means "Save" creates a brand
+// new list, same as always.
+let editingCustomListUrlInput = null;
+
+// Carries a stable id across an edit (see editCustomList) so a shuffled
+// list's daily reshuffle seed stays consistent rather than resetting every
+// time it's edited -- same reasoning as a Channel's channelId, and needed
+// for the same reason: this list could end up merged with others into one
+// row (the ordinary merge-into-one-shelf mechanism, not a dedicated
+// feature here), where there's no outer entry.id to fall back on for any
+// individual list's own seed.
+let customListDraftListId = null;
+
+function saveCustomList() {
+  const nameInput = document.getElementById('customListNameInput');
+  const name = nameInput.value.trim();
+  if (!name) {
+    alert('Name this list first.');
+    return;
+  }
+
+  if (editingCreatorListSlug) {
+    saveCreatorListEdit(name);
+    return;
+  }
+  if (editingLocalCustomListSlug) {
+    saveLocalCustomListEdit(name);
+    return;
+  }
+
+  const shuffle = document.getElementById('customListRandomizeCheck').checked;
+  const listId = customListDraftListId || generateChannelId();
+  // Allow empty lists -- type defaults to 'movie' if nothing was added yet
+  const listType = customListDraftType || 'movie';
+  const payload = { listId: listId, type: listType, items: customListDraftItems, shuffle: shuffle };
+  const newUrl = 'customlist:v1:' + JSON.stringify(payload);
+
+  // Locate (or create) the row's actual DOM node so it can be handed
+  // straight into the save flow below -- using replaceWith + a direct
+  // reference to the freshly-parsed node, rather than outerHTML + a stale
+  // reference, since pendingSaveListContext needs a node still attached to
+  // the document when the save flow eventually writes the published URL
+  // back into it.
+  let sourceRow;
+  if (editingCustomListUrlInput) {
+    const oldSourceRow = editingCustomListUrlInput.closest('.source-row');
+    const temp = document.createElement('div');
+    temp.innerHTML = customListSourceRowHtml(newUrl);
+    sourceRow = temp.firstElementChild;
+    if (oldSourceRow) oldSourceRow.replaceWith(sourceRow);
+    // A row holding just this one Custom List also uses its own name as
+    // the row's name -- keep those in sync. A merged row's name is the
+    // shared shelf name instead, so that's left alone.
+    const rowDiv = sourceRow.closest('.entry');
+    if (rowDiv && rowDiv.querySelectorAll('.url').length === 1) {
+      const rowNameInput = rowDiv.querySelector('.name');
+      if (rowNameInput) rowNameInput.value = name;
+    }
+    editingCustomListUrlInput = null;
+    renumber();
+    checkAllDuplicateUrls();
+    saveState();
+  } else {
+    const newRowDiv = addRow(name, newUrl, customListDraftType, true, 'Custom Lists');
+    sourceRow = newRowDiv ? newRowDiv.querySelector('.source-row') : null;
+  }
+
+  customListDraftItems = [];
+  customListDraftType = 'movie';
+  updateCustomListTypeRadio('movie');
+  customListDraftListId = null;
+  nameInput.value = '';
+  document.getElementById('customListRandomizeCheck').checked = false;
+  document.getElementById('customListSearchInput').value = '';
+  document.getElementById('customListSearchResult').innerHTML = '';
+  renderCustomListDraftList();
+  updateCustomListSaveButtonLabel();
+
+  // Straight into the same save flow the row's own "Save List" button
+  // uses (creator-profile signed-in -> visibility picker directly;
+  // otherwise the anonymous-vs-create-a-profile choice) -- no separate
+  // trip down to the list below and a second click needed.
+  const urlInput = sourceRow ? sourceRow.querySelector('.url') : null;
+  if (sourceRow && urlInput) {
+    beginSaveListFlow(sourceRow, urlInput, name);
+  } else {
+    alert('List "' + name + '" saved, but the save dialog couldn\\'t open automatically -- use the "Save List" button on it below.');
+  }
+}
+
+// Saves changes to a list already living on the creator's profile --
+// straight back to the server (no local row involved at all, unlike every
+// other save path here), since a Creator-owned list's canonical copy is
+// the one on the server, not a row in this particular install link.
+async function saveCreatorListEdit(name) {
+  if (!activeCreator) {
+    alert('Your Creator Profile session expired -- please restore it again.');
+    editingCreatorListSlug = null;
+    updateCustomListSaveButtonLabel();
+    return;
+  }
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        slug: editingCreatorListSlug,
+        name: name,
+        type: customListDraftType,
+        items: customListDraftItems,
+        visibility: visibility,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      alert('Could not save changes: ' + (data.error || 'unknown error'));
+      return;
+    }
+    alert('"' + name + '" updated.');
+    cancelEditCustomList();
+    renderCreatorDashboard();
+  } catch (e) {
+    alert('Network error while saving.');
+  }
+}
+
+// Local equivalent of saveCreatorListEdit above -- same role, writes to
+// the local store instead of the server, no visibility to preserve since
+// local lists don't have one.
+function saveLocalCustomListEdit(name) {
+  const map = loadLocalCustomLists();
+  const slug = editingLocalCustomListSlug;
+  const existing = map[slug];
+  map[slug] = {
+    slug: slug,
+    name: name,
+    type: customListDraftType,
+    items: customListDraftItems,
+    createdAt: existing ? existing.createdAt : Date.now(),
+    updatedAt: Date.now(),
+  };
+  saveLocalCustomListsMap(map);
+  cancelEditCustomList();
+  renderCreatorDashboard();
+}
+
+// Loads an existing Custom List's picks back into the draft so they can be
+// adjusted and saved back over the same list, instead of needing to
+// delete and rebuild it from scratch.
+function editCustomList(btn) {
+  const sourceRow = btn.closest('.source-row');
+  const urlInput = sourceRow && sourceRow.querySelector('.url');
+  if (!urlInput) {
+    alert('Could not read this list to edit it.');
+    return;
+  }
+  const payload = parseCustomListPayloadClient(urlInput.value);
+  if (!payload) {
+    alert('Could not read this list to edit it.');
+    return;
+  }
+  customListDraftItems = (payload.items || []).slice();
+  customListDraftType = payload.type || 'movie';
+  updateCustomListTypeRadio(customListDraftType);
+  customListDraftListId = payload.listId || null;
+  const rowDiv = urlInput.closest('.entry');
+  const currentName = rowDiv && rowDiv.querySelectorAll('.url').length === 1 && rowDiv.querySelector('.name')
+    ? rowDiv.querySelector('.name').value.trim()
+    : '';
+  document.getElementById('customListNameInput').value = currentName;
+  document.getElementById('customListSearchType').value = payload.type === 'series' ? 'tv' : 'movie';
+  document.getElementById('customListRandomizeCheck').checked = !!payload.shuffle;
+  editingCustomListUrlInput = urlInput;
+  editingCreatorListSlug = null;
+  renderCustomListDraftList();
+  updateCustomListSaveButtonLabel();
+
+  switchTab('lists');
+  // Create List has no pill of its own -- see the matching fix in
+  // editCreatorList/editLocalCustomList for why this doesn't try to grab
+  // one to highlight.
+  if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+  const panel = document.getElementById('listsSubCreateList');
+  if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function cancelEditCustomList() {
+  editingCustomListUrlInput = null;
+  editingCreatorListSlug = null;
+  editingLocalCustomListSlug = null;
+  customListDraftItems = [];
+  customListDraftType = 'movie';
+  updateCustomListTypeRadio('movie');
+  customListDraftListId = null;
+  document.getElementById('customListNameInput').value = '';
+  const searchInput = document.getElementById('customListSearchInput');
+  if (searchInput) searchInput.value = '';
+  const searchRes = document.getElementById('customListSearchResult');
+  if (searchRes) searchRes.innerHTML = '';
+  document.getElementById('customListRandomizeCheck').checked = false;
+  renderCustomListDraftList();
+  updateCustomListSaveButtonLabel();
+  
+  if (typeof switchListsSubmenu === 'function') {
+    switchListsSubmenu('my-lists', document.querySelector('#listsSubnavBar button:nth-child(1)'));
+  }
+}
+
+function updateCustomListSaveButtonLabel() {
+  const saveBtn = document.getElementById('customListSaveBtn');
+  const cancelBtn = document.getElementById('customListCancelEditBtn');
+  const visRow = document.getElementById('customListVisibilityRow');
+  if (!saveBtn) return;
+  const titleEl = document.getElementById('customListEditorTitle');
+  const isEditing = editingCreatorListSlug || editingLocalCustomListSlug || editingCustomListUrlInput;
+  if (titleEl) {
+    titleEl.innerHTML = (isEditing ? 'Edit Custom List' : 'Create a Custom List') + ' <span class="badge" id="customListDraftCountBadge"></span>';
+    // Must update badge text again since we just rewrote innerHTML
+    const badge = document.getElementById('customListDraftCountBadge');
+    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+  }
+
+  if (editingCreatorListSlug) {
+    saveBtn.textContent = 'Save changes to your Creator list';
+    if (cancelBtn) cancelBtn.style.display = '';
+    if (visRow) visRow.style.display = '';
+  } else if (editingLocalCustomListSlug) {
+    saveBtn.textContent = 'Save changes to this list';
+    if (cancelBtn) cancelBtn.style.display = '';
+    if (visRow) visRow.style.display = 'none';
+  } else if (editingCustomListUrlInput) {
+    saveBtn.textContent = 'Save changes to this List';
+    if (cancelBtn) cancelBtn.style.display = '';
+    if (visRow) visRow.style.display = 'none';
+  } else {
+    saveBtn.textContent = 'Save as a List';
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (visRow) visRow.style.display = 'none';
+  }
+}
+
+
+
+function closeCreateListModal() {
+  document.getElementById('listsSubCreateList').style.display = 'none';
+  document.getElementById('listsSubMyLists').style.display = 'block';
+}
+
+function setCustomListDraftTypeToggle(type) {
+  if (customListDraftItems.length > 0 && customListDraftType !== type) {
+    alert('This list already contains ' + (customListDraftType === 'movie' ? 'movies' : 'shows') + '. Clear the list first to change its type.');
+    updateCustomListTypeRadio(customListDraftType);
+    return;
+  }
+  customListDraftType = type;
+}
+
+function updateCustomListTypeRadio(type) {
+  const radios = document.getElementsByName('customListTypeRadio');
+  for (let i = 0; i < radios.length; i++) {
+    if (radios[i].value === type) {
+      radios[i].checked = true;
+    }
+  }
+}
+
+// --- Watch History --------------------------------------------------------
+
+window._watchedItemIds = new Set();
+// Shows where every currently-aired episode has been watched -- separate
+// from _watchedItemIds (which only ever holds movie/episode ids, never a
+// show's own id) since a show's poster is never itself added to Watch
+// History, only its episodes are. Computed by updateContinueWatching
+// below whenever it can't find a next unwatched, aired episode.
+window._fullyWatchedShowIds = new Set();
+
+// Finds the position:relative box a watched-checkmark badge should be
+// inserted into for a given .clickable-poster/.clickable-episode element.
+// Poster markup isn't consistent across the app -- some wrap the image in
+// its own positioned box (livePreviewPosterHtml), some set
+// position:relative on the clickable element itself via a CSS class
+// rather than an inline style (.list-card-mini-poster-img-wrap), and some
+// put .clickable-poster directly on the <img> (the Custom Lists /
+// Continue Watching dashboard cards) -- and an <img> can't hold rendered
+// children, so that last case falls back to the image's own parent
+// instead of the image itself.
+function findWatchBadgeWrap(el) {
+  const wrap = el.querySelector('div[style*="position:relative"]') || el.querySelector('.poster-image-wrap') || el.querySelector('div[style*="aspect-ratio"]');
+  if (wrap) return wrap;
+  if (el.tagName === 'IMG') return el.parentElement;
+  return el;
+}
+
+function initWatchHistory() {
+  if (typeof loadLocalCustomLists === 'function') {
+    const map = loadLocalCustomLists();
+    if (map['watch-history']) {
+      const items = map['watch-history'].items || [];
+      items.forEach(it => window._watchedItemIds.add(String(it.id)));
+    }
+  }
+  try {
+    const raw = localStorage.getItem('myListAddon:fullyWatchedShows');
+    if (raw) JSON.parse(raw).forEach(id => window._fullyWatchedShowIds.add(String(id)));
+  } catch (e) {
+    // non-critical -- badges just won't show for shows until the next
+    // time updateContinueWatching recomputes them
+  }
+
+  const observer = new MutationObserver(mutations => {
+    if (!window._watchedItemIds) return;
+    document.querySelectorAll('.clickable-poster, .clickable-episode').forEach(el => {
+      const id = el.dataset.id;
+      if (!id) return;
+      // A show's own poster (data-type="series") is checked against the
+      // fully-watched set instead of the regular watched-item set, since
+      // the show's id itself never lands in Watch History -- only its
+      // episodes do. Episodes have no data-type, so they fall through to
+      // the regular check same as movies always have.
+      const isWatched = el.dataset.type === 'series'
+        ? (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(id))
+        : window._watchedItemIds.has(id);
+      if (!isWatched) return;
+      const wrap = findWatchBadgeWrap(el);
+      if (!wrap) return;
+      // Checking wrap (not el) for an existing badge matters: when el is
+      // an <img> (it can't hold children), wrap is el.parentElement --
+      // checking el itself here would always find nothing, insert another
+      // badge into wrap every time this observer fires, and since that
+      // insertion is itself a mutation under the very subtree being
+      // observed, immediately re-trigger this same callback -- an
+      // unbounded loop that floods the DOM and freezes the tab.
+      if (!wrap.querySelector('.watch-indicator-overlay')) {
+        wrap.insertAdjacentHTML('beforeend', '<div class="watch-indicator-overlay">&#x2713;</div>');
+      }
+    });
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+setTimeout(initWatchHistory, 500);
+
+// Adds/removes the blue "watched" checkmark badge on every currently
+// on-screen poster/episode card matching this id. Called right after
+// toggling something, so the change shows up immediately rather than
+// waiting on the MutationObserver above (which only reacts to new DOM
+// nodes appearing, not to _watchedItemIds/_fullyWatchedShowIds changing
+// underneath content that's already on screen).
+function refreshWatchBadge(id, type) {
+  const strId = String(id);
+  const isWatched = type === 'series'
+    ? (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(strId))
+    : (window._watchedItemIds && window._watchedItemIds.has(strId));
+  document.querySelectorAll('.clickable-poster[data-id="' + escapeAttr(strId) + '"], .clickable-episode[data-id="' + escapeAttr(strId) + '"]').forEach(el => {
+    const wrap = findWatchBadgeWrap(el);
+    if (!wrap) return;
+    // See the matching comment in initWatchHistory's observer above -- this
+    // has to check wrap, not el, for the same reason.
+    const overlay = wrap.querySelector('.watch-indicator-overlay');
+    if (isWatched) {
+      if (!overlay) wrap.insertAdjacentHTML('beforeend', '<div class="watch-indicator-overlay">&#x2713;</div>');
+    } else if (overlay) {
+      overlay.remove();
+    }
+  });
+}
+
+// Updates the fully-watched set for one show (persisting it so the badge
+// survives a refresh) and immediately refreshes that show's badge
+// wherever its poster is currently on screen.
+function setShowFullyWatched(showId, isFullyWatched) {
+  if (!window._fullyWatchedShowIds) window._fullyWatchedShowIds = new Set();
+  const had = window._fullyWatchedShowIds.has(showId);
+  if (isFullyWatched) window._fullyWatchedShowIds.add(showId);
+  else window._fullyWatchedShowIds.delete(showId);
+  if (had !== isFullyWatched) {
+    try {
+      localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify([...window._fullyWatchedShowIds]));
+    } catch (e) {
+      // non-critical
+    }
+  }
+  refreshWatchBadge(showId, 'series');
+}
+
+function getOrCreateWatchHistoryList() {
+  const map = loadLocalCustomLists();
+  if (!map['watch-history']) {
+    map['watch-history'] = {
+      slug: 'watch-history',
+      localSlug: 'watch-history',
+      name: 'Watch History',
+      description: 'Automatically tracking your watched movies, shows, and episodes.',
+      items: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    saveLocalCustomListsMap(map);
+  } else if (!map['watch-history'].slug) {
+    // Backfills a slug on a Watch History list saved before this list
+    // started needing one -- without it, "Your Custom Lists" can't match
+    // its View/Edit/Delete/+Add buttons back to this entry.
+    map['watch-history'].slug = 'watch-history';
+    saveLocalCustomListsMap(map);
+  }
+  return map['watch-history'];
+}
+
+window.toggleWatchStatus = function(id, type, name, poster) {
+  const map = loadLocalCustomLists();
+  const list = getOrCreateWatchHistoryList();
+  
+  const existingIdx = list.items.findIndex(it => it.id === id);
+  if (existingIdx >= 0) {
+    list.items.splice(existingIdx, 1);
+    window._watchedItemIds.delete(id);
+  } else {
+    // If this is an episode, embed show/season/episode context so
+    // updateContinueWatching() can find "next unwatched" without extra API calls.
+    let item = { id, type, name, poster };
+    if (type === 'episode') {
+      const d = window._currentItemDetails;
+      if (d) {
+        item.showId = d.id;
+        item.showTitle = d.title;
+        item.showPoster = d.poster || '';
+        const cache = window._episodeDataCache || {};
+        const found = Object.values(cache).find(ep => String(ep.id) === String(id));
+        // Prefer the season number stamped onto the cached episode itself
+        // (set when that season's episode grid was loaded) over the single
+        // "last season expanded" global, since more than one season can be
+        // expanded at once and that global can point at the wrong one.
+        item.seasonNum = (found && found.season_number != null) ? found.season_number : (window._currentSeasonNum || null);
+        item.episodeNum = found ? found.episode_number : null;
+      }
+    }
+    list.items.unshift(item);
+    window._watchedItemIds.add(id);
+  }
+  
+  list.updatedAt = Date.now();
+  map['watch-history'] = list;
+  saveLocalCustomListsMap(map);
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
+  // Update Continue Watching for episode toggles
+  if (type === 'episode') {
+    const d = window._currentItemDetails;
+    if (d && d.id) updateContinueWatching(d.id).catch(() => {});
+  }
+  
+  // Re-render UI
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  
+  // Update button if we are in the details modal
+  const btn = document.getElementById('btnMarkWatched');
+  if (btn) {
+    if (window._watchedItemIds.has(id)) {
+      btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched';
+      btn.classList.remove('primary');
+      btn.classList.add('secondary');
+    } else {
+      btn.innerHTML = 'Mark as Watched';
+      btn.classList.remove('secondary');
+      btn.classList.add('primary');
+    }
+  }
+  
+  // To update posters dynamically, we need to refresh the grid if possible
+  // For now, let's just let the user see it next time, or we can toggle class on existing DOM elements
+  refreshWatchBadge(id, type);
+};
+
+// Batch-adds or batch-removes many items (episodes, mainly) to/from the
+// Watch History list in a single localStorage write.
+window.toggleBatchWatchStatus = function(items) {
+  if (!items || !items.length) return { added: 0, removed: 0, nowWatched: false };
+
+  const map = loadLocalCustomLists();
+  const list = getOrCreateWatchHistoryList();
+
+  const allWatched = items.every(it => window._watchedItemIds.has(String(it.id)));
+  let added = 0;
+  let removed = 0;
+
+  if (allWatched) {
+    const removeIds = new Set(items.map(it => String(it.id)));
+    list.items = list.items.filter(it => !removeIds.has(String(it.id)));
+    removeIds.forEach(id => {
+      if (window._watchedItemIds.has(id)) {
+        window._watchedItemIds.delete(id);
+        removed++;
+      }
+    });
+  } else {
+    const existingIds = new Set(list.items.map(it => String(it.id)));
+    items.forEach(it => {
+      const id = String(it.id);
+      if (!existingIds.has(id)) {
+        list.items.unshift({ id: id, type: it.type, name: it.name, poster: it.poster,
+          showId: it.showId || null, showTitle: it.showTitle || null, showPoster: it.showPoster || '',
+          seasonNum: it.seasonNum || null, episodeNum: it.episodeNum || null });
+        existingIds.add(id);
+        added++;
+      }
+      window._watchedItemIds.add(id);
+    });
+  }
+
+  list.updatedAt = Date.now();
+  map['watch-history'] = list;
+  saveLocalCustomListsMap(map);
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
+  updateContinueWatchingForBatch(items).catch(() => {});
+
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+
+  items.forEach(it => refreshWatchBadge(it.id, it.type));
+
+  return { added: added, removed: removed, nowWatched: !allWatched };
+};
+
+// --- Continue Watching --------------------------------------------------------
+
+function getOrCreateContinueWatchingList() {
+  const map = loadLocalCustomLists();
+  if (!map['continue-watching']) {
+    map['continue-watching'] = {
+      slug: 'continue-watching',
+      localSlug: 'continue-watching',
+      name: 'Continue Watching',
+      description: 'Next unwatched episode for each show you have started.',
+      type: 'series',
+      items: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    saveLocalCustomListsMap(map);
+  } else if (!map['continue-watching'].slug) {
+    map['continue-watching'].slug = 'continue-watching';
+    saveLocalCustomListsMap(map);
+  }
+  return map['continue-watching'];
+}
+
+async function updateContinueWatching(showId) {
+  if (!showId) return;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+
+  const map = loadLocalCustomLists();
+  const history = map['watch-history'];
+  const cwList = getOrCreateContinueWatchingList();
+
+  cwList.items = cwList.items.filter(it => it.showId !== showId);
+
+  const watchedEps = (history ? history.items : []).filter(it =>
+    it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
+  );
+
+  if (!watchedEps.length) {
+    map['continue-watching'] = cwList;
+    cwList.updatedAt = Date.now();
+    saveLocalCustomListsMap(map);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    setShowFullyWatched(showId, false);
+    return;
+  }
+
+  const latest = watchedEps.reduce((best, ep) => {
+    if (ep.seasonNum > best.seasonNum) return ep;
+    if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
+    return best;
+  }, watchedEps[0]);
+
+  // Whether every currently-aired episode has been watched -- stays null
+  // if a fetch below fails, so a network hiccup can't flip the badge one
+  // way or the other; it just leaves whatever was already known.
+  let showFullyWatched = null;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
+      '&seasonNum=' + latest.seasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
+    const data = await res.json();
+    if (!data.ok || !data.season || !data.season.episodes) throw new Error('no data');
+
+    const eps = data.season.episodes.filter(ep => isEpisodeAired(ep));
+    const nextInSeason = eps.find(ep => ep.episode_number > latest.episodeNum);
+
+    if (nextInSeason) {
+      cwList.items.unshift({
+        id: String(nextInSeason.id),
+        type: 'episode',
+        // Bare episode name -- matching Watch History's own item.name
+        // convention. formatWatchItemLabel already reconstructs "Show
+        // SxxExx" from showTitle/seasonNum/episodeNum for display, so a
+        // pre-formatted composite string here would show that same
+        // show/season/episode prefix twice (once from formatWatchItemLabel
+        // itself, once baked into this string as its subtitle).
+        name: nextInSeason.name,
+        poster: latest.showPoster || '',
+        showId: showId,
+        showTitle: latest.showTitle || '',
+        showPoster: latest.showPoster || '',
+        seasonNum: latest.seasonNum,
+        episodeNum: nextInSeason.episode_number
+      });
+      showFullyWatched = false;
+    } else {
+      const nextSeasonNum = latest.seasonNum + 1;
+      const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
+        '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
+      const data2 = await res2.json();
+      if (data2.ok && data2.season && data2.season.episodes) {
+        const nextEps = data2.season.episodes.filter(ep => isEpisodeAired(ep));
+        const firstNext = nextEps[0];
+        if (firstNext) {
+          cwList.items.unshift({
+            id: String(firstNext.id),
+            type: 'episode',
+            name: firstNext.name,
+            poster: latest.showPoster || '',
+            showId: showId,
+            showTitle: latest.showTitle || '',
+            showPoster: latest.showPoster || '',
+            seasonNum: nextSeasonNum,
+            episodeNum: firstNext.episode_number
+          });
+          showFullyWatched = false;
+        } else {
+          // TMDB knows about the next season but it hasn't started airing
+          // yet -- nothing unwatched-and-aired remains right now.
+          showFullyWatched = true;
+        }
+      } else {
+        // No further season at all -- this was the last one, and it's
+        // fully watched.
+        showFullyWatched = true;
+      }
+    }
+  } catch (e) {
+    // Silent failure -- showFullyWatched stays null, see comment above.
+  }
+
+  map['continue-watching'] = cwList;
+  cwList.updatedAt = Date.now();
+  saveLocalCustomListsMap(map);
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
+}
+
+async function updateContinueWatchingForBatch(items) {
+  const showIds = [...new Set(items.map(it => it.showId).filter(Boolean))];
+  for (const showId of showIds) {
+    await updateContinueWatching(showId).catch(() => {});
+  }
+}
+

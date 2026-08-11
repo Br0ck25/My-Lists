@@ -1,0 +1,437 @@
+// --- config UI (served at / and /:config/configure) -----------------------
+
+// --- Streaming Top 10 / Streaming quick-add lists ---------------------------
+//
+// TO ADD YOUR REAL LINKS: find the provider's row below and replace its
+// movieUrl / showUrl with the real mdblist.com list URL. Anything still set
+// to "CHANGE-ME" is a placeholder — swap it and redeploy.
+//
+// There are two tables: STREAMING_TOP10 (the "Streaming Top 10" panel /
+// charts) and STREAMING_ALL (the plain "Streaming" panel / full catalog).
+// They're independent, so the same provider can have different links in each.
+const STREAMING_TOP10 = [
+  {
+    name: "Apple TV+",
+    movieUrl: "https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today",
+    showUrl: "https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today",
+  },
+  {
+    name: "Disney+",
+    movieUrl: "https://mdblist.com/lists/andykai/disney-top-10-no-hulu",
+    showUrl: "https://mdblist.com/lists/andykai/disney-trending-no-hulu",
+  },
+  {
+    name: "HBO Max",
+    movieUrl: "https://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q",
+    showUrl: "https://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd",
+  },
+  {
+    name: "Hulu",
+    movieUrl: "https://mdblist.com/lists/hulupiv/hulu-top-10-movies",
+    showUrl: "https://mdblist.com/lists/hulupiv/hulu-top-10-shows",
+  },
+  {
+    name: "Netflix",
+    movieUrl: "https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies",
+    showUrl: "https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows",
+  },
+  {
+    name: "Paramount+",
+    movieUrl: "https://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today",
+    showUrl: "https://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today",
+  },
+  {
+    name: "Prime Video",
+    movieUrl: "https://mdblist.com/lists/diimaan/amazon-prime-top-10-movies",
+    showUrl: "https://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows",
+  },
+  {
+    name: "Peacock",
+    movieUrl: "https://mdblist.com/lists/diimaan/peacock-top-10-movies",
+    showUrl: "https://mdblist.com/lists/peacockpiv/peacock-top-10-shows",
+  },
+];
+
+const STREAMING_ALL = [
+  {
+    name: "Apple TV+",
+    movieUrl: "https://mdblist.com/lists/slimshizn/apple-tv-movies",
+    showUrl: "https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows",
+  },
+  {
+    name: "Disney+",
+    movieUrl: "https://mdblist.com/lists/garycrawfordgc/disney-movies",
+    showUrl: "https://mdblist.com/lists/garycrawfordgc/disney-shows",
+  },
+  {
+    name: "Discovery+",
+    movieUrl: "https://mdblist.com/lists/k0meta/discovery-movies",
+    showUrl: "https://mdblist.com/lists/marko8426/discovery-shows",
+  },
+  {
+    name: "HBO Max",
+    movieUrl: "https://mdblist.com/lists/snoak/latest-max-movies",
+    showUrl: "https://mdblist.com/lists/garycrawfordgc/hbo-shows",
+  },
+  {
+    name: "Hulu",
+    movieUrl: "https://mdblist.com/lists/garycrawfordgc/hulu-movies",
+    showUrl: "https://mdblist.com/lists/garycrawfordgc/hulu-shows",
+  },
+  {
+    name: "Netflix",
+    movieUrl: "https://mdblist.com/lists/garycrawfordgc/netflix-movies",
+    showUrl: "https://mdblist.com/lists/garycrawfordgc/netflix-shows",
+  },
+  {
+    name: "Netflix Kids",
+    movieUrl: "https://mdblist.com/lists/poodlehead/netflix-kids-movies",
+    showUrl: "https://mdblist.com/lists/poodlehead/netflix-kids-tv",
+  },
+  {
+    name: "Paramount+",
+    movieUrl: "https://mdblist.com/lists/snoak/latest-paramount-plus-movies",
+    showUrl: "https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows",
+  },
+  {
+    name: "Prime Video",
+    movieUrl: "https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies",
+    showUrl: "https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows",
+  },
+  {
+    name: "Peacock",
+    movieUrl: "https://mdblist.com/lists/tvgeniekodi/peacock-movies",
+    showUrl: "https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows",
+  },
+];
+
+// Builds the static HTML rows for a streaming quick-add panel from one of
+// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
+function getProviderIconBadge(name, group) {
+  const n = (name || '').toLowerCase();
+  if (group === 'Combined Charts' || n === 'popular' || n === 'trending' || n.includes('(all services)')) {
+    return '<span class="provider-chip-icon" style="background:var(--accent);color:#fff;font-weight:800;font-size:0.7rem;letter-spacing:-0.02em;">ML</span>';
+  }
+  if (group === 'MDBList Charts' || n.includes('mdblist') || n.includes('streaming charts') || n.includes('moviemeter') || n.includes('us daily')) {
+    return '<span class="provider-chip-icon" style="background:#007AFF;color:#fff;font-weight:700;">M</span>';
+  }
+  if (n.includes('netflix')) return '<span class="provider-chip-icon netflix">N</span>';
+  if (n.includes('prime') || n.includes('amazon')) return '<span class="provider-chip-icon prime">P</span>';
+  if (n.includes('apple')) return '<span class="provider-chip-icon apple">A</span>';
+  if (n.includes('disney')) return '<span class="provider-chip-icon disney">D+</span>';
+  if (n.includes('max') || n.includes('hbo')) return '<span class="provider-chip-icon max">M</span>';
+  if (n.includes('hulu')) return '<span class="provider-chip-icon hulu">h</span>';
+  if (n.includes('paramount')) return '<span class="provider-chip-icon paramount">P+</span>';
+  if (n.includes('peacock')) return '<span class="provider-chip-icon peacock">P</span>';
+  if (n.includes('discovery')) return '<span class="provider-chip-icon discovery">D</span>';
+  if (n.includes('tmdb')) return '<span class="provider-chip-icon" style="background:#01b4e4;color:#fff;">T</span>';
+  if (n.includes('trakt')) return '<span class="provider-chip-icon" style="background:#ed1c24;color:#fff;">T</span>';
+  if (n.includes('simkl')) return '<span class="provider-chip-icon" style="background:#000;border:1px solid #333;color:#fff;">S</span>';
+  if (group === 'Kids') return '<span class="provider-chip-icon" style="background:#FF9900;color:#fff;">K</span>';
+  return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
+}
+
+// Builds the static HTML rows for a streaming quick-add panel from one of
+// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
+// 10"). Computed server-side (rather than in the client <script>) so the
+// URLs never have to fight the nested template-literal escaping used
+// elsewhere in the builder page's inline script.
+function buildStreamingRowsHtml(list, labelSuffix, group) {
+  const rows = list.map((p) => {
+    const label = labelSuffix ? `${p.name} ${labelSuffix}` : p.name;
+    const badge = getProviderIconBadge(p.name, group);
+    let btns = '';
+    if (p.movieUrl && p.showUrl) {
+      btns = `
+        <button type="button" class="lc-btn secondary" onclick="addRow('${label}', '${p.movieUrl}', 'movie', true, '${group}')">+ Movies</button>
+        <button type="button" class="lc-btn secondary" onclick="addRow('${label}', '${p.showUrl}', 'series', true, '${group}')">+ Shows</button>`;
+    } else if (p.url && p.type) {
+      const btnText = p.type === 'movie' ? '+ Movies' : '+ Shows';
+      btns = `
+        <button type="button" class="lc-btn secondary" onclick="addRow('${p.name}', '${p.url}', '${p.type}', true, '${group}')">${btnText}</button>`;
+    }
+    return `
+    <div class="discover-chart-card">
+      <div class="discover-chart-header">
+        ${badge}
+        <div class="discover-chart-info">
+          <div class="discover-chart-title">${p.name}</div>
+          <div class="discover-chart-sub">${labelSuffix ? labelSuffix : (p.type === 'movie' ? 'Theatrical Box Office' : (p.type === 'series' ? 'Anime Trending' : 'Movies & Shows'))}</div>
+        </div>
+      </div>
+      <div class="discover-chart-btns">
+        ${btns}
+      </div>
+    </div>`;
+  }).join("");
+  return `<div class="quick-grid">${rows}</div>`;
+}
+
+function buildStreamingTop10Html() {
+  return buildStreamingRowsHtml(STREAMING_TOP10, "Top 10", "Streaming Top 10");
+}
+
+function buildStreamingHtml() {
+  return buildStreamingRowsHtml(STREAMING_ALL, "", "Streaming");
+}
+
+// --- mdblist Charts: mdblist's own real Official Lists ---------------------
+//
+// mdblist.com DOES run its own distinct official-charts system, separate
+// from community lists -- see https://mdblist.com/lists/official. These
+// live at a different URL shape (/lists/official/{movies|shows}/{slug},
+// one segment deeper than a normal user list at /lists/{user}/{slug}),
+// which mdblistJsonUrl above handles by preserving however many path
+// segments are given rather than assuming exactly two.
+// TO ADD OR CHANGE A LINK: edit the matching row below.
+const MDBLIST_OFFICIAL_CHARTS = [
+  {
+    name: "MDBList Popular",
+    movieUrl: "https://mdblist.com/lists/official/movies/popular",
+    showUrl: "https://mdblist.com/lists/official/shows/popular",
+  },
+  {
+    name: "US Daily Streaming Charts",
+    movieUrl: "https://mdblist.com/lists/official/movies/justwatch-streaming-charts",
+    showUrl: "https://mdblist.com/lists/official/shows/justwatch-streaming-charts",
+  },
+  {
+    name: "Streaming Charts (Extended)",
+    movieUrl: "https://mdblist.com/lists/official/movies/streaming-charts",
+    showUrl: "https://mdblist.com/lists/official/shows/streaming-charts",
+  },
+  {
+    name: "IMDb MovieMeter",
+    movieUrl: "https://mdblist.com/lists/official/movies/moviemeter",
+    showUrl: "https://mdblist.com/lists/official/shows/moviemeter",
+  },
+];
+
+function buildMdblistChartsHtml() {
+  return buildStreamingRowsHtml(MDBLIST_OFFICIAL_CHARTS, "", "MDBList Charts");
+}
+
+// --- TMDB / Trakt official charts (one-click quick-adds) -------------------
+//
+// Unlike the Trending/Popular/etc panels above (each backed by a real,
+// community-curated mdblist.com list), these use small sentinel "URLs"
+// (tmdb:chart:X / trakt:chart:X) that detectSource/fetchCatalog recognize
+// and route to fetchTmdbChart/fetchTraktChart -- hitting TMDB's and Trakt's
+// own official chart endpoints directly instead of a third party's list.
+// The same sentinel is reused for both the Movies and Shows button on a
+// row; entry.type (set by which button was clicked) picks the right side
+// of that chart's path map at fetch time.
+const TMDB_CHART_LISTS = [
+  { name: "TMDB Trending", movieUrl: "tmdb:chart:trending", showUrl: "tmdb:chart:trending" },
+  { name: "TMDB Popular", movieUrl: "tmdb:chart:popular", showUrl: "tmdb:chart:popular" },
+  { name: "TMDB Top Rated", movieUrl: "tmdb:chart:top_rated", showUrl: "tmdb:chart:top_rated" },
+  { name: "TMDB Now Playing", movieUrl: "tmdb:chart:now_playing", showUrl: "tmdb:chart:now_playing" },
+  { name: "TMDB Upcoming", movieUrl: "tmdb:chart:upcoming", showUrl: "tmdb:chart:upcoming" },
+];
+
+// All of Trakt's official charts below (see TRAKT_CHART_PATHS/
+// fetchTraktChart), pulled directly from Trakt's own API. These used to
+// point at community-curated mdblist.com lists mirroring Trakt's charts
+// instead, because Trakt's API had started rejecting this add-on's shared
+// Client ID with a 403 ("invalid or unapproved app") -- that Client ID has
+// since been replaced, so these go straight to Trakt's API again. If it
+// happens again, the Worker owner needs a fresh app from
+// https://trakt.tv/oauth/applications, or a person can supply their own
+// Client ID in the meantime (see the Trakt Client ID box above).
+const TRAKT_CHART_LISTS = [
+  { name: "Trakt Trending", movieUrl: "trakt:chart:trending", showUrl: "trakt:chart:trending" },
+  { name: "Trakt Popular", movieUrl: "trakt:chart:popular", showUrl: "trakt:chart:popular" },
+  { name: "Trakt Most Played", movieUrl: "trakt:chart:most_played", showUrl: "trakt:chart:most_played" },
+  { name: "Trakt Most Watched", movieUrl: "trakt:chart:most_watched", showUrl: "trakt:chart:most_watched" },
+  { name: "Trakt Most Collected", movieUrl: "trakt:chart:most_collected", showUrl: "trakt:chart:most_collected" },
+  { name: "Trakt Most Favorited", movieUrl: "trakt:chart:most_favorited", showUrl: "trakt:chart:most_favorited" },
+  {
+    name: "Trakt Most Anticipated",
+    movieUrl: "trakt:chart:most_anticipated",
+    showUrl: "trakt:chart:most_anticipated",
+  },
+];
+
+// Weekly box-office gross is inherently a theatrical-movies concept -- no
+// shows equivalent, so this is a single-button (movies-only) row like In
+// Theaters above, not a movies+shows pair.
+const TRAKT_BOXOFFICE_LIST = [
+  { name: "Trakt Box Office", url: "trakt:chart:box_office", type: "movie" },
+];
+
+const SIMKL_CHART_LISTS = [
+  { name: "Simkl Trending Today", movieUrl: "simkl:chart:today", showUrl: "simkl:chart:today" },
+  { name: "Simkl Trending This Week", movieUrl: "simkl:chart:week", showUrl: "simkl:chart:week" },
+  { name: "Simkl Trending This Month", movieUrl: "simkl:chart:month", showUrl: "simkl:chart:month" },
+];
+
+// Simkl tracks anime as its own category, mixing movies and series together
+// rather than splitting them the way its movies/tv charts do -- so this is
+// a single-button row (like Trakt Box Office above), added as Shows since
+// most of what shows up here is ongoing series rather than standalone films.
+const SIMKL_ANIME_LIST = [
+  { name: "Simkl Anime Trending", url: "simkl:chart:anime-week", type: "series" },
+];
+
+function buildTmdbChartsHtml() {
+  return buildStreamingRowsHtml(TMDB_CHART_LISTS, "", "TMDB Charts");
+}
+
+function buildTraktChartsHtml() {
+  return buildStreamingRowsHtml([...TRAKT_CHART_LISTS, ...TRAKT_BOXOFFICE_LIST], "", "Trakt Charts");
+}
+
+function buildSimklChartsHtml() {
+  return buildStreamingRowsHtml([...SIMKL_CHART_LISTS, ...SIMKL_ANIME_LIST], "", "Simkl Charts");
+}
+
+// --- Combined charts (blend multiple sources into one shelf) ---------------
+//
+// Reuses the exact same multi-source merge mechanism as the "+ Add another
+// source" button on a manually built row (see fetchMergedCatalog): a row's
+// entry.url can hold several newline-separated sources, fetched in
+// parallel and deduped by IMDB id (first-listed source wins on a tie).
+// These quick-adds just pre-fill that merge -- either the same chart from
+// each of MDBList/TMDB/Trakt, or every streaming service's Top 10/catalog
+// at once -- instead of making someone add each source by hand.
+const COMBINED_CHART_LISTS = [
+  {
+    name: "Popular",
+    movieUrls: [
+      "https://mdblist.com/lists/official/movies/popular",
+      "tmdb:chart:popular",
+      "trakt:chart:popular",
+    ],
+    showUrls: [
+      "https://mdblist.com/lists/official/shows/popular",
+      "tmdb:chart:popular",
+      "trakt:chart:popular",
+    ],
+  },
+  {
+    name: "Trending",
+    // MDBList's official lists don't include a "Trending" chart of their
+    // own (just Popular / JustWatch streaming charts / IMDb MovieMeter),
+    // so this blends TMDB + Trakt + all three Simkl trending windows
+    // (same simkl:chart:today/week/month URLs as SIMKL_CHART_LISTS above,
+    // each dispatches to movies or shows at fetch time based on the
+    // merged row's own type -- same one URL works for both movieUrls and
+    // showUrls here for that reason).
+    movieUrls: ["tmdb:chart:trending", "trakt:chart:trending", "simkl:chart:today", "simkl:chart:week", "simkl:chart:month"],
+    showUrls: ["tmdb:chart:trending", "trakt:chart:trending", "simkl:chart:today", "simkl:chart:week", "simkl:chart:month"],
+  },
+  {
+    // Every service's Top 10 (see STREAMING_TOP10 above) merged into one
+    // shelf -- computed from that same table rather than duplicated here,
+    // so adding/removing a service there keeps this in sync automatically.
+    name: "Streaming Top 10 (All Services)",
+    movieUrls: STREAMING_TOP10.map((s) => s.movieUrl),
+    showUrls: STREAMING_TOP10.map((s) => s.showUrl),
+  },
+  {
+    // Every service's full catalog (see STREAMING_ALL above) merged into
+    // one shelf -- same sync-from-the-table approach as above.
+    name: "Streaming (All Services)",
+    movieUrls: STREAMING_ALL.map((s) => s.movieUrl),
+    showUrls: STREAMING_ALL.map((s) => s.showUrl),
+  },
+];
+
+// Renders each source list as a single-quoted JS array literal (e.g.
+// ['a','b']) so it can sit inside an onclick="..." attribute -- which is
+// itself double-quoted -- without the two colliding.
+function jsStringArrayLiteral(arr) {
+  return "[" + arr.map((s) => "'" + String(s).replace(/'/g, "\\'") + "'").join(",") + "]";
+}
+
+function buildCombinedChartsHtml() {
+  const rows = COMBINED_CHART_LISTS.map((p) => {
+    const badge = getProviderIconBadge(p.name, 'Combined Charts');
+    return `
+    <div class="discover-chart-card">
+      <div class="discover-chart-header">
+        ${badge}
+        <div class="discover-chart-info">
+          <div class="discover-chart-title">${p.name}</div>
+          <div class="discover-chart-sub">Blended Multi-Source Catalog</div>
+        </div>
+      </div>
+      <div class="discover-chart-btns">
+        <button type="button" class="lc-btn secondary" onclick="addCombinedRow('${p.name}', ${jsStringArrayLiteral(p.movieUrls)}, 'movie', 'Combined Charts')">+ Movies</button>
+        <button type="button" class="lc-btn secondary" onclick="addCombinedRow('${p.name}', ${jsStringArrayLiteral(p.showUrls)}, 'series', 'Combined Charts')">+ Shows</button>
+      </div>
+    </div>`;
+  }).join("");
+  return `<div class="quick-grid">${rows}</div>`;
+}
+
+// Generates the client-side addAllCombinedCharts() function body straight
+// from COMBINED_CHART_LISTS -- the individual "+ Movies"/"+ Shows"
+// buttons on each row already get their (baked-in, hand-copy-free) source
+// arrays this same way via jsStringArrayLiteral (see buildCombinedChartsHtml
+// above). "Add all" used to be a second, hand-maintained copy of this same
+// data that referenced STREAMING_TOP10/STREAMING_ALL directly -- both of
+// which are server-side-only constants with no client-side equivalent, so
+// clicking "Add all" threw a ReferenceError partway through (right after
+// the hardcoded Popular/Trending/Streaming-Top-10-movies entries, which
+// happened to not need those variables) and silently never added Streaming
+// Top 10 Shows or Streaming (All Services) at all. Generating this
+// function from the same single source of truth as the per-row buttons
+// fixes that and makes a repeat impossible. Evaluated here at template-
+// render time (this is a genuine top-level function, not text sitting
+// inside the client-script template literal), so its ${...} use below is
+// just an ordinary interpolation producing static text -- like
+// combinedChartsHtml above, not a client-side call.
+function buildAddAllCombinedChartsJs() {
+  const calls = COMBINED_CHART_LISTS.map(function (p) {
+    const nameLit = "'" + String(p.name).replace(/'/g, "\\'") + "'";
+    return "  addCombinedRow(" + nameLit + ", " + jsStringArrayLiteral(p.movieUrls) + ", 'movie', 'Combined Charts');\n" +
+           "  addCombinedRow(" + nameLit + ", " + jsStringArrayLiteral(p.showUrls) + ", 'series', 'Combined Charts');";
+  }).join("\n");
+  return "function addAllCombinedCharts() {\n" + calls + "\n  saveState();\n}";
+}
+
+// Same fix, generalized to the other six quick-add panels: each panel's
+// individual "+ Movies"/"+ Shows"/"+ Add" buttons already build their
+// addRow() calls from a data table (via buildStreamingRowsHtml /
+// buildSimpleListRowsHtml above) -- Add All used to be a second,
+// hand-typed copy of each table instead of reading from it, and one of
+// them (Streaming Top 10) had silently drifted to drop the "Top 10"
+// suffix from every row's name (Netflix Top 10 -> just "Netflix") since
+// nothing kept the two copies in sync. Generating all of them from their
+// tables here, the same way Combined Charts' Add All does above, closes
+// that off for good instead of just patching the one that had drifted.
+function buildAddAllPairsCallsJs(list, group, labelSuffix) {
+  return list.map(function (p) {
+    const label = labelSuffix ? p.name + " " + labelSuffix : p.name;
+    return "  addRow(" + JSON.stringify(label) + ", " + JSON.stringify(p.movieUrl) + ", 'movie', true, " + JSON.stringify(group) + ");\n" +
+           "  addRow(" + JSON.stringify(label) + ", " + JSON.stringify(p.showUrl) + ", 'series', true, " + JSON.stringify(group) + ");";
+  }).join("\n");
+}
+function buildAddAllSimpleCallsJs(list, group) {
+  return list.map(function (l) {
+    return "  addRow(" + JSON.stringify(l.name) + ", " + JSON.stringify(l.url) + ", " + JSON.stringify(l.type) + ", true, " + JSON.stringify(group) + ");";
+  }).join("\n");
+}
+function buildAddAllFnJs(fnName, callsJs) {
+  return "function " + fnName + "() {\n" + callsJs + "\n  saveState();\n}";
+}
+
+// Discovery shelf for "I don't know what to watch" -- see fetchTmdbHiddenGems.
+const HIDDEN_GEMS_LIST = [
+  { name: "Hidden Gems", movieUrl: "tmdb:hidden-gems", showUrl: "tmdb:hidden-gems" },
+];
+
+function buildHiddenGemsHtml() {
+  return buildStreamingRowsHtml(HIDDEN_GEMS_LIST, "", "Hidden Gems");
+}
+
+const KIDS_LISTS = [
+  { name: "Rated G & Under", movieUrl: "tmdb:kids:g", showUrl: "tmdb:kids:g" },
+  { name: "Rated PG & Under", movieUrl: "tmdb:kids:pg", showUrl: "tmdb:kids:pg" },
+  { name: "Rated PG-13 & Under", movieUrl: "tmdb:kids:pg13", showUrl: "tmdb:kids:pg13" },
+];
+function buildKidsHtml() {
+  return buildStreamingRowsHtml(KIDS_LISTS, "", "Kids");
+}
+
