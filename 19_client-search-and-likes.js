@@ -260,7 +260,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
     const cardHtml = '<div class="list-card" data-list-type="' + l.type + '">' +
       '<div class="list-card-header">' +
-      '<div class="list-card-icon src-mylist" aria-label="My Lists">&#9733;</div>' +
+      '<div class="list-card-icon src-mylist" aria-label="My Lists">ML</div>' +
       '<div class="list-card-body">' +
       '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
       '<div class="list-card-meta">' +
@@ -627,7 +627,7 @@ function render5PosterListsFeed(container, lists) {
 
     return '<div class="list-card" data-list-type="' + escapeAttr(type) + '">' +
       '<div class="list-card-header">' +
-        '<div class="list-card-icon ' + (l.user ? 'src-mdblist' : 'src-mylist') + '">' + (l.user ? 'M' : '&#x2605;') + '</div>' +
+        '<div class="list-card-icon ' + (l.user ? 'src-mdblist' : 'src-mylist') + '">' + (l.user ? 'M' : 'ML') + '</div>' +
         '<div class="list-card-body">' +
           '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +

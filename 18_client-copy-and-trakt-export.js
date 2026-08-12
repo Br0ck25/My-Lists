@@ -447,6 +447,16 @@ function mapTraktExportEntry(it, category, historyMode) {
 // delisted) is skipped rather than guessed at with a Trakt-specific id
 // that nothing else in this app would recognize.
 function mapTraktExportEntryToWatchHistoryItem(it) {
+  // Trakt's history rows always carry a real watched_at (ISO 8601) --
+  // both the live API and the export JSON use the exact same shape, since
+  // the export is generated from this same API. Falls back to "now" only
+  // if it's ever missing or unparseable, so an import still lands
+  // somewhere sensible rather than being silently dropped.
+  const watchedAtMs = (() => {
+    if (!it.watched_at) return Date.now();
+    const t = new Date(it.watched_at).getTime();
+    return isNaN(t) ? Date.now() : t;
+  })();
   if (it.type === 'episode' && it.show && it.show.ids && it.show.ids.imdb && it.episode) {
     const epId = it.episode.ids && it.episode.ids.tmdb ? String(it.episode.ids.tmdb) : null;
     if (!epId) return null;
@@ -463,6 +473,7 @@ function mapTraktExportEntryToWatchHistoryItem(it) {
       showPoster: showPoster,
       seasonNum: it.episode.season,
       episodeNum: it.episode.number,
+      watchedAt: watchedAtMs,
     };
   }
   const obj = it.movie;
@@ -472,6 +483,7 @@ function mapTraktExportEntryToWatchHistoryItem(it) {
     type: 'movie',
     name: obj.title || '',
     poster: 'https://images.metahub.space/poster/medium/' + obj.ids.imdb + '/img',
+    watchedAt: watchedAtMs,
   };
 }
 

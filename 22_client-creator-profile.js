@@ -626,32 +626,53 @@ async function loadCreatorSync() {
     // of sync with that shape later.
     let touchedTracking = false;
     if (Array.isArray(synced.watchHistory)) {
-      const wh = getOrCreateWatchHistoryList();
-      wh.items = synced.watchHistory;
-      wh.updatedAt = Date.now();
-      const map = loadLocalCustomLists();
-      map['watch-history'] = wh;
-      saveLocalCustomListsMap(map);
-      window._watchedItemIds = new Set(synced.watchHistory.map((it) => String(it.id)));
+      const localWH = loadLocalCustomLists()['watch-history'];
+      const localWHItems = (localWH && localWH.items) || [];
+      if (localWHItems.length > synced.watchHistory.length) {
+        // Local has more than the server -- almost certainly an earlier
+        // sync of this data never actually completed (see
+        // pushTrackingSync's own comment on why Watch History was split
+        // out of the main sync blob in the first place: a large
+        // watchHistory could silently fail to save under the old combined
+        // payload). Don't adopt the server's smaller copy over data
+        // that's visibly sitting in this browser right now -- push local
+        // up instead so the server catches up.
+        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+      } else {
+        const wh = getOrCreateWatchHistoryList();
+        wh.items = synced.watchHistory;
+        wh.updatedAt = Date.now();
+        const map = loadLocalCustomLists();
+        map['watch-history'] = wh;
+        saveLocalCustomListsMap(map);
+        window._watchedItemIds = new Set(synced.watchHistory.map((it) => String(it.id)));
+      }
       touchedTracking = true;
     }
     if (Array.isArray(synced.continueWatching)) {
-      const cw = getOrCreateContinueWatchingList();
+      const localCW = loadLocalCustomLists()['continue-watching'];
+      const localCWItems = (localCW && localCW.items) || [];
       const dedupedIncoming = dedupeContinueWatchingItems(synced.continueWatching);
-      cw.items = dedupedIncoming;
-      cw.updatedAt = Date.now();
-      const map = loadLocalCustomLists();
-      map['continue-watching'] = cw;
-      saveLocalCustomListsMap(map);
-      window._inProgressShowIds = new Set(dedupedIncoming.map((it) => String(it.showId)).filter(Boolean));
-      touchedTracking = true;
-      // The server's own copy may still carry whatever duplicate this just
-      // cleaned up (if it was ever written by an older, race-prone version
-      // of this code) -- push the corrected version back so it doesn't
-      // just reappear on the next sync-down.
-      if (dedupedIncoming.length !== synced.continueWatching.length && typeof scheduleTrackingSync === 'function') {
-        scheduleTrackingSync();
+      if (localCWItems.length > dedupedIncoming.length) {
+        // Same self-heal as Watch History just above.
+        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+      } else {
+        const cw = getOrCreateContinueWatchingList();
+        cw.items = dedupedIncoming;
+        cw.updatedAt = Date.now();
+        const map = loadLocalCustomLists();
+        map['continue-watching'] = cw;
+        saveLocalCustomListsMap(map);
+        window._inProgressShowIds = new Set(dedupedIncoming.map((it) => String(it.showId)).filter(Boolean));
+        // The server's own copy may still carry whatever duplicate this
+        // just cleaned up (if it was ever written by an older, race-prone
+        // version of this code) -- push the corrected version back so it
+        // doesn't just reappear on the next sync-down.
+        if (dedupedIncoming.length !== synced.continueWatching.length && typeof scheduleTrackingSync === 'function') {
+          scheduleTrackingSync();
+        }
       }
+      touchedTracking = true;
     }
     // Both feed the server-side Continue Watching cron and, once adopted
     // here, the exact same badge/dismissal logic Watch History and

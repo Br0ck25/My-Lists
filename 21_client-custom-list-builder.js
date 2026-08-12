@@ -784,7 +784,7 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   } else {
     // If this is an episode, embed show/season/episode context so
     // updateContinueWatching() can find "next unwatched" without extra API calls.
-    let item = { id, type, name, poster };
+    let item = { id, type, name, poster, watchedAt: Date.now() };
     if (type === 'episode') {
       const d = window._currentItemDetails;
       if (d) {
@@ -866,7 +866,7 @@ window.toggleBatchWatchStatus = function(items) {
       if (!existingIds.has(id)) {
         list.items.unshift({ id: id, type: it.type, name: it.name, poster: it.poster,
           showId: it.showId || null, showTitle: it.showTitle || null, showPoster: it.showPoster || '',
-          seasonNum: it.seasonNum || null, episodeNum: it.episodeNum || null });
+          seasonNum: it.seasonNum || null, episodeNum: it.episodeNum || null, watchedAt: Date.now() });
         existingIds.add(id);
         added++;
       }
@@ -909,6 +909,7 @@ window.addItemsToWatchHistory = async function(items) {
       id: id, type: it.type, name: it.name, poster: it.poster,
       showId: it.showId || null, showTitle: it.showTitle || null, showPoster: it.showPoster || '',
       seasonNum: it.seasonNum != null ? it.seasonNum : null, episodeNum: it.episodeNum != null ? it.episodeNum : null,
+      watchedAt: it.watchedAt || Date.now(),
     });
     existingIds.add(id);
     window._watchedItemIds.add(id);
