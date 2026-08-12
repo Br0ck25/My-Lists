@@ -77,7 +77,7 @@ function renderMyMdblistLists(lists) {
     const isSingleType = (l.mediatype === 'movie' || l.mediatype === 'show');
     const type = l.mediatype === 'show' ? 'series' : 'movie';
     const typeLabel = l.mediatype === 'show' ? 'Shows' : (l.mediatype === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'unknown') + '">Copy</button>';
     let addBtns = '';
     if (isSingleType) {
@@ -167,7 +167,7 @@ function renderMyTraktLists(lists) {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'unknown') + '">Copy</button>';
     let addBtns = '';
     if (isSingleType) {
@@ -350,10 +350,16 @@ function renderMyPrivateTraktLists(lists) {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = isHistory
       ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="shows">Copy (Shows)</button>' +
-        '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>'
+        '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>' +
+        // Marks every watched movie/episode straight into this add-on's
+        // own Watch History (and Continue Watching, for shows) -- unlike
+        // the Copy buttons above, which just duplicate the data into a
+        // browsable Custom List, this actually feeds the watched-tracking
+        // system itself. See markTraktHistoryAllWatched.
+        '<button type="button" class="lc-btn secondary" onclick="markTraktHistoryAllWatched(this)">Mark all as Watched</button>'
       : '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>';
 
     let addBtns = '';

@@ -310,27 +310,73 @@ async function populateSearchResultPosters() {
   const slots = [...document.querySelectorAll('.poster-preview-slot')];
   let idx = 0;
   const CONCURRENCY = 5;
+  // Fetches one /api/preview call for a single declared type -- split out
+  // so a mixed-content list (see fetchPreviewForSlot below) can fire two
+  // of these in parallel instead of duplicating the request logic.
+  async function fetchPreviewOnce(listUrl, type) {
+    const payload = { url: listUrl, type: type, sample: 12 };
+    const mkInput = document.getElementById('mdblistKeyInput');
+    if (mkInput && mkInput.value) payload.mdblistKey = mkInput.value.trim();
+    const tkInput = document.getElementById('tmdbKeyInput');
+    if (tkInput && tkInput.value) payload.tmdbKey = tkInput.value.trim();
+    const trkInput = document.getElementById('traktKeyInput');
+    if (trkInput && trkInput.value) payload.traktKey = trkInput.value.trim();
+    // trakt:watchlist and trakt:history (the "Watchlist"/"Watch History"
+    // cards under Your Trakt Lists) are both OAuth-only sources -- see
+    // fetchTraktWatchlist/fetchTraktHistory, which throw immediately
+    // without an accessToken, traktKey alone isn't enough for either.
+    if (typeof traktAccessToken !== 'undefined' && traktAccessToken) payload.traktAccessToken = traktAccessToken;
+    const res = await fetch(ORIGIN + '/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      cache: 'no-store',
+    });
+    return res.json();
+  }
+  // A list card that mixes movies and shows (MDBList/Trakt lists don't
+  // have to be one or the other) gets marked data-type="mixed" by its
+  // render function rather than being forced to either type -- /api/preview
+  // itself only ever answers for one declared type per call (movie or
+  // series, see its own coercion), so a single request here would only
+  // ever surface that list's movies and leave a TV-heavy or TV-only list
+  // showing no posters at all. Two parallel requests, merged, covers both.
+  async function fetchPreviewForSlot(listUrl, type) {
+    if (type !== 'mixed') {
+      return fetchPreviewOnce(listUrl, type);
+    }
+    const [movieResult, seriesResult] = await Promise.all([
+      fetchPreviewOnce(listUrl, 'movie').catch(() => null),
+      fetchPreviewOnce(listUrl, 'series').catch(() => null),
+    ]);
+    const movieOk = movieResult && movieResult.ok;
+    const seriesOk = seriesResult && seriesResult.ok;
+    if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
+    const movieSample = movieOk ? (movieResult.sample || []) : [];
+    const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
+    // Interleaved rather than movies-then-shows, so a list that's mostly
+    // one type still shows a representative mix in the first few tiles
+    // rather than, say, nine movie posters and zero show posters just
+    // because movies happened to be fetched first.
+    const merged = [];
+    const maxLen = Math.max(movieSample.length, seriesSample.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (movieSample[i]) merged.push(movieSample[i]);
+      if (seriesSample[i]) merged.push(seriesSample[i]);
+    }
+    return {
+      ok: true,
+      sample: merged,
+      count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
+    };
+  }
   async function worker() {
     while (idx < slots.length) {
       const slot = slots[idx++];
       const listUrl = slot.dataset.url;
       const type = slot.dataset.type || 'movie';
       try {
-        const payload = { url: listUrl, type: type, sample: 12 };
-        const mkInput = document.getElementById('mdblistKeyInput');
-        if (mkInput && mkInput.value) payload.mdblistKey = mkInput.value.trim();
-        const tkInput = document.getElementById('tmdbKeyInput');
-        if (tkInput && tkInput.value) payload.tmdbKey = tkInput.value.trim();
-        const trkInput = document.getElementById('traktKeyInput');
-        if (trkInput && trkInput.value) payload.traktKey = trkInput.value.trim();
-
-        const res = await fetch(ORIGIN + '/api/preview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          cache: 'no-store',
-        });
-        const data = await res.json();
+        const data = await fetchPreviewForSlot(listUrl, type);
         if (data.ok && data.sample && data.sample.length) {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
@@ -349,7 +395,7 @@ async function populateSearchResultPosters() {
               }
 
               inner += '<div class="list-card-mini-poster-tile">' +
-                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
+                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
                   '<div class="poster-add-overlay">+</div>' +
                   overlays +
@@ -687,7 +733,7 @@ function openEpisodeDetails(epNum) {
       '<div style="flex: 1; min-width: 300px;">' +
         '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">E' + ep.episode_number + ' - ' + escapeHtml(ep.name) + '</h1>' +
           '<div style="margin-bottom:20px;">' +
-            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatus(' + ep.episode_number + ')">' +
+            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(\\'' + ep.id + '\\', \\'episode\\', \\'' + (ep.name ? escapeAttr(ep.name.replace(/'/g, "\\'")) : '') + '\\', \\'' + still + '\\')">' +
               (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
             '</button>' +
           '</div>' +
@@ -699,38 +745,8 @@ function openEpisodeDetails(epNum) {
   showModal(innerHtml, 'modal-card-wide');
 }
 
-// An episode counts as "aired" once it has a real air_date that isn't in
-// the future -- used to keep unaired/TBA episodes out of both the batch
-// "mark watched" actions and Continue Watching's idea of what's next.
-function isEpisodeAired(ep) {
-  if (!ep || !ep.air_date) return false;
-  const airDate = new Date(ep.air_date);
-  if (isNaN(airDate.getTime())) return false;
-  return airDate.getTime() <= Date.now();
-}
-
-// Toggles a single episode's watched status via the generic toggleWatchStatus
-// (same one movies use) -- that function already embeds show/season/episode
-// context and refreshes Continue Watching for episode toggles, so this is
-// just a clean, backslash-free way to call it from the onclick attribute.
-function toggleEpisodeWatchStatus(epNum) {
-  const ep = window._episodeDataCache && window._episodeDataCache[epNum];
-  if (!ep) return;
-  window.toggleWatchStatus(String(ep.id), 'episode', ep.name || '', ep.still_path || '');
-}
-
-
 async function openItemDetailsModal(id, type) {
   if (!id || id.startsWith('channel_')) return;
-  
-  // A poster clicked from inside an open showModal()-based overlay (e.g.
-  // the "View all" list preview) needs that overlay closed here --
-  // switchTab below only changes which full-page tab-panel is active
-  // underneath it, and does nothing to the overlay itself, which is a
-  // separate, always-on-top element appended straight to <body>. Without
-  // this, the destination page loads correctly in the background but stays
-  // hidden behind the still-open modal.
-  if (typeof closeModal === 'function') closeModal();
   
   window._previousTab = document.querySelector('.tab-btn.active')?.dataset.tab || 'discover';
   switchTab('item-details');
@@ -747,21 +763,6 @@ async function openItemDetailsModal(id, type) {
     if (!data.ok || !data.details) throw new Error(data.error || 'Failed to load details');
     
     const d = data.details;
-    window._currentItemDetails = d;
-    
-    // There's no server-side cron pushing updates into a browser's own
-    // localStorage, so a newly-aired episode can't add itself to Continue
-    // Watching in the background -- the closest thing to "automatic" is
-    // refreshing it here, so simply reopening a show you're partway
-    // through picks up anything that's aired since you last looked,
-    // without needing to watch/unwatch something first to trigger it.
-    // Only bothers if this show has any Watch History to begin with.
-    if (type === 'series' && typeof updateContinueWatching === 'function') {
-      const historyMap = loadLocalCustomLists();
-      const history = historyMap['watch-history'];
-      const hasWatchedEpisode = history && (history.items || []).some(it => it.type === 'episode' && it.showId === d.id);
-      if (hasWatchedEpisode) updateContinueWatching(d.id).catch(() => {});
-    }
     
     // Formatting helpers
     let dateStr = d.releaseYear || '';
@@ -810,13 +811,12 @@ async function openItemDetailsModal(id, type) {
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : '';
         seasonsHtml += 
           '<div style="background:var(--surface-light); border:1px solid var(--border); border-radius:8px; overflow:hidden;">' +
-            '<div style="display:flex; gap:16px; padding:16px; cursor:pointer; align-items:center;" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+            '<div style="display:flex; gap:16px; padding:16px; cursor:pointer;" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
               (sPoster ? '<img src="' + escapeAttr(sPoster) + '" style="width:80px; border-radius:4px; flex-shrink:0; box-shadow:0 2px 8px rgba(0,0,0,0.3);">' : '<div style="width:80px; height:120px; background:#333; border-radius:4px; flex-shrink:0;"></div>') +
-              '<div style="display:flex; flex-direction:column; justify-content:center; flex:1;">' +
+              '<div style="display:flex; flex-direction:column; justify-content:center;">' +
                 '<h4 style="margin:0 0 4px; font-size:1.2rem;">' + escapeHtml(season.name) + '</h4>' +
                 '<div style="color:var(--muted); font-size:0.9rem;">' + season.episode_count + ' episodes</div>' +
               '</div>' +
-              '<button type="button" class="lc-btn primary season-watch-btn" onclick="event.stopPropagation(); markSeasonWatched(this, &quot;' + escapeAttr(d.id) + '&quot;, ' + season.season_number + ', &quot;' + escapeAttr(season.name) + '&quot;)">Mark Season Watched</button>' +
             '</div>' +
             '<div class="season-episodes-container" style="display:none; padding:16px; border-top:1px solid var(--border); background:rgba(0,0,0,0.2);">' +
               '<div class="episodes-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:16px;"></div>' +
@@ -837,13 +837,6 @@ async function openItemDetailsModal(id, type) {
           '<p style="font-size:1.05rem; line-height:1.6; color:var(--text); margin-bottom: 24px;">' + escapeHtml(d.overview || 'No overview available.') + '</p>' +
           '<div style="display:flex; gap:16px; flex-wrap:wrap;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModal(&quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;)">+ Add to list</button>' +
-            (type === 'movie' ?
-              '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(&quot;' + escapeAttr(d.id) + '&quot;, &quot;movie&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">' +
-                (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
-              '</button>'
-            : type === 'series' ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn primary" onclick="markShowWatched(this, &quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">Mark Whole Show Watched</button>'
-            : '') +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -856,7 +849,6 @@ async function openItemDetailsModal(id, type) {
 }
 
 async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
-  window._currentSeasonNum = seasonNum;
   const container = headerEl.nextElementSibling;
   const grid = container.querySelector('.episodes-grid');
   
@@ -881,7 +873,6 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     let epsHtml = '';
     if (!window._episodeDataCache) window._episodeDataCache = {};
     data.season.episodes.forEach(ep => {
-      ep.season_number = seasonNum;
       window._episodeDataCache[ep.episode_number] = ep;
       const still = ep.still_path ? escapeAttr(ep.still_path) : '';
       epsHtml += 
@@ -899,162 +890,14 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
   }
 }
 
-// Fetches every aired episode of a single season and batch-marks them
-// watched (or unwatched if all already watched) via toggleBatchWatchStatus.
-async function markSeasonWatched(btnEl, imdbId, seasonNum, seasonName) {
-  if (!btnEl || btnEl.disabled) return;
-  const origLabel = btnEl.textContent;
-  btnEl.disabled = true;
-  btnEl.textContent = 'Fetching episodes...';
-
-  const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
-
-  try {
-    const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(imdbId) + '&seasonNum=' + seasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
-    const data = await res.json();
-    if (!data.ok || !data.season || !data.season.episodes || !data.season.episodes.length) {
-      throw new Error(data.error || 'No episodes found for this season.');
-    }
-
-    const d = window._currentItemDetails;
-    const episodes = data.season.episodes
-      .filter(ep => isEpisodeAired(ep))
-      .map(ep => ({
-        id: String(ep.id),
-        type: 'episode',
-        name: ep.name,
-        poster: ep.still_path || '',
-        showId: d ? d.id : null,
-        showTitle: d ? d.title : null,
-        showPoster: d ? (d.poster || '') : '',
-        seasonNum: seasonNum,
-        episodeNum: ep.episode_number
-      }));
-
-    if (!episodes.length) {
-      btnEl.disabled = false;
-      btnEl.textContent = origLabel;
-      alert('No aired episodes found for this season yet.');
-      return;
-    }
-
-    const result = window.toggleBatchWatchStatus(episodes);
-
-    btnEl.disabled = false;
-    if (result.nowWatched) {
-      btnEl.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-      btnEl.classList.remove('primary');
-      btnEl.classList.add('secondary');
-    } else {
-      btnEl.textContent = 'Mark Season Watched';
-      btnEl.classList.remove('secondary');
-      btnEl.classList.add('primary');
-    }
-  } catch (err) {
-    btnEl.disabled = false;
-    btnEl.textContent = origLabel;
-    alert('Could not load episodes for ' + (seasonName || 'this season') + ': ' + err.message);
-  }
-}
-
-// Loops over every season in the open show, fetching in batches of 4,
-// marks all aired episodes watched (or unwatched if all already marked).
-async function markShowWatched(btnEl, imdbId, title, poster) {
-  if (!btnEl || btnEl.disabled) return;
-
-  const d = window._currentItemDetails;
-  const seasonsData = (d && d.seasonsData) ? d.seasonsData.filter(s => s.season_number > 0) : [];
-  if (!seasonsData.length) {
-    alert('No seasons found for this show.');
-    return;
-  }
-
-  const origLabel = btnEl.textContent;
-  btnEl.disabled = true;
-  btnEl.textContent = 'Fetching episodes...';
-
-  const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
-
-  const allEpisodes = [];
-  let hadError = false;
-  const concurrency = 4;
-
-  for (let i = 0; i < seasonsData.length; i += concurrency) {
-    const batch = seasonsData.slice(i, i + concurrency);
-    btnEl.textContent = 'Fetching episodes... (' + Math.min(i + concurrency, seasonsData.length) + '/' + seasonsData.length + ')';
-    const results = await Promise.all(batch.map(season =>
-      fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(imdbId) + '&seasonNum=' + season.season_number + '&tmdbKey=' + encodeURIComponent(tmdbKey))
-        .then(r => r.json())
-        .catch(() => ({ ok: false }))
-    ));
-    results.forEach((seasonRes, ri) => {
-      if (seasonRes.ok && seasonRes.season && seasonRes.season.episodes) {
-        const sNum = batch[ri] ? batch[ri].season_number : null;
-        seasonRes.season.episodes
-          .filter(ep => isEpisodeAired(ep))
-          .forEach(ep => {
-            allEpisodes.push({
-              id: String(ep.id),
-              type: 'episode',
-              name: ep.name,
-              poster: ep.still_path || '',
-              showId: imdbId,
-              showTitle: title,
-              showPoster: poster || '',
-              seasonNum: sNum,
-              episodeNum: ep.episode_number
-            });
-          });
-      } else {
-        hadError = true;
-      }
-    });
-  }
-
-  if (!allEpisodes.length) {
-    btnEl.disabled = false;
-    btnEl.textContent = origLabel;
-    alert('Could not load any aired episodes for this show.');
-    return;
-  }
-
-  const result = window.toggleBatchWatchStatus(allEpisodes);
-
-  btnEl.disabled = false;
-  if (result.nowWatched) {
-    btnEl.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
-    btnEl.classList.remove('primary');
-    btnEl.classList.add('secondary');
-  } else {
-    btnEl.textContent = 'Mark Whole Show Watched';
-    btnEl.classList.remove('secondary');
-    btnEl.classList.add('primary');
-  }
-
-  if (hadError) alert('Some seasons could not be loaded, so this show may only be partially marked.');
-}
-
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
   
-  // Every Custom List the person could add this item to, from three
-  // places: (1) lists already added to the live catalog as a #lists row
-  // (editable in place via that row's own <input class="url">), (2)
-  // local-only Custom Lists that were saved (e.g. via Import from a link,
-  // or Copy to Custom List) but never added as a row, and (3) this
-  // account's server-synced Creator lists, same story. (2) and (3) used to
-  // be invisible here entirely -- only lists someone had explicitly
-  // "+ Add"-ed to their catalog ever showed up, so anything imported and
-  // left sitting under Your Custom Lists had no way to receive new items
-  // from this picker. seenSlugs dedupes a list that's in both a row and
-  // the local/creator source it came from, preferring the row (it's the
-  // live, currently-configured copy).
+  // Scrape available Custom Lists from the configured lists DOM
+  // Only show lists that are properly saved (have a localSlug or creatorSlug)
+  // Unsaved drafts (user dismissed visibility modal) are excluded
   const customLists = [];
-  const seenSlugs = new Set();
-
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
     if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
@@ -1065,38 +908,14 @@ function openSelectListModal(id, type, title, poster) {
         // Filter by item type: if list has a type (movie or series), it must match the item being added
         if (payload.type && payload.type !== type) return;
         const nameInput = row.querySelector('.name');
-        const slug = payload.localSlug || payload.creatorSlug;
-        if (slug) seenSlugs.add((payload.localSlug ? 'local:' : 'creator:') + slug);
         customLists.push({
           name: nameInput ? nameInput.value : (payload.listName || 'Unnamed List'),
-          source: 'row',
-          row: row,
-          items: payload.items || []
+          url: urlInput.value,
+          row: row
         });
       } catch(e) {}
     }
   });
-
-  if (typeof loadLocalCustomLists === 'function') {
-    const localMap = loadLocalCustomLists();
-    Object.keys(localMap).forEach(slug => {
-      // Watch History / Continue Watching are auto-managed, not something
-      // to manually file items into from this picker.
-      if (slug === 'watch-history' || slug === 'continue-watching') return;
-      if (seenSlugs.has('local:' + slug)) return;
-      const l = localMap[slug];
-      if (l.type && l.type !== type) return;
-      customLists.push({ name: l.name, source: 'local', slug: slug, type: l.type, visibility: l.visibility, items: l.items || [] });
-    });
-  }
-
-  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
-    lastCreatorListsData.forEach(l => {
-      if (seenSlugs.has('creator:' + l.slug)) return;
-      if (l.type && l.type !== type) return;
-      customLists.push({ name: l.name, source: 'creator', slug: l.slug, type: l.type, visibility: l.visibility, items: l.items || [] });
-    });
-  }
   
   let html = '';
   if (customLists.length === 0) {
@@ -1110,17 +929,20 @@ function openSelectListModal(id, type, title, poster) {
           document.getElementById('selectListModal').style.display = 'none';
           document.body.style.overflow = '';
           switchTab('lists');
-          // Create List has no pill of its own -- see the matching fix in
-          // editCreatorList/editLocalCustomList for why this doesn't try
-          // to grab one to highlight.
-          if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+          const btn = document.querySelector('#listsSubnavBar button:nth-child(5)');
+          if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list', btn);
         };
       }
     }, 0);
   } else {
     document.getElementById('addSelectedListsBtn').style.display = 'block';
     customLists.forEach((list, idx) => {
-      const isChecked = (list.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
+      let isChecked = false;
+      try {
+        const payloadStr = list.url.slice('customlist:v1:'.length);
+        const payload = JSON.parse(payloadStr);
+        isChecked = payload.items.some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
+      } catch(e) {}
       
       html += 
         '<label style="display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom: 1px solid rgba(0,0,0,0.05); cursor:pointer; color:#001f3f; font-size:1rem;">' +
@@ -1171,13 +993,15 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   let anyAdded = false;
   let anyRemoved = false;
   
-  for (const cb of checkboxes) {
+  checkboxes.forEach(cb => {
     const listIdx = parseInt(cb.dataset.idx, 10);
     const isChecked = cb.checked;
-    const result = await toggleItemInSelectedList(id, finalImdbId, type, listIdx, isChecked, title, poster);
-    if (result === 'added') anyAdded = true;
-    else if (result === 'removed') anyRemoved = true;
-  }
+    const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
+    if (changed) {
+      if (isChecked) anyAdded = true;
+      else anyRemoved = true;
+    }
+  });
   
   document.getElementById('selectListModal').style.display = 'none';
   document.body.style.overflow = '';
@@ -1188,46 +1012,6 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   if (anyAdded) showAddedToast('Added ' + title + ' to lists.');
   else if (anyRemoved && typeof showAddedToast === 'function') showAddedToast('Removed ' + title + ' from lists.');
 });
-
-// Adds or removes one item from one list picked in the Add-to-List modal.
-// A list can be one of three things (see openSelectListModal): a live
-// catalog row (mutated in place via its own <input class="url">, same as
-// always), or a local/creator Custom List that was never added as a row --
-// those don't have a DOM row to write to at all, so this builds the same
-// {localSlug|creatorSlug, type, items, visibility} shape
-// syncCustomListPayload already knows how to persist (to localStorage or
-// the server respectively) and hands off to that, rather than a second,
-// parallel save path.
-async function toggleItemInSelectedList(originalId, imdbId, type, listIdx, shouldBeInList, title, poster) {
-  if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return 'failed';
-  const list = window._selectListModalTempLists[listIdx];
-
-  if (list.source === 'row') {
-    const changed = toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeInList, title, poster);
-    if (!changed) return 'unchanged';
-    return shouldBeInList ? 'added' : 'removed';
-  }
-
-  const matches = (it) => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId);
-  const items = (list.items || []).slice();
-  const idx = items.findIndex(matches);
-  const exists = idx !== -1;
-  if (shouldBeInList === exists) return 'unchanged';
-  if (shouldBeInList) items.push({ imdbId, type, title, poster: poster || undefined });
-  else items.splice(idx, 1);
-
-  const payload = {
-    type: list.type || type,
-    items: items,
-    visibility: list.visibility || 'public',
-  };
-  if (list.source === 'creator') payload.creatorSlug = list.slug;
-  else payload.localSlug = list.slug;
-
-  list.items = items; // keep this in sync in case the same list gets toggled again before the modal closes
-  await syncCustomListPayload(payload, list.name);
-  return shouldBeInList ? 'added' : 'removed';
-}
 
 function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeInList, title, poster) {
   if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return false;

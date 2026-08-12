@@ -1044,6 +1044,54 @@ self.addEventListener('fetch', e => {
       }
     }
 
+    // /api/trakt-history-raw  (POST)  { accessToken, type: 'movies'|'episodes', page, limit }
+    // -> { ok, items: [...raw Trakt history rows...], hasMore }
+    // Deliberately returns Trakt's raw, unmapped rows rather than going
+    // through mapTraktHistoryItems (used everywhere else this add-on reads
+    // history) -- that mapping folds each row into a display-ready catalog
+    // meta and throws away the real per-episode TMDB id and season/episode
+    // numbers along the way, which is exactly what the client's "Mark all
+    // as Watched" needs to build proper Watch History/Continue Watching
+    // entries. This is the same raw shape a Trakt Export JSON file already
+    // uses (Trakt's export is generated from this same API), so the client
+    // reuses mapTraktExportEntryToWatchHistoryItem unchanged for both.
+    if (path === "/api/trakt-history-raw" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const accessToken = String(body.accessToken || "").trim();
+      if (!accessToken) return json({ ok: false, error: "Not connected to Trakt." }, 400);
+      const itemKind = body.type === "episodes" ? "episodes" : "movies";
+      const page = Math.max(1, parseInt(body.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(body.limit, 10) || 100));
+      try {
+        const res = await fetch(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": TRAKT_CLIENT_ID,
+            Authorization: `Bearer ${accessToken}`,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          // Never cache an authenticated, per-person response -- see the
+          // same caching note on fetchTrakt above.
+          cf: { cacheTtl: 0, cacheEverything: false },
+        });
+        if (res.status === 401) {
+          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
+        }
+        if (!res.ok) return json({ ok: false, error: `Trakt history request failed (HTTP ${res.status}).` });
+        const items = await res.json();
+        const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
+        return json({ ok: true, items: Array.isArray(items) ? items : [], hasMore: page < totalPages });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) });
+      }
+    }
+
     // /api/mdblist-my-lists?apikey=...
     // -> powers the "Your MDBList Lists" section in the builder: every list
     // the API key's own account has created (not just the built-in

@@ -79,7 +79,8 @@
       let matched = "no";
 
       try {
-        const syncKey = `creatorsync:${auth.username}`;
+        await ensureTrackingMigrated(env, auth.username);
+        const syncKey = `creatorsynctracking:${auth.username}`;
         const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
         if (raw) {
@@ -90,7 +91,7 @@
           }
         }
         if (!blob || typeof blob !== "object") {
-          blob = { config: [], presets: {}, collapsedPanels: {}, likedLists: [], watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {} };
+          blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
         }
         blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
         blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
@@ -489,6 +490,18 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
 
+      // Same one-time forward migration, this time for tracking data
+      // (watchHistory/continueWatching/fullyWatchedShowIds/
+      // dismissedContinueWatching/trackPlayback) -- see
+      // ensureTrackingMigrated's own comment. Critical to run here
+      // specifically: this endpoint is the most frequent write to
+      // creatorsync:{username} of any of them (any routine autosave), and
+      // the blob built below no longer includes tracking fields at all --
+      // without migrating first, the very next autosave after this
+      // shipped would silently erase anyone's tracking data before
+      // save-tracking ever got a chance to run for them.
+      await ensureTrackingMigrated(env, auth.username);
+
       // One-time forward migration: presets used to live embedded in this
       // same blob, but as of this endpoint no longer accepts them here at
       // all (see /api/creator/sync/save-presets below) -- an updated client
@@ -522,36 +535,13 @@
         config: Array.isArray(body.config) ? body.config : [],
         collapsedPanels: body.collapsedPanels && typeof body.collapsedPanels === "object" ? body.collapsedPanels : {},
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
-        // Watch History / Continue Watching -- unlike a named Custom List
-        // (see /api/creator/lists/save above), these are per-browser
-        // tracking data with mixed movie+episode items, not a single
-        // publishable movie-or-series list, so they ride along in this
-        // same private per-account blob rather than the creatorlist:*
-        // namespace. Always private by nature; there's no visibility
-        // toggle for either of these anywhere in the client.
-        watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
-        continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
-        // Shows fully caught up as of the last check, and shows dismissed
-        // from Continue Watching (each mapped to the latest-watched
-        // episode at the moment of dismissal) -- both ride along here for
-        // the same reason watchHistory/continueWatching do above, and both
-        // are read by the Continue Watching cron (checkForNewEpisodes,
-        // further down this file): fullyWatchedShowIds tells it which
-        // shows are even worth checking TMDB for (no point re-checking a
-        // show with a known next episode already waiting to be watched),
-        // and dismissedContinueWatching stops it from re-adding a card
-        // someone explicitly removed, the same way updateContinueWatching
-        // already respects a dismissal client-side.
-        fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
-        dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
-        trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
-      // Workers KV hard-caps a value at 25MB. Presets/Channels no longer
-      // live in this blob at all (see above), so this is now just a
-      // defensive backstop rather than the main thing it used to guard
-      // against.
+      // Workers KV hard-caps a value at 25MB. Presets/Channels and tracking
+      // data (watchHistory/continueWatching/etc) no longer live in this
+      // blob at all (see above), so this is now just a defensive backstop
+      // rather than the main thing it used to guard against.
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "This account's saved data is too large to store (over the 25MB limit)." });
       }
@@ -564,6 +554,53 @@
         // server-side rather than leaving "check your connection" as the
         // only explanation, which is misleading when the connection was
         // never the problem.
+        return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
+    // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,
+    // watchHistory, continueWatching, fullyWatchedShowIds,
+    // dismissedContinueWatching, trackPlayback } -> { ok }
+    // The dedicated, lightweight sibling of /api/creator/sync/save for
+    // Watch History / Continue Watching tracking data -- split out for the
+    // same reason presets were (see save-presets' own comment just below):
+    // watchHistory in particular can grow into the thousands of items for
+    // an active account (e.g. a bulk "mark as watched" import), and it used
+    // to ride along in the same blob as config/collapsedPanels/likedLists,
+    // making EVERY routine autosave -- and every single Auto-Track Playback
+    // ping (handleSubtitlesTrack, further down this file), which fires on
+    // every video play -- re-send and re-process the whole thing. Also read
+    // by the Continue Watching cron (checkForNewEpisodes) and
+    // fetchAutoTrackedCatalog (what Stremio/wako actually see for the
+    // Watch History/Continue Watching catalog rows) -- if this never
+    // successfully saves (e.g. it silently failed under the old combined
+    // blob's size), those rows show "No items found" even though the
+    // browser's own local copy looks complete.
+    if (path === "/api/creator/sync/save-tracking" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const blob = {
+        watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
+        continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
+        fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
+        dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
+        trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(blob);
+      if (serialized.length > 24 * 1024 * 1024) {
+        return json({ ok: false, error: "Your Watch History is too large to store (over the 25MB limit)." });
+      }
+      try {
+        await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
+      } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
       return json({ ok: true });
@@ -629,6 +666,7 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      await ensureTrackingMigrated(env, auth.username);
       const raw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
       let data = null;
       if (raw) {
@@ -658,14 +696,34 @@
             // data at all" and having loadCreatorSync skip straight to
             // pushCreatorSync (which would try to push this browser's
             // state up and never even look at what's already saved).
-            data = {
-              config: [], collapsedPanels: {}, likedLists: [], watchHistory: [],
-              continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {},
-              trackPlayback: false, updatedAt: Date.now(),
-            };
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
           }
           data.presets = presetsBlob.presets || {};
           data.presetsB64 = presetsBlob.presetsB64 || null;
+        }
+      }
+      // Tracking data (Watch History/Continue Watching/etc) also lives in
+      // its own key now -- see save-tracking's own comment above for why.
+      // Same merge pattern as presets: the client's loadCreatorSync still
+      // just reads data.watchHistory/data.continueWatching/etc exactly
+      // like before, unaware this is a third KV read.
+      const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+      if (trackingRaw) {
+        let trackingBlob = null;
+        try {
+          trackingBlob = JSON.parse(trackingRaw);
+        } catch {
+          trackingBlob = null;
+        }
+        if (trackingBlob) {
+          if (!data) {
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+          }
+          data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
+          data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
+          data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
+          data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
+          data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
         }
       }
       return json({ ok: true, data });
@@ -874,7 +932,7 @@
       const itemsHtml = listData.items
         .map(
           (it) =>
-            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08);">` +
+            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.08);">` +
             (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:40px;height:60px;object-fit:cover;border-radius:4px;flex:none;">` : "") +
             `<span>${escapeHtmlServer(it.title || "Untitled")}${it.year ? " (" + escapeHtmlServer(it.year) + ")" : ""}</span></div>`
         )
@@ -884,16 +942,17 @@
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtmlServer(listData.name)} \u2014 My Lists</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
-  a { color:#4d9fff; }
-  .card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:20px; margin-top:16px; }
-  code { background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:6px; word-break:break-all; }
-  button { background:rgba(255,255,255,0.08); color:#f1f2f5; border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px 16px; font-size:0.95rem; cursor:pointer; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
+  a { color:#007AFF; }
+  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:20px; margin-top:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  code { background:#F2F2F7; padding:2px 6px; border-radius:6px; word-break:break-all; }
+  button { background:#007AFF; color:#fff; border:none; border-radius:10px; padding:10px 16px; font-size:0.95rem; font-weight:600; cursor:pointer; }
+  button:hover { background:#0062CC; }
   button:disabled { opacity:0.6; cursor:default; }
 </style></head>
 <body>
   <h1 style="margin-bottom:4px;">${escapeHtmlServer(listData.name)}</h1>
-  <p style="color:#8d9099; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
+  <p style="color:#8E8E93; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
   <button type="button" id="likeListBtn" style="margin-top:10px;">\u2661 Like</button>
   <div class="card">
     <p><strong>Add this to your own My Lists Addon:</strong> paste this URL in as a list source --</p>

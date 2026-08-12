@@ -188,6 +188,90 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   alert(msg);
 }
 
+// Walks the connected Trakt account's full watch history (movies, then
+// episodes) via /api/trakt-history-raw and adds every item to Watch
+// History (and, for shows, Continue Watching) -- the live-account
+// equivalent of the Trakt Export importer's "mark as watched" checkbox,
+// for someone who's connected Trakt directly rather than uploading an
+// export file. Reuses mapTraktExportEntryToWatchHistoryItem unchanged: the
+// raw row shape is identical either way, since Trakt's own export is
+// generated from this same API.
+async function markTraktHistoryAllWatched(btn) {
+  if (!traktAccessToken) { alert('Connect Trakt first.'); return; }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) btn.disabled = true;
+
+  // Bounded the same way the server-side Continue Watching cron bounds
+  // itself (see checkForNewEpisodes, 07_source-fetchers-tmdb-simkl.js) --
+  // a Trakt power user's history can run into the tens of thousands of
+  // rows, and this is a synchronous, in-browser operation the person is
+  // actively waiting on, not a background job. 100 pages at 100/page is
+  // 10,000 events per kind (movies, episodes), comfortably past what
+  // almost anyone has logged; if it's genuinely hit, what's fetched so far
+  // still gets marked rather than discarded, and the result message says so.
+  const MAX_PAGES = 100;
+  const whItems = [];
+  const seenIds = new Set();
+  let hitPageCap = false;
+
+  for (const kind of ['movies', 'episodes']) {
+    let page = 1;
+    let hasMore = true;
+    while (hasMore && page <= MAX_PAGES) {
+      if (btn) btn.textContent = 'Fetching ' + kind + ' (page ' + page + ')\u2026';
+      let data;
+      try {
+        const res = await fetch(ORIGIN + '/api/trakt-history-raw', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accessToken: traktAccessToken, type: kind, page: page, limit: 100 }),
+        });
+        data = await res.json();
+      } catch (e) {
+        alert('Network error fetching Trakt history.');
+        if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+        return;
+      }
+      if (!data.ok) {
+        alert(data.error || 'Could not fetch Trakt history.');
+        if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+        return;
+      }
+      (data.items || []).forEach((it) => {
+        const mapped = mapTraktExportEntryToWatchHistoryItem(it);
+        // A rewatch logs a fresh row every time -- Watch History only
+        // needs one entry per item, same dedupe as the Export importer.
+        if (!mapped || seenIds.has(mapped.id)) return;
+        seenIds.add(mapped.id);
+        whItems.push(mapped);
+      });
+      hasMore = !!data.hasMore;
+      page++;
+    }
+    if (page > MAX_PAGES && hasMore) hitPageCap = true;
+  }
+
+  if (!whItems.length) {
+    alert('No watch history found on your Trakt account.');
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+    return;
+  }
+
+  if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
+  const whResult = await addItemsToWatchHistory(whItems);
+  if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
+  if (whResult.cwTotal) {
+    msg += ' Continue Watching checked for ' + whResult.cwSucceeded + ' of ' + whResult.cwTotal + ' show' + (whResult.cwTotal === 1 ? '' : 's') +
+      (whResult.cwSucceeded < whResult.cwTotal ? ' \u2014 the rest hit a network hiccup or TMDB rate limit; reopening one of those shows will retry it, or run this again.' : '.');
+  }
+  if (hitPageCap) {
+    msg += ' (Your history is large enough that this only covered the ' + (MAX_PAGES * 100).toLocaleString() + ' most recent watches per type \u2014 run it again later to pick up more.)';
+  }
+  alert(msg);
+}
+
 // --- Import from Trakt export --------------------------------------------
 //
 // Trakt VIP's own export (Settings > Data > Export on trakt.tv) is a .zip

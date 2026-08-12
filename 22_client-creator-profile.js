@@ -456,6 +456,12 @@ function scheduleCreatorSyncSave() {
   if (!activeCreator) return;
   if (creatorSyncSaveTimer) clearTimeout(creatorSyncSaveTimer);
   creatorSyncSaveTimer = setTimeout(pushCreatorSync, 1200);
+  // Tracking data (Watch History/Continue Watching/etc) is split into its
+  // own sync call now -- see pushTrackingSync's own comment -- so anything
+  // that already calls this general scheduler also gets tracking synced
+  // in lockstep, rather than auditing every individual call site for
+  // whether it happens to touch tracking data too.
+  scheduleTrackingSync();
 }
 
 // Debounced sibling of scheduleCreatorSyncSave, just for presets -- call
@@ -471,12 +477,28 @@ function schedulePresetsSync() {
   presetsSyncTimer = setTimeout(() => { pushPresetsDirectly(loadPresetsMap()); }, 1200);
 }
 
+// Debounced sibling of scheduleCreatorSyncSave, just for Watch History/
+// Continue Watching tracking data -- split out for the same reason
+// presets were: watchHistory in particular can grow into the thousands of
+// items (e.g. a bulk "mark as watched" import), and bundling it into every
+// routine autosave meant every single config change re-sent and
+// re-processed the whole thing, which risked the same free-plan CPU
+// budget problem presets did -- and, worse, meant a large watchHistory
+// that failed to save left Stremio/wako's Watch History/Continue Watching
+// catalog rows showing "No items found" even though the browser's own
+// local copy looked complete.
+let trackingSyncTimer = null;
+function scheduleTrackingSync() {
+  if (!activeCreator) return;
+  if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
+  trackingSyncTimer = setTimeout(pushTrackingSync, 1200);
+}
+
 async function pushCreatorSync() {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
-    const localMap = loadLocalCustomLists();
     await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -484,18 +506,37 @@ async function pushCreatorSync() {
         creatorName: activeCreator.creatorName,
         creatorKey: creatorKey,
         config: collectEntries(),
-        // Presets deliberately NOT included here -- they're the one piece
-        // of this state that can genuinely grow large (a TV Channel's
-        // "url" is its entire episode list) while everything else in this
-        // payload changes far more often but stays small. Bundling both
-        // together meant every single autosave re-sent and re-processed
-        // the full, ever-growing presets payload, which could tip a
-        // request over Cloudflare's free-plan 10ms CPU budget. See
-        // pushPresetsDirectly/schedulePresetsSync and the dedicated
-        // /api/creator/sync/save-presets endpoint, which now handle
-        // presets on their own, only when presets actually change.
+        // Presets and tracking data (watchHistory/continueWatching/etc)
+        // deliberately NOT included here -- both are pieces of this state
+        // that can genuinely grow large, while everything else in this
+        // payload changes far more often but stays small. See
+        // pushPresetsDirectly/schedulePresetsSync and
+        // pushTrackingSync/scheduleTrackingSync, which now handle those on
+        // their own, only when they actually change.
         collapsedPanels: collectCollapsedPanelsState(),
         likedLists: [...getLikedListsSet()],
+      }),
+    });
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
+// Pushes Watch History/Continue Watching tracking data straight to the
+// account's dedicated tracking record (see /api/creator/sync/save-
+// tracking) -- the ONLY path this data travels to the server through now.
+async function pushTrackingSync() {
+  if (!activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  try {
+    const localMap = loadLocalCustomLists();
+    await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
         // Always the full current list, same overwrite-the-blob approach
         // as everything else synced here -- see loadCreatorSync's comment
         // for why signing in replaces local state wholesale rather than
@@ -504,8 +545,8 @@ async function pushCreatorSync() {
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
         // Feeds the server-side Continue Watching cron (checkForNewEpisodes
-        // in 26_api-creator-and-admin-routes.js) -- see the blob comment
-        // there for why both of these need to travel alongside Watch
+        // in 07_source-fetchers-tmdb-simkl.js) -- see save-tracking's own
+        // comment for why both of these need to travel alongside Watch
         // History/Continue Watching rather than being derived server-side.
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
@@ -539,6 +580,7 @@ async function loadCreatorSync() {
       pushCreatorSync();
       const localPresets = loadPresetsMap();
       if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
+      pushTrackingSync();
       return;
     }
     const synced = data.data;
@@ -595,13 +637,21 @@ async function loadCreatorSync() {
     }
     if (Array.isArray(synced.continueWatching)) {
       const cw = getOrCreateContinueWatchingList();
-      cw.items = synced.continueWatching;
+      const dedupedIncoming = dedupeContinueWatchingItems(synced.continueWatching);
+      cw.items = dedupedIncoming;
       cw.updatedAt = Date.now();
       const map = loadLocalCustomLists();
       map['continue-watching'] = cw;
       saveLocalCustomListsMap(map);
-      window._inProgressShowIds = new Set(synced.continueWatching.map((it) => String(it.showId)).filter(Boolean));
+      window._inProgressShowIds = new Set(dedupedIncoming.map((it) => String(it.showId)).filter(Boolean));
       touchedTracking = true;
+      // The server's own copy may still carry whatever duplicate this just
+      // cleaned up (if it was ever written by an older, race-prone version
+      // of this code) -- push the corrected version back so it doesn't
+      // just reappear on the next sync-down.
+      if (dedupedIncoming.length !== synced.continueWatching.length && typeof scheduleTrackingSync === 'function') {
+        scheduleTrackingSync();
+      }
     }
     // Both feed the server-side Continue Watching cron and, once adopted
     // here, the exact same badge/dismissal logic Watch History and

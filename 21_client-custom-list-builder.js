@@ -576,6 +576,13 @@ window._fullyWatchedShowIds = new Set();
 // (initWatchHistory on load, updateContinueWatching as things change), so
 // the two sets are always mutually exclusive for a given showId.
 window._inProgressShowIds = new Set();
+// Shows explicitly dismissed from Continue Watching, keyed by showId, each
+// mapped to the exact watched snapshot (season/episode) the dismissal was
+// made at -- see dismissContinueWatchingShow below for why a snapshot
+// rather than a plain boolean. Restored from localStorage in
+// initWatchHistory below for a local-only browser; a signed-in account
+// gets it from the server instead (see loadCreatorSync).
+window._dismissedContinueWatching = {};
 
 // Finds the position:relative box a watched-checkmark badge should be
 // inserted into for a given .clickable-poster/.clickable-episode element.
@@ -636,6 +643,15 @@ function initWatchHistory() {
   } catch (e) {
     // non-critical -- badges just won't show for shows until the next
     // time updateContinueWatching recomputes them
+  }
+  try {
+    const dismissedRaw = localStorage.getItem('myListAddon:dismissedContinueWatching');
+    if (dismissedRaw) {
+      const parsed = JSON.parse(dismissedRaw);
+      if (parsed && typeof parsed === 'object') window._dismissedContinueWatching = parsed;
+    }
+  } catch (e) {
+    // non-critical -- a dismissed show might just reappear once
   }
 
   const observer = new MutationObserver(mutations => {
@@ -916,6 +932,24 @@ window.addItemsToWatchHistory = async function(items) {
 
 // --- Continue Watching --------------------------------------------------------
 
+// Drops any but the first entry per showId (items are always unshifted,
+// so first = most recently added) -- shared by getOrCreateContinueWatchingList
+// (self-healing local data left over from a fixed race condition, see its
+// own comment) and loadCreatorSync's sync-down (server data can carry the
+// same kind of duplicate forward if it was ever written by an older,
+// race-prone version of this code, or by the cron/Auto-Track ping in a
+// narrow window against a concurrent client save).
+function dedupeContinueWatchingItems(items) {
+  if (!items || !items.length) return items || [];
+  const seenShowIds = new Set();
+  return items.filter((it) => {
+    if (!it.showId) return true;
+    if (seenShowIds.has(it.showId)) return false;
+    seenShowIds.add(it.showId);
+    return true;
+  });
+}
+
 function getOrCreateContinueWatchingList() {
   const map = loadLocalCustomLists();
   if (!map['continue-watching']) {
@@ -934,7 +968,40 @@ function getOrCreateContinueWatchingList() {
     map['continue-watching'].slug = 'continue-watching';
     saveLocalCustomListsMap(map);
   }
-  return map['continue-watching'];
+  const cwList = map['continue-watching'];
+  // Self-heals data left over from a race condition in a previous version
+  // of updateContinueWatching, where concurrent commits for different
+  // shows could clobber each other and leave a stale duplicate entry for
+  // the same show sitting alongside a fresh one (see
+  // updateContinueWatching's own comment -- the write itself is fixed now,
+  // this just cleans up whatever it already left behind). Only saves if
+  // anything actually needed dropping.
+  if (cwList.items && cwList.items.length) {
+    const deduped = dedupeContinueWatchingItems(cwList.items);
+    if (deduped.length !== cwList.items.length) {
+      cwList.items = deduped;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    }
+  }
+  return cwList;
+}
+
+// Serializes the read-modify-write of localStorage's continue-watching
+// list (and the fullyWatchedShowIds/inProgressShowIds it triggers) across
+// concurrent updateContinueWatching calls -- see that function's own
+// comment for why. Network fetches still run in parallel across workers;
+// only the actual commit (load list, mutate, save list) queues up one at
+// a time, so it can never race with another commit in flight.
+let cwCommitLock = Promise.resolve();
+function withCwCommitLock(fn) {
+  const run = cwCommitLock.then(fn, fn);
+  // Swallow errors here so one failed commit doesn't permanently wedge the
+  // queue for every commit after it -- the actual error still propagates
+  // to whoever's awaiting "run" itself.
+  cwCommitLock = run.then(() => {}, () => {});
+  return run;
 }
 
 async function updateContinueWatching(showId) {
@@ -943,25 +1010,28 @@ async function updateContinueWatching(showId) {
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
 
-  const map = loadLocalCustomLists();
-  const history = map['watch-history'];
-  const cwList = getOrCreateContinueWatchingList();
-
-  cwList.items = cwList.items.filter(it => it.showId !== showId);
-
-  const watchedEps = (history ? history.items : []).filter(it =>
+  // Reading Watch History here (outside the commit lock) is safe: nothing
+  // concurrently writes to Watch History during a Continue Watching batch
+  // -- see addItemsToWatchHistory, which always finishes adding everything
+  // to Watch History before it ever calls updateContinueWatchingForBatch.
+  const watchedEps = (loadLocalCustomLists()['watch-history']?.items || []).filter(it =>
     it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
   );
 
   if (!watchedEps.length) {
-    map['continue-watching'] = cwList;
-    cwList.updatedAt = Date.now();
-    saveLocalCustomListsMap(map);
-    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-    setShowFullyWatched(showId, false);
-    setShowInProgress(showId, false);
-    return { ok: true };
+    return withCwCommitLock(() => {
+      const map = loadLocalCustomLists();
+      const cwList = getOrCreateContinueWatchingList();
+      cwList.items = cwList.items.filter(it => it.showId !== showId);
+      map['continue-watching'] = cwList;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+      setShowFullyWatched(showId, false);
+      setShowInProgress(showId, false);
+      return { ok: true };
+    });
   }
 
   const latest = watchedEps.reduce((best, ep) => {
@@ -979,6 +1049,10 @@ async function updateContinueWatching(showId) {
   // watched" apart from "the fetch failed", since both leave no Continue
   // Watching entry behind but only one of them should be retried.
   let showFullyWatched = null;
+  // Computed here (network phase, runs concurrently across workers) and
+  // only written to the list inside the locked commit phase below -- see
+  // withCwCommitLock's own comment for why the write itself can't race.
+  let newEntry = null;
 
   try {
     const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
@@ -990,7 +1064,7 @@ async function updateContinueWatching(showId) {
     const nextInSeason = eps.find(ep => ep.episode_number > latest.episodeNum);
 
     if (nextInSeason) {
-      cwList.items.unshift({
+      newEntry = {
         id: String(nextInSeason.id),
         type: 'episode',
         // Bare episode name -- matching Watch History's own item.name
@@ -1006,9 +1080,8 @@ async function updateContinueWatching(showId) {
         showPoster: latest.showPoster || '',
         seasonNum: latest.seasonNum,
         episodeNum: nextInSeason.episode_number
-      });
+      };
       showFullyWatched = false;
-      setShowInProgress(showId, true);
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
       const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
@@ -1018,7 +1091,7 @@ async function updateContinueWatching(showId) {
         const nextEps = data2.season.episodes.filter(ep => isEpisodeAired(ep));
         const firstNext = nextEps[0];
         if (firstNext) {
-          cwList.items.unshift({
+          newEntry = {
             id: String(firstNext.id),
             type: 'episode',
             name: firstNext.name,
@@ -1028,9 +1101,8 @@ async function updateContinueWatching(showId) {
             showPoster: latest.showPoster || '',
             seasonNum: nextSeasonNum,
             episodeNum: firstNext.episode_number
-          });
+          };
           showFullyWatched = false;
-          setShowInProgress(showId, true);
         } else {
           // TMDB knows about the next season but it hasn't started airing
           // yet -- nothing unwatched-and-aired remains right now.
@@ -1046,13 +1118,23 @@ async function updateContinueWatching(showId) {
     // Silent failure -- showFullyWatched stays null, see comment above.
   }
 
-  map['continue-watching'] = cwList;
-  cwList.updatedAt = Date.now();
-  saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-  if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
-  return { ok: showFullyWatched !== null };
+  return withCwCommitLock(() => {
+    const map = loadLocalCustomLists();
+    const cwList = getOrCreateContinueWatchingList();
+    // Removes any existing entry for this show -- including a stale one
+    // that might otherwise never get cleaned up -- before (maybe) adding
+    // the fresh one computed above.
+    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    if (newEntry) cwList.items.unshift(newEntry);
+    map['continue-watching'] = cwList;
+    cwList.updatedAt = Date.now();
+    saveLocalCustomListsMap(map);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
+    if (showFullyWatched === false) setShowInProgress(showId, true);
+    return { ok: showFullyWatched !== null };
+  });
 }
 
 // Runs updateContinueWatching for every distinct show in a batch, a few at
@@ -1090,5 +1172,59 @@ async function updateContinueWatchingForBatch(items) {
   const workers = Array(Math.min(CONCURRENCY, showIds.length)).fill(0).map(worker);
   await Promise.all(workers);
   return { succeeded: succeeded, total: showIds.length };
+}
+
+// Removes a show from Continue Watching without marking anything as
+// watched -- the person just doesn't want to be reminded about it right
+// now. Records exactly which watched snapshot (season/episode) this
+// dismissal applies to rather than a plain "dismissed forever" flag --
+// see checkForNewEpisodes and handleSubtitlesTrack's own "stillDismissed"
+// comments (both further down this file) for the matching server-side
+// check -- so watching a genuinely newer episode later naturally
+// supersedes the dismissal and lets the show reappear on its own.
+// Referenced by the "x" button on every Continue Watching card
+// (buildLocalListCardHtml/livePreviewPosterHtml's removeBtn).
+function dismissContinueWatchingShow(showId) {
+  if (!showId) return;
+  if (!window._dismissedContinueWatching) window._dismissedContinueWatching = {};
+
+  const history = loadLocalCustomLists()['watch-history'];
+  const watchedEps = (history ? history.items : []).filter(it =>
+    it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
+  );
+  if (watchedEps.length) {
+    const latest = watchedEps.reduce((best, ep) => {
+      if (ep.seasonNum > best.seasonNum) return ep;
+      if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
+      return best;
+    }, watchedEps[0]);
+    window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+  }
+  try {
+    localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(window._dismissedContinueWatching));
+  } catch (e) {
+    // non-critical -- the dismissal still applies for this session either way
+  }
+
+  // Goes through the same commit lock updateContinueWatching's own writes
+  // do, so this can't race with an in-flight commit for the same (or any
+  // other) show -- see withCwCommitLock's own comment.
+  withCwCommitLock(() => {
+    const map = loadLocalCustomLists();
+    const cwList = getOrCreateContinueWatchingList();
+    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    map['continue-watching'] = cwList;
+    cwList.updatedAt = Date.now();
+    saveLocalCustomListsMap(map);
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  });
+
+  // Dismissed is functionally "caught up" from this add-on's own
+  // perspective (same bucket checkForNewEpisodes tracks it in
+  // server-side) -- flips the badge from amber back to the blue
+  // checkmark, and the cron will still periodically check TMDB in case a
+  // real new episode later supersedes this dismissal.
+  setShowFullyWatched(showId, true);
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
 }
 

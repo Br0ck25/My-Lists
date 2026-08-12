@@ -507,14 +507,15 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
   let tmdbId = null;
   let type = null;
 
-  // Shows/movies opened from title search (Search Movies & TV Shows) carry
-  // a "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
-  // lookup below entirely for those and use the TMDB id directly. The type
-  // isn't encoded in the id itself, but the client always sends one
-  // alongside it (see /api/details above), so fallbackType covers it.
   if (imdbId.startsWith('tmdb:')) {
-    tmdbId = imdbId.split(':')[1];
-    type = fallbackType === 'series' ? 'tv' : fallbackType;
+      tmdbId = imdbId.split(':')[1];
+      type = fallbackType === 'series' ? 'tv' : fallbackType;
+    // Since we don't know the type from the ID alone, we might need a hint.
+    // Wait, we don't have the type parameter in fetchTmdbItemDetails!
+    // If it's tmdb:, we might have to probe both or accept it might fail if we guess wrong.
+    // However, the caller usually passes type implicitly? No, type is not passed!
+    // Actually, openItemDetailsModal passes id and type to the frontend, but the backend /api/details only receives imdbId!
+    // We should modify /api/details to also accept type!
   }
 
   if (!tmdbId) {
@@ -638,7 +639,7 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey) {
 // code from the Worker's own perspective; they're embedded template-literal
 // text that only becomes real JS once served to and run by a browser. Used
 // by findNextAiredEpisodeForShow below, for the Continue Watching cron
-// (see checkForNewEpisodes in 26_api-creator-and-admin-routes.js).
+// (checkForNewEpisodes, right below).
 function isEpisodeAiredServer(ep) {
   if (!ep || !ep.air_date) return false;
   const airDate = new Date(ep.air_date);
@@ -718,7 +719,8 @@ async function checkForNewEpisodes(env) {
   for (const key of listResult.keys) {
     if (showChecksUsed >= SHOW_CHECK_BUDGET) break;
     const username = key.name.slice('creator:'.length);
-    const syncRaw = await env.CONFIGS.get(`creatorsync:${username}`);
+    await ensureTrackingMigrated(env, username);
+    const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
     if (!syncRaw) continue;
 
     let blob;
@@ -785,7 +787,11 @@ async function checkForNewEpisodes(env) {
         id: String(next.episode.id),
         type: 'episode',
         name: next.episode.name,
-        poster: next.episode.still_path || latest.showPoster || '',
+        // Continue Watching cards show the series poster, not the episode
+        // still -- matches updateContinueWatching's own client-side
+        // behavior (21_client-custom-list-builder.js) and keeps the shelf
+        // visually consistent with every other poster-based row.
+        poster: latest.showPoster || '',
         showId: showId,
         showTitle: latest.showTitle || '',
         showPoster: latest.showPoster || '',
@@ -801,10 +807,11 @@ async function checkForNewEpisodes(env) {
       blob.continueWatching = continueWatching;
       blob.fullyWatchedShowIds = stillFullyWatched;
       blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsync:${username}`, JSON.stringify(blob));
+      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
     }
   }
 }
+
 
 
 

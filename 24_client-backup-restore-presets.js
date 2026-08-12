@@ -552,6 +552,23 @@ if (serverEntries.length) {
     traktAccessToken = saved.keys.traktAccessToken;
   }
 }
+// Trakt's OAuth connection is local, per-browser state -- unlike the
+// catalog entries above (which come from whatever install link opened
+// this page), it was never embedded in that link and only ever lives in
+// this browser's own localStorage (see disconnectTrakt/
+// pickUpTraktTokenFromUrl, both of which call saveState()). Restored here
+// regardless of which branch above ran, and only as a fallback (never
+// overwriting a token the server already provided for this exact
+// install), so a page that opened via an existing install link -- the
+// common case, since it's what "refresh" usually means here -- doesn't
+// lose an already-connected Trakt session just because it also happened
+// to have rows preloaded from that link.
+if (!traktAccessToken) {
+  const savedForTrakt = loadSavedState();
+  if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
+    traktAccessToken = savedForTrakt.keys.traktAccessToken;
+  }
+}
 suppressSave = false;
 renumber();
 renderPresetsList();

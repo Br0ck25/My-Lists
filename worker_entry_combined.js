@@ -1970,12 +1970,13 @@ function renderAdminLoginPage(errorMsg) {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:380px; margin:80px auto; padding:24px 16px; }
-  .card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:24px; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:380px; margin:80px auto; padding:24px 16px; }
+  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:24px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
   h1 { margin-top:0; font-size:1.25rem; }
-  input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.06); color:#f1f2f5; font-size:16px; box-sizing:border-box; }
-  button { width:100%; margin-top:12px; padding:12px 16px; border-radius:10px; border:none; background:#0066f7; color:#fff; font-size:1rem; cursor:pointer; }
-  .err { color:#ffb0b8; margin-top:12px; font-size:0.9rem; }
+  input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(0,0,0,0.13); background:#F2F2F7; color:#1C1C1E; font-size:16px; box-sizing:border-box; }
+  button { width:100%; margin-top:12px; padding:12px 16px; border-radius:10px; border:none; background:#007AFF; color:#fff; font-size:1rem; font-weight:600; cursor:pointer; }
+  button:hover { background:#0062CC; }
+  .err { color:#FF3B30; margin-top:12px; font-size:0.9rem; }
 </style></head>
 <body>
   <div class="card">
@@ -1991,7 +1992,7 @@ function renderAdminLoginPage(errorMsg) {
 
 async function renderAdminDashboard(env) {
   if (!env || !env.CONFIGS) {
-    return `<!DOCTYPE html><html><body style="background:#060b16;color:#f1f2f5;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
+    return `<!DOCTYPE html><html><body style="background:#F2F2F7;color:#1C1C1E;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
   }
   const today = statsToday();
   const [totalPV, todayPV, totalIN, todayIN, pvByDay, inByDay, creatorResult, sourceGroupResult] = await Promise.all([
@@ -2074,29 +2075,29 @@ async function renderAdminDashboard(env) {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:900px; margin:0 auto; padding:24px 16px; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:24px 16px; }
   h1 { margin-bottom:4px; }
   h2 { font-size:1.1rem; }
   .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:14px; margin:20px 0; }
-  .stat-card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:18px; }
+  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:18px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
   .stat-value { font-size:2rem; font-weight:700; }
-  .stat-label { color:#8d9099; font-size:0.9rem; margin-top:4px; }
-  table { width:100%; border-collapse:collapse; margin-top:10px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.9rem; }
-  th { color:#8d9099; font-weight:600; }
-  a { color:#4d9fff; }
-  .admin-tab-bar { display:flex; gap:8px; border-bottom:1px solid rgba(255,255,255,0.1); margin-top:24px; }
+  .stat-label { color:#8E8E93; font-size:0.9rem; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.9rem; }
+  th { color:#8E8E93; font-weight:600; }
+  a { color:#007AFF; }
+  .admin-tab-bar { display:flex; gap:8px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:24px; }
   .admin-tab-btn {
-    background:none; border:none; color:#8d9099; font-size:0.95rem; font-weight:600; cursor:pointer;
+    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:600; cursor:pointer;
     padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent;
   }
-  .admin-tab-btn.active { color:#f1f2f5; border-bottom-color:#0066f7; }
+  .admin-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
-  <p style="color:#8d9099; margin-top:0;">My Lists Addon usage stats.</p>
+  <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
   <div class="admin-tab-bar" role="tablist">
     <button type="button" class="admin-tab-btn active" data-admin-tab="last30" onclick="switchAdminTab('last30')">Last 30 Days</button>
@@ -2128,7 +2129,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="sources">
-    <p style="color:#8d9099; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
     <table>
       <tr><th>Source</th><th>Count</th><th>Share</th></tr>
       ${sourceGroupRows || '<tr><td colspan="3">No data yet.</td></tr>'}
@@ -2657,6 +2658,42 @@ function fetchCustomListCatalog(entry) {
     }));
 }
 
+// Copies forward tracking fields (watchHistory/continueWatching/
+// fullyWatchedShowIds/dismissedContinueWatching/trackPlayback) from the
+// old embedded location in creatorsync:{username} into the new dedicated
+// creatorsynctracking:{username} key, exactly once. Called defensively
+// from every write path that touches tracking data -- the client's own
+// save-tracking endpoint, the Continue Watching cron (checkForNewEpisodes
+// below), and the Auto-Track Playback subtitle ping (handleSubtitlesTrack,
+// further down this file) -- since any of the three could be the first to
+// run after this split shipped, and whichever runs first must not
+// silently lose whatever was already saved the old way.
+async function ensureTrackingMigrated(env, username) {
+  const existing = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+  if (existing !== null) return; // already migrated (or already using the new key)
+  const oldRaw = await env.CONFIGS.get(`creatorsync:${username}`);
+  if (!oldRaw) return;
+  try {
+    const oldBlob = JSON.parse(oldRaw);
+    const hasTrackingData = (Array.isArray(oldBlob.watchHistory) && oldBlob.watchHistory.length) ||
+      (Array.isArray(oldBlob.continueWatching) && oldBlob.continueWatching.length) ||
+      (Array.isArray(oldBlob.fullyWatchedShowIds) && oldBlob.fullyWatchedShowIds.length) ||
+      (oldBlob.dismissedContinueWatching && Object.keys(oldBlob.dismissedContinueWatching).length) ||
+      typeof oldBlob.trackPlayback === "boolean";
+    if (!hasTrackingData) return;
+    await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify({
+      watchHistory: Array.isArray(oldBlob.watchHistory) ? oldBlob.watchHistory : [],
+      continueWatching: Array.isArray(oldBlob.continueWatching) ? oldBlob.continueWatching : [],
+      fullyWatchedShowIds: Array.isArray(oldBlob.fullyWatchedShowIds) ? oldBlob.fullyWatchedShowIds : [],
+      dismissedContinueWatching: oldBlob.dismissedContinueWatching && typeof oldBlob.dismissedContinueWatching === "object" ? oldBlob.dismissedContinueWatching : {},
+      trackPlayback: typeof oldBlob.trackPlayback === "boolean" ? oldBlob.trackPlayback : false,
+      updatedAt: Date.now(),
+    }));
+  } catch {
+    // old blob unreadable -- nothing to migrate
+  }
+}
+
 async function fetchAutoTrackedCatalog(entry, env) {
   if (!env || !env.CONFIGS) return [];
   
@@ -2670,10 +2707,25 @@ async function fetchAutoTrackedCatalog(entry, env) {
   const username = parts[3];
   
   try {
-    const blobStr = await env.CONFIGS.get('creatorsync:' + username);
-    if (!blobStr) return [];
-    const blob = JSON.parse(blobStr);
-    const items = slug === 'watch-history' ? blob.watchHistory : blob.continueWatching;
+    // Tracking data lives in its own key now -- see ensureTrackingMigrated's
+    // comment for why (this used to read creatorsync:{username} directly,
+    // where a large watchHistory/continueWatching sat alongside everything
+    // else and made every single autosave heavier as it grew). Falls back
+    // to the old embedded location for an account that hasn't had any
+    // tracking write happen since the split (nothing has run
+    // ensureTrackingMigrated for it yet) -- read-only fallback, no write,
+    // since fetchAutoTrackedCatalog only ever reads.
+    let items;
+    const trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    if (trackingRaw) {
+      const trackingBlob = JSON.parse(trackingRaw);
+      items = slug === 'watch-history' ? trackingBlob.watchHistory : trackingBlob.continueWatching;
+    } else {
+      const blobStr = await env.CONFIGS.get('creatorsync:' + username);
+      if (!blobStr) return [];
+      const blob = JSON.parse(blobStr);
+      items = slug === 'watch-history' ? blob.watchHistory : blob.continueWatching;
+    }
     if (!items || !items.length) return [];
     
     const mappedItems = [];
@@ -3930,7 +3982,8 @@ async function checkForNewEpisodes(env) {
   for (const key of listResult.keys) {
     if (showChecksUsed >= SHOW_CHECK_BUDGET) break;
     const username = key.name.slice('creator:'.length);
-    const syncRaw = await env.CONFIGS.get(`creatorsync:${username}`);
+    await ensureTrackingMigrated(env, username);
+    const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
     if (!syncRaw) continue;
 
     let blob;
@@ -4017,7 +4070,7 @@ async function checkForNewEpisodes(env) {
       blob.continueWatching = continueWatching;
       blob.fullyWatchedShowIds = stillFullyWatched;
       blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsync:${username}`, JSON.stringify(blob));
+      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
     }
   }
 }
@@ -7592,7 +7645,7 @@ function renderMyMdblistLists(lists) {
     const isSingleType = (l.mediatype === 'movie' || l.mediatype === 'show');
     const type = l.mediatype === 'show' ? 'series' : 'movie';
     const typeLabel = l.mediatype === 'show' ? 'Shows' : (l.mediatype === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'unknown') + '">Copy</button>';
     let addBtns = '';
     if (isSingleType) {
@@ -7682,7 +7735,7 @@ function renderMyTraktLists(lists) {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'unknown') + '">Copy</button>';
     let addBtns = '';
     if (isSingleType) {
@@ -7865,10 +7918,16 @@ function renderMyPrivateTraktLists(lists) {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
-    const viewType = isSingleType ? type : 'movie';
+    const viewType = isSingleType ? type : 'mixed';
     const copyBtn = isHistory
       ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="shows">Copy (Shows)</button>' +
-        '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>'
+        '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>' +
+        // Marks every watched movie/episode straight into this add-on's
+        // own Watch History (and Continue Watching, for shows) -- unlike
+        // the Copy buttons above, which just duplicate the data into a
+        // browsable Custom List, this actually feeds the watched-tracking
+        // system itself. See markTraktHistoryAllWatched.
+        '<button type="button" class="lc-btn secondary" onclick="markTraktHistoryAllWatched(this)">Mark all as Watched</button>'
       : '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>';
 
     let addBtns = '';
@@ -8117,6 +8176,90 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   }
   if (failed.length) {
     msg += (msg ? '\\n\\n' : '') + 'Could not copy: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
+  }
+  alert(msg);
+}
+
+// Walks the connected Trakt account's full watch history (movies, then
+// episodes) via /api/trakt-history-raw and adds every item to Watch
+// History (and, for shows, Continue Watching) -- the live-account
+// equivalent of the Trakt Export importer's "mark as watched" checkbox,
+// for someone who's connected Trakt directly rather than uploading an
+// export file. Reuses mapTraktExportEntryToWatchHistoryItem unchanged: the
+// raw row shape is identical either way, since Trakt's own export is
+// generated from this same API.
+async function markTraktHistoryAllWatched(btn) {
+  if (!traktAccessToken) { alert('Connect Trakt first.'); return; }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) btn.disabled = true;
+
+  // Bounded the same way the server-side Continue Watching cron bounds
+  // itself (see checkForNewEpisodes, 07_source-fetchers-tmdb-simkl.js) --
+  // a Trakt power user's history can run into the tens of thousands of
+  // rows, and this is a synchronous, in-browser operation the person is
+  // actively waiting on, not a background job. 100 pages at 100/page is
+  // 10,000 events per kind (movies, episodes), comfortably past what
+  // almost anyone has logged; if it's genuinely hit, what's fetched so far
+  // still gets marked rather than discarded, and the result message says so.
+  const MAX_PAGES = 100;
+  const whItems = [];
+  const seenIds = new Set();
+  let hitPageCap = false;
+
+  for (const kind of ['movies', 'episodes']) {
+    let page = 1;
+    let hasMore = true;
+    while (hasMore && page <= MAX_PAGES) {
+      if (btn) btn.textContent = 'Fetching ' + kind + ' (page ' + page + ')\u2026';
+      let data;
+      try {
+        const res = await fetch(ORIGIN + '/api/trakt-history-raw', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accessToken: traktAccessToken, type: kind, page: page, limit: 100 }),
+        });
+        data = await res.json();
+      } catch (e) {
+        alert('Network error fetching Trakt history.');
+        if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+        return;
+      }
+      if (!data.ok) {
+        alert(data.error || 'Could not fetch Trakt history.');
+        if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+        return;
+      }
+      (data.items || []).forEach((it) => {
+        const mapped = mapTraktExportEntryToWatchHistoryItem(it);
+        // A rewatch logs a fresh row every time -- Watch History only
+        // needs one entry per item, same dedupe as the Export importer.
+        if (!mapped || seenIds.has(mapped.id)) return;
+        seenIds.add(mapped.id);
+        whItems.push(mapped);
+      });
+      hasMore = !!data.hasMore;
+      page++;
+    }
+    if (page > MAX_PAGES && hasMore) hitPageCap = true;
+  }
+
+  if (!whItems.length) {
+    alert('No watch history found on your Trakt account.');
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+    return;
+  }
+
+  if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
+  const whResult = await addItemsToWatchHistory(whItems);
+  if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
+  if (whResult.cwTotal) {
+    msg += ' Continue Watching checked for ' + whResult.cwSucceeded + ' of ' + whResult.cwTotal + ' show' + (whResult.cwTotal === 1 ? '' : 's') +
+      (whResult.cwSucceeded < whResult.cwTotal ? ' \u2014 the rest hit a network hiccup or TMDB rate limit; reopening one of those shows will retry it, or run this again.' : '.');
+  }
+  if (hitPageCap) {
+    msg += ' (Your history is large enough that this only covered the ' + (MAX_PAGES * 100).toLocaleString() + ' most recent watches per type \u2014 run it again later to pick up more.)';
   }
   alert(msg);
 }
@@ -8981,27 +9124,73 @@ async function populateSearchResultPosters() {
   const slots = [...document.querySelectorAll('.poster-preview-slot')];
   let idx = 0;
   const CONCURRENCY = 5;
+  // Fetches one /api/preview call for a single declared type -- split out
+  // so a mixed-content list (see fetchPreviewForSlot below) can fire two
+  // of these in parallel instead of duplicating the request logic.
+  async function fetchPreviewOnce(listUrl, type) {
+    const payload = { url: listUrl, type: type, sample: 12 };
+    const mkInput = document.getElementById('mdblistKeyInput');
+    if (mkInput && mkInput.value) payload.mdblistKey = mkInput.value.trim();
+    const tkInput = document.getElementById('tmdbKeyInput');
+    if (tkInput && tkInput.value) payload.tmdbKey = tkInput.value.trim();
+    const trkInput = document.getElementById('traktKeyInput');
+    if (trkInput && trkInput.value) payload.traktKey = trkInput.value.trim();
+    // trakt:watchlist and trakt:history (the "Watchlist"/"Watch History"
+    // cards under Your Trakt Lists) are both OAuth-only sources -- see
+    // fetchTraktWatchlist/fetchTraktHistory, which throw immediately
+    // without an accessToken, traktKey alone isn't enough for either.
+    if (typeof traktAccessToken !== 'undefined' && traktAccessToken) payload.traktAccessToken = traktAccessToken;
+    const res = await fetch(ORIGIN + '/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      cache: 'no-store',
+    });
+    return res.json();
+  }
+  // A list card that mixes movies and shows (MDBList/Trakt lists don't
+  // have to be one or the other) gets marked data-type="mixed" by its
+  // render function rather than being forced to either type -- /api/preview
+  // itself only ever answers for one declared type per call (movie or
+  // series, see its own coercion), so a single request here would only
+  // ever surface that list's movies and leave a TV-heavy or TV-only list
+  // showing no posters at all. Two parallel requests, merged, covers both.
+  async function fetchPreviewForSlot(listUrl, type) {
+    if (type !== 'mixed') {
+      return fetchPreviewOnce(listUrl, type);
+    }
+    const [movieResult, seriesResult] = await Promise.all([
+      fetchPreviewOnce(listUrl, 'movie').catch(() => null),
+      fetchPreviewOnce(listUrl, 'series').catch(() => null),
+    ]);
+    const movieOk = movieResult && movieResult.ok;
+    const seriesOk = seriesResult && seriesResult.ok;
+    if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
+    const movieSample = movieOk ? (movieResult.sample || []) : [];
+    const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
+    // Interleaved rather than movies-then-shows, so a list that's mostly
+    // one type still shows a representative mix in the first few tiles
+    // rather than, say, nine movie posters and zero show posters just
+    // because movies happened to be fetched first.
+    const merged = [];
+    const maxLen = Math.max(movieSample.length, seriesSample.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (movieSample[i]) merged.push(movieSample[i]);
+      if (seriesSample[i]) merged.push(seriesSample[i]);
+    }
+    return {
+      ok: true,
+      sample: merged,
+      count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
+    };
+  }
   async function worker() {
     while (idx < slots.length) {
       const slot = slots[idx++];
       const listUrl = slot.dataset.url;
       const type = slot.dataset.type || 'movie';
       try {
-        const payload = { url: listUrl, type: type, sample: 12 };
-        const mkInput = document.getElementById('mdblistKeyInput');
-        if (mkInput && mkInput.value) payload.mdblistKey = mkInput.value.trim();
-        const tkInput = document.getElementById('tmdbKeyInput');
-        if (tkInput && tkInput.value) payload.tmdbKey = tkInput.value.trim();
-        const trkInput = document.getElementById('traktKeyInput');
-        if (trkInput && trkInput.value) payload.traktKey = trkInput.value.trim();
-
-        const res = await fetch(ORIGIN + '/api/preview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          cache: 'no-store',
-        });
-        const data = await res.json();
+        const data = await fetchPreviewForSlot(listUrl, type);
         if (data.ok && data.sample && data.sample.length) {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
@@ -9020,7 +9209,7 @@ async function populateSearchResultPosters() {
               }
 
               inner += '<div class="list-card-mini-poster-tile">' +
-                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
+                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
                   '<div class="poster-add-overlay">+</div>' +
                   overlays +
@@ -11528,6 +11717,13 @@ window._fullyWatchedShowIds = new Set();
 // (initWatchHistory on load, updateContinueWatching as things change), so
 // the two sets are always mutually exclusive for a given showId.
 window._inProgressShowIds = new Set();
+// Shows explicitly dismissed from Continue Watching, keyed by showId, each
+// mapped to the exact watched snapshot (season/episode) the dismissal was
+// made at -- see dismissContinueWatchingShow below for why a snapshot
+// rather than a plain boolean. Restored from localStorage in
+// initWatchHistory below for a local-only browser; a signed-in account
+// gets it from the server instead (see loadCreatorSync).
+window._dismissedContinueWatching = {};
 
 // Finds the position:relative box a watched-checkmark badge should be
 // inserted into for a given .clickable-poster/.clickable-episode element.
@@ -11588,6 +11784,15 @@ function initWatchHistory() {
   } catch (e) {
     // non-critical -- badges just won't show for shows until the next
     // time updateContinueWatching recomputes them
+  }
+  try {
+    const dismissedRaw = localStorage.getItem('myListAddon:dismissedContinueWatching');
+    if (dismissedRaw) {
+      const parsed = JSON.parse(dismissedRaw);
+      if (parsed && typeof parsed === 'object') window._dismissedContinueWatching = parsed;
+    }
+  } catch (e) {
+    // non-critical -- a dismissed show might just reappear once
   }
 
   const observer = new MutationObserver(mutations => {
@@ -11868,6 +12073,24 @@ window.addItemsToWatchHistory = async function(items) {
 
 // --- Continue Watching --------------------------------------------------------
 
+// Drops any but the first entry per showId (items are always unshifted,
+// so first = most recently added) -- shared by getOrCreateContinueWatchingList
+// (self-healing local data left over from a fixed race condition, see its
+// own comment) and loadCreatorSync's sync-down (server data can carry the
+// same kind of duplicate forward if it was ever written by an older,
+// race-prone version of this code, or by the cron/Auto-Track ping in a
+// narrow window against a concurrent client save).
+function dedupeContinueWatchingItems(items) {
+  if (!items || !items.length) return items || [];
+  const seenShowIds = new Set();
+  return items.filter((it) => {
+    if (!it.showId) return true;
+    if (seenShowIds.has(it.showId)) return false;
+    seenShowIds.add(it.showId);
+    return true;
+  });
+}
+
 function getOrCreateContinueWatchingList() {
   const map = loadLocalCustomLists();
   if (!map['continue-watching']) {
@@ -11886,7 +12109,40 @@ function getOrCreateContinueWatchingList() {
     map['continue-watching'].slug = 'continue-watching';
     saveLocalCustomListsMap(map);
   }
-  return map['continue-watching'];
+  const cwList = map['continue-watching'];
+  // Self-heals data left over from a race condition in a previous version
+  // of updateContinueWatching, where concurrent commits for different
+  // shows could clobber each other and leave a stale duplicate entry for
+  // the same show sitting alongside a fresh one (see
+  // updateContinueWatching's own comment -- the write itself is fixed now,
+  // this just cleans up whatever it already left behind). Only saves if
+  // anything actually needed dropping.
+  if (cwList.items && cwList.items.length) {
+    const deduped = dedupeContinueWatchingItems(cwList.items);
+    if (deduped.length !== cwList.items.length) {
+      cwList.items = deduped;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    }
+  }
+  return cwList;
+}
+
+// Serializes the read-modify-write of localStorage's continue-watching
+// list (and the fullyWatchedShowIds/inProgressShowIds it triggers) across
+// concurrent updateContinueWatching calls -- see that function's own
+// comment for why. Network fetches still run in parallel across workers;
+// only the actual commit (load list, mutate, save list) queues up one at
+// a time, so it can never race with another commit in flight.
+let cwCommitLock = Promise.resolve();
+function withCwCommitLock(fn) {
+  const run = cwCommitLock.then(fn, fn);
+  // Swallow errors here so one failed commit doesn't permanently wedge the
+  // queue for every commit after it -- the actual error still propagates
+  // to whoever's awaiting "run" itself.
+  cwCommitLock = run.then(() => {}, () => {});
+  return run;
 }
 
 async function updateContinueWatching(showId) {
@@ -11895,25 +12151,28 @@ async function updateContinueWatching(showId) {
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
 
-  const map = loadLocalCustomLists();
-  const history = map['watch-history'];
-  const cwList = getOrCreateContinueWatchingList();
-
-  cwList.items = cwList.items.filter(it => it.showId !== showId);
-
-  const watchedEps = (history ? history.items : []).filter(it =>
+  // Reading Watch History here (outside the commit lock) is safe: nothing
+  // concurrently writes to Watch History during a Continue Watching batch
+  // -- see addItemsToWatchHistory, which always finishes adding everything
+  // to Watch History before it ever calls updateContinueWatchingForBatch.
+  const watchedEps = (loadLocalCustomLists()['watch-history']?.items || []).filter(it =>
     it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
   );
 
   if (!watchedEps.length) {
-    map['continue-watching'] = cwList;
-    cwList.updatedAt = Date.now();
-    saveLocalCustomListsMap(map);
-    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-    setShowFullyWatched(showId, false);
-    setShowInProgress(showId, false);
-    return { ok: true };
+    return withCwCommitLock(() => {
+      const map = loadLocalCustomLists();
+      const cwList = getOrCreateContinueWatchingList();
+      cwList.items = cwList.items.filter(it => it.showId !== showId);
+      map['continue-watching'] = cwList;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+      setShowFullyWatched(showId, false);
+      setShowInProgress(showId, false);
+      return { ok: true };
+    });
   }
 
   const latest = watchedEps.reduce((best, ep) => {
@@ -11931,6 +12190,10 @@ async function updateContinueWatching(showId) {
   // watched" apart from "the fetch failed", since both leave no Continue
   // Watching entry behind but only one of them should be retried.
   let showFullyWatched = null;
+  // Computed here (network phase, runs concurrently across workers) and
+  // only written to the list inside the locked commit phase below -- see
+  // withCwCommitLock's own comment for why the write itself can't race.
+  let newEntry = null;
 
   try {
     const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
@@ -11942,7 +12205,7 @@ async function updateContinueWatching(showId) {
     const nextInSeason = eps.find(ep => ep.episode_number > latest.episodeNum);
 
     if (nextInSeason) {
-      cwList.items.unshift({
+      newEntry = {
         id: String(nextInSeason.id),
         type: 'episode',
         // Bare episode name -- matching Watch History's own item.name
@@ -11958,9 +12221,8 @@ async function updateContinueWatching(showId) {
         showPoster: latest.showPoster || '',
         seasonNum: latest.seasonNum,
         episodeNum: nextInSeason.episode_number
-      });
+      };
       showFullyWatched = false;
-      setShowInProgress(showId, true);
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
       const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
@@ -11970,7 +12232,7 @@ async function updateContinueWatching(showId) {
         const nextEps = data2.season.episodes.filter(ep => isEpisodeAired(ep));
         const firstNext = nextEps[0];
         if (firstNext) {
-          cwList.items.unshift({
+          newEntry = {
             id: String(firstNext.id),
             type: 'episode',
             name: firstNext.name,
@@ -11980,9 +12242,8 @@ async function updateContinueWatching(showId) {
             showPoster: latest.showPoster || '',
             seasonNum: nextSeasonNum,
             episodeNum: firstNext.episode_number
-          });
+          };
           showFullyWatched = false;
-          setShowInProgress(showId, true);
         } else {
           // TMDB knows about the next season but it hasn't started airing
           // yet -- nothing unwatched-and-aired remains right now.
@@ -11998,13 +12259,23 @@ async function updateContinueWatching(showId) {
     // Silent failure -- showFullyWatched stays null, see comment above.
   }
 
-  map['continue-watching'] = cwList;
-  cwList.updatedAt = Date.now();
-  saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-  if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
-  return { ok: showFullyWatched !== null };
+  return withCwCommitLock(() => {
+    const map = loadLocalCustomLists();
+    const cwList = getOrCreateContinueWatchingList();
+    // Removes any existing entry for this show -- including a stale one
+    // that might otherwise never get cleaned up -- before (maybe) adding
+    // the fresh one computed above.
+    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    if (newEntry) cwList.items.unshift(newEntry);
+    map['continue-watching'] = cwList;
+    cwList.updatedAt = Date.now();
+    saveLocalCustomListsMap(map);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
+    if (showFullyWatched === false) setShowInProgress(showId, true);
+    return { ok: showFullyWatched !== null };
+  });
 }
 
 // Runs updateContinueWatching for every distinct show in a batch, a few at
@@ -12042,6 +12313,60 @@ async function updateContinueWatchingForBatch(items) {
   const workers = Array(Math.min(CONCURRENCY, showIds.length)).fill(0).map(worker);
   await Promise.all(workers);
   return { succeeded: succeeded, total: showIds.length };
+}
+
+// Removes a show from Continue Watching without marking anything as
+// watched -- the person just doesn't want to be reminded about it right
+// now. Records exactly which watched snapshot (season/episode) this
+// dismissal applies to rather than a plain "dismissed forever" flag --
+// see checkForNewEpisodes and handleSubtitlesTrack's own "stillDismissed"
+// comments (both further down this file) for the matching server-side
+// check -- so watching a genuinely newer episode later naturally
+// supersedes the dismissal and lets the show reappear on its own.
+// Referenced by the "x" button on every Continue Watching card
+// (buildLocalListCardHtml/livePreviewPosterHtml's removeBtn).
+function dismissContinueWatchingShow(showId) {
+  if (!showId) return;
+  if (!window._dismissedContinueWatching) window._dismissedContinueWatching = {};
+
+  const history = loadLocalCustomLists()['watch-history'];
+  const watchedEps = (history ? history.items : []).filter(it =>
+    it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
+  );
+  if (watchedEps.length) {
+    const latest = watchedEps.reduce((best, ep) => {
+      if (ep.seasonNum > best.seasonNum) return ep;
+      if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
+      return best;
+    }, watchedEps[0]);
+    window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+  }
+  try {
+    localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(window._dismissedContinueWatching));
+  } catch (e) {
+    // non-critical -- the dismissal still applies for this session either way
+  }
+
+  // Goes through the same commit lock updateContinueWatching's own writes
+  // do, so this can't race with an in-flight commit for the same (or any
+  // other) show -- see withCwCommitLock's own comment.
+  withCwCommitLock(() => {
+    const map = loadLocalCustomLists();
+    const cwList = getOrCreateContinueWatchingList();
+    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    map['continue-watching'] = cwList;
+    cwList.updatedAt = Date.now();
+    saveLocalCustomListsMap(map);
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  });
+
+  // Dismissed is functionally "caught up" from this add-on's own
+  // perspective (same bucket checkForNewEpisodes tracks it in
+  // server-side) -- flips the badge from amber back to the blue
+  // checkmark, and the cron will still periodically check TMDB in case a
+  // real new episode later supersedes this dismissal.
+  setShowFullyWatched(showId, true);
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
 }
 
 // --- Creator Profile system --------------------------------------------------
@@ -12502,6 +12827,12 @@ function scheduleCreatorSyncSave() {
   if (!activeCreator) return;
   if (creatorSyncSaveTimer) clearTimeout(creatorSyncSaveTimer);
   creatorSyncSaveTimer = setTimeout(pushCreatorSync, 1200);
+  // Tracking data (Watch History/Continue Watching/etc) is split into its
+  // own sync call now -- see pushTrackingSync's own comment -- so anything
+  // that already calls this general scheduler also gets tracking synced
+  // in lockstep, rather than auditing every individual call site for
+  // whether it happens to touch tracking data too.
+  scheduleTrackingSync();
 }
 
 // Debounced sibling of scheduleCreatorSyncSave, just for presets -- call
@@ -12517,12 +12848,28 @@ function schedulePresetsSync() {
   presetsSyncTimer = setTimeout(() => { pushPresetsDirectly(loadPresetsMap()); }, 1200);
 }
 
+// Debounced sibling of scheduleCreatorSyncSave, just for Watch History/
+// Continue Watching tracking data -- split out for the same reason
+// presets were: watchHistory in particular can grow into the thousands of
+// items (e.g. a bulk "mark as watched" import), and bundling it into every
+// routine autosave meant every single config change re-sent and
+// re-processed the whole thing, which risked the same free-plan CPU
+// budget problem presets did -- and, worse, meant a large watchHistory
+// that failed to save left Stremio/wako's Watch History/Continue Watching
+// catalog rows showing "No items found" even though the browser's own
+// local copy looked complete.
+let trackingSyncTimer = null;
+function scheduleTrackingSync() {
+  if (!activeCreator) return;
+  if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
+  trackingSyncTimer = setTimeout(pushTrackingSync, 1200);
+}
+
 async function pushCreatorSync() {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
-    const localMap = loadLocalCustomLists();
     await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -12530,18 +12877,37 @@ async function pushCreatorSync() {
         creatorName: activeCreator.creatorName,
         creatorKey: creatorKey,
         config: collectEntries(),
-        // Presets deliberately NOT included here -- they're the one piece
-        // of this state that can genuinely grow large (a TV Channel's
-        // "url" is its entire episode list) while everything else in this
-        // payload changes far more often but stays small. Bundling both
-        // together meant every single autosave re-sent and re-processed
-        // the full, ever-growing presets payload, which could tip a
-        // request over Cloudflare's free-plan 10ms CPU budget. See
-        // pushPresetsDirectly/schedulePresetsSync and the dedicated
-        // /api/creator/sync/save-presets endpoint, which now handle
-        // presets on their own, only when presets actually change.
+        // Presets and tracking data (watchHistory/continueWatching/etc)
+        // deliberately NOT included here -- both are pieces of this state
+        // that can genuinely grow large, while everything else in this
+        // payload changes far more often but stays small. See
+        // pushPresetsDirectly/schedulePresetsSync and
+        // pushTrackingSync/scheduleTrackingSync, which now handle those on
+        // their own, only when they actually change.
         collapsedPanels: collectCollapsedPanelsState(),
         likedLists: [...getLikedListsSet()],
+      }),
+    });
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
+// Pushes Watch History/Continue Watching tracking data straight to the
+// account's dedicated tracking record (see /api/creator/sync/save-
+// tracking) -- the ONLY path this data travels to the server through now.
+async function pushTrackingSync() {
+  if (!activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  try {
+    const localMap = loadLocalCustomLists();
+    await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
         // Always the full current list, same overwrite-the-blob approach
         // as everything else synced here -- see loadCreatorSync's comment
         // for why signing in replaces local state wholesale rather than
@@ -12550,8 +12916,8 @@ async function pushCreatorSync() {
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
         // Feeds the server-side Continue Watching cron (checkForNewEpisodes
-        // in 26_api-creator-and-admin-routes.js) -- see the blob comment
-        // there for why both of these need to travel alongside Watch
+        // in 07_source-fetchers-tmdb-simkl.js) -- see save-tracking's own
+        // comment for why both of these need to travel alongside Watch
         // History/Continue Watching rather than being derived server-side.
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
@@ -12585,6 +12951,7 @@ async function loadCreatorSync() {
       pushCreatorSync();
       const localPresets = loadPresetsMap();
       if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
+      pushTrackingSync();
       return;
     }
     const synced = data.data;
@@ -12641,13 +13008,21 @@ async function loadCreatorSync() {
     }
     if (Array.isArray(synced.continueWatching)) {
       const cw = getOrCreateContinueWatchingList();
-      cw.items = synced.continueWatching;
+      const dedupedIncoming = dedupeContinueWatchingItems(synced.continueWatching);
+      cw.items = dedupedIncoming;
       cw.updatedAt = Date.now();
       const map = loadLocalCustomLists();
       map['continue-watching'] = cw;
       saveLocalCustomListsMap(map);
-      window._inProgressShowIds = new Set(synced.continueWatching.map((it) => String(it.showId)).filter(Boolean));
+      window._inProgressShowIds = new Set(dedupedIncoming.map((it) => String(it.showId)).filter(Boolean));
       touchedTracking = true;
+      // The server's own copy may still carry whatever duplicate this just
+      // cleaned up (if it was ever written by an older, race-prone version
+      // of this code) -- push the corrected version back so it doesn't
+      // just reappear on the next sync-down.
+      if (dedupedIncoming.length !== synced.continueWatching.length && typeof scheduleTrackingSync === 'function') {
+        scheduleTrackingSync();
+      }
     }
     // Both feed the server-side Continue Watching cron and, once adopted
     // here, the exact same badge/dismissal logic Watch History and
@@ -14823,6 +15198,23 @@ if (serverEntries.length) {
     traktAccessToken = saved.keys.traktAccessToken;
   }
 }
+// Trakt's OAuth connection is local, per-browser state -- unlike the
+// catalog entries above (which come from whatever install link opened
+// this page), it was never embedded in that link and only ever lives in
+// this browser's own localStorage (see disconnectTrakt/
+// pickUpTraktTokenFromUrl, both of which call saveState()). Restored here
+// regardless of which branch above ran, and only as a fallback (never
+// overwriting a token the server already provided for this exact
+// install), so a page that opened via an existing install link -- the
+// common case, since it's what "refresh" usually means here -- doesn't
+// lose an already-connected Trakt session just because it also happened
+// to have rows preloaded from that link.
+if (!traktAccessToken) {
+  const savedForTrakt = loadSavedState();
+  if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
+    traktAccessToken = savedForTrakt.keys.traktAccessToken;
+  }
+}
 suppressSave = false;
 renumber();
 renderPresetsList();
@@ -15891,6 +16283,54 @@ self.addEventListener('fetch', e => {
       }
     }
 
+    // /api/trakt-history-raw  (POST)  { accessToken, type: 'movies'|'episodes', page, limit }
+    // -> { ok, items: [...raw Trakt history rows...], hasMore }
+    // Deliberately returns Trakt's raw, unmapped rows rather than going
+    // through mapTraktHistoryItems (used everywhere else this add-on reads
+    // history) -- that mapping folds each row into a display-ready catalog
+    // meta and throws away the real per-episode TMDB id and season/episode
+    // numbers along the way, which is exactly what the client's "Mark all
+    // as Watched" needs to build proper Watch History/Continue Watching
+    // entries. This is the same raw shape a Trakt Export JSON file already
+    // uses (Trakt's export is generated from this same API), so the client
+    // reuses mapTraktExportEntryToWatchHistoryItem unchanged for both.
+    if (path === "/api/trakt-history-raw" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const accessToken = String(body.accessToken || "").trim();
+      if (!accessToken) return json({ ok: false, error: "Not connected to Trakt." }, 400);
+      const itemKind = body.type === "episodes" ? "episodes" : "movies";
+      const page = Math.max(1, parseInt(body.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(body.limit, 10) || 100));
+      try {
+        const res = await fetch(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": TRAKT_CLIENT_ID,
+            Authorization: `Bearer ${accessToken}`,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          // Never cache an authenticated, per-person response -- see the
+          // same caching note on fetchTrakt above.
+          cf: { cacheTtl: 0, cacheEverything: false },
+        });
+        if (res.status === 401) {
+          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
+        }
+        if (!res.ok) return json({ ok: false, error: `Trakt history request failed (HTTP ${res.status}).` });
+        const items = await res.json();
+        const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
+        return json({ ok: true, items: Array.isArray(items) ? items : [], hasMore: page < totalPages });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) });
+      }
+    }
+
     // /api/mdblist-my-lists?apikey=...
     // -> powers the "Your MDBList Lists" section in the builder: every list
     // the API key's own account has created (not just the built-in
@@ -16163,7 +16603,8 @@ self.addEventListener('fetch', e => {
       let matched = "no";
 
       try {
-        const syncKey = `creatorsync:${auth.username}`;
+        await ensureTrackingMigrated(env, auth.username);
+        const syncKey = `creatorsynctracking:${auth.username}`;
         const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
         if (raw) {
@@ -16174,7 +16615,7 @@ self.addEventListener('fetch', e => {
           }
         }
         if (!blob || typeof blob !== "object") {
-          blob = { config: [], presets: {}, collapsedPanels: {}, likedLists: [], watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {} };
+          blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
         }
         blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
         blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
@@ -16573,6 +17014,18 @@ self.addEventListener('fetch', e => {
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
 
+      // Same one-time forward migration, this time for tracking data
+      // (watchHistory/continueWatching/fullyWatchedShowIds/
+      // dismissedContinueWatching/trackPlayback) -- see
+      // ensureTrackingMigrated's own comment. Critical to run here
+      // specifically: this endpoint is the most frequent write to
+      // creatorsync:{username} of any of them (any routine autosave), and
+      // the blob built below no longer includes tracking fields at all --
+      // without migrating first, the very next autosave after this
+      // shipped would silently erase anyone's tracking data before
+      // save-tracking ever got a chance to run for them.
+      await ensureTrackingMigrated(env, auth.username);
+
       // One-time forward migration: presets used to live embedded in this
       // same blob, but as of this endpoint no longer accepts them here at
       // all (see /api/creator/sync/save-presets below) -- an updated client
@@ -16606,36 +17059,13 @@ self.addEventListener('fetch', e => {
         config: Array.isArray(body.config) ? body.config : [],
         collapsedPanels: body.collapsedPanels && typeof body.collapsedPanels === "object" ? body.collapsedPanels : {},
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
-        // Watch History / Continue Watching -- unlike a named Custom List
-        // (see /api/creator/lists/save above), these are per-browser
-        // tracking data with mixed movie+episode items, not a single
-        // publishable movie-or-series list, so they ride along in this
-        // same private per-account blob rather than the creatorlist:*
-        // namespace. Always private by nature; there's no visibility
-        // toggle for either of these anywhere in the client.
-        watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
-        continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
-        // Shows fully caught up as of the last check, and shows dismissed
-        // from Continue Watching (each mapped to the latest-watched
-        // episode at the moment of dismissal) -- both ride along here for
-        // the same reason watchHistory/continueWatching do above, and both
-        // are read by the Continue Watching cron (checkForNewEpisodes,
-        // further down this file): fullyWatchedShowIds tells it which
-        // shows are even worth checking TMDB for (no point re-checking a
-        // show with a known next episode already waiting to be watched),
-        // and dismissedContinueWatching stops it from re-adding a card
-        // someone explicitly removed, the same way updateContinueWatching
-        // already respects a dismissal client-side.
-        fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
-        dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
-        trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
-      // Workers KV hard-caps a value at 25MB. Presets/Channels no longer
-      // live in this blob at all (see above), so this is now just a
-      // defensive backstop rather than the main thing it used to guard
-      // against.
+      // Workers KV hard-caps a value at 25MB. Presets/Channels and tracking
+      // data (watchHistory/continueWatching/etc) no longer live in this
+      // blob at all (see above), so this is now just a defensive backstop
+      // rather than the main thing it used to guard against.
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "This account's saved data is too large to store (over the 25MB limit)." });
       }
@@ -16648,6 +17078,53 @@ self.addEventListener('fetch', e => {
         // server-side rather than leaving "check your connection" as the
         // only explanation, which is misleading when the connection was
         // never the problem.
+        return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
+    // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,
+    // watchHistory, continueWatching, fullyWatchedShowIds,
+    // dismissedContinueWatching, trackPlayback } -> { ok }
+    // The dedicated, lightweight sibling of /api/creator/sync/save for
+    // Watch History / Continue Watching tracking data -- split out for the
+    // same reason presets were (see save-presets' own comment just below):
+    // watchHistory in particular can grow into the thousands of items for
+    // an active account (e.g. a bulk "mark as watched" import), and it used
+    // to ride along in the same blob as config/collapsedPanels/likedLists,
+    // making EVERY routine autosave -- and every single Auto-Track Playback
+    // ping (handleSubtitlesTrack, further down this file), which fires on
+    // every video play -- re-send and re-process the whole thing. Also read
+    // by the Continue Watching cron (checkForNewEpisodes) and
+    // fetchAutoTrackedCatalog (what Stremio/wako actually see for the
+    // Watch History/Continue Watching catalog rows) -- if this never
+    // successfully saves (e.g. it silently failed under the old combined
+    // blob's size), those rows show "No items found" even though the
+    // browser's own local copy looks complete.
+    if (path === "/api/creator/sync/save-tracking" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const blob = {
+        watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
+        continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
+        fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
+        dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
+        trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(blob);
+      if (serialized.length > 24 * 1024 * 1024) {
+        return json({ ok: false, error: "Your Watch History is too large to store (over the 25MB limit)." });
+      }
+      try {
+        await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
+      } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
       return json({ ok: true });
@@ -16713,6 +17190,7 @@ self.addEventListener('fetch', e => {
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      await ensureTrackingMigrated(env, auth.username);
       const raw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
       let data = null;
       if (raw) {
@@ -16742,14 +17220,34 @@ self.addEventListener('fetch', e => {
             // data at all" and having loadCreatorSync skip straight to
             // pushCreatorSync (which would try to push this browser's
             // state up and never even look at what's already saved).
-            data = {
-              config: [], collapsedPanels: {}, likedLists: [], watchHistory: [],
-              continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {},
-              trackPlayback: false, updatedAt: Date.now(),
-            };
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
           }
           data.presets = presetsBlob.presets || {};
           data.presetsB64 = presetsBlob.presetsB64 || null;
+        }
+      }
+      // Tracking data (Watch History/Continue Watching/etc) also lives in
+      // its own key now -- see save-tracking's own comment above for why.
+      // Same merge pattern as presets: the client's loadCreatorSync still
+      // just reads data.watchHistory/data.continueWatching/etc exactly
+      // like before, unaware this is a third KV read.
+      const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+      if (trackingRaw) {
+        let trackingBlob = null;
+        try {
+          trackingBlob = JSON.parse(trackingRaw);
+        } catch {
+          trackingBlob = null;
+        }
+        if (trackingBlob) {
+          if (!data) {
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+          }
+          data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
+          data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
+          data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
+          data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
+          data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
         }
       }
       return json({ ok: true, data });
@@ -16958,7 +17456,7 @@ self.addEventListener('fetch', e => {
       const itemsHtml = listData.items
         .map(
           (it) =>
-            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08);">` +
+            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.08);">` +
             (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:40px;height:60px;object-fit:cover;border-radius:4px;flex:none;">` : "") +
             `<span>${escapeHtmlServer(it.title || "Untitled")}${it.year ? " (" + escapeHtmlServer(it.year) + ")" : ""}</span></div>`
         )
@@ -16968,16 +17466,17 @@ self.addEventListener('fetch', e => {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtmlServer(listData.name)} \u2014 My Lists</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
-  a { color:#4d9fff; }
-  .card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:20px; margin-top:16px; }
-  code { background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:6px; word-break:break-all; }
-  button { background:rgba(255,255,255,0.08); color:#f1f2f5; border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px 16px; font-size:0.95rem; cursor:pointer; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
+  a { color:#007AFF; }
+  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:20px; margin-top:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  code { background:#F2F2F7; padding:2px 6px; border-radius:6px; word-break:break-all; }
+  button { background:#007AFF; color:#fff; border:none; border-radius:10px; padding:10px 16px; font-size:0.95rem; font-weight:600; cursor:pointer; }
+  button:hover { background:#0062CC; }
   button:disabled { opacity:0.6; cursor:default; }
 </style></head>
 <body>
   <h1 style="margin-bottom:4px;">${escapeHtmlServer(listData.name)}</h1>
-  <p style="color:#8d9099; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
+  <p style="color:#8E8E93; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
   <button type="button" id="likeListBtn" style="margin-top:10px;">\u2661 Like</button>
   <div class="card">
     <p><strong>Add this to your own My Lists Addon:</strong> paste this URL in as a list source --</p>

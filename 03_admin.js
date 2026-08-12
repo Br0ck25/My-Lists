@@ -156,12 +156,13 @@ function renderAdminLoginPage(errorMsg) {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:380px; margin:80px auto; padding:24px 16px; }
-  .card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:24px; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:380px; margin:80px auto; padding:24px 16px; }
+  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:24px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
   h1 { margin-top:0; font-size:1.25rem; }
-  input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.06); color:#f1f2f5; font-size:16px; box-sizing:border-box; }
-  button { width:100%; margin-top:12px; padding:12px 16px; border-radius:10px; border:none; background:#0066f7; color:#fff; font-size:1rem; cursor:pointer; }
-  .err { color:#ffb0b8; margin-top:12px; font-size:0.9rem; }
+  input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(0,0,0,0.13); background:#F2F2F7; color:#1C1C1E; font-size:16px; box-sizing:border-box; }
+  button { width:100%; margin-top:12px; padding:12px 16px; border-radius:10px; border:none; background:#007AFF; color:#fff; font-size:1rem; font-weight:600; cursor:pointer; }
+  button:hover { background:#0062CC; }
+  .err { color:#FF3B30; margin-top:12px; font-size:0.9rem; }
 </style></head>
 <body>
   <div class="card">
@@ -177,7 +178,7 @@ function renderAdminLoginPage(errorMsg) {
 
 async function renderAdminDashboard(env) {
   if (!env || !env.CONFIGS) {
-    return `<!DOCTYPE html><html><body style="background:#060b16;color:#f1f2f5;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
+    return `<!DOCTYPE html><html><body style="background:#F2F2F7;color:#1C1C1E;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
   }
   const today = statsToday();
   const [totalPV, todayPV, totalIN, todayIN, pvByDay, inByDay, creatorResult, sourceGroupResult] = await Promise.all([
@@ -260,29 +261,29 @@ async function renderAdminDashboard(env) {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
 <style>
-  body { background:#060b16; color:#f1f2f5; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; max-width:900px; margin:0 auto; padding:24px 16px; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:24px 16px; }
   h1 { margin-bottom:4px; }
   h2 { font-size:1.1rem; }
   .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:14px; margin:20px 0; }
-  .stat-card { background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.1); border-radius:14px; padding:18px; }
+  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:18px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
   .stat-value { font-size:2rem; font-weight:700; }
-  .stat-label { color:#8d9099; font-size:0.9rem; margin-top:4px; }
-  table { width:100%; border-collapse:collapse; margin-top:10px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.9rem; }
-  th { color:#8d9099; font-weight:600; }
-  a { color:#4d9fff; }
-  .admin-tab-bar { display:flex; gap:8px; border-bottom:1px solid rgba(255,255,255,0.1); margin-top:24px; }
+  .stat-label { color:#8E8E93; font-size:0.9rem; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.9rem; }
+  th { color:#8E8E93; font-weight:600; }
+  a { color:#007AFF; }
+  .admin-tab-bar { display:flex; gap:8px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:24px; }
   .admin-tab-btn {
-    background:none; border:none; color:#8d9099; font-size:0.95rem; font-weight:600; cursor:pointer;
+    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:600; cursor:pointer;
     padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent;
   }
-  .admin-tab-btn.active { color:#f1f2f5; border-bottom-color:#0066f7; }
+  .admin-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
-  <p style="color:#8d9099; margin-top:0;">My Lists Addon usage stats.</p>
+  <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
   <div class="admin-tab-bar" role="tablist">
     <button type="button" class="admin-tab-btn active" data-admin-tab="last30" onclick="switchAdminTab('last30')">Last 30 Days</button>
@@ -314,7 +315,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="sources">
-    <p style="color:#8d9099; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
     <table>
       <tr><th>Source</th><th>Count</th><th>Share</th></tr>
       ${sourceGroupRows || '<tr><td colspan="3">No data yet.</td></tr>'}

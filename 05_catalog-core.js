@@ -233,6 +233,42 @@ function fetchCustomListCatalog(entry) {
     }));
 }
 
+// Copies forward tracking fields (watchHistory/continueWatching/
+// fullyWatchedShowIds/dismissedContinueWatching/trackPlayback) from the
+// old embedded location in creatorsync:{username} into the new dedicated
+// creatorsynctracking:{username} key, exactly once. Called defensively
+// from every write path that touches tracking data -- the client's own
+// save-tracking endpoint, the Continue Watching cron (checkForNewEpisodes
+// below), and the Auto-Track Playback subtitle ping (handleSubtitlesTrack,
+// further down this file) -- since any of the three could be the first to
+// run after this split shipped, and whichever runs first must not
+// silently lose whatever was already saved the old way.
+async function ensureTrackingMigrated(env, username) {
+  const existing = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+  if (existing !== null) return; // already migrated (or already using the new key)
+  const oldRaw = await env.CONFIGS.get(`creatorsync:${username}`);
+  if (!oldRaw) return;
+  try {
+    const oldBlob = JSON.parse(oldRaw);
+    const hasTrackingData = (Array.isArray(oldBlob.watchHistory) && oldBlob.watchHistory.length) ||
+      (Array.isArray(oldBlob.continueWatching) && oldBlob.continueWatching.length) ||
+      (Array.isArray(oldBlob.fullyWatchedShowIds) && oldBlob.fullyWatchedShowIds.length) ||
+      (oldBlob.dismissedContinueWatching && Object.keys(oldBlob.dismissedContinueWatching).length) ||
+      typeof oldBlob.trackPlayback === "boolean";
+    if (!hasTrackingData) return;
+    await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify({
+      watchHistory: Array.isArray(oldBlob.watchHistory) ? oldBlob.watchHistory : [],
+      continueWatching: Array.isArray(oldBlob.continueWatching) ? oldBlob.continueWatching : [],
+      fullyWatchedShowIds: Array.isArray(oldBlob.fullyWatchedShowIds) ? oldBlob.fullyWatchedShowIds : [],
+      dismissedContinueWatching: oldBlob.dismissedContinueWatching && typeof oldBlob.dismissedContinueWatching === "object" ? oldBlob.dismissedContinueWatching : {},
+      trackPlayback: typeof oldBlob.trackPlayback === "boolean" ? oldBlob.trackPlayback : false,
+      updatedAt: Date.now(),
+    }));
+  } catch {
+    // old blob unreadable -- nothing to migrate
+  }
+}
+
 async function fetchAutoTrackedCatalog(entry, env) {
   if (!env || !env.CONFIGS) return [];
   
@@ -246,10 +282,25 @@ async function fetchAutoTrackedCatalog(entry, env) {
   const username = parts[3];
   
   try {
-    const blobStr = await env.CONFIGS.get('creatorsync:' + username);
-    if (!blobStr) return [];
-    const blob = JSON.parse(blobStr);
-    const items = slug === 'watch-history' ? blob.watchHistory : blob.continueWatching;
+    // Tracking data lives in its own key now -- see ensureTrackingMigrated's
+    // comment for why (this used to read creatorsync:{username} directly,
+    // where a large watchHistory/continueWatching sat alongside everything
+    // else and made every single autosave heavier as it grew). Falls back
+    // to the old embedded location for an account that hasn't had any
+    // tracking write happen since the split (nothing has run
+    // ensureTrackingMigrated for it yet) -- read-only fallback, no write,
+    // since fetchAutoTrackedCatalog only ever reads.
+    let items;
+    const trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    if (trackingRaw) {
+      const trackingBlob = JSON.parse(trackingRaw);
+      items = slug === 'watch-history' ? trackingBlob.watchHistory : trackingBlob.continueWatching;
+    } else {
+      const blobStr = await env.CONFIGS.get('creatorsync:' + username);
+      if (!blobStr) return [];
+      const blob = JSON.parse(blobStr);
+      items = slug === 'watch-history' ? blob.watchHistory : blob.continueWatching;
+    }
     if (!items || !items.length) return [];
     
     const mappedItems = [];
