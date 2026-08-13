@@ -62,6 +62,199 @@ async function bumpStatBy(env, kind, amount) {
   }
 }
 
+// Records roughly how recently a creator account was last active -- feeds
+// the "Last Active" column in the admin dashboard's Creator Accounts tab.
+// Throttled to at most once per 30 minutes per account (one extra read to
+// check, skipped write if already recent) so a burst of debounced
+// autosaves during a single active session doesn't turn into a KV write
+// on every one of them -- called from authenticateCreator on every
+// successful auth, fire-and-forget (never awaited there), so this can
+// never add latency or a failure mode to the actual authenticated action
+// it's riding along with.
+async function touchCreatorLastSeen(env, username) {
+  if (!env || !env.CONFIGS || !username) return;
+  try {
+    const key = `creatorlastseen:${username}`;
+    const raw = await env.CONFIGS.get(key);
+    const last = parseInt(raw, 10) || 0;
+    if (Date.now() - last < 30 * 60 * 1000) return; // updated recently enough
+    await env.CONFIGS.put(key, String(Date.now()));
+  } catch (e) {
+    // best-effort -- a missing/stale "Last Active" value is cosmetic only
+  }
+}
+
+// Records one "marked as watched" or "added to a list" event for a given
+// title -- feeds the admin dashboard's Trending Data tab, which is meant
+// to eventually seed this add-on's own trending/popular catalogs once
+// there's enough data. Bucketed by Eastern calendar day (see
+// easternDateKey) rather than a raw event log, so an arbitrary rolling
+// window (7/30/90 days) can be summed later without needing a real
+// time-series database -- evtdayindex tracks which title ids had any
+// activity on a given day, so the dashboard only has to sum counts for
+// titles that were actually active in the requested window instead of
+// checking every title that's ever been tracked. KV has no atomic
+// increment (same tradeoff as bumpStat above), so this is a reasonable
+// running total, not an exact ledger.
+async function recordTrackedEvent(env, eventType, id, title, mediaType) {
+  if (!env || !env.CONFIGS || !id) return;
+  try {
+    const day = statsToday();
+    const dayKey = `evtcount:${eventType}:${id}:${day}`;
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const indexKey = `evtdayindex:${eventType}:${day}`;
+
+    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(dayKey),
+      env.CONFIGS.get(totalKey),
+      env.CONFIGS.get(indexKey),
+    ]);
+    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
+
+    let index = [];
+    try {
+      index = indexRaw ? JSON.parse(indexRaw) : [];
+    } catch {
+      index = [];
+    }
+    if (!index.includes(id)) index.push(id);
+
+    await Promise.all([
+      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(totalKey, String(totalCount)),
+      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      // Overwritten every time rather than only on first sight -- keeps
+      // title/mediaType current if either ever changes upstream, and
+      // lastSeen doubles as a cheap staleness signal in the dashboard.
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+    ]);
+  } catch (e) {
+    // best-effort -- never breaks the actual watch/list action riding along
+  }
+}
+
+// Computes a top-100 leaderboard of the most tracked titles for a given
+// event type ("watched" or "list-add") and time window -- powers the
+// admin dashboard's Trending Data tab. See recordTrackedEvent's own
+// comment for the underlying data model. "today"/"7"/"30"/"90" sum via
+// each day's index (bounded to titles that were actually active
+// somewhere in that window, not every title ever tracked); "alltime"
+// reads each title's running total directly instead, since there's no
+// day-index for it that would need summing. mediaTypeFilter ("movie" /
+// "series" / falsy for both) is applied before the top-100 cut, not
+// after, so filtering to just movies still returns up to 100 movies
+// instead of whatever happened to survive filtering an already-mixed
+// top 100.
+async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
+  if (!env || !env.CONFIGS) return [];
+  const prefix = `evtcount:${eventType}:`;
+  const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
+
+  if (window === "alltime") {
+    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    const entries = await Promise.all(
+      alltimeKeys.map(async (k) => {
+        const id = k.name.slice(prefix.length, -":alltime".length);
+        const [countRaw, metaRaw] = await Promise.all([
+          env.CONFIGS.get(k.name),
+          env.CONFIGS.get(`evtmeta:${eventType}:${id}`),
+        ]);
+        let title = id;
+        let mediaType = "";
+        try {
+          if (metaRaw) {
+            const meta = JSON.parse(metaRaw);
+            title = meta.title || id;
+            mediaType = meta.mediaType || "";
+          }
+        } catch {
+          // fall back to raw id as the title
+        }
+        return { id, title, mediaType, count: parseInt(countRaw, 10) || 0 };
+      })
+    );
+    const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
+    filtered.sort((a, b) => b.count - a.count);
+    return filtered.slice(0, 100);
+  }
+
+  const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+  const nowMs = Date.now();
+  const dateKeys = [];
+  for (let i = 0; i < days; i++) {
+    dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+  }
+
+  // Union of every title id that had any activity anywhere in this window.
+  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtdayindex:${eventType}:${d}`)));
+  const idSet = new Set();
+  indexResults.forEach((raw) => {
+    if (!raw) return;
+    try {
+      JSON.parse(raw).forEach((id) => idSet.add(id));
+    } catch {
+      // skip an unparseable day index rather than failing the whole window
+    }
+  });
+  const ids = [...idSet].slice(0, 500); // defensive cap, see the size-guard convention used elsewhere in this file
+
+  const entries = await Promise.all(
+    ids.map(async (id) => {
+      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtcount:${eventType}:${id}:${d}`)));
+      const count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
+      const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
+      let title = id;
+      let mediaType = "";
+      try {
+        if (metaRaw) {
+          const meta = JSON.parse(metaRaw);
+          title = meta.title || id;
+          mediaType = meta.mediaType || "";
+        }
+      } catch {
+        // fall back to raw id as the title
+      }
+      return { id, title, mediaType, count };
+    })
+  );
+  const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
+  filtered.sort((a, b) => b.count - a.count);
+  return filtered.slice(0, 100);
+}
+
+// Lean sibling of recordTrackedEvent used only by the trending-data
+// backfill (26_api-creator-and-admin-routes.js) -- updates just the
+// all-time counter and metadata for a title, skipping the day-bucket and
+// day-index writes recordTrackedEvent also does. Backfilling from
+// existing Watch History/Custom List data has no natural "today" to
+// bucket it under, and walking real historical per-day data would
+// multiply KV operations well past a single Worker invocation's practical
+// budget (Cloudflare's free-plan subrequest limit in particular) for any
+// account with meaningful history. All-time-only is also the
+// semantically correct home for this anyway: a rolling "last 7 days"
+// window showing something watched two years ago wouldn't make sense
+// even if it were cheap to compute. Returns true/false so the caller can
+// track how many titles it actually got through this call.
+async function backfillTitleCount(env, eventType, id, title, mediaType, incrementBy) {
+  if (!env || !env.CONFIGS || !id || !incrementBy) return false;
+  try {
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const totalRaw = await env.CONFIGS.get(totalKey);
+    const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
+    await Promise.all([
+      env.CONFIGS.put(totalKey, String(total)),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+    ]);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // The group names bumpStatBy above gets called with ultimately come from
 // the client's own collectEntries() -- not attacker-controlled in the
 // normal case, but /api/track-install has no auth on it (same as the
@@ -222,15 +415,27 @@ async function renderAdminDashboard(env) {
       } catch {
         // fall back to the raw username slug above
       }
-      return { username, displayName, createdAt };
+      // Best-effort -- see touchCreatorLastSeen's own comment. An account
+      // that predates this feature, or simply hasn't made an authenticated
+      // request since it shipped, just shows as "\u2014" below rather than
+      // a wrong or misleading date.
+      let lastActive = null;
+      try {
+        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+        lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
+      } catch {
+        // non-critical
+      }
+      return { username, displayName, createdAt, lastActive };
     })
   );
-  creatorAccounts.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
   const accountRows = creatorAccounts
     .map(
       (c) =>
         `<tr><td>${escapeHtmlServer(c.displayName)}</td><td>${escapeHtmlServer(c.username)}</td>` +
-        `<td>${c.createdAt ? new Date(c.createdAt).toISOString().slice(0, 10) : "\u2014"}</td></tr>`
+        `<td>${c.createdAt ? easternDateKey(new Date(c.createdAt)) : "\u2014"}</td>` +
+        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td></tr>`
     )
     .join("");
   const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
@@ -280,6 +485,16 @@ async function renderAdminDashboard(env) {
   .admin-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
+  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.9rem; margin-right:8px; }
+  .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
+  .admin-badge.bug { background:rgba(255,59,48,0.12); color:#FF3B30; }
+  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:#007AFF; }
+  .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
+  .admin-badge.other { background:rgba(142,142,147,0.15); color:#636366; }
+  .feedback-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px 16px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .feedback-card.completed { opacity:0.55; }
+  .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
@@ -289,6 +504,8 @@ async function renderAdminDashboard(env) {
     <button type="button" class="admin-tab-btn active" data-admin-tab="last30" onclick="switchAdminTab('last30')">Last 30 Days</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="creators" onclick="switchAdminTab('creators')">Creator accounts</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="sources" onclick="switchAdminTab('sources')">Sources people use</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="trending" onclick="switchAdminTab('trending')">Trending Data</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="feedback" onclick="switchAdminTab('feedback')">Feedback</button>
   </div>
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
@@ -309,8 +526,8 @@ async function renderAdminDashboard(env) {
       <div class="stat-card"><div class="stat-value">${creatorAccounts.length}</div><div class="stat-label">Creator accounts${truncatedNote}</div></div>
     </div>
     <table>
-      <tr><th>Display name</th><th>Username</th><th>Created</th></tr>
-      ${accountRows || '<tr><td colspan="3">No accounts yet.</td></tr>'}
+      <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
+      ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
     </table>
   </div>
 
@@ -322,11 +539,221 @@ async function renderAdminDashboard(env) {
     </table>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="trending">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <div style="margin:12px 0;">
+      <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
+        <option value="watched">Most Watched</option>
+        <option value="list-add">Most Added to Lists</option>
+      </select>
+      <select class="admin-select" id="trendingWindowSelect" onchange="loadTrendingData()">
+        <option value="today">Today</option>
+        <option value="7" selected>Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+        <option value="alltime">All Time</option>
+      </select>
+      <select class="admin-select" id="trendingMediaTypeSelect" onchange="loadTrendingData()">
+        <option value="">Movies + Shows</option>
+        <option value="movie">Movies Only</option>
+        <option value="series">Shows Only</option>
+      </select>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="backfillTrendingBtn" onclick="runBackfillTrending()">Backfill Existing Data</button>
+      <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+    <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
+    <table>
+      <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
+      <tbody id="trendingTableBody"><tr><td colspan="4">Loading\u2026</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="feedback">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Bug reports, improvement requests, and ideas submitted from Settings &gt; Feedback, newest first.</p>
+    <div class="feedback-card">
+      <div style="font-weight:600; margin-bottom:8px;">Log something yourself</div>
+      <select class="admin-select" id="newFeedbackCategory" style="margin-bottom:8px;">
+        <option value="bug" selected>Bug</option>
+        <option value="improvement">Improvement</option>
+        <option value="idea">Idea</option>
+        <option value="other">Other</option>
+      </select>
+      <textarea id="newFeedbackMessage" placeholder="What did you find?" style="width:100%; min-height:70px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical;"></textarea>
+      <div style="margin-top:8px; display:flex; align-items:center; gap:10px;">
+        <button type="button" class="admin-select" style="cursor:pointer;" id="newFeedbackSubmitBtn" onclick="submitAdminFeedback()">Add to list</button>
+        <span id="newFeedbackStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+    </div>
+    <div id="feedbackList">Loading\u2026</div>
+  </div>
+
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
   <script>
     function switchAdminTab(tabId) {
       document.querySelectorAll('.admin-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.adminTab === tabId));
       document.querySelectorAll('.admin-tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.adminPanel === tabId));
+      if (tabId === 'trending' && !window._trendingLoadedOnce) { window._trendingLoadedOnce = true; loadTrendingData(); }
+      if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
+    }
+
+    function escapeHtmlAdmin(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function loadTrendingData() {
+      const body = document.getElementById('trendingTableBody');
+      body.innerHTML = '<tr><td colspan="4">Loading\u2026</td></tr>';
+      const type = document.getElementById('trendingTypeSelect').value;
+      const win = document.getElementById('trendingWindowSelect').value;
+      const mediaType = document.getElementById('trendingMediaTypeSelect').value;
+      try {
+        const res = await fetch('/admin/api/leaderboard?type=' + encodeURIComponent(type) + '&window=' + encodeURIComponent(win) + (mediaType ? '&mediaType=' + encodeURIComponent(mediaType) : ''));
+        const data = await res.json();
+        if (!data.ok || !data.entries || !data.entries.length) {
+          body.innerHTML = '<tr><td colspan="4">No data yet for this window.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.entries.map((e, i) =>
+          '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(e.title || e.id) + '</td><td>' + escapeHtmlAdmin(e.mediaType === 'series' ? 'Show' : 'Movie') + '</td><td>' + e.count + '</td></tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="4">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    async function runBackfillTrending() {
+      const btn = document.getElementById('backfillTrendingBtn');
+      const status = document.getElementById('backfillTrendingStatus');
+      btn.disabled = true;
+      let accountsDone = 0;
+      let titlesDone = 0;
+      let safetyCounter = 0;
+      // safetyCounter guards against an unexpected infinite loop (e.g. a
+      // bug that never returns done:true) -- 500 calls is comfortably
+      // past what any realistic account count needs right now, and this
+      // is a manual, admin-triggered action, not something that runs
+      // unattended.
+      try {
+        while (safetyCounter < 500) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/backfill-trending', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ', ' + titlesDone + ' title update' + (titlesDone === 1 ? '' : 's') + '.';
+            break;
+          }
+          accountsDone += data.accountsThisCall || 0;
+          titlesDone += data.titlesThisCall || 0;
+          status.textContent = 'Working\u2026 ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ' processed so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (processed ' + accountsDone + ' accounts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+    }
+
+    async function loadFeedback() {
+      const box = document.getElementById('feedbackList');
+      box.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/feedback');
+        const data = await res.json();
+        if (!data.ok || !data.entries || !data.entries.length) {
+          box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
+          return;
+        }
+        // Open (not completed) first, newest within each group -- the
+        // fetch itself already comes back newest-first, so this only
+        // needs to separate the two groups without disturbing that order.
+        const open = data.entries.filter((f) => !f.completed);
+        const done = data.entries.filter((f) => f.completed);
+        box.innerHTML = open.map(feedbackCardHtml).join('') +
+          (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
+          (data.truncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+      } catch (e) {
+        box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
+      }
+    }
+
+    function feedbackCardHtml(f) {
+      const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
+      const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
+      const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
+      const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
+      const completed = !!f.completed;
+      return '<div class="feedback-card' + (completed ? ' completed' : '') + '">' +
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
+          '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+          '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ', this)">' +
+            (completed ? '\u21a9 Mark not completed' : '\u2713 Mark completed') +
+          '</button>' +
+        '</div>' +
+        '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
+        '<div class="feedback-meta">' + when + ' \u2014 ' + who + contact + '</div>' +
+        '</div>';
+    }
+
+    // Lets the admin log an issue directly from the dashboard, without
+    // going through Settings > Feedback -- posts to the same /api/feedback
+    // endpoint real users hit, just tagged so it's obviously self-logged
+    // in the list below.
+    async function submitAdminFeedback() {
+      const category = document.getElementById('newFeedbackCategory').value;
+      const messageBox = document.getElementById('newFeedbackMessage');
+      const message = messageBox.value.trim();
+      const status = document.getElementById('newFeedbackStatus');
+      const btn = document.getElementById('newFeedbackSubmitBtn');
+      if (!message) {
+        status.textContent = 'Type something first.';
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = 'Saving\u2026';
+      try {
+        const res = await fetch('/api/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: category, message: message, creatorName: 'admin' }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          status.textContent = (data && data.error) || 'Could not save -- try again.';
+          btn.disabled = false;
+          return;
+        }
+        messageBox.value = '';
+        status.textContent = 'Added.';
+        loadFeedback();
+      } catch (e) {
+        status.textContent = 'Could not save -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    async function toggleFeedbackStatus(id, completed, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch('/admin/api/feedback/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, completed: completed }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          if (btn) btn.disabled = false;
+          alert((data && data.error) || 'Could not update -- try again.');
+          return;
+        }
+        loadFeedback();
+      } catch (e) {
+        if (btn) btn.disabled = false;
+        alert('Could not update -- check your connection.');
+      }
     }
   </script>
 </body></html>`;

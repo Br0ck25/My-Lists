@@ -112,6 +112,7 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
     updateCustomListTypeRadio(itemType);
     renderCustomListDraftList();
     if (btn) btn.textContent = 'Added \u2713';
+    if (typeof trackEvent === 'function') trackEvent('list-add', data.imdbId, title, itemType);
   } catch (e) {
     alert('Network error adding "' + title + '".');
     if (btn) {
@@ -803,6 +804,9 @@ window.toggleWatchStatus = function(id, type, name, poster) {
     }
     list.items.unshift(item);
     window._watchedItemIds.add(id);
+    if (typeof trackEvent === 'function') {
+      trackEvent('watched', item.showId || id, item.showTitle || name, type === 'movie' ? 'movie' : 'series');
+    }
   }
   
   list.updatedAt = Date.now();
@@ -872,6 +876,17 @@ window.toggleBatchWatchStatus = function(items) {
       }
       window._watchedItemIds.add(id);
     });
+    if (typeof trackEventsBatch === 'function') {
+      const seen = new Set();
+      const trackItems = [];
+      items.forEach((it) => {
+        const key = it.showId || it.id;
+        if (seen.has(key)) return;
+        seen.add(key);
+        trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+      });
+      trackEventsBatch('watched', trackItems);
+    }
   }
 
   list.updatedAt = Date.now();
@@ -916,6 +931,17 @@ window.addItemsToWatchHistory = async function(items) {
     added++;
   });
   if (!added) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
+  if (typeof trackEventsBatch === 'function') {
+    const seen = new Set();
+    const trackItems = [];
+    items.forEach((it) => {
+      const key = it.showId || it.id;
+      if (seen.has(key)) return;
+      seen.add(key);
+      trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+    });
+    trackEventsBatch('watched', trackItems);
+  }
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);

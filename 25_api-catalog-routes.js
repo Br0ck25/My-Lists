@@ -1092,6 +1092,93 @@ self.addEventListener('fetch', e => {
       }
     }
 
+    // /api/feedback  (POST)  { category, message, contact?, creatorName? } -> { ok }
+    // Settings > Feedback. No auth required -- anyone should be able to
+    // report a bug or suggest something without needing a Creator Profile
+    // first; creatorName is attached only if the person happens to be
+    // signed in, purely so it's visible in the admin dashboard, not
+    // verified against anything. Stored under a key that sorts
+    // chronologically as a plain string (zero-padded millisecond epoch),
+    // so the admin dashboard can list newest-first without needing to
+    // parse and sort every value first.
+    if (path === "/api/feedback" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const message = String(body.message || "").trim();
+      if (!message) return json({ ok: false, error: "Message can't be empty." }, 400);
+      if (message.length > 4000) return json({ ok: false, error: "That's a bit long -- please keep it under 4000 characters." }, 400);
+      const allowedCategories = new Set(["bug", "improvement", "idea", "other"]);
+      const category = allowedCategories.has(body.category) ? body.category : "other";
+      const contact = String(body.contact || "").trim().slice(0, 200);
+      const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+
+      // Simple per-IP rate limit (5/hour) -- KV's read-then-write isn't
+      // atomic (see bumpStat's own comment on the same tradeoff elsewhere
+      // in this file), so this is a deterrent against casual spam/abuse,
+      // not a hard guarantee against a determined actor.
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
+      const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+      const rateCount = parseInt(rateCountRaw, 10) || 0;
+      if (rateCount >= 5) {
+        return json({ ok: false, error: "You've sent a few of these already today -- try again tomorrow, or reach out another way if it's urgent." });
+      }
+
+      const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        id, category, message, contact: contact || null, creatorName,
+        createdAt: Date.now(),
+        completed: false,
+        // Recorded for basic spam triage in the admin dashboard, not
+        // shown to anyone else and never used for anything beyond that.
+        userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
+      };
+      try {
+        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+      } catch (e) {
+        return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
+    // /api/track-event  (POST)  { events: [{ eventType, id, title, mediaType }, ...] } -> { ok }
+    // Fire-and-forget analytics beacon feeding recordTrackedEvent above --
+    // "watched" for anything marked watched, "list-add" for anything added
+    // to a Custom List. No auth, and always answers ok (even when nothing
+    // was actually recorded) so a client never needs to treat this as
+    // something that can meaningfully fail -- it's genuinely optional
+    // telemetry, not something any real feature depends on.
+    if (path === "/api/track-event" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const events = Array.isArray(body.events) ? body.events.slice(0, 50) : [];
+      const allowedTypes = new Set(["watched", "list-add"]);
+      await Promise.all(
+        events.map((e) => {
+          if (!e || !allowedTypes.has(e.eventType) || !e.id) return Promise.resolve();
+          return recordTrackedEvent(
+            env,
+            e.eventType,
+            String(e.id).slice(0, 100),
+            String(e.title || "").slice(0, 200),
+            e.mediaType === "series" ? "series" : "movie"
+          );
+        })
+      );
+      return json({ ok: true });
+    }
+
     // /api/mdblist-my-lists?apikey=...
     // -> powers the "Your MDBList Lists" section in the builder: every list
     // the API key's own account has created (not just the built-in

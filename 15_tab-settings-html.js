@@ -57,5 +57,31 @@
       </div>
     </div>
   </div>
+
+  <!-- Submenu 3: Feedback -->
+  <div class="settings-subpanel" id="settingsSubFeedback" style="display:none;">
+    <div class="panel">
+      <h2 class="panel-title">Send Feedback</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Found a bug, have an idea, or want to see something improved? This goes straight to the developer.</p>
+      <div class="row">
+        <select id="feedbackCategorySelect">
+          <option value="bug">Bug</option>
+          <option value="improvement">Improvement</option>
+          <option value="idea">Idea</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <textarea id="feedbackMessageInput" rows="5" style="width:100%;" placeholder="What's on your mind?"></textarea>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="feedbackContactInput" placeholder="Contact info (optional) — email, Discord, etc., if you want a reply">
+      </div>
+      <div class="actions" style="margin-top:10px;">
+        <button type="button" class="primary" id="feedbackSubmitBtn" onclick="submitFeedback()">Send feedback</button>
+      </div>
+      <p id="feedbackStatus" style="margin-top:8px;"></p>
+    </div>
+  </div>
 </div>
 </div>

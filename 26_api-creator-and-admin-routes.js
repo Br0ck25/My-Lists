@@ -23,6 +23,9 @@
       }
       const valid = await verifyCreatorKey(creatorKey || "", profile.keyHash);
       if (!valid) return { ok: false, error: "Username or Key is incorrect." };
+      // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
+      // comment for why this is throttled and safe to never wait on.
+      touchCreatorLastSeen(env, v.normalized);
       return { ok: true, username: v.normalized, displayName: profile.displayName };
     }
 
@@ -932,39 +935,260 @@
       const itemsHtml = listData.items
         .map(
           (it) =>
-            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.08);">` +
-            (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:40px;height:60px;object-fit:cover;border-radius:4px;flex:none;">` : "") +
-            `<span>${escapeHtmlServer(it.title || "Untitled")}${it.year ? " (" + escapeHtmlServer(it.year) + ")" : ""}</span></div>`
+            `<a href="/${it.type || 'movie'}/${it.tmdb_id || ''}" style="display:flex; flex-direction:column; gap:6px; width:100%; min-width:0; text-decoration:none;">` +
+            `<div style="aspect-ratio:2/3; border-radius:8px; overflow:hidden; background:var(--panel-strong); box-shadow:var(--shadow-sm); width:100%;">` +
+            (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:100%; height:100%; object-fit:cover; display:block;" loading="lazy">` : ``) +
+            `</div>` +
+            `<div style="font-size:0.85rem; font-weight:600; color:var(--text); text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtmlServer(it.title || it.name || "Item")}</div>` +
+            `</a>`
         )
         .join("");
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
       const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtmlServer(listData.name)} \u2014 My Lists</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
-  a { color:#007AFF; }
-  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:20px; margin-top:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  code { background:#F2F2F7; padding:2px 6px; border-radius:6px; word-break:break-all; }
-  button { background:#007AFF; color:#fff; border:none; border-radius:10px; padding:10px 16px; font-size:0.95rem; font-weight:600; cursor:pointer; }
-  button:hover { background:#0062CC; }
-  button:disabled { opacity:0.6; cursor:default; }
-</style></head>
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --radius-pill: 999px;
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --surface: #1C1C1E;
+      --panel-strong: #2C2C2E;
+      --border: rgba(255,255,255,0.15);
+      --border-strong: rgba(255,255,255,0.25);
+      --text: #FFFFFF;
+      --text-2: #EBEBF5;
+    }
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  html { touch-action: manipulation; width: 100%; max-width: 100%; overflow-x: hidden; }
+  body {
+    font-family: var(--font-body);
+    margin: 0;
+    min-height: 100vh;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+    padding: 16px 12px calc(80px + env(safe-area-inset-bottom));
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 1200px;
+    width: 100%;
+    margin: 0 auto;
+    display: grid;
+    gap: 12px;
+    overflow-x: hidden;
+  }
+  @media (min-width: 641px) {
+    body { padding: 32px 20px 52px; }
+    .page { gap: 16px; }
+  }
+  .app-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px 4px 8px;
+  }
+  .app-header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .app-header-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    box-shadow: var(--shadow-sm);
+    object-fit: cover;
+  }
+  .app-header-title-group {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .app-header-title {
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    color: var(--text);
+    margin: 0;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .header-actions { display: flex; gap: 8px; margin-left: auto; align-items:center; }
+  
+  .tab-bar {
+    display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px;
+    margin-bottom: 4px; scrollbar-width: none;
+  }
+  .tab-btn {
+    flex: none; background: var(--surface); color: var(--text-2);
+    border: 1.5px solid var(--border-strong); border-radius: 999px; padding: 8px 16px;
+    font-size: 0.875rem; font-weight: 600; cursor: pointer; text-decoration: none;
+    box-shadow: var(--shadow-sm); transition: all 0.15s;
+  }
+  .tab-btn.active {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+    box-shadow: 0 2px 10px rgba(0,122,255,0.30);
+  }
+  .tab-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
+
+    .lc-btn {
+    padding: 6px 12px; min-height: unset;
+    font-size: 0.8rem; font-weight: 600;
+    border-radius: var(--radius-pill);
+    border: 1.5px solid var(--border-strong);
+    background: var(--bg); color: var(--text-2);
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    font-family: inherit; white-space: nowrap; text-decoration: none;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  
+  .detail-back-btn {
+    display: flex; align-items: center; gap: 6px;
+    background: none; border: none; font-size: 1.1rem;
+    font-weight: 700; color: var(--accent); cursor: pointer; padding: 4px 0; text-decoration: none;
+  }
+  
+  .subnav-pill {
+    flex: none; padding: 7px 16px; border-radius: var(--radius-pill); border: 1.5px solid var(--border-strong);
+    background: var(--surface); color: var(--text-2); font-size: 0.86rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+    box-shadow: var(--shadow-sm); font-family: inherit; margin: 0; text-decoration: none;
+  }
+  .subnav-pill.active {
+    background: var(--accent); color: #ffffff; border-color: var(--accent); box-shadow: 0 2px 8px rgba(0,122,255,0.28);
+  }
+
+  .poster-grid-3 {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; width: 100%;
+  }
+  @media (min-width: 641px) {
+    .poster-grid-3 {
+      grid-template-columns: repeat(9, 1fr); gap: 12px 8px;
+    }
+  }
+
+  code { background: var(--panel-strong); padding: 4px 8px; border-radius: 6px; word-break: break-all; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
 <body>
-  <h1 style="margin-bottom:4px;">${escapeHtmlServer(listData.name)}</h1>
-  <p style="color:#8E8E93; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
-  <button type="button" id="likeListBtn" style="margin-top:10px;">\u2661 Like</button>
-  <div class="card">
-    <p><strong>Add this to your own My Lists Addon:</strong> paste this URL in as a list source --</p>
-    <p><code>${shareUrl}</code></p>
-    <p><small><a href="${shareUrl}.json">View as JSON</a></small></p>
+  <div class="page">
+    <!-- Top App Bar -->
+    <header class="app-header">
+      <div class="app-header-left">
+        <img class="app-header-avatar" src="/icon.png" alt="App Icon">
+        <div class="app-header-title-group">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <h1 class="app-header-title">My Lists Addon</h1>
+            <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:0; margin-top:2px;" title="Toggle Dark Mode">🌓</button>
+          </div>
+        </div>
+      </div>
+      <div class="header-actions" id="authActions">
+        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <button type="button" class="lc-btn primary" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">+ Create Account</button>
+            <button type="button" class="lc-btn" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem;">Restore</button>
+          </div>
+          <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>
+        </div>
+      </div>
+    </header>
+
+    <!-- Top Tab Bar -->
+    <div class="tab-bar">
+      <a href="/" class="tab-btn">My Catalogs</a>
+      <a href="/" class="tab-btn active">Lists</a>
+      <a href="/" class="tab-btn">Discover</a>
+      <a href="/" class="tab-btn">Search</a>
+      <a href="/" class="tab-btn">Settings</a>
+    </div>
+
+    <div style="margin-bottom: 32px;">
+      <a href="/" class="tab-btn" style="text-decoration:none;">&larr; Back</a>
+    </div>
+
+    <div style="margin-bottom:32px;">
+      <h2 style="font-size:2.5rem; font-weight:700; margin:0 0 16px; letter-spacing:-0.02em;">${escapeHtmlServer(listData.name)}</h2>
+      <div style="color:var(--text-2); font-size:1.05rem; margin-bottom:16px;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></div>
+      <button type="button" class="lc-btn primary" id="likeListBtn">\u2661 Like</button>
+    </div>
+
+
+
+    <div class="poster-grid-3">
+      ${itemsHtml}
+    </div>
   </div>
-  <div class="card">${itemsHtml}</div>
+
   <script>
   (function () {
     var USERNAME = ${JSON.stringify(username)};
     var SLUG = ${JSON.stringify(listName)};
     var KEY = USERNAME + '/' + SLUG;
+    
+    // Auth header
+    try {
+      var cname = localStorage.getItem('myListAddon:creatorName');
+      if (cname) {
+        cname = cname.replace(/NaN/gi, '').replace(/undefined/gi, '').replace(/null/gi, ''); // Fix corrupted local storage
+        if (!cname || cname.trim() === '') cname = "Account";
+        cname = cname.charAt(0).toUpperCase() + cname.slice(1);
+        var actions = document.getElementById('authActions');
+        actions.innerHTML = '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+          '<span class="subnav-pill active" style="margin:0; font-size:0.82rem; padding:6px 12px; cursor:pointer;" onclick="location.href=\'/\'">&#x1F464; ' + cname.replace(/</g, '&lt;') + '</span>' +
+          '<button type="button" class="lc-btn" style="padding:5px 9px; font-size:0.78rem;" onclick="location.href=\'/\'" title="Sign Out / Switch">Sign Out</button>' +
+          '</div>' +
+          '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
+          '</div>';
+      }
+    } catch(e) {}
+
     var btn = document.getElementById('likeListBtn');
     function getLiked() {
       try { return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]')); } catch (e) { return new Set(); }
@@ -1004,9 +1228,6 @@
           btn.textContent = '\\u2665 Unlike';
         }
         document.getElementById('likeCountDisplay').textContent = '\\u2665 ' + data.likes;
-        // If this browser was signed into a Creator Profile on the builder
-        // page, persist the like to that account too -- fire-and-forget,
-        // same as the rest of this add-on's account sync.
         try {
           var creatorName = localStorage.getItem('myListAddon:creatorName');
           var creatorKey = localStorage.getItem('myListAddon:creatorKey');
@@ -1026,8 +1247,9 @@
     });
   })();
   </script>
-</body></html>`;
-      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() } });
+</body>
+</html>`;
+      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", ...corsHeaders() } });
     }
 
     // --- Admin dashboard (page views / install links generated) -----------
@@ -1045,6 +1267,190 @@
       }
       const html = await renderAdminDashboard(env);
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    }
+
+    // /admin/api/leaderboard?type=watched|list-add&window=today|7|30|90|alltime&mediaType=movie|series
+    // -> { ok, entries } -- backs the Trending Data tab's dropdown, computed
+    // on demand rather than eagerly for every window/type combo on every
+    // page load (see computeLeaderboard's own comment on why this can fan
+    // out to a meaningful number of KV reads). mediaType is optional --
+    // omitted or anything else means both movies and shows together.
+    if (path === "/admin/api/leaderboard" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const eventType = url.searchParams.get("type") === "list-add" ? "list-add" : "watched";
+      const allowedWindows = new Set(["today", "7", "30", "90", "alltime"]);
+      const window = allowedWindows.has(url.searchParams.get("window")) ? url.searchParams.get("window") : "7";
+      const mediaTypeParam = url.searchParams.get("mediaType");
+      const mediaType = mediaTypeParam === "movie" || mediaTypeParam === "series" ? mediaTypeParam : null;
+      const entries = await computeLeaderboard(env, eventType, window, mediaType);
+      return json({ ok: true, entries });
+    }
+
+    // /admin/api/backfill-trending  (POST) -> { ok, done, accountsThisCall, titlesThisCall }
+    // Seeds the All Time trending leaderboards (see backfillTitleCount's
+    // own comment on why all-time-only) from data that already existed
+    // before trending tracking shipped -- each creator account's Watch
+    // History (aggregated to distinct shows/movies, dedupe-by-showId same
+    // as the live tracking does) and their own Custom Lists' current
+    // items. Processes exactly one account per call, capped to a handful
+    // of titles from each source, to stay comfortably under Cloudflare's
+    // per-request subrequest limit -- the admin dashboard's "Backfill
+    // Existing Data" button calls this repeatedly until it reports
+    // done:true, so this only needs to make forward progress each call,
+    // not finish everything at once. Resumes via a cursor stored at
+    // backfilltrending:cursor (same list()-cursor pattern
+    // checkForNewEpisodes already uses for its own account sweep);
+    // starting the sweep over from the top once every account has been
+    // visited is intentional, so an account created after the last full
+    // pass eventually gets covered too, and running this again later
+    // picks up anyone whose history grew since the first pass -- entries
+    // just accumulate (each backfill run adds its own snapshot on top of
+    // whatever's already there, same as any other watch/list-add event
+    // would), it doesn't overwrite.
+    if (path === "/admin/api/backfill-trending" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, done: true, accountsThisCall: 0, titlesThisCall: 0 });
+
+      const WATCHED_TITLE_CAP = 6;
+      const LIST_ITEM_CAP = 6;
+
+      const cursorRaw = await env.CONFIGS.get("backfilltrending:cursor");
+      const listOpts = { prefix: "creator:", limit: 1 };
+      if (cursorRaw) listOpts.cursor = cursorRaw;
+      const listResult = await env.CONFIGS.list(listOpts);
+
+      if (!listResult.keys.length) {
+        // Reached the end of the account list (or there are no accounts
+        // at all) -- reset to the top so a later run starts fresh rather
+        // than permanently reporting "done" against a stale cursor.
+        await env.CONFIGS.put("backfilltrending:cursor", "");
+        return json({ ok: true, done: true, accountsThisCall: 0, titlesThisCall: 0 });
+      }
+      await env.CONFIGS.put("backfilltrending:cursor", listResult.list_complete ? "" : (listResult.cursor || ""));
+
+      const username = listResult.keys[0].name.slice("creator:".length);
+      let titlesThisCall = 0;
+
+      // Watch History -> "watched", aggregated to distinct shows/movies
+      // (episodes collapse to their show, same as live tracking).
+      try {
+        const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+        if (trackingRaw) {
+          const tracking = JSON.parse(trackingRaw);
+          const watchHistory = Array.isArray(tracking.watchHistory) ? tracking.watchHistory : [];
+          const counts = new Map(); // id -> { title, mediaType, count }
+          watchHistory.forEach((it) => {
+            const id = it.showId || it.id;
+            if (!id) return;
+            const title = it.showTitle || it.name || "";
+            const mediaType = it.type === "movie" ? "movie" : "series";
+            const existing = counts.get(id);
+            if (existing) existing.count++;
+            else counts.set(id, { title, mediaType, count: 1 });
+          });
+          const topTitles = [...counts.entries()].slice(0, WATCHED_TITLE_CAP);
+          for (const [id, info] of topTitles) {
+            const ok = await backfillTitleCount(env, "watched", id, info.title, info.mediaType, info.count);
+            if (ok) titlesThisCall++;
+          }
+        }
+      } catch (e) {
+        // Skip this account's Watch History on any read/parse error --
+        // still worth trying its Custom Lists below, and the account
+        // will simply be revisited on a future full pass.
+      }
+
+      // Custom Lists -> "list-add", using each list's current items
+      // (there's no historical "added at" timestamp to work from, only
+      // present membership -- see this endpoint's own comment on why
+      // that's fine for an all-time-only count). Lists directly, by this
+      // account's own creatorlist: prefix, rather than going through
+      // creatorlistorder:{username} (which tracks display order for
+      // reordering specifically, not guaranteed to be a complete
+      // inventory of every list the account has).
+      try {
+        const listsResult = await env.CONFIGS.list({ prefix: `creatorlist:${username}:`, limit: 20 });
+        let itemsSeen = 0;
+        for (const listKey of listsResult.keys) {
+          if (itemsSeen >= LIST_ITEM_CAP) break;
+          const listRaw = await env.CONFIGS.get(listKey.name);
+          if (!listRaw) continue;
+          const list = JSON.parse(listRaw);
+          const items = Array.isArray(list.items) ? list.items : [];
+          for (const it of items) {
+            if (itemsSeen >= LIST_ITEM_CAP) break;
+            const id = it.imdbId || it.id;
+            if (!id) continue;
+            const ok = await backfillTitleCount(env, "list-add", id, it.title || it.name || "", list.type === "series" ? "series" : "movie", 1);
+            if (ok) titlesThisCall++;
+            itemsSeen++;
+          }
+        }
+      } catch (e) {
+        // Skip this account's Custom Lists on any read/parse error.
+      }
+
+      return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
+    }
+
+    // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
+    // newest first. Reads up to 300 entries; feedback keys already sort
+    // chronologically as plain strings (see /api/feedback's own comment),
+    // so list() naturally returns oldest-first and this just reverses it.
+    if (path === "/admin/api/feedback" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, entries: [] });
+      const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 300 });
+      const keys = listResult.keys.slice().reverse();
+      const entries = await Promise.all(
+        keys.map(async (k) => {
+          try {
+            const raw = await env.CONFIGS.get(k.name);
+            return raw ? JSON.parse(raw) : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: listResult.list_complete === false });
+    }
+
+    // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
+    // Toggles the "completed" flag on one feedback entry -- id here is the
+    // entry's own id field (the part of the KV key after "feedback:"), not
+    // the full key name, so the client never needs to know the storage
+    // layout to mark something done.
+    if (path === "/admin/api/feedback/status" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      if (!id) return json({ ok: false, error: "Missing id." }, 400);
+      const key = `feedback:${id}`;
+      const raw = await env.CONFIGS.get(key);
+      if (!raw) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
+      let entry;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+      }
+      entry.completed = !!body.completed;
+      try {
+        await env.CONFIGS.put(key, JSON.stringify(entry));
+      } catch (e) {
+        return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
+      }
+      return json({ ok: true });
     }
 
     if (path === "/admin/login" && request.method === "POST") {

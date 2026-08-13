@@ -1009,7 +1009,10 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   btn.disabled = false;
   btn.textContent = 'Done';
   
-  if (anyAdded) showAddedToast('Added ' + title + ' to lists.');
+  if (anyAdded) {
+    showAddedToast('Added ' + title + ' to lists.');
+    if (typeof trackEvent === 'function') trackEvent('list-add', finalImdbId, title, type);
+  }
   else if (anyRemoved && typeof showAddedToast === 'function') showAddedToast('Removed ' + title + ' from lists.');
 });
 

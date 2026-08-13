@@ -102,14 +102,6 @@ function switchTab(name) {
   if (name === 'discover') {
     filterDiscoverShelves('all', document.querySelector('#discoverSubnavBar button:nth-child(1)'));
   }
-  if (name === 'catalogs') {
-    // Same "load automatically when the tab opens" treatment Lists/Discover
-    // already get above -- Catalogs was the one tab still requiring a
-    // manual "Refresh Preview" click just to see anything, even on the
-    // very first visit with shelves already configured (e.g. from an
-    // existing install link).
-    if (typeof renderLivePreview === 'function') renderLivePreview();
-  }
 }
 
 function showAddedToast(msg) {
@@ -154,8 +146,7 @@ function switchListsSubmenu(name, btn) {
     'curated': 'listsSubCurated',
     'bulk': 'listsSubBulk',
     'create-list': 'listsSubCreateList',
-      'list-search': 'listsSubListSearch',
-      'import': 'listsSubImport'
+      'list-search': 'listsSubListSearch'
   };
   Object.keys(subpanels).forEach(function(k) {
     const el = document.getElementById(subpanels[k]);
@@ -187,7 +178,8 @@ function switchSettingsSubmenu(name, btn) {
   }
   const subpanels = {
     'keys': 'settingsSubKeys',
-    'backup': 'settingsSubBackup'
+    'backup': 'settingsSubBackup',
+    'feedback': 'settingsSubFeedback'
   };
   Object.keys(subpanels).forEach(function(k) {
     const el = document.getElementById(subpanels[k]);
@@ -196,6 +188,75 @@ function switchSettingsSubmenu(name, btn) {
   const activeId = subpanels[name];
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
+}
+
+// Sends a Settings > Feedback submission to the server -- deliberately
+// works with or without a Creator Profile (attaches the username if
+// signed in, purely informational, not required) since anyone should be
+// able to report a bug or suggest something without needing an account
+// first.
+async function submitFeedback() {
+  const btn = document.getElementById('feedbackSubmitBtn');
+  const statusEl = document.getElementById('feedbackStatus');
+  const category = document.getElementById('feedbackCategorySelect').value;
+  const message = document.getElementById('feedbackMessageInput').value.trim();
+  const contact = document.getElementById('feedbackContactInput').value.trim();
+  if (!message) {
+    if (statusEl) { statusEl.textContent = 'Write something first.'; statusEl.style.color = 'var(--danger)'; }
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) { statusEl.textContent = 'Sending\u2026'; statusEl.style.color = 'var(--muted)'; }
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: category,
+        message: message,
+        contact: contact,
+        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok) {
+      if (statusEl) { statusEl.textContent = 'Thanks \u2014 sent.'; statusEl.style.color = 'var(--accent)'; }
+      document.getElementById('feedbackMessageInput').value = '';
+      document.getElementById('feedbackContactInput').value = '';
+    } else {
+      if (statusEl) { statusEl.textContent = (data && data.error) || 'Could not send \u2014 try again in a moment.'; statusEl.style.color = 'var(--danger)'; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = 'Could not send \u2014 check your connection.'; statusEl.style.color = 'var(--danger)'; }
+  }
+  if (btn) btn.disabled = false;
+}
+
+// Fire-and-forget analytics beacon feeding recordTrackedEvent server-side
+// (see its own comment) -- never awaited by callers, and wrapped so a
+// failure here can never disrupt the actual watch/list action it's riding
+// along on. keepalive lets the request finish even if the page navigates
+// away right after (e.g. right after adding something and switching tabs).
+function trackEvent(eventType, id, title, mediaType) {
+  trackEventsBatch(eventType, [{ id: id, title: title, mediaType: mediaType }]);
+}
+
+function trackEventsBatch(eventType, items) {
+  if (!items || !items.length) return;
+  try {
+    const events = items.slice(0, 50)
+      .filter((it) => it && it.id)
+      .map((it) => ({ eventType: eventType, id: String(it.id), title: it.title || '', mediaType: it.mediaType === 'series' ? 'series' : 'movie' }));
+    if (!events.length) return;
+    fetch(ORIGIN + '/api/track-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: events }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) {
+    // non-critical -- this is optional telemetry, not a real feature
+  }
 }
 
 function filterDiscoverShelves(filter, btn) {
@@ -711,8 +772,8 @@ function addRow(name, url, type, enabled, group, channelId) {
           </div>
           <div class="entry-type-row" style="width: auto;">
             <select class="type" \${(isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : ''}>
-              <option value="movie" \${(type==='movie'||(isCustomList&&type==='movie'))?'selected':''}>&#x1F3AC; Movies</option>
-              <option value="series" \${(type==='series'||isChannel||(isCustomList&&type==='series'))?'selected':''}>&#x1F4FA; Shows</option>
+              <option value="movie" \${(type==='movie'||(isCustomList&&type==='movie'))?'selected':''}>Movies</option>
+              <option value="series" \${(type==='series'||isChannel||(isCustomList&&type==='series'))?'selected':''}>Shows</option>
             </select>
           </div>
         </div>

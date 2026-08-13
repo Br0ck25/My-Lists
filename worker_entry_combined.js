@@ -1876,6 +1876,199 @@ async function bumpStatBy(env, kind, amount) {
   }
 }
 
+// Records roughly how recently a creator account was last active -- feeds
+// the "Last Active" column in the admin dashboard's Creator Accounts tab.
+// Throttled to at most once per 30 minutes per account (one extra read to
+// check, skipped write if already recent) so a burst of debounced
+// autosaves during a single active session doesn't turn into a KV write
+// on every one of them -- called from authenticateCreator on every
+// successful auth, fire-and-forget (never awaited there), so this can
+// never add latency or a failure mode to the actual authenticated action
+// it's riding along with.
+async function touchCreatorLastSeen(env, username) {
+  if (!env || !env.CONFIGS || !username) return;
+  try {
+    const key = `creatorlastseen:${username}`;
+    const raw = await env.CONFIGS.get(key);
+    const last = parseInt(raw, 10) || 0;
+    if (Date.now() - last < 30 * 60 * 1000) return; // updated recently enough
+    await env.CONFIGS.put(key, String(Date.now()));
+  } catch (e) {
+    // best-effort -- a missing/stale "Last Active" value is cosmetic only
+  }
+}
+
+// Records one "marked as watched" or "added to a list" event for a given
+// title -- feeds the admin dashboard's Trending Data tab, which is meant
+// to eventually seed this add-on's own trending/popular catalogs once
+// there's enough data. Bucketed by Eastern calendar day (see
+// easternDateKey) rather than a raw event log, so an arbitrary rolling
+// window (7/30/90 days) can be summed later without needing a real
+// time-series database -- evtdayindex tracks which title ids had any
+// activity on a given day, so the dashboard only has to sum counts for
+// titles that were actually active in the requested window instead of
+// checking every title that's ever been tracked. KV has no atomic
+// increment (same tradeoff as bumpStat above), so this is a reasonable
+// running total, not an exact ledger.
+async function recordTrackedEvent(env, eventType, id, title, mediaType) {
+  if (!env || !env.CONFIGS || !id) return;
+  try {
+    const day = statsToday();
+    const dayKey = `evtcount:${eventType}:${id}:${day}`;
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const indexKey = `evtdayindex:${eventType}:${day}`;
+
+    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(dayKey),
+      env.CONFIGS.get(totalKey),
+      env.CONFIGS.get(indexKey),
+    ]);
+    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
+
+    let index = [];
+    try {
+      index = indexRaw ? JSON.parse(indexRaw) : [];
+    } catch {
+      index = [];
+    }
+    if (!index.includes(id)) index.push(id);
+
+    await Promise.all([
+      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(totalKey, String(totalCount)),
+      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      // Overwritten every time rather than only on first sight -- keeps
+      // title/mediaType current if either ever changes upstream, and
+      // lastSeen doubles as a cheap staleness signal in the dashboard.
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+    ]);
+  } catch (e) {
+    // best-effort -- never breaks the actual watch/list action riding along
+  }
+}
+
+// Computes a top-100 leaderboard of the most tracked titles for a given
+// event type ("watched" or "list-add") and time window -- powers the
+// admin dashboard's Trending Data tab. See recordTrackedEvent's own
+// comment for the underlying data model. "today"/"7"/"30"/"90" sum via
+// each day's index (bounded to titles that were actually active
+// somewhere in that window, not every title ever tracked); "alltime"
+// reads each title's running total directly instead, since there's no
+// day-index for it that would need summing. mediaTypeFilter ("movie" /
+// "series" / falsy for both) is applied before the top-100 cut, not
+// after, so filtering to just movies still returns up to 100 movies
+// instead of whatever happened to survive filtering an already-mixed
+// top 100.
+async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
+  if (!env || !env.CONFIGS) return [];
+  const prefix = `evtcount:${eventType}:`;
+  const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
+
+  if (window === "alltime") {
+    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    const entries = await Promise.all(
+      alltimeKeys.map(async (k) => {
+        const id = k.name.slice(prefix.length, -":alltime".length);
+        const [countRaw, metaRaw] = await Promise.all([
+          env.CONFIGS.get(k.name),
+          env.CONFIGS.get(`evtmeta:${eventType}:${id}`),
+        ]);
+        let title = id;
+        let mediaType = "";
+        try {
+          if (metaRaw) {
+            const meta = JSON.parse(metaRaw);
+            title = meta.title || id;
+            mediaType = meta.mediaType || "";
+          }
+        } catch {
+          // fall back to raw id as the title
+        }
+        return { id, title, mediaType, count: parseInt(countRaw, 10) || 0 };
+      })
+    );
+    const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
+    filtered.sort((a, b) => b.count - a.count);
+    return filtered.slice(0, 100);
+  }
+
+  const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+  const nowMs = Date.now();
+  const dateKeys = [];
+  for (let i = 0; i < days; i++) {
+    dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+  }
+
+  // Union of every title id that had any activity anywhere in this window.
+  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtdayindex:${eventType}:${d}`)));
+  const idSet = new Set();
+  indexResults.forEach((raw) => {
+    if (!raw) return;
+    try {
+      JSON.parse(raw).forEach((id) => idSet.add(id));
+    } catch {
+      // skip an unparseable day index rather than failing the whole window
+    }
+  });
+  const ids = [...idSet].slice(0, 500); // defensive cap, see the size-guard convention used elsewhere in this file
+
+  const entries = await Promise.all(
+    ids.map(async (id) => {
+      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtcount:${eventType}:${id}:${d}`)));
+      const count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
+      const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
+      let title = id;
+      let mediaType = "";
+      try {
+        if (metaRaw) {
+          const meta = JSON.parse(metaRaw);
+          title = meta.title || id;
+          mediaType = meta.mediaType || "";
+        }
+      } catch {
+        // fall back to raw id as the title
+      }
+      return { id, title, mediaType, count };
+    })
+  );
+  const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
+  filtered.sort((a, b) => b.count - a.count);
+  return filtered.slice(0, 100);
+}
+
+// Lean sibling of recordTrackedEvent used only by the trending-data
+// backfill (26_api-creator-and-admin-routes.js) -- updates just the
+// all-time counter and metadata for a title, skipping the day-bucket and
+// day-index writes recordTrackedEvent also does. Backfilling from
+// existing Watch History/Custom List data has no natural "today" to
+// bucket it under, and walking real historical per-day data would
+// multiply KV operations well past a single Worker invocation's practical
+// budget (Cloudflare's free-plan subrequest limit in particular) for any
+// account with meaningful history. All-time-only is also the
+// semantically correct home for this anyway: a rolling "last 7 days"
+// window showing something watched two years ago wouldn't make sense
+// even if it were cheap to compute. Returns true/false so the caller can
+// track how many titles it actually got through this call.
+async function backfillTitleCount(env, eventType, id, title, mediaType, incrementBy) {
+  if (!env || !env.CONFIGS || !id || !incrementBy) return false;
+  try {
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const totalRaw = await env.CONFIGS.get(totalKey);
+    const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
+    await Promise.all([
+      env.CONFIGS.put(totalKey, String(total)),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+    ]);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // The group names bumpStatBy above gets called with ultimately come from
 // the client's own collectEntries() -- not attacker-controlled in the
 // normal case, but /api/track-install has no auth on it (same as the
@@ -2036,15 +2229,27 @@ async function renderAdminDashboard(env) {
       } catch {
         // fall back to the raw username slug above
       }
-      return { username, displayName, createdAt };
+      // Best-effort -- see touchCreatorLastSeen's own comment. An account
+      // that predates this feature, or simply hasn't made an authenticated
+      // request since it shipped, just shows as "\u2014" below rather than
+      // a wrong or misleading date.
+      let lastActive = null;
+      try {
+        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+        lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
+      } catch {
+        // non-critical
+      }
+      return { username, displayName, createdAt, lastActive };
     })
   );
-  creatorAccounts.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
   const accountRows = creatorAccounts
     .map(
       (c) =>
         `<tr><td>${escapeHtmlServer(c.displayName)}</td><td>${escapeHtmlServer(c.username)}</td>` +
-        `<td>${c.createdAt ? new Date(c.createdAt).toISOString().slice(0, 10) : "\u2014"}</td></tr>`
+        `<td>${c.createdAt ? easternDateKey(new Date(c.createdAt)) : "\u2014"}</td>` +
+        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td></tr>`
     )
     .join("");
   const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
@@ -2094,6 +2299,16 @@ async function renderAdminDashboard(env) {
   .admin-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
+  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.9rem; margin-right:8px; }
+  .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
+  .admin-badge.bug { background:rgba(255,59,48,0.12); color:#FF3B30; }
+  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:#007AFF; }
+  .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
+  .admin-badge.other { background:rgba(142,142,147,0.15); color:#636366; }
+  .feedback-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px 16px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .feedback-card.completed { opacity:0.55; }
+  .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
@@ -2103,6 +2318,8 @@ async function renderAdminDashboard(env) {
     <button type="button" class="admin-tab-btn active" data-admin-tab="last30" onclick="switchAdminTab('last30')">Last 30 Days</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="creators" onclick="switchAdminTab('creators')">Creator accounts</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="sources" onclick="switchAdminTab('sources')">Sources people use</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="trending" onclick="switchAdminTab('trending')">Trending Data</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="feedback" onclick="switchAdminTab('feedback')">Feedback</button>
   </div>
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
@@ -2123,8 +2340,8 @@ async function renderAdminDashboard(env) {
       <div class="stat-card"><div class="stat-value">${creatorAccounts.length}</div><div class="stat-label">Creator accounts${truncatedNote}</div></div>
     </div>
     <table>
-      <tr><th>Display name</th><th>Username</th><th>Created</th></tr>
-      ${accountRows || '<tr><td colspan="3">No accounts yet.</td></tr>'}
+      <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
+      ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
     </table>
   </div>
 
@@ -2136,11 +2353,221 @@ async function renderAdminDashboard(env) {
     </table>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="trending">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <div style="margin:12px 0;">
+      <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
+        <option value="watched">Most Watched</option>
+        <option value="list-add">Most Added to Lists</option>
+      </select>
+      <select class="admin-select" id="trendingWindowSelect" onchange="loadTrendingData()">
+        <option value="today">Today</option>
+        <option value="7" selected>Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+        <option value="alltime">All Time</option>
+      </select>
+      <select class="admin-select" id="trendingMediaTypeSelect" onchange="loadTrendingData()">
+        <option value="">Movies + Shows</option>
+        <option value="movie">Movies Only</option>
+        <option value="series">Shows Only</option>
+      </select>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="backfillTrendingBtn" onclick="runBackfillTrending()">Backfill Existing Data</button>
+      <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+    <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
+    <table>
+      <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
+      <tbody id="trendingTableBody"><tr><td colspan="4">Loading\u2026</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="feedback">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Bug reports, improvement requests, and ideas submitted from Settings &gt; Feedback, newest first.</p>
+    <div class="feedback-card">
+      <div style="font-weight:600; margin-bottom:8px;">Log something yourself</div>
+      <select class="admin-select" id="newFeedbackCategory" style="margin-bottom:8px;">
+        <option value="bug" selected>Bug</option>
+        <option value="improvement">Improvement</option>
+        <option value="idea">Idea</option>
+        <option value="other">Other</option>
+      </select>
+      <textarea id="newFeedbackMessage" placeholder="What did you find?" style="width:100%; min-height:70px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical;"></textarea>
+      <div style="margin-top:8px; display:flex; align-items:center; gap:10px;">
+        <button type="button" class="admin-select" style="cursor:pointer;" id="newFeedbackSubmitBtn" onclick="submitAdminFeedback()">Add to list</button>
+        <span id="newFeedbackStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+    </div>
+    <div id="feedbackList">Loading\u2026</div>
+  </div>
+
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
   <script>
     function switchAdminTab(tabId) {
       document.querySelectorAll('.admin-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.adminTab === tabId));
       document.querySelectorAll('.admin-tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.adminPanel === tabId));
+      if (tabId === 'trending' && !window._trendingLoadedOnce) { window._trendingLoadedOnce = true; loadTrendingData(); }
+      if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
+    }
+
+    function escapeHtmlAdmin(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function loadTrendingData() {
+      const body = document.getElementById('trendingTableBody');
+      body.innerHTML = '<tr><td colspan="4">Loading\u2026</td></tr>';
+      const type = document.getElementById('trendingTypeSelect').value;
+      const win = document.getElementById('trendingWindowSelect').value;
+      const mediaType = document.getElementById('trendingMediaTypeSelect').value;
+      try {
+        const res = await fetch('/admin/api/leaderboard?type=' + encodeURIComponent(type) + '&window=' + encodeURIComponent(win) + (mediaType ? '&mediaType=' + encodeURIComponent(mediaType) : ''));
+        const data = await res.json();
+        if (!data.ok || !data.entries || !data.entries.length) {
+          body.innerHTML = '<tr><td colspan="4">No data yet for this window.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.entries.map((e, i) =>
+          '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(e.title || e.id) + '</td><td>' + escapeHtmlAdmin(e.mediaType === 'series' ? 'Show' : 'Movie') + '</td><td>' + e.count + '</td></tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="4">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    async function runBackfillTrending() {
+      const btn = document.getElementById('backfillTrendingBtn');
+      const status = document.getElementById('backfillTrendingStatus');
+      btn.disabled = true;
+      let accountsDone = 0;
+      let titlesDone = 0;
+      let safetyCounter = 0;
+      // safetyCounter guards against an unexpected infinite loop (e.g. a
+      // bug that never returns done:true) -- 500 calls is comfortably
+      // past what any realistic account count needs right now, and this
+      // is a manual, admin-triggered action, not something that runs
+      // unattended.
+      try {
+        while (safetyCounter < 500) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/backfill-trending', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ', ' + titlesDone + ' title update' + (titlesDone === 1 ? '' : 's') + '.';
+            break;
+          }
+          accountsDone += data.accountsThisCall || 0;
+          titlesDone += data.titlesThisCall || 0;
+          status.textContent = 'Working\u2026 ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ' processed so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (processed ' + accountsDone + ' accounts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+    }
+
+    async function loadFeedback() {
+      const box = document.getElementById('feedbackList');
+      box.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/feedback');
+        const data = await res.json();
+        if (!data.ok || !data.entries || !data.entries.length) {
+          box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
+          return;
+        }
+        // Open (not completed) first, newest within each group -- the
+        // fetch itself already comes back newest-first, so this only
+        // needs to separate the two groups without disturbing that order.
+        const open = data.entries.filter((f) => !f.completed);
+        const done = data.entries.filter((f) => f.completed);
+        box.innerHTML = open.map(feedbackCardHtml).join('') +
+          (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
+          (data.truncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+      } catch (e) {
+        box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
+      }
+    }
+
+    function feedbackCardHtml(f) {
+      const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
+      const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
+      const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
+      const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
+      const completed = !!f.completed;
+      return '<div class="feedback-card' + (completed ? ' completed' : '') + '">' +
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
+          '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+          '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ', this)">' +
+            (completed ? '\u21a9 Mark not completed' : '\u2713 Mark completed') +
+          '</button>' +
+        '</div>' +
+        '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
+        '<div class="feedback-meta">' + when + ' \u2014 ' + who + contact + '</div>' +
+        '</div>';
+    }
+
+    // Lets the admin log an issue directly from the dashboard, without
+    // going through Settings > Feedback -- posts to the same /api/feedback
+    // endpoint real users hit, just tagged so it's obviously self-logged
+    // in the list below.
+    async function submitAdminFeedback() {
+      const category = document.getElementById('newFeedbackCategory').value;
+      const messageBox = document.getElementById('newFeedbackMessage');
+      const message = messageBox.value.trim();
+      const status = document.getElementById('newFeedbackStatus');
+      const btn = document.getElementById('newFeedbackSubmitBtn');
+      if (!message) {
+        status.textContent = 'Type something first.';
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = 'Saving\u2026';
+      try {
+        const res = await fetch('/api/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: category, message: message, creatorName: 'admin' }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          status.textContent = (data && data.error) || 'Could not save -- try again.';
+          btn.disabled = false;
+          return;
+        }
+        messageBox.value = '';
+        status.textContent = 'Added.';
+        loadFeedback();
+      } catch (e) {
+        status.textContent = 'Could not save -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    async function toggleFeedbackStatus(id, completed, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch('/admin/api/feedback/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, completed: completed }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          if (btn) btn.disabled = false;
+          alert((data && data.error) || 'Could not update -- try again.');
+          return;
+        }
+        loadFeedback();
+      } catch (e) {
+        if (btn) btn.disabled = false;
+        alert('Could not update -- check your connection.');
+      }
     }
   </script>
 </body></html>`;
@@ -3771,14 +4198,15 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
   let tmdbId = null;
   let type = null;
 
-  // Shows/movies opened from title search (Search Movies & TV Shows) carry
-  // a "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
-  // lookup below entirely for those and use the TMDB id directly. The type
-  // isn't encoded in the id itself, but the client always sends one
-  // alongside it (see /api/details above), so fallbackType covers it.
   if (imdbId.startsWith('tmdb:')) {
-    tmdbId = imdbId.split(':')[1];
-    type = fallbackType === 'series' ? 'tv' : fallbackType;
+      tmdbId = imdbId.split(':')[1];
+      type = fallbackType === 'series' ? 'tv' : fallbackType;
+    // Since we don't know the type from the ID alone, we might need a hint.
+    // Wait, we don't have the type parameter in fetchTmdbItemDetails!
+    // If it's tmdb:, we might have to probe both or accept it might fail if we guess wrong.
+    // However, the caller usually passes type implicitly? No, type is not passed!
+    // Actually, openItemDetailsModal passes id and type to the frontend, but the backend /api/details only receives imdbId!
+    // We should modify /api/details to also accept type!
   }
 
   if (!tmdbId) {
@@ -3902,7 +4330,7 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey) {
 // code from the Worker's own perspective; they're embedded template-literal
 // text that only becomes real JS once served to and run by a browser. Used
 // by findNextAiredEpisodeForShow below, for the Continue Watching cron
-// (see checkForNewEpisodes in 07_source-fetchers-tmdb-simkl.js).
+// (checkForNewEpisodes, right below).
 function isEpisodeAiredServer(ep) {
   if (!ep || !ep.air_date) return false;
   const airDate = new Date(ep.air_date);
@@ -4052,7 +4480,7 @@ async function checkForNewEpisodes(env) {
         name: next.episode.name,
         // Continue Watching cards show the series poster, not the episode
         // still -- matches updateContinueWatching's own client-side
-        // behavior (11_ ... client-list functions) and keeps the shelf
+        // behavior (21_client-custom-list-builder.js) and keeps the shelf
         // visually consistent with every other poster-based row.
         poster: latest.showPoster || '',
         showId: showId,
@@ -4074,6 +4502,7 @@ async function checkForNewEpisodes(env) {
     }
   }
 }
+
 
 
 
@@ -5886,9 +6315,6 @@ function renderBuilder(
     right: 6px;
     width: 24px;
     height: 24px;
-    min-width: 24px;
-    min-height: 24px;
-    box-sizing: border-box;
     border-radius: 50%;
     background: #007aff;
     color: white;
@@ -5900,16 +6326,6 @@ function renderBuilder(
     box-shadow: 0 2px 4px rgba(0,0,0,0.5);
     z-index: 5;
     pointer-events: none;
-  }
-
-  /* A show with a watched episode still waiting on an unwatched, aired
-     one -- i.e. currently in Continue Watching. Same badge, amber instead
-     of blue; flips back to the default blue checkmark the moment the
-     show's last episode is watched (see setShowFullyWatched/
-     setShowInProgress). */
-  .watch-indicator-overlay.watch-indicator-partial {
-    background: #ff9500;
-    font-size: 12px;
   }
 
   .is-watch-history-shelf .watch-indicator-overlay {
@@ -6554,6 +6970,7 @@ if ('serviceWorker' in navigator) {
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" onclick="switchSettingsSubmenu('keys', this)"><span class="check-icon">&#x2713;</span> Keys &amp; Account</button>
     <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">&#x1F4BE; Presets &amp; Backup</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">&#x1F4AC; Feedback</button>
   </div>
 
   <!-- Submenu 2: Presets & Backup -->
@@ -6652,6 +7069,32 @@ if ('serviceWorker' in navigator) {
         </div>
         <div id="letterboxdExportImportResult"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- Submenu 3: Feedback -->
+  <div class="settings-subpanel" id="settingsSubFeedback" style="display:none;">
+    <div class="panel">
+      <h2 class="panel-title">Send Feedback</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Found a bug, have an idea, or want to see something improved? This goes straight to the developer.</p>
+      <div class="row">
+        <select id="feedbackCategorySelect">
+          <option value="bug">Bug</option>
+          <option value="improvement">Improvement</option>
+          <option value="idea">Idea</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <textarea id="feedbackMessageInput" rows="5" style="width:100%;" placeholder="What's on your mind?"></textarea>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="feedbackContactInput" placeholder="Contact info (optional) — email, Discord, etc., if you want a reply">
+      </div>
+      <div class="actions" style="margin-top:10px;">
+        <button type="button" class="primary" id="feedbackSubmitBtn" onclick="submitFeedback()">Send feedback</button>
+      </div>
+      <p id="feedbackStatus" style="margin-top:8px;"></p>
     </div>
   </div>
 </div>
@@ -6760,14 +7203,6 @@ function switchTab(name) {
   if (name === 'discover') {
     filterDiscoverShelves('all', document.querySelector('#discoverSubnavBar button:nth-child(1)'));
   }
-  if (name === 'catalogs') {
-    // Same "load automatically when the tab opens" treatment Lists/Discover
-    // already get above -- Catalogs was the one tab still requiring a
-    // manual "Refresh Preview" click just to see anything, even on the
-    // very first visit with shelves already configured (e.g. from an
-    // existing install link).
-    if (typeof renderLivePreview === 'function') renderLivePreview();
-  }
 }
 
 function showAddedToast(msg) {
@@ -6812,8 +7247,7 @@ function switchListsSubmenu(name, btn) {
     'curated': 'listsSubCurated',
     'bulk': 'listsSubBulk',
     'create-list': 'listsSubCreateList',
-      'list-search': 'listsSubListSearch',
-      'import': 'listsSubImport'
+      'list-search': 'listsSubListSearch'
   };
   Object.keys(subpanels).forEach(function(k) {
     const el = document.getElementById(subpanels[k]);
@@ -6845,7 +7279,8 @@ function switchSettingsSubmenu(name, btn) {
   }
   const subpanels = {
     'keys': 'settingsSubKeys',
-    'backup': 'settingsSubBackup'
+    'backup': 'settingsSubBackup',
+    'feedback': 'settingsSubFeedback'
   };
   Object.keys(subpanels).forEach(function(k) {
     const el = document.getElementById(subpanels[k]);
@@ -6854,6 +7289,75 @@ function switchSettingsSubmenu(name, btn) {
   const activeId = subpanels[name];
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
+}
+
+// Sends a Settings > Feedback submission to the server -- deliberately
+// works with or without a Creator Profile (attaches the username if
+// signed in, purely informational, not required) since anyone should be
+// able to report a bug or suggest something without needing an account
+// first.
+async function submitFeedback() {
+  const btn = document.getElementById('feedbackSubmitBtn');
+  const statusEl = document.getElementById('feedbackStatus');
+  const category = document.getElementById('feedbackCategorySelect').value;
+  const message = document.getElementById('feedbackMessageInput').value.trim();
+  const contact = document.getElementById('feedbackContactInput').value.trim();
+  if (!message) {
+    if (statusEl) { statusEl.textContent = 'Write something first.'; statusEl.style.color = 'var(--danger)'; }
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) { statusEl.textContent = 'Sending\u2026'; statusEl.style.color = 'var(--muted)'; }
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: category,
+        message: message,
+        contact: contact,
+        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok) {
+      if (statusEl) { statusEl.textContent = 'Thanks \u2014 sent.'; statusEl.style.color = 'var(--accent)'; }
+      document.getElementById('feedbackMessageInput').value = '';
+      document.getElementById('feedbackContactInput').value = '';
+    } else {
+      if (statusEl) { statusEl.textContent = (data && data.error) || 'Could not send \u2014 try again in a moment.'; statusEl.style.color = 'var(--danger)'; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = 'Could not send \u2014 check your connection.'; statusEl.style.color = 'var(--danger)'; }
+  }
+  if (btn) btn.disabled = false;
+}
+
+// Fire-and-forget analytics beacon feeding recordTrackedEvent server-side
+// (see its own comment) -- never awaited by callers, and wrapped so a
+// failure here can never disrupt the actual watch/list action it's riding
+// along on. keepalive lets the request finish even if the page navigates
+// away right after (e.g. right after adding something and switching tabs).
+function trackEvent(eventType, id, title, mediaType) {
+  trackEventsBatch(eventType, [{ id: id, title: title, mediaType: mediaType }]);
+}
+
+function trackEventsBatch(eventType, items) {
+  if (!items || !items.length) return;
+  try {
+    const events = items.slice(0, 50)
+      .filter((it) => it && it.id)
+      .map((it) => ({ eventType: eventType, id: String(it.id), title: it.title || '', mediaType: it.mediaType === 'series' ? 'series' : 'movie' }));
+    if (!events.length) return;
+    fetch(ORIGIN + '/api/track-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: events }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) {
+    // non-critical -- this is optional telemetry, not a real feature
+  }
 }
 
 function filterDiscoverShelves(filter, btn) {
@@ -9559,7 +10063,7 @@ function openEpisodeDetails(epNum) {
       '<div style="flex: 1; min-width: 300px;">' +
         '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">E' + ep.episode_number + ' - ' + escapeHtml(ep.name) + '</h1>' +
           '<div style="margin-bottom:20px;">' +
-            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatus(' + ep.episode_number + ')">' +
+            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(\\'' + ep.id + '\\', \\'episode\\', \\'' + (ep.name ? escapeAttr(ep.name.replace(/'/g, "\\'")) : '') + '\\', \\'' + still + '\\')">' +
               (window._watchedItemIds && window._watchedItemIds.has(String(ep.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
             '</button>' +
           '</div>' +
@@ -9571,38 +10075,8 @@ function openEpisodeDetails(epNum) {
   showModal(innerHtml, 'modal-card-wide');
 }
 
-// An episode counts as "aired" once it has a real air_date that isn't in
-// the future -- used to keep unaired/TBA episodes out of both the batch
-// "mark watched" actions and Continue Watching's idea of what's next.
-function isEpisodeAired(ep) {
-  if (!ep || !ep.air_date) return false;
-  const airDate = new Date(ep.air_date);
-  if (isNaN(airDate.getTime())) return false;
-  return airDate.getTime() <= Date.now();
-}
-
-// Toggles a single episode's watched status via the generic toggleWatchStatus
-// (same one movies use) -- that function already embeds show/season/episode
-// context and refreshes Continue Watching for episode toggles, so this is
-// just a clean, backslash-free way to call it from the onclick attribute.
-function toggleEpisodeWatchStatus(epNum) {
-  const ep = window._episodeDataCache && window._episodeDataCache[epNum];
-  if (!ep) return;
-  window.toggleWatchStatus(String(ep.id), 'episode', ep.name || '', ep.still_path || '');
-}
-
-
 async function openItemDetailsModal(id, type) {
   if (!id || id.startsWith('channel_')) return;
-  
-  // A poster clicked from inside an open showModal()-based overlay (e.g.
-  // the "View all" list preview) needs that overlay closed here --
-  // switchTab below only changes which full-page tab-panel is active
-  // underneath it, and does nothing to the overlay itself, which is a
-  // separate, always-on-top element appended straight to <body>. Without
-  // this, the destination page loads correctly in the background but stays
-  // hidden behind the still-open modal.
-  if (typeof closeModal === 'function') closeModal();
   
   window._previousTab = document.querySelector('.tab-btn.active')?.dataset.tab || 'discover';
   switchTab('item-details');
@@ -9619,21 +10093,6 @@ async function openItemDetailsModal(id, type) {
     if (!data.ok || !data.details) throw new Error(data.error || 'Failed to load details');
     
     const d = data.details;
-    window._currentItemDetails = d;
-    
-    // There's no server-side cron pushing updates into a browser's own
-    // localStorage, so a newly-aired episode can't add itself to Continue
-    // Watching in the background -- the closest thing to "automatic" is
-    // refreshing it here, so simply reopening a show you're partway
-    // through picks up anything that's aired since you last looked,
-    // without needing to watch/unwatch something first to trigger it.
-    // Only bothers if this show has any Watch History to begin with.
-    if (type === 'series' && typeof updateContinueWatching === 'function') {
-      const historyMap = loadLocalCustomLists();
-      const history = historyMap['watch-history'];
-      const hasWatchedEpisode = history && (history.items || []).some(it => it.type === 'episode' && it.showId === d.id);
-      if (hasWatchedEpisode) updateContinueWatching(d.id).catch(() => {});
-    }
     
     // Formatting helpers
     let dateStr = d.releaseYear || '';
@@ -9682,13 +10141,12 @@ async function openItemDetailsModal(id, type) {
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : '';
         seasonsHtml += 
           '<div style="background:var(--surface-light); border:1px solid var(--border); border-radius:8px; overflow:hidden;">' +
-            '<div style="display:flex; gap:16px; padding:16px; cursor:pointer; align-items:center;" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+            '<div style="display:flex; gap:16px; padding:16px; cursor:pointer;" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
               (sPoster ? '<img src="' + escapeAttr(sPoster) + '" style="width:80px; border-radius:4px; flex-shrink:0; box-shadow:0 2px 8px rgba(0,0,0,0.3);">' : '<div style="width:80px; height:120px; background:#333; border-radius:4px; flex-shrink:0;"></div>') +
-              '<div style="display:flex; flex-direction:column; justify-content:center; flex:1;">' +
+              '<div style="display:flex; flex-direction:column; justify-content:center;">' +
                 '<h4 style="margin:0 0 4px; font-size:1.2rem;">' + escapeHtml(season.name) + '</h4>' +
                 '<div style="color:var(--muted); font-size:0.9rem;">' + season.episode_count + ' episodes</div>' +
               '</div>' +
-              '<button type="button" class="lc-btn primary season-watch-btn" onclick="event.stopPropagation(); markSeasonWatched(this, &quot;' + escapeAttr(d.id) + '&quot;, ' + season.season_number + ', &quot;' + escapeAttr(season.name) + '&quot;)">Mark Season Watched</button>' +
             '</div>' +
             '<div class="season-episodes-container" style="display:none; padding:16px; border-top:1px solid var(--border); background:rgba(0,0,0,0.2);">' +
               '<div class="episodes-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:16px;"></div>' +
@@ -9709,13 +10167,6 @@ async function openItemDetailsModal(id, type) {
           '<p style="font-size:1.05rem; line-height:1.6; color:var(--text); margin-bottom: 24px;">' + escapeHtml(d.overview || 'No overview available.') + '</p>' +
           '<div style="display:flex; gap:16px; flex-wrap:wrap;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModal(&quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;)">+ Add to list</button>' +
-            (type === 'movie' ?
-              '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(&quot;' + escapeAttr(d.id) + '&quot;, &quot;movie&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">' +
-                (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
-              '</button>'
-            : type === 'series' ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn primary" onclick="markShowWatched(this, &quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">Mark Whole Show Watched</button>'
-            : '') +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -9728,7 +10179,6 @@ async function openItemDetailsModal(id, type) {
 }
 
 async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
-  window._currentSeasonNum = seasonNum;
   const container = headerEl.nextElementSibling;
   const grid = container.querySelector('.episodes-grid');
   
@@ -9753,7 +10203,6 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     let epsHtml = '';
     if (!window._episodeDataCache) window._episodeDataCache = {};
     data.season.episodes.forEach(ep => {
-      ep.season_number = seasonNum;
       window._episodeDataCache[ep.episode_number] = ep;
       const still = ep.still_path ? escapeAttr(ep.still_path) : '';
       epsHtml += 
@@ -9771,162 +10220,14 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
   }
 }
 
-// Fetches every aired episode of a single season and batch-marks them
-// watched (or unwatched if all already watched) via toggleBatchWatchStatus.
-async function markSeasonWatched(btnEl, imdbId, seasonNum, seasonName) {
-  if (!btnEl || btnEl.disabled) return;
-  const origLabel = btnEl.textContent;
-  btnEl.disabled = true;
-  btnEl.textContent = 'Fetching episodes...';
-
-  const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
-
-  try {
-    const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(imdbId) + '&seasonNum=' + seasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
-    const data = await res.json();
-    if (!data.ok || !data.season || !data.season.episodes || !data.season.episodes.length) {
-      throw new Error(data.error || 'No episodes found for this season.');
-    }
-
-    const d = window._currentItemDetails;
-    const episodes = data.season.episodes
-      .filter(ep => isEpisodeAired(ep))
-      .map(ep => ({
-        id: String(ep.id),
-        type: 'episode',
-        name: ep.name,
-        poster: ep.still_path || '',
-        showId: d ? d.id : null,
-        showTitle: d ? d.title : null,
-        showPoster: d ? (d.poster || '') : '',
-        seasonNum: seasonNum,
-        episodeNum: ep.episode_number
-      }));
-
-    if (!episodes.length) {
-      btnEl.disabled = false;
-      btnEl.textContent = origLabel;
-      alert('No aired episodes found for this season yet.');
-      return;
-    }
-
-    const result = window.toggleBatchWatchStatus(episodes);
-
-    btnEl.disabled = false;
-    if (result.nowWatched) {
-      btnEl.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-      btnEl.classList.remove('primary');
-      btnEl.classList.add('secondary');
-    } else {
-      btnEl.textContent = 'Mark Season Watched';
-      btnEl.classList.remove('secondary');
-      btnEl.classList.add('primary');
-    }
-  } catch (err) {
-    btnEl.disabled = false;
-    btnEl.textContent = origLabel;
-    alert('Could not load episodes for ' + (seasonName || 'this season') + ': ' + err.message);
-  }
-}
-
-// Loops over every season in the open show, fetching in batches of 4,
-// marks all aired episodes watched (or unwatched if all already marked).
-async function markShowWatched(btnEl, imdbId, title, poster) {
-  if (!btnEl || btnEl.disabled) return;
-
-  const d = window._currentItemDetails;
-  const seasonsData = (d && d.seasonsData) ? d.seasonsData.filter(s => s.season_number > 0) : [];
-  if (!seasonsData.length) {
-    alert('No seasons found for this show.');
-    return;
-  }
-
-  const origLabel = btnEl.textContent;
-  btnEl.disabled = true;
-  btnEl.textContent = 'Fetching episodes...';
-
-  const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
-
-  const allEpisodes = [];
-  let hadError = false;
-  const concurrency = 4;
-
-  for (let i = 0; i < seasonsData.length; i += concurrency) {
-    const batch = seasonsData.slice(i, i + concurrency);
-    btnEl.textContent = 'Fetching episodes... (' + Math.min(i + concurrency, seasonsData.length) + '/' + seasonsData.length + ')';
-    const results = await Promise.all(batch.map(season =>
-      fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(imdbId) + '&seasonNum=' + season.season_number + '&tmdbKey=' + encodeURIComponent(tmdbKey))
-        .then(r => r.json())
-        .catch(() => ({ ok: false }))
-    ));
-    results.forEach((seasonRes, ri) => {
-      if (seasonRes.ok && seasonRes.season && seasonRes.season.episodes) {
-        const sNum = batch[ri] ? batch[ri].season_number : null;
-        seasonRes.season.episodes
-          .filter(ep => isEpisodeAired(ep))
-          .forEach(ep => {
-            allEpisodes.push({
-              id: String(ep.id),
-              type: 'episode',
-              name: ep.name,
-              poster: ep.still_path || '',
-              showId: imdbId,
-              showTitle: title,
-              showPoster: poster || '',
-              seasonNum: sNum,
-              episodeNum: ep.episode_number
-            });
-          });
-      } else {
-        hadError = true;
-      }
-    });
-  }
-
-  if (!allEpisodes.length) {
-    btnEl.disabled = false;
-    btnEl.textContent = origLabel;
-    alert('Could not load any aired episodes for this show.');
-    return;
-  }
-
-  const result = window.toggleBatchWatchStatus(allEpisodes);
-
-  btnEl.disabled = false;
-  if (result.nowWatched) {
-    btnEl.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
-    btnEl.classList.remove('primary');
-    btnEl.classList.add('secondary');
-  } else {
-    btnEl.textContent = 'Mark Whole Show Watched';
-    btnEl.classList.remove('secondary');
-    btnEl.classList.add('primary');
-  }
-
-  if (hadError) alert('Some seasons could not be loaded, so this show may only be partially marked.');
-}
-
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
   
-  // Every Custom List the person could add this item to, from three
-  // places: (1) lists already added to the live catalog as a #lists row
-  // (editable in place via that row's own <input class="url">), (2)
-  // local-only Custom Lists that were saved (e.g. via Import from a link,
-  // or Copy to Custom List) but never added as a row, and (3) this
-  // account's server-synced Creator lists, same story. (2) and (3) used to
-  // be invisible here entirely -- only lists someone had explicitly
-  // "+ Add"-ed to their catalog ever showed up, so anything imported and
-  // left sitting under Your Custom Lists had no way to receive new items
-  // from this picker. seenSlugs dedupes a list that's in both a row and
-  // the local/creator source it came from, preferring the row (it's the
-  // live, currently-configured copy).
+  // Scrape available Custom Lists from the configured lists DOM
+  // Only show lists that are properly saved (have a localSlug or creatorSlug)
+  // Unsaved drafts (user dismissed visibility modal) are excluded
   const customLists = [];
-  const seenSlugs = new Set();
-
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
     if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
@@ -9937,38 +10238,14 @@ function openSelectListModal(id, type, title, poster) {
         // Filter by item type: if list has a type (movie or series), it must match the item being added
         if (payload.type && payload.type !== type) return;
         const nameInput = row.querySelector('.name');
-        const slug = payload.localSlug || payload.creatorSlug;
-        if (slug) seenSlugs.add((payload.localSlug ? 'local:' : 'creator:') + slug);
         customLists.push({
           name: nameInput ? nameInput.value : (payload.listName || 'Unnamed List'),
-          source: 'row',
-          row: row,
-          items: payload.items || []
+          url: urlInput.value,
+          row: row
         });
       } catch(e) {}
     }
   });
-
-  if (typeof loadLocalCustomLists === 'function') {
-    const localMap = loadLocalCustomLists();
-    Object.keys(localMap).forEach(slug => {
-      // Watch History / Continue Watching are auto-managed, not something
-      // to manually file items into from this picker.
-      if (slug === 'watch-history' || slug === 'continue-watching') return;
-      if (seenSlugs.has('local:' + slug)) return;
-      const l = localMap[slug];
-      if (l.type && l.type !== type) return;
-      customLists.push({ name: l.name, source: 'local', slug: slug, type: l.type, visibility: l.visibility, items: l.items || [] });
-    });
-  }
-
-  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
-    lastCreatorListsData.forEach(l => {
-      if (seenSlugs.has('creator:' + l.slug)) return;
-      if (l.type && l.type !== type) return;
-      customLists.push({ name: l.name, source: 'creator', slug: l.slug, type: l.type, visibility: l.visibility, items: l.items || [] });
-    });
-  }
   
   let html = '';
   if (customLists.length === 0) {
@@ -9982,17 +10259,20 @@ function openSelectListModal(id, type, title, poster) {
           document.getElementById('selectListModal').style.display = 'none';
           document.body.style.overflow = '';
           switchTab('lists');
-          // Create List has no pill of its own -- see the matching fix in
-          // editCreatorList/editLocalCustomList for why this doesn't try
-          // to grab one to highlight.
-          if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+          const btn = document.querySelector('#listsSubnavBar button:nth-child(5)');
+          if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list', btn);
         };
       }
     }, 0);
   } else {
     document.getElementById('addSelectedListsBtn').style.display = 'block';
     customLists.forEach((list, idx) => {
-      const isChecked = (list.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
+      let isChecked = false;
+      try {
+        const payloadStr = list.url.slice('customlist:v1:'.length);
+        const payload = JSON.parse(payloadStr);
+        isChecked = payload.items.some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
+      } catch(e) {}
       
       html += 
         '<label style="display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom: 1px solid rgba(0,0,0,0.05); cursor:pointer; color:#001f3f; font-size:1rem;">' +
@@ -10043,13 +10323,15 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   let anyAdded = false;
   let anyRemoved = false;
   
-  for (const cb of checkboxes) {
+  checkboxes.forEach(cb => {
     const listIdx = parseInt(cb.dataset.idx, 10);
     const isChecked = cb.checked;
-    const result = await toggleItemInSelectedList(id, finalImdbId, type, listIdx, isChecked, title, poster);
-    if (result === 'added') anyAdded = true;
-    else if (result === 'removed') anyRemoved = true;
-  }
+    const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
+    if (changed) {
+      if (isChecked) anyAdded = true;
+      else anyRemoved = true;
+    }
+  });
   
   document.getElementById('selectListModal').style.display = 'none';
   document.body.style.overflow = '';
@@ -10057,49 +10339,12 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   btn.disabled = false;
   btn.textContent = 'Done';
   
-  if (anyAdded) showAddedToast('Added ' + title + ' to lists.');
+  if (anyAdded) {
+    showAddedToast('Added ' + title + ' to lists.');
+    if (typeof trackEvent === 'function') trackEvent('list-add', finalImdbId, title, type);
+  }
   else if (anyRemoved && typeof showAddedToast === 'function') showAddedToast('Removed ' + title + ' from lists.');
 });
-
-// Adds or removes one item from one list picked in the Add-to-List modal.
-// A list can be one of three things (see openSelectListModal): a live
-// catalog row (mutated in place via its own <input class="url">, same as
-// always), or a local/creator Custom List that was never added as a row --
-// those don't have a DOM row to write to at all, so this builds the same
-// {localSlug|creatorSlug, type, items, visibility} shape
-// syncCustomListPayload already knows how to persist (to localStorage or
-// the server respectively) and hands off to that, rather than a second,
-// parallel save path.
-async function toggleItemInSelectedList(originalId, imdbId, type, listIdx, shouldBeInList, title, poster) {
-  if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return 'failed';
-  const list = window._selectListModalTempLists[listIdx];
-
-  if (list.source === 'row') {
-    const changed = toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeInList, title, poster);
-    if (!changed) return 'unchanged';
-    return shouldBeInList ? 'added' : 'removed';
-  }
-
-  const matches = (it) => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId);
-  const items = (list.items || []).slice();
-  const idx = items.findIndex(matches);
-  const exists = idx !== -1;
-  if (shouldBeInList === exists) return 'unchanged';
-  if (shouldBeInList) items.push({ imdbId, type, title, poster: poster || undefined });
-  else items.splice(idx, 1);
-
-  const payload = {
-    type: list.type || type,
-    items: items,
-    visibility: list.visibility || 'public',
-  };
-  if (list.source === 'creator') payload.creatorSlug = list.slug;
-  else payload.localSlug = list.slug;
-
-  list.items = items; // keep this in sync in case the same list gets toggled again before the modal closes
-  await syncCustomListPayload(payload, list.name);
-  return shouldBeInList ? 'added' : 'removed';
-}
 
 function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeInList, title, poster) {
   if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return false;
@@ -11265,6 +11510,7 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
     updateCustomListTypeRadio(itemType);
     renderCustomListDraftList();
     if (btn) btn.textContent = 'Added \u2713';
+    if (typeof trackEvent === 'function') trackEvent('list-add', data.imdbId, title, itemType);
   } catch (e) {
     alert('Network error adding "' + title + '".');
     if (btn) {
@@ -11956,6 +12202,9 @@ window.toggleWatchStatus = function(id, type, name, poster) {
     }
     list.items.unshift(item);
     window._watchedItemIds.add(id);
+    if (typeof trackEvent === 'function') {
+      trackEvent('watched', item.showId || id, item.showTitle || name, type === 'movie' ? 'movie' : 'series');
+    }
   }
   
   list.updatedAt = Date.now();
@@ -12025,6 +12274,17 @@ window.toggleBatchWatchStatus = function(items) {
       }
       window._watchedItemIds.add(id);
     });
+    if (typeof trackEventsBatch === 'function') {
+      const seen = new Set();
+      const trackItems = [];
+      items.forEach((it) => {
+        const key = it.showId || it.id;
+        if (seen.has(key)) return;
+        seen.add(key);
+        trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+      });
+      trackEventsBatch('watched', trackItems);
+    }
   }
 
   list.updatedAt = Date.now();
@@ -12069,6 +12329,17 @@ window.addItemsToWatchHistory = async function(items) {
     added++;
   });
   if (!added) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
+  if (typeof trackEventsBatch === 'function') {
+    const seen = new Set();
+    const trackItems = [];
+    items.forEach((it) => {
+      const key = it.showId || it.id;
+      if (seen.has(key)) return;
+      seen.add(key);
+      trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+    });
+    trackEventsBatch('watched', trackItems);
+  }
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);
@@ -14934,7 +15205,6 @@ async function saveCurrentAsPreset() {
   if (localOk) schedulePresetsSync();
 }
 
-
 function renderPresetsList() {
   const container = document.getElementById('presetsList');
   const badge = document.getElementById('presetsCountBadge');
@@ -16365,6 +16635,93 @@ self.addEventListener('fetch', e => {
       }
     }
 
+    // /api/feedback  (POST)  { category, message, contact?, creatorName? } -> { ok }
+    // Settings > Feedback. No auth required -- anyone should be able to
+    // report a bug or suggest something without needing a Creator Profile
+    // first; creatorName is attached only if the person happens to be
+    // signed in, purely so it's visible in the admin dashboard, not
+    // verified against anything. Stored under a key that sorts
+    // chronologically as a plain string (zero-padded millisecond epoch),
+    // so the admin dashboard can list newest-first without needing to
+    // parse and sort every value first.
+    if (path === "/api/feedback" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const message = String(body.message || "").trim();
+      if (!message) return json({ ok: false, error: "Message can't be empty." }, 400);
+      if (message.length > 4000) return json({ ok: false, error: "That's a bit long -- please keep it under 4000 characters." }, 400);
+      const allowedCategories = new Set(["bug", "improvement", "idea", "other"]);
+      const category = allowedCategories.has(body.category) ? body.category : "other";
+      const contact = String(body.contact || "").trim().slice(0, 200);
+      const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+
+      // Simple per-IP rate limit (5/hour) -- KV's read-then-write isn't
+      // atomic (see bumpStat's own comment on the same tradeoff elsewhere
+      // in this file), so this is a deterrent against casual spam/abuse,
+      // not a hard guarantee against a determined actor.
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
+      const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+      const rateCount = parseInt(rateCountRaw, 10) || 0;
+      if (rateCount >= 5) {
+        return json({ ok: false, error: "You've sent a few of these already today -- try again tomorrow, or reach out another way if it's urgent." });
+      }
+
+      const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        id, category, message, contact: contact || null, creatorName,
+        createdAt: Date.now(),
+        completed: false,
+        // Recorded for basic spam triage in the admin dashboard, not
+        // shown to anyone else and never used for anything beyond that.
+        userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
+      };
+      try {
+        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+      } catch (e) {
+        return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
+    // /api/track-event  (POST)  { events: [{ eventType, id, title, mediaType }, ...] } -> { ok }
+    // Fire-and-forget analytics beacon feeding recordTrackedEvent above --
+    // "watched" for anything marked watched, "list-add" for anything added
+    // to a Custom List. No auth, and always answers ok (even when nothing
+    // was actually recorded) so a client never needs to treat this as
+    // something that can meaningfully fail -- it's genuinely optional
+    // telemetry, not something any real feature depends on.
+    if (path === "/api/track-event" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const events = Array.isArray(body.events) ? body.events.slice(0, 50) : [];
+      const allowedTypes = new Set(["watched", "list-add"]);
+      await Promise.all(
+        events.map((e) => {
+          if (!e || !allowedTypes.has(e.eventType) || !e.id) return Promise.resolve();
+          return recordTrackedEvent(
+            env,
+            e.eventType,
+            String(e.id).slice(0, 100),
+            String(e.title || "").slice(0, 200),
+            e.mediaType === "series" ? "series" : "movie"
+          );
+        })
+      );
+      return json({ ok: true });
+    }
+
     // /api/mdblist-my-lists?apikey=...
     // -> powers the "Your MDBList Lists" section in the builder: every list
     // the API key's own account has created (not just the built-in
@@ -16581,6 +16938,9 @@ self.addEventListener('fetch', e => {
       }
       const valid = await verifyCreatorKey(creatorKey || "", profile.keyHash);
       if (!valid) return { ok: false, error: "Username or Key is incorrect." };
+      // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
+      // comment for why this is throttled and safe to never wait on.
+      touchCreatorLastSeen(env, v.normalized);
       return { ok: true, username: v.normalized, displayName: profile.displayName };
     }
 
@@ -17490,39 +17850,260 @@ self.addEventListener('fetch', e => {
       const itemsHtml = listData.items
         .map(
           (it) =>
-            `<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.08);">` +
-            (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:40px;height:60px;object-fit:cover;border-radius:4px;flex:none;">` : "") +
-            `<span>${escapeHtmlServer(it.title || "Untitled")}${it.year ? " (" + escapeHtmlServer(it.year) + ")" : ""}</span></div>`
+            `<a href="/${it.type || 'movie'}/${it.tmdb_id || ''}" style="display:flex; flex-direction:column; gap:6px; width:100%; min-width:0; text-decoration:none;">` +
+            `<div style="aspect-ratio:2/3; border-radius:8px; overflow:hidden; background:var(--panel-strong); box-shadow:var(--shadow-sm); width:100%;">` +
+            (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:100%; height:100%; object-fit:cover; display:block;" loading="lazy">` : ``) +
+            `</div>` +
+            `<div style="font-size:0.85rem; font-weight:600; color:var(--text); text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtmlServer(it.title || it.name || "Item")}</div>` +
+            `</a>`
         )
         .join("");
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
       const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtmlServer(listData.name)} \u2014 My Lists</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:640px; margin:0 auto; padding:24px 16px; }
-  a { color:#007AFF; }
-  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:20px; margin-top:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  code { background:#F2F2F7; padding:2px 6px; border-radius:6px; word-break:break-all; }
-  button { background:#007AFF; color:#fff; border:none; border-radius:10px; padding:10px 16px; font-size:0.95rem; font-weight:600; cursor:pointer; }
-  button:hover { background:#0062CC; }
-  button:disabled { opacity:0.6; cursor:default; }
-</style></head>
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --radius-pill: 999px;
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --surface: #1C1C1E;
+      --panel-strong: #2C2C2E;
+      --border: rgba(255,255,255,0.15);
+      --border-strong: rgba(255,255,255,0.25);
+      --text: #FFFFFF;
+      --text-2: #EBEBF5;
+    }
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  html { touch-action: manipulation; width: 100%; max-width: 100%; overflow-x: hidden; }
+  body {
+    font-family: var(--font-body);
+    margin: 0;
+    min-height: 100vh;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+    padding: 16px 12px calc(80px + env(safe-area-inset-bottom));
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 1200px;
+    width: 100%;
+    margin: 0 auto;
+    display: grid;
+    gap: 12px;
+    overflow-x: hidden;
+  }
+  @media (min-width: 641px) {
+    body { padding: 32px 20px 52px; }
+    .page { gap: 16px; }
+  }
+  .app-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px 4px 8px;
+  }
+  .app-header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .app-header-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    box-shadow: var(--shadow-sm);
+    object-fit: cover;
+  }
+  .app-header-title-group {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .app-header-title {
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    color: var(--text);
+    margin: 0;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .header-actions { display: flex; gap: 8px; margin-left: auto; align-items:center; }
+  
+  .tab-bar {
+    display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px;
+    margin-bottom: 4px; scrollbar-width: none;
+  }
+  .tab-btn {
+    flex: none; background: var(--surface); color: var(--text-2);
+    border: 1.5px solid var(--border-strong); border-radius: 999px; padding: 8px 16px;
+    font-size: 0.875rem; font-weight: 600; cursor: pointer; text-decoration: none;
+    box-shadow: var(--shadow-sm); transition: all 0.15s;
+  }
+  .tab-btn.active {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+    box-shadow: 0 2px 10px rgba(0,122,255,0.30);
+  }
+  .tab-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
+
+    .lc-btn {
+    padding: 6px 12px; min-height: unset;
+    font-size: 0.8rem; font-weight: 600;
+    border-radius: var(--radius-pill);
+    border: 1.5px solid var(--border-strong);
+    background: var(--bg); color: var(--text-2);
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    font-family: inherit; white-space: nowrap; text-decoration: none;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  
+  .detail-back-btn {
+    display: flex; align-items: center; gap: 6px;
+    background: none; border: none; font-size: 1.1rem;
+    font-weight: 700; color: var(--accent); cursor: pointer; padding: 4px 0; text-decoration: none;
+  }
+  
+  .subnav-pill {
+    flex: none; padding: 7px 16px; border-radius: var(--radius-pill); border: 1.5px solid var(--border-strong);
+    background: var(--surface); color: var(--text-2); font-size: 0.86rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+    box-shadow: var(--shadow-sm); font-family: inherit; margin: 0; text-decoration: none;
+  }
+  .subnav-pill.active {
+    background: var(--accent); color: #ffffff; border-color: var(--accent); box-shadow: 0 2px 8px rgba(0,122,255,0.28);
+  }
+
+  .poster-grid-3 {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; width: 100%;
+  }
+  @media (min-width: 641px) {
+    .poster-grid-3 {
+      grid-template-columns: repeat(9, 1fr); gap: 12px 8px;
+    }
+  }
+
+  code { background: var(--panel-strong); padding: 4px 8px; border-radius: 6px; word-break: break-all; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
 <body>
-  <h1 style="margin-bottom:4px;">${escapeHtmlServer(listData.name)}</h1>
-  <p style="color:#8E8E93; margin-top:0;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></p>
-  <button type="button" id="likeListBtn" style="margin-top:10px;">\u2661 Like</button>
-  <div class="card">
-    <p><strong>Add this to your own My Lists Addon:</strong> paste this URL in as a list source --</p>
-    <p><code>${shareUrl}</code></p>
-    <p><small><a href="${shareUrl}.json">View as JSON</a></small></p>
+  <div class="page">
+    <!-- Top App Bar -->
+    <header class="app-header">
+      <div class="app-header-left">
+        <img class="app-header-avatar" src="/icon.png" alt="App Icon">
+        <div class="app-header-title-group">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <h1 class="app-header-title">My Lists Addon</h1>
+            <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:0; margin-top:2px;" title="Toggle Dark Mode">🌓</button>
+          </div>
+        </div>
+      </div>
+      <div class="header-actions" id="authActions">
+        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <button type="button" class="lc-btn primary" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">+ Create Account</button>
+            <button type="button" class="lc-btn" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem;">Restore</button>
+          </div>
+          <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>
+        </div>
+      </div>
+    </header>
+
+    <!-- Top Tab Bar -->
+    <div class="tab-bar">
+      <a href="/" class="tab-btn">My Catalogs</a>
+      <a href="/" class="tab-btn active">Lists</a>
+      <a href="/" class="tab-btn">Discover</a>
+      <a href="/" class="tab-btn">Search</a>
+      <a href="/" class="tab-btn">Settings</a>
+    </div>
+
+    <div style="margin-bottom: 32px;">
+      <a href="/" class="tab-btn" style="text-decoration:none;">&larr; Back</a>
+    </div>
+
+    <div style="margin-bottom:32px;">
+      <h2 style="font-size:2.5rem; font-weight:700; margin:0 0 16px; letter-spacing:-0.02em;">${escapeHtmlServer(listData.name)}</h2>
+      <div style="color:var(--text-2); font-size:1.05rem; margin-bottom:16px;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></div>
+      <button type="button" class="lc-btn primary" id="likeListBtn">\u2661 Like</button>
+    </div>
+
+
+
+    <div class="poster-grid-3">
+      ${itemsHtml}
+    </div>
   </div>
-  <div class="card">${itemsHtml}</div>
+
   <script>
   (function () {
     var USERNAME = ${JSON.stringify(username)};
     var SLUG = ${JSON.stringify(listName)};
     var KEY = USERNAME + '/' + SLUG;
+    
+    // Auth header
+    try {
+      var cname = localStorage.getItem('myListAddon:creatorName');
+      if (cname) {
+        cname = cname.replace(/NaN/gi, '').replace(/undefined/gi, '').replace(/null/gi, ''); // Fix corrupted local storage
+        if (!cname || cname.trim() === '') cname = "Account";
+        cname = cname.charAt(0).toUpperCase() + cname.slice(1);
+        var actions = document.getElementById('authActions');
+        actions.innerHTML = '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+          '<span class="subnav-pill active" style="margin:0; font-size:0.82rem; padding:6px 12px; cursor:pointer;" onclick="location.href=\'/\'">&#x1F464; ' + cname.replace(/</g, '&lt;') + '</span>' +
+          '<button type="button" class="lc-btn" style="padding:5px 9px; font-size:0.78rem;" onclick="location.href=\'/\'" title="Sign Out / Switch">Sign Out</button>' +
+          '</div>' +
+          '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
+          '</div>';
+      }
+    } catch(e) {}
+
     var btn = document.getElementById('likeListBtn');
     function getLiked() {
       try { return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]')); } catch (e) { return new Set(); }
@@ -17562,9 +18143,6 @@ self.addEventListener('fetch', e => {
           btn.textContent = '\\u2665 Unlike';
         }
         document.getElementById('likeCountDisplay').textContent = '\\u2665 ' + data.likes;
-        // If this browser was signed into a Creator Profile on the builder
-        // page, persist the like to that account too -- fire-and-forget,
-        // same as the rest of this add-on's account sync.
         try {
           var creatorName = localStorage.getItem('myListAddon:creatorName');
           var creatorKey = localStorage.getItem('myListAddon:creatorKey');
@@ -17584,8 +18162,9 @@ self.addEventListener('fetch', e => {
     });
   })();
   </script>
-</body></html>`;
-      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() } });
+</body>
+</html>`;
+      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", ...corsHeaders() } });
     }
 
     // --- Admin dashboard (page views / install links generated) -----------
@@ -17603,6 +18182,190 @@ self.addEventListener('fetch', e => {
       }
       const html = await renderAdminDashboard(env);
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    }
+
+    // /admin/api/leaderboard?type=watched|list-add&window=today|7|30|90|alltime&mediaType=movie|series
+    // -> { ok, entries } -- backs the Trending Data tab's dropdown, computed
+    // on demand rather than eagerly for every window/type combo on every
+    // page load (see computeLeaderboard's own comment on why this can fan
+    // out to a meaningful number of KV reads). mediaType is optional --
+    // omitted or anything else means both movies and shows together.
+    if (path === "/admin/api/leaderboard" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const eventType = url.searchParams.get("type") === "list-add" ? "list-add" : "watched";
+      const allowedWindows = new Set(["today", "7", "30", "90", "alltime"]);
+      const window = allowedWindows.has(url.searchParams.get("window")) ? url.searchParams.get("window") : "7";
+      const mediaTypeParam = url.searchParams.get("mediaType");
+      const mediaType = mediaTypeParam === "movie" || mediaTypeParam === "series" ? mediaTypeParam : null;
+      const entries = await computeLeaderboard(env, eventType, window, mediaType);
+      return json({ ok: true, entries });
+    }
+
+    // /admin/api/backfill-trending  (POST) -> { ok, done, accountsThisCall, titlesThisCall }
+    // Seeds the All Time trending leaderboards (see backfillTitleCount's
+    // own comment on why all-time-only) from data that already existed
+    // before trending tracking shipped -- each creator account's Watch
+    // History (aggregated to distinct shows/movies, dedupe-by-showId same
+    // as the live tracking does) and their own Custom Lists' current
+    // items. Processes exactly one account per call, capped to a handful
+    // of titles from each source, to stay comfortably under Cloudflare's
+    // per-request subrequest limit -- the admin dashboard's "Backfill
+    // Existing Data" button calls this repeatedly until it reports
+    // done:true, so this only needs to make forward progress each call,
+    // not finish everything at once. Resumes via a cursor stored at
+    // backfilltrending:cursor (same list()-cursor pattern
+    // checkForNewEpisodes already uses for its own account sweep);
+    // starting the sweep over from the top once every account has been
+    // visited is intentional, so an account created after the last full
+    // pass eventually gets covered too, and running this again later
+    // picks up anyone whose history grew since the first pass -- entries
+    // just accumulate (each backfill run adds its own snapshot on top of
+    // whatever's already there, same as any other watch/list-add event
+    // would), it doesn't overwrite.
+    if (path === "/admin/api/backfill-trending" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, done: true, accountsThisCall: 0, titlesThisCall: 0 });
+
+      const WATCHED_TITLE_CAP = 6;
+      const LIST_ITEM_CAP = 6;
+
+      const cursorRaw = await env.CONFIGS.get("backfilltrending:cursor");
+      const listOpts = { prefix: "creator:", limit: 1 };
+      if (cursorRaw) listOpts.cursor = cursorRaw;
+      const listResult = await env.CONFIGS.list(listOpts);
+
+      if (!listResult.keys.length) {
+        // Reached the end of the account list (or there are no accounts
+        // at all) -- reset to the top so a later run starts fresh rather
+        // than permanently reporting "done" against a stale cursor.
+        await env.CONFIGS.put("backfilltrending:cursor", "");
+        return json({ ok: true, done: true, accountsThisCall: 0, titlesThisCall: 0 });
+      }
+      await env.CONFIGS.put("backfilltrending:cursor", listResult.list_complete ? "" : (listResult.cursor || ""));
+
+      const username = listResult.keys[0].name.slice("creator:".length);
+      let titlesThisCall = 0;
+
+      // Watch History -> "watched", aggregated to distinct shows/movies
+      // (episodes collapse to their show, same as live tracking).
+      try {
+        const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+        if (trackingRaw) {
+          const tracking = JSON.parse(trackingRaw);
+          const watchHistory = Array.isArray(tracking.watchHistory) ? tracking.watchHistory : [];
+          const counts = new Map(); // id -> { title, mediaType, count }
+          watchHistory.forEach((it) => {
+            const id = it.showId || it.id;
+            if (!id) return;
+            const title = it.showTitle || it.name || "";
+            const mediaType = it.type === "movie" ? "movie" : "series";
+            const existing = counts.get(id);
+            if (existing) existing.count++;
+            else counts.set(id, { title, mediaType, count: 1 });
+          });
+          const topTitles = [...counts.entries()].slice(0, WATCHED_TITLE_CAP);
+          for (const [id, info] of topTitles) {
+            const ok = await backfillTitleCount(env, "watched", id, info.title, info.mediaType, info.count);
+            if (ok) titlesThisCall++;
+          }
+        }
+      } catch (e) {
+        // Skip this account's Watch History on any read/parse error --
+        // still worth trying its Custom Lists below, and the account
+        // will simply be revisited on a future full pass.
+      }
+
+      // Custom Lists -> "list-add", using each list's current items
+      // (there's no historical "added at" timestamp to work from, only
+      // present membership -- see this endpoint's own comment on why
+      // that's fine for an all-time-only count). Lists directly, by this
+      // account's own creatorlist: prefix, rather than going through
+      // creatorlistorder:{username} (which tracks display order for
+      // reordering specifically, not guaranteed to be a complete
+      // inventory of every list the account has).
+      try {
+        const listsResult = await env.CONFIGS.list({ prefix: `creatorlist:${username}:`, limit: 20 });
+        let itemsSeen = 0;
+        for (const listKey of listsResult.keys) {
+          if (itemsSeen >= LIST_ITEM_CAP) break;
+          const listRaw = await env.CONFIGS.get(listKey.name);
+          if (!listRaw) continue;
+          const list = JSON.parse(listRaw);
+          const items = Array.isArray(list.items) ? list.items : [];
+          for (const it of items) {
+            if (itemsSeen >= LIST_ITEM_CAP) break;
+            const id = it.imdbId || it.id;
+            if (!id) continue;
+            const ok = await backfillTitleCount(env, "list-add", id, it.title || it.name || "", list.type === "series" ? "series" : "movie", 1);
+            if (ok) titlesThisCall++;
+            itemsSeen++;
+          }
+        }
+      } catch (e) {
+        // Skip this account's Custom Lists on any read/parse error.
+      }
+
+      return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
+    }
+
+    // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
+    // newest first. Reads up to 300 entries; feedback keys already sort
+    // chronologically as plain strings (see /api/feedback's own comment),
+    // so list() naturally returns oldest-first and this just reverses it.
+    if (path === "/admin/api/feedback" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, entries: [] });
+      const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 300 });
+      const keys = listResult.keys.slice().reverse();
+      const entries = await Promise.all(
+        keys.map(async (k) => {
+          try {
+            const raw = await env.CONFIGS.get(k.name);
+            return raw ? JSON.parse(raw) : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: listResult.list_complete === false });
+    }
+
+    // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
+    // Toggles the "completed" flag on one feedback entry -- id here is the
+    // entry's own id field (the part of the KV key after "feedback:"), not
+    // the full key name, so the client never needs to know the storage
+    // layout to mark something done.
+    if (path === "/admin/api/feedback/status" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      if (!id) return json({ ok: false, error: "Missing id." }, 400);
+      const key = `feedback:${id}`;
+      const raw = await env.CONFIGS.get(key);
+      if (!raw) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
+      let entry;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+      }
+      entry.completed = !!body.completed;
+      try {
+        await env.CONFIGS.put(key, JSON.stringify(entry));
+      } catch (e) {
+        return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
+      }
+      return json({ ok: true });
     }
 
     if (path === "/admin/login" && request.method === "POST") {
