@@ -336,12 +336,42 @@ function mapTmdbItem(it, imdbId, type, videos) {
 // reused under the same display name for consistency with how the
 // Trending/Popular quick-add panels already pair up a movie list and a
 // show list under one shared catalog name.
+//
+// The provider-filtered entries below (netflix, disney, etc.) aren't
+// official TMDB charts, but reuse the exact same pathMap[wantKind] shape
+// (see fetchTmdbChart below) so they don't need their own fetcher --
+// tmdbProviderChartPaths(id) builds a discover query with
+// with_watch_providers=id, watch_region hardcoded to US (see the admin
+// dashboard's Provider Preview tab for previewing other regions; making
+// this region user-configurable per-entry is a separate, bigger change),
+// and with_watch_monetization_types=flatrate so this only matches titles
+// actually included with that service's subscription, not ones merely
+// available to rent/buy through it. Provider ids were looked up and
+// confirmed via that same Provider Preview tab -- TMDB is known to have
+// more than one entry for some services (e.g. two separate "Disney Plus"
+// ids), so these are NOT to be hand-edited from memory; re-verify through
+// the lookup tool before changing any of them.
+function tmdbProviderChartPaths(providerId) {
+  const q = `with_watch_providers=${providerId}&watch_region=US&with_watch_monetization_types=flatrate&sort_by=popularity.desc`;
+  return { movie: `discover/movie?${q}`, tv: `discover/tv?${q}` };
+}
+
 const TMDB_CHART_PATHS = {
   trending: { movie: "trending/movie/week", tv: "trending/tv/week" },
   popular: { movie: "movie/popular", tv: "tv/popular" },
   top_rated: { movie: "movie/top_rated", tv: "tv/top_rated" },
   now_playing: { movie: "movie/now_playing", tv: "tv/airing_today" },
   upcoming: { movie: "movie/upcoming", tv: "tv/on_the_air" },
+  netflix: tmdbProviderChartPaths(8),
+  netflixkids: tmdbProviderChartPaths(175),
+  appletv: tmdbProviderChartPaths(350),
+  disney: tmdbProviderChartPaths(337),
+  hbomax: tmdbProviderChartPaths(1899),
+  hulu: tmdbProviderChartPaths(15),
+  discovery: tmdbProviderChartPaths(520),
+  paramount: tmdbProviderChartPaths(2303),
+  primevideo: tmdbProviderChartPaths(9),
+  peacock: tmdbProviderChartPaths(387),
 };
 
 // Fetches a PAGE_SIZE window (starting at `skip`, optionally offset by an
@@ -415,6 +445,59 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
   });
 
   return resolved.filter(Boolean);
+}
+
+// A hard-capped 10-item version of fetchTmdbChart, for the "Top 10" panel's
+// provider rows (STREAMING_TOP10) -- fetchTmdbChart itself is unbounded and
+// keeps paginating through the entire catalog as Stremio/wako scroll,
+// which is correct for the full "Streaming Catalogs" panel but not for
+// something labeled "Top 10". This exists specifically so pagination stops
+// after 10, the same way the old hand-curated 10-item mdblist.com lists
+// this replaced used to stop naturally once you'd scrolled through all of
+// them -- TOP_N below is the only thing controlling that, not something
+// TMDB itself expresses (their discover results are just popularity-
+// sorted, uncapped).
+async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
+  const TOP_N = 10;
+  if (skip >= TOP_N) return []; // already gave everything -- tells the caller to stop paginating
+  if (!apiKey) {
+    throw new Error(
+      "TMDB charts aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
+    );
+  }
+  const wantKind = entry.type === "series" ? "tv" : "movie";
+  const pathMap = TMDB_CHART_PATHS[chartKey];
+  const chartPath = pathMap && pathMap[wantKind];
+  if (!chartPath) {
+    throw new Error("This TMDB chart doesn't have a shows version.");
+  }
+  // A single direct page-1 request -- TOP_N=10 always fits inside TMDB's
+  // own 20-per-page results, so this deliberately skips
+  // fetchTmdbPagedResults's own windowing (built for pulling up to
+  // PAGE_SIZE=100 items across several concurrent TMDB pages, which here
+  // would mean 5x more TMDB calls, and 5x more per-title detail lookups
+  // below, than a top-10 list actually needs).
+  const sep = chartPath.includes("?") ? "&" : "?";
+  const src = `https://api.themoviedb.org/3/${chartPath}${sep}api_key=${encodeURIComponent(apiKey)}&page=1`;
+  const res = await fetch(src, {
+    headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+    cf: { cacheTtl: 900, cacheEverything: true },
+  });
+  if (!res.ok) {
+    throw new Error(`TMDB request failed (HTTP ${res.status}).`);
+  }
+  const data = await res.json();
+  const windowItems = (Array.isArray(data.results) ? data.results : []).slice(0, TOP_N);
+
+  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    if (!imdbId) return null;
+    return mapTmdbItem(it, imdbId, entry.type, videos);
+  });
+  // Slicing our own already-capped (at most 10-item) result against the
+  // caller's real skip/PAGE_SIZE window -- returns [] once skip walks past
+  // the 10th item, without any further TMDB calls.
+  return resolved.filter(Boolean).slice(skip, skip + PAGE_SIZE);
 }
 
 // --- Hidden Gems: a no-personalization discovery shelf ---------------------
@@ -506,16 +589,16 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
   if (!apiKey) return null;
   let tmdbId = null;
   let type = null;
+  // Shows/movies opened from Search Movies & TV Shows carry a "tmdb:<id>"
+  // identifier instead of a real IMDb id -- fallbackType (the caller's own
+  // type, passed through from /api/details's own request) is the only way
+  // to know which TMDB endpoint to hit for one of these, since a bare
+  // numeric TMDB id doesn't say movie or tv on its own.
+  const wasTmdbOnly = imdbId.startsWith('tmdb:');
 
-  if (imdbId.startsWith('tmdb:')) {
-      tmdbId = imdbId.split(':')[1];
-      type = fallbackType === 'series' ? 'tv' : fallbackType;
-    // Since we don't know the type from the ID alone, we might need a hint.
-    // Wait, we don't have the type parameter in fetchTmdbItemDetails!
-    // If it's tmdb:, we might have to probe both or accept it might fail if we guess wrong.
-    // However, the caller usually passes type implicitly? No, type is not passed!
-    // Actually, openItemDetailsModal passes id and type to the frontend, but the backend /api/details only receives imdbId!
-    // We should modify /api/details to also accept type!
+  if (wasTmdbOnly) {
+    tmdbId = imdbId.split(':')[1];
+    type = fallbackType === 'series' ? 'tv' : (fallbackType === 'movie' ? 'movie' : null);
   }
 
   if (!tmdbId) {
@@ -535,9 +618,9 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
       type = "tv";
     }
   }
-  if (!tmdbId) return null;
+  if (!tmdbId || !type) return null;
 
-  const detailSrc = "https://api.themoviedb.org/3/" + type + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings";
+  const detailSrc = "https://api.themoviedb.org/3/" + type + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids";
   const detailRes = await fetch(detailSrc, {
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
@@ -565,8 +648,24 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
     if (trailer) trailerKey = trailer.key;
   }
 
+  // Resolves the REAL IMDb id -- if the caller already had a real one,
+  // keep using exactly that (no reason to trust TMDB's own external_ids
+  // echo of what was already known); if the caller only had a bare
+  // tmdb:<id> (Search Movies & TV Shows), this is the ONLY place that ever
+  // turns it into a real IMDb id. Every downstream watched-status check or
+  // save (toggleWatchStatus, markShowWatched, Watch History) keys off this
+  // id -- without this, a title opened from Search silently tracked
+  // watched-state under a literal "tmdb:12345" placeholder that nothing
+  // else in the app ever recognized: marking it watched from Search never
+  // showed up anywhere else, and a title already marked watched via
+  // Discover/a chart never showed as watched when reopened from Search,
+  // since the two entry points were keying the exact same title under two
+  // different, unrelated ids.
+  const realImdbId = wasTmdbOnly ? ((match.external_ids && match.external_ids.imdb_id) || null) : imdbId;
+  if (!realImdbId) return null; // TMDB has no IMDb id for this title -- nothing to track watched-state against
+
   return {
-    id: imdbId,
+    id: realImdbId,
     title: match.title || match.name,
     overview: match.overview || "",
     poster: match.poster_path ? "https://image.tmdb.org/t/p/w500" + match.poster_path : "",
@@ -575,6 +674,17 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
     releaseYear: (match.release_date || match.first_air_date || "").slice(0, 4),
     releaseDate: match.release_date || match.first_air_date || null,
     seasonsData: type === "tv" && match.seasons ? match.seasons : null,
+    // Exposed so the client can pass it straight back on every per-season
+    // fetch (see fetchTmdbSeasonDetails's own knownTmdbId param) instead of
+    // re-resolving imdbId -> tmdbId itself each time. That resolution is
+    // one extra TMDB call per season, and firing several of them
+    // concurrently for a show TMDB hasn't been asked about before all race
+    // to populate the same cold cache entry -- some of those concurrent
+    // /find/ calls can come back empty from TMDB under that burst, which
+    // silently drops that season's episodes even though the show/season
+    // genuinely exists (see markShowWatched's own comment for the visible
+    // symptom this caused).
+    tmdbId: tmdbId,
     runtime: match.runtime || (match.episode_run_time && match.episode_run_time[0]) || null,
     budget: match.budget || null,
     revenue: match.revenue || null,
@@ -584,7 +694,7 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
   };
 }
 
-async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey) {
+async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
   if (!apiKey) return null;
   // Shows opened from title search (Search Movies & TV Shows) carry a
   // "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
@@ -594,21 +704,23 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey) {
   // "tmdb:12345" string, every season fails to load ("Error loading
   // episodes."), and since no episodes ever render there's nothing left to
   // mark watched either.
-  let tmdbId;
-  if (imdbId.startsWith('tmdb:')) {
-    tmdbId = imdbId.split(':')[1];
-  } else {
-    // First, find TMDB ID from IMDB ID
-    const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(imdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
-    const findRes = await fetch(findSrc, {
-      headers: { "User-Agent": "my-list-addon/1.14" },
-      cf: { cacheTtl: 604800, cacheEverything: true },
-    });
-    if (!findRes.ok) return null;
-    const findData = await findRes.json();
+  let tmdbId = knownTmdbId || null;
+  if (!tmdbId) {
+    if (imdbId.startsWith('tmdb:')) {
+      tmdbId = imdbId.split(':')[1];
+    } else {
+      // First, find TMDB ID from IMDB ID
+      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(imdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+      const findRes = await fetch(findSrc, {
+        headers: { "User-Agent": "my-list-addon/1.14" },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (!findRes.ok) return null;
+      const findData = await findRes.json();
 
-    if (!findData.tv_results || findData.tv_results.length === 0) return null;
-    tmdbId = findData.tv_results[0].id;
+      if (!findData.tv_results || findData.tv_results.length === 0) return null;
+      tmdbId = findData.tv_results[0].id;
+    }
   }
 
   const src = "https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonNum + "?api_key=" + encodeURIComponent(apiKey);

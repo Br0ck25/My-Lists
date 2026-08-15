@@ -197,7 +197,6 @@ function renderCreatorProfileBar() {
       '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
       '<div style="display:flex; align-items:center; gap:8px;">' +
       '<span class="subnav-pill active" style="margin:0; font-size:0.82rem; padding:6px 12px; cursor:pointer;" onclick="switchTab(&quot;keys&quot;)">&#x1F464; ' + escapeHtml(activeCreator.displayName) + '</span>' +
-      '<button type="button" class="lc-btn" style="padding:5px 9px; font-size:0.78rem;" onclick="switchCreatorProfile()" title="Sign Out / Switch">Sign Out</button>' +
       '</div>' +
       '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
       '</div>';
@@ -205,8 +204,7 @@ function renderCreatorProfileBar() {
     bar.innerHTML =
       '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
       '<div style="display:flex; align-items:center; gap:6px;">' +
-      '<button type="button" class="lc-btn primary" onclick="openCreateProfileModal()" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">+ Create Account</button>' +
-      '<button type="button" class="lc-btn" onclick="openRestoreModal()" style="padding:6px 12px; font-size:0.82rem;">Restore</button>' +
+      '<button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">Login</button>' +
       '</div>' +
       '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
       '</div>';
@@ -222,7 +220,7 @@ function renderAccountKeySection() {
       '<p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Save and sync your lists, channels, presets, likes, and settings across all your devices automatically. No email or password needed &mdash; just a username and key.</p>' +
       '<div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-top:12px;">' +
       '<button type="button" class="primary" onclick="openCreateProfileModal()">Create Free Account</button>' +
-      '<button type="button" class="secondary" onclick="openRestoreModal()">Restore Existing Account</button>' +
+      '<button type="button" class="secondary" onclick="openRestoreModal()">Login</button>' +
       '</div>';
     return;
   }
@@ -241,7 +239,112 @@ function renderAccountKeySection() {
     '<button type="button" class="secondary" id="accountKeyToggleBtn" onclick="toggleAccountKeyVisibility()">Show Key</button>' +
     '<button type="button" class="secondary" onclick="copyAccountKey()">Copy Key</button>' +
     '</div>' +
-    '<p style="margin-top:10px;"><small>Anyone with this key can sign in as you and edit your lists &mdash; keep it somewhere safe, and don\\'t share it.</small></p>';
+    '<p style="margin-top:10px;"><small>Anyone with this key can sign in as you and edit your lists &mdash; keep it somewhere safe, and don&apos;t share it.</small></p>' +
+    '<div class="danger-zone" style="margin-top:20px; padding:14px 16px; border:1px solid rgba(255,59,48,0.3); border-radius:12px; background:rgba(255,59,48,0.05);">' +
+      '<div style="font-weight:700; font-size:0.9rem; color:var(--danger, #ff3b30); margin-bottom:4px;">Delete Account</div>' +
+      '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Permanently delete your account, all published lists, and all synced data from the server.</p>' +
+      '<button type="button" class="lc-btn" style="background:#ff3b30; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openDeleteAccountModal()">Delete Account &amp; All Data</button>' +
+    '</div>';
+}
+
+function openDeleteAccountModal() {
+  if (!activeCreator) return;
+  showModal(
+    '<div class="modal-body">' +
+      '<h2 class="panel-title" style="color:var(--danger, #ff3b30);">&#x26A0; Delete Account &amp; All Data</h2>' +
+      '<p style="margin:8px 0 14px; font-size:0.9rem;">Are you sure you want to delete your account <strong>' + escapeHtml(activeCreator.displayName) + '</strong>?</p>' +
+      '<div style="background:rgba(255,59,48,0.08); border:1px solid rgba(255,59,48,0.25); border-radius:8px; padding:12px; margin-bottom:14px; font-size:0.85rem; color:var(--text);">' +
+        '<p style="margin:0 0 6px; font-weight:700; color:var(--danger, #ff3b30);">&#x2717; This action is permanent and cannot be undone.</p>' +
+        '<ul style="margin:0; padding-left:18px; color:var(--muted);">' +
+          '<li>All your published lists will be deleted from the server.</li>' +
+          '<li>All synced backups, likes, and channel configurations will be erased.</li>' +
+          '<li>Your account key will become permanently invalid.</li>' +
+        '</ul>' +
+      '</div>' +
+      '<div id="deleteAccountStatus"></div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<button type="button" class="secondary" onclick="closeModal()">Cancel</button>' +
+        '<button type="button" id="confirmDeleteAccountBtn" class="primary" style="background:#ff3b30; border-color:#ff3b30; color:#fff;" onclick="handleDeleteAccount()">Permanently Delete Everything</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+async function handleDeleteAccount() {
+  if (!activeCreator) return;
+  const btn = document.getElementById('confirmDeleteAccountBtn');
+  const status = document.getElementById('deleteAccountStatus');
+  if (btn) btn.disabled = true;
+  if (status) status.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;">Deleting account and all data\u2026</p>';
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/delete-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!data || !data.ok) {
+      if (status) status.innerHTML = '<p class="testresult err">&#x2717; ' + escapeHtml((data && data.error) || 'Failed to delete account.') + '</p>';
+      if (btn) btn.disabled = false;
+      return;
+    }
+    localStorage.removeItem('myListAddon:creatorName');
+    localStorage.removeItem('myListAddon:creatorKey');
+    localStorage.removeItem('myListAddon:creatorDisplayName');
+    localStorage.removeItem('myListAddon:dashboardListOrder');
+    activeCreator = null;
+    closeModal();
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderCreatorDashboard();
+    renderLocalCustomListsDashboard();
+    showAddedToast('Your account and all data have been permanently deleted.');
+  } catch (err) {
+    if (status) status.innerHTML = '<p class="testresult err">&#x2717; Network error deleting account.</p>';
+    if (btn) btn.disabled = false;
+  }
+}
+
+function openShareListModal(listName, listUrl) {
+  showModal(
+    '<div class="modal-body">' +
+      '<h2 class="panel-title" style="margin-bottom:6px;">Share List</h2>' +
+      '<p style="margin:0 0 14px; font-size:0.88rem; color:var(--muted);">Share <strong>' + escapeHtml(listName || 'Custom List') + '</strong> with others or open it in your browser.</p>' +
+      '<div style="display:flex; gap:8px; align-items:center; margin-bottom:14px;">' +
+        '<input type="text" id="shareListUrlInput" value="' + escapeAttr(listUrl) + '" readonly style="flex:1; padding:10px 12px; font-size:0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+        '<button type="button" class="lc-btn primary" id="shareListCopyBtn" onclick="copyShareListUrl()" style="white-space:nowrap; padding:10px 16px;">Copy Link</button>' +
+      '</div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<a href="' + escapeAttr(listUrl) + '" target="_blank" class="button secondary lc-btn" style="text-decoration:none; display:inline-flex; align-items:center;">Open Link &nearr;</a>' +
+        '<button type="button" class="secondary lc-btn" onclick="closeModal()">Close</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function copyShareListUrl() {
+  const input = document.getElementById('shareListUrlInput');
+  const btn = document.getElementById('shareListCopyBtn');
+  if (!input) return;
+  input.select();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(() => {
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    }).catch(() => {
+      document.execCommand('copy');
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    });
+  } else {
+    document.execCommand('copy');
+    if (btn) btn.textContent = 'Copied \u2713';
+    showAddedToast('Link copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+  }
 }
 
 function toggleAccountKeyVisibility() {
@@ -346,13 +449,13 @@ function switchCreatorProfile() {
 function openRestoreModal() {
   showModal(
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
-    '<h2>Restore Account</h2>' +
-    '<p class="modal-sub">Enter your Username and Account Key to restore and sync your lists.</p>' +
+    '<h2>Login</h2>' +
+    '<p class="modal-sub">Enter your Username and Account Key to login and sync your lists.</p>' +
     '<div class="row"><input type="text" id="restoreNameInput" placeholder="Username"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="restoreKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
     '<div id="restoreModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitRestoreProfile()">Restore Account</button>' +
+    '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
     '</div>'
   );
@@ -762,7 +865,7 @@ function openCreateProfileModal() {
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
-    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Restore</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Login</button>' +
     '</div>'
   );
 }
@@ -846,22 +949,78 @@ function openVisibilityModal() {
   const ctx = pendingSaveListContext;
   if (!ctx) return;
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
-    '<h2 style="margin-top:0; color:#001f3f;">Visibility</h2>' +
-    '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:16px; margin: 20px 0;">' +
-    '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; color:#001f3f;">' +
-      '<input type="radio" name="listVisibility" value="public" checked style="margin-top:4px; accent-color:#003366;">' +
-      '<span style="flex:1;"><strong>Public</strong><br><small style="color:#555;">Anyone with the link can view and use this list.</small></span>' +
-    '</label>' +
-    '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; color:#001f3f;">' +
-      '<input type="radio" name="listVisibility" value="private" style="margin-top:4px; accent-color:#003366;">' +
-      '<span style="flex:1;"><strong>Private</strong><br><small style="color:#555;">Only you can view and edit this list after restoring your Creator Profile.</small></span>' +
-    '</label>' +
-    '</div>' +
-    '<div style="display:flex; justify-content:flex-end;">' +
-      '<button type="button" onclick="confirmSaveAsCreator()" style="background: transparent; color: #003366; font-weight: 600; border: none; padding: 8px 16px; font-size: 1rem; cursor: pointer;">Save List</button>' +
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;">Save Custom List</h2>' +
+      '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Creator Profile.</p>' +
+      '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:12px; margin: 16px 0 20px;">' +
+        '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg);">' +
+          '<input type="radio" name="listVisibility" value="public" checked style="margin-top:3px; accent-color:var(--brand);">' +
+          '<span style="flex:1;"><strong style="color:var(--text); font-size:0.92rem;">Public</strong><br><small style="color:var(--muted);">Anyone with the link can view, like, and add this list to their catalogs.</small></span>' +
+        '</label>' +
+        '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg);">' +
+          '<input type="radio" name="listVisibility" value="private" style="margin-top:3px; accent-color:var(--brand);">' +
+          '<span style="flex:1;"><strong style="color:var(--text); font-size:0.92rem;">Private</strong><br><small style="color:var(--muted);">Only you can view and edit this list when logged into your account.</small></span>' +
+        '</label>' +
+      '</div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<button type="button" class="secondary lc-btn" onclick="closeModal()">Cancel</button>' +
+        '<button type="button" class="primary lc-btn" onclick="confirmSaveAsCreator()">Save List</button>' +
+      '</div>' +
     '</div>'
   );
+}
+
+function showSavedCustomListModal(listName, visibility, url) {
+  const isPrivate = visibility === 'private';
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;">\u2713 List Saved</h2>' +
+      '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
+        '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Creator Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
+      '</p>' +
+      (isPrivate
+        ? '<div style="padding:12px 14px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.2); border-radius:10px; margin-bottom:16px;">' +
+            '<p style="margin:0; font-size:0.84rem; color:var(--text);">&#x1F512; Only you can see this list from your profile when logged in.</p>' +
+          '</div>'
+        : '<div style="margin-bottom:16px;">' +
+            '<p style="margin:0 0 8px; font-size:0.84rem; color:var(--muted);">Public share link:</p>' +
+            '<div style="display:flex; gap:8px; align-items:center;">' +
+              '<input type="text" id="savedListUrlInput" value="' + escapeAttr(url || '') + '" readonly style="flex:1; padding:10px 12px; font-size:0.88rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+              '<button type="button" class="lc-btn primary" id="savedListCopyBtn" onclick="copyShareUrlById(&quot;savedListUrlInput&quot;, this)" style="white-space:nowrap; padding:10px 14px;">Copy Link</button>' +
+            '</div>' +
+          '</div>'
+      ) +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        (!isPrivate && url ? '<a href="' + escapeAttr(url) + '" target="_blank" class="button secondary lc-btn" style="text-decoration:none; display:inline-flex; align-items:center;">Open Link &nearr;</a>' : '') +
+        '<button type="button" class="primary lc-btn" onclick="closeModal()">Done</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function copyShareUrlById(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  input.select();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(() => {
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    }).catch(() => {
+      document.execCommand('copy');
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    });
+  } else {
+    document.execCommand('copy');
+    if (btn) btn.textContent = 'Copied \u2713';
+    showAddedToast('Link copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+  }
 }
 
 async function confirmSaveAsCreator() {
@@ -899,11 +1058,7 @@ async function confirmSaveAsCreator() {
     });
     ctx.sourceRow.outerHTML = customListSourceRowHtml('customlist:v1:' + JSON.stringify(updatedPayload));
     saveState();
-    alert(
-      visibility === 'private'
-        ? 'Saved to your Creator Profile as a private list.'
-        : 'Saved to your Creator Profile. Link:\\n' + data.url
-    );
+    showSavedCustomListModal(ctx.name, visibility, data.url);
     renderCreatorDashboard();
   } catch (e) {
     alert('Network error while saving.');
@@ -951,71 +1106,90 @@ async function renderCreatorDashboard() {
       if (pruned && typeof saveState === 'function') saveState();
     }
     
-    const rowsHtml = data.lists.length
-      ? data.lists.map((l) => {
-          const shareBtn = l.visibility === 'private'
-            ? ''
-            : '<button type="button" class="lc-btn secondary creatorListShareBtn" data-url="' + escapeAttr(l.url) + '">Share</button>';
-          const allPosters = (l.items || []).slice(0, 9).filter((it) => it.poster);
-          const totalCount = l.itemCount || allPosters.length;
-          const posterThumbs = allPosters.map((it, i) => {
-            const isMobileEnd = (i === 2 && allPosters.length > 3);
-            const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
-            let overlays = '';
-            if (isMobileEnd) {
-              overlays += '<div class="list-card-count-overlay mobile-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-            }
-            if (isDesktopEnd) {
-              overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-            }
-            return '<div class="list-card-mini-poster-tile">' +
-              '<div class="list-card-mini-poster-img-wrap">' +
-                '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.imdbId || it.id) + '" data-type="' + escapeAttr(l.type || 'movie') + '" alt="" loading="lazy">' +
-                overlays +
-              '</div>' +
-              '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
-            '</div>';
-          }).join('');
-          return '<div class="creator-list-row list-card" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
-            '<div class="list-card-header">' +
-              '<div class="list-card-icon src-mylist">ML</div>' +
-              '<div class="list-card-body">' +
-                '<div class="list-card-title">' +
-                  '<span class="drag-handle" draggable="true" style="cursor:grab; padding:0 6px 0 0;">\u2630</span>' +
-                  escapeHtml(l.name) +
-                '</div>' +
-                '<div class="list-card-meta">' +
-                  '<span>' + (l.visibility === 'private' ? 'Private' : 'Public') + '</span>' +
-                  '<span class="list-card-meta-sep">&middot;</span>' +
-                  '<span>' + (l.type === 'series' ? 'Shows' : 'Movies') + '</span>' +
-                  '<span class="list-card-meta-sep">&middot;</span>' +
-                  '<span>' + l.itemCount + ' items</span>' +
-                  ((l.likes || 0) > 0 ? '<span class="list-card-meta-sep">&middot;</span><span>\u2665 ' + l.likes + '</span>' : '') +
-                '</div>' +
-              '</div>' +
-              '<div class="list-card-actions">' +
-                '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
-                '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>' +
-                shareBtn +
-                '<button type="button" class="lc-btn primary creatorListAddToConfigBtn" data-slug="' + escapeAttr(l.slug) + '">+ Add</button>' +
-              '</div>' +
-            '</div>' +
-            (posterThumbs ? '<div class="list-card-posters poster-preview-static creatorListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
-          '</div>';
-        }).join('')
-      : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
-
-    // Watch History / Continue Watching never live on the server (see
-    // renderAutoTrackedListsHtml) -- append them from localStorage so
-    // they don't vanish just because someone's signed in. lastLocalCustomListsData
-    // gets pointed at just these two so the click-delegation handlers below
-    // (Edit/Delete/+Add/View) can still resolve a click on either of them
-    // while lastCreatorListsData covers the server rows above.
     const autoTracked = renderAutoTrackedListsHtml();
     lastLocalCustomListsData = autoTracked.lists;
 
-    box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + autoTracked.html + '</div>';
-    document.querySelectorAll('#creatorListRows .drag-handle').forEach((h) => initCreatorListTouchDrag(h));
+    function buildServerListCardHtml(l) {
+      const shareBtn = l.visibility === 'private'
+        ? ''
+        : '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '">Share</button>';
+      const allPosters = (l.items || []).slice(0, 9).filter((it) => it.poster);
+      const totalCount = l.itemCount || allPosters.length;
+      const posterThumbs = allPosters.map((it, i) => {
+        const isMobileEnd = (i === 2 && allPosters.length > 3);
+        const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
+        let overlays = '';
+        if (isMobileEnd) {
+          overlays += '<div class="list-card-count-overlay mobile-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        }
+        if (isDesktopEnd) {
+          overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        }
+        return '<div class="list-card-mini-poster-tile">' +
+          '<div class="list-card-mini-poster-img-wrap">' +
+            '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.imdbId || it.id) + '" data-type="' + escapeAttr(l.type || 'movie') + '" alt="" loading="lazy">' +
+            overlays +
+          '</div>' +
+          '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
+          (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+        '</div>';
+      }).join('');
+      const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+      return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
+        '<div class="list-card-header">' +
+          '<div class="list-card-body">' +
+            '<div class="list-card-title">' +
+              '<span class="drag-handle-list" title="Drag to reorder">&#x2630;</span>' +
+              escapeHtml(l.name) +
+            '</div>' +
+            '<div class="list-card-meta">' +
+              '<span>' + (l.visibility === 'private' ? 'Private' : 'Public') + '</span>' +
+              '<span class="list-card-meta-sep">&middot;</span>' +
+              '<span>' + (l.type === 'series' ? 'Shows' : 'Movies') + '</span>' +
+              '<span class="list-card-meta-sep">&middot;</span>' +
+              '<span>' + l.itemCount + ' items</span>' +
+              '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="list-card-actions">' +
+            '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>' +
+            shareBtn +
+            '<button type="button" class="lc-btn ' + (isAdded ? 'secondary creatorListAddToConfigBtn is-added' : 'primary creatorListAddToConfigBtn') + '" ' +
+              (isAdded ? 'style="color:var(--danger);"' : '') +
+              ' data-slug="' + escapeAttr(l.slug) + '">' +
+              (isAdded ? 'Remove' : '+ Add') +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+        (posterThumbs ? '<div class="list-card-posters poster-preview-static creatorListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
+      '</div>';
+    }
+
+    const allDashboardLists = [
+      ...(data.lists || []).map((l) => ({ isServer: true, list: l })),
+      ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
+    ];
+
+    let savedOrder = [];
+    try {
+      savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    } catch (e) {}
+    if (savedOrder && savedOrder.length) {
+      const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
+      allDashboardLists.sort((a, b) => {
+        const posA = orderMap.has(a.list.slug) ? orderMap.get(a.list.slug) : 9999;
+        const posB = orderMap.has(b.list.slug) ? orderMap.get(b.list.slug) : 9999;
+        return posA - posB;
+      });
+    }
+
+    const rowsHtml = allDashboardLists.length
+      ? allDashboardLists.map((item) => item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list)).join('')
+      : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
+
+    box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+    document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
   } catch (e) {
     box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
   }
@@ -1095,55 +1269,63 @@ function buildLocalListCardHtml(l) {
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
       (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+      (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
     '</div>';
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
-  // Watch History's own card: every poster shown here is watched by
-  // definition, so the blue checkmark badge is redundant -- same
-  // suppression the Live Preview shelf and "see all" modal already apply
-  // via this class (see the .is-watch-history-shelf CSS rule), just not
-  // previously wired up to this specific card's markup.
-  const cardClass = 'list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : '');
-  return '<div class="' + cardClass + '" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
+  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : '');
+
+  let isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+  if (!isAdded && isAutoTracked) {
+    const entries = document.querySelectorAll('#lists .entry');
+    for (const entry of entries) {
+      const nameInput = entry.querySelector('.name');
+      const urlInput = entry.querySelector('.url');
+      if (urlInput && (urlInput.value.indexOf('autotrack:' + l.slug) !== -1 || (urlInput.value.indexOf(l.slug) !== -1 && urlInput.value.startsWith('customlist:v1:')))) {
+        isAdded = true;
+        break;
+      }
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(l.name.toLowerCase())) {
+        isAdded = true;
+        break;
+      }
+    }
+  }
+  const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary localListAddToConfigBtn is-added' : 'primary localListAddToConfigBtn') + '" ' +
+    (isAdded ? 'style="color:var(--danger);"' : '') +
+    ' data-slug="' + escapeAttr(l.slug) + '">' +
+    (isAdded ? 'Remove' : '+ Add') +
+  '</button>';
+
+  return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
-      '<div class="list-card-icon src-mylist">ML</div>' +
       '<div class="list-card-body">' +
-        '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+        '<div class="list-card-title">' +
+          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          escapeHtml(l.name) +
+        '</div>' +
         '<div class="list-card-meta">' +
           '<span>' + typeLabel + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span>' +
           '<span>' + itemCount + ' item' + (itemCount === 1 ? '' : 's') + '</span>' +
+          '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
         '</div>' +
       '</div>' +
-      // Watch History and Continue Watching are auto-generated from what
-      // you actually watch, not something to hand-edit or delete -- Edit
-      // would desync it from _watchedItemIds (nothing would tell the
-      // "watched" badge system an item was removed), and Delete doesn't
-      // just clear this browser: the next background account sync push
-      // (a full overwrite, not a merge) would wipe it from every
-      // signed-in device too. Both stay view-only; the poster grid below
-      // still works normally.
       (isAutoTracked
         ? '<div class="list-card-actions">' +
             '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap; margin-right:8px;">Auto-tracked</span>' +
-            '<button type="button" class="lc-btn primary localListAddToConfigBtn" data-slug="' + escapeAttr(l.slug) + '">+ Add</button>' +
+            addBtnHtml +
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
             '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>' +
-            '<button type="button" class="lc-btn primary localListAddToConfigBtn" data-slug="' + escapeAttr(l.slug) + '">+ Add</button>' +
+            addBtnHtml +
           '</div>') +
     '</div>' +
-    (posterThumbs ? '<div class="list-card-posters poster-preview-static localListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
+    (posterThumbs ? '<div class="list-card-posters poster-preview-static localListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
   '</div>';
 }
 
-// Backfills a slug onto Watch History / Continue Watching entries saved by
-// an older version of this addon before they carried one -- without it,
-// the dashboard's View/Edit/Delete/+Add buttons can't match a click back
-// to the right entry. Same patch getOrCreateWatchHistoryList /
-// getOrCreateContinueWatchingList apply on write; this covers the
-// read-only path where someone opens this tab without touching either
 // list first.
 function backfillAutoTrackedListSlugs(map) {
   let patched = false;
@@ -1176,14 +1358,28 @@ function renderLocalCustomListsDashboard(box) {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
 
-  const lists = Object.keys(map)
-    .map((k) => map[k])
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const lists = Object.keys(map).map((k) => map[k]);
+  let savedOrder = [];
+  try {
+    savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+  } catch (e) {}
+  if (savedOrder && savedOrder.length) {
+    const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
+    lists.sort((a, b) => {
+      const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
+      const posB = orderMap.has(b.slug) ? orderMap.get(b.slug) : 9999;
+      if (posA !== posB) return posA - posB;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+  } else {
+    lists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
   lastLocalCustomListsData = lists;
   const rowsHtml = lists.length
     ? lists.map(buildLocalListCardHtml).join('')
     : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
   box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+  document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
 }
 
 
@@ -1214,17 +1410,14 @@ if (_creatorDashEl) {
         removeShowId: (list.slug === 'continue-watching' && it.showId) ? it.showId : null,
       };
     }) : [];
-    openListPreviewModal(viewBtn.dataset.name, viewBtn.dataset.type, '', { sample: sample, maybeMore: false });
+    openListDetailsPage(viewBtn.dataset.name, viewBtn.dataset.type, '', { sample: sample, maybeMore: false });
     return;
   }
   const shareBtn = e.target.closest('.creatorListShareBtn');
   if (shareBtn) {
     const listUrl = shareBtn.dataset.url;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(listUrl).then(() => alert("Link copied: " + listUrl)).catch(() => prompt("Share this link:", listUrl));
-    } else {
-      prompt("Share this link:", listUrl);
-    }
+    const listName = shareBtn.dataset.name || 'Custom List';
+    openShareListModal(listName, listUrl);
     return;
   }
   const deleteBtn = e.target.closest('.creatorListDeleteBtn');
@@ -1275,10 +1468,41 @@ if (_creatorDashEl) {
       alert('Could not find that list -- try refreshing.');
       return;
     }
-    const payload = { listId: generateChannelId(), type: listMeta.type, items: listMeta.items || [], shuffle: false };
-    addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
-    addToConfigBtn.disabled = true;
-    addToConfigBtn.textContent = 'Added \u2713';
+    const isAdded = addToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listMeta.type, slug);
+        removeListFromConfig(null, 'movie', slug);
+        removeListFromConfig(null, 'series', slug);
+      }
+      addToConfigBtn.classList.remove('is-added', 'secondary');
+      addToConfigBtn.classList.add('primary');
+      addToConfigBtn.textContent = '+ Add';
+      addToConfigBtn.style.color = '';
+      showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
+    } else {
+      if (listMeta.type === 'mixed') {
+        const items = listMeta.items || [];
+        const movies = items.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type)));
+        const series = items.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv'));
+        if (movies.length > 0) {
+          const payload = { listId: generateChannelId(), listSlug: slug, type: 'movie', items: movies, shuffle: false };
+          addRow(listMeta.name + (series.length > 0 ? ' (Movies)' : ''), 'customlist:v1:' + JSON.stringify(payload), 'movie', true, 'Custom Lists');
+        }
+        if (series.length > 0 || movies.length === 0) {
+          const payload = { listId: generateChannelId(), listSlug: slug, type: 'series', items: series, shuffle: false };
+          addRow(listMeta.name + (movies.length > 0 ? ' (Shows)' : ''), 'customlist:v1:' + JSON.stringify(payload), 'series', true, 'Custom Lists');
+        }
+      } else {
+        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type, items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
+      }
+      addToConfigBtn.classList.add('is-added', 'secondary');
+      addToConfigBtn.classList.remove('primary');
+      addToConfigBtn.textContent = 'Remove';
+      addToConfigBtn.style.color = 'var(--danger)';
+      showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
+    }
     return;
   }
   const localEditBtn = e.target.closest('.localListEditBtn');
@@ -1327,6 +1551,52 @@ if (_creatorDashEl) {
       return;
     }
     
+    let isAdded = localAddToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
+    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching')) {
+      const entries = document.querySelectorAll('#lists .entry');
+      for (const entry of entries) {
+        const nameInput = entry.querySelector('.name');
+        const urlInput = entry.querySelector('.url');
+        if (urlInput && (urlInput.value.indexOf('autotrack:' + slug) !== -1 || (urlInput.value.indexOf(slug) !== -1 && urlInput.value.startsWith('customlist:v1:')))) {
+          isAdded = true;
+          break;
+        }
+        if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
+          isAdded = true;
+          break;
+        }
+      }
+    }
+
+    if (isAdded) {
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (rowPayload && rowPayload.localSlug === slug) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        } else if (urlInput.value.indexOf('autotrack:' + slug) !== -1) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        }
+      });
+      if (slug === 'watch-history' || slug === 'continue-watching') {
+        document.querySelectorAll('#lists .entry').forEach((entry) => {
+          const nameInput = entry.querySelector('.name');
+          if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
+            entry.remove();
+          }
+        });
+      }
+      if (typeof renumber === 'function') renumber();
+      if (typeof saveState === 'function') saveState();
+      localAddToConfigBtn.classList.remove('is-added', 'secondary');
+      localAddToConfigBtn.classList.add('primary');
+      localAddToConfigBtn.textContent = '+ Add';
+      localAddToConfigBtn.style.color = '';
+      showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
+      return;
+    }
+
     const items = listMeta.items || [];
     
     if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching') {
@@ -1354,13 +1624,13 @@ if (_creatorDashEl) {
       
       if (movies.length > 0) {
         const url = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
-          ? 'autotrack:' + slug + ':movie:' + activeCreator.normalized
+          ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
           : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'movie', items: movies, shuffle: false });
         addRow(listMeta.name + (series.length > 0 ? ' (Movies)' : ''), url, 'movie', true, 'My Lists');
       }
       if (series.length > 0 || movies.length === 0) {
         const url = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
-          ? 'autotrack:' + slug + ':series:' + activeCreator.normalized
+          ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
           : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'series', items: series, shuffle: false });
         addRow(listMeta.name + (movies.length > 0 ? ' (Shows)' : ''), url, 'series', true, 'My Lists');
       }
@@ -1369,8 +1639,11 @@ if (_creatorDashEl) {
       addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'My Lists');
     }
     
-    localAddToConfigBtn.disabled = true;
-    localAddToConfigBtn.textContent = 'Added \u2713';
+    localAddToConfigBtn.classList.add('is-added', 'secondary');
+    localAddToConfigBtn.classList.remove('primary');
+    localAddToConfigBtn.textContent = 'Remove';
+    localAddToConfigBtn.style.color = 'var(--danger)';
+    showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
   }
 });
 }
@@ -1449,34 +1722,37 @@ function getCreatorListDragAfterElement(container, y) {
 async function persistCreatorListOrderFromDom() {
   const container = document.getElementById('creatorListRows');
   if (!container) return;
-  const order = [...container.querySelectorAll('.creator-list-row')].map((row) => row.dataset.slug);
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  const order = [...container.querySelectorAll('.creator-list-row')].map((row) => row.dataset.slug).filter(Boolean);
   try {
-    await fetch(ORIGIN + '/api/creator/lists/reorder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, order: order }),
-    });
-  } catch (e) {
-    // A failed reorder save just means it reverts to server order next
-    // load -- not worth interrupting with an error for a drag-and-drop.
+    localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(order));
+  } catch (e) {}
+  if (activeCreator) {
+    const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    try {
+      await fetch(ORIGIN + '/api/creator/lists/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, order: order }),
+      });
+    } catch (e) {
+      // A failed reorder save just means it reverts to server order next
+      // load -- not worth interrupting with an error for a drag-and-drop.
+    }
   }
 }
 
 function initCreatorListTouchDrag(handle) {
   if (!handle) return;
+  handle.setAttribute('draggable', 'true');
   handle.addEventListener('dragstart', (e) => {
     creatorListDragRow = handle.closest('.creator-list-row');
-    creatorListDragRow.classList.add('dragging');
-  });
-  document.addEventListener('dragover', (e) => {
-    if (!creatorListDragRow) return;
-    const container = document.getElementById('creatorListRows');
-    if (!container) return;
-    e.preventDefault();
-    const afterEl = getCreatorListDragAfterElement(container, e.clientY);
-    if (afterEl == null) container.appendChild(creatorListDragRow);
-    else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+    if (creatorListDragRow) {
+      creatorListDragRow.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', creatorListDragRow.dataset.slug || '');
+      }
+    }
   });
   handle.addEventListener('dragend', () => {
     if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
@@ -1487,6 +1763,7 @@ function initCreatorListTouchDrag(handle) {
     if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
     e.preventDefault();
     creatorListDragRow = handle.closest('.creator-list-row');
+    if (!creatorListDragRow) return;
     creatorListDragRow.classList.add('dragging');
     try { handle.setPointerCapture(e.pointerId); } catch (err) {}
     const move = (ev) => {
@@ -1508,6 +1785,16 @@ function initCreatorListTouchDrag(handle) {
   });
 }
 
+document.addEventListener('dragover', (e) => {
+  if (!creatorListDragRow) return;
+  const container = document.getElementById('creatorListRows');
+  if (!container) return;
+  e.preventDefault();
+  const afterEl = getCreatorListDragAfterElement(container, e.clientY);
+  if (afterEl == null) container.appendChild(creatorListDragRow);
+  else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+});
+
 // Editing a row's name/url/type or toggling its checkbox doesn't go through
 // addRow/renumber, so save on those too via delegation instead of wiring up
 // a listener on every individual field.
@@ -1515,11 +1802,20 @@ document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
 function openCreateListModal() {
-  document.getElementById('createListModalName').value = '';
-  document.getElementById('createListModalPublic').checked = true;
-  document.getElementById('createListModalBtn').disabled = true;
-  document.getElementById('createListModalBtn').style.opacity = '0.5';
-  document.getElementById('createListModal').style.display = 'flex';
+  const nameEl = document.getElementById('createListModalName');
+  if (nameEl) nameEl.value = '';
+  const typeEl = document.getElementById('createListModalType');
+  if (typeEl) typeEl.value = 'movie';
+  const pubEl = document.getElementById('createListModalPublic');
+  if (pubEl) pubEl.checked = true;
+  const btn = document.getElementById('createListModalBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.innerText = 'Create';
+  }
+  const modal = document.getElementById('createListModal');
+  if (modal) modal.style.display = 'flex';
 }
 
 async function submitCreateListModal() {
@@ -1527,8 +1823,10 @@ async function submitCreateListModal() {
   if (!name) return;
   const isPublic = document.getElementById('createListModalPublic').checked;
   const visibility = isPublic ? 'public' : 'private';
+  const typeEl = document.getElementById('createListModalType');
+  const type = typeEl ? typeEl.value : 'movie';
   
-  const payload = { listId: generateChannelId(), type: 'movie', items: [], shuffle: false };
+  const payload = { listId: generateChannelId(), type: type, items: [], shuffle: false };
   const newUrl = 'customlist:v1:' + JSON.stringify(payload);
   
   const btn = document.getElementById('createListModalBtn');
@@ -1545,7 +1843,7 @@ async function submitCreateListModal() {
           creatorName: activeCreator.creatorName,
           creatorKey: creatorKey,
           name: name,
-          type: 'movie',
+          type: type,
           items: [],
           visibility: visibility
         })
@@ -1565,7 +1863,7 @@ async function submitCreateListModal() {
         creatorOwner: activeCreator.creatorName,
         visibility: visibility
       });
-      addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), 'movie', true, 'Custom Lists');
+      addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
     } else {
       // Local list
       const slug = payload.listId;
@@ -1574,22 +1872,23 @@ async function submitCreateListModal() {
       const map = loadLocalCustomLists();
       map[slug] = {
         name: name,
-        type: 'movie',
+        type: type,
         items: [],
+        createdAt: Date.now(),
         updatedAt: Date.now()
       };
       saveLocalCustomListsMap(map);
       
-      addRow(name, 'customlist:v1:' + JSON.stringify(payload), 'movie', true, 'Custom Lists');
+      addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
     }
     
     saveState();
     document.getElementById('createListModal').style.display = 'none';
-    switchTab('lists');
-    switchListsSubmenu('my-lists', document.querySelector('#listsSubnavBar button:nth-child(1)'));
     renderCreatorDashboard();
-  } catch (e) {
-    alert('Network error while saving.');
+    showAddedToast('Created list "' + name + '".');
+    switchTab('lists');
+  } catch (err) {
+    alert('Network error creating list.');
   } finally {
     btn.innerText = 'Create';
     btn.disabled = false;

@@ -86,6 +86,7 @@ function detectSource(input) {
   if (s === "trakt:watchlist") return "trakt-watchlist";
   if (s === "trakt:history") return "trakt-history";
   if (s.startsWith("tmdb:chart:")) return "tmdb-chart";
+  if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";

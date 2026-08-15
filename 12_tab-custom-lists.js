@@ -1,11 +1,8 @@
 <div class="tab-panel" data-tab-panel="lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
+    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> Custom Lists</button>
     <button type="button" class="subnav-pill" onclick="switchListsSubmenu('liked', this)">Liked</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('popular', this)">Popular</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('curated', this)">Curated</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('list-search', this)">Find Lists</button>
     <button type="button" class="subnav-pill" onclick="switchListsSubmenu('import', this)">Import</button>
   </div>
 
@@ -46,23 +43,6 @@
     <div id="likedListsFeed"><p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p></div>
   </div>
 
-  <!-- Submenu 3: Popular Lists Feed -->
-  <div class="lists-subpanel" id="listsSubPopular" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Popular Community Lists</h2>
-      <button type="button" class="secondary lc-btn" onclick="loadPopularListsFeed()">Refresh</button>
-    </div>
-    <div id="popularListsFeed"></div>
-  </div>
-
-  <!-- Submenu 4: Curated Lists Feed -->
-  <div class="lists-subpanel" id="listsSubCurated" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Curated &amp; Official Lists</h2>
-    </div>
-    <div id="curatedListsFeed"></div>
-  </div>
-
   <!-- Submenu 5: Create Custom List Builder -->
   <div class="lists-subpanel" id="listsSubCreateList" style="display:none;">
     <div class="panel">
@@ -100,7 +80,7 @@
           </select>
         </label>
       </div>
-      <div id="customListTypeToggles" style="margin-top:8px; display:flex; gap:16px;">
+      <div id="customListTypeToggles" style="margin-top:8px; display:flex; gap:16px; flex-wrap:wrap;">
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
           <input type="radio" name="customListTypeRadio" value="movie" onchange="setCustomListDraftTypeToggle('movie')" checked>
           <span style="font-size:0.85rem;">Movies</span>
@@ -108,6 +88,10 @@
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
           <input type="radio" name="customListTypeRadio" value="series" onchange="setCustomListDraftTypeToggle('series')">
           <span style="font-size:0.85rem;">Shows</span>
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+          <input type="radio" name="customListTypeRadio" value="mixed" onchange="setCustomListDraftTypeToggle('mixed')">
+          <span style="font-size:0.85rem;">Mixed (Movies &amp; Shows)</span>
         </label>
       </div>
       <div class="row" style="margin-top:10px;">
@@ -132,32 +116,13 @@
         <input type="text" id="customListImportNameInput" placeholder="Name (e.g. My Favorites)">
         <button type="button" class="secondary" id="customListImportBtn" onclick="importCustomListFromLink(this)">Import from link</button>
       </div>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:10px;">
+        <input type="checkbox" id="customListImportSyncCheck" checked>
+        <span style="font-size:0.85rem;">Keep custom list synced with external link</span>
+      </label>
     </div>
   </div>
 
 
 
-  <!-- Submenu 6: Find Lists -->
-<div class="lists-subpanel" id="listsSubListSearch" style="display:none;">
-
-  <div class="panel">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Search Public Lists &amp; Catalogs</h2>
-    </div>
-    <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search across hundreds of public MDBList, Trakt, and community lists to add to your catalogs.</p>
-    
-    <div class="row">
-      <input type="text" id="listSearchInput" placeholder="Search lists by title or keyword..." onkeydown="if(event.key==='Enter'){event.preventDefault();runListSearch();}">
-      <button type="button" class="primary" onclick="runListSearch()">Search</button>
-    </div>
-
-    <div class="subnav-pills-bar" id="listSearchTypeChips" style="margin-top:10px;">
-      <button type="button" class="subnav-pill active" onclick="setListSearchFilter('all', this)"><span class="check-icon">&#x2713;</span> All</button>
-      <button type="button" class="subnav-pill" onclick="setListSearchFilter('movie', this)">Movies</button>
-      <button type="button" class="subnav-pill" onclick="setListSearchFilter('series', this)">Shows</button>
-    </div>
-
-    <div id="listSearchResult" style="margin-top:14px;"></div>
-  </div>
-</div>
 </div>

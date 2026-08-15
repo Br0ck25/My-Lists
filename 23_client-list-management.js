@@ -398,6 +398,24 @@ function buildConfig(entries, keys) {
   return btoa(bin).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+\$/,'');
 }
 
+// Repairs an autotrack: URL that was generated before activeCreator's
+// normalized username was correctly threaded through (a past bug baked
+// the literal string "undefined" into the username segment for anyone
+// who added Watch History/Continue Watching to a shelf while that bug was
+// live -- see the "+Add to catalog" handler in 22_client-creator-
+// profile.js). Also repairs a URL left over from a *different* signed-in
+// account (e.g. after switching Creator Profiles), which would otherwise
+// silently keep reading someone else's tracking data forever. A no-op for
+// anything else, including when nobody's signed in right now -- there's
+// no correct username to repair it with yet, so it's left alone until
+// there is.
+function repairAutotrackUrl(url) {
+  if (!activeCreator || !activeCreator.creatorName) return url;
+  const m = /^autotrack:(watch-history|continue-watching):(movie|series):(.*)$/.exec(url);
+  if (!m || m[3] === activeCreator.creatorName) return url;
+  return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
+}
+
 function collectEntries() {
   // Catalog IDs must be unique per (type, id) pair for wako/Stremio to tell
   // catalogs apart. Several quick-add sections deliberately reuse short
@@ -414,7 +432,15 @@ function collectEntries() {
     // A merged entry has multiple .url inputs (one per source); join them
     // newline-separated into the single stored "url" field -- fetchCatalog
     // server-side splits on the same delimiter to fan out to each source.
-    const urls = [...div.querySelectorAll('.url')].map(el => el.value.trim()).filter(Boolean);
+    const urls = [...div.querySelectorAll('.url')].map(el => {
+      const raw = el.value.trim();
+      const repaired = repairAutotrackUrl(raw);
+      // Written back into the actual input, not just the returned data --
+      // so the repair sticks (gets picked up by the next autosave/sync)
+      // instead of silently re-appearing every time this runs.
+      if (repaired !== raw) el.value = repaired;
+      return repaired;
+    }).filter(Boolean);
     const url = urls.join('\\n');
     const type = div.querySelector('.type').value;
     // The per-list enable/disable checkbox was removed -- every added list
@@ -577,30 +603,158 @@ function livePreviewPosterHtml(m) {
   const removeBtn = m.removeShowId
     ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(m.removeShowId) + '&quot;)" title="Remove from Continue Watching">&times;</button>'
     : '';
+  const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
+  const addOverlay = '<div class="poster-add-overlay" title="Add to Custom List">+</div>';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       removeBtn +
+      addOverlay +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
     (m.subtitle ? '<div class="live-preview-poster-subtitle">' + escapeHtml(m.subtitle) + '</div>' : '') +
+    yearHtml +
   '</div>';
 }
 
-async function openListPreviewModal(name, type, listUrl, preloaded) {
-  showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
-    '<h2>' + escapeHtml(name) + '</h2>' +
-    '<div class="live-preview-modal-grid" id="listPreviewGrid"></div>' +
-    '<p id="listPreviewStatus"><small>Loading\u2026</small></p>',
-    'modal-card-wide'
-  );
-  const modalCard = document.querySelector('#activeModalOverlay .modal-card');
-  const gridEl = document.getElementById('listPreviewGrid');
-  if (name && name.toLowerCase().includes('watch history')) {
-    gridEl.classList.add('is-watch-history-shelf');
+// The full-page "See All" view for any single, already-known list url --
+// used by the Catalogs/Shelves Live Preview, Search results, and My Lists'
+// own "view list" buttons alike, so there's one paginated list view in the
+// whole app instead of several slightly-different modal/overlay
+// implementations. Reuses the exact same /api/preview pagination logic
+// the old modal (openListPreviewModal) used -- only the container changed,
+// from a showModal() card to the dedicated list-details tab panel (see
+// 09_page-shell.js), so a real back button and browser-tab-switch history
+// work the way they do for item details, instead of a floating overlay.
+//
+// opts.skipPushState is set by the popstate handler and the initial
+// deep-link check (both in 24_client-backup-restore-presets.js) -- in
+// either case the browser's URL already points here, so pushing another
+// history entry would just create a duplicate back-button step.
+async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
+  opts = opts || {};
+  const currentActiveTab = localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
+  if (currentActiveTab !== 'list-details' && currentActiveTab !== 'item-details') {
+    window._previousTab = currentActiveTab;
+    window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
   }
-  const statusEl = document.getElementById('listPreviewStatus');
+  switchTab('list-details');
+
+  if (!opts.skipPushState) {
+    const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
+    if (cleanPath) {
+      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
+    } else {
+      const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: listUrl || '' });
+      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl || '' }, '', '/#/list?' + params.toString());
+    }
+  }
+
+  if (!preloaded && listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
+    const rec = window._curatedRecs[listUrl];
+    preloaded = { sample: rec.items, count: rec.items.length, maybeMore: false };
+  }
+
+  const titleEl = document.getElementById('detailTitle');
+  const subEl = document.getElementById('detailSubtitle');
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const addBtn = document.getElementById('detailAddBtn');
+  const likeBtn = document.getElementById('detailLikeBtn');
+  if (!gridEl) return;
+
+  let creatorName = (opts && opts.creatorName) || (preloaded && preloaded.creatorName) || null;
+  if (!creatorName && listUrl) {
+    const mdb = listUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?mdblist\\.com/lists/([^/]+)', 'i'));
+    if (mdb) creatorName = mdb[1];
+    const trakt = listUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?trakt\\.tv/users/([^/]+)', 'i'));
+    if (trakt) creatorName = trakt[1];
+    const internal = listUrl.match(new RegExp('^/lists/([^/]+)/[^/]+', 'i'));
+    if (internal && internal[1] !== 'mdblist' && internal[1] !== 'trakt' && internal[1] !== 'tmdb') {
+      creatorName = internal[1];
+    }
+  }
+
+  const knownTotalItems = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) || (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  let likesCount = (opts && opts.likes !== undefined && opts.likes !== null && opts.likes !== '') ? opts.likes : ((preloaded && preloaded.likes !== undefined && preloaded.likes !== null) ? preloaded.likes : null);
+
+  function formatSubtitle(count, maybeMore, itemsThisPage) {
+    const parts = [];
+    if (creatorName) parts.push('by ' + creatorName);
+    parts.push(type === 'series' ? 'Shows' : 'Movies');
+    if (knownTotalItems) {
+      parts.push(knownTotalItems + ' items');
+    } else if (count !== undefined && count !== null) {
+      parts.push(count + (maybeMore && itemsThisPage > 0 && pagesLoaded < MAX_PAGES ? '+' : '') + ' item' + (count === 1 ? '' : 's'));
+    } else {
+      parts.push('Loading\u2026');
+    }
+    if (likesCount !== null && likesCount !== undefined && likesCount !== '') {
+      parts.push('\u2665 ' + likesCount);
+    }
+    return parts.join(' \u2022 ');
+  }
+
+  window._currentListDetailsUpdateLikes = function(newLikes) {
+    likesCount = newLikes;
+    subEl.textContent = formatSubtitle(loadedCount, false, 0);
+  };
+
+  titleEl.textContent = name || 'List';
+  subEl.textContent = formatSubtitle(null, false, 0);
+  gridEl.innerHTML = '';
+  gridEl.classList.toggle('is-watch-history-shelf', !!(name && name.toLowerCase().includes('watch history')));
+  statusEl.innerHTML = '<small>Loading\u2026</small>';
+
+  // Both only make sense against a real external url -- a local/My Lists
+  // preview (listUrl === '') has nothing a catalog row could point at,
+  // and nothing any other visitor could "like" either.
+  function updateDetailAddBtn() {
+    if (!listUrl || listUrl.startsWith('custom:')) {
+      addBtn.style.display = 'none';
+      return;
+    }
+    addBtn.style.display = '';
+    const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(listUrl, type) : false;
+    if (isAdded) {
+      addBtn.textContent = 'Remove';
+      addBtn.classList.remove('primary');
+      addBtn.classList.add('secondary');
+      addBtn.style.color = 'var(--danger)';
+    } else {
+      addBtn.textContent = '+ Add';
+      addBtn.classList.add('primary');
+      addBtn.classList.remove('secondary');
+      addBtn.style.color = '';
+    }
+  }
+  updateDetailAddBtn();
+
+  if (likeBtn) {
+    if (listUrl && !listUrl.startsWith('custom:')) {
+      const isLiked = getLikedListsSet().has(listUrl);
+      likeBtn.style.display = '';
+      likeBtn.dataset.url = listUrl;
+      likeBtn.classList.toggle('liked', isLiked);
+      likeBtn.innerHTML = isLiked ? '&#9829;' : '&#9825;';
+    } else {
+      likeBtn.style.display = 'none';
+    }
+  }
+
+  addBtn.onclick = function() {
+    const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(listUrl, type) : false;
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') removeListFromConfig(listUrl, type);
+      updateDetailAddBtn();
+      showAddedToast('Removed "' + (name || 'List') + '" from your Catalogs.');
+    } else {
+      addRow(name || 'List', listUrl, type, true, 'Custom');
+      updateDetailAddBtn();
+      showAddedToast('Added "' + (name || 'List') + '" to your Catalogs.');
+    }
+  };
+
   const keys = collectKeys();
   let skip = 0;
   let loading = false;
@@ -614,23 +768,20 @@ async function openListPreviewModal(name, type, listUrl, preloaded) {
     loadedCount += items.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
+    subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
-      statusEl.innerHTML = loadedCount
-        ? '<small>' + loadedCount + ' item' + (loadedCount === 1 ? '' : 's') + '</small>'
-        : '<small>No items found.</small>';
+      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
     } else {
-      statusEl.innerHTML = '<small>' + loadedCount + '+ items \u2014 scroll for more\u2026</small>';
+      statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
   }
 
   async function loadNextPage() {
     if (loading || done) return;
-    if (!listUrl) {
+    if (!listUrl || listUrl.startsWith('custom:')) {
       done = true;
-      statusEl.innerHTML = loadedCount
-        ? '<small>' + loadedCount + ' item' + (loadedCount === 1 ? '' : 's') + '</small>'
-        : '<small>No items found.</small>';
+      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
     }
     loading = true;
@@ -665,11 +816,20 @@ async function openListPreviewModal(name, type, listUrl, preloaded) {
     }
   }
 
-  if (modalCard) {
-    modalCard.addEventListener('scroll', () => {
-      if (modalCard.scrollTop + modalCard.clientHeight >= modalCard.scrollHeight - 300) loadNextPage();
+  // Scrolls the whole page (not a modal card) -- this is a real tab panel
+  // now, so "near the bottom of the page" is what should trigger the next
+  // page, the same way any other infinite-scroll feed on the page would.
+  if (!window._listDetailsScrollBound) {
+    window._listDetailsScrollBound = true;
+    window.addEventListener('scroll', () => {
+      const panel = document.getElementById('content-list-details');
+      if (!panel || panel.hidden || !window._listDetailsLoadNextPage) return;
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 400) {
+        window._listDetailsLoadNextPage();
+      }
     });
   }
+  window._listDetailsLoadNextPage = loadNextPage;
 
   if (preloaded && preloaded.sample && preloaded.sample.length) {
     appendItems(preloaded.sample);
@@ -683,12 +843,12 @@ async function openListPreviewModal(name, type, listUrl, preloaded) {
 
 // Reuses the page-0 sample renderLivePreview already fetched for this
 // shelf (see livePreviewShelfData) so opening See All doesn't cost a
-// redundant request -- openListPreviewModal picks up pagination from
+// redundant request -- openListDetailsPage picks up pagination from
 // there for anything beyond it.
 function openLivePreviewSeeAll(i) {
   const shelf = livePreviewShelfData[i];
   if (!shelf) return;
-  openListPreviewModal(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore });
+  openListDetailsPage(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore });
 }
 
 

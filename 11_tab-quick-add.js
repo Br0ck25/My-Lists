@@ -4,6 +4,8 @@
     <button type="button" class="subnav-pill active" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('movie', this)">Movies</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('series', this)">Shows</button>
+    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
+    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('curated', this)">Curated</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('kids', this)">Kids</button>
   </div>
@@ -40,4 +42,23 @@
 
   <!-- Discover Lists Feed (Movies / Shows list view matching search) -->
   <div id="discoverListsFeed" style="display:none;"></div>
+
+  <!-- Popular Lists Feed in Discover -->
+  <div class="discover-subpanel" id="discoverSubPopular" style="display:none;">
+    <div class="shelf-header" style="margin-bottom:10px;">
+      <h2 class="shelf-title">Popular Community Lists</h2>
+      <button type="button" class="secondary lc-btn" onclick="loadPopularListsFeed(true)">Refresh</button>
+    </div>
+    <div id="popularListsFeed"></div>
+  </div>
+
+  <!-- Curated Lists Feed in Discover -->
+  <div class="discover-subpanel" id="discoverSubCurated" style="display:none;">
+    <div class="shelf-header" style="margin-bottom:10px;">
+      <h2 class="shelf-title">Curated For You</h2>
+      <button type="button" class="secondary lc-btn" onclick="loadCuratedListsFeed(true)">Refresh</button>
+    </div>
+    <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Personalized recommendations and curated lists tailored to your watch history and tastes.</p>
+    <div id="curatedListsFeed"></div>
+  </div>
 </div>

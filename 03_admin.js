@@ -346,25 +346,124 @@ async function isAdminRequest(request, env) {
 
 function renderAdminLoginPage(errorMsg) {
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admin \u2014 My Lists Addon</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F2F2F7">
+<title>Admin \u2014 ${ADDON_NAME}</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:380px; margin:80px auto; padding:24px 16px; }
-  .card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:24px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  h1 { margin-top:0; font-size:1.25rem; }
-  input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(0,0,0,0.13); background:#F2F2F7; color:#1C1C1E; font-size:16px; box-sizing:border-box; }
-  button { width:100%; margin-top:12px; padding:12px 16px; border-radius:10px; border:none; background:#007AFF; color:#fff; font-size:1rem; font-weight:600; cursor:pointer; }
-  button:hover { background:#0062CC; }
-  .err { color:#FF3B30; margin-top:12px; font-size:0.9rem; }
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --danger: #FF3B30;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow: 0 2px 10px rgba(0,0,0,0.08);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-pill: 999px;
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--font-body);
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 16px;
+  }
+  .login-wrap { width: 100%; max-width: 380px; }
+  .login-header {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    margin-bottom: 20px;
+  }
+  .login-header img { width: 36px; height: 36px; border-radius: 10px; box-shadow: var(--shadow-sm); }
+  .login-header span { font-size: 1.2rem; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    padding: 20px;
+    width: 100%;
+  }
+  .panel-title { font-size: 1.1rem; font-weight: 700; margin: 0 0 14px; letter-spacing: -0.01em; color: var(--text); }
+  .row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 0; width: 100%; }
+  input {
+    width: 100%;
+    padding: 11px 14px;
+    border-radius: var(--radius-sm);
+    border: 1.5px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+    font-size: 16px;
+    font-family: inherit;
+    min-height: 44px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,122,255,0.15); }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    padding: 11px 18px;
+    min-height: 44px;
+    border-radius: var(--radius-pill);
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.925rem;
+    font-family: inherit;
+    transition: opacity 0.12s;
+  }
+  button:hover { opacity: 0.85; }
+  .err { color: var(--danger); margin: 14px 0 0; font-size: 0.85rem; }
 </style></head>
 <body>
-  <div class="card">
-    <h1>Admin sign in</h1>
-    <form method="POST" action="/admin/login">
-      <input type="password" name="key" placeholder="Admin key" autofocus>
-      <button type="submit">Sign in</button>
-    </form>
-    ${errorMsg ? `<p class="err">${escapeHtmlServer(errorMsg)}</p>` : ""}
+  <div class="login-wrap">
+    <div class="login-header">
+      <img src="/icon.png" alt="${ADDON_NAME}">
+      <span>${ADDON_NAME}</span>
+    </div>
+    <div class="panel">
+      <h2 class="panel-title">Admin sign in</h2>
+      <form method="POST" action="/admin/login">
+        <div class="row">
+          <input type="password" name="key" placeholder="Admin key" autofocus>
+        </div>
+        <button type="submit">Sign in</button>
+      </form>
+      ${errorMsg ? `<p class="err">${escapeHtmlServer(errorMsg)}</p>` : ""}
+    </div>
   </div>
 </body></html>`;
 }
@@ -495,6 +594,11 @@ async function renderAdminDashboard(env) {
   .feedback-card.completed { opacity:0.55; }
   .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
   .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; }
+  .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap:12px; margin-top:10px; }
+  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:#E5E5EA; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:#E5E5EA; display:flex; align-items:center; justify-content:center; color:#8E8E93; font-size:0.75rem; text-align:center; padding:6px; box-sizing:border-box; }
+  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; }
+  .netflix-preview-year { color:#8E8E93; font-size:0.75rem; }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
@@ -506,6 +610,8 @@ async function renderAdminDashboard(env) {
     <button type="button" class="admin-tab-btn" data-admin-tab="sources" onclick="switchAdminTab('sources')">Sources people use</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="trending" onclick="switchAdminTab('trending')">Trending Data</button>
     <button type="button" class="admin-tab-btn" data-admin-tab="feedback" onclick="switchAdminTab('feedback')">Feedback</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="apiusage" onclick="switchAdminTab('apiusage')">API Usage</button>
+    <button type="button" class="admin-tab-btn" data-admin-tab="netflixpreview" onclick="switchAdminTab('netflixpreview')">Provider Preview</button>
   </div>
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
@@ -587,6 +693,63 @@ async function renderAdminDashboard(env) {
     <div id="feedbackList">Loading\u2026</div>
   </div>
 
+  <!-- Edit Feedback Modal -->
+  <div id="editFeedbackModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center; padding:16px;">
+    <div style="background:#fff; border-radius:14px; padding:20px; max-width:500px; width:100%; box-shadow:0 4px 20px rgba(0,0,0,0.15);">
+      <h3 style="margin:0 0 12px; font-size:1.1rem; color:#001f3f;">Edit Feedback</h3>
+      <input type="hidden" id="editFeedbackId">
+      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Category</label>
+      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:12px; width:100%;">
+        <option value="bug">bug</option>
+        <option value="improvement">improvement</option>
+        <option value="idea">idea</option>
+        <option value="other">other</option>
+      </select>
+      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Message</label>
+      <textarea id="editFeedbackMessage" style="width:100%; min-height:100px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical; margin-bottom:12px;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer;" onclick="closeEditFeedbackModal()">Cancel</button>
+        <button type="button" class="admin-select" id="editFeedbackSaveBtn" style="cursor:pointer; background:#001f3f; color:#fff;" onclick="saveEditFeedback()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="apiusage">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Requests made using this Worker's own shared API keys (the fallback used whenever a visitor hasn't supplied their own) -- not counting anyone's personal keys, which only they can rate-limit. Watch these against each provider's limit if catalogs start coming back empty or slow.</p>
+    <table>
+      <tr><th>Key</th><th>Last 24h</th><th>Last 7 days</th><th>Last 30 days</th><th>Provider limit</th></tr>
+      <tbody id="apiUsageTableBody"><tr><td colspan="5">Loading\u2026</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="netflixpreview">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">A look at what a TMDB-discover-based shelf would actually contain for any streaming provider, before wiring it into Quick Add for real -- pulled live from TMDB, not a saved list. Counts are TMDB/JustWatch's own tracking, not the provider's real numbers, and typically run a bit under what trackers like FlixPatrol report.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Find a provider's id</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">TMDB sometimes has more than one entry for the same service (e.g. two separate "Disney Plus" ids) -- look the name up here rather than guessing, since a wrong id fails silently: it just quietly shows the wrong catalog under the right label.</p>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="providerLookupQueryInput" class="admin-select" style="margin-right:0; flex:1; max-width:220px;" placeholder="e.g. disney, max, hulu" onkeydown="if(event.key==='Enter'){event.preventDefault();lookupProviderIds();}">
+        <button type="button" class="secondary lc-btn" onclick="lookupProviderIds()">Search</button>
+        <span id="providerLookupStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <div id="providerLookupResults" style="margin-top:10px;"></div>
+    </div>
+
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:16px; flex-wrap:wrap;">
+      <label style="font-size:0.85rem; color:#8E8E93;">Provider id
+        <input type="text" id="netflixPreviewProviderIdInput" class="admin-select" style="margin-right:0; width:60px;" value="8" placeholder="8">
+      </label>
+      <label style="font-size:0.85rem; color:#8E8E93;">Region
+        <input type="text" id="netflixPreviewRegionInput" class="admin-select" style="margin-right:0; width:70px; text-transform:uppercase;" value="US" maxlength="2" placeholder="US">
+      </label>
+      <button type="button" class="secondary lc-btn" onclick="loadNetflixPreview()">Load Preview</button>
+      <span id="netflixPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+    </div>
+    <div id="netflixPreviewMovies"></div>
+    <div id="netflixPreviewShows" style="margin-top:28px;"></div>
+  </div>
+
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
   <script>
     function switchAdminTab(tabId) {
@@ -594,6 +757,8 @@ async function renderAdminDashboard(env) {
       document.querySelectorAll('.admin-tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.adminPanel === tabId));
       if (tabId === 'trending' && !window._trendingLoadedOnce) { window._trendingLoadedOnce = true; loadTrendingData(); }
       if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
+      if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
+      if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
     }
 
     function escapeHtmlAdmin(s) {
@@ -657,27 +822,157 @@ async function renderAdminDashboard(env) {
       loadTrendingData();
     }
 
+    async function loadApiUsage() {
+      const body = document.getElementById('apiUsageTableBody');
+      body.innerHTML = '<tr><td colspan="5">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/apiusage');
+        const data = await res.json();
+        if (!data.ok || !data.keys || !data.keys.length) {
+          body.innerHTML = '<tr><td colspan="5">No data yet.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.keys.map((k) =>
+          '<tr>' +
+            '<td>' + escapeHtmlAdmin(k.label) + (k.configured ? '' : ' <span style="color:#FF9500;">(not set)</span>') + '</td>' +
+            '<td>' + k.last24h + '</td>' +
+            '<td>' + k.last7d + '</td>' +
+            '<td>' + k.last30d + '</td>' +
+            '<td style="color:#8E8E93;">' + escapeHtmlAdmin(k.limit) + '</td>' +
+          '</tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="5">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    function netflixPreviewSectionHtml(label, section) {
+      if (!section) return '';
+      const posters = section.items.map((it) =>
+        '<div>' +
+          (it.poster
+            ? '<img class="netflix-preview-poster" src="' + escapeHtmlAdmin(it.poster) + '" alt="" loading="lazy">'
+            : '<div class="netflix-preview-poster-placeholder">No poster</div>') +
+          '<div class="netflix-preview-title">' + escapeHtmlAdmin(it.title) + '</div>' +
+          (it.date ? '<div class="netflix-preview-year">' + escapeHtmlAdmin(it.date) + '</div>' : '') +
+        '</div>'
+      ).join('');
+      return '<h3 style="margin:0 0 4px; font-size:1.05rem;">' + label + ' <span style="color:#8E8E93; font-weight:400; font-size:0.85rem;">(~' + section.total.toLocaleString() + ' total on TMDB/JustWatch, showing first ' + section.items.length + ')</span></h3>' +
+        '<div class="netflix-preview-grid">' + posters + '</div>';
+    }
+
+    async function loadNetflixPreview() {
+      const statusEl = document.getElementById('netflixPreviewStatus');
+      const moviesEl = document.getElementById('netflixPreviewMovies');
+      const showsEl = document.getElementById('netflixPreviewShows');
+      const regionInput = document.getElementById('netflixPreviewRegionInput');
+      const providerIdInput = document.getElementById('netflixPreviewProviderIdInput');
+      const region = (regionInput.value || 'US').trim().toUpperCase().slice(0, 2) || 'US';
+      const providerId = (providerIdInput.value || '8').trim() || '8';
+      statusEl.textContent = 'Loading\u2026';
+      moviesEl.innerHTML = '';
+      showsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/netflix-preview?region=' + encodeURIComponent(region) + '&providerId=' + encodeURIComponent(providerId));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load preview.';
+          return;
+        }
+        statusEl.textContent = '';
+        moviesEl.innerHTML = netflixPreviewSectionHtml('Movies', data.movies);
+        showsEl.innerHTML = netflixPreviewSectionHtml('Shows', data.shows);
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    // Fills the Provider id field from a lookup result and immediately
+    // reloads the preview with it -- clicking a name found this way should
+    // just show that provider's shelf, not require a second manual click.
+    function pickProviderId(id) {
+      document.getElementById('netflixPreviewProviderIdInput').value = id;
+      loadNetflixPreview();
+    }
+
+    async function lookupProviderIds() {
+      const statusEl = document.getElementById('providerLookupStatus');
+      const resultsEl = document.getElementById('providerLookupResults');
+      const queryInput = document.getElementById('providerLookupQueryInput');
+      const regionInput = document.getElementById('netflixPreviewRegionInput');
+      const query = (queryInput.value || '').trim();
+      const region = (regionInput.value || 'US').trim().toUpperCase().slice(0, 2) || 'US';
+      statusEl.textContent = 'Searching\u2026';
+      resultsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/provider-lookup?region=' + encodeURIComponent(region) + (query ? '&query=' + encodeURIComponent(query) : ''));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not search.';
+          return;
+        }
+        statusEl.textContent = '';
+        if (!data.results.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">No matches.</p>';
+          return;
+        }
+        resultsEl.innerHTML = data.results.map((p) =>
+          '<button type="button" class="admin-select" style="cursor:pointer; margin:0 6px 6px 0;" onclick="pickProviderId(' + p.id + ')">' +
+            escapeHtmlAdmin(p.name) + ' <span style="color:#8E8E93;">(' + p.id + ')</span>' +
+          '</button>'
+        ).join('');
+      } catch (e) {
+        statusEl.textContent = 'Could not search -- check your connection.';
+      }
+    }
+
+    // feedbackEntries is the client's local copy of the list, kept in sync
+    // with the server -- submitAdminFeedback and toggleFeedbackStatus both
+    // mutate this array and re-render immediately (optimistic), then send
+    // the real change to the server in the background, only reaching back
+    // into the DOM again if that background call fails and the local
+    // change needs to be rolled back.
+    let feedbackEntries = [];
+    let feedbackTruncated = false;
+
     async function loadFeedback() {
       const box = document.getElementById('feedbackList');
       box.textContent = 'Loading\u2026';
       try {
         const res = await fetch('/admin/api/feedback');
         const data = await res.json();
-        if (!data.ok || !data.entries || !data.entries.length) {
-          box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
+        if (!data.ok) {
+          box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
           return;
         }
-        // Open (not completed) first, newest within each group -- the
-        // fetch itself already comes back newest-first, so this only
-        // needs to separate the two groups without disturbing that order.
-        const open = data.entries.filter((f) => !f.completed);
-        const done = data.entries.filter((f) => f.completed);
-        box.innerHTML = open.map(feedbackCardHtml).join('') +
-          (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
-          (data.truncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+        feedbackEntries = data.entries || [];
+        feedbackTruncated = !!data.truncated;
+        renderFeedbackList();
       } catch (e) {
         box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
       }
+    }
+
+    // Pure render of whatever's currently in feedbackEntries -- called
+    // after the initial load, and again (instantly, no fetch) any time
+    // submitAdminFeedback/toggleFeedbackStatus change that array so the
+    // list reflects the change right away instead of waiting on a round
+    // trip back to the server.
+    function renderFeedbackList() {
+      const box = document.getElementById('feedbackList');
+      if (!feedbackEntries.length) {
+        box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
+        return;
+      }
+      // Open (not completed) first, newest within each group -- the
+      // fetch itself already comes back newest-first, and new entries are
+      // unshifted onto the front locally, so this only needs to separate
+      // the two groups without disturbing that order.
+      const open = feedbackEntries.filter((f) => !f.completed);
+      const done = feedbackEntries.filter((f) => f.completed);
+      box.innerHTML = open.map(feedbackCardHtml).join('') +
+        (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
+        (feedbackTruncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
     }
 
     function feedbackCardHtml(f) {
@@ -686,12 +981,15 @@ async function renderAdminDashboard(env) {
       const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
-      return '<div class="feedback-card' + (completed ? ' completed' : '') + '">' +
+      return '<div class="feedback-card' + (completed ? ' completed' : '') + '" id="feedbackCard_' + escapeHtmlAdmin(f.id) + '">' +
         '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
           '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
-          '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ', this)">' +
-            (completed ? '\u21a9 Mark not completed' : '\u2713 Mark completed') +
-          '</button>' +
+          '<div style="display:flex; gap:6px;">' +
+            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="openEditFeedbackModal(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x270E; Edit</button>' +
+            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ')">' +
+              (completed ? '\u21a9 Mark not completed' : '\u2713 Mark completed') +
+            '</button>' +
+          '</div>' +
         '</div>' +
         '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
         '<div class="feedback-meta">' + when + ' \u2014 ' + who + contact + '</div>' +
@@ -701,7 +999,10 @@ async function renderAdminDashboard(env) {
     // Lets the admin log an issue directly from the dashboard, without
     // going through Settings > Feedback -- posts to the same /api/feedback
     // endpoint real users hit, just tagged so it's obviously self-logged
-    // in the list below.
+    // in the list below. Optimistic: the card appears the instant this
+    // function runs, built from a temporary client-side id, and is
+    // swapped for the server's real entry once the save actually
+    // completes (or removed again if it fails).
     async function submitAdminFeedback() {
       const category = document.getElementById('newFeedbackCategory').value;
       const messageBox = document.getElementById('newFeedbackMessage');
@@ -713,7 +1014,22 @@ async function renderAdminDashboard(env) {
         return;
       }
       btn.disabled = true;
+
+      const tempId = 'temp:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8);
+      const optimisticEntry = {
+        id: tempId,
+        category: category,
+        message: message,
+        contact: null,
+        creatorName: 'admin',
+        createdAt: Date.now(),
+        completed: false,
+      };
+      feedbackEntries.unshift(optimisticEntry);
+      renderFeedbackList();
+      messageBox.value = '';
       status.textContent = 'Saving\u2026';
+
       try {
         const res = await fetch('/api/feedback', {
           method: 'POST',
@@ -722,21 +1038,44 @@ async function renderAdminDashboard(env) {
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {
+          feedbackEntries = feedbackEntries.filter((f) => f.id !== tempId);
+          renderFeedbackList();
+          messageBox.value = message;
           status.textContent = (data && data.error) || 'Could not save -- try again.';
           btn.disabled = false;
           return;
         }
-        messageBox.value = '';
+        // Swap the temp id for the server's real one -- otherwise a Mark
+        // Completed click on this card would send an id the server has
+        // never heard of.
+        if (data.entry && data.entry.id) {
+          const idx = feedbackEntries.findIndex((f) => f.id === tempId);
+          if (idx !== -1) {
+            feedbackEntries[idx] = data.entry;
+            renderFeedbackList();
+          }
+        }
         status.textContent = 'Added.';
-        loadFeedback();
       } catch (e) {
+        feedbackEntries = feedbackEntries.filter((f) => f.id !== tempId);
+        renderFeedbackList();
+        messageBox.value = message;
         status.textContent = 'Could not save -- check your connection.';
       }
       btn.disabled = false;
     }
 
-    async function toggleFeedbackStatus(id, completed, btn) {
-      if (btn) btn.disabled = true;
+    // Optimistic: flips the entry's completed flag (and re-renders,
+    // moving the card between the Open/Completed groups) the instant
+    // it's clicked, then sends the real change to the server in the
+    // background. Rolled back to whatever the server still actually has
+    // if that background call fails.
+    async function toggleFeedbackStatus(id, completed) {
+      const idx = feedbackEntries.findIndex((f) => f.id === id);
+      if (idx === -1) return;
+      const previousCompleted = feedbackEntries[idx].completed;
+      feedbackEntries[idx] = Object.assign({}, feedbackEntries[idx], { completed: completed });
+      renderFeedbackList();
       try {
         const res = await fetch('/admin/api/feedback/status', {
           method: 'POST',
@@ -745,14 +1084,73 @@ async function renderAdminDashboard(env) {
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {
-          if (btn) btn.disabled = false;
+          const stillIdx = feedbackEntries.findIndex((f) => f.id === id);
+          if (stillIdx !== -1) {
+            feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
+            renderFeedbackList();
+          }
           alert((data && data.error) || 'Could not update -- try again.');
           return;
         }
-        loadFeedback();
       } catch (e) {
-        if (btn) btn.disabled = false;
+        const stillIdx = feedbackEntries.findIndex((f) => f.id === id);
+        if (stillIdx !== -1) {
+          feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
+          renderFeedbackList();
+        }
         alert('Could not update -- check your connection.');
+      }
+    }
+
+    function openEditFeedbackModal(id) {
+      const entry = feedbackEntries.find((f) => f.id === id);
+      if (!entry) return;
+      document.getElementById('editFeedbackId').value = entry.id;
+      document.getElementById('editFeedbackCategory').value = entry.category || 'other';
+      document.getElementById('editFeedbackMessage').value = entry.message || '';
+      document.getElementById('editFeedbackSaveBtn').disabled = false;
+      document.getElementById('editFeedbackSaveBtn').textContent = 'Save Changes';
+      document.getElementById('editFeedbackModal').style.display = 'flex';
+    }
+
+    function closeEditFeedbackModal() {
+      document.getElementById('editFeedbackModal').style.display = 'none';
+    }
+
+    async function saveEditFeedback() {
+      const id = document.getElementById('editFeedbackId').value;
+      const category = document.getElementById('editFeedbackCategory').value;
+      const message = document.getElementById('editFeedbackMessage').value.trim();
+      const saveBtn = document.getElementById('editFeedbackSaveBtn');
+      if (!message) {
+        alert('Please enter a message.');
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving\u2026';
+      try {
+        const res = await fetch('/admin/api/feedback/edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, category, message }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          alert((data && data.error) || 'Could not save feedback edits.');
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save Changes';
+          return;
+        }
+        const idx = feedbackEntries.findIndex((f) => f.id === id);
+        if (idx !== -1 && data.entry) {
+          feedbackEntries[idx] = data.entry;
+          renderFeedbackList();
+        }
+        closeEditFeedbackModal();
+      } catch (err) {
+        alert('Network error while saving feedback edits.');
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save Changes';
       }
     }
   </script>

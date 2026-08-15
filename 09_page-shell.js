@@ -1,6 +1,6 @@
 function renderBuilder(
   origin,
-  { initialEntries = [], initialKeys = {}, isConfigureMode = false } = {}
+  { initialEntries = [], initialKeys = {}, isConfigureMode = false, deepLinkList = null } = {}
 ) {
   const initialTmdbKey = initialKeys.tmdbKey || "";
   const initialMdblistKey = initialKeys.mdblistKey || "";
@@ -25,10 +25,20 @@ function renderBuilder(
           { name: "Popular", url: "https://mdblist.com/lists/official/shows/popular\ntmdb:chart:popular\ntrakt:chart:popular", type: "series", enabled: true, group: "Combined Charts" },
           { name: "Trending", url: "tmdb:chart:trending\ntrakt:chart:trending\nsimkl:chart:today\nsimkl:chart:week\nsimkl:chart:month", type: "movie", enabled: true, group: "Combined Charts" },
           { name: "Trending", url: "tmdb:chart:trending\ntrakt:chart:trending\nsimkl:chart:today\nsimkl:chart:week\nsimkl:chart:month", type: "series", enabled: true, group: "Combined Charts" },
+          // Both the Top 10 and full Streaming Catalogs merged rows below
+          // use the exact same joined url string for their movie row and
+          // series row now -- unlike the old per-provider mdblist.com
+          // urls they replaced, a tmdb:chart:X source doesn't encode
+          // movie/series in the url itself; fetchCatalog picks the right
+          // side of TMDB_CHART_PATHS[chartKey] from entry.type at fetch
+          // time (see 07_source-fetchers-tmdb-simkl.js), the same way the
+          // standalone per-provider rows in 08_quickadd-chart-data.js
+          // already reuse one url for both their +Movies and +Shows
+          // buttons.
           { name: "Streaming Top 10 (All Services)", url: "https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today\nhttps://mdblist.com/lists/andykai/disney-top-10-no-hulu\nhttps://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q\nhttps://mdblist.com/lists/hulupiv/hulu-top-10-movies\nhttps://mdblist.com/lists/hdlists/netflix-top-10-trending-movies\nhttps://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today\nhttps://mdblist.com/lists/diimaan/amazon-prime-top-10-movies\nhttps://mdblist.com/lists/diimaan/peacock-top-10-movies", type: "movie", enabled: true, group: "Combined Charts" },
           { name: "Streaming Top 10 (All Services)", url: "https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today\nhttps://mdblist.com/lists/andykai/disney-trending-no-hulu\nhttps://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd\nhttps://mdblist.com/lists/hulupiv/hulu-top-10-shows\nhttps://mdblist.com/lists/hdlists/netflix-top-10-trending-shows\nhttps://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today\nhttps://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows\nhttps://mdblist.com/lists/peacockpiv/peacock-top-10-shows", type: "series", enabled: true, group: "Combined Charts" },
-          { name: "Streaming (All Services)", url: "https://mdblist.com/lists/slimshizn/apple-tv-movies\nhttps://mdblist.com/lists/garycrawfordgc/disney-movies\nhttps://mdblist.com/lists/k0meta/discovery-movies\nhttps://mdblist.com/lists/snoak/latest-max-movies\nhttps://mdblist.com/lists/garycrawfordgc/hulu-movies\nhttps://mdblist.com/lists/garycrawfordgc/netflix-movies\nhttps://mdblist.com/lists/poodlehead/netflix-kids-movies\nhttps://mdblist.com/lists/snoak/latest-paramount-plus-movies\nhttps://mdblist.com/lists/garycrawfordgc/amazon-prime-movies\nhttps://mdblist.com/lists/tvgeniekodi/peacock-movies", type: "movie", enabled: true, group: "Combined Charts" },
-          { name: "Streaming (All Services)", url: "https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows\nhttps://mdblist.com/lists/garycrawfordgc/disney-shows\nhttps://mdblist.com/lists/marko8426/discovery-shows\nhttps://mdblist.com/lists/garycrawfordgc/hbo-shows\nhttps://mdblist.com/lists/garycrawfordgc/hulu-shows\nhttps://mdblist.com/lists/garycrawfordgc/netflix-shows\nhttps://mdblist.com/lists/poodlehead/netflix-kids-tv\nhttps://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows\nhttps://mdblist.com/lists/garycrawfordgc/amazon-prime-shows\nhttps://mdblist.com/lists/tvgeniekodi/peacock-tv-shows", type: "series", enabled: true, group: "Combined Charts" }
+          { name: "Streaming (All Services)", url: "tmdb:chart:appletv\ntmdb:chart:disney\ntmdb:chart:discovery\ntmdb:chart:hbomax\ntmdb:chart:hulu\ntmdb:chart:netflix\ntmdb:chart:netflixkids\ntmdb:chart:paramount\ntmdb:chart:primevideo\ntmdb:chart:peacock", type: "movie", enabled: true, group: "Combined Charts" },
+          { name: "Streaming (All Services)", url: "tmdb:chart:appletv\ntmdb:chart:disney\ntmdb:chart:discovery\ntmdb:chart:hbomax\ntmdb:chart:hulu\ntmdb:chart:netflix\ntmdb:chart:netflixkids\ntmdb:chart:paramount\ntmdb:chart:primevideo\ntmdb:chart:peacock", type: "series", enabled: true, group: "Combined Charts" }
       ]
   );
 
@@ -437,6 +447,18 @@ function renderBuilder(
     font-weight: 500;
     margin-top: 1px;
   }
+  .discover-chart-seeall {
+    flex-shrink: 0;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+    padding: 4px 2px;
+  }
+  .discover-chart-seeall:hover {
+    text-decoration: underline;
+  }
   .discover-chart-btns {
     display: flex;
     gap: 6px;
@@ -628,23 +650,15 @@ function renderBuilder(
     gap: 10px;
     min-width: 0;
   }
-  .list-card-icon {
-    width: 44px; height: 44px;
-    border-radius: 12px;
-    flex: none;
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 800; font-size: 1.1rem;
-    color: #fff; text-transform: uppercase;
-  }
-  .list-card-icon.src-mdblist { background: var(--accent); }
-  .list-card-icon.src-trakt   { background: #FF3B30; }
-  .list-card-icon.src-mylist  { background: var(--accent); }
-  .list-card-icon.src-custom  { background: #5856D6; }
   .list-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .list-card-title {
     font-weight: 700; font-size: 0.96rem; color: var(--text);
     margin: 0 0 2px; line-height: 1.3;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    cursor: pointer;
+  }
+  .list-card-title:hover {
+    color: var(--accent);
   }
   .list-card-meta {
     font-size: 0.76rem; color: var(--muted);
@@ -807,6 +821,14 @@ function renderBuilder(
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .list-card-mini-poster-year {
+    font-size: 0.64rem;
+    color: var(--muted);
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .clickable-poster {
     cursor: pointer;
   }
@@ -829,13 +851,43 @@ function renderBuilder(
     font-weight: bold;
     opacity: 0.85;
     transition: opacity 0.2s, background 0.2s;
-    z-index: 2;
+    z-index: 5;
+    cursor: pointer;
   }
-  .clickable-poster:hover .poster-add-overlay {
+  .clickable-poster:hover .poster-add-overlay,
+  .live-preview-poster-card:hover .poster-add-overlay {
     opacity: 1;
   }
   .poster-add-overlay:hover {
     background: var(--brand);
+    color: #fff;
+  }
+  #lists .poster-add-overlay,
+  #listsLivePreview .poster-add-overlay,
+  .entry .poster-add-overlay {
+    display: none !important;
+  }
+  .drag-handle-list {
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    color: var(--muted);
+    margin-right: 12px;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background-color 0.15s;
+    vertical-align: middle;
+  }
+  .drag-handle-list:hover {
+    color: var(--text);
+    background: var(--panel-strong);
+  }
+  .drag-handle-list:active {
+    cursor: grabbing;
   }
   .list-card-count-overlay {
     position: absolute;
@@ -1232,25 +1284,19 @@ function renderBuilder(
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .live-preview-poster-year {
+    font-size: 0.65rem;
+    color: var(--muted);
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
-  /* --- Detail Overlay ("See All" / Full List View - Screenshot 5) --------- */
-  #detailOverlay {
-    position: fixed; inset: 0; background: var(--bg);
-    z-index: 1500; overflow-y: auto; display: none;
-    padding: 16px 14px calc(80px + env(safe-area-inset-bottom));
-  }
-  #detailOverlay.active { display: block; }
-  .detail-top-nav {
-    display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; position: sticky; top: 0; background: var(--bg);
-    padding: 8px 0; z-index: 10;
-  }
-  .detail-back-btn {
-    display: flex; align-items: center; gap: 6px;
-    background: none; border: none; font-size: 1.1rem;
-    font-weight: 700; color: var(--accent); cursor: pointer; padding: 4px 0;
-  }
+  /* --- List Details page ("See All" full list view) ----------------------- */
+  .list-details-page { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
   .detail-header-info h1 {
-    font-size: 1.3rem; font-weight: 800; margin: 0 0 2px;
+    font-size: 1.3rem; font-weight: 800; margin: 0;
   }
   .detail-header-info p {
     margin: 0; font-size: 0.85rem; color: var(--muted);
@@ -1413,7 +1459,7 @@ function renderBuilder(
   <!-- Top Tab Bar (Desktop View) -->
   <div class="tab-bar" role="tablist">
     <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">My Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">My Lists</button>
     <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
     <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
     <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
@@ -1427,13 +1473,13 @@ function renderBuilder(
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
+    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="My Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
         <line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line>
       </svg>
-      Lists
+      My Lists
     </button>
     <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1460,22 +1506,28 @@ function renderBuilder(
   <!-- Action Notification Toast -->
   <div id="actionToast" class="action-toast"></div>
 
-  <!-- Detail / See All Full View Overlay (Matching Screenshot 5) -->
-  <div id="detailOverlay">
-    <div class="detail-top-nav">
-      <button type="button" class="detail-back-btn" onclick="closeDetailOverlay()">&larr; Back</button>
-      <button type="button" class="lc-btn primary" id="detailAddAllBtn">+ Add to Catalogs</button>
+  <!-- List Details page ("See All" full list view) -->
+  <div class="tab-panel list-details-page" data-tab-panel="list-details" id="content-list-details" hidden>
+    <div style="margin-bottom: 20px;">
+      <button type="button" class="lc-btn secondary" onclick="navigateBackFromDetail()" style="padding: 6px 12px; font-size: 0.9rem;">&larr; Back</button>
     </div>
     <div class="detail-header-info" style="margin-bottom:14px;">
-      <h1 id="detailTitle">List Title</h1>
-      <p id="detailSubtitle">Author &bull; Shows &bull; 100 items</p>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <h1 id="detailTitle">List Title</h1>
+        <div style="display:flex; gap:10px; align-items:center; margin-left:auto;">
+          <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn">&#9825;</button>
+          <button type="button" class="lc-btn primary" id="detailAddBtn">+ Add</button>
+        </div>
+      </div>
+      <p id="detailSubtitle" style="margin-top:4px;">Loading&hellip;</p>
     </div>
     <div class="poster-grid-3" id="detailGrid"></div>
+    <p id="detailStatus" style="text-align:center; color:var(--muted); margin-top:14px;"><small>Loading&hellip;</small></p>
   </div>
 
   <div class="tab-panel" data-tab-panel="item-details" id="content-item-details" hidden>
     <div style="margin-bottom: 20px;">
-      <button type="button" class="lc-btn secondary" onclick="switchTab(window._previousTab || 'discover')" style="padding: 6px 12px; font-size: 0.9rem;">&larr; Back</button>
+      <button type="button" class="lc-btn secondary" onclick="navigateBackFromDetail()" style="padding: 6px 12px; font-size: 0.9rem;">&larr; Back</button>
     </div>
     <div id="itemDetailsBody" style="display: flex; flex-direction: column; gap: 24px;">
       <!-- Filled dynamically -->
@@ -1490,7 +1542,15 @@ function renderBuilder(
         <input type="text" id="createListModalName" placeholder="List name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;" oninput="document.getElementById('createListModalBtn').disabled = !this.value.trim(); document.getElementById('createListModalBtn').style.opacity = this.value.trim() ? '1' : '0.5';">
       </div>
       
-      <div style="margin-top: 24px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;">
+      <div style="margin-top: 14px;">
+        <select id="createListModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;">
+          <option value="movie">Movies</option>
+          <option value="series">Shows</option>
+          <option value="mixed">Mixed (Movies &amp; Shows)</option>
+        </select>
+      </div>
+      
+      <div style="margin-top: 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
         <span style="font-size: 0.95rem; font-weight:500; color: var(--text);">Public</span>
         <label class="ui-toggle">
           <input type="checkbox" id="createListModalPublic" checked>

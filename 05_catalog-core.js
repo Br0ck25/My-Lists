@@ -66,6 +66,22 @@ const PAGE_SIZE = 100; // items returned per catalog request, for sources we fet
 // its sources newline-separated in entry.url (see collectEntries in the
 // builder page). Everything downstream of this function only ever sees one
 // URL at a time; the fan-out/merge happens right here.
+// Fires a best-effort +1 into the same day-bucketed stats system bumpStat
+// uses elsewhere (03_admin.js) -- but only when isSharedKey is true, i.e.
+// this specific request is about to use this Worker's own shared key
+// rather than a visitor's personal one. Feeds the admin dashboard's API
+// Usage tab, which is meant to catch a shared key creeping toward its
+// provider's rate limit before catalogs start failing for everyone who
+// doesn't have their own key configured. keys.ctx (when the caller has
+// one) gets waitUntil'd so this can't add latency to the actual catalog
+// response it's riding along on; without one it's just an unawaited
+// fire-and-forget, same tradeoff bumpStat itself already documents.
+function trackSharedApiUse(keys, isSharedKey, name) {
+  if (!isSharedKey || !keys || !keys.env) return;
+  const p = bumpStat(keys.env, `apiuse:${name}`);
+  if (keys.ctx && typeof keys.ctx.waitUntil === "function") keys.ctx.waitUntil(p);
+}
+
 async function fetchCatalog(entry, skip = 0, keys = {}) {
   const urls = String(entry.url || "")
     .split("\n")
@@ -78,20 +94,22 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
   const mdblistKey = keys.mdblistKey || MDBLIST_API_KEY;
   const traktKey = keys.traktKey || TRAKT_CLIENT_ID;
   const source = detectSource(entry.url);
-  if (source === "mdblist-watchlist") return fetchMdblistWatchlist(entry, skip, mdblistKey);
-  if (source === "trakt") return fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || "");
-  if (source === "trakt-watchlist") return fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || "");
-  if (source === "trakt-history") return fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || "");
-  if (source === "tmdb") return fetchTmdb(entry, skip, TMDB_API_KEY);
-  if (source === "tmdb-chart") return fetchTmdbChart(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:chart:".length));
-  if (source === "tmdb-hidden-gems") return fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY);
-  if (source === "tmdb-kids") return fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length));
-  if (source === "trakt-chart") return fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length));
-  if (source === "simkl-chart") return fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length));
+  if (source === "mdblist-watchlist") { trackSharedApiUse(keys, !keys.mdblistKey, "mdblist"); return fetchMdblistWatchlist(entry, skip, mdblistKey); }
+  if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || ""); }
+  if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || ""); }
+  if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || ""); }
+  if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdb(entry, skip, TMDB_API_KEY); }
+  if (source === "tmdb-chart") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbChart(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:chart:".length)); }
+  if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
+  if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
+  if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
+  if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
+  if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); return fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
   if (source === "channel") return fetchChannelCatalog(entry);
   if (source === "custom-list") return fetchCustomListCatalog(entry);
   if (source === "autotrack") return fetchAutoTrackedCatalog(entry, keys.env);
   if (source === "published-list") return fetchPublishedListCatalog(entry, keys.env);
+  trackSharedApiUse(keys, !keys.mdblistKey, "mdblist");
   return fetchMdblist(entry, skip, mdblistKey);
 }
 
@@ -159,12 +177,6 @@ function parseChannelPayload(rawUrl) {
 function fetchChannelCatalog(entry) {
   const payload = parseChannelPayload(entry.url);
   if (!payload || !payload.items.length) return [];
-  // payload.channelId/payload.name (not entry.id/entry.name) are the real
-  // identity here -- when multiple channels are merged into one row (see
-  // mergeChannelsIntoRow client-side), each is fetched independently via
-  // fetchMergedCatalog with a synthetic { url, type } that has no entry.id
-  // or entry.name at all. Falls back to the row's own for channels saved
-  // before these fields existed.
   const channelId = payload.channelId || entry.id;
   const name = payload.name || entry.name;
   return [
@@ -173,11 +185,6 @@ function fetchChannelCatalog(entry) {
       type: "series",
       name: name,
       poster: payload.poster || undefined,
-      // "square" (1:1) cropped the sides off any wide logo (most network
-      // logos are much wider than tall) -- "landscape" (16:9) is the
-      // widest shape Stremio/wako support, so it crops far less. Not a
-      // perfect fit for every logo's exact proportions, but the closest
-      // available.
       posterShape: "landscape",
     },
   ];
@@ -185,24 +192,15 @@ function fetchChannelCatalog(entry) {
 
 // --- Custom Lists --------------------------------------------------------------
 //
-// A hand-picked list of movies OR shows (not mixed -- see payload.type),
-// built by search-and-pick in the builder. Unlike a (TV) Channel this
-// isn't a single synthetic tile -- each pick is returned as its own
-// ordinary, independently-typed catalog item, same as any other list here.
-// This also used to be split into "Movie Channels" (movies only) with its
-// own merge feature; folded into one generic feature since a movie or show
-// picked this way was never actually a "channel" in any meaningful sense
-// -- there's no synthetic wrapper to give it one, so it's just a list, and
-// simpler to treat it as exactly that (including reusing the same merge-
-// into-one-shelf mechanism every other list type already has, rather than
-// a bespoke one).
+// A hand-picked list of movies, shows, or mixed items built by search-and-pick
+// in the builder. When served in a catalog shelf, items are automatically filtered
+// to match the shelf type (entry.type).
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
     if (!raw.startsWith("customlist:v1:")) return null;
     const data = JSON.parse(raw.slice("customlist:v1:".length));
     if (!data || !Array.isArray(data.items)) return null;
-    if (data.type !== "movie" && data.type !== "series") return null;
     return data;
   } catch (e) {
     return null;
@@ -212,21 +210,23 @@ function parseCustomListPayload(rawUrl) {
 function fetchCustomListCatalog(entry) {
   const payload = parseCustomListPayload(entry.url);
   if (!payload || !payload.items.length) return [];
-  // "Randomize order" reshuffles once a day rather than on every single
-  // request -- same reasoning as a Channel's "Randomize play order" (see
-  // buildChannelMeta): the order stays put if someone reopens the shelf
-  // later the same day, but looks freshly shuffled again tomorrow.
-  // payload.listId (not entry.id) is the seed source since this list could
-  // be merged with others into one row via the ordinary merge mechanism,
-  // where there's no outer entry.id for any individual list to use.
   const items = payload.shuffle
     ? seededShuffle(payload.items, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
     : payload.items;
   return items
-    .filter((it) => it && it.imdbId)
+    .filter((it) => {
+      if (!it || !it.imdbId) return false;
+      const itType = it.kind || it.type;
+      if (entry.type === 'movie') {
+        if (itType === 'series' || itType === 'tv') return false;
+      } else if (entry.type === 'series') {
+        if (itType === 'movie') return false;
+      }
+      return true;
+    })
     .map((it) => ({
       id: it.imdbId,
-      type: payload.type,
+      type: entry.type || (it.kind === 'series' || it.type === 'series' || it.type === 'tv' ? 'series' : 'movie'),
       name: it.title,
       poster: it.poster || undefined,
       releaseInfo: it.year || undefined,
@@ -376,10 +376,19 @@ async function fetchPublishedListCatalog(entry, env) {
   }
   if (!payload || !Array.isArray(payload.items)) return [];
   return payload.items
-    .filter((it) => it && it.imdbId)
+    .filter((it) => {
+      if (!it || !it.imdbId) return false;
+      const itType = it.kind || it.type;
+      if (entry.type === 'movie') {
+        if (itType === 'series' || itType === 'tv') return false;
+      } else if (entry.type === 'series') {
+        if (itType === 'movie') return false;
+      }
+      return true;
+    })
     .map((it) => ({
       id: it.imdbId,
-      type: payload.type,
+      type: entry.type || (it.kind === 'series' || it.type === 'series' || it.type === 'tv' ? 'series' : 'movie'),
       name: it.title,
       poster: it.poster || undefined,
       releaseInfo: it.year || undefined,

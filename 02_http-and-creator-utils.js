@@ -6,13 +6,18 @@ function corsHeaders() {
   };
 }
 
-function json(data, status = 200) {
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "max-age=3600",
       ...corsHeaders(),
+      // Applied last so a caller (e.g. the admin dashboard's own JSON
+      // endpoints -- see their own comment on why they need this) can
+      // override the max-age default above, rather than every non-admin
+      // call site needing to keep repeating the default just to get it.
+      ...extraHeaders,
     },
   });
 }
@@ -234,6 +239,14 @@ function slugifyServer(s) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
     .slice(0, 60);
+}
+
+function deslugifyServer(s) {
+  return String(s || "")
+    .split("-")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
 }
 
 // Server-side HTML escaping for the public /lists/:username/:listname page

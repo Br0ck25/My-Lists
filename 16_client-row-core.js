@@ -1,6 +1,149 @@
 <script>
 const ORIGIN = ${JSON.stringify(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
+// Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
+// exact page load resolved a known chart slug -- e.g. loading
+// /lists/TMDB-Trending directly (a bookmark, a shared link, a refresh)
+// rather than reaching it by clicking "See All" inside an already-running
+// session. null on every other page load (the normal case). See
+// handleInitialDeepLink in 24_client-backup-restore-presets.js, which
+// checks this before falling back to the older #/list?... hash format for
+// anything that isn't one of these known charts.
+const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+// Every native/official chart's (slug, name, movieUrl, showUrl) -- lets
+// openListDetailsPage (23_client-list-management.js) push the clean
+// /lists/<slug> path when the list it's opening is one of these, instead
+// of always falling back to the older #/list?... hash format.
+const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+
+function deslugify(s) {
+  return String(s || '')
+    .split('-')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function getListCleanPath(listUrl, name) {
+  if (!listUrl) return null;
+  const rawUrl = String(listUrl).trim();
+
+  // 1. Known chart
+  if (typeof CHART_SLUG_ENTRIES !== 'undefined') {
+    const knownChart = CHART_SLUG_ENTRIES.find((e) => e.movieUrl === rawUrl || e.showUrl === rawUrl || e.url === rawUrl);
+    if (knownChart) return '/lists/' + knownChart.slug;
+  }
+
+  // 2. Addon internal list (/lists/:user/:slug)
+  if (typeof location !== 'undefined' && rawUrl.startsWith(location.origin + '/lists/')) {
+    return rawUrl.slice(location.origin.length);
+  }
+  if (rawUrl.startsWith('/lists/')) {
+    return rawUrl;
+  }
+
+  // 3. MDBList list: https://mdblist.com/lists/:user/:slug
+  const mdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?mdblist\\.com/lists/([^/]+)/([^/?#]+)', 'i'));
+  if (mdbMatch) {
+    return '/lists/mdblist/' + mdbMatch[1] + '/' + mdbMatch[2];
+  }
+
+  // 4. Trakt list: https://trakt.tv/users/:user/lists/:slug
+  const traktMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?trakt\\.tv/users/([^/]+)/lists/([^/?#]+)', 'i'));
+  if (traktMatch) {
+    return '/lists/trakt/' + traktMatch[1] + '/' + traktMatch[2];
+  }
+
+  // 5. TMDB list: https://www.themoviedb.org/list/:id
+  const tmdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/list/([0-9]+)', 'i'));
+  if (tmdbMatch) {
+    return '/lists/tmdb/' + tmdbMatch[1];
+  }
+
+  return null;
+}
+
+function isListAddedToConfig(url, type, slug) {
+  const entries = document.querySelectorAll('#lists .entry');
+  for (const entry of entries) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    const urlInputs = entry.querySelectorAll('.url');
+    for (const el of urlInputs) {
+      const u = el.value.trim();
+      if (url && u === url.trim()) return true;
+      if (slug) {
+        const payload = parseCustomListPayloadClient(u);
+        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function removeListFromConfig(url, type, slug) {
+  const entries = document.querySelectorAll('#lists .entry');
+  let removed = false;
+  for (const entry of entries) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    const urlInputs = entry.querySelectorAll('.url');
+    for (const el of urlInputs) {
+      const u = el.value.trim();
+      let match = false;
+      if (url && u === url.trim()) match = true;
+      if (slug) {
+        const payload = parseCustomListPayloadClient(u);
+        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) match = true;
+      }
+      if (match) {
+        entry.remove();
+        removed = true;
+        break;
+      }
+    }
+  }
+  if (removed) {
+    renumber();
+    saveState();
+  }
+  return removed;
+}
+
+function navigateBackFromDetail() {
+  const targetTab = window._previousTab || 'discover';
+  if (history.length > 1) {
+    history.back();
+  } else {
+    if (location.pathname !== '/' && location.pathname !== '/configure' && !location.pathname.startsWith('/configure')) {
+      history.replaceState({ view: 'tab', tab: targetTab }, '', '/');
+    }
+    document.querySelectorAll('.tab-panel').forEach(function(p) {
+      p.hidden = (p.getAttribute('data-tab-panel') !== targetTab);
+    });
+    document.querySelectorAll('.tab-btn').forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === targetTab);
+    });
+    document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === targetTab);
+    });
+    const addShelfBtn = document.getElementById('headerAddShelfBtn');
+    if (addShelfBtn) addShelfBtn.style.display = (targetTab === 'catalogs' ? 'block' : 'none');
+    const createListBtn = document.getElementById('headerCreateListBtn');
+    if (createListBtn) createListBtn.style.display = (targetTab === 'lists' ? 'block' : 'none');
+
+    try {
+      localStorage.setItem('myListAddon:activeTab', targetTab);
+    } catch (e) {}
+    if (typeof window._previousScrollY === 'number') {
+      const scrollPos = window._previousScrollY;
+      setTimeout(() => {
+        window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      }, 0);
+    }
+  }
+}
+
 // Global state variables
 var suppressSave = false;
 var activeCreator = null;
@@ -95,12 +238,67 @@ function switchTab(name) {
     localStorage.setItem('myListAddon:activeTab', name);
   } catch (e) {}
 
+  if (name !== 'list-details' && name !== 'item-details') {
+    if (location.pathname.startsWith('/lists/')) {
+      history.pushState({ view: 'tab', tab: name }, '', '/');
+    }
+  }
+
   if (name === 'lists') {
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-    if (typeof renderMyLists === 'function') renderMyLists();
+    let savedSub = 'my-lists';
+    try {
+      savedSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+    } catch (e) {}
+    const pills = document.querySelectorAll('#listsSubnavBar .subnav-pill');
+    let targetBtn = null;
+    pills.forEach((p) => {
+      const oc = p.getAttribute('onclick') || '';
+      if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+        targetBtn = p;
+      }
+    });
+    switchListsSubmenu(savedSub, targetBtn || pills[0]);
+  }
+  if (name === 'settings') {
+    let savedSub = 'keys';
+    try {
+      savedSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'keys';
+    } catch (e) {}
+    const pills = document.querySelectorAll('#settingsSubnavBar .subnav-pill');
+    let targetBtn = null;
+    pills.forEach((p) => {
+      const oc = p.getAttribute('onclick') || '';
+      if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+        targetBtn = p;
+      }
+    });
+    switchSettingsSubmenu(savedSub, targetBtn || pills[0]);
+  }
+  if (name === 'catalogs') {
+    // Auto-loads posters the moment this tab is shown -- previously
+    // required clicking "Refresh Preview" by hand even just to look at
+    // shelves that were already configured. The button (still there)
+    // stays useful after editing a URL, since that shouldn't re-fire a
+    // live request on every keystroke -- see renderLivePreview's own
+    // comment.
+    if (typeof renderLivePreview === 'function') renderLivePreview();
   }
   if (name === 'discover') {
-    filterDiscoverShelves('all', document.querySelector('#discoverSubnavBar button:nth-child(1)'));
+    let savedFilter = 'all';
+    try {
+      savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    } catch (e) {}
+    const activeFilter = window._currentDiscoverFilter || savedFilter;
+    window._currentDiscoverFilter = activeFilter;
+    const pills = document.querySelectorAll('#discoverSubnavBar .subnav-pill');
+    let targetBtn = null;
+    pills.forEach((p) => {
+      const oc = p.getAttribute('onclick') || '';
+      if (oc.indexOf("'" + activeFilter + "'") !== -1 || oc.indexOf('"' + activeFilter + '"') !== -1) {
+        targetBtn = p;
+      }
+    });
+    filterDiscoverShelves(activeFilter, targetBtn || pills[0]);
   }
 }
 
@@ -125,11 +323,14 @@ function restoreActiveTab() {
   try {
     tab = localStorage.getItem('myListAddon:activeTab') || 'discover';
   } catch (e) {}
-  if (tab === 'item-details') tab = 'discover';
+  if (tab === 'item-details' || tab === 'list-details') tab = 'discover';
   switchTab(tab);
 }
 
 function switchListsSubmenu(name, btn) {
+  try {
+    localStorage.setItem('myListAddon:listsSubmenu', name);
+  } catch (e) {}
   document.querySelectorAll('#listsSubnavBar .subnav-pill').forEach(function(p) {
     p.classList.remove('active');
     const c = p.querySelector('.check-icon');
@@ -140,13 +341,11 @@ function switchListsSubmenu(name, btn) {
     btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
   }
   const subpanels = {
-    'popular': 'listsSubPopular',
     'my-lists': 'listsSubMyLists',
     'liked': 'listsSubLiked',
-    'curated': 'listsSubCurated',
     'bulk': 'listsSubBulk',
     'create-list': 'listsSubCreateList',
-      'list-search': 'listsSubListSearch'
+    'import': 'listsSubImport'
   };
   Object.keys(subpanels).forEach(function(k) {
     const el = document.getElementById(subpanels[k]);
@@ -156,17 +355,18 @@ function switchListsSubmenu(name, btn) {
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
 
-  if (name === 'popular') loadPopularListsFeed();
   if (name === 'my-lists') {
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
     if (typeof runMyTraktLists === 'function') runMyTraktLists();
   }
   if (name === 'liked') renderLikedListsFeed();
-  if (name === 'curated') loadCuratedListsFeed();
 }
 
 function switchSettingsSubmenu(name, btn) {
+  try {
+    localStorage.setItem('myListAddon:settingsSubmenu', name);
+  } catch (e) {}
   if (btn) {
     document.querySelectorAll('#settingsSubnavBar .subnav-pill').forEach(function(p) {
       p.classList.remove('active');
@@ -260,6 +460,10 @@ function trackEventsBatch(eventType, items) {
 }
 
 function filterDiscoverShelves(filter, btn) {
+  window._currentDiscoverFilter = filter || 'all';
+  try {
+    localStorage.setItem('myListAddon:discoverSubmenu', filter || 'all');
+  } catch (e) {}
   if (btn) {
     document.querySelectorAll('#discoverSubnavBar .subnav-pill').forEach(function(p) {
       p.classList.remove('active');
@@ -271,31 +475,30 @@ function filterDiscoverShelves(filter, btn) {
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
   const feedContainer = document.getElementById('discoverListsFeed');
-  
-  // Now 'all' also uses the feed container since the shelves have been moved to Catalogs
-  if (filter === 'movie' || filter === 'series' || filter === 'gems' || filter === 'kids' || filter === 'all') {
-    if (shelvesContainer) shelvesContainer.style.display = 'none';
+  const popularContainer = document.getElementById('discoverSubPopular');
+  const curatedContainer = document.getElementById('discoverSubCurated');
+
+  if (popularContainer) popularContainer.style.display = 'none';
+  if (curatedContainer) curatedContainer.style.display = 'none';
+  if (shelvesContainer) shelvesContainer.style.display = 'none';
+  if (feedContainer) feedContainer.style.display = 'none';
+
+  if (filter === 'popular') {
+    if (popularContainer) {
+      popularContainer.style.display = 'block';
+      if (typeof loadPopularListsFeed === 'function') loadPopularListsFeed();
+    }
+  } else if (filter === 'curated') {
+    if (curatedContainer) {
+      curatedContainer.style.display = 'block';
+      if (typeof loadCuratedListsFeed === 'function') loadCuratedListsFeed();
+    }
+  } else {
     if (feedContainer) {
       feedContainer.style.display = 'block';
       if (typeof renderDiscoverChartsList === 'function') {
         renderDiscoverChartsList(filter);
       }
-    }
-  } else {
-    if (feedContainer) feedContainer.style.display = 'none';
-    if (shelvesContainer) {
-      shelvesContainer.style.display = 'block';
-      const shelves = shelvesContainer.querySelectorAll('.discover-shelf');
-      shelves.forEach(function(shelf) {
-        const st = shelf.getAttribute('data-shelf-type') || 'all';
-        if (filter === 'all') {
-          shelf.style.display = '';
-        } else if (filter === 'gems') {
-          shelf.style.display = (st === 'gems') ? '' : 'none';
-        } else {
-          shelf.style.display = '';
-        }
-      });
     }
   }
 }
@@ -511,10 +714,14 @@ function quickAddProvider(name) {
   }
 }
 
-function closeDetailOverlay() {
-  const el = document.getElementById('detailOverlay');
-  if (el) el.classList.remove('active');
-}
+// Kept as a no-op (not removed) -- the poster-click handler in
+// 19_client-search-and-likes.js still calls this defensively before every
+// item-details open, and detailOverlay itself no longer exists (it's the
+// list-details tab panel now, see 09_page-shell.js and
+// openListDetailsPage in 23_client-list-management.js, which switchTab
+// already hides/shows the normal way). Safer to leave this as a harmless
+// no-op than to hunt down and remove every defensive call site.
+function closeDetailOverlay() {}
 
 
 // Renders one source URL row. A "merged" entry (multiple sources feeding

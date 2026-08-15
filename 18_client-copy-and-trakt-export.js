@@ -37,8 +37,9 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
 // store otherwise (mirroring saveLocalCustomList). Unlike either of those,
 // there's no existing row/draft involved here at all -- this always
 // creates a brand new saved list, never edits one in place.
-async function saveItemsAsNewCustomList(name, type, items, visibility) {
+async function saveItemsAsNewCustomList(name, type, items, visibility, extraProps) {
   visibility = visibility === 'private' ? 'private' : 'public';
+  extraProps = extraProps || {};
   if (activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     try {
@@ -52,6 +53,8 @@ async function saveItemsAsNewCustomList(name, type, items, visibility) {
           type: type,
           items: items,
           visibility: visibility,
+          sourceUrl: extraProps.sourceUrl || '',
+          synced: !!extraProps.sourceUrl,
         }),
       });
       const data = await res.json();
@@ -70,7 +73,17 @@ async function saveItemsAsNewCustomList(name, type, items, visibility) {
     n++;
   }
   const now = Date.now();
-  map[slug] = { slug: slug, name: name, type: type, items: items, visibility: visibility, createdAt: now, updatedAt: now };
+  map[slug] = {
+    slug: slug,
+    name: name,
+    type: type,
+    items: items,
+    visibility: visibility,
+    sourceUrl: extraProps.sourceUrl || '',
+    synced: !!extraProps.sourceUrl,
+    createdAt: now,
+    updatedAt: now
+  };
   const persisted = saveLocalCustomListsMap(map);
   if (!persisted) {
     return { ok: false, error: 'localStorage save failed (likely full \u2014 try clearing out some old Custom Lists, or importing fewer categories at once)' };
@@ -101,7 +114,7 @@ async function saveItemsAsNewCustomList(name, type, items, visibility) {
 // than truncating or growing one list without bound.
 const CUSTOM_LIST_CHUNK_SIZE = 6000;
 
-async function copyListToCustomList(name, listUrl, contentType, btn, historyMode) {
+async function copyListToCustomList(name, listUrl, contentType, btn, historyMode, extraProps) {
   const typesToCopy = contentType === 'movie' || contentType === 'series' ? [contentType] : ['movie', 'series'];
   const isSplit = typesToCopy.length > 1;
   // Restored on the way out below -- this is called from several different
@@ -157,7 +170,7 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
     for (let i = 0; i * CUSTOM_LIST_CHUNK_SIZE < items.length; i++) {
       const chunk = items.slice(i * CUSTOM_LIST_CHUNK_SIZE, (i + 1) * CUSTOM_LIST_CHUNK_SIZE);
       const listName = i === 0 ? baseListName : baseListName + ' ' + (i + 1);
-      const result = await saveItemsAsNewCustomList(listName, type, chunk, 'private');
+      const result = await saveItemsAsNewCustomList(listName, type, chunk, 'private', extraProps);
       if (result.ok) {
         created.push({ name: listName, count: chunk.length });
       } else {

@@ -1,4 +1,3 @@
-
 // --- router ---------------------------------------------------------------
 
 export default {
@@ -89,6 +88,26 @@ export default {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       return new Response(
         renderBuilder(url.origin, { isConfigureMode: true }),
+        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      );
+    }
+
+    // /lists/<slug>  (single segment, no second "/") -> a clean, shareable
+    // url for one of the native/official charts (see CHART_SLUG_ENTRIES,
+    // 08_quickadd-chart-data.js) -- resolves the slug and serves the same
+    // builder page, but with that chart pre-opened in the list-details view
+    // (see SERVER_DEEP_LINK_LIST, 09_page-shell.js, and
+    // handleInitialDeepLink, 24_client-backup-restore-presets.js). This is
+    // distinct from /lists/:username/:listname below (always two segments,
+    // a person's own published Custom List) -- an unrecognized slug here
+    // just lands on the normal default builder page rather than a hard
+    // 404, since a stale or mistyped link shouldn't dead-end someone.
+    m = path.match(/^\/lists\/([A-Za-z0-9-]+)$/);
+    if (m) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      const chart = resolveChartSlug(m[1]);
+      return new Response(
+        renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: "movie", url: chart.movieUrl } } : {}),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
     }
@@ -193,7 +212,7 @@ self.addEventListener('fetch', e => {
       const staleKey = env && env.CONFIGS ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, traktKey, traktAccessToken, env });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, traktKey, traktAccessToken, env, ctx });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -321,7 +340,7 @@ self.addEventListener('fetch', e => {
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, traktKey, traktAccessToken, env });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, traktKey, traktAccessToken, env, ctx });
         body = {
           ok: true,
           count: metas.length,
@@ -404,6 +423,9 @@ self.addEventListener('fetch', e => {
     // needed for this, since it's the same public data for everyone.
     if (path === "/api/toplists") {
       try {
+        // Always the shared key here -- no per-user override exists for
+        // this endpoint (see the comment above).
+        ctx.waitUntil(bumpStat(env, "apiuse:mdblistpopular"));
         const lists = await fetchTopLists(MDBLIST_POPULAR_KEY);
         return json({ ok: true, lists });
       } catch (err) {
@@ -416,14 +438,36 @@ self.addEventListener('fetch', e => {
         const q = url.searchParams;
         const imdbId = q.get("imdbId");
         const seasonNum = q.get("seasonNum");
-        const tmdbKey = q.get("tmdbKey") || TMDB_API_KEY;
+        const tmdbKeyParam = q.get("tmdbKey") || "";
+        const tmdbKey = tmdbKeyParam || TMDB_API_KEY;
+        if (!tmdbKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+        // Optional -- when the caller already resolved this show's tmdbId
+        // (e.g. from the same /api/details response that gave it
+        // imdbId/seasonsData in the first place), passing it straight
+        // through skips a redundant imdbId -> tmdbId /find lookup here.
+        // Matters most when several seasons of the same show are being
+        // fetched concurrently (see markShowWatched's own comment): without
+        // this, each one redundantly re-resolves the same show, and those
+        // concurrent /find calls racing to fill a cold cache entry for a
+        // show TMDB hasn't been asked about yet can come back empty under
+        // that burst, silently dropping that season's episodes.
+        const knownTmdbId = q.get("tmdbId") || null;
         
         if (!imdbId || !seasonNum) return json({ ok: false, error: "Missing imdbId or seasonNum" }, 400);
         
-        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey);
+        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId);
         if (!seasonData) return json({ ok: false, error: "Not found or TMDB error" }, 404);
         
-        return json({ ok: true, season: seasonData });
+        // A short max-age (not json()'s 3600s default) -- this response's
+        // shape has changed before (the tmdbId passthrough above is a
+        // recent example) and a stale hour-old browser cache of the old
+        // shape is exactly the kind of thing that looks like "the fix
+        // didn't work" for anyone re-testing a show/season they'd already
+        // opened recently. The actual TMDB calls are still cached for a
+        // full week at Cloudflare's edge (see fetchTmdbSeasonDetails's own
+        // cf.cacheTtl) regardless of this -- this only governs how long
+        // the browser reuses its own copy of this specific JSON reply.
+        return json({ ok: true, season: seasonData }, 200, { "Cache-Control": "max-age=60" });
       }
 
     // /api/title-search?q=...&type=movie|tv
@@ -434,6 +478,8 @@ self.addEventListener('fetch', e => {
       const kind = url.searchParams.get("type") === "movie" ? "movie" : "tv";
       if (!q) return json({ ok: false, error: "Missing search query." }, 400);
       try {
+        // Always the shared key -- no per-user override for this endpoint.
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const src = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
           TMDB_API_KEY
         )}&query=${encodeURIComponent(q)}&include_adult=false`;
@@ -466,6 +512,8 @@ self.addEventListener('fetch', e => {
       const tmdbId = url.searchParams.get("tmdbId") || "";
       if (!tmdbId) return json({ ok: false, error: "Missing tmdbId." }, 400);
       try {
+        // Always the shared key -- 2 outbound TMDB calls per request.
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         const [details, showRes] = await Promise.all([
           fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY),
           fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(TMDB_API_KEY)}`, {
@@ -501,6 +549,8 @@ self.addEventListener('fetch', e => {
       const season = url.searchParams.get("season") || "";
       if (!tmdbId || !season) return json({ ok: false, error: "Missing tmdbId or season." }, 400);
       try {
+        // Always the shared key.
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const src = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${encodeURIComponent(
           season
         )}?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
@@ -559,7 +609,9 @@ self.addEventListener('fetch', e => {
           // below already bounds how much actually gets processed regardless
           // of pool size, and this loop still stops early via total_pages
           // for any network with genuinely fewer than 10 pages of results.
+          let discoverPagesFetched = 0;
           for (let page = 1; page <= 10; page++) {
+            discoverPagesFetched++;
             const discoverRes = await fetch(
               `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
                 `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=${page}&include_adult=false`,
@@ -607,6 +659,10 @@ self.addEventListener('fetch', e => {
               poster: show.poster_path ? `https://image.tmdb.org/t/p/w300${show.poster_path}` : null,
             };
           });
+          // Always the shared key -- the discover page loop
+          // (discoverPagesFetched), the network logo lookup (1), and one
+          // fetchTmdbDetails call per discovered show all landed above.
+          ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", discoverPagesFetched + 1 + discoverResults.length));
           const resolved = shows.filter(Boolean);
           if (!resolved.length) return json({ ok: false, error: "Couldn't resolve any shows for that network to IMDB." });
           return json({ ok: true, shows: resolved, networkLogo });
@@ -621,7 +677,7 @@ self.addEventListener('fetch', e => {
         // mdblist's own JSON shape like it used to.
         let metas;
         try {
-          metas = await fetchCatalog({ url: listUrl, type: "series" }, 0, { mdblistKey, traktKey, traktAccessToken, env });
+          metas = await fetchCatalog({ url: listUrl, type: "series" }, 0, { mdblistKey, traktKey, traktAccessToken, env, ctx });
         } catch (err) {
           return json({ ok: false, error: `Could not read that list: ${err.message || err}` });
         }
@@ -644,6 +700,8 @@ self.addEventListener('fetch', e => {
             return null;
           }
         });
+        // Always the shared key -- one TMDB find call per item in the list.
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", metas.length));
         const resolved = shows.filter(Boolean);
         if (!resolved.length) return json({ ok: false, error: "Couldn't resolve any shows in that list to TMDB." });
         return json({ ok: true, shows: resolved });
@@ -658,6 +716,7 @@ self.addEventListener('fetch', e => {
       const tmdbId = url.searchParams.get("tmdbId") || "";
       if (!tmdbId) return json({ ok: false, error: "Missing tmdbId." }, 400);
       try {
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const details = await fetchTmdbDetails(tmdbId, "movie", TMDB_API_KEY);
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
         return json({ ok: true, imdbId: details.imdbId });
@@ -673,12 +732,132 @@ self.addEventListener('fetch', e => {
       const tmdbId = url.searchParams.get("tmdbId") || "";
       if (!tmdbId) return json({ ok: false, error: "Missing tmdbId." }, 400);
       try {
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const details = await fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY);
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this show." });
         return json({ ok: true, imdbId: details.imdbId });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
+    }
+
+    // /api/recommendations  (POST)  { movieIds: [...], showIds: [...] } -> { ok, movies: [...], shows: [...] }
+    // Generates personalized movie and show recommendations from TMDB based on user watch history.
+    if (path === "/api/recommendations" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
+      const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
+      const tmdbKey = body.tmdbKey || TMDB_API_KEY;
+
+      const [movieLists, showLists] = await Promise.all([
+        Promise.all(movieIds.map(async (rawId) => {
+          try {
+            let tmdbId = "";
+            if (String(rawId).startsWith("tmdb:")) {
+              tmdbId = String(rawId).slice(5);
+            } else {
+              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(rawId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
+                cf: { cacheTtl: 86400, cacheEverything: true }
+              });
+              const findData = await findRes.json();
+              if (findData.movie_results && findData.movie_results[0]) {
+                tmdbId = findData.movie_results[0].id;
+              }
+            }
+            if (!tmdbId) return [];
+            const recRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+              cf: { cacheTtl: 86400, cacheEverything: true }
+            });
+            const recData = await recRes.json();
+            let list = recData.results || [];
+            if (!list.length) {
+              const simRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+                cf: { cacheTtl: 86400, cacheEverything: true }
+              });
+              const simData = await simRes.json();
+              list = simData.results || [];
+            }
+            return list;
+          } catch {
+            return [];
+          }
+        })),
+        Promise.all(showIds.map(async (rawId) => {
+          try {
+            let tmdbId = "";
+            if (String(rawId).startsWith("tmdb:")) {
+              tmdbId = String(rawId).slice(5);
+            } else {
+              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(rawId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
+                cf: { cacheTtl: 86400, cacheEverything: true }
+              });
+              const findData = await findRes.json();
+              if (findData.tv_results && findData.tv_results[0]) {
+                tmdbId = findData.tv_results[0].id;
+              }
+            }
+            if (!tmdbId) return [];
+            const recRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+              cf: { cacheTtl: 86400, cacheEverything: true }
+            });
+            const recData = await recRes.json();
+            let list = recData.results || [];
+            if (!list.length) {
+              const simRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+                cf: { cacheTtl: 86400, cacheEverything: true }
+              });
+              const simData = await simRes.json();
+              list = simData.results || [];
+            }
+            return list;
+          } catch {
+            return [];
+          }
+        }))
+      ]);
+
+      const seenMovieIds = new Set();
+      const recMovies = [];
+      for (const list of movieLists) {
+        for (const m of list) {
+          if (m && m.id && !seenMovieIds.has(m.id) && m.poster_path) {
+            seenMovieIds.add(m.id);
+            recMovies.push({
+              id: "tmdb:" + m.id,
+              name: m.title || "Movie",
+              poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
+              year: (m.release_date || "").slice(0, 4),
+              type: "movie",
+              rating: m.vote_average ? m.vote_average.toFixed(1) : null
+            });
+          }
+        }
+      }
+
+      const seenShowIds = new Set();
+      const recShows = [];
+      for (const list of showLists) {
+        for (const s of list) {
+          if (s && s.id && !seenShowIds.has(s.id) && s.poster_path) {
+            seenShowIds.add(s.id);
+            recShows.push({
+              id: "tmdb:" + s.id,
+              name: s.name || "Show",
+              poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
+              year: (s.first_air_date || "").slice(0, 4),
+              type: "series",
+              rating: s.vote_average ? s.vote_average.toFixed(1) : null
+            });
+          }
+        }
+      }
+
+      return json({ ok: true, movies: recMovies.slice(0, 40), shows: recShows.slice(0, 40) });
     }
 
     // /api/trakt-search?q=...
@@ -690,9 +869,58 @@ self.addEventListener('fetch', e => {
       const traktKey = url.searchParams.get("traktKey") || "";
       try {
         const lists = await searchTraktLists(q, traktKey);
+        // Always the shared key when traktKey wasn't supplied -- 1 search
+        // call plus 1 classify call per result (searchTraktLists's own
+        // internal mapWithConcurrency over the results it just got back).
+        if (!traktKey) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + lists.length));
         return json({ ok: true, lists });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
+      }
+    }
+
+    // /api/trakt-popular-lists?traktKey=...
+    // -> returns popular public community lists directly from Trakt's API
+    if (path === "/api/trakt-popular-lists") {
+      const traktKeyParam = url.searchParams.get("traktKey") || "";
+      const traktKey = traktKeyParam || TRAKT_CLIENT_ID;
+      if (!traktKey) {
+        return json({ ok: false, lists: [] });
+      }
+      try {
+        const src = "https://api.trakt.tv/lists/popular?limit=30";
+        const res = await fetch(src, {
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": traktKey,
+            "User-Agent": "my-list-addon/1.6",
+          },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        });
+        if (!res.ok) {
+          return json({ ok: false, lists: [] });
+        }
+        const data = await res.json();
+        const lists = (Array.isArray(data) ? data : [])
+          .map((r) => r.list || r)
+          .filter((l) => l && l.ids && l.ids.slug && l.user && (l.user.username || (l.user.ids && l.user.ids.slug)))
+          .map((l) => {
+            const username = l.user.username || l.user.ids.slug;
+            const slug = l.ids.slug;
+            return {
+              name: l.name,
+              user: username,
+              slug: slug,
+              items: l.item_count || 0,
+              likes: l.likes || 0,
+              url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(slug)}`,
+              type: "movie",
+            };
+          });
+        return json({ ok: true, lists });
+      } catch (err) {
+        return json({ ok: false, lists: [] });
       }
     }
 
@@ -750,6 +978,9 @@ self.addEventListener('fetch', e => {
           ...l,
           contentType: await classifyTraktListContentType(username, l.slug, traktKey),
         }));
+        // Always the shared key when traktKeyParam wasn't supplied -- 1
+        // call for the lists index above, plus 1 classify call per list.
+        if (!traktKeyParam) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + classified.length));
         return json({ ok: true, lists: classified });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
@@ -1038,6 +1269,11 @@ self.addEventListener('fetch', e => {
           contentType: "unknown",
         };
 
+        // Always the shared TRAKT_CLIENT_ID (OAuth calls always identify
+        // via this add-on's own app, never a per-user override) -- lists,
+        // me, watchlist, and history are 4 fixed calls, plus 1 classify
+        // call per list.
+        ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4 + classified.length));
         return json({ ok: true, lists: [watchlistEntry, historyEntry, ...classified] });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
@@ -1068,6 +1304,7 @@ self.addEventListener('fetch', e => {
       const page = Math.max(1, parseInt(body.page, 10) || 1);
       const limit = Math.min(100, Math.max(1, parseInt(body.limit, 10) || 100));
       try {
+        ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
         const res = await fetch(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
           headers: {
             "Content-Type": "application/json",
@@ -1120,12 +1357,18 @@ self.addEventListener('fetch', e => {
       // Simple per-IP rate limit (5/hour) -- KV's read-then-write isn't
       // atomic (see bumpStat's own comment on the same tradeoff elsewhere
       // in this file), so this is a deterrent against casual spam/abuse,
-      // not a hard guarantee against a determined actor.
+      // not a hard guarantee against a determined actor. Skipped entirely
+      // for the admin dashboard's own "Log something yourself" form (an
+      // authenticated admin, not an anonymous IP, submitting it) -- the
+      // admin session cookie already rides along on that fetch() call
+      // since it's same-origin, so isAdminRequest can tell the two apart
+      // without any extra plumbing on the client side.
+      const isAdmin = await isAdminRequest(request, env);
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
-      const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+      const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (rateCount >= 5) {
+      if (!isAdmin && rateCount >= 5) {
         return json({ ok: false, error: "You've sent a few of these already today -- try again tomorrow, or reach out another way if it's urgent." });
       }
 
@@ -1140,11 +1383,16 @@ self.addEventListener('fetch', e => {
       };
       try {
         await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
-        await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+        if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // entry is echoed back so the admin dashboard's "Log something
+      // yourself" form can show the new card instantly (optimistic, using
+      // its own locally-built entry) and then swap in the server's real
+      // id/createdAt once this resolves -- needed because a later Mark
+      // Completed click has to send an id the server actually recognizes.
+      return json({ ok: true, entry });
     }
 
     // /api/track-event  (POST)  { events: [{ eventType, id, title, mediaType }, ...] } -> { ok }
@@ -1363,10 +1611,16 @@ self.addEventListener('fetch', e => {
       const imdbId = reqBody.imdbId;
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
       if (!imdbId) return json({ ok: false, error: "Missing imdbId" }, 400);
+      if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       
       const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type);
       if (!details) return json({ ok: false, error: "Not found or TMDB error" }, 404);
       
-      return json({ ok: true, details });
+      // Short max-age -- same reasoning as /api/season's own comment: this
+      // response's shape changes occasionally (tmdbId is a recent
+      // addition), and json()'s 3600s default would leave anyone who'd
+      // opened this exact show recently stuck looking at an hour-old,
+      // pre-fix cached copy.
+      return json({ ok: true, details }, 200, { "Cache-Control": "max-age=60" });
     }
 

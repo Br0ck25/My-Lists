@@ -77,6 +77,11 @@
       }
 
       const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
+      // Already running inside the caller's ctx.waitUntil (see
+      // handleSubtitlesTrack's own call site), so no extra waitUntil
+      // needed here -- see trackSharedApiUse in 05_catalog-core.js for
+      // the same pattern elsewhere.
+      if (!tmdbKey) bumpStat(env, "apiuse:tmdb");
       const parts = id.split(":");
       const imdbId = parts[0];
       let matched = "no";
@@ -463,6 +468,36 @@
       });
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: filteredNewOrder }));
       return json({ ok: true, order: filteredNewOrder });
+    }
+
+    // /api/creator/delete-account  (POST)  { creatorName, creatorKey } -> { ok }
+    // Permanently removes the creator profile, their published lists, order, and sync data
+    if (path === "/api/creator/delete-account" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Database not configured." }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+      const u = auth.username;
+      try {
+        const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${u}:` });
+        for (const k of listKeys.keys) {
+          await env.CONFIGS.delete(k.name);
+        }
+      } catch {}
+      try {
+        await env.CONFIGS.delete(`creatorprofile:${u}`);
+        await env.CONFIGS.delete(`creatorlistorder:${u}`);
+        await env.CONFIGS.delete(`creatortrack:${u}`);
+        await env.CONFIGS.delete(`creatorpresets:${u}`);
+        await env.CONFIGS.delete(`creatorlikes:${u}`);
+        await env.CONFIGS.delete(`creatorchannels:${u}`);
+      } catch {}
+      return json({ ok: true });
     }
 
     // --- Site-wide account sync ---------------------------------------------
@@ -876,8 +911,83 @@
     // navigation -- see isBrowserNavigation) gets the raw list data.
     // Either way this reads straight from KV; it never round-trips through
     // fetchCatalog itself (that's only for *other* configs pointing at
-    // this URL as a source -- see fetchPublishedListCatalog, which
-    // mirrors this same lookup order and private-list handling).
+    // Clean external list paths: /lists/mdblist/:user/:slug, /lists/trakt/:user/:slug, /lists/tmdb/:id
+    m = path.match(/^\/lists\/mdblist\/([^/]+)\/([^/]+)(?:\.json)?$/i);
+    if (m) {
+      const mdblistUser = m[1];
+      const mdblistSlug = m[2];
+      const targetUrl = `https://mdblist.com/lists/${mdblistUser}/${mdblistSlug}`;
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(
+        renderBuilder(url.origin, {
+          deepLinkList: {
+            name: deslugifyServer(mdblistSlug),
+            type: "movie",
+            url: targetUrl,
+            creatorName: mdblistUser,
+            maybeMore: true,
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...corsHeaders(),
+          },
+        }
+      );
+    }
+
+    m = path.match(/^\/lists\/trakt\/([^/]+)\/([^/]+)(?:\.json)?$/i);
+    if (m) {
+      const traktUser = m[1];
+      const traktSlug = m[2];
+      const targetUrl = `https://trakt.tv/users/${traktUser}/lists/${traktSlug}`;
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(
+        renderBuilder(url.origin, {
+          deepLinkList: {
+            name: deslugifyServer(traktSlug),
+            type: "movie",
+            url: targetUrl,
+            creatorName: traktUser,
+            maybeMore: true,
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...corsHeaders(),
+          },
+        }
+      );
+    }
+
+    m = path.match(/^\/lists\/tmdb\/([0-9]+)(?:\.json)?$/i);
+    if (m) {
+      const tmdbId = m[1];
+      const targetUrl = `https://www.themoviedb.org/list/${tmdbId}`;
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(
+        renderBuilder(url.origin, {
+          deepLinkList: {
+            name: `TMDB List ${tmdbId}`,
+            type: "movie",
+            url: targetUrl,
+            maybeMore: true,
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...corsHeaders(),
+          },
+        }
+      );
+    }
+
     m = path.match(/^\/lists\/([a-z0-9-]+)\/([a-z0-9-]+)(?:\.json)?$/i);
     if (m) {
       const username = m[1].toLowerCase();
@@ -932,324 +1042,34 @@
       if (wantsJson) {
         return json({ ok: true, name: listData.name, type: listData.type, items: listData.items, creatorName: creatorDisplayName, likes });
       }
-      const itemsHtml = listData.items
-        .map(
-          (it) =>
-            `<a href="/${it.type || 'movie'}/${it.tmdb_id || ''}" style="display:flex; flex-direction:column; gap:6px; width:100%; min-width:0; text-decoration:none;">` +
-            `<div style="aspect-ratio:2/3; border-radius:8px; overflow:hidden; background:var(--panel-strong); box-shadow:var(--shadow-sm); width:100%;">` +
-            (it.poster ? `<img src="${escapeHtmlServer(it.poster)}" style="width:100%; height:100%; object-fit:cover; display:block;" loading="lazy">` : ``) +
-            `</div>` +
-            `<div style="font-size:0.85rem; font-weight:600; color:var(--text); text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtmlServer(it.title || it.name || "Item")}</div>` +
-            `</a>`
-        )
-        .join("");
+      ctx.waitUntil(bumpStat(env, "pageviews"));
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
-      const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtmlServer(listData.name)} \u2014 My Lists</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script>
-  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-    document.documentElement.classList.add('dark-theme');
-  }
-</script>
-<style>
-  :root {
-    --bg: #F2F2F7;
-    --surface: #FFFFFF;
-    --panel-strong: #E5E5EA;
-    --border: rgba(0,0,0,0.08);
-    --border-strong: rgba(0,0,0,0.15);
-    --text: #000000;
-    --text-2: #3A3A3C;
-    --muted: #8E8E93;
-    --accent: #007AFF;
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
-    --radius-pill: 999px;
-    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #000000;
-      --surface: #1C1C1E;
-      --panel-strong: #2C2C2E;
-      --border: rgba(255,255,255,0.15);
-      --border-strong: rgba(255,255,255,0.25);
-      --text: #FFFFFF;
-      --text-2: #EBEBF5;
-    }
-  }
-  html.dark-theme {
-    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
-    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
-    --text: #FFFFFF; --text-2: #EBEBF5;
-  }
-  * { box-sizing: border-box; }
-  html { touch-action: manipulation; width: 100%; max-width: 100%; overflow-x: hidden; }
-  body {
-    font-family: var(--font-body);
-    margin: 0;
-    min-height: 100vh;
-    width: 100%;
-    max-width: 100%;
-    overflow-x: hidden;
-    padding: 16px 12px calc(80px + env(safe-area-inset-bottom));
-    background: var(--bg);
-    color: var(--text);
-    font-size: 15px;
-    -webkit-font-smoothing: antialiased;
-  }
-  .page {
-    max-width: 1200px;
-    width: 100%;
-    margin: 0 auto;
-    display: grid;
-    gap: 12px;
-    overflow-x: hidden;
-  }
-  @media (min-width: 641px) {
-    body { padding: 32px 20px 52px; }
-    .page { gap: 16px; }
-  }
-  .app-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 10px;
-    padding: 6px 4px 8px;
-  }
-  .app-header-left {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-  .app-header-avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 12px;
-    box-shadow: var(--shadow-sm);
-    object-fit: cover;
-  }
-  .app-header-title-group {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-  .app-header-title {
-    font-size: 1.35rem;
-    font-weight: 800;
-    letter-spacing: -0.025em;
-    color: var(--text);
-    margin: 0;
-    line-height: 1.15;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .header-actions { display: flex; gap: 8px; margin-left: auto; align-items:center; }
-  
-  .tab-bar {
-    display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px;
-    margin-bottom: 4px; scrollbar-width: none;
-  }
-  .tab-btn {
-    flex: none; background: var(--surface); color: var(--text-2);
-    border: 1.5px solid var(--border-strong); border-radius: 999px; padding: 8px 16px;
-    font-size: 0.875rem; font-weight: 600; cursor: pointer; text-decoration: none;
-    box-shadow: var(--shadow-sm); transition: all 0.15s;
-  }
-  .tab-btn.active {
-    background: var(--accent); color: #fff; border-color: var(--accent);
-    box-shadow: 0 2px 10px rgba(0,122,255,0.30);
-  }
-  .tab-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
-
-    .lc-btn {
-    padding: 6px 12px; min-height: unset;
-    font-size: 0.8rem; font-weight: 600;
-    border-radius: var(--radius-pill);
-    border: 1.5px solid var(--border-strong);
-    background: var(--bg); color: var(--text-2);
-    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
-    font-family: inherit; white-space: nowrap; text-decoration: none;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
-  }
-  .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  
-  .detail-back-btn {
-    display: flex; align-items: center; gap: 6px;
-    background: none; border: none; font-size: 1.1rem;
-    font-weight: 700; color: var(--accent); cursor: pointer; padding: 4px 0; text-decoration: none;
-  }
-  
-  .subnav-pill {
-    flex: none; padding: 7px 16px; border-radius: var(--radius-pill); border: 1.5px solid var(--border-strong);
-    background: var(--surface); color: var(--text-2); font-size: 0.86rem; font-weight: 600; cursor: pointer;
-    white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-    transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
-    box-shadow: var(--shadow-sm); font-family: inherit; margin: 0; text-decoration: none;
-  }
-  .subnav-pill.active {
-    background: var(--accent); color: #ffffff; border-color: var(--accent); box-shadow: 0 2px 8px rgba(0,122,255,0.28);
-  }
-
-  .poster-grid-3 {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; width: 100%;
-  }
-  @media (min-width: 641px) {
-    .poster-grid-3 {
-      grid-template-columns: repeat(9, 1fr); gap: 12px 8px;
-    }
-  }
-
-  code { background: var(--panel-strong); padding: 4px 8px; border-radius: 6px; word-break: break-all; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-</style>
-</head>
-<body>
-  <div class="page">
-    <!-- Top App Bar -->
-    <header class="app-header">
-      <div class="app-header-left">
-        <img class="app-header-avatar" src="/icon.png" alt="App Icon">
-        <div class="app-header-title-group">
-          <div style="display:flex; align-items:center; gap:8px;">
-            <h1 class="app-header-title">My Lists Addon</h1>
-            <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:0; margin-top:2px;" title="Toggle Dark Mode">🌓</button>
-          </div>
-        </div>
-      </div>
-      <div class="header-actions" id="authActions">
-        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
-          <div style="display:flex; align-items:center; gap:6px;">
-            <button type="button" class="lc-btn primary" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">+ Create Account</button>
-            <button type="button" class="lc-btn" onclick="location.href='/'" style="padding:6px 12px; font-size:0.82rem;">Restore</button>
-          </div>
-          <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>
-        </div>
-      </div>
-    </header>
-
-    <!-- Top Tab Bar -->
-    <div class="tab-bar">
-      <a href="/" class="tab-btn">My Catalogs</a>
-      <a href="/" class="tab-btn active">Lists</a>
-      <a href="/" class="tab-btn">Discover</a>
-      <a href="/" class="tab-btn">Search</a>
-      <a href="/" class="tab-btn">Settings</a>
-    </div>
-
-    <div style="margin-bottom: 32px;">
-      <a href="/" class="tab-btn" style="text-decoration:none;">&larr; Back</a>
-    </div>
-
-    <div style="margin-bottom:32px;">
-      <h2 style="font-size:2.5rem; font-weight:700; margin:0 0 16px; letter-spacing:-0.02em;">${escapeHtmlServer(listData.name)}</h2>
-      <div style="color:var(--text-2); font-size:1.05rem; margin-bottom:16px;">by ${escapeHtmlServer(creatorDisplayName)} \u2022 ${listData.type === "movie" ? "Movies" : "Shows"} \u2022 ${listData.items.length} item${listData.items.length === 1 ? "" : "s"} \u2022 <span id="likeCountDisplay">\u2665 ${likes}</span></div>
-      <button type="button" class="lc-btn primary" id="likeListBtn">\u2661 Like</button>
-    </div>
-
-
-
-    <div class="poster-grid-3">
-      ${itemsHtml}
-    </div>
-  </div>
-
-  <script>
-  (function () {
-    var USERNAME = ${JSON.stringify(username)};
-    var SLUG = ${JSON.stringify(listName)};
-    var KEY = USERNAME + '/' + SLUG;
-    
-    // Auth header
-    try {
-      var cname = localStorage.getItem('myListAddon:creatorName');
-      if (cname) {
-        cname = cname.replace(/NaN/gi, '').replace(/undefined/gi, '').replace(/null/gi, ''); // Fix corrupted local storage
-        if (!cname || cname.trim() === '') cname = "Account";
-        cname = cname.charAt(0).toUpperCase() + cname.slice(1);
-        var actions = document.getElementById('authActions');
-        actions.innerHTML = '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
-          '<div style="display:flex; align-items:center; gap:8px;">' +
-          '<span class="subnav-pill active" style="margin:0; font-size:0.82rem; padding:6px 12px; cursor:pointer;" onclick="location.href=\'/\'">&#x1F464; ' + cname.replace(/</g, '&lt;') + '</span>' +
-          '<button type="button" class="lc-btn" style="padding:5px 9px; font-size:0.78rem;" onclick="location.href=\'/\'" title="Sign Out / Switch">Sign Out</button>' +
-          '</div>' +
-          '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
-          '</div>';
-      }
-    } catch(e) {}
-
-    var btn = document.getElementById('likeListBtn');
-    function getLiked() {
-      try { return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]')); } catch (e) { return new Set(); }
-    }
-    function rememberLiked(k) {
-      var set = getLiked();
-      set.add(k);
-      try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(Array.from(set))); } catch (e) {}
-    }
-    function forgetLiked(k) {
-      var set = getLiked();
-      set.delete(k);
-      try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(Array.from(set))); } catch (e) {}
-    }
-    var isLiked = getLiked().has(KEY);
-    if (isLiked) {
-      btn.textContent = '\\u2665 Unlike';
-    }
-    btn.addEventListener('click', function () {
-      btn.disabled = true;
-      fetch('/api/lists/like', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: USERNAME, slug: SLUG, action: isLiked ? 'unlike' : 'like' }),
-      }).then(function (r) { return r.json(); }).then(function (data) {
-        if (!data.ok) {
-          alert('Could not update this like: ' + (data.error || 'unknown error'));
-          return;
+      return new Response(
+        renderBuilder(url.origin, {
+          deepLinkList: {
+            name: listData.name,
+            type: listData.type,
+            url: shareUrl,
+            creatorName: creatorDisplayName,
+            likes: likes,
+            sample: (listData.items || []).map((it) => ({
+              id: it.id || (it.tmdb_id ? String(it.tmdb_id) : ""),
+              name: it.title || it.name || "Item",
+              poster: it.poster || "",
+              year: it.year || it.releaseInfo || "",
+              type: it.type || listData.type || "movie",
+            })),
+            maybeMore: false,
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...corsHeaders(),
+          },
         }
-        if (isLiked) {
-          forgetLiked(KEY);
-          isLiked = false;
-          btn.textContent = '\\u2661 Like';
-        } else {
-          rememberLiked(KEY);
-          isLiked = true;
-          btn.textContent = '\\u2665 Unlike';
-        }
-        document.getElementById('likeCountDisplay').textContent = '\\u2665 ' + data.likes;
-        try {
-          var creatorName = localStorage.getItem('myListAddon:creatorName');
-          var creatorKey = localStorage.getItem('myListAddon:creatorKey');
-          if (creatorName && creatorKey) {
-            fetch('/api/creator/sync/like', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ creatorName: creatorName, creatorKey: creatorKey, usernameSlug: KEY, liked: isLiked }),
-            }).catch(function () {});
-          }
-        } catch (e) {}
-      }).catch(function () {
-        alert('Network error while updating this like.');
-      }).finally(function () {
-        btn.disabled = false;
-      });
-    });
-  })();
-  </script>
-</body>
-</html>`;
-      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", ...corsHeaders() } });
+      );
     }
 
     // --- Admin dashboard (page views / install links generated) -----------
@@ -1261,6 +1081,7 @@
     // not a bare ?key=... in the URL that would sit around in browser
     // history/logs.
     if (path === "/admin" && request.method === "GET") {
+
       const authed = await isAdminRequest(request, env);
       if (!authed) {
         return new Response(renderAdminLoginPage(), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
@@ -1284,7 +1105,12 @@
       const mediaTypeParam = url.searchParams.get("mediaType");
       const mediaType = mediaTypeParam === "movie" || mediaTypeParam === "series" ? mediaTypeParam : null;
       const entries = await computeLeaderboard(env, eventType, window, mediaType);
-      return json({ ok: true, entries });
+      // no-store -- json()'s own default (max-age=3600) would otherwise
+      // have the browser silently reuse an hour-old leaderboard on the
+      // next tab switch/refresh instead of hitting the network again (see
+      // /admin/api/feedback's own comment, which is where this was first
+      // caught).
+      return json({ ok: true, entries }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/backfill-trending  (POST) -> { ok, done, accountsThisCall, titlesThisCall }
@@ -1402,7 +1228,7 @@
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: true, entries: [] });
+      if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
       const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 300 });
       const keys = listResult.keys.slice().reverse();
       const entries = await Promise.all(
@@ -1415,7 +1241,14 @@
           }
         })
       );
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: listResult.list_complete === false });
+      // no-store -- json()'s own default (max-age=3600) meant the browser
+      // would silently keep serving this exact response (including
+      // whatever was/wasn't marked completed) for up to an hour on any
+      // later refresh or tab switch, no matter how many changes had since
+      // been saved to KV -- a mark-completed or a brand new entry could
+      // both look like they'd never happened, purely because the *read*
+      // was stale, not because either write had actually failed.
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: listResult.list_complete === false }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
@@ -1450,7 +1283,190 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
       }
-      return json({ ok: true });
+      return json({ ok: true }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/feedback/edit  (POST)  { id, message, category } -> { ok, entry }
+    // Allows the admin to edit the message or category of any feedback entry.
+    if (path === "/admin/api/feedback/edit" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      if (!id) return json({ ok: false, error: "Missing id." }, 400);
+      const key = `feedback:${id}`;
+      const raw = await env.CONFIGS.get(key);
+      if (!raw) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
+      let entry;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+      }
+      if (typeof body.message === "string" && body.message.trim()) {
+        entry.message = body.message.trim().slice(0, 4000);
+      }
+      if (typeof body.category === "string" && ["bug", "improvement", "idea", "other"].includes(body.category.trim())) {
+        entry.category = body.category.trim();
+      }
+      entry.updatedAt = Date.now();
+      try {
+        await env.CONFIGS.put(key, JSON.stringify(entry));
+        return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
+      } catch (e) {
+        return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
+      }
+    }
+
+    // /admin/api/apiusage -> { ok, keys: [{ name, label, configured, last24h,
+    // last7d, last30d, limit }] } -- backs the API Usage tab. Only counts
+    // requests that used one of this Worker's own shared keys (the
+    // fallback used when a visitor hasn't supplied a personal one, see
+    // trackSharedApiUse in 05_catalog-core.js and its call sites) -- a
+    // visitor's own key is never counted here since only they can exhaust
+    // its rate limit. Day-bucketed the same way as every other stat in
+    // this file (see bumpStat/loadStatsByDay), so "last 24h" really means
+    // "today's Eastern-calendar-day bucket", same as the Trending tab's
+    // "Today" window.
+    if (path === "/admin/api/apiusage" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const defs = [
+        { name: "tmdb", label: "TMDB (TMDB_API_KEY)", envVar: "TMDB_API_KEY", limit: "~40 req/sec per IP -- no published daily cap" },
+        { name: "trakt", label: "Trakt (TRAKT_CLIENT_ID)", envVar: "TRAKT_CLIENT_ID", limit: "1,000 GET calls / 5 min" },
+        { name: "simkl", label: "Simkl (SIMKL_CLIENT_ID)", envVar: "SIMKL_CLIENT_ID", limit: "10 req/sec (GET)" },
+        { name: "mdblist", label: "MDBList (MDBLIST_API_KEY)", envVar: "MDBLIST_API_KEY", limit: "1,000/day (free tier -- higher on paid plans)" },
+        { name: "mdblistpopular", label: "MDBList Popular Lists (MDBLIST_POPULAR_KEY)", envVar: "MDBLIST_POPULAR_KEY", limit: "1,000/day (free tier -- higher on paid plans)" },
+      ];
+      const nowMs = Date.now();
+      const keys = await Promise.all(defs.map(async (d) => {
+        const byDay = await loadStatsByDay(env, `apiuse:${d.name}`);
+        let last24h = 0, last7d = 0, last30d = 0;
+        for (let i = 0; i < 30; i++) {
+          const count = byDay[easternDateKey(new Date(nowMs - i * 86400000))] || 0;
+          if (i < 1) last24h += count;
+          if (i < 7) last7d += count;
+          last30d += count;
+        }
+        return { name: d.name, label: d.label, configured: !!(env && env[d.envVar]), last24h, last7d, last30d, limit: d.limit };
+      }));
+      // no-store -- see /admin/api/feedback's own comment on why every
+      // admin JSON endpoint needs this (json()'s default lets the browser
+      // silently reuse an hour-old response instead of refetching).
+      return json({ ok: true, keys }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/netflix-preview?region=US&providerId=8 -> { ok, region,
+    // providerId, movies: { total, items }, shows: { total, items } } --
+    // lets the admin see roughly how big a TMDB-discover-based shelf for
+    // ANY watch provider would be, and what it'd actually contain, before
+    // wiring a tmdb:chart:X entry into Quick Add for real. providerId
+    // defaults to 8 (Netflix) but accepts any TMDB provider id -- pair
+    // this with /admin/api/provider-lookup below to find the right id for
+    // a given service by name first, since TMDB is known to have more
+    // than one entry for some providers (e.g. two separate "Disney Plus"
+    // ids) and guessing wrong fails silently -- it just quietly shows the
+    // wrong catalog under the right label. Deliberately NOT the same code
+    // path as a real catalog fetch (fetchTmdbChart/fetchTmdbPagedResults)
+    // -- this only needs TMDB's own title/poster/total_results for a
+    // quick look, not a resolved IMDb id per item (that's a separate TMDB
+    // call per title, and this is meant to be a cheap one-shot preview,
+    // not something that has to walk the whole list).
+    async function fetchNetflixPreviewTmdb(kind, region, apiKey, providerId) {
+      const src = `https://api.themoviedb.org/3/discover/${kind}?api_key=${encodeURIComponent(apiKey)}` +
+        `&with_watch_providers=${encodeURIComponent(providerId)}&watch_region=${encodeURIComponent(region)}` +
+        `&with_watch_monetization_types=flatrate&sort_by=popularity.desc&page=1`;
+      const res = await fetch(src, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 3600, cacheEverything: true },
+      });
+      if (!res.ok) throw new Error(`TMDB request failed (HTTP ${res.status}).`);
+      const data = await res.json();
+      const items = (data.results || []).slice(0, 24).map((it) => ({
+        id: it.id,
+        title: it.title || it.name || "Untitled",
+        poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : null,
+        date: (it.release_date || it.first_air_date || "").slice(0, 4),
+      }));
+      return { total: data.total_results || 0, items };
+    }
+
+    if (path === "/admin/api/netflix-preview" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!TMDB_API_KEY) return json({ ok: false, error: "TMDB_API_KEY isn't configured on this Worker." });
+      // Same normalization TMDB itself expects -- just the two-letter
+      // country code, not a locale like "en-US".
+      const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
+      const providerIdParam = (url.searchParams.get("providerId") || "8").trim();
+      const providerId = /^\d+$/.test(providerIdParam) ? providerIdParam : "8";
+      try {
+        const [movies, shows] = await Promise.all([
+          fetchNetflixPreviewTmdb("movie", region, TMDB_API_KEY, providerId),
+          fetchNetflixPreviewTmdb("tv", region, TMDB_API_KEY, providerId),
+        ]);
+        // Always the shared key -- 2 TMDB calls per preview load.
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
+        return json({ ok: true, region, providerId, movies, shows }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) });
+      }
+    }
+
+    // /admin/api/provider-lookup?query=disney&region=US -> { ok, results:
+    // [{ id, name }] } -- pulls TMDB's own official watch-provider list
+    // (the actual source of truth /admin/api/netflix-preview's providerId
+    // gets checked against) so a provider's real numeric id can be
+    // confirmed by name before it's wired into anything. Queries both the
+    // movie and tv provider lists and merges them, since a given service's
+    // presence can differ slightly between the two; de-duplicated by id
+    // and, when a region is given, ordered by that region's own
+    // display_priority (TMDB's closest thing to "which of these is the
+    // one people actually mean" -- relevant since some providers, like
+    // Disney Plus, have more than one id and only one is the one that
+    // actually turns up in region-filtered discover results).
+    if (path === "/admin/api/provider-lookup" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!TMDB_API_KEY) return json({ ok: false, error: "TMDB_API_KEY isn't configured on this Worker." });
+      const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
+      const query = (url.searchParams.get("query") || "").trim().toLowerCase();
+      try {
+        const [movieRes, tvRes] = await Promise.all([
+          fetch(`https://api.themoviedb.org/3/watch/providers/movie?api_key=${encodeURIComponent(TMDB_API_KEY)}&watch_region=${encodeURIComponent(region)}`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 86400, cacheEverything: true },
+          }),
+          fetch(`https://api.themoviedb.org/3/watch/providers/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}&watch_region=${encodeURIComponent(region)}`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 86400, cacheEverything: true },
+          }),
+        ]);
+        if (!movieRes.ok || !tvRes.ok) throw new Error("TMDB request failed.");
+        const [movieData, tvData] = await Promise.all([movieRes.json(), tvRes.json()]);
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
+
+        const byId = new Map();
+        [...(movieData.results || []), ...(tvData.results || [])].forEach((p) => {
+          if (byId.has(p.provider_id)) return;
+          const priorities = p.display_priorities || {};
+          const priority = priorities[region] != null ? priorities[region] : (p.display_priority != null ? p.display_priority : 9999);
+          byId.set(p.provider_id, { id: p.provider_id, name: p.provider_name, priority });
+        });
+        let results = [...byId.values()];
+        if (query) results = results.filter((p) => p.name.toLowerCase().includes(query));
+        results.sort((a, b) => a.priority - b.priority);
+        results = results.slice(0, 40).map((p) => ({ id: p.id, name: p.name }));
+        return json({ ok: true, results }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) });
+      }
     }
 
     if (path === "/admin/login" && request.method === "POST") {
@@ -1478,7 +1494,16 @@
         status: 302,
         headers: {
           "Location": "/admin",
-          "Set-Cookie": `${ADMIN_COOKIE_NAME}=${cookieValue}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(ADMIN_SESSION_MS / 1000)}`,
+          // Path=/ (not /admin) -- this cookie needs to ride along on
+          // fetch() calls the admin dashboard makes to endpoints outside
+          // /admin too, e.g. /api/feedback for "Log something yourself"
+          // (see isAdminRequest's call there). A browser withholds a
+          // cookie entirely from any request whose path doesn't fall
+          // under Path, silently, with no error surfaced anywhere --
+          // isAdminRequest just always saw no cookie and treated every
+          // one of those requests as anonymous, which is what made the
+          // public rate limit apply to admin submissions too.
+          "Set-Cookie": `${ADMIN_COOKIE_NAME}=${cookieValue}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(ADMIN_SESSION_MS / 1000)}`,
         },
       });
     }
@@ -1488,7 +1513,11 @@
         status: 302,
         headers: {
           "Location": "/admin",
-          "Set-Cookie": `${ADMIN_COOKIE_NAME}=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+          // Path must match the cookie's own Path exactly for this to
+          // actually clear it -- a Set-Cookie with a different Path is
+          // treated as a distinct cookie, not an overwrite of the
+          // original.
+          "Set-Cookie": `${ADMIN_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
         },
       });
     }
@@ -1501,6 +1530,10 @@
         const body = await request.json();
         const items = body.items || [];
         const resolved = [];
+        // Always the shared TMDB_API_KEY -- no per-user override on this
+        // endpoint. Counted precisely (not just items.length) since a
+        // search miss skips the second (external-ids) call.
+        let tmdbCallCount = 0;
         // Process in small batches (e.g., 10 at a time) to stay within subrequest limits
         const BATCH_SIZE = 10;
         for (let i = 0; i < items.length; i += BATCH_SIZE) {
@@ -1512,6 +1545,7 @@
             
             // Step 1: Search TMDB
             const searchSrc = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(q)}&include_adult=false${y ? '&primary_release_year=' + y : ''}`;
+            tmdbCallCount++;
             const searchRes = await fetch(searchSrc, {
               headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
               cf: { cacheTtl: 86400, cacheEverything: true },
@@ -1523,6 +1557,7 @@
             
             // Step 2: Get External IDs to find IMDB id
             const extSrc = `https://api.themoviedb.org/3/movie/${match.id}/external_ids?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
+            tmdbCallCount++;
             const extRes = await fetch(extSrc, {
               headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
               cf: { cacheTtl: 86400, cacheEverything: true },
@@ -1545,6 +1580,7 @@
             if (res) resolved.push(res);
           }
         }
+        if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
         return json({ ok: true, resolved });
       } catch (e) {
         return json({ ok: false, error: String(e) }, 500);

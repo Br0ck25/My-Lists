@@ -31,6 +31,15 @@ const STREAMING_TOP10 = [
     showUrl: "https://mdblist.com/lists/hulupiv/hulu-top-10-shows",
   },
   {
+    // Reverted back to the community mdblist.com lists (from the brief
+    // tmdb:top10:netflix experiment) -- TMDB/JustWatch's popularity
+    // ranking doesn't match Netflix's own actual weekly Top 10 (verified
+    // against netflix.com/tudum/top10, which publishes Netflix's real
+    // self-reported rankings), so the TMDB-based version was consistently
+    // wrong here even though it was correctly capped at exactly 10 items.
+    // fetchTmdbProviderTop10 / tmdb:top10:X (see TMDB_CHART_PATHS.netflix)
+    // is left in place, unused, in case an actual verified feed of
+    // Netflix's real Top 10 data becomes available later.
     name: "Netflix",
     movieUrl: "https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies",
     showUrl: "https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows",
@@ -55,53 +64,56 @@ const STREAMING_TOP10 = [
 const STREAMING_ALL = [
   {
     name: "Apple TV+",
-    movieUrl: "https://mdblist.com/lists/slimshizn/apple-tv-movies",
-    showUrl: "https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows",
+    movieUrl: "tmdb:chart:appletv",
+    showUrl: "tmdb:chart:appletv",
   },
   {
     name: "Disney+",
-    movieUrl: "https://mdblist.com/lists/garycrawfordgc/disney-movies",
-    showUrl: "https://mdblist.com/lists/garycrawfordgc/disney-shows",
+    movieUrl: "tmdb:chart:disney",
+    showUrl: "tmdb:chart:disney",
   },
   {
     name: "Discovery+",
-    movieUrl: "https://mdblist.com/lists/k0meta/discovery-movies",
-    showUrl: "https://mdblist.com/lists/marko8426/discovery-shows",
+    movieUrl: "tmdb:chart:discovery",
+    showUrl: "tmdb:chart:discovery",
   },
   {
     name: "HBO Max",
-    movieUrl: "https://mdblist.com/lists/snoak/latest-max-movies",
-    showUrl: "https://mdblist.com/lists/garycrawfordgc/hbo-shows",
+    movieUrl: "tmdb:chart:hbomax",
+    showUrl: "tmdb:chart:hbomax",
   },
   {
     name: "Hulu",
-    movieUrl: "https://mdblist.com/lists/garycrawfordgc/hulu-movies",
-    showUrl: "https://mdblist.com/lists/garycrawfordgc/hulu-shows",
+    movieUrl: "tmdb:chart:hulu",
+    showUrl: "tmdb:chart:hulu",
   },
   {
+    // Was two community mdblist.com lists (garycrawfordgc/netflix-*) --
+    // swapped for the same live TMDB provider-filtered chart as the
+    // Streaming Top 10 Netflix row above (see TMDB_CHART_PATHS.netflix).
     name: "Netflix",
-    movieUrl: "https://mdblist.com/lists/garycrawfordgc/netflix-movies",
-    showUrl: "https://mdblist.com/lists/garycrawfordgc/netflix-shows",
+    movieUrl: "tmdb:chart:netflix",
+    showUrl: "tmdb:chart:netflix",
   },
   {
     name: "Netflix Kids",
-    movieUrl: "https://mdblist.com/lists/poodlehead/netflix-kids-movies",
-    showUrl: "https://mdblist.com/lists/poodlehead/netflix-kids-tv",
+    movieUrl: "tmdb:chart:netflixkids",
+    showUrl: "tmdb:chart:netflixkids",
   },
   {
     name: "Paramount+",
-    movieUrl: "https://mdblist.com/lists/snoak/latest-paramount-plus-movies",
-    showUrl: "https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows",
+    movieUrl: "tmdb:chart:paramount",
+    showUrl: "tmdb:chart:paramount",
   },
   {
     name: "Prime Video",
-    movieUrl: "https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies",
-    showUrl: "https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows",
+    movieUrl: "tmdb:chart:primevideo",
+    showUrl: "tmdb:chart:primevideo",
   },
   {
     name: "Peacock",
-    movieUrl: "https://mdblist.com/lists/tvgeniekodi/peacock-movies",
-    showUrl: "https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows",
+    movieUrl: "tmdb:chart:peacock",
+    showUrl: "tmdb:chart:peacock",
   },
 ];
 
@@ -141,12 +153,21 @@ function buildStreamingRowsHtml(list, labelSuffix, group) {
     const label = labelSuffix ? `${p.name} ${labelSuffix}` : p.name;
     const badge = getProviderIconBadge(p.name, group);
     let btns = '';
+    // "See All" opens the real, paginated list-details page for this
+    // card's own url (see openListDetailsPage, 23_client-list-management.js)
+    // -- previously the Discover tab's cards had no preview at all, only
+    // the +Movies/+Shows add buttons below. Defaults to the movie side
+    // when a card has both; the page itself is single-type, same as
+    // every other "See All" in the app.
+    let seeAllLink = '';
     if (p.movieUrl && p.showUrl) {
+      seeAllLink = `<a href="javascript:void(0)" class="discover-chart-seeall" onclick="openListDetailsPage('${label}', 'movie', '${p.movieUrl}')">See All &rsaquo;</a>`;
       btns = `
         <button type="button" class="lc-btn secondary" onclick="addRow('${label}', '${p.movieUrl}', 'movie', true, '${group}')">+ Movies</button>
         <button type="button" class="lc-btn secondary" onclick="addRow('${label}', '${p.showUrl}', 'series', true, '${group}')">+ Shows</button>`;
     } else if (p.url && p.type) {
       const btnText = p.type === 'movie' ? '+ Movies' : '+ Shows';
+      seeAllLink = `<a href="javascript:void(0)" class="discover-chart-seeall" onclick="openListDetailsPage('${p.name}', '${p.type}', '${p.url}')">See All &rsaquo;</a>`;
       btns = `
         <button type="button" class="lc-btn secondary" onclick="addRow('${p.name}', '${p.url}', '${p.type}', true, '${group}')">${btnText}</button>`;
     }
@@ -158,6 +179,7 @@ function buildStreamingRowsHtml(list, labelSuffix, group) {
           <div class="discover-chart-title">${p.name}</div>
           <div class="discover-chart-sub">${labelSuffix ? labelSuffix : (p.type === 'movie' ? 'Theatrical Box Office' : (p.type === 'series' ? 'Anime Trending' : 'Movies & Shows'))}</div>
         </div>
+        ${seeAllLink}
       </div>
       <div class="discover-chart-btns">
         ${btns}
@@ -347,6 +369,12 @@ function jsStringArrayLiteral(arr) {
 function buildCombinedChartsHtml() {
   const rows = COMBINED_CHART_LISTS.map((p) => {
     const badge = getProviderIconBadge(p.name, 'Combined Charts');
+    // Same newline-joined multi-source url convention the "Streaming (All
+    // Services)" starter preset already uses (09_page-shell.js) --
+    // fetchMergedCatalog fans this out to every source in the list, so
+    // openListDetailsPage's normal single-url pagination works here too
+    // without needing its own special case for a "combined" list.
+    const seeAllUrl = JSON.stringify(p.movieUrls.join("\n"));
     return `
     <div class="discover-chart-card">
       <div class="discover-chart-header">
@@ -355,6 +383,7 @@ function buildCombinedChartsHtml() {
           <div class="discover-chart-title">${p.name}</div>
           <div class="discover-chart-sub">Blended Multi-Source Catalog</div>
         </div>
+        <a href="javascript:void(0)" class="discover-chart-seeall" onclick='openListDetailsPage(${JSON.stringify(p.name)}, "movie", ${seeAllUrl})'>See All &rsaquo;</a>
       </div>
       <div class="discover-chart-btns">
         <button type="button" class="lc-btn secondary" onclick="addCombinedRow('${p.name}', ${jsStringArrayLiteral(p.movieUrls)}, 'movie', 'Combined Charts')">+ Movies</button>
@@ -433,5 +462,62 @@ const KIDS_LISTS = [
 ];
 function buildKidsHtml() {
   return buildStreamingRowsHtml(KIDS_LISTS, "", "Kids");
+}
+
+// --- Clean, shareable /lists/<slug> urls for every native/official chart ---
+//
+// "TMDB Trending" -> "TMDB-Trending" -- title case preserved, everything
+// that isn't a letter/number collapsed to a single hyphen. Used both to
+// build CHART_SLUG_REGISTRY below (server-side lookup for the /lists/<slug>
+// route) and embedded into the client script as CHART_SLUG_ENTRIES (see
+// renderBuilder, 09_page-shell.js) so openListDetailsPage
+// (23_client-list-management.js) can push this same clean path instead of
+// the old #/list?name=...&url=... hash whenever the list being opened is
+// one of these known charts.
+function slugifyChartName(name) {
+  return String(name || "").trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+// A flat array (not just the slug-keyed object below) because the client
+// needs to search it the other direction too -- "is this listUrl one of
+// our known charts, and if so what's its slug" -- which is an array scan
+// either way there's no single key to look up by.
+const CHART_SLUG_ENTRIES = (() => {
+  const seenSlugs = new Set();
+  const entries = [];
+  function add(name, movieUrl, showUrl) {
+    if (!name || !movieUrl) return;
+    const slug = slugifyChartName(name);
+    // First one wins on a naming clash (e.g. "Trending" appears in both
+    // COMBINED_CHART_LISTS and could in principle appear elsewhere) --
+    // silently skipping the rest is safer than one table's entry
+    // overwriting another's further down this list.
+    if (!slug || seenSlugs.has(slug)) return;
+    seenSlugs.add(slug);
+    entries.push({ slug, name, movieUrl, showUrl: showUrl || movieUrl });
+  }
+  [
+    ...MDBLIST_OFFICIAL_CHARTS,
+    ...TMDB_CHART_LISTS,
+    ...TRAKT_CHART_LISTS,
+    ...SIMKL_CHART_LISTS,
+    ...STREAMING_TOP10,
+    ...STREAMING_ALL,
+    ...HIDDEN_GEMS_LIST,
+    ...KIDS_LISTS,
+  ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
+  [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
+  COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));
+  return entries;
+})();
+
+const CHART_SLUG_REGISTRY = Object.fromEntries(CHART_SLUG_ENTRIES.map((e) => [e.slug, e]));
+
+// Used by the /lists/<slug> route (25_api-catalog-routes.js) -- returns
+// null on an unknown slug rather than throwing, since a stale or
+// hand-edited link should land the visitor in the app (default view)
+// rather than a hard error.
+function resolveChartSlug(slug) {
+  return CHART_SLUG_REGISTRY[slug] || null;
 }
 

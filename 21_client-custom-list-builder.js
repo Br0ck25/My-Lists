@@ -16,13 +16,15 @@ let customListDraftType = 'movie'; // 'movie' or 'series', set by user toggle
 async function importCustomListFromLink(btn) {
   const urlInput = document.getElementById('customListImportUrlInput');
   const nameInput = document.getElementById('customListImportNameInput');
+  const syncCheck = document.getElementById('customListImportSyncCheck');
   const listUrl = urlInput.value.trim();
   if (!listUrl) {
     alert('Paste a list URL first.');
     return;
   }
   const name = nameInput.value.trim() || guessNameFromUrl(listUrl);
-  await copyListToCustomList(name, listUrl, 'unknown', btn);
+  const syncWithLink = syncCheck ? syncCheck.checked : false;
+  await copyListToCustomList(name, listUrl, 'unknown', btn, null, { sourceUrl: syncWithLink ? listUrl : '' });
   urlInput.value = '';
   nameInput.value = '';
 }
@@ -82,9 +84,14 @@ document.getElementById('customListSearchResult').addEventListener('click', (e) 
 
 async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
   const itemType = searchType === 'tv' ? 'series' : 'movie';
-  if (customListDraftType && customListDraftType !== itemType) {
-    alert('This list is set to ' + (customListDraftType === 'movie' ? 'Movies' : 'Shows') + ' -- start a new list (or save/clear this one first) to add a ' + (itemType === 'movie' ? 'movie' : 'show') + '.');
-    return;
+  if (customListDraftType && customListDraftType !== 'mixed' && customListDraftType !== itemType) {
+    if (!customListDraftItems.length) {
+      customListDraftType = itemType;
+      updateCustomListTypeRadio(itemType);
+    } else {
+      customListDraftType = 'mixed';
+      updateCustomListTypeRadio('mixed');
+    }
   }
   if (btn) {
     btn.disabled = true;
@@ -107,9 +114,9 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
       title: title,
       year: year || undefined,
       poster: poster || undefined,
+      type: itemType,
     });
-    customListDraftType = itemType;
-    updateCustomListTypeRadio(itemType);
+    if (!customListDraftType) customListDraftType = itemType;
     renderCustomListDraftList();
     if (btn) btn.textContent = 'Added \u2713';
     if (typeof trackEvent === 'function') trackEvent('list-add', data.imdbId, title, itemType);
@@ -131,9 +138,11 @@ function renderCustomListDraftList() {
     return;
   }
   box.innerHTML = customListDraftItems.map((it, i) => {
+    const itType = it.type || (it.kind === 'series' || it.kind === 'tv' ? 'series' : 'movie');
+    const typeBadge = '<span style="font-size:0.68rem; font-weight:600; padding:2px 6px; border-radius:4px; background:var(--bg); border:1px solid var(--border); color:var(--muted); margin-left:6px; flex:none;">' + (itType === 'series' ? 'Show' : 'Movie') + '</span>';
     const label = escapeHtml(it.title || it.name || 'Untitled') + (it.year ? ' (' + escapeHtml(it.year) + ')' : '');
     const idStr = it.imdbId || it.id || '';
-    const onClickStr = idStr ? ' onclick="showItemDetails(&quot;' + escapeAttr(idStr) + '&quot;, &quot;' + escapeAttr(customListDraftType || 'movie') + '&quot;)"' : '';
+    const onClickStr = idStr ? ' onclick="showItemDetails(&quot;' + escapeAttr(idStr) + '&quot;, &quot;' + escapeAttr(itType) + '&quot;)"' : '';
     const posterImg = it.poster
       ? '<img src="' + escapeAttr(it.poster) + '" alt="" loading="lazy" class="custom-list-pick-poster"' + onClickStr + '>'
       : '<span class="custom-list-pick-poster empty-poster"></span>';
@@ -142,6 +151,7 @@ function renderCustomListDraftList() {
       '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" style="width:50px; flex:none; text-align:center;" title="Type a position to move this pick there">' +
       posterImg +
       '<span style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="' + escapeAttr(label) + '">' + label + '</span>' +
+      typeBadge +
       '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="-1"' + (i === 0 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2191</button>' +
       '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="1"' + (i === customListDraftItems.length - 1 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2193</button>' +
       '<button type="button" class="secondary customListRemovePickBtn" style="flex:none; padding:8px 12px;">Remove</button>' +
@@ -352,8 +362,25 @@ function saveCustomList() {
     checkAllDuplicateUrls();
     saveState();
   } else {
-    const newRowDiv = addRow(name, newUrl, customListDraftType, true, 'Custom Lists');
-    sourceRow = newRowDiv ? newRowDiv.querySelector('.source-row') : null;
+    if (listType === 'mixed') {
+      const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type)));
+      const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv'));
+      if (movies.length > 0) {
+        const moviePayload = { listId: generateChannelId(), type: 'movie', items: movies, shuffle: shuffle };
+        const movieUrl = 'customlist:v1:' + JSON.stringify(moviePayload);
+        const movieRow = addRow(name + (series.length > 0 ? ' (Movies)' : ''), movieUrl, 'movie', true, 'Custom Lists');
+        if (!sourceRow) sourceRow = movieRow ? movieRow.querySelector('.source-row') : null;
+      }
+      if (series.length > 0 || movies.length === 0) {
+        const seriesPayload = { listId: generateChannelId(), type: 'series', items: series, shuffle: shuffle };
+        const seriesUrl = 'customlist:v1:' + JSON.stringify(seriesPayload);
+        const seriesRow = addRow(name + (movies.length > 0 ? ' (Shows)' : ''), seriesUrl, 'series', true, 'Custom Lists');
+        if (!sourceRow) sourceRow = seriesRow ? seriesRow.querySelector('.source-row') : null;
+      }
+    } else {
+      const newRowDiv = addRow(name, newUrl, customListDraftType, true, 'Custom Lists');
+      sourceRow = newRowDiv ? newRowDiv.querySelector('.source-row') : null;
+    }
   }
 
   customListDraftItems = [];
@@ -412,7 +439,11 @@ async function saveCreatorListEdit(name) {
       alert('Could not save changes: ' + (data.error || 'unknown error'));
       return;
     }
-    alert('"' + name + '" updated.');
+    if (typeof showSavedCustomListModal === 'function') {
+      showSavedCustomListModal(name, visibility, data.url);
+    } else {
+      showAddedToast('"' + name + '" updated \u2713');
+    }
     cancelEditCustomList();
     renderCreatorDashboard();
   } catch (e) {
@@ -436,6 +467,7 @@ function saveLocalCustomListEdit(name) {
     updatedAt: Date.now(),
   };
   saveLocalCustomListsMap(map);
+  showAddedToast('"' + name + '" updated \u2713');
   cancelEditCustomList();
   renderCreatorDashboard();
 }
@@ -543,12 +575,24 @@ function closeCreateListModal() {
 }
 
 function setCustomListDraftTypeToggle(type) {
-  if (customListDraftItems.length > 0 && customListDraftType !== type) {
-    alert('This list already contains ' + (customListDraftType === 'movie' ? 'movies' : 'shows') + '. Clear the list first to change its type.');
-    updateCustomListTypeRadio(customListDraftType);
+  if (type === 'mixed') {
+    customListDraftType = 'mixed';
+    updateCustomListTypeRadio('mixed');
     return;
   }
+  if (customListDraftItems.length > 0 && customListDraftType !== type) {
+    const hasOpposite = customListDraftItems.some(it => {
+      const itType = it.type || (it.kind === 'series' || it.kind === 'tv' ? 'series' : 'movie');
+      return itType !== type;
+    });
+    if (hasOpposite) {
+      alert('This list contains both movies and shows -- keep it set to "Mixed" or remove incompatible items first.');
+      updateCustomListTypeRadio(customListDraftType);
+      return;
+    }
+  }
   customListDraftType = type;
+  updateCustomListTypeRadio(type);
 }
 
 function updateCustomListTypeRadio(type) {
@@ -901,6 +945,112 @@ window.toggleBatchWatchStatus = function(items) {
   items.forEach(it => refreshWatchBadge(it.id, it.type));
 
   return { added: added, removed: removed, nowWatched: !allWatched };
+};
+
+// Fetches every aired episode across every season of the show currently
+// open in the item details modal and hands them all to
+// toggleBatchWatchStatus in one call -- that function's own all-watched
+// check is what decides whether this ends up marking the whole show
+// watched or, if it already was, flipping it back to unwatched. Unaired
+// episodes are left out entirely so a show with an upcoming season can
+// still reach "fully watched" for everything that's actually aired so
+// far, matching the same rule updateContinueWatching uses for the
+// blue-checkmark badge.
+window.markShowWatched = async function(imdbId) {
+  const d = window._currentItemDetails;
+  if (!d || !d.id || String(d.id) !== String(imdbId) || !d.seasonsData) return;
+
+  const btn = document.getElementById('btnMarkShowWatched');
+  const seasons = d.seasonsData.filter(s => s.season_number !== 0);
+  if (!seasons.length) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = 'Fetching episodes... (0/' + seasons.length + ')';
+  }
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+
+  const allEpisodes = [];
+  const CONCURRENCY = 4;
+  let nextIdx = 0;
+  let done = 0;
+  let failedSeasons = 0;
+
+  async function worker() {
+    while (nextIdx < seasons.length) {
+      const season = seasons[nextIdx++];
+      // Retries once before giving up on a season -- a single transient
+      // failure (a cold cache, a momentary TMDB hiccup) used to silently
+      // drop that season's episodes, which for a show where every season
+      // happened to fail meant allEpisodes stayed empty and the button
+      // reverted with no explanation, as if the click had done nothing
+      // (a retry immediately after usually "just worked" once cache/
+      // network conditions cleared, which is exactly the confusing
+      // pattern this is meant to head off).
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(imdbId) +
+            (d.tmdbId ? '&tmdbId=' + encodeURIComponent(d.tmdbId) : '') +
+            '&seasonNum=' + season.season_number + '&tmdbKey=' + encodeURIComponent(tmdbKey));
+          const data = await res.json();
+          if (data.ok && data.season && data.season.episodes) {
+            data.season.episodes.forEach(ep => {
+              if (!isEpisodeAired(ep)) return;
+              allEpisodes.push({
+                id: String(ep.id),
+                type: 'episode',
+                name: ep.name,
+                poster: d.poster || '',
+                showId: String(d.id),
+                showTitle: d.title,
+                showPoster: d.poster || '',
+                seasonNum: season.season_number,
+                episodeNum: ep.episode_number
+              });
+            });
+            break;
+          }
+        } catch (e) {
+          // Falls through to the retry (attempt 0) or gets counted as a
+          // real failure below (attempt 1).
+        }
+        if (attempt === 1) failedSeasons++;
+      }
+      done++;
+      if (btn) btn.innerHTML = 'Fetching episodes... (' + done + '/' + seasons.length + ')';
+    }
+  }
+
+  await Promise.all(Array(Math.min(CONCURRENCY, seasons.length)).fill(0).map(worker));
+
+  if (!btn) return;
+  btn.disabled = false;
+
+  if (!allEpisodes.length) {
+    // Nothing aired yet, or every fetch failed even after a retry -- said
+    // plainly rather than silently reverting to the pre-click label,
+    // which looked exactly like the click had done nothing.
+    const stillFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
+    if (failedSeasons > 0) {
+      btn.innerHTML = "Couldn't load episodes -- try again";
+    } else {
+      btn.innerHTML = stillFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched';
+    }
+    return;
+  }
+
+  const result = window.toggleBatchWatchStatus(allEpisodes);
+  if (result.nowWatched) {
+    btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
+    btn.classList.remove('primary');
+    btn.classList.add('secondary');
+  } else {
+    btn.innerHTML = 'Mark Whole Show Watched';
+    btn.classList.remove('secondary');
+    btn.classList.add('primary');
+  }
 };
 
 // One-way add to Watch History as watched -- unlike toggleBatchWatchStatus

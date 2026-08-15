@@ -51,11 +51,11 @@ function renderMyMdblistLists(lists) {
   const watchlistAddedSeries = alreadyAdded.has('mdblist:watchlist|series');
   const watchlistCard = '<div class="list-card" data-list-type="mixed">' +
     '<div class="list-card-header">' +
-      '<div class="list-card-icon src-mdblist" aria-label="MDBList">M</div>' +
       '<div class="list-card-body">' +
         '<div class="list-card-title">My Watchlist</div>' +
         '<div class="list-card-meta">' +
           '<span>Official MDBList Watchlist</span>' +
+          '<span class="list-card-meta-sep">&middot;</span><span>&#9829; 0</span>' +
         '</div>' +
       '</div>' +
       '<div class="list-card-actions">' +
@@ -64,7 +64,7 @@ function renderMyMdblistLists(lists) {
         '<button type="button" class="lc-btn primary myListAddBtn" ' + (watchlistAddedSeries ? 'disabled' : '') + ' data-name="My Watchlist" data-url="mdblist:watchlist" data-type="series">' + (watchlistAddedSeries ? '&#10003;' : '+ Shows') + '</button>' +
       '</div>' +
     '</div>' +
-    '<div class="list-card-posters poster-preview-slot" data-url="mdblist:watchlist" data-type="movie"></div>' +
+    '<div class="list-card-posters poster-preview-slot" data-name="My Watchlist" data-url="mdblist:watchlist" data-type="movie"></div>' +
   '</div>';
 
   if (!lists || !lists.length) {
@@ -91,12 +91,12 @@ function renderMyMdblistLists(lists) {
     }
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
-        '<div class="list-card-icon src-mdblist" aria-label="MDBList">M</div>' +
         '<div class="list-card-body">' +
           '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
+            '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
@@ -104,7 +104,7 @@ function renderMyMdblistLists(lists) {
           addBtns +
         '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
     '</div>';
   }).join('');
 
@@ -181,12 +181,12 @@ function renderMyTraktLists(lists) {
     }
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
-        '<div class="list-card-icon src-trakt" aria-label="Trakt">T</div>' +
         '<div class="list-card-body">' +
           '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
+            '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
@@ -194,7 +194,7 @@ function renderMyTraktLists(lists) {
           addBtns +
         '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
     '</div>';
   }).join('');
 
@@ -375,12 +375,12 @@ function renderMyPrivateTraktLists(lists) {
 
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
-        '<div class="list-card-icon src-trakt" aria-label="Trakt">T</div>' +
         '<div class="list-card-body">' +
           '<div class="list-card-title">' + escapeHtml(l.name) + (l.private ? ' <span class="badge">Private</span>' : '') + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
+            '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
@@ -388,7 +388,7 @@ function renderMyPrivateTraktLists(lists) {
           addBtns +
         '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
     '</div>';
   }).join('');
 

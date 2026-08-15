@@ -586,8 +586,93 @@ document.querySelectorAll('details.panel.collapsible').forEach((d) => {
 });
 restoreActiveTab();
 tryAutoRestoreCreatorProfile();
+
+// Deep-link support for the list-details/item-details full pages (see
+// openListDetailsPage in 23_client-list-management.js and
+// openItemDetailsModal in 19_client-search-and-likes.js) -- both push a
+// real #/list?... or #/item?... URL when opened, so a bookmark, shared
+// link, or a plain page refresh lands back on that exact page instead of
+// always falling back to whatever tab was last active.
+(function handleInitialDeepLink() {
+  if (SERVER_DEEP_LINK_LIST) {
+    openListDetailsPage(SERVER_DEEP_LINK_LIST.name, SERVER_DEEP_LINK_LIST.type, SERVER_DEEP_LINK_LIST.url, SERVER_DEEP_LINK_LIST, { skipPushState: true });
+    return;
+  }
+  const path = location.pathname || '';
+  const mdbMatch = path.match(new RegExp('^/lists/mdblist/([^/]+)/([^/]+)', 'i'));
+  if (mdbMatch) {
+    const listUrl = 'https://mdblist.com/lists/' + mdbMatch[1] + '/' + mdbMatch[2];
+    const name = typeof deslugify === 'function' ? deslugify(mdbMatch[2]) : mdbMatch[2];
+    openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+  const traktMatch = path.match(new RegExp('^/lists/trakt/([^/]+)/([^/]+)', 'i'));
+  if (traktMatch) {
+    const listUrl = 'https://trakt.tv/users/' + traktMatch[1] + '/lists/' + traktMatch[2];
+    const name = typeof deslugify === 'function' ? deslugify(traktMatch[2]) : traktMatch[2];
+    openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+  const tmdbMatch = path.match(new RegExp('^/lists/tmdb/([0-9]+)', 'i'));
+  if (tmdbMatch) {
+    const listUrl = 'https://www.themoviedb.org/list/' + tmdbMatch[1];
+    openListDetailsPage('TMDB List ' + tmdbMatch[1], 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+
+  const hash = location.hash || '';
+  if (hash.startsWith('#/list?')) {
+    const params = new URLSearchParams(hash.slice('#/list?'.length));
+    openListDetailsPage(params.get('name') || 'List', params.get('type') || 'movie', params.get('url') || '', null, { skipPushState: true });
+  } else if (hash.startsWith('#/item?')) {
+    const params = new URLSearchParams(hash.slice('#/item?'.length));
+    openItemDetailsModal(params.get('id') || '', params.get('type') || 'movie', { skipPushState: true });
+  }
+})();
+
+window.addEventListener('popstate', (e) => {
+  const state = e.state;
+  if (state && state.view === 'list') {
+    openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true });
+  } else if (state && state.view === 'item') {
+    openItemDetailsModal(state.id, state.type, { skipPushState: true });
+  } else {
+    if (location.pathname.startsWith('/lists/')) {
+      history.replaceState({ view: 'tab', tab: window._previousTab || 'discover' }, '', '/');
+    }
+    const targetTab = window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
+    const cleanTab = (targetTab === 'list-details' || targetTab === 'item-details') ? 'discover' : targetTab;
+
+    document.querySelectorAll('.tab-panel').forEach(function(p) {
+      p.hidden = (p.getAttribute('data-tab-panel') !== cleanTab);
+    });
+    document.querySelectorAll('.tab-btn').forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === cleanTab);
+    });
+    document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === cleanTab);
+    });
+
+    const addShelfBtn = document.getElementById('headerAddShelfBtn');
+    if (addShelfBtn) addShelfBtn.style.display = (cleanTab === 'catalogs' ? 'block' : 'none');
+    const createListBtn = document.getElementById('headerCreateListBtn');
+    if (createListBtn) createListBtn.style.display = (cleanTab === 'lists' ? 'block' : 'none');
+
+    try {
+      localStorage.setItem('myListAddon:activeTab', cleanTab);
+    } catch (err) {}
+
+    if (typeof window._previousScrollY === 'number') {
+      const scrollPos = window._previousScrollY;
+      setTimeout(() => {
+        window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      }, 0);
+    }
+  }
+});
 </script>
 
 </body>
 </html>`;
 }
+
