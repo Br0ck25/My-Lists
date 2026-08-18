@@ -4,9 +4,12 @@ function renderBuilder(
 ) {
   const initialTmdbKey = initialKeys.tmdbKey || "";
   const initialMdblistKey = initialKeys.mdblistKey || "";
+  const initialMdblistAccessToken = initialKeys.mdblistAccessToken || "";
   const initialTraktKey = initialKeys.traktKey || "";
   const initialTraktUsername = initialKeys.traktUsername || "";
   const initialTraktAccessToken = initialKeys.traktAccessToken || "";
+  const initialShuffleShelves = !!initialKeys.shuffleShelves;
+  const initialShuffleItems = !!initialKeys.shuffleItems;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -264,6 +267,11 @@ function renderBuilder(
       padding: 5px 0 calc(5px + env(safe-area-inset-bottom));
       box-shadow: 0 -1px 0 rgba(0,0,0,0.08), 0 -4px 16px rgba(0,0,0,0.05);
     }
+    :root.dark-theme .bottom-nav, html.dark-theme .bottom-nav, body.dark-theme .bottom-nav {
+      background: rgba(0,0,0,0.94) !important;
+      border-top: 1px solid var(--border) !important;
+      box-shadow: 0 -1px 0 rgba(255,255,255,0.08), 0 -4px 16px rgba(0,0,0,0.6) !important;
+    }
     .bottom-nav-item {
       flex: 1;
       display: flex;
@@ -300,16 +308,21 @@ function renderBuilder(
     display: flex;
     gap: 8px;
     width: 100%;
+    max-width: 100%;
     min-width: 0;
     overflow-x: auto;
+    overflow-y: hidden;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
-    padding: 2px 0 6px;
+    touch-action: pan-x;
+    padding: 4px 16px 8px 4px;
     align-items: center;
+    box-sizing: border-box;
   }
   .subnav-pills-bar::-webkit-scrollbar { display: none; }
   .subnav-pill {
     flex: none;
+    flex-shrink: 0;
     padding: 7px 16px;
     border-radius: var(--radius-pill);
     border: 1.5px solid var(--border-strong);

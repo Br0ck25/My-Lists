@@ -1,19 +1,98 @@
+function extractMdblistItem(it) {
+  if (!it) return null;
+  // MDBList sync/watched item shapes:
+  // Episodes: { watched_at, episode: { season, number, name, ids, show: { title, year, ids: { imdb, tmdb } } } }
+  // Shows:    { watched_at, show: { title, year, ids: { imdb, tmdb }, poster } }
+  // Movies:   { watched_at, movie: { title, year, ids: { imdb, tmdb }, poster } }
+  // Direct:   { id, title, mediatype, imdb_id, poster, ... }
+  const ep = it.episode || null;
+  const epShow = ep && ep.show ? ep.show : null;
+  const inner = it.show || it.movie || epShow || it;
+  const rawId = inner.imdb_id || inner.imdbid || (inner.ids && inner.ids.imdb) || (typeof inner.id === 'string' && inner.id.startsWith('tt') ? inner.id : '');
+  const tmdbId = inner.tmdb_id || inner.tmdbid || (inner.ids && inner.ids.tmdb) || '';
+  const id = rawId || (tmdbId ? ('tmdb:' + tmdbId) : '');
+  if (!id) return null;
+
+  const isEpisode = !!ep || !!epShow;
+  const isShow = isEpisode || !!it.show || inner.mediatype === 'show' || inner.mediatype === 'series' || inner.type === 'show' || inner.type === 'series' || !!inner.seasons;
+  const mt = isShow ? 'series' : (it.movie || inner.mediatype === 'movie' || inner.type === 'movie' ? 'movie' : (inner.mediatype || inner.type || it.mediatype || it.type || 'movie')).toLowerCase();
+
+  let name = inner.title || inner.name || it.title || it.name || 'Untitled';
+  const showTitle = (epShow && epShow.title) || (it.show && it.show.title) || inner.title || inner.name || it.title || '';
+  if (ep && (ep.season || ep.number)) {
+    const s = ep.season || 1;
+    const e = ep.number || ep.episode || 1;
+    const epName = ep.name || ep.title ? ' \u2014 ' + (ep.name || ep.title) : '';
+    name = (showTitle || 'Show') + ' S' + s + 'E' + e + epName;
+  }
+  const showPoster = inner.poster || it.poster || (rawId ? `https://images.metahub.space/poster/medium/${rawId}/img` : undefined);
+  const poster = isEpisode ? (ep && (ep.poster || ep.still) || showPoster) : showPoster;
+  const releaseYear = inner.release_year || inner.year || it.release_year || it.year || undefined;
+  return {
+    id,
+    imdbId: rawId,
+    tmdbId,
+    mediatype: mt,
+    name,
+    showTitle,
+    poster,
+    releaseInfo: releaseYear ? String(releaseYear) : undefined,
+    season: ep ? (ep.season || 1) : undefined,
+    episode: ep ? (ep.number || ep.episode || 1) : undefined,
+  };
+}
+
 function mapMdblistItems(data, type) {
-  const items = Array.isArray(data) ? data : [...(data.movies || []), ...(data.shows || [])];
-  return items
-    .filter((it) => it.imdb_id)
+  if (!data) return [];
+  let rawList = [];
+  if (Array.isArray(data)) {
+    rawList = data;
+  } else if (data && typeof data === 'object') {
+    if (type === 'series') {
+      rawList = [
+        ...(Array.isArray(data.shows) ? data.shows : []),
+        ...(Array.isArray(data.episodes) ? data.episodes : []),
+        ...(Array.isArray(data.seasons) ? data.seasons : []),
+      ];
+    } else {
+      rawList = Array.isArray(data.movies) ? data.movies : [];
+    }
+    if (!rawList.length) {
+      if (Array.isArray(data.results)) rawList = data.results;
+      else if (Array.isArray(data.items)) rawList = data.items;
+      else {
+        rawList = [
+          ...(Array.isArray(data.movies) ? data.movies : []),
+          ...(Array.isArray(data.shows) ? data.shows : []),
+          ...(Array.isArray(data.episodes) ? data.episodes : []),
+          ...(Array.isArray(data.seasons) ? data.seasons : []),
+        ];
+      }
+    }
+  }
+
+  return rawList
+    .map(extractMdblistItem)
+    .filter(Boolean)
     .filter((it) => {
-      const mt = (it.mediatype || it.type || "").toLowerCase();
-      if (type === "series") return mt === "show" || mt === "series" || mt === "tv";
-      return mt === "movie" || mt === "";
+      const mt = it.mediatype;
+      if (type === 'series') return mt === 'show' || mt === 'series' || mt === 'tv';
+      return mt === 'movie' || mt === '' || mt === 'unknown';
     })
-    .map((it) => ({
-      id: it.imdb_id,
-      type,
-      name: it.title || it.name,
-      poster: it.poster || `https://images.metahub.space/poster/medium/${it.imdb_id}/img`,
-      releaseInfo: it.release_year ? String(it.release_year) : undefined,
-    }));
+    .map((it) => {
+      const posterFallbackId = (it.imdbId && it.imdbId.startsWith('tt')) ? it.imdbId : (it.id && it.id.startsWith('tt') ? it.id : '');
+      return {
+        id: it.id,
+        imdbId: it.imdbId,
+        type,
+        name: it.name,
+        showTitle: it.showTitle,
+        poster: it.poster || (posterFallbackId ? `https://images.metahub.space/poster/medium/${posterFallbackId}/img` : undefined),
+        releaseInfo: it.releaseInfo,
+        season: it.season,
+        episode: it.episode,
+      };
+    });
 }
 
 async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
@@ -25,15 +104,18 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
   }
 
   const res = await fetch(src, {
-    headers: { "User-Agent": "my-list-addon/1.3" },
-    cf: { cacheTtl: 900, cacheEverything: true },
+    headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
+    cf: { cacheTtl: 300, cacheEverything: true },
   });
+
   if (!res.ok) {
-    const hint =
-      res.status === 404
-        ? " If this is a private list, paste your MDBList API key into the 'Your API keys' box above."
-        : "";
-    throw new Error(`mdblist request failed (HTTP ${res.status}).${hint}`);
+    if (res.status === 404) {
+      throw new Error(
+        "MDBList returned 404. Check that the user and list names match the URL on mdblist.com, and that the list is set to Public."
+      );
+    }
+    const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key or connection." : "";
+    throw new Error(`MDBList request failed (HTTP ${res.status}).${hint}`);
   }
 
   const data = await res.json();
@@ -41,31 +123,112 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
-// Pulls the signed-in user's MDBList watchlist via the official REST API.
-// Unlike public list URLs, this always needs a personal MDBList API key —
-// there's no public feed for someone else's watchlist.
-async function fetchMdblistWatchlist(entry, skip = 0, mdblistKey = "") {
-  if (!mdblistKey) {
+// Pulls the user's watchlist from MDBList
+async function fetchMdblistWatchlist(entry, skip = 0, mdblistKey = "", mdblistAccessToken = "") {
+  const token = mdblistAccessToken || mdblistKey;
+  if (!token) {
     throw new Error(
-      "Your MDBList watchlist needs your MDBList API key — paste it into the 'Your API keys' box above (get a free one at mdblist.com/preferences)."
+      "Your MDBList watchlist needs your connected MDBList account or API key."
     );
   }
 
-  const res = await fetch(
-    `https://api.mdblist.com/watchlist/items?apikey=${encodeURIComponent(mdblistKey)}&append_to_response=poster`,
-    {
-      headers: { "User-Agent": "my-list-addon/1.3" },
-      cf: { cacheTtl: 300, cacheEverything: true },
-    }
-  );
+  const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}`, "Accept": "application/json" };
+  const authQuery = mdblistAccessToken ? "" : `?apikey=${encodeURIComponent(mdblistKey)}`;
+  if (mdblistAccessToken) {
+    headers["Authorization"] = `Bearer ${mdblistAccessToken}`;
+  }
+
+  const res = await fetch(`https://api.mdblist.com/watchlist${authQuery}`, {
+    headers,
+    cf: { cacheTtl: 300, cacheEverything: true },
+  });
+
   if (!res.ok) {
-    const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key." : "";
+    const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key or connection." : "";
     throw new Error(`MDBList watchlist request failed (HTTP ${res.status}).${hint}`);
   }
 
   const data = await res.json();
   const metas = mapMdblistItems(data, entry.type);
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+}
+
+// Pulls the user's watched history from MDBList, paginated.
+async function fetchMdblistHistory(entry, skip = 0, mdblistKey = "", mdblistAccessToken = "") {
+  const token = mdblistAccessToken || mdblistKey;
+  if (!token) {
+    throw new Error(
+      "Your MDBList watch history needs your connected MDBList account or API key."
+    );
+  }
+
+  const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}`, "Accept": "application/json" };
+  const authQuery = mdblistAccessToken ? "" : `?apikey=${encodeURIComponent(mdblistKey)}`;
+  if (mdblistAccessToken) {
+    headers["Authorization"] = `Bearer ${mdblistAccessToken}`;
+  }
+
+  const sep = authQuery ? "&" : "?";
+  let allItems = [];
+
+  // MDBList /sync/watched with mediatype query: movie, show, episode
+  const mediatypesToTry = entry.type === 'series' ? ['show', 'episode'] : ['movie'];
+
+  for (const mt of mediatypesToTry) {
+    const url = `https://api.mdblist.com/sync/watched${authQuery}${sep}mediatype=${mt}&offset=${skip}&limit=${PAGE_SIZE}&append_to_response=poster`;
+    try {
+      const res = await fetch(url, {
+        headers,
+        cf: { cacheTtl: 60, cacheEverything: false },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+          if (Array.isArray(data.movies) && data.movies.length) allItems.push(...data.movies);
+          if (Array.isArray(data.shows) && data.shows.length) allItems.push(...data.shows);
+          if (Array.isArray(data.episodes) && data.episodes.length) allItems.push(...data.episodes);
+          if (Array.isArray(data.results) && data.results.length) allItems.push(...data.results);
+          if (Array.isArray(data.items) && data.items.length) allItems.push(...data.items);
+          if (Array.isArray(data) && data.length) allItems.push(...data);
+        } else if (Array.isArray(data)) {
+          allItems.push(...data);
+        }
+      }
+    } catch {}
+    if (allItems.length) break;
+  }
+
+  // Fallback to unfiltered sync/watched if mediatype query returned nothing
+  if (!allItems.length) {
+    try {
+      const url = `https://api.mdblist.com/sync/watched${authQuery}${sep}offset=${skip}&limit=${PAGE_SIZE}&append_to_response=poster`;
+      const res = await fetch(url, {
+        headers,
+        cf: { cacheTtl: 60, cacheEverything: false },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+          if (entry.type === 'series') {
+            if (Array.isArray(data.shows)) allItems.push(...data.shows);
+            if (Array.isArray(data.episodes)) allItems.push(...data.episodes);
+          } else {
+            if (Array.isArray(data.movies)) allItems.push(...data.movies);
+          }
+          if (!allItems.length) {
+            if (Array.isArray(data.results)) allItems.push(...data.results);
+            else if (Array.isArray(data.items)) allItems.push(...data.items);
+            else if (Array.isArray(data)) allItems.push(...data);
+          }
+        } else if (Array.isArray(data)) {
+          allItems.push(...data);
+        }
+      }
+    } catch {}
+  }
+
+  const metas = mapMdblistItems(allItems, entry.type);
+  return enrichTrailers(metas.slice(0, PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
 // Trakt's list-items endpoint returns an array of wrapper objects, each

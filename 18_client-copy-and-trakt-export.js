@@ -9,6 +9,7 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   while (pagesLoaded < MAX_PAGES) {
     const body = { url: listUrl, type: type, skip: skip, sample: 100 };
     if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+    if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
     if (keys.traktKey) body.traktKey = keys.traktKey;
     if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
     const res = await fetch(ORIGIN + '/api/preview', {
@@ -185,10 +186,21 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   }
 
   if (!created.length && !failed.length) {
-    alert('That list has no items to copy.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('No Items', 'That list has no items to copy.', false);
+    } else {
+      alert('That list has no items to copy.');
+    }
     return;
   }
-  if (created.length) renderCreatorDashboard();
+  if (created.length) {
+    try {
+      if (typeof trackEvent === 'function') {
+        trackEvent('list-copy', listUrl || listName, listName);
+      }
+    } catch (e) {}
+    renderCreatorDashboard();
+  }
 
   let msg = '';
   if (created.length) {
@@ -196,9 +208,13 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
       ' in your Custom Lists \u2014 find them under the Custom Lists tab to add them to your lists.';
   }
   if (failed.length) {
-    msg += (msg ? '\\n\\n' : '') + 'Could not copy: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
+    msg += (msg ? ' | ' : '') + 'Could not copy: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
   }
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(failed.length ? 'Copy Incomplete' : 'List Copied', msg, !failed.length);
+  } else {
+    alert(msg);
+  }
 }
 
 // Walks the connected Trakt account's full watch history (movies, then
@@ -210,18 +226,17 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
 // raw row shape is identical either way, since Trakt's own export is
 // generated from this same API.
 async function markTraktHistoryAllWatched(btn) {
-  if (!traktAccessToken) { alert('Connect Trakt first.'); return; }
+  if (!traktAccessToken) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Trakt Not Connected', 'Please connect your Trakt account in Settings first.', false);
+    } else {
+      alert('Connect Trakt first.');
+    }
+    return;
+  }
   const originalLabel = btn ? btn.textContent : '';
   if (btn) btn.disabled = true;
 
-  // Bounded the same way the server-side Continue Watching cron bounds
-  // itself (see checkForNewEpisodes, 07_source-fetchers-tmdb-simkl.js) --
-  // a Trakt power user's history can run into the tens of thousands of
-  // rows, and this is a synchronous, in-browser operation the person is
-  // actively waiting on, not a background job. 100 pages at 100/page is
-  // 10,000 events per kind (movies, episodes), comfortably past what
-  // almost anyone has logged; if it's genuinely hit, what's fetched so far
-  // still gets marked rather than discarded, and the result message says so.
   const MAX_PAGES = 100;
   const whItems = [];
   const seenIds = new Set();
@@ -241,12 +256,20 @@ async function markTraktHistoryAllWatched(btn) {
         });
         data = await res.json();
       } catch (e) {
-        alert('Network error fetching Trakt history.');
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Network Error', 'Network error fetching Trakt history.', false);
+        } else {
+          alert('Network error fetching Trakt history.');
+        }
         if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
         return;
       }
       if (!data.ok) {
-        alert(data.error || 'Could not fetch Trakt history.');
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Error', data.error || 'Could not fetch Trakt history.', false);
+        } else {
+          alert(data.error || 'Could not fetch Trakt history.');
+        }
         if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
         return;
       }
@@ -265,7 +288,11 @@ async function markTraktHistoryAllWatched(btn) {
   }
 
   if (!whItems.length) {
-    alert('No watch history found on your Trakt account.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('No History', 'No watch history found on your Trakt account.', false);
+    } else {
+      alert('No watch history found on your Trakt account.');
+    }
     if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
     return;
   }
@@ -282,7 +309,215 @@ async function markTraktHistoryAllWatched(btn) {
   if (hitPageCap) {
     msg += ' (Your history is large enough that this only covered the ' + (MAX_PAGES * 100).toLocaleString() + ' most recent watches per type \u2014 run it again later to pick up more.)';
   }
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert('Trakt History Synced', msg, true);
+  } else {
+    alert(msg);
+  }
+}
+
+function mapMdblistItemsToWatchHistory(rawItems) {
+  const whItems = [];
+  const seenIds = new Set();
+
+  (rawItems || []).forEach((it) => {
+    if (!it) return;
+    // MDBList sync/watched episode shape: { last_watched_at, episode: { season, number, name, ids, show: { title, year, ids: { imdb, tmdb } }, poster } }
+    // MDBList sync/watched movie shape:   { last_watched_at, movie: { title, year, ids: { imdb, tmdb } } }
+    const ep = it.episode || null;
+    const epShow = ep && ep.show ? ep.show : null;   // show nested inside episode
+    const inner = it.show || it.movie || epShow || it;
+    const watchedAtMs = (() => {
+      const d = it.last_watched_at || it.watched_at || inner.last_watched_at || inner.watched_at;
+      if (!d) return Date.now();
+      const t = new Date(d).getTime();
+      return isNaN(t) ? Date.now() : t;
+    })();
+
+    const imdbId = inner.imdb_id || inner.imdbid ||
+                   (inner.ids && inner.ids.imdb) ||
+                   (typeof inner.id === 'string' && inner.id.startsWith('tt') ? inner.id : '');
+    const tmdbId = inner.tmdb_id || inner.tmdbid || (inner.ids && inner.ids.tmdb) || '';
+    const isMovie = !ep && !epShow && !it.show && (it.movie || inner.mediatype === 'movie' || inner.type === 'movie');
+
+    if (!imdbId && !tmdbId) return;
+
+    if (isMovie) {
+      const poster = inner.poster || it.poster || (imdbId ? 'https://images.metahub.space/poster/medium/' + imdbId + '/img' : '');
+      const id = imdbId || ('tmdb:' + tmdbId);
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        whItems.push({
+          id: id,
+          imdbId: imdbId || undefined,
+          tmdbId: tmdbId ? String(tmdbId) : undefined,
+          type: 'movie',
+          title: inner.title || inner.name || 'Movie',
+          year: inner.release_year ? String(inner.release_year) : (inner.year ? String(inner.year) : ''),
+          poster: inner.poster || it.poster || (imdbId ? 'https://images.metahub.space/poster/medium/' + imdbId + '/img' : ''),
+          watchedAt: watchedAtMs,
+        });
+      }
+      return;
+    }
+
+    // Series / Episode
+    const showTitle = inner.title || inner.name || it.title || 'Show';
+    // showPoster: full show artwork used by catalog renderer (metahub keyed by IMDb ID)
+    // poster: episode still image used by the history-shelf item renderer
+    const showPoster = imdbId ? 'https://images.metahub.space/poster/medium/' + imdbId + '/img' : (inner.poster || '');
+    const showId = imdbId || (tmdbId ? ('tmdb:' + tmdbId) : '');
+
+    if (ep) {
+      const seasonNum = ep.season || 1;
+      const epNum = ep.number || ep.episode || 1;
+      const epTmdbId = ep.ids && ep.ids.tmdb ? String(ep.ids.tmdb) : (ep.tmdb_id ? String(ep.tmdb_id) : '');
+      const epKey = showId + ':' + seasonNum + ':' + epNum;
+      if (!seenIds.has(epKey)) {
+        seenIds.add(epKey);
+        whItems.push({
+          id: epTmdbId || epKey,
+          type: 'episode',
+          name: ep.name || ep.title || ('Episode ' + epNum),
+          showTitle: showTitle,
+          showId: showId,
+          showPoster: showPoster,
+          seasonNum: seasonNum,
+          episodeNum: epNum,
+          poster: ep.poster || ep.still || showPoster,
+          watchedAt: watchedAtMs,
+        });
+      }
+      return;
+    }
+
+    if (Array.isArray(inner.seasons) && inner.seasons.length) {
+      inner.seasons.forEach((s) => {
+        const seasonNum = s.number || s.season_number || s.season || 1;
+        if (Array.isArray(s.episodes) && s.episodes.length) {
+          s.episodes.forEach((sep) => {
+            const epNum = sep.number || sep.episode_number || sep.episode || 1;
+            const epTmdbId = sep.tmdb_id || sep.tmdbid || (sep.ids && sep.ids.tmdb) || '';
+            const epKey = showId + ':' + seasonNum + ':' + epNum;
+            if (!seenIds.has(epKey)) {
+              seenIds.add(epKey);
+              whItems.push({
+                id: epTmdbId ? String(epTmdbId) : epKey,
+                type: 'episode',
+                name: sep.name || sep.title || ('Episode ' + epNum),
+                showTitle: showTitle,
+                showId: showId,
+                seasonNum: seasonNum,
+                epNum: epNum,
+                poster: showPoster,
+                watchedAt: sep.watched_at || sep.last_watched_at ? (new Date(sep.watched_at || sep.last_watched_at).getTime() || watchedAtMs) : watchedAtMs,
+              });
+            }
+          });
+        }
+      });
+    } else {
+      const epKey = showId + ':' + (inner.season || 1) + ':' + (inner.episode || 1);
+      if (!seenIds.has(epKey)) {
+        seenIds.add(epKey);
+        whItems.push({
+          id: inner.episode_tmdb_id ? String(inner.episode_tmdb_id) : epKey,
+          type: inner.season ? 'episode' : 'series',
+          name: inner.episode_title || showTitle,
+          showTitle: showTitle,
+          showId: showId,
+          seasonNum: inner.season || 1,
+          epNum: inner.episode || 1,
+          poster: showPoster,
+          watchedAt: watchedAtMs,
+        });
+      }
+    }
+  });
+
+  return whItems;
+}
+
+async function markMdblistHistoryAllWatched(btn) {
+  const manualKey = document.getElementById('mdblistKeyInput') ? document.getElementById('mdblistKeyInput').value.trim() : '';
+  const token = mdblistAccessToken || manualKey;
+  if (!token) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('MDBList Not Connected', 'Please connect your MDBList account or enter an API key in Settings first.', false);
+    } else {
+      alert('Connect MDBList first.');
+    }
+    return;
+  }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Fetching MDBList history\u2026'; }
+
+  // Paginate through all pages of sync/watched
+  const MAX_PAGES = 50;
+  let allRawItems = [];
+  let page = 1;
+  let fetchMore = true;
+  while (fetchMore && page <= MAX_PAGES) {
+    if (btn) btn.textContent = 'Fetching MDBList history (page ' + page + ')\u2026';
+    let data;
+    try {
+      const res = await fetch(ORIGIN + '/api/mdblist-history-raw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken: mdblistAccessToken, apikey: manualKey, page }),
+      });
+      data = await res.json();
+    } catch (e) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Network Error', 'Network error fetching MDBList history (page ' + page + ').', false);
+      } else {
+        alert('Network error fetching MDBList history.');
+      }
+      if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+      return;
+    }
+    if (!data.ok) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Error', data.error || 'Could not fetch MDBList history.', false);
+      } else {
+        alert(data.error || 'Could not fetch MDBList history.');
+      }
+      if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+      return;
+    }
+    allRawItems = allRawItems.concat(data.items || []);
+    fetchMore = !!data.hasMore;
+    page++;
+  }
+
+  const whItems = mapMdblistItemsToWatchHistory(allRawItems);
+  console.log('[MDBList] raw items:', allRawItems.length, 'mapped:', whItems.length);
+
+  if (!whItems.length) {
+    const detailMsg = 'No watch history found on your MDBList account. Fetched ' + allRawItems.length + ' raw items from MDBList.';
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('No History', detailMsg, false);
+    } else {
+      alert(detailMsg);
+    }
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+    return;
+  }
+
+  if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
+  const whResult = await addItemsToWatchHistory(whItems);
+  if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
+  if (whResult.cwTotal) {
+    msg += ' Continue Watching checked for ' + whResult.cwSucceeded + ' of ' + whResult.cwTotal + ' show' + (whResult.cwTotal === 1 ? '' : 's') +
+      (whResult.cwSucceeded < whResult.cwTotal ? ' \u2014 reopening one of those shows will retry it, or run this again.' : '.');
+  }
+  if (typeof showAppAlert === 'function') {
+    showAppAlert('MDBList History Synced', msg, true);
+  } else {
+    alert(msg);
+  }
 }
 
 // --- Import from Trakt export --------------------------------------------
@@ -349,7 +584,7 @@ function readTraktExportJsonFiles(pattern) {
   return { items: items, matchedFiles: matchedFiles, errors: errors };
 }
 
-document.getElementById('traktExportFileInput').addEventListener('change', async (e) => {
+document.getElementById('traktExportFileInput')?.addEventListener('change', async (e) => {
   const file = e.target.files && e.target.files[0];
   const box = document.getElementById('traktExportImportResult');
   if (!file || !box) return;
@@ -845,3 +1080,667 @@ window.runLetterboxdExportImport = async function() {
   if (!msg) msg = 'Nothing to import in the selected categories.';
   alert(msg);
 };
+
+// --- Unified Multi-Format List Importer -----------------------------------
+let unifiedImportSelectedFiles = [];
+let discoveredImportCategories = [];
+
+function populateImportTargetLists() {
+  const sel = document.getElementById('importTargetListSelect');
+  if (!sel) return;
+  const currentVal = sel.value;
+  const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+  let options = '<option value="watchlist">Watchlist</option>' +
+    '<option value="watch-history">Watch History</option>';
+
+  const userLists = Object.keys(map).filter(k => k !== 'watchlist' && k !== 'watch-history' && k !== 'continue-watching');
+  if (userLists.length) {
+    options += '<optgroup label="Your Custom Lists">';
+    userLists.forEach(slug => {
+      const l = map[slug];
+      if (l) options += '<option value="list:' + escapeAttr(slug) + '">' + escapeHtml(l.name || slug) + ' (' + (l.type === 'series' ? 'Shows' : (l.type === 'movie' ? 'Movies' : 'Mixed')) + ')</option>';
+    });
+    options += '</optgroup>';
+  }
+  options += '<option value="new">+ Create New Custom List&hellip;</option>';
+  sel.innerHTML = options;
+  if (currentVal && Array.from(sel.options).some(o => o.value === currentVal)) {
+    sel.value = currentVal;
+  }
+  onImportTargetListChange();
+}
+
+function onImportTargetListChange() {
+  const sel = document.getElementById('importTargetListSelect');
+  const wrap = document.getElementById('importNewListInputWrap');
+  if (!sel || !wrap) return;
+  wrap.style.display = sel.value === 'new' ? 'block' : 'none';
+}
+
+function buildCategoryTargetOptionsHtml(defaultTarget, defaultNewName) {
+  const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+  let opts = '<option value="watchlist"' + (defaultTarget === 'watchlist' ? ' selected' : '') + '>Watchlist</option>' +
+    '<option value="watch-history"' + (defaultTarget === 'watch-history' ? ' selected' : '') + '>Watch History</option>';
+
+  const userLists = Object.keys(map).filter(k => k !== 'watchlist' && k !== 'watch-history' && k !== 'continue-watching');
+  if (userLists.length) {
+    opts += '<optgroup label="Your Custom Lists">';
+    userLists.forEach(slug => {
+      const l = map[slug];
+      if (l) {
+        const val = 'list:' + slug;
+        opts += '<option value="' + escapeAttr(val) + '"' + (defaultTarget === val ? ' selected' : '') + '>' + escapeHtml(l.name || slug) + '</option>';
+      }
+    });
+    opts += '</optgroup>';
+  }
+  const cleanNewName = defaultNewName || 'Imported List';
+  opts += '<option value="new:' + escapeAttr(cleanNewName) + '"' + (defaultTarget.startsWith('new') ? ' selected' : '') + '>+ New List: ' + escapeHtml(cleanNewName) + '</option>';
+  return opts;
+}
+
+function renderDiscoveredCategories() {
+  const box = document.getElementById('unifiedImportResult');
+  if (!box) return;
+
+  if (!discoveredImportCategories.length) {
+    box.innerHTML = '';
+    return;
+  }
+
+  const globalTargetWrap = document.getElementById('importTargetListSelect')?.closest('div');
+  const globalNewWrap = document.getElementById('importNewListInputWrap');
+  if (globalTargetWrap) globalTargetWrap.style.display = discoveredImportCategories.length > 1 ? 'none' : '';
+  if (globalNewWrap && discoveredImportCategories.length > 1) globalNewWrap.style.display = 'none';
+
+  let html = '<div style="margin-top:10px; border-top:1px solid var(--border); padding-top:12px;">' +
+    '<p style="font-weight:600; font-size:0.9rem; margin-bottom:8px; color:var(--text);">Discovered Lists & Categories (' + discoveredImportCategories.length + '):</p>' +
+    '<div style="display:flex; flex-direction:column; gap:10px;">';
+
+  discoveredImportCategories.forEach((cat, idx) => {
+    const isWatchedOrDiary = cat.isWatchCategory || cat.id.includes('watch') || cat.id.includes('diary') || cat.id.includes('history');
+    const watchToggle = isWatchedOrDiary
+      ? '<div style="margin-left:26px; margin-top:4px;"><label style="font-size:0.8rem; color:var(--muted); cursor:pointer; display:inline-flex; align-items:center; gap:5px;"><input type="checkbox" class="importCatAlsoMarkWatchedCheck" data-cat-index="' + idx + '" checked> Also add to Watch History (marks watched)</label></div>'
+      : '';
+
+    html += '<div class="row" style="flex-direction:column; align-items:flex-start; padding:10px 12px; background:var(--bg-2, rgba(255,255,255,0.03)); border:1px solid var(--border); border-radius:8px;">' +
+      '<div style="display:flex; align-items:center; justify-content:space-between; width:100%; flex-wrap:wrap; gap:8px;">' +
+        '<label style="display:inline-flex; align-items:center; gap:8px; font-weight:600; font-size:0.9rem; cursor:pointer; color:var(--text);">' +
+          '<input type="checkbox" class="importCatCheck" data-cat-index="' + idx + '" checked> ' +
+          escapeHtml(cat.label) +
+          ' <span style="font-weight:normal; color:var(--muted); font-size:0.82rem;">(' + cat.items.length + ' entries)</span>' +
+        '</label>' +
+        '<div style="display:inline-flex; align-items:center; gap:6px;">' +
+          '<span style="font-size:0.8rem; color:var(--muted);">Destination:</span>' +
+          '<select class="importCatTargetSelect" data-cat-index="' + idx + '" style="padding:6px 10px; font-size:0.85rem; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+            buildCategoryTargetOptionsHtml(cat.defaultTarget, cat.defaultNewName) +
+          '</select>' +
+        '</div>' +
+      '</div>' +
+      watchToggle +
+    '</div>';
+  });
+
+  html += '</div></div>';
+  box.innerHTML = html;
+}
+
+async function onUnifiedImportFilesSelected(input) {
+  unifiedImportSelectedFiles = input.files ? Array.from(input.files) : [];
+  discoveredImportCategories = [];
+  const countEl = document.getElementById('unifiedImportSelectedCount');
+  const box = document.getElementById('unifiedImportResult');
+  const sourceSel = document.getElementById('importListSourceSelect');
+  const selectedSource = sourceSel ? sourceSel.value : 'auto';
+
+  if (!countEl) return;
+  if (!unifiedImportSelectedFiles.length) {
+    countEl.textContent = 'No files selected';
+    if (box) box.innerHTML = '';
+    return;
+  }
+
+  if (unifiedImportSelectedFiles.length === 1) {
+    countEl.textContent = unifiedImportSelectedFiles[0].name;
+  } else {
+    countEl.textContent = unifiedImportSelectedFiles.length + ' files selected';
+  }
+
+  if (box) {
+    box.innerHTML = '<p style="margin-top:10px; font-size:0.85rem; color:var(--muted);"><small>Scanning file(s)&hellip;</small></p>';
+  }
+
+  const discovered = [];
+
+  for (const file of unifiedImportSelectedFiles) {
+    const isZip = file.name.toLowerCase().endsWith('.zip');
+    if (isZip) {
+      if (typeof fflate === 'undefined') {
+        if (box) box.innerHTML = '<p class="testresult err">\u2717 The zip reader library (fflate) is not loaded.</p>';
+        return;
+      }
+      try {
+        const buf = await file.arrayBuffer();
+        const zipEntries = fflate.unzipSync(new Uint8Array(buf));
+        const entriesByCat = new Map();
+
+        for (const [entryName, u8data] of Object.entries(zipEntries)) {
+          if (entryName.endsWith('/') || entryName.startsWith('__MACOSX')) continue;
+          const lowerName = entryName.toLowerCase();
+          const baseName = entryName.split('/').pop() || entryName;
+          const lowerBase = baseName.toLowerCase();
+
+          if (!lowerName.endsWith('.csv') && !lowerName.endsWith('.json') && !lowerName.endsWith('.txt')) continue;
+
+          const text = fflate.strFromU8(u8data);
+          const items = extractItemsFromFileContent(baseName, text, selectedSource);
+          if (!items.length) continue;
+
+          // Categorization & chunk grouping logic for Trakt, Letterboxd, Simkl, and custom lists
+          const noExt = baseName.replace(/\.[^.]+$/, '');
+          // Strip chunk number suffixes e.g. -1, -2, _1, .part1, (1)
+          const cleanBase = noExt.replace(/[-_ ]\d+$/, '').replace(/\.part\d+$/, '');
+          const lowerClean = cleanBase.toLowerCase();
+
+          let catKey = lowerClean;
+          let catLabel = '';
+          let defaultTarget = 'new';
+          let defaultNewName = '';
+          let isWatchCategory = false;
+
+          if (lowerClean === 'watched-history' || lowerClean === 'history') {
+            catKey = 'history';
+            catLabel = 'Watch History';
+            defaultTarget = 'watch-history';
+            isWatchCategory = true;
+          } else if (lowerClean === 'watched-movies') {
+            catKey = 'watched-movies';
+            catLabel = 'Watched Movies';
+            defaultTarget = 'watch-history';
+            isWatchCategory = true;
+          } else if (lowerClean === 'watched-shows') {
+            catKey = 'watched-shows';
+            catLabel = 'Watched Shows';
+            defaultTarget = 'watch-history';
+            isWatchCategory = true;
+          } else if (lowerClean === 'watched') {
+            catKey = 'watched';
+            catLabel = 'Watched (all-time list)';
+            defaultTarget = 'watch-history';
+            isWatchCategory = true;
+          } else if (lowerClean === 'collection-movies') {
+            catKey = 'collection-movies';
+            catLabel = 'Collection Movies';
+            defaultTarget = 'new';
+            defaultNewName = 'Collection Movies';
+          } else if (lowerClean === 'collection-shows') {
+            catKey = 'collection-shows';
+            catLabel = 'Collection Shows';
+            defaultTarget = 'new';
+            defaultNewName = 'Collection Shows';
+          } else if (lowerClean === 'collection') {
+            catKey = 'collection';
+            catLabel = 'Collection';
+            defaultTarget = 'new';
+            defaultNewName = 'Collection';
+          } else if (lowerClean === 'lists-watchlist' || lowerClean === 'watchlist') {
+            catKey = 'watchlist';
+            catLabel = 'Watchlist';
+            defaultTarget = 'watchlist';
+          } else if (lowerClean === 'ratings-movies') {
+            catKey = 'ratings-movies';
+            catLabel = 'Ratings Movies';
+            defaultTarget = 'new';
+            defaultNewName = 'Ratings Movies';
+          } else if (lowerClean === 'ratings-shows') {
+            catKey = 'ratings-shows';
+            catLabel = 'Ratings Shows';
+            defaultTarget = 'new';
+            defaultNewName = 'Ratings Shows';
+          } else if (lowerClean === 'ratings') {
+            catKey = 'ratings';
+            catLabel = 'Ratings';
+            defaultTarget = 'new';
+            defaultNewName = 'Ratings';
+          } else if (lowerClean === 'diary') {
+            catKey = 'diary';
+            catLabel = 'Diary';
+            defaultTarget = 'watch-history';
+            isWatchCategory = true;
+          } else if (lowerName.includes('lists/') || lowerClean.startsWith('lists-')) {
+            const listName = cleanBase.replace(/^lists-?/, '').replace(/[-_]/g, ' ').trim();
+            const titleCase = listName.replace(/\b\w/g, c => c.toUpperCase());
+            catKey = 'list_' + lowerClean;
+            catLabel = 'List: ' + titleCase;
+            defaultTarget = 'new';
+            defaultNewName = titleCase;
+          } else {
+            const humanName = cleanBase.replace(/[-_]/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+            catKey = lowerClean;
+            catLabel = humanName;
+            defaultTarget = (lowerClean.includes('watchlist') ? 'watchlist' : (lowerClean.includes('history') || lowerClean.includes('watched') ? 'watch-history' : 'new'));
+            defaultNewName = humanName;
+            isWatchCategory = defaultTarget === 'watch-history';
+          }
+
+          if (!entriesByCat.has(catKey)) {
+            entriesByCat.set(catKey, {
+              id: catKey,
+              label: catLabel,
+              items: [],
+              defaultTarget: defaultTarget,
+              defaultNewName: defaultNewName,
+              isWatchCategory: isWatchCategory
+            });
+          }
+          entriesByCat.get(catKey).items.push(...items);
+        }
+
+        for (const cat of entriesByCat.values()) {
+          // Dedupe within category
+          const uMap = new Map();
+          cat.items.forEach(it => {
+            const k = it.imdbId ? ('imdb:' + it.imdbId) : (it.title ? ((it.title + '|' + it.year).toLowerCase()) : ('raw:' + it.id));
+            if (!uMap.has(k)) uMap.set(k, it);
+          });
+          cat.items = Array.from(uMap.values());
+          if (cat.items.length) discovered.push(cat);
+        }
+      } catch (err) {
+        if (box) box.innerHTML = '<p class="testresult err">\u2717 Could not read zip: ' + escapeHtml(err && err.message ? err.message : String(err)) + '</p>';
+        return;
+      }
+    } else {
+      // Standalone single file (.csv, .json, .txt)
+      try {
+        const text = await file.text();
+        const items = extractItemsFromFileContent(file.name, text, selectedSource);
+        if (items.length) {
+          const lowerName = file.name.toLowerCase();
+          let defaultTarget = 'watchlist';
+          if (lowerName.includes('history') || lowerName.includes('watched') || lowerName.includes('diary')) {
+            defaultTarget = 'watch-history';
+          }
+          const defaultNewName = file.name.replace(/\.[^.]+$/, '');
+          discovered.push({
+            id: 'file_' + file.name,
+            label: file.name,
+            items: items,
+            defaultTarget: defaultTarget,
+            defaultNewName: defaultNewName,
+            isWatchCategory: defaultTarget === 'watch-history'
+          });
+        }
+      } catch (err) {}
+    }
+  }
+
+  discoveredImportCategories = discovered;
+  if (!discoveredImportCategories.length) {
+    if (box) box.innerHTML = '<p class="testresult err">\u2717 No recognizable movie or TV show entries found in selected file(s).</p>';
+    return;
+  }
+
+  renderDiscoveredCategories();
+}
+
+// Parses arbitrary CSV text into an array of objects
+function parseCsvToRows(text) {
+  const cr = String.fromCharCode(13);
+  const lf = String.fromCharCode(10);
+  const cleanText = text ? text.split(cr).join('') : '';
+  const lines = cleanText.split(lf).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  
+  function parseLine(line) {
+    const cells = [];
+    let inQuotes = false;
+    let cell = '';
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        cells.push(cell.trim());
+        cell = '';
+      } else {
+        cell += ch;
+      }
+    }
+    cells.push(cell.trim());
+    return cells;
+  }
+
+  const cleanHeaderRgx = new RegExp('[^a-z0-9]', 'g');
+  const headers = parseLine(lines[0]).map(h => h.toLowerCase().replace(cleanHeaderRgx, ''));
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const vals = parseLine(lines[i]);
+    if (!vals.length || (vals.length === 1 && !vals[0])) continue;
+    const row = {};
+    headers.forEach((h, idx) => {
+      row[h] = vals[idx] !== undefined ? vals[idx] : '';
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+// Inspects content/filename to detect source format
+function detectFileFormat(filename, text, userSource) {
+  if (userSource && userSource !== 'auto') return userSource;
+  const lowerName = (filename || '').toLowerCase();
+  const lowerText = (text || '').slice(0, 2000).toLowerCase();
+
+  if (lowerText.includes('letterboxd uri') || lowerName.includes('letterboxd') || lowerName.includes('watched.csv') || lowerName.includes('diary.csv')) {
+    return 'letterboxd';
+  }
+  if (lowerText.includes('const') && (lowerText.includes('title type') || lowerText.includes('imdb rating') || lowerText.includes('your rating'))) {
+    return 'imdb';
+  }
+  if (lowerText.includes('trakt_id') || lowerText.includes('trakt.tv') || lowerName.includes('trakt')) {
+    return 'trakt';
+  }
+  if (lowerText.includes('simkl') || lowerName.includes('simkl')) {
+    return 'simkl';
+  }
+  if (lowerText.includes('movieid') && (lowerText.includes('imdbid') || lowerText.includes('tmdbid'))) {
+    return 'movielens';
+  }
+  if (lowerText.includes('tmdb') || lowerText.includes('themoviedb') || lowerName.includes('tmdb')) {
+    return 'tmdb';
+  }
+  return 'generic';
+}
+
+// Extracts items from a single file's text content
+function extractItemsFromFileContent(filename, text, source) {
+  const format = detectFileFormat(filename, text, source);
+  const items = [];
+
+  // Try JSON first if text looks like JSON
+  if (text.trim().startsWith('[') || text.trim().startsWith('{')) {
+    try {
+      const json = JSON.parse(text);
+      const rawList = Array.isArray(json) ? json : (json.movies || json.shows || json.items || json.results || json.history || json.watchlist || []);
+      if (Array.isArray(rawList)) {
+        rawList.forEach(entry => {
+          if (!entry) return;
+          const movie = entry.movie || entry;
+          const show = entry.show;
+          const ep = entry.episode;
+          const title = (show && show.title) || movie.title || movie.name || (entry.title || entry.name || '');
+          const year = (movie.year || (movie.release_date && movie.release_date.slice(0, 4)) || (show && show.year) || entry.year || '');
+          const ids = entry.ids || movie.ids || show.ids || {};
+          const imdbId = ids.imdb || movie.imdb_id || entry.imdb_id || (typeof movie.id === 'string' && movie.id.startsWith('tt') ? movie.id : '');
+          const tmdbId = ids.tmdb || movie.tmdb_id || entry.tmdb_id || (typeof movie.id === 'number' ? movie.id : '');
+          const type = (show || ep || entry.type === 'show' || entry.type === 'series' || entry.media_type === 'tv') ? 'series' : 'movie';
+          const poster = movie.poster_path ? ('https://image.tmdb.org/t/p/w500' + movie.poster_path) : (imdbId ? 'https://images.metahub.space/poster/medium/' + imdbId + '/img' : '');
+          if (imdbId || tmdbId || title) {
+            items.push({
+              id: imdbId || (tmdbId ? 'tmdb:' + tmdbId : title),
+              imdbId: imdbId || '',
+              tmdbId: tmdbId ? String(tmdbId) : '',
+              title: title,
+              name: title,
+              year: year ? String(year) : '',
+              type: type,
+              poster: poster,
+            });
+          }
+        });
+        return items;
+      }
+    } catch (e) {}
+  }
+
+  // Parse as CSV / Delimited rows
+  const rows = parseCsvToRows(text);
+  if (!rows.length) {
+    // Fallback: search for tt IDs line-by-line
+    const cr = String.fromCharCode(13);
+    const lf = String.fromCharCode(10);
+    const cleanText = text ? text.split(cr).join('') : '';
+    const lines = cleanText.split(lf);
+    const ttRgx = new RegExp('\\b(tt\\d{7,10})\\b');
+    const sepRgx = new RegExp('[,\\t]', 'g');
+    lines.forEach(l => {
+      const match = l.match(ttRgx);
+      if (match) {
+        const cleanTitle = l.replace(match[1], '').replace(sepRgx, ' ').trim() || match[1];
+        items.push({
+          id: match[1],
+          imdbId: match[1],
+          title: cleanTitle,
+          name: cleanTitle,
+          year: '',
+          type: 'movie',
+          poster: 'https://images.metahub.space/poster/medium/' + match[1] + '/img',
+        });
+      }
+    });
+    return items;
+  }
+
+  const digitRgx = new RegExp('^\\d+$');
+  rows.forEach(r => {
+    let imdbId = r.const || r.tconst || r.imdbid || r.imdb_id || '';
+    if (imdbId && !imdbId.startsWith('tt') && digitRgx.test(imdbId)) {
+      imdbId = 'tt' + imdbId.padStart(7, '0');
+    }
+    const tmdbId = r.tmdbid || r.tmdb_id || r.tmdb || '';
+    const title = r.title || r.name || r.originalname || r.movietitle || '';
+    const year = r.year || r.releaseyear || (r.releasedate ? r.releasedate.slice(0, 4) : '') || (r.date ? r.date.slice(0, 4) : '') || '';
+    const titleType = (r.titletype || r.type || r.mediatype || '').toLowerCase();
+    const type = (titleType.includes('tv') || titleType.includes('show') || titleType.includes('series') || titleType.includes('episode')) ? 'series' : 'movie';
+    const poster = imdbId ? ('https://images.metahub.space/poster/medium/' + imdbId + '/img') : '';
+
+    if (imdbId || tmdbId || title) {
+      items.push({
+        id: imdbId || (tmdbId ? 'tmdb:' + tmdbId : title),
+        imdbId: imdbId || '',
+        tmdbId: tmdbId ? String(tmdbId) : '',
+        title: title,
+        name: title,
+        year: year ? String(year) : '',
+        type: type,
+        poster: poster,
+      });
+    }
+  });
+
+  return items;
+}
+
+async function runUnifiedListImport() {
+  const btn = document.getElementById('btnUnifiedImport');
+  const resultBox = document.getElementById('unifiedImportResult');
+  const globalMarkWatchedCheck = document.getElementById('importAlsoMarkWatchedCheck');
+  const globalAlsoMarkWatched = globalMarkWatchedCheck ? globalMarkWatchedCheck.checked : false;
+
+  if (!discoveredImportCategories.length) {
+    alert('Please select at least one file to import.');
+    return;
+  }
+
+  const checkedCatCards = Array.from(document.querySelectorAll('.importCatCheck:checked'));
+  if (!checkedCatCards.length) {
+    alert('Please select at least one category/list to import.');
+    return;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Importing\u2026';
+  }
+
+  const selectedCategories = checkedCatCards.map(chk => {
+    const idx = parseInt(chk.dataset.catIndex, 10);
+    const cat = discoveredImportCategories[idx];
+    const targetSel = document.querySelector('.importCatTargetSelect[data-cat-index="' + idx + '"]');
+    const watchChk = document.querySelector('.importCatAlsoMarkWatchedCheck[data-cat-index="' + idx + '"]');
+    return {
+      cat: cat,
+      target: targetSel ? targetSel.value : cat.defaultTarget,
+      alsoMarkWatched: (watchChk ? watchChk.checked : false) || globalAlsoMarkWatched
+    };
+  });
+
+  const createdSummary = [];
+  const errors = [];
+  let totalWatchedAdded = 0;
+
+  for (const entry of selectedCategories) {
+    const cat = entry.cat;
+    const targetList = entry.target;
+    const alsoMarkWatched = entry.alsoMarkWatched;
+    const rawItems = cat.items;
+
+    if (resultBox) {
+      resultBox.innerHTML = '<p style="font-size:0.88rem; color:var(--muted);"><small>Processing ' + escapeHtml(cat.label) + ' (' + rawItems.length + ' items)&hellip;</small></p>';
+    }
+
+    // Resolve missing IMDb / Poster metadata via TMDB bulk-resolve
+    const toResolve = rawItems.filter(it => !it.imdbId && it.title);
+    if (toResolve.length > 0) {
+      try {
+        const res = await fetch(ORIGIN + '/api/bulk-resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: toResolve }),
+        });
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.resolved)) {
+          const resolvedMap = new Map();
+          data.resolved.forEach(r => {
+            if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
+          });
+          rawItems.forEach(it => {
+            if (!it.imdbId && it.title) {
+              const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
+              if (found && found.imdbId) {
+                it.imdbId = found.imdbId;
+                it.id = found.imdbId;
+                it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
+              }
+            }
+          });
+        }
+      } catch (e) {}
+    }
+
+    const finalItems = rawItems.map(it => ({
+      id: it.imdbId || it.id,
+      imdbId: it.imdbId || '',
+      tmdbId: it.tmdbId || '',
+      type: it.type || 'movie',
+      name: it.title || it.name,
+      title: it.title || it.name,
+      poster: it.poster || (it.imdbId ? ('https://images.metahub.space/poster/medium/' + it.imdbId + '/img') : ''),
+      year: it.year || ''
+    }));
+
+    let savedCount = 0;
+    let listDisplayName = '';
+
+    if (targetList === 'watchlist') {
+      listDisplayName = 'Watchlist';
+      const map = loadLocalCustomLists();
+      let wl = map['watchlist'];
+      if (!wl) {
+        wl = { slug: 'watchlist', localSlug: 'watchlist', name: 'Watchlist', description: 'Your personal Watchlist.', type: 'mixed', items: [], createdAt: Date.now(), updatedAt: Date.now() };
+      }
+      const existing = new Set((wl.items || []).map(i => String(i.id || i.imdbId)));
+      finalItems.forEach(it => {
+        const key = String(it.id || it.imdbId);
+        if (!existing.has(key)) {
+          wl.items.unshift(it);
+          existing.add(key);
+          savedCount++;
+        }
+      });
+      wl.updatedAt = Date.now();
+      map['watchlist'] = wl;
+      saveLocalCustomListsMap(map);
+    } else if (targetList === 'watch-history') {
+      listDisplayName = 'Watch History';
+      if (typeof addItemsToWatchHistory === 'function') {
+        const whResult = await addItemsToWatchHistory(finalItems);
+        savedCount = whResult.added;
+      }
+    } else if (targetList.startsWith('list:')) {
+      const slug = targetList.slice(5);
+      const map = loadLocalCustomLists();
+      const existingList = map[slug];
+      if (existingList) {
+        listDisplayName = existingList.name || slug;
+        existingList.items = Array.isArray(existingList.items) ? existingList.items : [];
+        const existing = new Set(existingList.items.map(i => String(i.id || i.imdbId)));
+        finalItems.forEach(it => {
+          const key = String(it.id || it.imdbId);
+          if (!existing.has(key)) {
+            existingList.items.unshift(it);
+            existing.add(key);
+            savedCount++;
+          }
+        });
+        existingList.updatedAt = Date.now();
+        map[slug] = existingList;
+        saveLocalCustomListsMap(map);
+      }
+    } else if (targetList.startsWith('new')) {
+      let newListName = targetList.startsWith('new:') ? targetList.slice(4).trim() : cat.defaultNewName;
+      if (!newListName) newListName = cat.label;
+      listDisplayName = newListName;
+      const hasMovies = finalItems.some(i => i.type === 'movie');
+      const hasShows = finalItems.some(i => i.type === 'series');
+      const listType = (hasMovies && !hasShows) ? 'movie' : ((!hasMovies && hasShows) ? 'series' : 'mixed');
+      const saveRes = await saveItemsAsNewCustomList(newListName, listType, finalItems, 'public');
+      if (saveRes.ok) {
+        savedCount = finalItems.length;
+      } else {
+        errors.push(newListName + ': ' + (saveRes.error || 'Could not save list.'));
+      }
+    }
+
+    if (alsoMarkWatched && targetList !== 'watch-history' && typeof addItemsToWatchHistory === 'function') {
+      const whResult = await addItemsToWatchHistory(finalItems);
+      totalWatchedAdded += whResult.added;
+    }
+
+    if (savedCount > 0) {
+      createdSummary.push(listDisplayName + ' (' + savedCount + ' items)');
+    }
+  }
+
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Import';
+  }
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof populateImportTargetLists === 'function') populateImportTargetLists();
+
+  let summaryHtml = '<div style="margin-top:12px;">';
+  if (createdSummary.length) {
+    summaryHtml += '<p class="testresult ok">\u2713 Successfully imported:<br>' + createdSummary.map(escapeHtml).join('<br>') + '</p>';
+  }
+  if (totalWatchedAdded) {
+    summaryHtml += '<p style="margin-top:6px; font-size:0.85rem; color:#7ce7b6;">\u2713 Marked ' + totalWatchedAdded + ' item(s) as watched in Watch History.</p>';
+  }
+  if (errors.length) {
+    summaryHtml += '<p class="testresult err" style="margin-top:8px;">' + errors.map(escapeHtml).join('<br>') + '</p>';
+  }
+  if (!createdSummary.length && !errors.length) {
+    summaryHtml += '<p style="color:var(--muted); font-size:0.85rem;">No new items were added (items may already exist in the target lists).</p>';
+  }
+  summaryHtml += '</div>';
+
+  if (resultBox) resultBox.innerHTML = summaryHtml;
+}
+
+

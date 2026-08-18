@@ -143,15 +143,9 @@ function getProviderIconBadge(name, group) {
   return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
 }
 
-// Builds the static HTML rows for a streaming quick-add panel from one of
-// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
-// 10"). Computed server-side (rather than in the client <script>) so the
-// URLs never have to fight the nested template-literal escaping used
-// elsewhere in the builder page's inline script.
 function buildStreamingRowsHtml(list, labelSuffix, group) {
   const rows = list.map((p) => {
     const label = labelSuffix ? `${p.name} ${labelSuffix}` : p.name;
-    const badge = getProviderIconBadge(p.name, group);
     let btns = '';
     // "See All" opens the real, paginated list-details page for this
     // card's own url (see openListDetailsPage, 23_client-list-management.js)
@@ -174,7 +168,6 @@ function buildStreamingRowsHtml(list, labelSuffix, group) {
     return `
     <div class="discover-chart-card">
       <div class="discover-chart-header">
-        ${badge}
         <div class="discover-chart-info">
           <div class="discover-chart-title">${p.name}</div>
           <div class="discover-chart-sub">${labelSuffix ? labelSuffix : (p.type === 'movie' ? 'Theatrical Box Office' : (p.type === 'series' ? 'Anime Trending' : 'Movies & Shows'))}</div>
@@ -244,6 +237,7 @@ function buildMdblistChartsHtml() {
 // row; entry.type (set by which button was clicked) picks the right side
 // of that chart's path map at fetch time.
 const TMDB_CHART_LISTS = [
+  { name: "New Releases (Last 30 Days)", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_shows" },
   { name: "TMDB Trending", movieUrl: "tmdb:chart:trending", showUrl: "tmdb:chart:trending" },
   { name: "TMDB Popular", movieUrl: "tmdb:chart:popular", showUrl: "tmdb:chart:popular" },
   { name: "TMDB Top Rated", movieUrl: "tmdb:chart:top_rated", showUrl: "tmdb:chart:top_rated" },
@@ -368,7 +362,6 @@ function jsStringArrayLiteral(arr) {
 
 function buildCombinedChartsHtml() {
   const rows = COMBINED_CHART_LISTS.map((p) => {
-    const badge = getProviderIconBadge(p.name, 'Combined Charts');
     // Same newline-joined multi-source url convention the "Streaming (All
     // Services)" starter preset already uses (09_page-shell.js) --
     // fetchMergedCatalog fans this out to every source in the list, so
@@ -378,7 +371,6 @@ function buildCombinedChartsHtml() {
     return `
     <div class="discover-chart-card">
       <div class="discover-chart-header">
-        ${badge}
         <div class="discover-chart-info">
           <div class="discover-chart-title">${p.name}</div>
           <div class="discover-chart-sub">Blended Multi-Source Catalog</div>
@@ -459,6 +451,7 @@ const KIDS_LISTS = [
   { name: "Rated G & Under", movieUrl: "tmdb:kids:g", showUrl: "tmdb:kids:g" },
   { name: "Rated PG & Under", movieUrl: "tmdb:kids:pg", showUrl: "tmdb:kids:pg" },
   { name: "Rated PG-13 & Under", movieUrl: "tmdb:kids:pg13", showUrl: "tmdb:kids:pg13" },
+  { name: "Netflix Kids", movieUrl: "tmdb:chart:netflixkids", showUrl: "tmdb:chart:netflixkids" },
 ];
 function buildKidsHtml() {
   return buildStreamingRowsHtml(KIDS_LISTS, "", "Kids");

@@ -105,12 +105,15 @@ async function ensureMdblistPopularLoaded() {
   if (mdblistPopularCache) return mdblistPopularCache;
   try {
     const res = await fetch(ORIGIN + '/api/toplists');
+    if (!res.ok) return [];
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return [];
     const data = await res.json();
-    mdblistPopularCache = data.ok ? data.lists.slice().sort((a, b) => (b.likes || 0) - (a.likes || 0)) : [];
+    mdblistPopularCache = data && data.ok && Array.isArray(data.lists) ? data.lists.slice().sort((a, b) => (b.likes || 0) - (a.likes || 0)) : [];
   } catch (e) {
     mdblistPopularCache = [];
   }
-  return mdblistPopularCache;
+  return mdblistPopularCache || [];
 }
 
 let traktPopularCache = null;
@@ -119,8 +122,11 @@ async function ensureTraktPopularLoaded() {
   try {
     const key = (document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
     const res = await fetch(ORIGIN + '/api/trakt-popular-lists' + (key ? '?traktKey=' + encodeURIComponent(key) : ''));
+    if (!res.ok) return [];
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return [];
     const data = await res.json();
-    if (data.ok && Array.isArray(data.lists)) {
+    if (data && data.ok && Array.isArray(data.lists)) {
       traktPopularCache = data.lists;
       return traktPopularCache;
     }
@@ -144,15 +150,30 @@ async function runListSearch() {
   }
   box.innerHTML = '<p><small>Searching\u2026</small></p>';
 
+  try {
+    fetch(ORIGIN + '/api/track-search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: q }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) {}
+
   const qLower = q.toLowerCase();
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
   const traktKey = document.getElementById('traktKeyInput').value.trim();
-  const [mdblistAll, traktResult, myListsResult] = await Promise.all([
+
+  const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
     ensureMdblistPopularLoaded(),
     fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
-      .then((r) => r.json())
+      .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
       .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
     fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
-      .then((r) => r.json())
+      .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
+      .catch(() => ({ ok: false, lists: [] })),
+    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
+      .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
   ]);
 
@@ -161,12 +182,22 @@ async function runListSearch() {
     .slice(0, 30);
   const traktMatches = traktResult.ok ? traktResult.lists.slice(0, 30) : [];
   const myListsMatches = myListsResult.ok ? myListsResult.lists : [];
+  const tmdbMatches = tmdbResult.ok ? tmdbResult.lists : [];
 
-  renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches);
+  renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches);
 }
 
-function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, targetBox) {
-  const box = targetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
+function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox) {
+  let realTmdbMatches = tmdbMatches;
+  let realTargetBox = targetBox;
+  if (tmdbMatches && (tmdbMatches.nodeType || !Array.isArray(tmdbMatches))) {
+    if (tmdbMatches && tmdbMatches.nodeType) {
+      realTargetBox = tmdbMatches;
+    }
+    realTmdbMatches = [];
+  }
+  if (!Array.isArray(realTmdbMatches)) realTmdbMatches = [];
+  const box = realTargetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
   if (!box) return;
   const alreadyAdded = new Set();
   document.querySelectorAll('#lists .entry').forEach((entry) => {
@@ -178,6 +209,38 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
 
   const combinedCards = [];
 
+  // Build one .list-card per TMDB collection / chart result
+  realTmdbMatches.forEach((l) => {
+    const added = alreadyAdded.has(l.url + '|' + l.type);
+    const alreadyLikedExt = getLikedListsSet().has(l.url);
+    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
+    const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
+      '<div class="list-card-header">' +
+      '<div class="list-card-body">' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-meta">' +
+      '<span style="color:var(--brand); font-weight:600;">' + escapeHtml(l.user) + '</span>' +
+      '<span class="list-card-meta-sep">&middot;</span>' +
+      '<span>' + typeLabel + '</span>' +
+      (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + escapeHtml(l.items) + '</span>' : '') +
+      '</div>' +
+      '</div>' +
+      '<div class="list-card-actions">' +
+      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
+      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
+      '</button>' +
+      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+      (added ? 'style="color:var(--danger);"' : '') +
+      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '">' +
+      (added ? 'Remove' : '+ Add') +
+      '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
+      '</div>';
+    combinedCards.push({ likes: 50, html: cardHtml });
+  });
+
   // Build one .list-card per mdblist result
   mdblistMatches.forEach((l) => {
     const added = alreadyAdded.has(l.url + '|' + l.type);
@@ -186,7 +249,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
       '<div class="list-card-header">' +
       '<div class="list-card-body">' +
-      '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
       '<div class="list-card-meta">' +
       '<span>by ' + escapeHtml(l.user) + '</span>' +
       '<span class="list-card-meta-sep">&middot;</span>' +
@@ -244,7 +307,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     const cardHtml = '<div class="list-card" data-list-type="' + cardType + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(viewType) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
       '<div class="list-card-header">' +
       '<div class="list-card-body">' +
-      '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
       '<div class="list-card-meta">' +
       '<span>by ' + escapeHtml(l.user) + '</span>' +
       '<span class="list-card-meta-sep">&middot;</span>' +
@@ -279,7 +342,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.creatorName || 'Anonymous') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
       '<div class="list-card-header">' +
       '<div class="list-card-body">' +
-      '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
       '<div class="list-card-meta">' +
       '<span>by ' + escapeHtml(l.creatorName || 'Anonymous') + '</span>' +
       '<span class="list-card-meta-sep">&middot;</span>' +
@@ -342,13 +405,17 @@ async function populateSearchResultPosters() {
     // fetchTraktWatchlist/fetchTraktHistory, which throw immediately
     // without an accessToken, traktKey alone isn't enough for either.
     if (typeof traktAccessToken !== 'undefined' && traktAccessToken) payload.traktAccessToken = traktAccessToken;
+    if (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) payload.mdblistAccessToken = mdblistAccessToken;
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       cache: 'no-store',
     });
-    return res.json();
+    if (!res.ok) return { ok: false };
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return { ok: false };
+    return await res.json();
   }
   // A list card that mixes movies and shows (MDBList/Trakt lists don't
   // have to be one or the other) gets marked data-type="mixed" by its
@@ -418,11 +485,13 @@ async function populateSearchResultPosters() {
               if (isMobileEnd) {
                 overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
-              const isEndTile = isMobileEnd || isDesktopEnd;
-              inner += '<div class="list-card-mini-poster-tile' + (isEndTile ? ' searchViewListBtn' : '') + '" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
-                '<div class="list-card-mini-poster-img-wrap' + (isEndTile ? '' : ' clickable-poster') + '" ' + (isEndTile ? '' : 'data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '"') + '>' +
+              if (isDesktopEnd) {
+                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+              }
+              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
-                  (isEndTile ? '' : '<div class="poster-add-overlay">+</div>') +
+                  '<div class="poster-add-overlay">+</div>' +
                   overlays +
                 '</div>' +
                 '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
@@ -532,6 +601,32 @@ document.addEventListener('click', async (e) => {
       addBtn.textContent = 'Remove';
       addBtn.style.color = 'var(--danger)';
       showAddedToast('Added "' + listName + '" to your Catalogs.');
+    }
+    return;
+  }
+  const curatedAddBtn = e.target.closest('.curatedAddBtn');
+  if (curatedAddBtn) {
+    const listTitle = curatedAddBtn.dataset.title || 'Curated List';
+    const listType = curatedAddBtn.dataset.type || 'movie';
+    const customUrl = curatedAddBtn.dataset.url || '';
+    const isAdded = curatedAddBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && (isListAddedToConfig(null, listType, customUrl) || isListAddedToConfig(customUrl, listType)));
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listType, customUrl);
+        removeListFromConfig(customUrl, listType);
+      }
+      curatedAddBtn.classList.remove('is-added', 'secondary');
+      curatedAddBtn.classList.add('primary');
+      curatedAddBtn.textContent = '+ Add';
+      curatedAddBtn.style.color = '';
+      showAddedToast('Removed "' + listTitle + '" from your Catalogs.');
+    } else {
+      addRow(listTitle, customUrl, listType, true, 'Curated');
+      curatedAddBtn.classList.add('is-added', 'secondary');
+      curatedAddBtn.classList.remove('primary');
+      curatedAddBtn.textContent = 'Remove';
+      curatedAddBtn.style.color = 'var(--danger)';
+      showAddedToast('Added "' + listTitle + '" to your Catalogs.');
     }
     return;
   }
@@ -691,6 +786,7 @@ async function loadPopularListsFeed(forceRefresh) {
 }
 
 function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items) {
+  items = Array.isArray(items) ? items : [];
   const previewPosters = items.slice(0, 9);
   const totalCount = items.length;
 
@@ -704,11 +800,10 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
     if (isDesktopEnd) {
       overlays += '<div class="list-card-count-overlay desktop-only curatedViewBtn" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
-    const isEndTile = isMobileEnd || isDesktopEnd;
-    return '<div class="list-card-mini-poster-tile' + (isEndTile ? ' curatedViewBtn' : '') + '" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
-      '<div class="list-card-mini-poster-img-wrap' + (isEndTile ? '' : ' clickable-poster') + '" ' + (isEndTile ? '' : 'data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '"') + '>' +
+    return '<div class="list-card-mini-poster-tile" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
+      '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
         '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
-        (isEndTile ? '' : '<div class="poster-add-overlay">+</div>') +
+        '<div class="poster-add-overlay">+</div>' +
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(s.name) + '</div>' +
@@ -718,6 +813,13 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
 
   window._curatedRecs = window._curatedRecs || {};
   window._curatedRecs[customUrl] = { title, type, items };
+
+  const isAdded = typeof isListAddedToConfig === 'function' && (isListAddedToConfig(null, type, customUrl) || isListAddedToConfig(customUrl, type));
+  const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary curatedAddBtn is-added' : 'primary curatedAddBtn') + '" ' +
+    (isAdded ? 'style="color:var(--danger);"' : '') +
+    ' data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
+    (isAdded ? 'Remove' : '+ Add') +
+  '</button>';
 
   return '<div class="list-card" data-name="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
     '<div class="list-card-header">' +
@@ -732,7 +834,7 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
         '</div>' +
       '</div>' +
       '<div class="list-card-actions">' +
-        '<button type="button" class="lc-btn primary curatedViewBtn" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">View All</button>' +
+        addBtnHtml +
       '</div>' +
     '</div>' +
     '<div class="list-card-posters">' + postersHtml + '</div>' +
@@ -752,10 +854,16 @@ async function loadCuratedListsFeed(forceRefresh) {
     }
   } catch (e) {}
 
-  const watchHistory = customListsMap['watch-history'] || (typeof getOrCreateWatchHistoryList === 'function' ? getOrCreateWatchHistoryList() : null) || { items: [] };
+  let totalWatchHistoryCount = 0;
+  Object.keys(customListsMap).forEach(k => {
+    const l = customListsMap[k];
+    if (k === 'watch-history' || k.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
+      totalWatchHistoryCount += (l && l.items) ? l.items.length : 0;
+    }
+  });
   const continueWatching = customListsMap['continue-watching'] || (typeof getOrCreateContinueWatchingList === 'function' ? getOrCreateContinueWatchingList() : null) || { items: [] };
 
-  const currentCount = (watchHistory.items ? watchHistory.items.length : 0) + (continueWatching.items ? continueWatching.items.length : 0);
+  const currentCount = totalWatchHistoryCount + (continueWatching.items ? continueWatching.items.length : 0);
   const historyChanged = (currentCount !== lastCuratedWatchCount);
 
   if (curatedListsFeedLoaded && !forceRefresh && !historyChanged && container.children.length > 0) {
@@ -771,82 +879,103 @@ async function loadCuratedListsFeed(forceRefresh) {
       }
     } catch (e) {}
 
-    const watchHistory = customListsMap['watch-history'] || (typeof getOrCreateWatchHistoryList === 'function' ? getOrCreateWatchHistoryList() : null) || { items: [] };
-    const continueWatching = customListsMap['continue-watching'] || (typeof getOrCreateContinueWatchingList === 'function' ? getOrCreateContinueWatchingList() : null) || { items: [] };
-    
-    let whItems = (watchHistory && Array.isArray(watchHistory.items)) ? watchHistory.items : [];
+    const customLists = Object.values(customListsMap).filter(Boolean);
+    let whItems = [];
+    Object.keys(customListsMap).forEach(k => {
+      const l = customListsMap[k];
+      if (k === 'watch-history' || k.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
+        if (l && Array.isArray(l.items)) whItems.push(...l.items);
+      }
+    });
+    if (!whItems.length && typeof getOrCreateWatchHistoryList === 'function') {
+      const defWh = getOrCreateWatchHistoryList();
+      if (defWh && Array.isArray(defWh.items)) whItems.push(...defWh.items);
+    }
     if (!whItems.length) {
       try {
         const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
         if (Array.isArray(rawWh)) whItems = rawWh;
       } catch (e) {}
     }
+    const continueWatching = customListsMap['continue-watching'] || (typeof getOrCreateContinueWatchingList === 'function' ? getOrCreateContinueWatchingList() : null) || { items: [] };
     let cwItems = (continueWatching && Array.isArray(continueWatching.items)) ? continueWatching.items : [];
 
-    const allWatched = [...cwItems, ...whItems];
+    const watchlist = customListsMap['watchlist'] || { items: [] };
+    let wlItems = (watchlist && Array.isArray(watchlist.items)) ? watchlist.items : [];
+
+    const otherCustomItems = [];
+    Object.keys(customListsMap).forEach((k) => {
+      if (k !== 'watch-history' && k !== 'continue-watching' && k !== 'watchlist') {
+        const l = customListsMap[k];
+        if (l && Array.isArray(l.items)) otherCustomItems.push(...l.items);
+      }
+    });
+    if (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
+      lastCreatorListsData.forEach((l) => {
+        if (l && Array.isArray(l.items)) otherCustomItems.push(...l.items);
+      });
+    }
+
+    const allWatchedAndSaved = [...cwItems, ...whItems, ...wlItems, ...otherCustomItems];
 
     const movieIds = [];
     const showIds = [];
     const seenShowIds = new Set();
     const seenMovieIds = new Set();
 
-    for (const it of allWatched) {
+    for (const it of allWatchedAndSaved) {
       if (!it) continue;
-      const showId = it.showId || (it.type === 'series' ? it.id : null);
-      if (showId && !seenShowIds.has(String(showId))) {
-        seenShowIds.add(String(showId));
-        showIds.push(String(showId));
-      } else if (it.type === 'movie' || (!it.showId && it.type !== 'episode')) {
-        const movieId = it.id || it.imdbId;
-        if (movieId && !seenMovieIds.has(String(movieId))) {
-          seenMovieIds.add(String(movieId));
-          movieIds.push(String(movieId));
+      const rawShowId = it.showId || (it.type === 'series' || it.type === 'tv' || it.kind === 'series' || it.kind === 'tv' || it.showTitle ? (it.id || it.imdbId) : null);
+      if (rawShowId) {
+        const cleanShowId = String(rawShowId).replace(/^tmdb:/, '').split(':')[0].trim();
+        if (cleanShowId && !seenShowIds.has(cleanShowId)) {
+          seenShowIds.add(cleanShowId);
+          showIds.push(cleanShowId);
+        }
+      } else {
+        const rawMovieId = it.imdbId || it.id;
+        if (rawMovieId) {
+          const cleanMovieId = String(rawMovieId).replace(/^tmdb:/, '').split(':')[0].trim();
+          if (cleanMovieId && !seenMovieIds.has(cleanMovieId)) {
+            seenMovieIds.add(cleanMovieId);
+            movieIds.push(cleanMovieId);
+          }
         }
       }
     }
 
     const likedUrls = [...getLikedListsSet()];
-    const customLists = (typeof getLocalCustomLists === 'function' ? getLocalCustomLists() : []) || [];
-
-    if (!movieIds.length && !showIds.length && !likedUrls.length && !customLists.length) {
-      container.innerHTML =
-        '<div style="text-align:center; padding:32px 16px; background:var(--card-bg, rgba(255,255,255,0.03)); border:1px solid var(--border); border-radius:14px; margin-top:10px;">' +
-          '<div style="font-size:2rem; margin-bottom:8px;">✨</div>' +
-          '<h3 style="margin:0 0 6px; font-size:1.05rem;">Personalized For You</h3>' +
-          '<p style="margin:0 auto 14px; max-width:420px; font-size:0.85rem; color:var(--muted);">' +
-            'Watch movies or shows with Auto-Track enabled, or like and create custom lists to unlock smart recommendations and similar lists here.' +
-          '</p>' +
-          '<div style="display:flex; justify-content:center; gap:8px;">' +
-            '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;all&quot;)">Explore Discover</button>' +
-          '</div>' +
-        '</div>';
-      return;
-    }
-
     const tmdbKey = (document.getElementById('tmdbKeyInput') ? document.getElementById('tmdbKeyInput').value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
     
-    // Pass up to 12 recent movie IDs and 12 recent show IDs for rich diverse recommendations
+    // Pass recent movie IDs and show IDs for rich recommendations
     const sampleMovieIds = movieIds.slice(0, 12);
     const sampleShowIds = showIds.slice(0, 12);
 
     const [recData, mdblists, traktLists] = await Promise.all([
-      (sampleMovieIds.length || sampleShowIds.length)
-        ? fetch(ORIGIN + '/api/recommendations', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ movieIds: sampleMovieIds, showIds: sampleShowIds, tmdbKey })
-          }).then(r => r.json()).catch(() => ({ ok: false }))
-        : Promise.resolve({ ok: false }),
-      ensureMdblistPopularLoaded(),
-      ensureTraktPopularLoaded()
+      fetch(ORIGIN + '/api/recommendations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ movieIds: sampleMovieIds, showIds: sampleShowIds, tmdbKey })
+      }).then(async (r) => {
+        if (!r.ok) return { ok: false };
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.includes('application/json')) return { ok: false };
+        return await r.json();
+      }).catch(() => ({ ok: false })),
+      ensureMdblistPopularLoaded().catch(() => []),
+      ensureTraktPopularLoaded().catch(() => [])
     ]);
 
-    const publicListsPool = [...(mdblists || []), ...(traktLists || [])];
+    const chartCatalogList = (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES))
+      ? CHART_SLUG_ENTRIES.map(c => ({ name: c.name, url: c.movieUrl || c.showUrl || c.url, type: (c.showUrl && c.showUrl.includes('shows')) ? 'series' : 'movie', user: 'Curated' }))
+      : [];
+
+    const publicListsPool = [...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
     let sectionsHtml = '';
 
     // Section A: Recommended Movies List
     if (recData && recData.ok && recData.movies && recData.movies.length) {
-      sectionsHtml += buildCuratedRecommendationCard('Recommended Movies', 'movie', 'custom:curated:recommended-movies', 'Based on your movie watch history', recData.movies);
+      sectionsHtml += buildCuratedRecommendationCard('Recommended Movies', 'movie', 'custom:curated:recommended-movies', 'Based on your movie watch history & watchlist', recData.movies);
     }
 
     // Section B: Recommended Shows List
@@ -854,29 +983,38 @@ async function loadCuratedListsFeed(forceRefresh) {
       sectionsHtml += buildCuratedRecommendationCard('Recommended Shows', 'series', 'custom:curated:recommended-shows', 'Based on your series watch history & continue watching', recData.shows);
     }
 
-    // Section C: Lists Similar to Liked Lists
-    if (likedUrls.length && publicListsPool.length) {
-      const likedKeywords = likedUrls.map(u => {
-        const parts = u.split('/').filter(Boolean);
-        return parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ') : '';
-      }).filter(Boolean);
-
-      const similarToLiked = publicListsPool.filter(l => {
-        if (likedUrls.includes(l.url)) return false;
-        const nameLower = (l.name || '').toLowerCase();
-        return likedKeywords.some(kw => kw.length > 3 && nameLower.includes(kw.toLowerCase()));
-      }).slice(0, 5);
-
-      if (similarToLiked.length) {
-        sectionsHtml += '<div style="margin-top:24px; margin-bottom:8px;"><h3 style="font-size:0.95rem; margin:0 0 2px;">Lists Similar to Lists You Liked</h3><p style="margin:0; font-size:0.8rem; color:var(--muted);">Public community lists based on your liked lists</p></div>';
-        const alreadyAdded = new Set();
-        document.querySelectorAll('#lists .entry').forEach(function(entry) {
-          const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
-          entry.querySelectorAll('.url').forEach(function(el) {
-            alreadyAdded.add(el.value.trim() + '|' + t);
-          });
+    // Section C: Recommended Community & Curated Lists
+    if (publicListsPool.length) {
+      const alreadyAdded = new Set();
+      document.querySelectorAll('#lists .entry').forEach(function(entry) {
+        const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+        entry.querySelectorAll('.url').forEach(function(el) {
+          alreadyAdded.add(el.value.trim() + '|' + t);
         });
-        sectionsHtml += similarToLiked.map(l => {
+      });
+
+      let recommendedLists = [];
+      if (likedUrls.length) {
+        const likedKeywords = likedUrls.map(u => {
+          const parts = u.split('/').filter(Boolean);
+          return parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ') : '';
+        }).filter(Boolean);
+
+        recommendedLists = publicListsPool.filter(l => {
+          if (likedUrls.includes(l.url)) return false;
+          const nameLower = (l.name || '').toLowerCase();
+          return likedKeywords.some(kw => kw.length > 3 && nameLower.includes(kw.toLowerCase()));
+        }).slice(0, 6);
+      }
+
+      if (!recommendedLists.length) {
+        // Pick top popular & trending community lists
+        recommendedLists = publicListsPool.filter(l => !alreadyAdded.has(l.url + '|' + (l.type || 'movie'))).slice(0, 8);
+      }
+
+      if (recommendedLists.length) {
+        sectionsHtml += '<div style="margin-top:24px; margin-bottom:8px;"><h3 style="font-size:0.95rem; margin:0 0 2px;">Recommended Community Lists</h3><p style="margin:0; font-size:0.8rem; color:var(--muted);">Top community and curated lists you might like</p></div>';
+        sectionsHtml += recommendedLists.map(l => {
           const type = l.type || 'movie';
           const added = alreadyAdded.has(l.url + '|' + type);
           const alreadyLiked = getLikedListsSet().has(l.url);
@@ -884,13 +1022,13 @@ async function loadCuratedListsFeed(forceRefresh) {
           return '<div class="list-card" data-list-type="' + escapeAttr(type) + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
             '<div class="list-card-header">' +
               '<div class="list-card-body">' +
-                '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+                '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
                 '<div class="list-card-meta">' +
                   '<span>by ' + escapeHtml(author) + '</span>' +
                   '<span class="list-card-meta-sep">&middot;</span>' +
                   '<span>' + (type === 'series' ? 'Shows' : 'Movies') + '</span>' +
                   (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
-                  '<span class="list-card-meta-sep">&middot;</span><span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
+                  '<span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
                 '</div>' +
               '</div>' +
               '<div class="list-card-actions">' +
@@ -935,7 +1073,7 @@ async function loadCuratedListsFeed(forceRefresh) {
           return '<div class="list-card" data-list-type="' + escapeAttr(type) + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
             '<div class="list-card-header">' +
               '<div class="list-card-body">' +
-                '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+                '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
                 '<div class="list-card-meta">' +
                   '<span>by ' + escapeHtml(author) + '</span>' +
                   '<span class="list-card-meta-sep">&middot;</span>' +
@@ -974,18 +1112,28 @@ async function loadCuratedListsFeed(forceRefresh) {
     lastCuratedWatchCount = currentCount;
     curatedListsFeedLoaded = true;
   } catch (err) {
-    container.innerHTML = '<p class="testresult err">&#x2717; Error loading curated lists.</p>';
+    console.error('Curated lists error:', err);
+    container.innerHTML =
+      '<div style="text-align:center; padding:24px 16px; background:var(--card-bg); border:1px solid var(--border); border-radius:14px;">' +
+        '<p style="margin:0 0 10px; font-size:0.88rem; color:var(--muted);">Watch more items or like community lists to build personalized recommendations.</p>' +
+        '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;all&quot;)">Explore Discover</button>' +
+      '</div>';
   }
 }
 
-async function renderLikedListsFeed() {
+async function renderLikedListsFeed(forceRefresh) {
   const container = document.getElementById('likedListsFeed');
   if (!container) return;
   const likedUrls = [...getLikedListsSet()];
   if (!likedUrls.length) {
     container.innerHTML = '<p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p>';
+    container.dataset.likedCount = '0';
     return;
   }
+  if (!forceRefresh && container.dataset.likedCount === String(likedUrls.length) && container.children.length > 0 && !container.innerText.includes('Loading')) {
+    return;
+  }
+  container.dataset.likedCount = String(likedUrls.length);
   container.innerHTML = '<p style="color:var(--muted); font-size:0.88rem;">Loading your ' + likedUrls.length + ' liked list(s)...</p>';
   try {
     const toplists = await ensureMdblistPopularLoaded();
@@ -1034,7 +1182,7 @@ function render5PosterListsFeed(container, lists) {
     return '<div class="list-card" data-list-type="' + escapeAttr(type) + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>by ' + escapeHtml(author) + '</span>' +
             '<span class="list-card-meta-sep">&middot;</span>' +
@@ -1114,7 +1262,8 @@ function isEpisodeAired(ep) {
   if (!ep || !ep.air_date) return false;
   const airDate = new Date(ep.air_date);
   if (isNaN(airDate.getTime())) return false;
-  return airDate.getTime() <= Date.now();
+  // Compare against end of current day UTC (with 12h buffer for timezone differences)
+  return airDate.getTime() <= (Date.now() + 12 * 3600 * 1000);
 }
 
 function openEpisodeDetails(epNum) {
@@ -1151,6 +1300,36 @@ function openEpisodeDetails(epNum) {
   showModal(innerHtml, 'modal-card-wide');
 }
 
+function isItemWatched(id, tmdbId, imdbId) {
+  const idsToCheck = [id, tmdbId, imdbId, (tmdbId ? 'tmdb:' + tmdbId : null), (id ? 'tmdb:' + id : null)].filter(Boolean).map(String);
+  if (window._watchedItemIds) {
+    if (idsToCheck.some(i => window._watchedItemIds.has(i))) return true;
+  }
+  if (window._fullyWatchedShowIds) {
+    if (idsToCheck.some(i => window._fullyWatchedShowIds.has(i))) return true;
+  }
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    for (const key of Object.keys(map)) {
+      const l = map[key];
+      if (key === 'watch-history' || key.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
+        if (l && Array.isArray(l.items)) {
+          if (l.items.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)) || idsToCheck.includes(String(it.showId)))) {
+            return true;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  try {
+    const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
+    if (Array.isArray(rawWh) && rawWh.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)))) {
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 // opts.skipPushState is set by the popstate handler and the initial
 // deep-link check (both in 24_client-backup-restore-presets.js) -- in
 // either case the browser's URL already points here, so pushing another
@@ -1159,27 +1338,42 @@ async function openItemDetailsModal(id, type, opts) {
   opts = opts || {};
   if (!id || id.startsWith('channel_')) return;
   
-  const currentActiveTab = document.querySelector('.tab-btn.active')?.dataset.tab || 'discover';
-  if (currentActiveTab !== 'item-details' && currentActiveTab !== 'list-details') {
+  const visiblePanel = document.querySelector('.tab-panel:not([hidden])')?.dataset?.tabPanel;
+  const currentActiveTab = visiblePanel || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || window._originTab || 'discover';
+  if (currentActiveTab === 'list-details') {
+    window._listScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+    window._previousTab = 'list-details';
+  } else if (currentActiveTab !== 'item-details') {
     window._previousTab = currentActiveTab;
     window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
   }
   switchTab('item-details');
+  window.scrollTo({ top: 0, behavior: 'instant' });
 
   // A real, bookmarkable/shareable URL for this specific title.
   if (!opts.skipPushState) {
     const params = new URLSearchParams({ id: id, type: type || 'movie' });
-    history.pushState({ view: 'item', id: id, type: type }, '', '#/item?' + params.toString());
+    history.pushState({ view: 'item', id: id, type: type, fromList: (currentActiveTab === 'list-details'), listScrollY: window._listScrollY }, '', '#/item?' + params.toString());
   }
   
   const body = document.getElementById('itemDetailsBody');
   body.innerHTML = '<p style="color:var(--muted); text-align:center; padding: 40px;">Fetching information from TMDB...</p>';
   
   const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
   
   try {
     const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(id) + '&tmdbKey=' + encodeURIComponent(tmdbKey) + (type ? '&type=' + encodeURIComponent(type) : ''));
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      let parsed = null;
+      try { parsed = JSON.parse(errText); } catch(e) {}
+      throw new Error((parsed && parsed.error) || 'Not found or TMDB error');
+    }
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      throw new Error('Server returned non-JSON response.');
+    }
     const data = await res.json();
     if (!data.ok || !data.details) throw new Error(data.error || 'Failed to load details');
     
@@ -1261,18 +1455,16 @@ async function openItemDetailsModal(id, type, opts) {
           '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">' + escapeHtml(d.title) + '</h1>' +
           '<div style="margin-bottom:16px; color:var(--text); font-size:1.05rem;">' + infoHtml + '</div>' +
           '<p style="font-size:1.05rem; line-height:1.6; color:var(--text); margin-bottom: 24px;">' + escapeHtml(d.overview || 'No overview available.') + '</p>' +
-          '<div style="display:flex; gap:16px; flex-wrap:wrap;">' +
-            '<button type="button" class="lc-btn primary" onclick="openSelectListModal(&quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;)">+ Add to list</button>' +
-            (type === 'movie' ?
-              '<button type="button" id="btnMarkWatched" class="lc-btn ' + (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(&quot;' + escapeAttr(d.id) + '&quot;, &quot;movie&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">' +
-                (window._watchedItemIds && window._watchedItemIds.has(String(d.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
+          '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
+            '<button type="button" class="lc-btn primary" onclick="openSelectListModal(&quot;' + escapeAttr(d.id) + '&quot;, &quot;' + escapeAttr((d.seasonsData && d.seasonsData.length > 0) || type === 'series' || d.type === 'series' || d.type === 'tv' ? 'series' : 'movie') + '&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">+ Add to list</button>' +
+            (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeAttr(d.id) + '&quot;)">' +
+                (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
               '</button>'
-              : '') +
-            (type === 'series' ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(d.id)) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeAttr(d.id) + '&quot;)">' +
-                (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(d.id)) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
-              '</button>'
-              : '') +
+              :
+              '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="toggleWatchStatus(&quot;' + escapeAttr(d.id) + '&quot;, &quot;movie&quot;, &quot;' + escapeAttr(d.title) + '&quot;, &quot;' + escapeAttr(d.poster || '') + '&quot;)">' +
+                (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
+              '</button>') +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -1305,7 +1497,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
   grid.innerHTML = '<div style="grid-column: 1 / -1; text-align:center; padding: 20px; color:var(--muted);">Loading episodes...</div>';
   
   const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
   
   try {
     const d = window._currentItemDetails;
@@ -1339,18 +1531,20 @@ function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
   
-  // Scrape available Custom Lists from the configured lists DOM
-  // Only show lists that are properly saved (have a localSlug or creatorSlug)
-  // Unsaved drafts (user dismissed visibility modal) are excluded
+  // Ensure Watchlist exists locally
+  if (typeof loadLocalCustomLists === 'function' && typeof backfillAutoTrackedListSlugs === 'function') {
+    const m = loadLocalCustomLists();
+    backfillAutoTrackedListSlugs(m);
+  }
+
+  // Scrape available Custom Lists from the configured lists DOM, local lists, and creator lists
   const customLists = [];
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
     if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
       try {
         const payload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
-        // Only include lists that have been properly saved
         if (!payload.localSlug && !payload.creatorSlug) return;
-        // Filter by item type: if list has a type (movie or series), it must match the item being added OR be mixed
         if (payload.type && payload.type !== 'mixed' && payload.type !== type) return;
         const nameInput = row.querySelector('.name');
         customLists.push({
@@ -1369,15 +1563,35 @@ function openSelectListModal(id, type, title, poster) {
       const l = localMap[slug];
       if (!l) return;
       if (l.type && l.type !== 'mixed' && l.type !== type) return;
-      const existing = customLists.find(c => c.url && (c.url.includes(slug) || (c.name && c.name === l.name)));
+      const existing = customLists.find(c => c.url && (c.url.includes(slug) || (c.name && c.name.toLowerCase() === (l.name || '').toLowerCase())));
       if (!existing) {
         customLists.push({
           name: l.name || 'Custom List',
-          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: l.type || 'movie', items: l.items || [], shuffle: false })
+          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: l.type || 'mixed', items: l.items || [], shuffle: false }),
+          row: null
         });
       }
     });
   } catch(e) {}
+
+  if (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
+    lastCreatorListsData.forEach(l => {
+      if (!l || !l.slug) return;
+      if (l.type && l.type !== 'mixed' && l.type !== type) return;
+      const existing = customLists.find(c => c.url && (c.url.includes(l.slug) || (c.name && c.name.toLowerCase() === (l.name || '').toLowerCase())));
+      if (!existing) {
+        customLists.push({
+          name: l.name || 'Custom List',
+          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), creatorSlug: l.slug, type: l.type || 'mixed', items: l.items || [], shuffle: false, visibility: l.visibility || 'private' }),
+          row: null
+        });
+      }
+    });
+  }
+
+  // Store globally so submitCreateListModal and addSelectedListsBtn can access it
+  window._selectListModalTempLists = customLists;
+  window._selectListModalCurrentItem = { id: id, type: type, title: title, poster: poster };
 
   let html = '';
   if (customLists.length === 0) {
@@ -1403,7 +1617,7 @@ function openSelectListModal(id, type, title, poster) {
       try {
         const payloadStr = list.url.slice('customlist:v1:'.length);
         const payload = JSON.parse(payloadStr);
-        isChecked = payload.items.some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
+        isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
       } catch(e) {}
       
       html += 
@@ -1412,10 +1626,6 @@ function openSelectListModal(id, type, title, poster) {
           '<input type="checkbox" class="list-select-cb" data-idx="' + idx + '" ' + (isChecked ? 'checked ' : '') + 'style="width:20px; height:20px; cursor:pointer; accent-color:#003366;">' +
         '</label>';
     });
-    
-    // Store globally so the onclick handler can access it
-    window._selectListModalTempLists = customLists;
-    window._selectListModalCurrentItem = { id: id, type: type, title: title, poster: poster };
   }
   
   body.innerHTML = html;
@@ -1438,16 +1648,18 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   btn.disabled = true;
   btn.textContent = 'Saving...';
   
-  let finalImdbId = id;
+  let cleanId = String(id || '').trim();
+  while (cleanId.startsWith('tmdb:')) cleanId = cleanId.slice(5).trim();
+  let finalImdbId = cleanId;
   if (!String(finalImdbId).startsWith('tt')) {
-    const endpoint = type === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
+    const endpoint = (type === 'series' || type === 'tv') ? '/api/resolve-show?tmdbId=' : '/api/resolve-movie?tmdbId=';
     try {
-      const res = await fetch(endpoint + finalImdbId);
+      const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanId));
       const data = await res.json();
-      if (data.ok) finalImdbId = data.imdbId;
-      else finalImdbId = 'tmdb:' + finalImdbId;
+      if (data.ok && data.imdbId) finalImdbId = data.imdbId;
+      else finalImdbId = 'tmdb:' + cleanId;
     } catch(e) {
-      finalImdbId = 'tmdb:' + finalImdbId;
+      finalImdbId = 'tmdb:' + cleanId;
     }
   }
 
@@ -1483,18 +1695,26 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
   const list = window._selectListModalTempLists[listIdx];
   
   try {
-    const urlInput = list.row.querySelector('.url');
-    if (!urlInput) return false;
-    const payloadStr = urlInput.value.slice('customlist:v1:'.length);
-    const payload = JSON.parse(payloadStr);
+    let payload = null;
+    if (list.row) {
+      const urlInput = list.row.querySelector('.url');
+      if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
+        payload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+      }
+    }
+    if (!payload && list.url && list.url.startsWith('customlist:v1:')) {
+      payload = JSON.parse(list.url.slice('customlist:v1:'.length));
+    }
+    if (!payload) return false;
+    if (!Array.isArray(payload.items)) payload.items = [];
     
-    // We check for existing items using imdbId, or fall back to checking originalId (tmdb fallback)
-    const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId));
+    // Check for existing items using imdbId or originalId
+    const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
     const exists = idx !== -1;
     
     let changed = false;
     if (shouldBeInList && !exists) {
-      payload.items.push({ imdbId, type, title, poster: poster || undefined });
+      payload.items.push({ imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined });
       changed = true;
     } else if (!shouldBeInList && exists) {
       payload.items.splice(idx, 1);
@@ -1503,21 +1723,23 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     
     if (changed) {
       const newUrl = 'customlist:v1:' + JSON.stringify(payload);
-      const urlInput = list.row.querySelector('.url');
-      if (urlInput) {
-        urlInput.value = newUrl;
-        if (typeof autoSaveDebounced === 'function') autoSaveDebounced();
+      list.url = newUrl;
+      if (list.row) {
+        const urlInput = list.row.querySelector('.url');
+        if (urlInput) {
+          urlInput.value = newUrl;
+          if (typeof autoSaveDebounced === 'function') autoSaveDebounced();
+        }
       }
       
-      // Sync to backend -- read the display name from the row's name input
-      const nameInput = list.row.querySelector('.name');
+      const nameInput = list.row ? list.row.querySelector('.name') : null;
       const rowName = (nameInput ? nameInput.value : '') || list.name || '';
       syncCustomListPayload(payload, rowName);
     }
     return changed;
     
   } catch (err) {
-    console.error('Error adding to custom list', err);
+    console.error('Error updating custom list item', err);
     return false;
   }
 }
@@ -1542,20 +1764,33 @@ async function syncCustomListPayload(payload, name) {
           })
         });
         const data = await res.json();
-        if (!data.ok) {
-          alert('Could not sync item to list: ' + (data.error || 'unknown error'));
+        if (data.ok && typeof renderCreatorDashboard === 'function') {
+          renderCreatorDashboard();
         }
-      } catch(e) {
-        alert('Network error syncing list: ' + String(e));
-      }
+      } catch(e) {}
     }
-  } else if (payload.localSlug) {
+  }
+  if (payload.localSlug) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
       const map = loadLocalCustomLists();
       if (map[payload.localSlug]) {
         map[payload.localSlug].items = payload.items;
+        map[payload.localSlug].updatedAt = Date.now();
+        saveLocalCustomListsMap(map);
+      } else {
+        map[payload.localSlug] = {
+          slug: payload.localSlug,
+          name: name || payload.localSlug,
+          type: payload.type || 'mixed',
+          isWatchlist: payload.localSlug === 'watchlist',
+          items: payload.items,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
         saveLocalCustomListsMap(map);
       }
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     }
   }
 }
@@ -1588,17 +1823,31 @@ async function runCatalogSearch() {
   }
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
+  try {
+    fetch(ORIGIN + '/api/track-search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: q }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) {}
+
   if (currentCatalogSearchType === 'lists') {
     const qLower = q.toLowerCase();
+    const tkInput = document.getElementById('tmdbKeyInput');
+    const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
     const traktKey = (document.getElementById('traktKeyInput')?.value || '').trim();
     try {
-      const [mdblistAll, traktResult, myListsResult] = await Promise.all([
+      const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
         ensureMdblistPopularLoaded(),
         fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
-          .then((r) => r.json())
+          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
           .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
         fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
-          .then((r) => r.json())
+          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
+          .catch(() => ({ ok: false, lists: [] })),
+        fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
+          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
           .catch(() => ({ ok: false, lists: [] })),
       ]);
 
@@ -1607,8 +1856,9 @@ async function runCatalogSearch() {
         .slice(0, 30);
       const traktMatches = traktResult.ok ? (traktResult.lists || []).slice(0, 30) : [];
       const myListsMatches = myListsResult.ok ? (myListsResult.lists || []) : [];
+      const tmdbMatches = tmdbResult.ok ? (tmdbResult.lists || []) : [];
 
-      renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, resEl);
+      renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches, resEl);
       return;
     } catch (e) {
       resEl.innerHTML = '<p class="testresult err">✗ Network error searching lists.</p>';

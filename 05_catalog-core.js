@@ -1,8 +1,11 @@
 // --- manifest ----------------------------------------------------------
 
-function buildManifest(entries, origin, track) {
-  const active = entries.filter((e) => e.enabled !== false);
-  const resources = ["catalog", { name: "meta", types: ["series"], idPrefixes: ["channel_"] }];
+function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
+  let active = entries.filter((e) => e.enabled !== false);
+  if (shuffleShelves && active.length > 1) {
+    active = deterministicDailyShuffle(active, `shelves:${configSeed || ''}`);
+  }
+  const resources = ["catalog", { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "channel_"] }];
   const idPrefixes = ["tt", "channel_"];
   // Stremio/wako call every installed addon's subtitles resource the
   // instant ANY video starts playing (checking for subtitle tracks) --
@@ -39,6 +42,10 @@ function buildManifest(entries, origin, track) {
     behaviorHints: {
       configurable: true,
       configurationRequired: active.length === 0,
+    },
+    stremioAddonsConfig: {
+      issuer: "https://stremio-addons.net",
+      signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..03spiD2axLxuJ_5ELBKq0g.SyhPc0VygCk1q_6JaM2YlfBPXxtlBVdwV5c8Y1MLcuo4q7zXyf36akYD54YPYCoOFvZgAxSZxhxo0-HMsbc1AhtKhbOsCUtWLCgYcbxhA6h861dBPzOhjgxmN-z6e2De.b0_UZrNPtaDqDglgwvES-w"
     },
   };
 }
@@ -87,30 +94,47 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+  
+  let result;
   if (urls.length > 1) {
-    return fetchMergedCatalog(urls, entry.type, skip, keys);
+    result = await fetchMergedCatalog(urls, entry.type, skip, keys);
+  } else {
+    const mdblistKey = keys.mdblistAccessToken || keys.mdblistKey || MDBLIST_API_KEY;
+    const traktKey = keys.traktKey || TRAKT_CLIENT_ID;
+    const source = detectSource(entry.url);
+    if (source === "mdblist-watchlist") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistWatchlist(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
+    else if (source === "mdblist-history") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistHistory(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
+    else if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || ""); }
+    else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || ""); }
+    else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || ""); }
+    else if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdb(entry, skip, TMDB_API_KEY); }
+    else if (source === "tmdb-chart") {
+      trackSharedApiUse(keys, true, "tmdb");
+      const webChart = typeof parseTmdbWebChartUrl === "function" ? parseTmdbWebChartUrl(entry.url) : null;
+      const chartKey = webChart ? webChart.chartKey : entry.url.trim().slice("tmdb:chart:".length);
+      result = await fetchTmdbChart(entry, skip, TMDB_API_KEY, chartKey);
+    }
+    else if (source === "tmdb-collection") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbCollection(entry, skip, TMDB_API_KEY); }
+    else if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
+    else if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
+    else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
+    else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
+    else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
+    else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
+    else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
+    else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env);
+    else if (source === "curated") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchCuratedCatalog(entry, skip, keys); }
+    else if (source === "published-list") result = await fetchPublishedListCatalog(entry, keys.env);
+    else {
+      trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist");
+      result = await fetchMdblist(entry, skip, mdblistKey);
+    }
   }
 
-  const mdblistKey = keys.mdblistKey || MDBLIST_API_KEY;
-  const traktKey = keys.traktKey || TRAKT_CLIENT_ID;
-  const source = detectSource(entry.url);
-  if (source === "mdblist-watchlist") { trackSharedApiUse(keys, !keys.mdblistKey, "mdblist"); return fetchMdblistWatchlist(entry, skip, mdblistKey); }
-  if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || ""); }
-  if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || ""); }
-  if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || ""); }
-  if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdb(entry, skip, TMDB_API_KEY); }
-  if (source === "tmdb-chart") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbChart(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:chart:".length)); }
-  if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
-  if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
-  if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); return fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
-  if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); return fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
-  if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); return fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
-  if (source === "channel") return fetchChannelCatalog(entry);
-  if (source === "custom-list") return fetchCustomListCatalog(entry);
-  if (source === "autotrack") return fetchAutoTrackedCatalog(entry, keys.env);
-  if (source === "published-list") return fetchPublishedListCatalog(entry, keys.env);
-  trackSharedApiUse(keys, !keys.mdblistKey, "mdblist");
-  return fetchMdblist(entry, skip, mdblistKey);
+  if (keys.shuffleItems && Array.isArray(result) && result.length > 1) {
+    result = deterministicDailyShuffle(result, `items:${entry.id || entry.name}:${keys.configParam || ''}`);
+  }
+  return result || [];
 }
 
 // Fans a merged catalog row out to each source at the same skip/page
@@ -174,7 +198,16 @@ function parseChannelPayload(rawUrl) {
   }
 }
 
-function fetchChannelCatalog(entry) {
+function getPaddedChannelLogo(rawPoster, origin) {
+  if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
+  const m = rawPoster.match(/https:\/\/image\.tmdb\.org\/t\/p\/(?:w\d+|original)\/(.+)/);
+  if (m && origin) {
+    return `${origin}/api/channel-logo?path=${encodeURIComponent('/' + m[1])}`;
+  }
+  return rawPoster;
+}
+
+function fetchChannelCatalog(entry, origin) {
   const payload = parseChannelPayload(entry.url);
   if (!payload || !payload.items.length) return [];
   const channelId = payload.channelId || entry.id;
@@ -184,7 +217,7 @@ function fetchChannelCatalog(entry) {
       id: "channel_" + channelId,
       type: "series",
       name: name,
-      poster: payload.poster || undefined,
+      poster: getPaddedChannelLogo(payload.poster, origin),
       posterShape: "landscape",
     },
   ];
@@ -207,9 +240,17 @@ function parseCustomListPayload(rawUrl) {
   }
 }
 
-function fetchCustomListCatalog(entry) {
+function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   const payload = parseCustomListPayload(entry.url);
-  if (!payload || !payload.items.length) return [];
+  if (!payload || !payload.items || !payload.items.length) {
+    if (payload && (
+      (payload.listSlug && (payload.listSlug.startsWith('custom:curated:') || payload.listSlug.startsWith('curated:'))) ||
+      (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows')))
+    )) {
+      return fetchCuratedCatalog({ url: payload.listSlug || (entry.type === 'series' ? 'custom:curated:recommended-shows' : 'custom:curated:recommended-movies'), type: entry.type }, skip, keys);
+    }
+    return [];
+  }
   const items = payload.shuffle
     ? seededShuffle(payload.items, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
     : payload.items;
@@ -233,6 +274,118 @@ function fetchCustomListCatalog(entry) {
     }));
 }
 
+async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
+  const isSeries = entry.type === 'series' || (entry.url && entry.url.includes('shows'));
+  const tmdbKey = keys.tmdbKey || TMDB_API_KEY;
+  let sampleIds = [];
+
+  if (keys.env && keys.env.CONFIGS) {
+    let username = keys.username || keys.creatorName || '';
+    if (!username && keys.configParam) {
+      try {
+        const resolved = await resolveConfig(keys.configParam, keys.env);
+        if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
+      } catch {}
+    }
+    if (username) {
+      try {
+        const trackingRaw = await keys.env.CONFIGS.get(`creatorsynctracking:${username}`);
+        if (trackingRaw) {
+          const tracking = JSON.parse(trackingRaw);
+          if (isSeries) {
+            const list = Array.isArray(tracking.continueWatching) && tracking.continueWatching.length
+              ? tracking.continueWatching
+              : (Array.isArray(tracking.watchHistory) ? tracking.watchHistory : []);
+            sampleIds = list.map(it => it.showId || it.id).filter(Boolean).slice(0, 10);
+          } else {
+            const list = Array.isArray(tracking.watchHistory) ? tracking.watchHistory : [];
+            sampleIds = list.filter(it => it.type === 'movie' || !it.seasonNum).map(it => it.id || it.imdbId).filter(Boolean).slice(0, 10);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (sampleIds.length > 0) {
+    try {
+      const recs = await Promise.all(sampleIds.map(async (rawId) => {
+        try {
+          let tmdbId = '';
+          if (String(rawId).startsWith('tmdb:')) {
+            tmdbId = String(rawId).slice(5);
+          } else {
+            const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(rawId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
+              cf: { cacheTtl: 86400, cacheEverything: true }
+            });
+            const findData = await findRes.json();
+            const resKey = isSeries ? 'tv_results' : 'movie_results';
+            if (findData[resKey] && findData[resKey][0]) {
+              tmdbId = findData[resKey][0].id;
+            }
+          }
+          if (!tmdbId) return [];
+          const endpoint = isSeries ? 'tv' : 'movie';
+          const recRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+            cf: { cacheTtl: 86400, cacheEverything: true }
+          });
+          const recData = await recRes.json();
+          let list = recData.results || [];
+          if (!list.length) {
+            const simRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+              cf: { cacheTtl: 86400, cacheEverything: true }
+            });
+            const simData = await simRes.json();
+            list = simData.results || [];
+          }
+          return list;
+        } catch {
+          return [];
+        }
+      }));
+
+      const seenTmdb = new Set();
+      const combined = [];
+      recs.forEach(list => {
+        (list || []).forEach(item => {
+          if (item && item.id && !seenTmdb.has(item.id)) {
+            seenTmdb.add(item.id);
+            combined.push(item);
+          }
+        });
+      });
+
+      if (combined.length > 0) {
+        const mapped = await Promise.all(combined.slice(skip, skip + PAGE_SIZE).map(async (it) => {
+          try {
+            let imdbId = '';
+            const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${it.id}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
+              cf: { cacheTtl: 86400, cacheEverything: true }
+            });
+            const detailData = await detailRes.json();
+            imdbId = detailData.imdb_id;
+            if (!imdbId) imdbId = `tmdb:${it.id}`;
+            const releaseYear = (it.release_date || it.first_air_date || '').slice(0, 4);
+            return {
+              id: imdbId,
+              type: isSeries ? 'series' : 'movie',
+              name: it.title || it.name || 'Untitled',
+              poster: it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : undefined,
+              releaseInfo: releaseYear || undefined,
+            };
+          } catch {
+            return null;
+          }
+        }));
+        const validMapped = mapped.filter(Boolean);
+        if (validMapped.length > 0) return validMapped;
+      }
+    } catch {}
+  }
+
+  // Fallback: TMDB Popular items so recommendations shelf is never empty
+  return fetchTmdbChart(entry, skip, tmdbKey, 'popular');
+}
+
 // Copies forward tracking fields (watchHistory/continueWatching/
 // fullyWatchedShowIds/dismissedContinueWatching/trackPlayback) from the
 // old embedded location in creatorsync:{username} into the new dedicated
@@ -252,6 +405,7 @@ async function ensureTrackingMigrated(env, username) {
     const oldBlob = JSON.parse(oldRaw);
     const hasTrackingData = (Array.isArray(oldBlob.watchHistory) && oldBlob.watchHistory.length) ||
       (Array.isArray(oldBlob.continueWatching) && oldBlob.continueWatching.length) ||
+      (Array.isArray(oldBlob.watchlist) && oldBlob.watchlist.length) ||
       (Array.isArray(oldBlob.fullyWatchedShowIds) && oldBlob.fullyWatchedShowIds.length) ||
       (oldBlob.dismissedContinueWatching && Object.keys(oldBlob.dismissedContinueWatching).length) ||
       typeof oldBlob.trackPlayback === "boolean";
@@ -259,6 +413,7 @@ async function ensureTrackingMigrated(env, username) {
     await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify({
       watchHistory: Array.isArray(oldBlob.watchHistory) ? oldBlob.watchHistory : [],
       continueWatching: Array.isArray(oldBlob.continueWatching) ? oldBlob.continueWatching : [],
+      watchlist: Array.isArray(oldBlob.watchlist) ? oldBlob.watchlist : [],
       fullyWatchedShowIds: Array.isArray(oldBlob.fullyWatchedShowIds) ? oldBlob.fullyWatchedShowIds : [],
       dismissedContinueWatching: oldBlob.dismissedContinueWatching && typeof oldBlob.dismissedContinueWatching === "object" ? oldBlob.dismissedContinueWatching : {},
       trackPlayback: typeof oldBlob.trackPlayback === "boolean" ? oldBlob.trackPlayback : false,
@@ -277,29 +432,21 @@ async function fetchAutoTrackedCatalog(entry, env) {
   const parts = String(entry.url || "").split(":");
   if (parts.length < 4) return [];
   
-  const slug = parts[1]; // watch-history or continue-watching
+  const slug = parts[1]; // watch-history, continue-watching, or watchlist
   const targetType = parts[2]; // movie or series
   const username = parts[3];
   
   try {
-    // Tracking data lives in its own key now -- see ensureTrackingMigrated's
-    // comment for why (this used to read creatorsync:{username} directly,
-    // where a large watchHistory/continueWatching sat alongside everything
-    // else and made every single autosave heavier as it grew). Falls back
-    // to the old embedded location for an account that hasn't had any
-    // tracking write happen since the split (nothing has run
-    // ensureTrackingMigrated for it yet) -- read-only fallback, no write,
-    // since fetchAutoTrackedCatalog only ever reads.
     let items;
     const trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
     if (trackingRaw) {
       const trackingBlob = JSON.parse(trackingRaw);
-      items = slug === 'watch-history' ? trackingBlob.watchHistory : trackingBlob.continueWatching;
+      items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (trackingBlob.watchlist || []));
     } else {
       const blobStr = await env.CONFIGS.get('creatorsync:' + username);
       if (!blobStr) return [];
       const blob = JSON.parse(blobStr);
-      items = slug === 'watch-history' ? blob.watchHistory : blob.continueWatching;
+      items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (blob.watchlist || []));
     }
     if (!items || !items.length) return [];
     
@@ -312,11 +459,17 @@ async function fetchAutoTrackedCatalog(entry, env) {
       if (targetType === 'movie' && !isMovie) return;
       if (targetType === 'series' && isMovie) return;
       
+      const showId = isMovie ? null : (it.showId || it.imdbId || it.id);
+      const showPoster = isMovie
+        ? it.poster
+        : (it.showPoster ||
+           (showId && showId.startsWith('tt') ? 'https://images.metahub.space/poster/medium/' + showId + '/img' : '') ||
+           it.poster);
       const mapped = {
-        id: isMovie ? (it.imdbId || it.id) : (it.showId || it.imdbId || it.id),
+        id: isMovie ? (it.imdbId || it.id) : (showId || it.id),
         type: targetType,
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
-        poster: isMovie ? it.poster : (it.showPoster || it.poster),
+        poster: showPoster,
         releaseInfo: it.year || undefined
       };
       
@@ -522,11 +675,9 @@ function buildChannelMeta(entry, origin) {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: payload.poster || `${origin}/icon.png`,
-    // Same reasoning as fetchChannelCatalog above -- landscape crops far
-    // less of a wide logo than square did.
+    poster: getPaddedChannelLogo(payload.poster, origin),
     posterShape: "landscape",
-    background: payload.poster || undefined,
+    background: getPaddedChannelLogo(payload.poster, origin),
     videos,
   };
 }

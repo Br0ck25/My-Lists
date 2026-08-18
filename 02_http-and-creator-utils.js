@@ -6,6 +6,28 @@ function corsHeaders() {
   };
 }
 
+function base64UrlEncodeBytes(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function generatePkcePair() {
+  const randomBytes = new Uint8Array(32);
+  crypto.getRandomValues(randomBytes);
+  const verifier = base64UrlEncodeBytes(randomBytes);
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const challenge = base64UrlEncodeBytes(new Uint8Array(digest));
+  return { verifier, challenge };
+}
+
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -51,13 +73,46 @@ function isBrowserNavigation(request) {
 
 // --- config encoding -------------------------------------------------
 
+// --- Deterministic 24-Hour Daily Randomizer --------------------------------
+function getDailySeed(salt = "") {
+  const dayBucket = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  let hash = 0;
+  const str = `${dayBucket}:${salt}`;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) || 1;
+}
+
+function pseudoRandom(seed) {
+  let t = (seed += 0x6d2b79f5);
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+function deterministicDailyShuffle(array, salt = "") {
+  if (!Array.isArray(array) || array.length <= 1) return array;
+  let seed = getDailySeed(salt);
+  const copy = [...array];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const rnd = pseudoRandom(seed++);
+    const j = Math.floor(rnd * (i + 1));
+    const temp = copy[i];
+    copy[i] = copy[j];
+    copy[j] = temp;
+  }
+  return copy;
+}
+
 // entries: [{ id, name, type: 'movie'|'series', url }]
 //
 // Config is normally { entries, tmdbKey, mdblistKey } but older install
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", traktKey: "", traktUsername: "", traktAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "" };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -78,29 +133,15 @@ function decodeConfig(config) {
       entries,
       tmdbKey: (!Array.isArray(parsed) && parsed.tmdbKey) || "",
       mdblistKey: (!Array.isArray(parsed) && parsed.mdblistKey) || "",
+      mdblistAccessToken: (!Array.isArray(parsed) && parsed.mdblistAccessToken) || "",
       traktKey: (!Array.isArray(parsed) && parsed.traktKey) || "",
       traktUsername: (!Array.isArray(parsed) && parsed.traktUsername) || "",
-      // The OAuth access token from "Connect Trakt" (see /api/trakt/oauth/*
-      // below) -- unlike traktKey (the Client ID, used unauthenticated for
-      // public data), this is what lets fetchTrakt below read a private
-      // list. Baked into the link the same way every other key here is --
-      // there's deliberately no server-side token storage/refresh (see the
-      // comment on /api/trakt/oauth/callback), so this expires after
-      // Trakt's own ~3 month token lifetime and needs reconnecting then.
       traktAccessToken: (!Array.isArray(parsed) && parsed.traktAccessToken) || "",
-      // Playback tracking (see /:config/subtitles/... in
-      // 25_api-catalog-routes.js, and buildManifest's comment on why that
-      // route exists at all). Requires a Creator Profile, since that's the
-      // only place Watch History persists outside a single browser for a
-      // bare server-side request -- Stremio/wako calling this addon
-      // directly, with no cookies or login -- to write into. The Creator
-      // Key travels in the install link the same way traktAccessToken
-      // above already does: the link IS the credential for this addon
-      // (same as any Stremio addon manifest URL), so this isn't a new
-      // category of exposure, just one more thing riding along with it.
       track: !!(!Array.isArray(parsed) && parsed.track),
       trackCreatorName: (!Array.isArray(parsed) && parsed.trackCreatorName) || "",
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
+      shuffleShelves: !!(!Array.isArray(parsed) && parsed.shuffleShelves),
+      shuffleItems: !!(!Array.isArray(parsed) && parsed.shuffleItems),
     };
   } catch {
     return empty;

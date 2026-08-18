@@ -178,7 +178,29 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     );
     const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
     filtered.sort((a, b) => b.count - a.count);
-    return filtered.slice(0, 100);
+    const topEntries = filtered.slice(0, 100);
+
+    // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
+    await Promise.all(
+      topEntries.map(async (e) => {
+        if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
+          try {
+            if (typeof fetchTmdbItemDetails === "function") {
+              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+              if (det && det.title) {
+                e.title = det.title;
+                if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
+                if (env && env.CONFIGS) {
+                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                }
+              }
+            }
+          } catch {}
+        }
+      })
+    );
+
+    return topEntries;
   }
 
   const days = window === "today" ? 1 : parseInt(window, 10) || 7;
@@ -222,7 +244,29 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
   );
   const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
   filtered.sort((a, b) => b.count - a.count);
-  return filtered.slice(0, 100);
+  const topEntries = filtered.slice(0, 100);
+
+  // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
+  await Promise.all(
+    topEntries.map(async (e) => {
+      if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
+        try {
+          if (typeof fetchTmdbItemDetails === "function") {
+            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+            if (det && det.title) {
+              e.title = det.title;
+              if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
+              if (env && env.CONFIGS) {
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+              }
+            }
+          }
+        } catch {}
+      }
+    })
+  );
+
+  return topEntries;
 }
 
 // Lean sibling of recordTrackedEvent used only by the trending-data
@@ -253,6 +297,254 @@ async function backfillTitleCount(env, eventType, id, title, mediaType, incremen
   } catch (e) {
     return false;
   }
+}
+
+// Anonymous search query tracking
+async function recordSearchQuery(env, query) {
+  if (!env || !env.CONFIGS) return;
+  const q = String(query || "").trim().toLowerCase().slice(0, 60);
+  if (q.length < 2) return;
+  try {
+    const day = statsToday();
+    const dayKey = `searchquery:${q}:${day}`;
+    const totalKey = `searchquery:${q}:alltime`;
+    const indexKey = `searchquerydayindex:${day}`;
+
+    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(dayKey),
+      env.CONFIGS.get(totalKey),
+      env.CONFIGS.get(indexKey),
+    ]);
+    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
+
+    let index = [];
+    try {
+      index = indexRaw ? JSON.parse(indexRaw) : [];
+    } catch {
+      index = [];
+    }
+    if (!index.includes(q)) index.push(q);
+
+    await Promise.all([
+      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(totalKey, String(totalCount)),
+      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+    ]);
+  } catch (e) {}
+}
+
+async function computeSearchLeaderboard(env, window) {
+  if (!env || !env.CONFIGS) return [];
+  const prefix = "searchquery:";
+  if (window === "alltime") {
+    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    const entries = await Promise.all(
+      alltimeKeys.map(async (k) => {
+        const query = k.name.slice(prefix.length, -":alltime".length);
+        const countRaw = await env.CONFIGS.get(k.name);
+        return { query, count: parseInt(countRaw, 10) || 0 };
+      })
+    );
+    const valid = entries.filter((e) => e.count > 0);
+    valid.sort((a, b) => b.count - a.count);
+    return valid.slice(0, 100);
+  }
+
+  const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+  const nowMs = Date.now();
+  const dateKeys = [];
+  for (let i = 0; i < days; i++) {
+    dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+  }
+
+  // Check both searchquerydayindex and direct searchquery list prefix
+  const [indexResults, listResult] = await Promise.all([
+    Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`))),
+    env.CONFIGS.list({ prefix, limit: 1000 }),
+  ]);
+
+  const querySet = new Set();
+  indexResults.forEach((raw) => {
+    if (!raw) return;
+    try {
+      JSON.parse(raw).forEach((q) => querySet.add(q));
+    } catch {}
+  });
+
+  (listResult.keys || []).forEach((k) => {
+    const rest = k.name.slice(prefix.length);
+    const lastColon = rest.lastIndexOf(":");
+    if (lastColon !== -1) {
+      const q = rest.slice(0, lastColon);
+      const sfx = rest.slice(lastColon + 1);
+      if (sfx !== "alltime") querySet.add(q);
+    }
+  });
+
+  const queries = [...querySet].slice(0, 500);
+
+  const entries = await Promise.all(
+    queries.map(async (q) => {
+      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquery:${q}:${d}`)));
+      let count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
+      if (count === 0 && window === "today") {
+        const totalRaw = await env.CONFIGS.get(`searchquery:${q}:alltime`);
+        count = parseInt(totalRaw, 10) || 0;
+      }
+      return { query: q, count };
+    })
+  );
+  const valid = entries.filter((e) => e.count > 0);
+  valid.sort((a, b) => b.count - a.count);
+  return valid.slice(0, 100);
+}
+
+// Telemetry for Stremio playback tracking
+async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const promises = [bumpStat(env, "playback_pings")];
+    const mt = mediaType === "episode" ? "episode" : mediaType === "series" ? "series" : "movie";
+    promises.push(bumpStat(env, `watch_type:${mt}`));
+
+    const genreList = Array.isArray(genres)
+      ? genres
+      : typeof genres === "string"
+      ? genres.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    if (genreList.length) {
+      genreList.slice(0, 5).forEach((g) => {
+        const cleanG = String(g || "").trim();
+        if (cleanG) promises.push(bumpStat(env, `genre:${cleanG}`));
+      });
+    }
+
+    const yearNum = parseInt(releaseYear, 10);
+    if (yearNum && yearNum > 1900 && yearNum < 2100) {
+      let decade = "Classic (<1970)";
+      if (yearNum >= 2020) decade = "2020s";
+      else if (yearNum >= 2010) decade = "2010s";
+      else if (yearNum >= 2000) decade = "2000s";
+      else if (yearNum >= 1990) decade = "1990s";
+      else if (yearNum >= 1980) decade = "1980s";
+      else if (yearNum >= 1970) decade = "1970s";
+      promises.push(bumpStat(env, `decade:${decade}`));
+    }
+    await Promise.all(promises);
+  } catch (e) {}
+}
+
+async function computeCatalogAndCommunityLeaderboards(env) {
+  if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
+  
+  // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
+  const [catalogList, sourceGroupList] = await Promise.all([
+    env.CONFIGS.list({ prefix: "stats:catalog_add:", limit: 1000 }),
+    env.CONFIGS.list({ prefix: "stats:sourcegroup:", limit: 1000 }),
+  ]);
+
+  const catalogMap = new Map();
+  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total"));
+  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total"));
+
+  await Promise.all([
+    ...totalCatalogKeys.map(async (k) => {
+      const name = k.name.slice("stats:catalog_add:".length, -":total".length);
+      const raw = await env.CONFIGS.get(k.name);
+      const count = parseInt(raw, 10) || 0;
+      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+    }),
+    ...totalSourceGroupKeys.map(async (k) => {
+      const name = k.name.slice("stats:sourcegroup:".length, -":total".length);
+      const raw = await env.CONFIGS.get(k.name);
+      const count = parseInt(raw, 10) || 0;
+      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+    }),
+  ]);
+
+  const catalogEntries = Array.from(catalogMap.entries()).map(([name, count]) => ({ name, count }));
+  catalogEntries.sort((a, b) => b.count - a.count);
+
+  // 2. Community / Creator Lists
+  const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: 1000 });
+  const communityLists = await Promise.all(
+    listResult.keys.map(async (k) => {
+      const raw = await env.CONFIGS.get(k.name);
+      if (!raw) return null;
+      let data;
+      try { data = JSON.parse(raw); } catch { return null; }
+      if (!data || !data.slug || !data.creatorName) return null;
+      const [likesRaw, copiesRaw] = await Promise.all([
+        env.CONFIGS.get(`creatorlistlikes:${data.slug}`),
+        env.CONFIGS.get(`stats:list_copy:${data.slug}:total`),
+      ]);
+      const likes = parseInt(likesRaw, 10) || 0;
+      const copies = parseInt(copiesRaw, 10) || 0;
+      const itemCount = Array.isArray(data.items) ? data.items.length : 0;
+      return {
+        slug: data.slug,
+        name: data.name || data.slug,
+        creator: data.creatorName,
+        type: data.type || 'mixed',
+        itemCount,
+        likes,
+        copies,
+        updatedAt: data.updatedAt || data.createdAt || 0,
+      };
+    })
+  );
+  const validLists = communityLists.filter(Boolean);
+  validLists.sort((a, b) => (b.likes + b.copies * 2) - (a.likes + a.copies * 2));
+
+  return { catalogs: catalogEntries.slice(0, 100), communityLists: validLists.slice(0, 100) };
+}
+
+async function computeAudienceAnalytics(env) {
+  if (!env || !env.CONFIGS) return { watchTypes: {}, genres: [], decades: [] };
+  
+  const [movieRaw, seriesRaw, episodeRaw, genreList, decadeList] = await Promise.all([
+    env.CONFIGS.get("stats:watch_type:movie:total"),
+    env.CONFIGS.get("stats:watch_type:series:total"),
+    env.CONFIGS.get("stats:watch_type:episode:total"),
+    env.CONFIGS.list({ prefix: "stats:genre:", limit: 1000 }),
+    env.CONFIGS.list({ prefix: "stats:decade:", limit: 1000 }),
+  ]);
+
+  const movies = parseInt(movieRaw, 10) || 0;
+  const series = parseInt(seriesRaw, 10) || 0;
+  const episodes = parseInt(episodeRaw, 10) || 0;
+  const totalWatch = movies + series + episodes;
+
+  const totalGenreKeys = (genreList.keys || []).filter((k) => k.name.endsWith(":total"));
+  const genres = await Promise.all(
+    totalGenreKeys.map(async (k) => {
+      const name = k.name.slice("stats:genre:".length, -":total".length);
+      const raw = await env.CONFIGS.get(k.name);
+      return { name, count: parseInt(raw, 10) || 0 };
+    })
+  );
+  const validGenres = genres.filter((g) => g.count > 0 && g.name);
+  validGenres.sort((a, b) => b.count - a.count);
+
+  const totalDecadeKeys = (decadeList.keys || []).filter((k) => k.name.endsWith(":total"));
+  const decades = await Promise.all(
+    totalDecadeKeys.map(async (k) => {
+      const name = k.name.slice("stats:decade:".length, -":total".length);
+      const raw = await env.CONFIGS.get(k.name);
+      return { name, count: parseInt(raw, 10) || 0 };
+    })
+  );
+  const validDecades = decades.filter((d) => d.count > 0 && d.name);
+  validDecades.sort((a, b) => b.count - a.count);
+
+  return {
+    watchTypes: { movies, series, episodes, total: totalWatch },
+    genres: validGenres.slice(0, 50),
+    decades: validDecades.slice(0, 50),
+  };
 }
 
 // The group names bumpStatBy above gets called with ultimately come from
@@ -473,13 +765,20 @@ async function renderAdminDashboard(env) {
     return `<!DOCTYPE html><html><body style="background:#F2F2F7;color:#1C1C1E;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
   }
   const today = statsToday();
-  const [totalPV, todayPV, totalIN, todayIN, pvByDay, inByDay, creatorResult, sourceGroupResult] = await Promise.all([
+  const [
+    totalPV, todayPV, totalIN, todayIN, totalPP, todayPP,
+    pvByDay, inByDay, ppByDay,
+    creatorResult, sourceGroupResult
+  ] = await Promise.all([
     env.CONFIGS.get("stats:pageviews:total"),
     env.CONFIGS.get(`stats:pageviews:${today}`),
     env.CONFIGS.get("stats:installs:total"),
     env.CONFIGS.get(`stats:installs:${today}`),
+    env.CONFIGS.get("stats:playback_pings:total"),
+    env.CONFIGS.get(`stats:playback_pings:${today}`),
     loadStatsByDay(env, "pageviews"),
     loadStatsByDay(env, "installs"),
+    loadStatsByDay(env, "playback_pings"),
     // "creator:" (with the colon) is deliberately narrow -- creatorlist:,
     // creatorsync:, etc. all start with "creator" too but not "creator:",
     // so this can't accidentally sweep those in as if they were accounts.
@@ -496,7 +795,7 @@ async function renderAdminDashboard(env) {
   const nowMs = Date.now();
   for (let i = 0; i < 30; i++) {
     const key = easternDateKey(new Date(nowMs - i * 86400000));
-    rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td></tr>`);
+    rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
   }
 
   const creatorAccounts = await Promise.all(
@@ -565,26 +864,35 @@ async function renderAdminDashboard(env) {
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:24px 16px; }
-  h1 { margin-bottom:4px; }
+  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; box-sizing:border-box; }
+  h1 { margin-bottom:4px; font-size:1.6rem; }
   h2 { font-size:1.1rem; }
-  .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:14px; margin:20px 0; }
-  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:18px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  .stat-value { font-size:2rem; font-weight:700; }
-  .stat-label { color:#8E8E93; font-size:0.9rem; margin-top:4px; }
-  table { width:100%; border-collapse:collapse; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.9rem; }
-  th { color:#8E8E93; font-weight:600; }
+  .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:12px; margin:16px 0; }
+  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .stat-value { font-size:1.6rem; font-weight:700; }
+  .stat-label { color:#8E8E93; font-size:0.82rem; margin-top:4px; }
+  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  table { width:100%; border-collapse:collapse; background:#FFFFFF; border:none; margin:0; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.85rem; white-space:nowrap; }
+  th { color:#8E8E93; font-weight:600; background:#FAFAFC; }
   a { color:#007AFF; }
-  .admin-tab-bar { display:flex; gap:8px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:24px; }
-  .admin-tab-btn {
-    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:600; cursor:pointer;
-    padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent;
+  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:20px; flex-wrap:wrap; }
+  .admin-main-tab-btn {
+    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:700; cursor:pointer;
+    padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent; transition:color 0.15s ease;
   }
-  .admin-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
+  .admin-main-tab-btn:hover { color:#1C1C1E; }
+  .admin-main-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
+  .admin-subnav-bar { display:flex; gap:8px; margin:14px 0 16px; flex-wrap:wrap; }
+  .subnav-pill {
+    background:#FFFFFF; border:1px solid rgba(0,0,0,0.1); border-radius:20px; padding:6px 14px;
+    font-size:0.85rem; font-weight:600; color:#8E8E93; cursor:pointer; transition:all 0.15s ease;
+  }
+  .subnav-pill:hover { border-color:rgba(0,0,0,0.25); color:#1C1C1E; }
+  .subnav-pill.active { background:#007AFF; color:#FFFFFF; border-color:#007AFF; }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
-  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.9rem; margin-right:8px; }
+  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.85rem; margin-right:6px; }
   .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
   .admin-badge.bug { background:rgba(255,59,48,0.12); color:#FF3B30; }
   .admin-badge.improvement { background:rgba(0,122,255,0.12); color:#007AFF; }
@@ -592,57 +900,88 @@ async function renderAdminDashboard(env) {
   .admin-badge.other { background:rgba(142,142,147,0.15); color:#636366; }
   .feedback-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px 16px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
   .feedback-card.completed { opacity:0.55; }
+  .feedback-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; }
+  .feedback-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
   .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
-  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; }
-  .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap:12px; margin-top:10px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; }
+  .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap:10px; margin-top:10px; }
   .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:#E5E5EA; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
   .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:#E5E5EA; display:flex; align-items:center; justify-content:center; color:#8E8E93; font-size:0.75rem; text-align:center; padding:6px; box-sizing:border-box; }
   .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; }
   .netflix-preview-year { color:#8E8E93; font-size:0.75rem; }
+  @media (max-width: 600px) {
+    body { padding: 14px 10px; }
+    .stat-cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .feedback-card { padding: 12px; }
+    .feedback-card-header { flex-direction: column; align-items: flex-start !important; }
+    .feedback-actions { width: 100%; }
+    .feedback-actions button { flex-grow: 1; text-align: center; }
+  }
 </style></head>
 <body>
   <h1>Admin Dashboard</h1>
   <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
-  <div class="admin-tab-bar" role="tablist">
-    <button type="button" class="admin-tab-btn active" data-admin-tab="last30" onclick="switchAdminTab('last30')">Last 30 Days</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="creators" onclick="switchAdminTab('creators')">Creator accounts</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="sources" onclick="switchAdminTab('sources')">Sources people use</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="trending" onclick="switchAdminTab('trending')">Trending Data</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="feedback" onclick="switchAdminTab('feedback')">Feedback</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="apiusage" onclick="switchAdminTab('apiusage')">API Usage</button>
-    <button type="button" class="admin-tab-btn" data-admin-tab="netflixpreview" onclick="switchAdminTab('netflixpreview')">Provider Preview</button>
+  <div class="admin-main-tab-bar" role="tablist">
+    <button type="button" class="admin-main-tab-btn active" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
+    <button type="button" class="admin-main-tab-btn" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
+    <button type="button" class="admin-main-tab-btn" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
+  </div>
+
+  <div class="admin-subnav-bar" id="adminSubnavOverview">
+    <button type="button" class="subnav-pill active" data-sub-tab="last30" onclick="switchAdminSubTab('last30')">Last 30 Days</button>
+    <button type="button" class="subnav-pill" data-sub-tab="sources" onclick="switchAdminSubTab('sources')">Sources people use</button>
+    <button type="button" class="subnav-pill" data-sub-tab="apiusage" onclick="switchAdminSubTab('apiusage')">API Usage</button>
+  </div>
+  <div class="admin-subnav-bar" id="adminSubnavDiscovery" style="display:none;">
+    <button type="button" class="subnav-pill" data-sub-tab="trending" onclick="switchAdminSubTab('trending')">Trending Data</button>
+    <button type="button" class="subnav-pill" data-sub-tab="search" onclick="switchAdminSubTab('search')">Search &amp; Queries</button>
+    <button type="button" class="subnav-pill" data-sub-tab="catalogs_lists" onclick="switchAdminSubTab('catalogs_lists')">Catalogs &amp; Lists</button>
+    <button type="button" class="subnav-pill" data-sub-tab="audience" onclick="switchAdminSubTab('audience')">Playback &amp; Audience</button>
+  </div>
+  <div class="admin-subnav-bar" id="adminSubnavManagement" style="display:none;">
+    <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
+    <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
+    <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
   </div>
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
     <div class="stat-cards">
       <div class="stat-card"><div class="stat-value">${parseInt(totalPV, 10) || 0}</div><div class="stat-label">Total page views</div></div>
       <div class="stat-card"><div class="stat-value">${parseInt(todayPV, 10) || 0}</div><div class="stat-label">Page views today</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(totalIN, 10) || 0}</div><div class="stat-label">Total install links generated</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayIN, 10) || 0}</div><div class="stat-label">Install links generated today</div></div>
+      <div class="stat-card"><div class="stat-value">${parseInt(totalIN, 10) || 0}</div><div class="stat-label">Total install links</div></div>
+      <div class="stat-card"><div class="stat-value">${parseInt(todayIN, 10) || 0}</div><div class="stat-label">Install links today</div></div>
+      <div class="stat-card"><div class="stat-value">${parseInt(totalPP, 10) || 0}</div><div class="stat-label">Total playback streams</div></div>
+      <div class="stat-card"><div class="stat-value">${parseInt(todayPP, 10) || 0}</div><div class="stat-label">Streams today</div></div>
     </div>
-    <table>
-      <tr><th>Date</th><th>Page views</th><th>Install links</th></tr>
-      ${rows.join("")}
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Date</th><th>Page views</th><th>Install links</th><th>Playback pings</th></tr>
+        ${rows.join("")}
+      </table>
+    </div>
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="creators">
     <div class="stat-cards">
       <div class="stat-card"><div class="stat-value">${creatorAccounts.length}</div><div class="stat-label">Creator accounts${truncatedNote}</div></div>
     </div>
-    <table>
-      <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
-      ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
+        ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
+      </table>
+    </div>
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="sources">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
-    <table>
-      <tr><th>Source</th><th>Count</th><th>Share</th></tr>
-      ${sourceGroupRows || '<tr><td colspan="3">No data yet.</td></tr>'}
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Source</th><th>Count</th><th>Share</th></tr>
+        ${sourceGroupRows || '<tr><td colspan="3">No data yet.</td></tr>'}
+      </table>
+    </div>
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
@@ -668,10 +1007,78 @@ async function renderAdminDashboard(env) {
       <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
     <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
-    <table>
-      <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
-      <tbody id="trendingTableBody"><tr><td colspan="4">Loading\u2026</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
+        <tbody id="trendingTableBody"><tr><td colspan="4">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="search">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Anonymous queries and search terms users have entered in the Discover and Search tabs.</p>
+    <div style="margin:12px 0;">
+      <select class="admin-select" id="searchWindowSelect" onchange="loadSearchData()">
+        <option value="today">Today</option>
+        <option value="7" selected>Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+        <option value="alltime">All Time</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Search Query</th><th>Count</th></tr></thead>
+        <tbody id="searchTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="catalogs_lists">
+    <h2 style="margin-top:0;">Most Installed Curated &amp; Provider Catalogs</h2>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Which built-in charts and provider catalogs users add to their Stremio configuration.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Catalog / Chart Name</th><th>Times Installed</th></tr></thead>
+        <tbody id="installedCatalogsTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2 style="margin-top:28px;">Top Community &amp; Creator Lists</h2>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Ranked by community engagement (likes and list copies/imports).</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>List Name</th><th>Creator</th><th>Type</th><th>Items</th><th>Likes</th><th>Copies</th></tr></thead>
+        <tbody id="topCommunityListsTableBody"><tr><td colspan="7">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="audience">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Audience viewing breakdown derived from Stremio stream playback pings.</p>
+    
+    <div class="stat-cards">
+      <div class="stat-card"><div class="stat-value" id="audienceTotalPlays">0</div><div class="stat-label">Total streams tracked</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceMoviePlays">0</div><div class="stat-label">Movie plays</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceSeriesPlays">0</div><div class="stat-label">Show plays</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceEpisodePlays">0</div><div class="stat-label">Episode plays</div></div>
+    </div>
+
+    <h2 style="margin-top:20px;">Top Watched Genres</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Genre</th><th>Stream Count</th></tr></thead>
+        <tbody id="topGenresTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2 style="margin-top:28px;">Release Era / Decades</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Release Era</th><th>Stream Count</th></tr></thead>
+        <tbody id="topDecadesTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="feedback">
@@ -716,10 +1123,13 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel" data-admin-panel="apiusage">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Requests made using this Worker's own shared API keys (the fallback used whenever a visitor hasn't supplied their own) -- not counting anyone's personal keys, which only they can rate-limit. Watch these against each provider's limit if catalogs start coming back empty or slow.</p>
-    <table>
-      <tr><th>Key</th><th>Last 24h</th><th>Last 7 days</th><th>Last 30 days</th><th>Provider limit</th></tr>
-      <tbody id="apiUsageTableBody"><tr><td colspan="5">Loading\u2026</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Key</th><th>Last 24h</th><th>Last 7 days</th><th>Last 30 days</th><th>Provider limit</th></tr>
+        <tbody id="apiUsageTableBody"><tr><td colspan="5">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="netflixpreview">
@@ -752,13 +1162,186 @@ async function renderAdminDashboard(env) {
 
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
   <script>
-    function switchAdminTab(tabId) {
-      document.querySelectorAll('.admin-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.adminTab === tabId));
+    const categoryDefaults = {
+      overview: 'last30',
+      discovery: 'trending',
+      management: 'creators',
+    };
+    const tabToCategory = {
+      last30: 'overview',
+      sources: 'overview',
+      apiusage: 'overview',
+      trending: 'discovery',
+      search: 'discovery',
+      catalogs_lists: 'discovery',
+      audience: 'discovery',
+      creators: 'management',
+      feedback: 'management',
+      netflixpreview: 'management',
+    };
+
+    function switchAdminMainTab(catId) {
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === catId));
+      document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
+        bar.style.display = bar.id === ('adminSubnav' + catId.charAt(0).toUpperCase() + catId.slice(1)) ? 'flex' : 'none';
+      });
+      let targetSubTab = categoryDefaults[catId] || 'last30';
+      try {
+        const savedTab = localStorage.getItem('myListAddon:adminActiveTab');
+        if (savedTab && tabToCategory[savedTab] === catId) {
+          targetSubTab = savedTab;
+        }
+      } catch (e) {}
+      switchAdminSubTab(targetSubTab);
+    }
+
+    function switchAdminSubTab(tabId, updateUrl = true) {
+      const cat = tabToCategory[tabId] || 'overview';
+      try {
+        localStorage.setItem('myListAddon:adminActiveTab', tabId);
+      } catch (e) {}
+      if (updateUrl && history.replaceState) {
+        history.replaceState(null, '', '#' + tabId);
+      }
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === cat));
+      document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
+        bar.style.display = bar.id === ('adminSubnav' + cat.charAt(0).toUpperCase() + cat.slice(1)) ? 'flex' : 'none';
+      });
+      document.querySelectorAll('.subnav-pill').forEach((p) => p.classList.toggle('active', p.dataset.subTab === tabId));
       document.querySelectorAll('.admin-tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.adminPanel === tabId));
+
       if (tabId === 'trending' && !window._trendingLoadedOnce) { window._trendingLoadedOnce = true; loadTrendingData(); }
+      if (tabId === 'search' && !window._searchLoadedOnce) { window._searchLoadedOnce = true; loadSearchData(); }
+      if (tabId === 'catalogs_lists' && !window._catalogsListsLoadedOnce) { window._catalogsListsLoadedOnce = true; loadCatalogsAndListsData(); }
+      if (tabId === 'audience' && !window._audienceLoadedOnce) { window._audienceLoadedOnce = true; loadAudienceData(); }
       if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
       if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
+    }
+
+    // Alias for compatibility
+    function switchAdminTab(tabId) {
+      switchAdminSubTab(tabId);
+    }
+
+    function restoreAdminActiveTab() {
+      let targetTab = '';
+      const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
+      if (hashTab && tabToCategory[hashTab]) {
+        targetTab = hashTab;
+      } else {
+        try {
+          const savedTab = localStorage.getItem('myListAddon:adminActiveTab');
+          if (savedTab && tabToCategory[savedTab]) {
+            targetTab = savedTab;
+          }
+        } catch (e) {}
+      }
+      if (!targetTab) targetTab = 'last30';
+      switchAdminSubTab(targetTab, false);
+    }
+
+    window.addEventListener('hashchange', () => {
+      const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
+      if (hashTab && tabToCategory[hashTab]) {
+        switchAdminSubTab(hashTab, false);
+      }
+    });
+
+    restoreAdminActiveTab();
+
+    async function loadSearchData() {
+      const body = document.getElementById('searchTableBody');
+      body.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      const win = document.getElementById('searchWindowSelect').value;
+      try {
+        const res = await fetch('/admin/api/analytics?section=search&window=' + encodeURIComponent(win));
+        const data = await res.json();
+        if (!data.ok || !data.searches || !data.searches.length) {
+          body.innerHTML = '<tr><td colspan="3">No searches recorded yet for this window.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.searches.map((s, i) =>
+          '<tr><td>' + (i + 1) + '</td><td><strong>' + escapeHtmlAdmin(s.query) + '</strong></td><td>' + s.count + '</td></tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="3">Could not load search data -- try again.</td></tr>';
+      }
+    }
+
+    async function loadCatalogsAndListsData() {
+      const catBody = document.getElementById('installedCatalogsTableBody');
+      const listBody = document.getElementById('topCommunityListsTableBody');
+      catBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      listBody.innerHTML = '<tr><td colspan="7">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/analytics?section=catalogs_lists');
+        const data = await res.json();
+        if (!data.ok) {
+          catBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          listBody.innerHTML = '<tr><td colspan="7">Could not load.</td></tr>';
+          return;
+        }
+        if (!data.catalogs || !data.catalogs.length) {
+          catBody.innerHTML = '<tr><td colspan="3">No catalog installations recorded yet.</td></tr>';
+        } else {
+          catBody.innerHTML = data.catalogs.map((c, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(c.name) + '</td><td>' + c.count + '</td></tr>'
+          ).join('');
+        }
+
+        if (!data.communityLists || !data.communityLists.length) {
+          listBody.innerHTML = '<tr><td colspan="7">No community lists found.</td></tr>';
+        } else {
+          listBody.innerHTML = data.communityLists.map((l, i) =>
+            '<tr><td>' + (i + 1) + '</td><td><strong>' + escapeHtmlAdmin(l.name) + '</strong></td><td>' + escapeHtmlAdmin(l.creator) + '</td><td>' + escapeHtmlAdmin(l.type) + '</td><td>' + l.itemCount + '</td><td>&#x2764; ' + l.likes + '</td><td>' + l.copies + '</td></tr>'
+          ).join('');
+        }
+      } catch (e) {
+        catBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+        listBody.innerHTML = '<tr><td colspan="7">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    async function loadAudienceData() {
+      const genresBody = document.getElementById('topGenresTableBody');
+      const decadesBody = document.getElementById('topDecadesTableBody');
+      genresBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      decadesBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/analytics?section=audience');
+        const data = await res.json();
+        if (!data.ok) {
+          genresBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          decadesBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          return;
+        }
+
+        const wt = data.watchTypes || {};
+        document.getElementById('audienceTotalPlays').textContent = (wt.total || 0).toLocaleString();
+        document.getElementById('audienceMoviePlays').textContent = (wt.movies || 0).toLocaleString();
+        document.getElementById('audienceSeriesPlays').textContent = (wt.series || 0).toLocaleString();
+        document.getElementById('audienceEpisodePlays').textContent = (wt.episodes || 0).toLocaleString();
+
+        if (!data.genres || !data.genres.length) {
+          genresBody.innerHTML = '<tr><td colspan="3">No genre playback data yet.</td></tr>';
+        } else {
+          genresBody.innerHTML = data.genres.map((g, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(g.name) + '</td><td>' + g.count + '</td></tr>'
+          ).join('');
+        }
+
+        if (!data.decades || !data.decades.length) {
+          decadesBody.innerHTML = '<tr><td colspan="3">No decade playback data yet.</td></tr>';
+        } else {
+          decadesBody.innerHTML = data.decades.map((d, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(d.name) + '</td><td>' + d.count + '</td></tr>'
+          ).join('');
+        }
+      } catch (e) {
+        genresBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+        decadesBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+      }
     }
 
     function escapeHtmlAdmin(s) {
@@ -982,13 +1565,15 @@ async function renderAdminDashboard(env) {
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
       return '<div class="feedback-card' + (completed ? ' completed' : '') + '" id="feedbackCard_' + escapeHtmlAdmin(f.id) + '">' +
-        '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
+        '<div class="feedback-card-header">' +
           '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
-          '<div style="display:flex; gap:6px;">' +
+          '<div class="feedback-actions">' +
+            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="copyFeedbackMessage(this, ' + escapeHtmlAdmin(JSON.stringify(f.message || '')) + ')">&#x2398; Copy</button>' +
             '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="openEditFeedbackModal(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x270E; Edit</button>' +
             '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ')">' +
-              (completed ? '\u21a9 Mark not completed' : '\u2713 Mark completed') +
+              (completed ? '\u21a9 Reopen' : '\u2713 Mark done') +
             '</button>' +
+            '<button type="button" class="admin-select" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);" onclick="deleteFeedbackEntry(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x2715; Delete</button>' +
           '</div>' +
         '</div>' +
         '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
@@ -1151,6 +1736,48 @@ async function renderAdminDashboard(env) {
         alert('Network error while saving feedback edits.');
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save Changes';
+      }
+    }
+
+    async function copyFeedbackMessage(btn, message) {
+      try {
+        await navigator.clipboard.writeText(message);
+        const prevText = btn.innerHTML;
+        btn.innerHTML = '&#x2713; Copied!';
+        btn.style.color = '#34C759';
+        setTimeout(() => {
+          btn.innerHTML = prevText;
+          btn.style.color = '';
+        }, 1800);
+      } catch (e) {
+        alert('Could not copy message to clipboard.');
+      }
+    }
+
+    async function deleteFeedbackEntry(id) {
+      if (!confirm('Permanently delete this feedback entry?')) return;
+      const idx = feedbackEntries.findIndex((f) => f.id === id);
+      if (idx === -1) return;
+      const removedEntry = feedbackEntries[idx];
+      feedbackEntries.splice(idx, 1);
+      renderFeedbackList();
+
+      try {
+        const res = await fetch('/admin/api/feedback/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          feedbackEntries.splice(idx, 0, removedEntry);
+          renderFeedbackList();
+          alert((data && data.error) || 'Could not delete feedback entry.');
+        }
+      } catch (err) {
+        feedbackEntries.splice(idx, 0, removedEntry);
+        renderFeedbackList();
+        alert('Network error while deleting feedback entry.');
       }
     }
   </script>

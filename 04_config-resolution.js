@@ -10,12 +10,15 @@ async function resolveConfig(configParam, env) {
           entries: Array.isArray(parsed.entries) ? parsed.entries : [],
           tmdbKey: parsed.tmdbKey || "",
           mdblistKey: parsed.mdblistKey || "",
+          mdblistAccessToken: parsed.mdblistAccessToken || "",
           traktKey: parsed.traktKey || "",
           traktUsername: parsed.traktUsername || "",
           traktAccessToken: parsed.traktAccessToken || "",
           track: !!parsed.track,
           trackCreatorName: parsed.trackCreatorName || "",
           trackCreatorKey: parsed.trackCreatorKey || "",
+          shuffleShelves: !!parsed.shuffleShelves,
+          shuffleItems: !!parsed.shuffleItems,
         };
       } catch {
         // fall through to legacy decode below
@@ -80,12 +83,38 @@ function parsePublishedListUrl(rawUrl) {
   return { username: m[1].toLowerCase(), listName: m[2].toLowerCase() };
 }
 
+function parseTmdbWebChartUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  const m = s.match(/^https?:\/\/(?:www\.)?themoviedb\.org\/(movie|tv|trending)(?:\/([a-z0-9_-]+))?/i);
+  if (!m) return null;
+  const section = m[1].toLowerCase();
+  const sub = (m[2] || "").toLowerCase();
+  
+  if (section === "movie") {
+    if (!sub || sub === "popular") return { chartKey: "popular", type: "movie", name: "TMDB Popular Movies" };
+    if (sub === "top-rated" || sub === "top_rated") return { chartKey: "top_rated", type: "movie", name: "TMDB Top Rated Movies" };
+    if (sub === "now-playing" || sub === "now_playing") return { chartKey: "now_playing", type: "movie", name: "TMDB Now Playing" };
+    if (sub === "upcoming") return { chartKey: "upcoming", type: "movie", name: "TMDB Upcoming Movies" };
+  } else if (section === "tv") {
+    if (!sub || sub === "popular") return { chartKey: "popular", type: "series", name: "TMDB Popular Shows" };
+    if (sub === "top-rated" || sub === "top_rated") return { chartKey: "top_rated", type: "series", name: "TMDB Top Rated Shows" };
+    if (sub === "airing-today" || sub === "airing_today") return { chartKey: "now_playing", type: "series", name: "TMDB Airing Today" };
+    if (sub === "on-the-air" || sub === "on_the_air") return { chartKey: "upcoming", type: "series", name: "TMDB On The Air" };
+  } else if (section === "trending") {
+    if (sub === "movie" || sub === "movies") return { chartKey: "trending", type: "movie", name: "TMDB Trending Movies" };
+    if (sub === "tv" || sub === "shows") return { chartKey: "trending", type: "series", name: "TMDB Trending Shows" };
+    return { chartKey: "trending", type: "movie", name: "TMDB Trending" };
+  }
+  return null;
+}
+
 function detectSource(input) {
   const s = (input || "").trim();
-  if (s === "mdblist:watchlist") return "mdblist-watchlist";
+  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:")) return "mdblist-watchlist";
+  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/history\//i.test(s)) return "mdblist-history";
   if (s === "trakt:watchlist") return "trakt-watchlist";
   if (s === "trakt:history") return "trakt-history";
-  if (s.startsWith("tmdb:chart:")) return "tmdb-chart";
+  if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
@@ -94,6 +123,8 @@ function detectSource(input) {
   if (s.startsWith("channel:v1:")) return "channel";
   if (s.startsWith("customlist:v1:")) return "custom-list";
   if (s.startsWith("autotrack:")) return "autotrack";
+  if (s.startsWith("custom:curated:") || s.startsWith("curated:")) return "curated";
+  if (s.startsWith("tmdb:collection:") || /^https?:\/\/(?:www\.)?themoviedb\.org\/collection\//i.test(s)) return "tmdb-collection";
   if (parsePublishedListUrl(s)) return "published-list";
   if (/^https?:\/\/(www\.|app\.)?trakt\.tv\//i.test(s)) return "trakt";
   if (/^https?:\/\/(www\.)?themoviedb\.org\/list\//i.test(s)) return "tmdb";
@@ -120,6 +151,18 @@ function traktListPath(input) {
 function tmdbListId(input) {
   const s = (input || "").trim();
   const m = s.match(/themoviedb\.org\/list\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+// Parses a TMDB collection URL or sentinel (e.g. tmdb:collection:86311 or
+// https://www.themoviedb.org/collection/86311) into its numeric collection id.
+function tmdbCollectionId(input) {
+  const s = (input || "").trim();
+  if (s.startsWith("tmdb:collection:")) {
+    const id = s.slice("tmdb:collection:".length).split(/[^0-9]/)[0];
+    return id || null;
+  }
+  const m = s.match(/themoviedb\.org\/collection\/(\d+)/i);
   return m ? m[1] : null;
 }
 
@@ -271,4 +314,3 @@ async function searchTraktLists(query, traktKeyOverride) {
     contentType: await classifyTraktListContentType(l.user, l.slug, traktKey),
   }));
 }
-

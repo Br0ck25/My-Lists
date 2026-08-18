@@ -13,6 +13,10 @@ function exportConfigJson() {
   }
   const keys = collectKeys();
   const payload = { entries };
+  if (keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
+  if (keys.tmdbSessionId) payload.tmdbSessionId = keys.tmdbSessionId;
+  if (keys.tmdbAccountId) payload.tmdbAccountId = keys.tmdbAccountId;
+  if (keys.tmdbUsername) payload.tmdbUsername = keys.tmdbUsername;
   if (keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
@@ -46,7 +50,29 @@ function applyImportedConfig(data) {
   }
   document.getElementById('lists').innerHTML = '';
   data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  if (data.tmdbKey) {
+    const el = document.getElementById('tmdbKeyInput');
+    if (el) el.value = data.tmdbKey;
+    try { localStorage.setItem('myListAddon:tmdbKey', data.tmdbKey); } catch (e) {}
+  }
+  if (data.tmdbSessionId) {
+    tmdbSessionId = data.tmdbSessionId;
+    try { localStorage.setItem('myListAddon:tmdbSessionId', data.tmdbSessionId); } catch (e) {}
+  }
+  if (data.tmdbAccountId) {
+    tmdbAccountId = data.tmdbAccountId;
+    try { localStorage.setItem('myListAddon:tmdbAccountId', data.tmdbAccountId); } catch (e) {}
+  }
+  if (data.tmdbUsername) {
+    tmdbUsername = data.tmdbUsername;
+    try { localStorage.setItem('myListAddon:tmdbUsername', data.tmdbUsername); } catch (e) {}
+  }
+  if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
   if (data.mdblistKey) document.getElementById('mdblistKeyInput').value = data.mdblistKey;
+  if (data.mdblistAccessToken) {
+    mdblistAccessToken = data.mdblistAccessToken;
+    if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  }
   if (data.traktKey) document.getElementById('traktKeyInput').value = data.traktKey;
   if (data.traktUsername) document.getElementById('traktUsernameInput').value = data.traktUsername;
   if (data.traktAccessToken) {
@@ -57,6 +83,7 @@ function applyImportedConfig(data) {
   checkAllDuplicateUrls();
   saveState();
   renderChannelMergeList();
+  if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
   scheduleMyMdblistListsRefresh();
   scheduleMyTraktListsRefresh();
   alert('Imported ' + data.entries.length + ' list(s).');
@@ -99,6 +126,10 @@ async function importFromLink() {
     }
     data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
     if (data.mdblistKey) document.getElementById('mdblistKeyInput').value = data.mdblistKey;
+    if (data.mdblistAccessToken) {
+      mdblistAccessToken = data.mdblistAccessToken;
+      if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+    }
     if (data.traktKey) document.getElementById('traktKeyInput').value = data.traktKey;
     if (data.traktUsername) document.getElementById('traktUsernameInput').value = data.traktUsername;
     if (data.traktAccessToken) {
@@ -419,6 +450,8 @@ function saveState() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       entries: collectEntries(),
       keys: collectKeys(),
+      shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
+      shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
     }));
   } catch (e) {
     // localStorage unavailable (private browsing, disabled, etc.) — fine,
@@ -436,6 +469,8 @@ function loadSavedState() {
     return {
       entries: Array.isArray(parsed.entries) ? parsed.entries : [],
       keys: parsed.keys && typeof parsed.keys === 'object' ? parsed.keys : {},
+      shuffleShelves: !!parsed.shuffleShelves,
+      shuffleItems: !!parsed.shuffleItems,
     };
   } catch (e) {
     return null;
@@ -468,8 +503,9 @@ async function generate() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        entries, mdblistKey: keys.mdblistKey, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
+        entries, mdblistKey: keys.mdblistKey, mdblistAccessToken: keys.mdblistAccessToken, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
         track: keys.track, trackCreatorName: keys.trackCreatorName, trackCreatorKey: keys.trackCreatorKey,
+        shuffleShelves: keys.shuffleShelves, shuffleItems: keys.shuffleItems,
       }),
     });
     const data = await res.json();
@@ -485,7 +521,7 @@ async function generate() {
     // episodes can make the encoded config huge even with just one or two
     // rows total, so this checks the actual encoded length instead.
     if (config.length > 4000) {
-      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\'s long and may fail to install in apps with URL-length limits \u2014 including wako. If you\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
     }
   }
 
@@ -529,9 +565,17 @@ async function generate() {
 // pre-fill
 suppressSave = true;
 const serverEntries = (${initialEntriesJson});
+const serverShuffleShelves = ${initialShuffleShelves ? 'true' : 'false'};
+const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 if (serverEntries.length) {
   // Opened via a real install/configure link — this is the source of truth.
   serverEntries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  if (document.getElementById('shuffleShelvesCheckbox')) {
+    document.getElementById('shuffleShelvesCheckbox').checked = serverShuffleShelves;
+  }
+  if (document.getElementById('shuffleItemsCheckbox')) {
+    document.getElementById('shuffleItemsCheckbox').checked = serverShuffleItems;
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved.
@@ -539,8 +583,17 @@ if (serverEntries.length) {
   if (saved && Array.isArray(saved.entries) && saved.entries.length) {
     saved.entries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
   }
+  if (saved && document.getElementById('shuffleShelvesCheckbox')) {
+    document.getElementById('shuffleShelvesCheckbox').checked = !!saved.shuffleShelves;
+  }
+  if (saved && document.getElementById('shuffleItemsCheckbox')) {
+    document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
+  }
   if (saved && saved.keys && saved.keys.mdblistKey) {
     document.getElementById('mdblistKeyInput').value = saved.keys.mdblistKey;
+  }
+  if (saved && saved.keys && saved.keys.mdblistAccessToken) {
+    mdblistAccessToken = saved.keys.mdblistAccessToken;
   }
   if (saved && saved.keys && saved.keys.traktKey) {
     document.getElementById('traktKeyInput').value = saved.keys.traktKey;
@@ -552,17 +605,12 @@ if (serverEntries.length) {
     traktAccessToken = saved.keys.traktAccessToken;
   }
 }
-// Trakt's OAuth connection is local, per-browser state -- unlike the
-// catalog entries above (which come from whatever install link opened
-// this page), it was never embedded in that link and only ever lives in
-// this browser's own localStorage (see disconnectTrakt/
-// pickUpTraktTokenFromUrl, both of which call saveState()). Restored here
-// regardless of which branch above ran, and only as a fallback (never
-// overwriting a token the server already provided for this exact
-// install), so a page that opened via an existing install link -- the
-// common case, since it's what "refresh" usually means here -- doesn't
-// lose an already-connected Trakt session just because it also happened
-// to have rows preloaded from that link.
+if (!mdblistAccessToken) {
+  const savedForMdblist = loadSavedState();
+  if (savedForMdblist && savedForMdblist.keys && savedForMdblist.keys.mdblistAccessToken) {
+    mdblistAccessToken = savedForMdblist.keys.mdblistAccessToken;
+  }
+}
 if (!traktAccessToken) {
   const savedForTrakt = loadSavedState();
   if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
@@ -579,8 +627,14 @@ renderCreatorProfileBar();
 renderAccountKeySection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
+if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
+if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
 pickUpTraktTokenFromUrl();
 renderTraktConnectStatus();
+if (typeof pickUpTmdbTokenFromUrl === 'function') pickUpTmdbTokenFromUrl();
+if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
+if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+if (typeof populateImportTargetLists === 'function') populateImportTargetLists();
 document.querySelectorAll('details.panel.collapsible').forEach((d) => {
   d.addEventListener('toggle', scheduleCreatorSyncSave);
 });
@@ -613,10 +667,47 @@ tryAutoRestoreCreatorProfile();
     openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
     return;
   }
-  const tmdbMatch = path.match(new RegExp('^/lists/tmdb/([0-9]+)', 'i'));
+  const curatedMatch = path.match(new RegExp('^/lists/curated/([^/]+)', 'i'));
+  if (curatedMatch) {
+    const slug = curatedMatch[1];
+    const isShow = slug.includes('show') || slug.includes('tv') || slug.includes('series');
+    const title = isShow ? 'Recommended Shows' : 'Recommended Movies';
+    const listUrl = 'custom:curated:' + slug;
+    openListDetailsPage(title, isShow ? 'series' : 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/continue-watching' || path.toLowerCase() === '/lists/continue_watching') {
+    openListDetailsPage('Continue Watching', 'series', 'autotrack:continue-watching', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/watch-history' || path.toLowerCase() === '/lists/watch_history') {
+    openListDetailsPage('Watch History', 'movie', 'autotrack:watch-history', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/watchlist') {
+    openListDetailsPage('Watchlist', 'mixed', 'autotrack:watchlist', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/new-movies') {
+    openListDetailsPage('New Movies', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/new-shows') {
+    openListDetailsPage('New Shows', 'series', 'tmdb:chart:new_shows', null, { skipPushState: true });
+    return;
+  }
+  const tmdbCollMatch = path.match(new RegExp('^/lists/tmdb/collection/([0-9]+)(?:-([a-z0-9_-]+))?', 'i'));
+  if (tmdbCollMatch) {
+    const listUrl = 'https://www.themoviedb.org/collection/' + tmdbCollMatch[1];
+    const name = tmdbCollMatch[2] ? (typeof deslugify === 'function' ? deslugify(tmdbCollMatch[2]) : tmdbCollMatch[2]) : ('TMDB Collection ' + tmdbCollMatch[1]);
+    openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+  const tmdbMatch = path.match(new RegExp('^/lists/tmdb/([0-9]+)(?:-([a-z0-9_-]+))?', 'i'));
   if (tmdbMatch) {
     const listUrl = 'https://www.themoviedb.org/list/' + tmdbMatch[1];
-    openListDetailsPage('TMDB List ' + tmdbMatch[1], 'movie', listUrl, null, { skipPushState: true });
+    const name = tmdbMatch[2] ? (typeof deslugify === 'function' ? deslugify(tmdbMatch[2]) : tmdbMatch[2]) : ('TMDB List ' + tmdbMatch[1]);
+    openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
     return;
   }
 
@@ -632,41 +723,52 @@ tryAutoRestoreCreatorProfile();
 
 window.addEventListener('popstate', (e) => {
   const state = e.state;
-  if (state && state.view === 'list') {
-    openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true });
-  } else if (state && state.view === 'item') {
-    openItemDetailsModal(state.id, state.type, { skipPushState: true });
-  } else {
-    if (location.pathname.startsWith('/lists/')) {
-      history.replaceState({ view: 'tab', tab: window._previousTab || 'discover' }, '', '/');
+  const path = location.pathname || '';
+  const hash = location.hash || '';
+  const isListPath = (path.startsWith('/lists/') && path !== '/lists') || hash.startsWith('#/list?');
+
+  if ((state && state.view === 'list') || isListPath) {
+    const listKey = state ? ((state.name || '') + '::' + (state.listUrl || '')) : '';
+    const currentListKey = window._currentListDetailsKey || '';
+    const gridEl = document.getElementById('detailGrid');
+    if (gridEl && gridEl.children.length > 0 && (!listKey || currentListKey === listKey || !state)) {
+      switchTab('list-details');
+      if (typeof window._listScrollY === 'number') {
+        const targetScroll = window._listScrollY;
+        window.scrollTo({ top: targetScroll, behavior: 'instant' });
+        requestAnimationFrame(() => {
+          window.scrollTo({ top: targetScroll, behavior: 'instant' });
+          setTimeout(() => {
+            window.scrollTo({ top: targetScroll, behavior: 'instant' });
+          }, 50);
+        });
+      }
+      return;
     }
-    const targetTab = window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
+    if (state && state.view === 'list') {
+      openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true, restoreScrollY: window._listScrollY });
+    }
+  } else if ((state && state.view === 'item') || hash.startsWith('#/item?')) {
+    const itemId = (state && state.id) || (new URLSearchParams(hash.slice('#/item?'.length)).get('id')) || '';
+    const itemType = (state && state.type) || (new URLSearchParams(hash.slice('#/item?'.length)).get('type')) || 'movie';
+    openItemDetailsModal(itemId, itemType, { skipPushState: true });
+  } else {
+    const targetTab = window._originTab || window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
     const cleanTab = (targetTab === 'list-details' || targetTab === 'item-details') ? 'discover' : targetTab;
-
-    document.querySelectorAll('.tab-panel').forEach(function(p) {
-      p.hidden = (p.getAttribute('data-tab-panel') !== cleanTab);
-    });
-    document.querySelectorAll('.tab-btn').forEach(function(b) {
-      b.classList.toggle('active', b.getAttribute('data-tab') === cleanTab);
-    });
-    document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
-      b.classList.toggle('active', b.getAttribute('data-tab') === cleanTab);
-    });
-
-    const addShelfBtn = document.getElementById('headerAddShelfBtn');
-    if (addShelfBtn) addShelfBtn.style.display = (cleanTab === 'catalogs' ? 'block' : 'none');
-    const createListBtn = document.getElementById('headerCreateListBtn');
-    if (createListBtn) createListBtn.style.display = (cleanTab === 'lists' ? 'block' : 'none');
-
-    try {
-      localStorage.setItem('myListAddon:activeTab', cleanTab);
-    } catch (err) {}
+    if (location.pathname.startsWith('/lists/')) {
+      history.replaceState({ view: 'tab', tab: cleanTab }, '', '/');
+    }
+    switchTab(cleanTab);
 
     if (typeof window._previousScrollY === 'number') {
       const scrollPos = window._previousScrollY;
-      setTimeout(() => {
+      window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      requestAnimationFrame(() => {
         window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      }, 0);
+        setTimeout(() => {
+          window.scrollTo({ top: scrollPos, behavior: 'instant' });
+        }, 50);
+      });
     }
   }
 });

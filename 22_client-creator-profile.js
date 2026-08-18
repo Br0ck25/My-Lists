@@ -609,6 +609,7 @@ async function pushCreatorSync() {
         creatorName: activeCreator.creatorName,
         creatorKey: creatorKey,
         config: collectEntries(),
+        keys: (typeof collectKeys === 'function') ? collectKeys() : {},
         // Presets and tracking data (watchHistory/continueWatching/etc)
         // deliberately NOT included here -- both are pieces of this state
         // that can genuinely grow large, while everything else in this
@@ -646,11 +647,8 @@ async function pushTrackingSync() {
         // merging.
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
+        watchlist: (localMap['watchlist'] && localMap['watchlist'].items) || [],
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
-        // Feeds the server-side Continue Watching cron (checkForNewEpisodes
-        // in 07_source-fetchers-tmdb-simkl.js) -- see save-tracking's own
-        // comment for why both of these need to travel alongside Watch
-        // History/Continue Watching rather than being derived server-side.
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
       }),
@@ -721,6 +719,55 @@ async function loadCreatorSync() {
       }
     }
 
+    if (synced.keys && typeof synced.keys === 'object') {
+      try {
+        if (synced.keys.tmdbKey) {
+          localStorage.setItem('myListAddon:tmdbKey', synced.keys.tmdbKey);
+          const el = document.getElementById('tmdbKeyInput');
+          if (el) el.value = synced.keys.tmdbKey;
+        }
+        if (synced.keys.tmdbSessionId) {
+          localStorage.setItem('myListAddon:tmdbSessionId', synced.keys.tmdbSessionId);
+          window.tmdbSessionId = synced.keys.tmdbSessionId;
+        }
+        if (synced.keys.tmdbAccountId) {
+          localStorage.setItem('myListAddon:tmdbAccountId', synced.keys.tmdbAccountId);
+          window.tmdbAccountId = synced.keys.tmdbAccountId;
+        }
+        if (synced.keys.tmdbUsername) {
+          localStorage.setItem('myListAddon:tmdbUsername', synced.keys.tmdbUsername);
+          window.tmdbUsername = synced.keys.tmdbUsername;
+        }
+        if (synced.keys.mdblistKey) {
+          localStorage.setItem('myListAddon:mdblistKey', synced.keys.mdblistKey);
+          const el = document.getElementById('mdblistKeyInput');
+          if (el) el.value = synced.keys.mdblistKey;
+        }
+        if (synced.keys.mdblistAccessToken) {
+          localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
+          window.mdblistAccessToken = synced.keys.mdblistAccessToken;
+        }
+        if (synced.keys.traktKey) {
+          localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
+          const el = document.getElementById('traktKeyInput');
+          if (el) el.value = synced.keys.traktKey;
+        }
+        if (synced.keys.traktUsername) {
+          localStorage.setItem('myListAddon:traktUsername', synced.keys.traktUsername);
+          const el = document.getElementById('traktUsernameInput');
+          if (el) el.value = synced.keys.traktUsername;
+        }
+        if (synced.keys.traktAccessToken) {
+          localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
+          window.traktAccessToken = synced.keys.traktAccessToken;
+        }
+        if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+        if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+        if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
+        if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
+      } catch (e) {}
+    }
+
     // Watch History / Continue Watching -- same wholesale-replace as
     // everything else in this blob (see this function's own comment).
     // getOrCreateWatchHistoryList/getOrCreateContinueWatchingList are used
@@ -777,6 +824,20 @@ async function loadCreatorSync() {
       }
       touchedTracking = true;
     }
+    if (Array.isArray(synced.watchlist)) {
+      const localWL = loadLocalCustomLists()['watchlist'];
+      const localWLItems = (localWL && localWL.items) || [];
+      if (localWLItems.length > synced.watchlist.length) {
+        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+      } else {
+        const map = loadLocalCustomLists();
+        backfillAutoTrackedListSlugs(map);
+        map['watchlist'].items = synced.watchlist;
+        map['watchlist'].updatedAt = Date.now();
+        saveLocalCustomListsMap(map);
+      }
+      touchedTracking = true;
+    }
     // Both feed the server-side Continue Watching cron and, once adopted
     // here, the exact same badge/dismissal logic Watch History and
     // Continue Watching already use client-side (see updateContinueWatching
@@ -801,12 +862,21 @@ async function loadCreatorSync() {
         // non-critical
       }
     }
+    if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
+      try {
+        localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(synced.dashboardListOrder));
+      } catch (e) {
+        // non-critical
+      }
+      touchedTracking = true;
+    }
     // The dashboard may have already rendered (from before this fetch
     // resolved) with whatever was on this browser beforehand -- refresh it
     // now that the synced watch data has landed, or a device signing in
     // for the first time would show a stale/empty Watch History card
     // until something else happened to trigger a re-render.
     if (touchedTracking && typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    try { if (typeof cleanWatchedFromWatchlists === 'function') cleanWatchedFromWatchlists(); } catch (e) {}
 
     saveState();
   } catch (e) {
@@ -1046,7 +1116,7 @@ async function confirmSaveAsCreator() {
     });
     const data = await res.json();
     if (!data.ok) {
-      alert('Could not save this list: ' + (data.error || 'unknown error'));
+      showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
       return;
     }
     const updatedPayload = Object.assign({}, ctx.payload, {
@@ -1061,22 +1131,39 @@ async function confirmSaveAsCreator() {
     showSavedCustomListModal(ctx.name, visibility, data.url);
     renderCreatorDashboard();
   } catch (e) {
-    alert('Network error while saving.');
+    showAppNoticeModal('Network Error', 'A network error occurred while saving. Please try again.', true);
   } finally {
     pendingSaveListContext = null;
   }
 }
 
+function showAppNoticeModal(title, message, isError) {
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;' + (isError ? ' color:var(--danger);' : '') + '">' + escapeHtml(title || 'Notice') + '</h2>' +
+      '<p style="margin:12px 0 20px; font-size:0.9rem; color:var(--text); line-height:1.4;">' + escapeHtml(message || '') + '</p>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end;">' +
+        '<button type="button" class="primary lc-btn" onclick="closeModal()">OK</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
 // --- Creator Dashboard ---------------------------------------------------------
 
-async function renderCreatorDashboard() {
+async function renderCreatorDashboard(options) {
+  const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
   if (!box) return;
   if (!activeCreator) {
-    renderLocalCustomListsDashboard(box);
+    renderLocalCustomListsDashboard(box, silent);
     return;
   }
-  box.innerHTML = '<p><small>Loading your lists\u2026</small></p>';
+  const hasExistingContent = !!(box.querySelector('#creatorListRows') || (box.children && box.children.length > 0 && !box.querySelector('.testresult')));
+  if (!hasExistingContent && !silent) {
+    box.innerHTML = '<p><small>Loading your lists\u2026</small></p>';
+  }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   try {
     const res = await fetch(ORIGIN + '/api/creator/lists', {
@@ -1086,7 +1173,9 @@ async function renderCreatorDashboard() {
     });
     const data = await res.json();
     if (!data.ok) {
-      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your lists.') + '</p>';
+      if (!hasExistingContent) {
+        box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your lists.') + '</p>';
+      }
       return;
     }
     lastCreatorListsData = data.lists;
@@ -1113,6 +1202,8 @@ async function renderCreatorDashboard() {
       const shareBtn = l.visibility === 'private'
         ? ''
         : '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '">Share</button>';
+      const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist');
+      const deleteBtnHtml = isWatchlist ? '' : '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
       const allPosters = (l.items || []).slice(0, 9).filter((it) => it.poster);
       const totalCount = l.itemCount || allPosters.length;
       const posterThumbs = allPosters.map((it, i) => {
@@ -1125,9 +1216,14 @@ async function renderCreatorDashboard() {
         if (isDesktopEnd) {
           overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
         }
+        const removeBtn = isWatchlist
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          : '';
+        const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
         return '<div class="list-card-mini-poster-tile">' +
           '<div class="list-card-mini-poster-img-wrap">' +
-            '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.imdbId || it.id) + '" data-type="' + escapeAttr(l.type || 'movie') + '" alt="" loading="lazy">' +
+            '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.imdbId || it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+            removeBtn +
             overlays +
           '</div>' +
           '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
@@ -1145,15 +1241,15 @@ async function renderCreatorDashboard() {
             '<div class="list-card-meta">' +
               '<span>' + (l.visibility === 'private' ? 'Private' : 'Public') + '</span>' +
               '<span class="list-card-meta-sep">&middot;</span>' +
-              '<span>' + (l.type === 'series' ? 'Shows' : 'Movies') + '</span>' +
+              '<span>' + (l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Mixed' : 'Movies')) + '</span>' +
               '<span class="list-card-meta-sep">&middot;</span>' +
-              '<span>' + l.itemCount + ' items</span>' +
+              '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
               '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
-            '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>' +
+            deleteBtnHtml +
             shareBtn +
             '<button type="button" class="lc-btn ' + (isAdded ? 'secondary creatorListAddToConfigBtn is-added' : 'primary creatorListAddToConfigBtn') + '" ' +
               (isAdded ? 'style="color:var(--danger);"' : '') +
@@ -1172,9 +1268,16 @@ async function renderCreatorDashboard() {
     ];
 
     let savedOrder = [];
-    try {
-      savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-    } catch (e) {}
+    if (Array.isArray(data.order) && data.order.length) {
+      savedOrder = data.order;
+      try {
+        localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
+      } catch (e) {}
+    } else {
+      try {
+        savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+      } catch (e) {}
+    }
     if (savedOrder && savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       allDashboardLists.sort((a, b) => {
@@ -1188,38 +1291,17 @@ async function renderCreatorDashboard() {
       ? allDashboardLists.map((item) => item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list)).join('')
       : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
 
+    const prevScrollTop = box.scrollTop;
     box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+    if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
   } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
+    if (!hasExistingContent) {
+      box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
+    }
   }
 }
 
-// Local equivalent of the dashboard above -- same row layout (minus
-// Share, which needs a server-hosted URL to share, and minus drag-to-
-// reorder, which would need a local reordering scheme of its own; sorted
-// by most-recently-updated instead). Synchronous, no fetch, since it's
-// just reading localStorage.
-// Builds one list-card's HTML for a local (browser-only) list -- shared by
-// renderLocalCustomListsDashboard (signed out: every local list) and
-// renderAutoTrackedListsHtml (signed in: just Watch History/Continue
-// Watching, since those two never get migrated to a Creator Profile).
-// Builds a "Show Name S03E07 Episode Name" label for a Watch History /
-// Continue Watching episode entry -- both store showTitle/seasonNum/
-// episodeNum alongside the raw episode name (see toggleWatchStatus,
-// toggleBatchWatchStatus, and updateContinueWatching), so the season and
-// episode number can always be reconstructed here instead of just showing
-// the bare episode title, which on its own doesn't say which show or
-// which episode it even is. Falls back to whatever name/title it has for
-// movies (no season/episode) or older entries saved before this existed.
-// Splits a Watch History / Continue Watching episode entry into a
-// "Show Name S03E07" line and an "Episode Name" line -- both items store
-// showTitle/seasonNum/episodeNum alongside the raw episode name (see
-// toggleWatchStatus, toggleBatchWatchStatus, and updateContinueWatching),
-// so this can always reconstruct which show/season/episode it is instead
-// of just showing the bare episode title, which on its own says neither.
-// Movies (no season/episode) and older entries saved before this existed
-// just get a single line back, with subtitle empty.
 function formatWatchItemLabel(it) {
   if (!it) return { title: '', subtitle: '' };
   if (it.showTitle && it.seasonNum != null && it.episodeNum != null) {
@@ -1232,6 +1314,7 @@ function formatWatchItemLabel(it) {
 
 function buildLocalListCardHtml(l) {
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
+  const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist');
   const itemCount = (l.items || []).length;
   const allPosters = (l.items || []).slice(0, 9).filter((it) => (l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster)));
   const totalCount = itemCount || allPosters.length;
@@ -1245,21 +1328,17 @@ function buildLocalListCardHtml(l) {
     if (isDesktopEnd) {
       overlays += '<div class="list-card-count-overlay desktop-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
-    // Watch History / Continue Watching items are keyed by episode/
-    // movie id (it.id), not the imdbId/title shape a hand-built
-    // Custom List item has -- fall back through both schemas, and
-    // for a Continue Watching entry specifically, link the poster to
-    // the show itself (it.showId) rather than the episode's own id,
-    // since there's no per-episode details view to send it to.
     const posterId = it.showId || it.imdbId || it.id;
-    const posterType = it.showId ? 'series' : (l.type || 'movie');
+    const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
     const label = formatWatchItemLabel(it);
-    // Only Continue Watching gets a remove button -- Watch History and
-    // regular Custom Lists don't have a "dismiss until something changes"
-    // concept the way Continue Watching's "what's next" suggestion does.
-    const removeBtn = (l.slug === 'continue-watching' && it.showId)
-      ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;)" title="Remove from Continue Watching">&times;</button>'
-      : '';
+    let removeBtn = '';
+    if (l.slug === 'continue-watching' && it.showId) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    } else if (isWatchlist) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+    } else if (l.slug === 'watch-history') {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+    }
     const itemPoster = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
@@ -1297,6 +1376,10 @@ function buildLocalListCardHtml(l) {
     (isAdded ? 'Remove' : '+ Add') +
   '</button>';
 
+  const deleteBtnHtml = (isAutoTracked || isWatchlist)
+    ? ''
+    : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
+
   return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body">' +
@@ -1307,7 +1390,7 @@ function buildLocalListCardHtml(l) {
         '<div class="list-card-meta">' +
           '<span>' + typeLabel + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span>' +
-          '<span>' + itemCount + ' item' + (itemCount === 1 ? '' : 's') + '</span>' +
+          '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
         '</div>' +
       '</div>' +
@@ -1318,7 +1401,7 @@ function buildLocalListCardHtml(l) {
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
-            '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>' +
+            deleteBtnHtml +
             addBtnHtml +
           '</div>') +
     '</div>' +
@@ -1335,6 +1418,22 @@ function backfillAutoTrackedListSlugs(map) {
       patched = true;
     }
   });
+  // Auto-create mixed Watchlist if not present
+  const hasWatchlist = Object.values(map).some(
+    (l) => l && (l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist)
+  );
+  if (!hasWatchlist) {
+    map['watchlist'] = {
+      slug: 'watchlist',
+      name: 'Watchlist',
+      type: 'mixed',
+      isWatchlist: true,
+      items: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    patched = true;
+  }
   if (patched) saveLocalCustomListsMap(map);
 }
 
@@ -1350,11 +1449,12 @@ function backfillAutoTrackedListSlugs(map) {
 function renderAutoTrackedListsHtml() {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
-  const lists = ['watch-history', 'continue-watching'].map((key) => map[key]).filter(Boolean);
+  const keys = ['watch-history', 'continue-watching', 'watchlist'];
+  const lists = keys.map((key) => map[key]).filter(Boolean);
   return { html: lists.map(buildLocalListCardHtml).join(''), lists: lists };
 }
 
-function renderLocalCustomListsDashboard(box) {
+function renderLocalCustomListsDashboard(box, silent) {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
 
@@ -1378,7 +1478,9 @@ function renderLocalCustomListsDashboard(box) {
   const rowsHtml = lists.length
     ? lists.map(buildLocalListCardHtml).join('')
     : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
+  const prevScrollTop = box ? box.scrollTop : 0;
   box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+  if (prevScrollTop) box.scrollTop = prevScrollTop;
   document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
 }
 
@@ -1392,6 +1494,9 @@ if (_creatorDashEl) {
     const slug = viewBtn.dataset.slug;
     const pool = (viewBtn.classList.contains('localListViewBtn') || viewBtn.classList.contains('localListViewTrigger')) ? lastLocalCustomListsData : lastCreatorListsData;
     const list = (pool || []).filter((l) => l.slug === slug)[0];
+    const isCw = list && list.slug === 'continue-watching';
+    const isWatchlist = list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'));
+    const isHistory = list && (list.slug === 'watch-history' || (list.name && list.name.toLowerCase() === 'watch history'));
     const sample = list ? (list.items || []).map((it) => {
       const label = formatWatchItemLabel(it);
       return {
@@ -1403,11 +1508,12 @@ if (_creatorDashEl) {
         type: it.showId ? 'series' : (list.type || 'movie'),
         name: label.title,
         subtitle: label.subtitle,
-        poster: list.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+        poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
         year: it.year,
-        // Only Continue Watching's own grid gets a remove button -- see
-        // buildLocalListCardHtml's matching comment for why.
-        removeShowId: (list.slug === 'continue-watching' && it.showId) ? it.showId : null,
+        removeShowId: isCw ? (it.showId || it.id) : null,
+        removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+        removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+        removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? list.slug : null,
       };
     }) : [];
     openListDetailsPage(viewBtn.dataset.name, viewBtn.dataset.type, '', { sample: sample, maybeMore: false });
@@ -1423,36 +1529,47 @@ if (_creatorDashEl) {
   const deleteBtn = e.target.closest('.creatorListDeleteBtn');
   if (deleteBtn) {
     const slug = deleteBtn.dataset.slug;
-    if (!confirm("Delete this list? This cannot be undone.")) return;
-    const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-    try {
-      const res = await fetch(ORIGIN + '/api/creator/lists/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, slug: slug }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        alert('Could not delete: ' + (data.error || 'unknown error'));
-        return;
-      }
-      
-      // Remove from main lists config if present
-      document.querySelectorAll('#lists .url').forEach((urlInput) => {
-        const rowPayload = parseCustomListPayloadClient(urlInput.value);
-        if (rowPayload && (rowPayload.creatorSlug === slug || rowPayload.slug === slug)) {
-          const entry = urlInput.closest('.entry');
-          if (entry) {
-            entry.remove();
-            if (typeof saveState === 'function') saveState();
+    if (slug === 'watchlist') return;
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", async () => {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, slug: slug }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          if (typeof showAppAlert === 'function') {
+            showAppAlert('Error', 'Could not delete: ' + (data.error || 'unknown error'), false);
+          } else {
+            alert('Could not delete: ' + (data.error || 'unknown error'));
           }
+          return;
         }
-      });
-      
-      renderCreatorDashboard();
-    } catch (err) {
-      alert('Network error while deleting.');
-    }
+        
+        // Remove from main lists config if present
+        document.querySelectorAll('#lists .url').forEach((urlInput) => {
+          const rowPayload = parseCustomListPayloadClient(urlInput.value);
+          if (rowPayload && (rowPayload.creatorSlug === slug || rowPayload.slug === slug)) {
+            const entry = urlInput.closest('.entry');
+            if (entry) {
+              entry.remove();
+              if (typeof saveState === 'function') saveState();
+            }
+          }
+        });
+        
+        renderCreatorDashboard();
+      } catch (err) {
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Network Error', 'Network error while deleting.', false);
+        } else {
+          alert('Network error while deleting.');
+        }
+      }
+    }, true);
     return;
   }
   const editBtn = e.target.closest('.creatorListEditBtn');
@@ -1523,23 +1640,25 @@ if (_creatorDashEl) {
     // Same as above -- deleting either of these doesn't just clear this
     // browser, it also wipes them from every signed-in device on the next
     // background account sync (a full overwrite, not a merge).
-    if (slug === 'watch-history' || slug === 'continue-watching') return;
-    if (!confirm("Delete this list? This cannot be undone.")) return;
-    const map = loadLocalCustomLists();
-    delete map[slug];
-    saveLocalCustomListsMap(map);
-    
-    // Remove from main lists config if present
-    document.querySelectorAll('#lists .url').forEach((urlInput) => {
-      const rowPayload = parseCustomListPayloadClient(urlInput.value);
-      if (rowPayload && rowPayload.localSlug === slug) {
-        const entry = urlInput.closest('.entry');
-        if (entry) entry.remove();
-      }
-    });
-    if (typeof saveState === 'function') saveState();
-    
-    renderCreatorDashboard();
+    if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') return;
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", () => {
+      const map = loadLocalCustomLists();
+      delete map[slug];
+      saveLocalCustomListsMap(map);
+      
+      // Remove from main lists config if present
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (rowPayload && rowPayload.localSlug === slug) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        }
+      });
+      if (typeof saveState === 'function') saveState();
+      
+      renderCreatorDashboard();
+    }, true);
     return;
   }
   const localAddToConfigBtn = e.target.closest('.localListAddToConfigBtn');
@@ -1654,12 +1773,14 @@ function editCreatorList(slug) {
     alert('Could not find that list -- try refreshing.');
     return;
   }
+  const isWatchlist = slug === 'watchlist' || listMeta.isWatchlist || (listMeta.name && listMeta.name.toLowerCase() === 'watchlist');
   customListDraftItems = (listMeta.items || []).slice();
-  customListDraftType = listMeta.type;
+  customListDraftType = isWatchlist ? 'mixed' : (listMeta.type || 'mixed');
   editingCreatorListSlug = slug;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = listMeta.type === 'series' ? 'tv' : 'movie';
+  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   const visSelect = document.getElementById('customListVisibilitySelect');
   if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
   renderCustomListDraftList();
@@ -1686,13 +1807,15 @@ function editLocalCustomList(slug) {
     alert('Could not find that list -- try refreshing.');
     return;
   }
+  const isWatchlist = slug === 'watchlist' || listMeta.isWatchlist || (listMeta.name && listMeta.name.toLowerCase() === 'watchlist');
   customListDraftItems = (listMeta.items || []).slice();
-  customListDraftType = listMeta.type;
+  customListDraftType = isWatchlist ? 'mixed' : (listMeta.type || 'mixed');
   editingLocalCustomListSlug = slug;
   editingCreatorListSlug = null;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = listMeta.type === 'series' ? 'tv' : 'movie';
+  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
   switchTab('lists');
@@ -1826,14 +1949,35 @@ async function submitCreateListModal() {
   const typeEl = document.getElementById('createListModalType');
   const type = typeEl ? typeEl.value : 'movie';
   
-  const payload = { listId: generateChannelId(), type: type, items: [], shuffle: false };
-  const newUrl = 'customlist:v1:' + JSON.stringify(payload);
+  const currentPendingItem = window._selectListModalCurrentItem;
+  let initialItems = [];
   
   const btn = document.getElementById('createListModalBtn');
   btn.innerText = 'Saving...';
   btn.disabled = true;
   
   try {
+    if (currentPendingItem && currentPendingItem.title) {
+      let finalImdbId = currentPendingItem.id;
+      if (finalImdbId && !String(finalImdbId).startsWith('tt')) {
+        const endpoint = currentPendingItem.type === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
+        try {
+          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(finalImdbId));
+          const data = await res.json();
+          if (data.ok && data.imdbId) finalImdbId = data.imdbId;
+        } catch(e) {}
+      }
+      initialItems.push({
+        imdbId: finalImdbId || currentPendingItem.id,
+        type: currentPendingItem.type || (type === 'series' ? 'series' : 'movie'),
+        title: currentPendingItem.title,
+        poster: currentPendingItem.poster || undefined
+      });
+    }
+
+    const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
+    const newUrl = 'customlist:v1:' + JSON.stringify(payload);
+
     if (activeCreator) {
       const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
       const res = await fetch(ORIGIN + '/api/creator/lists/save', {
@@ -1844,13 +1988,13 @@ async function submitCreateListModal() {
           creatorKey: creatorKey,
           name: name,
           type: type,
-          items: [],
+          items: initialItems,
           visibility: visibility
         })
       });
       const data = await res.json();
       if (!data.ok) {
-        alert('Could not save this list: ' + (data.error || 'unknown error'));
+        showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
         btn.innerText = 'Create';
         btn.disabled = false;
         return;
@@ -1873,7 +2017,7 @@ async function submitCreateListModal() {
       map[slug] = {
         name: name,
         type: type,
-        items: [],
+        items: initialItems,
         createdAt: Date.now(),
         updatedAt: Date.now()
       };
@@ -1885,13 +2029,138 @@ async function submitCreateListModal() {
     saveState();
     document.getElementById('createListModal').style.display = 'none';
     renderCreatorDashboard();
-    showAddedToast('Created list "' + name + '".');
-    switchTab('lists');
+    
+    if (currentPendingItem && currentPendingItem.title) {
+      showAddedToast('Added "' + currentPendingItem.title + '" to "' + name + '".');
+      if (typeof trackEvent === 'function') trackEvent('list-add', initialItems[0] ? initialItems[0].imdbId : currentPendingItem.id, currentPendingItem.title, currentPendingItem.type);
+      window._selectListModalCurrentItem = null;
+    } else {
+      showAddedToast('Created list "' + name + '".');
+      switchTab('lists');
+    }
   } catch (err) {
-    alert('Network error creating list.');
+    showAppNoticeModal('Network Error', 'A network error occurred while creating your list. Please check your connection and try again.', true);
   } finally {
     btn.innerText = 'Create';
     btn.disabled = false;
   }
 }
+
+function removeWatchlistItemDirect(id, btn) {
+  if (!id) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  let changed = false;
+  Object.keys(map).forEach(key => {
+    const list = map[key];
+    if (list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'))) {
+      const initialLen = (list.items || []).length;
+      list.items = (list.items || []).filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      if (list.items.length !== initialLen) {
+        list.updatedAt = Date.now();
+        changed = true;
+      }
+    }
+  });
+  if (changed) {
+    if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watchlist.');
+  }
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    const creatorWatchlist = lastCreatorListsData.find(l => l && (l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist')));
+    if (creatorWatchlist && Array.isArray(creatorWatchlist.items)) {
+      const initialLen = creatorWatchlist.items.length;
+      creatorWatchlist.items = creatorWatchlist.items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      if (creatorWatchlist.items.length !== initialLen) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            name: creatorWatchlist.name,
+            type: creatorWatchlist.type || 'mixed',
+            items: creatorWatchlist.items,
+            visibility: creatorWatchlist.visibility || 'private',
+            slug: creatorWatchlist.slug,
+          }),
+        }).then(() => {
+          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+        }).catch(() => {});
+      }
+    }
+  }
+}
+
+function removeWatchHistoryItemDirect(id, btn) {
+  if (!id) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (map['watch-history'] && Array.isArray(map['watch-history'].items)) {
+    const initialLen = map['watch-history'].items.length;
+    map['watch-history'].items = map['watch-history'].items.filter(it => String(it.id || it.imdbId) !== targetId);
+    if (map['watch-history'].items.length !== initialLen) {
+      if (window._watchedItemIds) window._watchedItemIds.delete(targetId);
+      map['watch-history'].updatedAt = Date.now();
+      if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
+    }
+  }
+}
+
+function removeCustomListItemDirect(id, slug, btn) {
+  if (!id || !slug) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (map[slug] && Array.isArray(map[slug].items)) {
+    const initialLen = map[slug].items.length;
+    map[slug].items = map[slug].items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+    if (map[slug].items.length !== initialLen) {
+      map[slug].updatedAt = Date.now();
+      if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof showAddedToast === 'function') showAddedToast('Removed item from list.');
+    }
+  }
+}
+
 

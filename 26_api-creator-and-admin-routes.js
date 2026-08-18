@@ -118,6 +118,12 @@
               matched = "no (could not look up this episode on TMDB)";
             } else {
               const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+              const showGenres = (showDetails && showDetails.genres) || [];
+              const showYear = (showDetails && (showDetails.releaseYear || showDetails.year || (showDetails.releaseDate && showDetails.releaseDate.slice(0, 4)))) || null;
+              ctx.waitUntil(recordPlaybackTelemetry(env, "episode", showGenres, showYear));
+              if (showDetails && showDetails.title) {
+                ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, showDetails.title, "series"));
+              }
               const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === String(ep.id));
               if (!alreadyWatched) {
                 blob.watchHistory.unshift({
@@ -173,9 +179,15 @@
             }
           }
         } else if (stremioType === "movie") {
+          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const movieGenres = (details && details.genres) || [];
+          const movieYear = (details && (details.releaseYear || details.year || (details.releaseDate && details.releaseDate.slice(0, 4)))) || null;
+          ctx.waitUntil(recordPlaybackTelemetry(env, "movie", movieGenres, movieYear));
+          if (details && details.title) {
+            ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, details.title, "movie"));
+          }
           const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === imdbId);
           if (!alreadyWatched) {
-            const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
             blob.watchHistory.unshift({
               id: imdbId,
               type: "movie",
@@ -183,13 +195,37 @@
               poster: (details && details.poster) || "",
             });
           }
-          matched = alreadyWatched ? "yes (already watched)" : "yes";
         } else {
           matched = "no (unrecognized id format)";
         }
 
+        blob.watchlist = Array.isArray(blob.watchlist) ? blob.watchlist : [];
+        if (blob.watchlist.length) {
+          const initLen = blob.watchlist.length;
+          blob.watchlist = blob.watchlist.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+        }
+
         blob.updatedAt = Date.now();
         await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+
+        // Auto-remove watched item from user's Creator Watchlist if present
+        try {
+          const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:` });
+          for (const k of (listKeys.keys || [])) {
+            const rawList = await env.CONFIGS.get(k.name);
+            if (!rawList) continue;
+            const l = JSON.parse(rawList);
+            const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
+            if (isWatchlist && Array.isArray(l.items) && l.items.length) {
+              const initLen = l.items.length;
+              l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+              if (l.items.length !== initLen) {
+                l.updatedAt = Date.now();
+                await env.CONFIGS.put(k.name, JSON.stringify(l));
+              }
+            }
+          }
+        } catch {}
       } catch (err) {
         matched = "error: " + (err && err.message ? err.message : String(err));
       }
@@ -336,7 +372,7 @@
           })
         )
       ).filter(Boolean);
-      return json({ ok: true, displayName: auth.displayName, lists });
+      return json({ ok: true, displayName: auth.displayName, lists, order });
     }
 
     // /api/creator/lists/save  (POST)
@@ -353,7 +389,7 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
 
-      const type = body.type === "series" ? "series" : body.type === "movie" ? "movie" : null;
+      const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
       const visibility = body.visibility === "private" ? "private" : "public";
       const name = String(body.name || "").trim();
@@ -447,27 +483,9 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
-      const newOrder = Array.isArray(body.order) ? body.order.map(String) : [];
-      // Only accept slugs that already belong to this creator -- silently
-      // dropping anything else rather than trusting the client's list
-      // wholesale (never trust client-side validation).
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
-      let currentOrder = [];
-      try {
-        currentOrder = orderRaw ? JSON.parse(orderRaw).order || [] : [];
-      } catch {
-        currentOrder = [];
-      }
-      const currentSet = new Set(currentOrder);
-      const filteredNewOrder = newOrder.filter((s) => currentSet.has(s));
-      // Anything the creator owns that somehow didn't appear in the
-      // submitted order (shouldn't normally happen) is appended at the end
-      // rather than silently dropped.
-      currentOrder.forEach((s) => {
-        if (!filteredNewOrder.includes(s)) filteredNewOrder.push(s);
-      });
-      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: filteredNewOrder }));
-      return json({ ok: true, order: filteredNewOrder });
+      const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
+      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
+      return json({ ok: true, order: newOrder });
     }
 
     // /api/creator/delete-account  (POST)  { creatorName, creatorKey } -> { ok }
@@ -571,6 +589,7 @@
 
       const blob = {
         config: Array.isArray(body.config) ? body.config : [],
+        keys: body.keys && typeof body.keys === "object" ? body.keys : {},
         collapsedPanels: body.collapsedPanels && typeof body.collapsedPanels === "object" ? body.collapsedPanels : {},
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
         updatedAt: Date.now(),
@@ -627,6 +646,7 @@
       const blob = {
         watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
         continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
+        watchlist: Array.isArray(body.watchlist) ? body.watchlist : [],
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
@@ -759,10 +779,21 @@
           }
           data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
+          data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
         }
+      }
+      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+      if (orderRaw) {
+        try {
+          const orderBlob = JSON.parse(orderRaw);
+          if (Array.isArray(orderBlob.order)) {
+            if (!data) data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+            data.dashboardListOrder = orderBlob.order;
+          }
+        } catch {}
       }
       return json({ ok: true, data });
     }
@@ -824,11 +855,14 @@
     // published.
     if (path === "/api/search-published-lists") {
       if (!env || !env.CONFIGS) return json({ ok: true, lists: [] });
-      const q = (url.searchParams.get("q") || "").toLowerCase();
+      const rawQ = url.searchParams.get("q") || "";
+      const q = rawQ.toLowerCase().trim();
+      const isMyListsSearch = (q === "my lists" || q === "mylists" || q === "my list" || q === "mylist");
       try {
+        const fetchLimit = isMyListsSearch ? 250 : 50;
         const [anonResult, creatorResult] = await Promise.all([
-          env.CONFIGS.list({ prefix: "publishedlist:user:", limit: 50 }),
-          env.CONFIGS.list({ prefix: "creatorlist:", limit: 50 }),
+          env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
+          env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
         ]);
         const anonCandidates = await Promise.all(
           anonResult.keys.map(async (k) => {
@@ -894,9 +928,9 @@
         );
         const matches = [...anonCandidates, ...creatorCandidates]
           .filter(Boolean)
-          .filter((l) => !q || l.name.toLowerCase().includes(q))
-          .slice(0, 30);
-        return json({ ok: true, lists: matches });
+          .filter((l) => isMyListsSearch || !q || (l.name && l.name.toLowerCase().includes(q)) || (l.creatorName && l.creatorName.toLowerCase().includes(q)))
+          .sort((a, b) => (b.likes || 0) - (a.likes || 0));
+        return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 30) });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -964,17 +998,45 @@
       );
     }
 
-    m = path.match(/^\/lists\/tmdb\/([0-9]+)(?:\.json)?$/i);
+    m = path.match(/^\/lists\/tmdb\/collection\/([0-9]+)(?:-([a-z0-9_-]+))?(?:\.json)?$/i);
     if (m) {
       const tmdbId = m[1];
-      const targetUrl = `https://www.themoviedb.org/list/${tmdbId}`;
+      const targetUrl = `https://www.themoviedb.org/collection/${tmdbId}`;
+      const name = m[2] ? deslugifyServer(m[2]) : `TMDB Collection ${tmdbId}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
       return new Response(
         renderBuilder(url.origin, {
           deepLinkList: {
-            name: `TMDB List ${tmdbId}`,
+            name,
             type: "movie",
             url: targetUrl,
+            creatorName: "TMDB",
+            maybeMore: true,
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...corsHeaders(),
+          },
+        }
+      );
+    }
+
+    m = path.match(/^\/lists\/tmdb\/([0-9]+)(?:-([a-z0-9_-]+))?(?:\.json)?$/i);
+    if (m) {
+      const tmdbId = m[1];
+      const targetUrl = `https://www.themoviedb.org/list/${tmdbId}`;
+      const name = m[2] ? deslugifyServer(m[2]) : `TMDB List ${tmdbId}`;
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(
+        renderBuilder(url.origin, {
+          deepLinkList: {
+            name,
+            type: "movie",
+            url: targetUrl,
+            creatorName: "TMDB",
             maybeMore: true,
           },
         }),
@@ -1229,8 +1291,19 @@
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
-      const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 300 });
-      const keys = listResult.keys.slice().reverse();
+      let allKeys = [];
+      let cursor = undefined;
+      let listComplete = false;
+      while (!listComplete) {
+        const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
+        allKeys.push(...listResult.keys);
+        if (listResult.list_complete || !listResult.cursor) {
+          listComplete = true;
+        } else {
+          cursor = listResult.cursor;
+        }
+      }
+      const keys = allKeys.slice().reverse();
       const entries = await Promise.all(
         keys.map(async (k) => {
           try {
@@ -1241,14 +1314,7 @@
           }
         })
       );
-      // no-store -- json()'s own default (max-age=3600) meant the browser
-      // would silently keep serving this exact response (including
-      // whatever was/wasn't marked completed) for up to an hour on any
-      // later refresh or tab switch, no matter how many changes had since
-      // been saved to KV -- a mark-completed or a brand new entry could
-      // both look like they'd never happened, purely because the *read*
-      // was stale, not because either write had actually failed.
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: listResult.list_complete === false }, 200, { "Cache-Control": "no-store" });
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
@@ -1322,6 +1388,51 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
       }
+    }
+
+    // /admin/api/feedback/delete (POST) { id } -> { ok }
+    // Allows the admin to permanently delete a feedback entry from KV storage.
+    if (path === "/admin/api/feedback/delete" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      if (!id) return json({ ok: false, error: "Missing id." }, 400);
+      const key = `feedback:${id}`;
+      try {
+        await env.CONFIGS.delete(key);
+        return json({ ok: true }, 200, { "Cache-Control": "no-store" });
+      } catch (e) {
+        return json({ ok: false, error: "Could not delete feedback entry. Please try again." }, 500);
+      }
+    }
+
+    // /admin/api/analytics?section=search|catalogs_lists|audience&window=...
+    // Backs the Search, Catalogs & Lists, and Playback & Audience tabs in the admin dashboard.
+    if (path === "/admin/api/analytics" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const section = url.searchParams.get("section") || "search";
+      if (section === "search") {
+        const windowParam = url.searchParams.get("window") || "7";
+        const searches = await computeSearchLeaderboard(env, windowParam);
+        return json({ ok: true, searches }, 200, { "Cache-Control": "no-store" });
+      }
+      if (section === "catalogs_lists") {
+        const data = await computeCatalogAndCommunityLeaderboards(env);
+        return json({ ok: true, ...data }, 200, { "Cache-Control": "no-store" });
+      }
+      if (section === "audience") {
+        const data = await computeAudienceAnalytics(env);
+        return json({ ok: true, ...data }, 200, { "Cache-Control": "no-store" });
+      }
+      return json({ ok: false, error: "Invalid section." }, 400);
     }
 
     // /admin/api/apiusage -> { ok, keys: [{ name, label, configured, last24h,

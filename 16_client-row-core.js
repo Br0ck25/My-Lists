@@ -1,5 +1,5 @@
 <script>
-const ORIGIN = ${JSON.stringify(origin)};
+const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
 // Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
 // exact page load resolved a known chart slug -- e.g. loading
@@ -25,16 +25,45 @@ function deslugify(s) {
 }
 
 function getListCleanPath(listUrl, name) {
+  const normName = String(name || '').toLowerCase().trim();
+  if (normName === 'continue watching') return '/lists/continue-watching';
+  if (normName === 'watch history') return '/lists/watch-history';
+  if (normName === 'watchlist') return '/lists/watchlist';
+
   if (!listUrl) return null;
   const rawUrl = String(listUrl).trim();
 
-  // 1. Known chart
+  if (rawUrl.startsWith('autotrack:')) {
+    const parts = rawUrl.split(':');
+    const slug = parts[1] || 'watch-history';
+    return '/lists/' + slug;
+  }
+
+  if (rawUrl.startsWith('customlist:v1:')) {
+    try {
+      const payload = JSON.parse(rawUrl.slice('customlist:v1:'.length));
+      const slug = payload.localSlug || payload.creatorSlug || payload.slug;
+      if (slug === 'continue-watching' || slug === 'watch-history' || slug === 'watchlist') {
+        return '/lists/' + slug;
+      }
+    } catch (e) {}
+  }
+
+  // 1. Curated list
+  if (rawUrl.startsWith('custom:curated:')) {
+    const slug = rawUrl.slice('custom:curated:'.length);
+    return '/lists/curated/' + slug;
+  }
+  if (rawUrl === 'tmdb:chart:new_movies') return '/lists/new-movies';
+  if (rawUrl === 'tmdb:chart:new_shows') return '/lists/new-shows';
+
+  // 2. Known chart
   if (typeof CHART_SLUG_ENTRIES !== 'undefined') {
     const knownChart = CHART_SLUG_ENTRIES.find((e) => e.movieUrl === rawUrl || e.showUrl === rawUrl || e.url === rawUrl);
     if (knownChart) return '/lists/' + knownChart.slug;
   }
 
-  // 2. Addon internal list (/lists/:user/:slug)
+  // 3. Addon internal list (/lists/:user/:slug)
   if (typeof location !== 'undefined' && rawUrl.startsWith(location.origin + '/lists/')) {
     return rawUrl.slice(location.origin.length);
   }
@@ -54,10 +83,19 @@ function getListCleanPath(listUrl, name) {
     return '/lists/trakt/' + traktMatch[1] + '/' + traktMatch[2];
   }
 
-  // 5. TMDB list: https://www.themoviedb.org/list/:id
+  // 5. TMDB collection: https://www.themoviedb.org/collection/:id or tmdb:collection::id
+  const tmdbCollMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/collection/([0-9]+)', 'i')) ||
+    (rawUrl.startsWith('tmdb:collection:') ? [null, rawUrl.slice('tmdb:collection:'.length).split(/[^0-9]/)[0]] : null);
+  if (tmdbCollMatch && tmdbCollMatch[1]) {
+    const cleanSlug = name ? '-' + String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
+    return '/lists/tmdb/collection/' + tmdbCollMatch[1] + (cleanSlug && cleanSlug !== '-' ? cleanSlug : '');
+  }
+
+  // 6. TMDB list: https://www.themoviedb.org/list/:id
   const tmdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/list/([0-9]+)', 'i'));
-  if (tmdbMatch) {
-    return '/lists/tmdb/' + tmdbMatch[1];
+  if (tmdbMatch && tmdbMatch[1]) {
+    const cleanSlug = name ? '-' + String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
+    return '/lists/tmdb/' + tmdbMatch[1] + (cleanSlug && cleanSlug !== '-' ? cleanSlug : '');
   }
 
   return null;
@@ -111,35 +149,34 @@ function removeListFromConfig(url, type, slug) {
 }
 
 function navigateBackFromDetail() {
-  const targetTab = window._previousTab || 'discover';
+  const currentTab = document.querySelector('.tab-panel:not([hidden])')?.dataset?.tabPanel;
   if (history.length > 1) {
     history.back();
-  } else {
-    if (location.pathname !== '/' && location.pathname !== '/configure' && !location.pathname.startsWith('/configure')) {
-      history.replaceState({ view: 'tab', tab: targetTab }, '', '/');
+  } else if (currentTab === 'item-details' && window._previousTab === 'list-details') {
+    switchTab('list-details');
+    if (typeof window._listScrollY === 'number') {
+      const scrollPos = window._listScrollY;
+      window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: scrollPos, behavior: 'instant' });
+        setTimeout(() => {
+          window.scrollTo({ top: scrollPos, behavior: 'instant' });
+        }, 50);
+      });
     }
-    document.querySelectorAll('.tab-panel').forEach(function(p) {
-      p.hidden = (p.getAttribute('data-tab-panel') !== targetTab);
-    });
-    document.querySelectorAll('.tab-btn').forEach(function(b) {
-      b.classList.toggle('active', b.getAttribute('data-tab') === targetTab);
-    });
-    document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
-      b.classList.toggle('active', b.getAttribute('data-tab') === targetTab);
-    });
-    const addShelfBtn = document.getElementById('headerAddShelfBtn');
-    if (addShelfBtn) addShelfBtn.style.display = (targetTab === 'catalogs' ? 'block' : 'none');
-    const createListBtn = document.getElementById('headerCreateListBtn');
-    if (createListBtn) createListBtn.style.display = (targetTab === 'lists' ? 'block' : 'none');
-
-    try {
-      localStorage.setItem('myListAddon:activeTab', targetTab);
-    } catch (e) {}
+  } else {
+    const targetTab = window._originTab || window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
+    const cleanTab = (targetTab === 'list-details' || targetTab === 'item-details') ? 'discover' : targetTab;
+    switchTab(cleanTab);
     if (typeof window._previousScrollY === 'number') {
       const scrollPos = window._previousScrollY;
-      setTimeout(() => {
+      window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      requestAnimationFrame(() => {
         window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      }, 0);
+        setTimeout(() => {
+          window.scrollTo({ top: scrollPos, behavior: 'instant' });
+        }, 50);
+      });
     }
   }
 }
@@ -153,6 +190,7 @@ var livePreviewShelfData = [];
 // its own piece of state instead of being read from a DOM field.
 var activeTraktToken = null;
 let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
+let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
 
 async function compressJsonToBase64(obj) {
   try {
@@ -234,71 +272,77 @@ function switchTab(name) {
   document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
   });
-  try {
-    localStorage.setItem('myListAddon:activeTab', name);
-  } catch (e) {}
-
   if (name !== 'list-details' && name !== 'item-details') {
+    window._originTab = name;
+    try {
+      localStorage.setItem('myListAddon:activeTab', name);
+    } catch (e) {}
     if (location.pathname.startsWith('/lists/')) {
       history.pushState({ view: 'tab', tab: name }, '', '/');
     }
   }
 
   if (name === 'lists') {
-    let savedSub = 'my-lists';
-    try {
-      savedSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
-    } catch (e) {}
-    const pills = document.querySelectorAll('#listsSubnavBar .subnav-pill');
-    let targetBtn = null;
-    pills.forEach((p) => {
-      const oc = p.getAttribute('onclick') || '';
-      if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
-        targetBtn = p;
-      }
-    });
-    switchListsSubmenu(savedSub, targetBtn || pills[0]);
+    if (!window._listsInitializedOnce) {
+      window._listsInitializedOnce = true;
+      let savedSub = 'my-lists';
+      try {
+        savedSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+      } catch (e) {}
+      const pills = document.querySelectorAll('#listsSubnavBar .subnav-pill');
+      let targetBtn = null;
+      pills.forEach((p) => {
+        const oc = p.getAttribute('onclick') || '';
+        if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+          targetBtn = p;
+        }
+      });
+      switchListsSubmenu(savedSub, targetBtn || pills[0]);
+    }
   }
   if (name === 'settings') {
-    let savedSub = 'keys';
-    try {
-      savedSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'keys';
-    } catch (e) {}
-    const pills = document.querySelectorAll('#settingsSubnavBar .subnav-pill');
-    let targetBtn = null;
-    pills.forEach((p) => {
-      const oc = p.getAttribute('onclick') || '';
-      if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
-        targetBtn = p;
-      }
-    });
-    switchSettingsSubmenu(savedSub, targetBtn || pills[0]);
+    if (!window._settingsInitializedOnce) {
+      window._settingsInitializedOnce = true;
+      let savedSub = 'account';
+      try {
+        savedSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
+      } catch (e) {}
+      const pills = document.querySelectorAll('#settingsSubnavBar .subnav-pill');
+      let targetBtn = null;
+      pills.forEach((p) => {
+        const oc = p.getAttribute('onclick') || '';
+        if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+          targetBtn = p;
+        }
+      });
+      switchSettingsSubmenu(savedSub, targetBtn || pills[0]);
+    }
   }
   if (name === 'catalogs') {
-    // Auto-loads posters the moment this tab is shown -- previously
-    // required clicking "Refresh Preview" by hand even just to look at
-    // shelves that were already configured. The button (still there)
-    // stays useful after editing a URL, since that shouldn't re-fire a
-    // live request on every keystroke -- see renderLivePreview's own
-    // comment.
-    if (typeof renderLivePreview === 'function') renderLivePreview();
+    if (!window._catalogsInitializedOnce) {
+      window._catalogsInitializedOnce = true;
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+    }
   }
   if (name === 'discover') {
-    let savedFilter = 'all';
-    try {
-      savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
-    } catch (e) {}
-    const activeFilter = window._currentDiscoverFilter || savedFilter;
-    window._currentDiscoverFilter = activeFilter;
-    const pills = document.querySelectorAll('#discoverSubnavBar .subnav-pill');
-    let targetBtn = null;
-    pills.forEach((p) => {
-      const oc = p.getAttribute('onclick') || '';
-      if (oc.indexOf("'" + activeFilter + "'") !== -1 || oc.indexOf('"' + activeFilter + '"') !== -1) {
-        targetBtn = p;
-      }
-    });
-    filterDiscoverShelves(activeFilter, targetBtn || pills[0]);
+    if (!window._discoverInitializedOnce) {
+      window._discoverInitializedOnce = true;
+      let savedFilter = 'all';
+      try {
+        savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+      } catch (e) {}
+      const activeFilter = window._currentDiscoverFilter || savedFilter;
+      window._currentDiscoverFilter = activeFilter;
+      const pills = document.querySelectorAll('#discoverSubnavBar .subnav-pill');
+      let targetBtn = null;
+      pills.forEach((p) => {
+        const oc = p.getAttribute('onclick') || '';
+        if (oc.indexOf("'" + activeFilter + "'") !== -1 || oc.indexOf('"' + activeFilter + '"') !== -1) {
+          targetBtn = p;
+        }
+      });
+      filterDiscoverShelves(activeFilter, targetBtn || pills[0]);
+    }
   }
 }
 
@@ -316,6 +360,68 @@ function showAddedToast(msg) {
   toast._timer = setTimeout(() => {
     toast.classList.remove('show');
   }, 2200);
+}
+
+function showModal(innerHtml, extraClass) {
+  closeModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'activeModalOverlay';
+  overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeModal();
+  });
+  document.body.appendChild(overlay);
+}
+
+function closeModal() {
+  const existing = document.getElementById('activeModalOverlay');
+  if (existing) existing.remove();
+}
+
+function showAppAlert(title, message, isSuccess = false) {
+  const icon = isSuccess ? '\u2713' : '\u2715';
+  const iconColor = isSuccess ? 'var(--accent-2, #00b4d8)' : 'var(--danger, #e63946)';
+  const html =
+    '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+      '<h3 style="margin:0; font-size:1.1rem; display:flex; align-items:center; gap:8px;">' +
+        '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+        escapeHtml(title) +
+      '</h3>' +
+      '<button type="button" class="action-btn" onclick="closeModal()" style="font-size:1.1rem; line-height:1; padding:2px 8px; cursor:pointer;">\u2715</button>' +
+    '</div>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+      '<button type="button" class="primary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">OK</button>' +
+    '</div>';
+  showModal(html);
+}
+
+function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = true) {
+  const icon = isDanger ? '&#x26A0;' : '?';
+  const iconColor = isDanger ? 'var(--danger, #e63946)' : 'var(--accent-2, #00b4d8)';
+  const confirmBtnStyle = isDanger ? 'background:var(--danger, #e63946); color:#fff; border:none;' : '';
+  const html =
+    '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+      '<h3 style="margin:0; font-size:1.1rem; display:flex; align-items:center; gap:8px;">' +
+        '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+        escapeHtml(title) +
+      '</h3>' +
+      '<button type="button" class="action-btn" onclick="closeModal()" style="font-size:1.1rem; line-height:1; padding:2px 8px; cursor:pointer;">\u2715</button>' +
+    '</div>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+      '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
+      '<button type="button" class="primary" id="appConfirmBtn" style="min-width:80px; padding:8px 16px; ' + confirmBtnStyle + '">' + escapeHtml(confirmBtnText || 'Confirm') + '</button>' +
+    '</div>';
+  showModal(html);
+  const btn = document.getElementById('appConfirmBtn');
+  if (btn) {
+    btn.onclick = () => {
+      closeModal();
+      if (typeof onConfirm === 'function') onConfirm();
+    };
+  }
 }
 
 function restoreActiveTab() {
@@ -356,11 +462,34 @@ function switchListsSubmenu(name, btn) {
   if (activeEl) activeEl.style.display = 'block';
 
   if (name === 'my-lists') {
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-    if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
-    if (typeof runMyTraktLists === 'function') runMyTraktLists();
+    const creatorBox = document.getElementById('creatorDashboard');
+    const hasCreatorContent = creatorBox && (creatorBox.querySelector('.list-card') || (creatorBox.children.length > 0 && !creatorBox.innerText.includes('Loading')));
+    if (!hasCreatorContent && typeof renderCreatorDashboard === 'function') {
+      renderCreatorDashboard();
+    }
+    const mdbBox = document.getElementById('myMdblistListsResult');
+    const hasMdbContent = mdbBox && mdbBox.children.length > 0;
+    if (!hasMdbContent && typeof runMyMdblistLists === 'function') {
+      runMyMdblistLists();
+    }
+    const traktBox = document.getElementById('myTraktListsResult');
+    const hasTraktContent = traktBox && traktBox.children.length > 0;
+    if (!hasTraktContent && typeof runMyTraktLists === 'function') {
+      runMyTraktLists();
+    }
+    const tmdbBox = document.getElementById('myTmdbListsResult');
+    const hasTmdbContent = tmdbBox && tmdbBox.children.length > 0;
+    if (!hasTmdbContent && typeof runMyTmdbLists === 'function') {
+      runMyTmdbLists();
+    }
   }
-  if (name === 'liked') renderLikedListsFeed();
+  if (name === 'liked') {
+    const likedBox = document.getElementById('likedListsFeed');
+    const hasLikedContent = likedBox && likedBox.children.length > 0;
+    if (!hasLikedContent && typeof renderLikedListsFeed === 'function') {
+      renderLikedListsFeed();
+    }
+  }
 }
 
 function switchSettingsSubmenu(name, btn) {
@@ -377,7 +506,9 @@ function switchSettingsSubmenu(name, btn) {
     btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
   }
   const subpanels = {
-    'keys': 'settingsSubKeys',
+    'account': 'settingsSubAccount',
+    'keys': 'settingsSubExternal',
+    'external': 'settingsSubExternal',
     'backup': 'settingsSubBackup',
     'feedback': 'settingsSubFeedback'
   };
@@ -385,9 +516,12 @@ function switchSettingsSubmenu(name, btn) {
     const el = document.getElementById(subpanels[k]);
     if (el) el.style.display = 'none';
   });
-  const activeId = subpanels[name];
+  const activeId = subpanels[name] || 'settingsSubAccount';
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
+  if (name === 'external' && typeof populateImportTargetLists === 'function') {
+    populateImportTargetLists();
+  }
 }
 
 // Sends a Settings > Feedback submission to the server -- deliberately
@@ -472,6 +606,9 @@ function filterDiscoverShelves(filter, btn) {
     });
     btn.classList.add('active');
     btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+    try {
+      btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    } catch (e) {}
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
   const feedContainer = document.getElementById('discoverListsFeed');
@@ -506,9 +643,13 @@ function filterDiscoverShelves(filter, btn) {
 // Renders the chart lists for the Movies or Shows tab in Discover as list-cards
 // (matching how search results and the Lists tab look) by converting the
 // baked-in chart data tables into the same object shape render5PosterListsFeed expects.
-function renderDiscoverChartsList(type) {
+function renderDiscoverChartsList(type, forceRefresh) {
   const container = document.getElementById('discoverListsFeed');
   if (!container) return;
+  if (!forceRefresh && window._currentDiscoverRenderedFilter === type && container.children.length > 0 && !container.innerText.includes('Loading')) {
+    return;
+  }
+  window._currentDiscoverRenderedFilter = type;
   container.innerHTML = '<p style="color:var(--muted); font-size:0.88rem;">Loading charts\u2026</p>';
 
   // Build list objects from all chart tables, filtered to the right type.
@@ -540,8 +681,17 @@ function renderDiscoverChartsList(type) {
   // They are exposed as window._CHARTS_* globals by 09_page-shell.js.
 
   if (type !== 'gems' && type !== 'kids') {
+    if (type === 'movie' || type === 'all') {
+      pushSingle('New Movies', 'tmdb:chart:new_movies', 'movie', 'TMDB');
+    }
+    if (type === 'series' || type === 'all') {
+      pushSingle('New Shows', 'tmdb:chart:new_shows', 'series', 'TMDB');
+    }
     if (window._CHARTS_TMDB) {
-      window._CHARTS_TMDB.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'TMDB'); });
+      window._CHARTS_TMDB.forEach(function(p) {
+        if (p.name.startsWith('New Releases')) return;
+        pushPair(p.name, p.movieUrl, p.showUrl, 'TMDB');
+      });
     }
     if (window._CHARTS_TRAKT) {
       window._CHARTS_TRAKT.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'Trakt'); });
@@ -932,8 +1082,15 @@ function addRow(name, url, type, enabled, group, channelId) {
   const isWatchlist = url === 'mdblist:watchlist';
   const isChannel = String(url || '').startsWith('channel:v1:');
   const isCustomList = String(url || '').startsWith('customlist:v1:');
+  const isPremade = (
+    String(url || '').startsWith('tmdb:chart:') ||
+    String(url || '').startsWith('tmdb:') ||
+    String(url || '').startsWith('autotrack:') ||
+    String(url || '').startsWith('custom:curated:') ||
+    (group && group !== 'Custom' && group !== 'Custom Lists' && !isChannel && !isCustomList)
+  );
   
-  if (group && group !== 'Custom' && group !== 'Custom Lists' && !isChannel && !isCustomList) {
+  if (isPremade) {
     div.classList.add('premade-shelf');
   }
   
@@ -989,7 +1146,7 @@ function addRow(name, url, type, enabled, group, channelId) {
     <div class="sources">\${rowsHtml}</div>
     \${isWatchlist
       ? '<p class="watchlist-note"><small>Uses the MDBList API key from Settings.</small></p>'
-      : (isChannel || isCustomList)
+      : (isChannel || isCustomList || isPremade)
         ? ''
         : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one shelf)</button>'}
     <div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>\${escapeHtml(name||'Unnamed')} - \${type === 'series' ? 'Series' : 'Movies'}</span><button type="button" class="text-action-btn" disabled>See All \›</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>
@@ -1174,5 +1331,17 @@ function editEntryChannel(btn) {
     }
   }
 }
+
+// Enables mouse wheel horizontal scrolling on .subnav-pills-bar and horizontal scrolling bars
+document.addEventListener('wheel', (e) => {
+  const bar = e.target.closest('.subnav-pills-bar, .tab-bar, .provider-chips-bar');
+  if (!bar) return;
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+    if ((e.deltaY > 0 && bar.scrollLeft + bar.clientWidth < bar.scrollWidth) || (e.deltaY < 0 && bar.scrollLeft > 0)) {
+      e.preventDefault();
+      bar.scrollLeft += e.deltaY;
+    }
+  }
+}, { passive: false });
 
 

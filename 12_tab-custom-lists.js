@@ -18,8 +18,11 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Your MDBList Lists</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists belonging to your MDBList API key configured in Settings.</p>
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="panel-title" style="margin-bottom:0;">Your MDBList Lists</h2>
+        <button type="button" class="secondary lc-btn" id="listsMdblistConnectBtn" onclick="toggleListsMdblistConnection()">Connect MDBList</button>
+      </div>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists belonging to your connected MDBList account or API key configured in Settings.</p>
       <div id="myMdblistListsResult"></div>
     </div>
 
@@ -31,6 +34,15 @@
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Public and personal lists from your Trakt username/account.</p>
       <div id="myTraktListsResult"></div>
       <div id="myPrivateTraktListsResult" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="panel-title" style="margin-bottom:0;">Your TMDB Lists</h2>
+        <button type="button" class="secondary lc-btn" id="listsTmdbConnectBtn" onclick="toggleListsTmdbConnection()">Connect TMDB</button>
+      </div>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists, Watchlist, and Favorites from your connected TMDB account.</p>
+      <div id="myTmdbListsResult"></div>
     </div>
   </div>
 

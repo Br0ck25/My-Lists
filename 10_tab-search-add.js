@@ -30,6 +30,23 @@
     <!-- Reorderable Catalog Shelves -->
     <div id="lists"></div>
 
+    <!-- 24-Hour Randomizer Controls -->
+    <div style="margin-top:16px; padding:14px 16px; background:var(--surface); border-radius:12px; border:1px solid var(--border);">
+      <div style="font-weight:600; font-size:0.92rem; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+        <span>Daily Randomizer</span>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem; margin:0; user-select:none;">
+          <input type="checkbox" id="shuffleShelvesCheckbox" onchange="saveState()" style="cursor:pointer; width:16px; height:16px;">
+          <span>Shuffle Shelves daily (every 24h)</span>
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem; margin:0; user-select:none;">
+          <input type="checkbox" id="shuffleItemsCheckbox" onchange="saveState()" style="cursor:pointer; width:16px; height:16px;">
+          <span>Shuffle Items in Shelves daily (every 24h)</span>
+        </label>
+      </div>
+    </div>
+
     <div class="actions" style="margin-top:16px;">
       <button type="button" onclick="removeAllLists()" class="secondary" style="color:var(--danger); border-color:rgba(255,59,48,0.25);">Remove all</button>
       <button type="button" class="primary" onclick="generate()">${isConfigureMode ? "Update Add-on" : "Generate Install Link"}</button>
@@ -65,7 +82,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">Combined Charts</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="combined-charts">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="combined-charts">+ Add all</button>
       </div>
       ${combinedChartsHtml}
     </div>
@@ -74,7 +91,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">TMDB Charts</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="tmdb-charts">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="tmdb-charts">+ Add all</button>
       </div>
       ${tmdbChartsHtml}
     </div>
@@ -83,7 +100,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">Trakt Charts</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="trakt-charts">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="trakt-charts">+ Add all</button>
       </div>
       ${traktChartsHtml}
     </div>
@@ -92,7 +109,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">MDBList Official</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="mdblist-charts">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="mdblist-charts">+ Add all</button>
       </div>
       ${mdblistChartsHtml}
     </div>
@@ -101,7 +118,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">Simkl Anime &amp; Trending</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="simkl-charts">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="simkl-charts">+ Add all</button>
       </div>
       ${simklChartsHtml}
     </div>
@@ -110,7 +127,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">Streaming Top 10</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="streaming-top10">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="streaming-top10">+ Add all</button>
       </div>
       ${streamingTop10Html}
     </div>
@@ -119,7 +136,7 @@
     <div class="shelf-section discover-shelf" data-shelf-type="all">
       <div class="shelf-header">
         <h2 class="shelf-title">Streaming Catalogs</h2>
-        <button type="button" class="qa-add-all-btn lc-btn secondary" data-add-all-action="streaming-catalogs">+ Add all</button>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="streaming-catalogs">+ Add all</button>
       </div>
       ${streamingHtml}
     </div>

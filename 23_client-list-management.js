@@ -391,6 +391,8 @@ function buildConfig(entries, keys) {
     payload.trackCreatorName = keys.trackCreatorName;
     payload.trackCreatorKey = keys.trackCreatorKey;
   }
+  if (keys && keys.shuffleShelves) payload.shuffleShelves = true;
+  if (keys && keys.shuffleItems) payload.shuffleItems = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -466,22 +468,45 @@ function collectEntries() {
 }
 
 function collectKeys() {
-  // trackPlayback only actually applies once signed into a Creator
-  // Profile (see renderTrackPlaybackSection's comment for why) -- the
-  // checkbox state can outlive a sign-out in localStorage, so this only
-  // includes it when there's actually an account to attach it to.
   let track = false;
   try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+  const tmdbKeyEl = document.getElementById('tmdbKeyInput');
+  let tmdbKey = tmdbKeyEl ? tmdbKeyEl.value.trim() : '';
+  if (!tmdbKey) {
+    try { tmdbKey = localStorage.getItem('myListAddon:tmdbKey') || ''; } catch (e) {}
+  }
+  let tmdbSession = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || '';
+  if (!tmdbSession) {
+    try { tmdbSession = localStorage.getItem('myListAddon:tmdbSessionId') || ''; } catch (e) {}
+  }
+  let tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || '';
+  if (!tmdbAcc) {
+    try { tmdbAcc = localStorage.getItem('myListAddon:tmdbAccountId') || ''; } catch (e) {}
+  }
+  let tmdbUser = (typeof tmdbUsername !== 'undefined' && tmdbUsername) || '';
+  if (!tmdbUser) {
+    try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
+  }
   const keys = {
-    mdblistKey: document.getElementById('mdblistKeyInput').value.trim(),
-    traktKey: document.getElementById('traktKeyInput').value.trim(),
-    traktUsername: document.getElementById('traktUsernameInput').value.trim(),
+    tmdbKey: tmdbKey,
+    tmdbSessionId: tmdbSession,
+    tmdbAccountId: tmdbAcc,
+    tmdbUsername: tmdbUser,
+    mdblistKey: document.getElementById('mdblistKeyInput') ? document.getElementById('mdblistKeyInput').value.trim() : '',
+    mdblistAccessToken: mdblistAccessToken,
+    traktKey: document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '',
+    traktUsername: document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '',
     traktAccessToken: traktAccessToken,
+    shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
+    shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
   };
-  if (track && typeof activeCreator !== 'undefined' && activeCreator) {
-    keys.track = true;
-    keys.trackCreatorName = activeCreator.creatorName;
-    keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (typeof activeCreator !== 'undefined' && activeCreator) {
+    keys.creatorName = activeCreator.creatorName;
+    if (track) {
+      keys.track = true;
+      keys.trackCreatorName = activeCreator.creatorName;
+      keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    }
   }
   return keys;
 }
@@ -563,9 +588,11 @@ async function renderLivePreview() {
       
       try {
         const body = { url: s.url, type: s.type, sample: 100 };
+        if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
         if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
         if (keys.traktKey) body.traktKey = keys.traktKey;
         if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+        if (keys.creatorName) body.creatorName = keys.creatorName;
         const res = await fetch(ORIGIN + '/api/preview', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -600,9 +627,18 @@ function livePreviewPosterHtml(m) {
   const posterEl = m.poster
     ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy">'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
-  const removeBtn = m.removeShowId
-    ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(m.removeShowId) + '&quot;)" title="Remove from Continue Watching">&times;</button>'
-    : '';
+  
+  let removeBtn = '';
+  if (m.removeShowId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(m.removeShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
+  } else if (m.removeWatchlistId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
+  } else if (m.removeHistoryId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
+  } else if (m.removeCustomListSlug) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
+  }
+
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
   const addOverlay = '<div class="poster-add-overlay" title="Add to Custom List">+</div>';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
@@ -615,6 +651,55 @@ function livePreviewPosterHtml(m) {
     (m.subtitle ? '<div class="live-preview-poster-subtitle">' + escapeHtml(m.subtitle) + '</div>' : '') +
     yearHtml +
   '</div>';
+}
+
+function removeListItemFromDetails(btn) {
+  if (!btn) return;
+  const type = btn.dataset.removeType || '';
+  const id = btn.dataset.removeId || '';
+  const extra = btn.dataset.removeSlug || '';
+  if (!id) return;
+  const targetId = String(id);
+  const card = btn.closest('.live-preview-poster-card');
+  if (card) {
+    card.style.opacity = '0';
+    card.style.transform = 'scale(0.85)';
+    card.style.transition = 'all 0.2s ease';
+    setTimeout(() => {
+      if (card && card.parentNode) {
+        card.parentNode.removeChild(card);
+        const grid = document.getElementById('detailGrid');
+        const remaining = grid ? grid.querySelectorAll('.live-preview-poster-card').length : 0;
+        if (typeof window._updateListDetailsItemCount === 'function') {
+          window._updateListDetailsItemCount(remaining);
+        }
+        if (remaining === 0) {
+          const statusEl = document.getElementById('detailStatus');
+          if (statusEl) statusEl.innerHTML = '<small>No items left.</small>';
+        }
+      }
+    }, 200);
+  }
+
+  // Clean from preloaded cache so refreshing or re-navigating reflects deletion
+  if (window._listPreloadedCache) {
+    Object.keys(window._listPreloadedCache).forEach((k) => {
+      const cache = window._listPreloadedCache[k];
+      if (cache && Array.isArray(cache.sample)) {
+        cache.sample = cache.sample.filter((it) => it && String(it.id || it.removeShowId || it.removeWatchlistId || it.removeHistoryId) !== targetId);
+      }
+    });
+  }
+
+  if (type === 'cw') {
+    if (typeof dismissContinueWatchingShow === 'function') dismissContinueWatchingShow(targetId, btn);
+  } else if (type === 'watchlist') {
+    if (typeof removeWatchlistItemDirect === 'function') removeWatchlistItemDirect(targetId, btn);
+  } else if (type === 'history') {
+    if (typeof removeWatchHistoryItemDirect === 'function') removeWatchHistoryItemDirect(targetId, btn);
+  } else if (type === 'custom' && extra) {
+    if (typeof removeCustomListItemDirect === 'function') removeCustomListItemDirect(targetId, extra, btn);
+  }
 }
 
 // The full-page "See All" view for any single, already-known list url --
@@ -633,7 +718,7 @@ function livePreviewPosterHtml(m) {
 // history entry would just create a duplicate back-button step.
 async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   opts = opts || {};
-  const currentActiveTab = localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
+  const currentActiveTab = window._originTab || localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
   if (currentActiveTab !== 'list-details' && currentActiveTab !== 'item-details') {
     window._previousTab = currentActiveTab;
     window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
@@ -650,9 +735,78 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     }
   }
 
-  if (!preloaded && listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
-    const rec = window._curatedRecs[listUrl];
-    preloaded = { sample: rec.items, count: rec.items.length, maybeMore: false };
+  const cacheKey = (name || '') + '::' + (listUrl || '');
+  window._currentListDetailsKey = cacheKey;
+  window._listPreloadedCache = window._listPreloadedCache || {};
+  if (preloaded && preloaded.sample && preloaded.sample.length) {
+    window._listPreloadedCache[cacheKey] = preloaded;
+  } else if (!preloaded) {
+    if (window._listPreloadedCache[cacheKey]) {
+      preloaded = window._listPreloadedCache[cacheKey];
+    } else if (listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
+      const rec = window._curatedRecs[listUrl];
+      preloaded = { sample: rec.items, count: rec.items.length, maybeMore: false };
+    } else if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
+      // Look up local custom lists or creator lists by name or slug
+      try {
+        const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        let match = Object.values(localMap).find((l) => l && (l.name === name || l.slug === name || (name && l.name && l.name.toLowerCase() === name.toLowerCase())));
+        if (!match && listUrl) {
+          if (listUrl === 'autotrack:continue-watching' || listUrl === 'custom:continue-watching') match = localMap['continue-watching'];
+          else if (listUrl === 'autotrack:watch-history' || listUrl === 'custom:watch-history') match = localMap['watch-history'];
+          else if (listUrl === 'autotrack:watchlist' || listUrl === 'custom:watchlist') match = localMap['watchlist'];
+        }
+        if (match && Array.isArray(match.items) && match.items.length) {
+          const isCw = match.slug === 'continue-watching';
+          const isWatchlist = match.slug === 'watchlist' || match.isWatchlist || (match.name && match.name.toLowerCase() === 'watchlist');
+          const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
+
+          const sample = match.items.map((it) => {
+            const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+            return {
+              id: it.showId || it.imdbId || it.id,
+              type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
+              name: label.title,
+              subtitle: label.subtitle,
+              poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+              year: it.year,
+              removeShowId: isCw ? (it.showId || it.id) : null,
+              removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+              removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+              removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? match.slug : null,
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      } catch (e) {}
+
+      if (!preloaded && typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
+        const match = lastCreatorListsData.find((l) => l && (l.name === name || l.slug === name || (name && l.name && l.name.toLowerCase() === name.toLowerCase())));
+        if (match && Array.isArray(match.items) && match.items.length) {
+          const isCw = match.slug === 'continue-watching';
+          const isWatchlist = match.slug === 'watchlist' || match.isWatchlist || (match.name && match.name.toLowerCase() === 'watchlist');
+          const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
+          const sample = match.items.map((it) => {
+            const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+            return {
+              id: it.showId || it.imdbId || it.id,
+              type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
+              name: label.title,
+              subtitle: label.subtitle,
+              poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+              year: it.year,
+              removeShowId: isCw ? (it.showId || it.id) : null,
+              removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+              removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+              removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? match.slug : null,
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      }
+    }
   }
 
   const titleEl = document.getElementById('detailTitle');
@@ -700,6 +854,11 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     subEl.textContent = formatSubtitle(loadedCount, false, 0);
   };
 
+  window._updateListDetailsItemCount = function(newCount) {
+    loadedCount = newCount;
+    if (subEl) subEl.textContent = formatSubtitle(newCount, false, 0);
+  };
+
   titleEl.textContent = name || 'List';
   subEl.textContent = formatSubtitle(null, false, 0);
   gridEl.innerHTML = '';
@@ -710,12 +869,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   // preview (listUrl === '') has nothing a catalog row could point at,
   // and nothing any other visitor could "like" either.
   function updateDetailAddBtn() {
-    if (!listUrl || listUrl.startsWith('custom:')) {
+    if (!listUrl && !name) {
       addBtn.style.display = 'none';
       return;
     }
     addBtn.style.display = '';
-    const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(listUrl, type) : false;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
     if (isAdded) {
       addBtn.textContent = 'Remove';
       addBtn.classList.remove('primary');
@@ -743,13 +902,22 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   addBtn.onclick = function() {
-    const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(listUrl, type) : false;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
     if (isAdded) {
-      if (typeof removeListFromConfig === 'function') removeListFromConfig(listUrl, type);
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(listUrl, type);
+        removeListFromConfig(null, type, listUrl);
+      }
       updateDetailAddBtn();
       showAddedToast('Removed "' + (name || 'List') + '" from your Catalogs.');
     } else {
-      addRow(name || 'List', listUrl, type, true, 'Custom');
+      if (listUrl && listUrl.startsWith('custom:curated:')) {
+        addRow(name || 'Curated List', listUrl, type, true, 'Curated');
+      } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
+        addRow(name || 'List', listUrl, type, true, 'New Releases');
+      } else {
+        addRow(name || 'List', listUrl, type, true, 'Custom');
+      }
       updateDetailAddBtn();
       showAddedToast('Added "' + (name || 'List') + '" to your Catalogs.');
     }
@@ -838,6 +1006,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     updateStatusAfterPage(preloaded.maybeMore, preloaded.sample.length);
   } else {
     await loadNextPage();
+  }
+
+  if (opts && typeof opts.restoreScrollY === 'number') {
+    const scrollTarget = opts.restoreScrollY;
+    setTimeout(() => {
+      window.scrollTo({ top: scrollTarget, behavior: 'instant' });
+    }, 10);
   }
 }
 
