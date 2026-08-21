@@ -863,52 +863,118 @@ async function renderAdminDashboard(env) {
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; box-sizing:border-box; }
-  h1 { margin-bottom:4px; font-size:1.6rem; }
-  h2 { font-size:1.1rem; }
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --danger: #FF3B30;
+    --success: #34C759;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow: 0 2px 10px rgba(0,0,0,0.08);
+    --shadow-md: 0 8px 30px rgba(0,0,0,0.18);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-pill: 999px;
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; }
+  h1 { margin-bottom:4px; font-size:1.6rem; color:var(--text); }
+  h2 { font-size:1.1rem; color:var(--text); }
   .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:12px; margin:16px 0; }
-  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  .stat-value { font-size:1.6rem; font-weight:700; }
-  .stat-label { color:#8E8E93; font-size:0.82rem; margin-top:4px; }
-  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  table { width:100%; border-collapse:collapse; background:#FFFFFF; border:none; margin:0; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.85rem; white-space:nowrap; }
-  th { color:#8E8E93; font-weight:600; background:#FAFAFC; }
-  a { color:#007AFF; }
-  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:20px; flex-wrap:wrap; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px; box-shadow:var(--shadow-sm); }
+  .stat-value { font-size:1.6rem; font-weight:700; color:var(--text); }
+  .stat-label { color:var(--muted); font-size:0.82rem; margin-top:4px; }
+  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); }
+  table { width:100%; border-collapse:collapse; background:var(--surface); border:none; margin:0; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:0.85rem; white-space:nowrap; color:var(--text); }
+  th { color:var(--muted); font-weight:600; background:var(--panel-strong); }
+  a { color:var(--accent); }
+  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid var(--border); margin-top:20px; flex-wrap:wrap; }
   .admin-main-tab-btn {
-    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:700; cursor:pointer;
+    background:none; border:none; color:var(--muted); font-size:0.95rem; font-weight:700; cursor:pointer;
     padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent; transition:color 0.15s ease;
   }
-  .admin-main-tab-btn:hover { color:#1C1C1E; }
-  .admin-main-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
+  .admin-main-tab-btn:hover { color:var(--text); }
+  .admin-main-tab-btn.active { color:var(--text); border-bottom-color:var(--accent); }
   .admin-subnav-bar { display:flex; gap:8px; margin:14px 0 16px; flex-wrap:wrap; }
   .subnav-pill {
-    background:#FFFFFF; border:1px solid rgba(0,0,0,0.1); border-radius:20px; padding:6px 14px;
-    font-size:0.85rem; font-weight:600; color:#8E8E93; cursor:pointer; transition:all 0.15s ease;
+    background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:6px 14px;
+    font-size:0.85rem; font-weight:600; color:var(--muted); cursor:pointer; transition:all 0.15s ease;
   }
-  .subnav-pill:hover { border-color:rgba(0,0,0,0.25); color:#1C1C1E; }
-  .subnav-pill.active { background:#007AFF; color:#FFFFFF; border-color:#007AFF; }
+  .subnav-pill:hover { border-color:var(--border-strong); color:var(--text); }
+  .subnav-pill.active { background:var(--accent); color:#FFFFFF; border-color:var(--accent); }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
-  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.85rem; margin-right:6px; }
+  .admin-select { padding:6px 10px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--surface); color:var(--text); font-size:0.85rem; margin-right:6px; outline:none; }
   .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
-  .admin-badge.bug { background:rgba(255,59,48,0.12); color:#FF3B30; }
-  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:#007AFF; }
+  .admin-badge.bug { background:rgba(255,59,48,0.12); color:var(--danger); }
+  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:var(--accent); }
   .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
-  .admin-badge.other { background:rgba(142,142,147,0.15); color:#636366; }
-  .feedback-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px 16px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .admin-badge.other { background:rgba(142,142,147,0.15); color:var(--muted); }
+  .feedback-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-top:10px; box-shadow:var(--shadow-sm); }
   .feedback-card.completed { opacity:0.55; }
   .feedback-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; }
   .feedback-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
-  .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
-  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; }
+  .feedback-meta { color:var(--muted); font-size:0.8rem; margin-top:6px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; color:var(--text); }
   .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap:10px; margin-top:10px; }
-  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:#E5E5EA; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
-  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:#E5E5EA; display:flex; align-items:center; justify-content:center; color:#8E8E93; font-size:0.75rem; text-align:center; padding:6px; box-sizing:border-box; }
-  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; }
-  .netflix-preview-year { color:#8E8E93; font-size:0.75rem; }
+  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:var(--panel-strong); box-shadow:var(--shadow-sm); }
+  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.75rem; text-align:center; padding:6px; }
+  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; color:var(--text); }
+  .netflix-preview-year { color:var(--muted); font-size:0.75rem; }
+
+  /* Standard Modals & Buttons */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; z-index: 1000;
+  }
+  .modal-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 22px; max-width: 440px; width: 100%;
+    max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-md);
+    color: var(--text);
+  }
+  .modal-close-x {
+    float: right; background: var(--bg); border: 1px solid var(--border-strong);
+    color: var(--muted); font-size: 1rem; cursor: pointer;
+    padding: 4px 10px; border-radius: 8px;
+  }
+  .modal-close-x:hover { color: var(--text); border-color: var(--text-2); }
+  .lc-btn {
+    padding: 10px 18px; min-height: 38px; border-radius: var(--radius-pill);
+    border: none; background: var(--accent); color: #fff; cursor: pointer;
+    font-weight: 600; font-size: 0.925rem; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: opacity 0.12s; text-decoration: none;
+  }
+  .lc-btn.secondary {
+    background: var(--surface); color: var(--text);
+    border: 1.5px solid var(--border-strong);
+  }
+  .lc-btn.danger {
+    background: var(--danger); color: #fff; border: none;
+  }
+  .lc-btn:hover:not(:disabled) { opacity: 0.85; }
+  .lc-btn:disabled { opacity: 0.4; cursor: default; }
+
   @media (max-width: 600px) {
     body { padding: 14px 10px; }
     .stat-cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -1101,22 +1167,25 @@ async function renderAdminDashboard(env) {
   </div>
 
   <!-- Edit Feedback Modal -->
-  <div id="editFeedbackModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center; padding:16px;">
-    <div style="background:#fff; border-radius:14px; padding:20px; max-width:500px; width:100%; box-shadow:0 4px 20px rgba(0,0,0,0.15);">
-      <h3 style="margin:0 0 12px; font-size:1.1rem; color:#001f3f;">Edit Feedback</h3>
+  <div id="editFeedbackModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card" style="max-width:500px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 style="margin:0; font-size:1.15rem; font-weight:700; color:var(--text);">Edit Feedback</h3>
+        <button type="button" class="modal-close-x" onclick="closeEditFeedbackModal()">&#x2715;</button>
+      </div>
       <input type="hidden" id="editFeedbackId">
-      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Category</label>
-      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:12px; width:100%;">
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Category</label>
+      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:14px; width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text);">
         <option value="bug">bug</option>
         <option value="improvement">improvement</option>
         <option value="idea">idea</option>
         <option value="other">other</option>
       </select>
-      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Message</label>
-      <textarea id="editFeedbackMessage" style="width:100%; min-height:100px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical; margin-bottom:12px;"></textarea>
-      <div style="display:flex; justify-content:flex-end; gap:8px;">
-        <button type="button" class="admin-select" style="cursor:pointer;" onclick="closeEditFeedbackModal()">Cancel</button>
-        <button type="button" class="admin-select" id="editFeedbackSaveBtn" style="cursor:pointer; background:#001f3f; color:#fff;" onclick="saveEditFeedback()">Save Changes</button>
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Message</label>
+      <textarea id="editFeedbackMessage" style="width:100%; min-height:120px; box-sizing:border-box; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text); font-family:inherit; font-size:0.92rem; resize:vertical; margin-bottom:16px; outline:none;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:10px;">
+        <button type="button" class="lc-btn secondary" onclick="closeEditFeedbackModal()">Cancel</button>
+        <button type="button" class="lc-btn primary" id="editFeedbackSaveBtn" onclick="saveEditFeedback()">Save Changes</button>
       </div>
     </div>
   </div>
@@ -1650,6 +1719,65 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    function closeAdminModal() {
+      const existing = document.getElementById('activeAdminModalOverlay');
+      if (existing) existing.remove();
+    }
+
+    function showAdminModal(innerHtml) {
+      closeAdminModal();
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.id = 'activeAdminModalOverlay';
+      overlay.innerHTML = '<div class="modal-card"><div class="modal-body">' + innerHtml + '</div></div>';
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) closeAdminModal();
+      });
+      document.body.appendChild(overlay);
+    }
+
+    function showAdminAlert(title, message, isSuccess = false) {
+      const icon = isSuccess ? '\u2713' : '\u2715';
+      const iconColor = isSuccess ? 'var(--success, #34C759)' : 'var(--danger, #FF3B30)';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+          '<button type="button" class="lc-btn primary" onclick="closeAdminModal()" style="min-width:80px;">OK</button>' +
+        '</div>';
+      showAdminModal(html);
+    }
+
+    function showAdminConfirm(title, message, confirmBtnText, onConfirm, isDanger = true) {
+      const icon = isDanger ? '\u26A0' : '?';
+      const iconColor = isDanger ? 'var(--danger, #FF3B30)' : 'var(--accent, #007AFF)';
+      const btnClass = isDanger ? 'lc-btn danger' : 'lc-btn primary';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:10px;">' +
+          '<button type="button" class="lc-btn secondary" onclick="closeAdminModal()">Cancel</button>' +
+          '<button type="button" class="' + btnClass + '" id="adminConfirmOkBtn">' + escapeHtmlAdmin(confirmBtnText || 'Confirm') + '</button>' +
+        '</div>';
+      showAdminModal(html);
+      document.getElementById('adminConfirmOkBtn')?.addEventListener('click', () => {
+        closeAdminModal();
+        if (typeof onConfirm === 'function') onConfirm();
+      });
+    }
+
     // Optimistic: flips the entry's completed flag (and re-renders,
     // moving the card between the Open/Completed groups) the instant
     // it's clicked, then sends the real change to the server in the
@@ -1674,7 +1802,8 @@ async function renderAdminDashboard(env) {
             feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
             renderFeedbackList();
           }
-          alert((data && data.error) || 'Could not update -- try again.');
+          const err = (data && data.error) || 'Could not update -- try again.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Update Failed', err, false);
           return;
         }
       } catch (e) {
@@ -1683,7 +1812,7 @@ async function renderAdminDashboard(env) {
           feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
           renderFeedbackList();
         }
-        alert('Could not update -- check your connection.');
+        showAdminAlert('Connection Error', 'Could not update -- check your connection.', false);
       }
     }
 
@@ -1708,7 +1837,7 @@ async function renderAdminDashboard(env) {
       const message = document.getElementById('editFeedbackMessage').value.trim();
       const saveBtn = document.getElementById('editFeedbackSaveBtn');
       if (!message) {
-        alert('Please enter a message.');
+        showAdminAlert('Missing Message', 'Please enter a message.', false);
         return;
       }
       saveBtn.disabled = true;
@@ -1721,7 +1850,8 @@ async function renderAdminDashboard(env) {
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {
-          alert((data && data.error) || 'Could not save feedback edits.');
+          const err = (data && data.error) || 'Could not save feedback edits.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Save Error', err, false);
           saveBtn.disabled = false;
           saveBtn.textContent = 'Save Changes';
           return;
@@ -1733,7 +1863,7 @@ async function renderAdminDashboard(env) {
         }
         closeEditFeedbackModal();
       } catch (err) {
-        alert('Network error while saving feedback edits.');
+        showAdminAlert('Network Error', 'Network error while saving feedback edits.', false);
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save Changes';
       }
@@ -1750,35 +1880,37 @@ async function renderAdminDashboard(env) {
           btn.style.color = '';
         }, 1800);
       } catch (e) {
-        alert('Could not copy message to clipboard.');
+        showAdminAlert('Copy Failed', 'Could not copy message to clipboard.', false);
       }
     }
 
     async function deleteFeedbackEntry(id) {
-      if (!confirm('Permanently delete this feedback entry?')) return;
-      const idx = feedbackEntries.findIndex((f) => f.id === id);
-      if (idx === -1) return;
-      const removedEntry = feedbackEntries[idx];
-      feedbackEntries.splice(idx, 1);
-      renderFeedbackList();
+      showAdminConfirm('Delete Feedback', 'Permanently delete this feedback entry?', 'Delete', async () => {
+        const idx = feedbackEntries.findIndex((f) => f.id === id);
+        if (idx === -1) return;
+        const removedEntry = feedbackEntries[idx];
+        feedbackEntries.splice(idx, 1);
+        renderFeedbackList();
 
-      try {
-        const res = await fetch('/admin/api/feedback/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: id }),
-        });
-        const data = await res.json().catch(() => null);
-        if (!data || !data.ok) {
+        try {
+          const res = await fetch('/admin/api/feedback/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id }),
+          });
+          const data = await res.json().catch(() => null);
+          if (!data || !data.ok) {
+            feedbackEntries.splice(idx, 0, removedEntry);
+            renderFeedbackList();
+            const err = (data && data.error) || 'Could not delete feedback entry.';
+            showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Delete Failed', err, false);
+          }
+        } catch (err) {
           feedbackEntries.splice(idx, 0, removedEntry);
           renderFeedbackList();
-          alert((data && data.error) || 'Could not delete feedback entry.');
+          showAdminAlert('Network Error', 'Network error while deleting feedback entry.', false);
         }
-      } catch (err) {
-        feedbackEntries.splice(idx, 0, removedEntry);
-        renderFeedbackList();
-        alert('Network error while deleting feedback entry.');
-      }
+      }, true);
     }
   </script>
 </body></html>`;

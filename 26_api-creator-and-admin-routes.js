@@ -708,6 +708,33 @@
       return json({ ok: true });
     }
 
+    // /api/creator/sync/save-channels (POST) { creatorName, creatorKey, channels, mergedChannels }
+    if (path === "/api/creator/sync/save-channels" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const channelsBlob = {
+        channels: body.channels && typeof body.channels === "object" ? body.channels : {},
+        mergedChannels: body.mergedChannels && typeof body.mergedChannels === "object" ? body.mergedChannels : {},
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(channelsBlob);
+      if (serialized.length > 24 * 1024 * 1024) {
+        return json({ ok: false, error: "Your saved channels are too large to store (over the 25MB limit)." });
+      }
+      try {
+        await env.CONFIGS.put(`creatorsyncchannels:${auth.username}`, serialized);
+      } catch (e) {
+        return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
     // /api/creator/sync/load -> { ok, data: blob | null }
     // null specifically (rather than an empty blob) distinguishes "this
     // account has never synced from any device" from "this account synced
@@ -758,6 +785,23 @@
           }
           data.presets = presetsBlob.presets || {};
           data.presetsB64 = presetsBlob.presetsB64 || null;
+        }
+      }
+      // Channels & merged channels live in their own key -- merge them back in for signed-in sync across browsers.
+      const channelsRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      if (channelsRaw) {
+        let channelsBlob = null;
+        try {
+          channelsBlob = JSON.parse(channelsRaw);
+        } catch {
+          channelsBlob = null;
+        }
+        if (channelsBlob) {
+          if (!data) {
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+          }
+          data.channels = channelsBlob.channels || {};
+          data.mergedChannels = channelsBlob.mergedChannels || {};
         }
       }
       // Tracking data (Watch History/Continue Watching/etc) also lives in

@@ -191,6 +191,8 @@ var livePreviewShelfData = [];
 var activeTraktToken = null;
 let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
 let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
+let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
+let simklUsername = ${JSON.stringify(initialSimklUsername)};
 
 async function compressJsonToBase64(obj) {
   try {
@@ -242,7 +244,7 @@ function switchTab(name) {
 
   const titles = {
     discover: { title: 'Discover', sub: 'Explore Popular & Streaming' },
-    catalogs: { title: 'My Catalogs', sub: 'Manage Configured Shelves' },
+    catalogs: { title: 'Catalogs', sub: 'Manage Configured Catalogs' },
     lists: { title: 'Lists', sub: 'Community & Curated Lists' },
     channels: { title: 'Channels', sub: '24/7 Continuous TV Streaming' },
     search: { title: 'Search', sub: 'Find Movies, Shows & Lists' },
@@ -253,15 +255,6 @@ function switchTab(name) {
   const subEl = document.getElementById('pageSubtitle');
   if (titleEl) titleEl.textContent = t.title;
   if (subEl) subEl.textContent = t.sub;
-
-  const createListBtn = document.getElementById('headerCreateListBtn');
-  if (createListBtn) {
-    createListBtn.style.display = name === 'lists' ? 'block' : 'none';
-  }
-  const addShelfBtn = document.getElementById('headerAddShelfBtn');
-  if (addShelfBtn) {
-    addShelfBtn.style.display = name === 'catalogs' ? 'block' : 'none';
-  }
 
   document.querySelectorAll('.tab-panel').forEach(function(p) {
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
@@ -316,6 +309,28 @@ function switchTab(name) {
         }
       });
       switchSettingsSubmenu(savedSub, targetBtn || pills[0]);
+    }
+  }
+  if (name === 'channels') {
+    if (!window._channelsInitializedOnce) {
+      window._channelsInitializedOnce = true;
+      let savedSub = 'my-channels';
+      try {
+        savedSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+      } catch (e) {}
+      const pills = document.querySelectorAll('#channelsSubnavBar .subnav-pill');
+      let targetBtn = null;
+      pills.forEach((p) => {
+        const oc = p.getAttribute('onclick') || '';
+        if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+          targetBtn = p;
+        }
+      });
+      if (typeof switchChannelsSubmenu === 'function') {
+        switchChannelsSubmenu(savedSub, targetBtn || pills[0]);
+      }
+    } else {
+      if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
     }
   }
   if (name === 'catalogs') {
@@ -729,6 +744,15 @@ function renderDiscoverChartsList(type, forceRefresh) {
     }
   }
 
+  if (type === 'holidays' || type === 'all') {
+    if (window._CHARTS_HOLIDAYS) {
+      window._CHARTS_HOLIDAYS.forEach(function(item) {
+        pushSingle(item.name, item.movieUrl, 'movie', 'Holiday Movies');
+        pushSingle(item.name, item.showUrl, 'series', 'Holiday Shows');
+      });
+    }
+  }
+
   if (typeof render5PosterListsFeed === 'function') {
     render5PosterListsFeed(container, lists);
   } else {
@@ -737,6 +761,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
 }
 
 function switchCatalogsSubmenu(filter, btn) {
+  if (filter === 'channels') {
+    switchTab('channels');
+    return;
+  }
   if (btn) {
     document.querySelectorAll('#catalogsFilterBar .subnav-pill').forEach(function(p) {
       p.classList.remove('active');
@@ -750,7 +778,6 @@ function switchCatalogsSubmenu(filter, btn) {
   const panels = {
     'all': document.getElementById('catalogsSubShelves'),
     'quickadd': document.getElementById('catalogsSubQuickAdd'),
-    'channels': document.getElementById('catalogsSubChannels'),
     'bulk': document.getElementById('catalogsSubBulk')
   };
 
@@ -1095,6 +1122,9 @@ function addRow(name, url, type, enabled, group, channelId) {
   }
   
   if (isChannel) {
+    if (channelId && String(channelId).startsWith('merged-')) {
+      div.dataset.mergedId = channelId;
+    }
     div.dataset.channelId = channelId || generateChannelId();
   }
   const urlList = isWatchlist
@@ -1148,7 +1178,7 @@ function addRow(name, url, type, enabled, group, channelId) {
       ? '<p class="watchlist-note"><small>Uses the MDBList API key from Settings.</small></p>'
       : (isChannel || isCustomList || isPremade)
         ? ''
-        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one shelf)</button>'}
+        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>'}
     <div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>\${escapeHtml(name||'Unnamed')} - \${type === 'series' ? 'Series' : 'Movies'}</span><button type="button" class="text-action-btn" disabled>See All \›</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>
   \`;
   container.appendChild(div);
@@ -1158,7 +1188,7 @@ function addRow(name, url, type, enabled, group, channelId) {
   checkAllDuplicateUrls();
   renumber();
   if (!suppressSave) {
-    showAddedToast('"' + (name || 'Shelf') + '" added to My Catalogs \u2713');
+    showAddedToast('"' + (name || 'Catalog') + '" added to My Catalogs \u2713');
   }
   return div;
 }
@@ -1216,6 +1246,9 @@ ${buildAddAllFnJs("addAllStreamingTop10", buildAddAllPairsCallsJs(STREAMING_TOP1
 // fixes that and makes a repeat impossible.
 ${buildAddAllCombinedChartsJs()}
 
+${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
+${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
+
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
   addRow("Hidden Gems", "tmdb:hidden-gems", "series", true, "Hidden Gems");
@@ -1232,10 +1265,12 @@ document.addEventListener('click', (e) => {
   else if (action === 'tmdb-charts') addAllTmdbCharts();
   else if (action === 'trakt-charts') addAllTraktCharts();
   else if (action === 'simkl-charts') addAllSimklCharts();
-  else if (action === 'streaming') addAllStreaming();
+  else if (action === 'streaming' || action === 'streaming-catalogs') addAllStreaming();
   else if (action === 'streaming-top10') addAllStreamingTop10();
   else if (action === 'combined-charts') addAllCombinedCharts();
   else if (action === 'hidden-gems') addAllHiddenGems();
+  else if (action === 'kids') addAllKidsCharts();
+  else if (action === 'holidays') addAllHolidayCharts();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal

@@ -43,6 +43,7 @@ async function runMyMdblistLists() {
 }
 
 function renderMyMdblistLists(lists) {
+  window._myMdblistLists = lists || [];
   const box = document.getElementById('myMdblistListsResult');
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No lists found on your MDBList account.</small></p>';
@@ -84,6 +85,9 @@ function renderMyMdblistLists(lists) {
       return 'movie';
     }
 
+    const isCustomUserList = !isHistory && !isWatchlist && !l.dynamic;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="mdblist" data-list-id="' + escapeAttr(l.id || l.slug) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -97,6 +101,7 @@ function renderMyMdblistLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'mixed') + '"></div>' +
@@ -118,6 +123,12 @@ document.getElementById('myMdblistListsResult').addEventListener('click', (e) =>
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -145,6 +156,7 @@ async function runMyTraktLists() {
 }
 
 function renderMyTraktLists(lists) {
+  window._myTraktLists = lists || [];
   const box = document.getElementById('myTraktListsResult');
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No public lists found for that Trakt username.</small></p>';
@@ -174,6 +186,10 @@ function renderMyTraktLists(lists) {
       addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedMovie ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' + (addedMovie ? '&#10003;' : '+ Movies') + '</button>' +
         '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
     }
+    const isCustomUserList = l.slug !== 'watchlist' && l.url !== 'trakt:watchlist';
+    const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -187,6 +203,7 @@ function renderMyTraktLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
@@ -208,6 +225,12 @@ document.getElementById('myTraktListsResult').addEventListener('click', (e) => {
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -244,7 +267,8 @@ function renderMdblistConnectStatus() {
   const connectBtn = document.getElementById('mdblistConnectBtn');
   const disconnectBtn = document.getElementById('mdblistDisconnectBtn');
   const listsBtn = document.getElementById('listsMdblistConnectBtn');
-  const token = mdblistAccessToken || '';
+  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  if (token) mdblistAccessToken = token;
   const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
   const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
   const connected = !!(token || key);
@@ -353,7 +377,8 @@ function renderTraktConnectStatus() {
   const connectBtn = document.getElementById('traktConnectBtn');
   const disconnectBtn = document.getElementById('traktDisconnectBtn');
   const listsBtn = document.getElementById('listsTraktConnectBtn');
-  const token = traktAccessToken || '';
+  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  if (token) traktAccessToken = token;
   const user = (userInput ? userInput.value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '';
   const key = (keyInput ? keyInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
   const connected = !!(token || key || user);
@@ -423,9 +448,13 @@ function pickUpTraktTokenFromUrl() {
       token_exchange_failed: 'Failed to exchange authorization code for a Trakt token.',
       access_denied: 'Trakt sign-in was cancelled.',
     };
-    const msg = messages[err] || ('Could not connect to Trakt (' + err + (detail ? ': ' + detail : '') + ').');
+    const isRateLimit = detail.includes('1015') || detail.includes('429') || err === 'exchange_failed';
+    const msg = isRateLimit 
+      ? 'Trakt web redirect was rate-limited by Cloudflare (1015). Opening direct PIN code activation instead...'
+      : (messages[err] || ('Could not connect to Trakt (' + err + (detail ? ': ' + detail : '') + ').'));
+
     if (typeof showAppAlert === 'function') {
-      showAppAlert('Trakt Connection Error', msg, false);
+      showAppAlert('Trakt Connection', msg, !isRateLimit);
     } else {
       alert(msg);
     }
@@ -433,6 +462,117 @@ function pickUpTraktTokenFromUrl() {
     params.delete('trakt_error_detail');
     const qs = params.toString();
     history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+
+    if (isRateLimit) {
+      setTimeout(() => {
+        startTraktDeviceLogin();
+      }, 500);
+    }
+  }
+}
+
+let _traktDevicePollTimer = null;
+
+function closeTraktDeviceModal() {
+  if (_traktDevicePollTimer) {
+    clearInterval(_traktDevicePollTimer);
+    _traktDevicePollTimer = null;
+  }
+  const modal = document.getElementById('traktDeviceModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function startTraktDeviceLogin() {
+  const modal = document.getElementById('traktDeviceModal');
+  const codeEl = document.getElementById('traktDeviceUserCode');
+  const statusEl = document.getElementById('traktDevicePollingStatus');
+  const linkEl = document.getElementById('traktDeviceActivateLink');
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  
+  if (modal) modal.style.display = 'flex';
+  if (codeEl) codeEl.innerText = 'LOADING...';
+  if (statusEl) statusEl.innerText = 'Requesting activation code from Trakt...';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/trakt/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ traktKey: traktKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.user_code) {
+      if (codeEl) codeEl.innerText = 'ERROR';
+      if (statusEl) {
+        statusEl.innerHTML = '<span style="color:var(--danger);">' + escapeHtml(data.error || 'Could not get device code.') + '</span> <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
+      }
+      return;
+    }
+
+    if (codeEl) codeEl.innerText = data.user_code;
+    if (linkEl) {
+      linkEl.href = data.verification_url || 'https://trakt.tv/activate';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span style="color:var(--accent); font-weight:600;">Code ready!</span> Enter code at trakt.tv/activate &bull; Waiting for approval...';
+    }
+
+    const deviceCode = data.device_code;
+    const intervalSec = Math.max(4, data.interval || 5);
+    const expiresAt = Date.now() + ((data.expires_in || 600) * 1000);
+
+    if (_traktDevicePollTimer) clearInterval(_traktDevicePollTimer);
+
+    _traktDevicePollTimer = setInterval(async () => {
+      if (Date.now() > expiresAt) {
+        clearInterval(_traktDevicePollTimer);
+        _traktDevicePollTimer = null;
+        if (statusEl) statusEl.innerHTML = 'Activation code expired. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Get New Code</button>';
+        return;
+      }
+
+      try {
+        const pollRes = await fetch(ORIGIN + '/api/trakt/device/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: deviceCode, traktKey: traktKey }),
+        });
+        const pollData = await pollRes.json();
+
+        if (pollData.ok && pollData.access_token) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          traktAccessToken = pollData.access_token;
+          try {
+            localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+          } catch(e) {}
+          if (pollData.username) {
+            try {
+              localStorage.setItem('myListAddon:traktUsername', pollData.username);
+            } catch(e) {}
+            const uInput = document.getElementById('traktUsernameInput');
+            if (uInput) uInput.value = pollData.username;
+          }
+          saveState();
+          closeTraktDeviceModal();
+          if (typeof showAppAlert === 'function') {
+            showAppAlert('Trakt Connected', 'Successfully connected to Trakt' + (pollData.username ? ' as @' + pollData.username : '') + '.', true);
+          }
+          renderTraktConnectStatus();
+        } else if (pollData.pending) {
+          // Still waiting for user confirmation
+        } else if (pollData.slowDown) {
+          // Slow down polling
+        } else if (pollData.error && !pollData.pending) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          if (statusEl) statusEl.innerText = pollData.error;
+        }
+      } catch (e) {}
+    }, intervalSec * 1000);
+
+  } catch (err) {
+    if (codeEl) codeEl.innerText = 'ERROR';
+    if (statusEl) statusEl.innerHTML = 'Network error requesting device code. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
   }
 }
 
@@ -516,6 +656,10 @@ function renderMyPrivateTraktLists(lists) {
         '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
     }
 
+    const isCustomUserList = !isHistory && l.slug !== 'watchlist' && l.url !== 'trakt:watchlist';
+    const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -529,6 +673,7 @@ function renderMyPrivateTraktLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
@@ -550,6 +695,12 @@ document.getElementById('myPrivateTraktListsResult').addEventListener('click', (
   const copyBtn = e.target.closest('.myPrivateListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -703,7 +854,7 @@ function renderTmdbConnectStatus() {
 
   if (connectBtn) connectBtn.textContent = sess ? 'Re-connect TMDB' : (key ? 'Update Key' : 'Connect TMDB Account');
   if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
-  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect TMDB' : 'Connect TMDB';
+  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect' : 'Connect TMDB';
 }
 
 let myTmdbListsTimer = null;
@@ -750,6 +901,7 @@ async function runMyTmdbLists() {
 }
 
 function renderMyTmdbLists(lists) {
+  window._myTmdbLists = lists || [];
   const box = document.getElementById('myTmdbListsResult');
   if (!box) return;
   if (!lists || !lists.length) {
@@ -803,9 +955,13 @@ function renderMyTmdbLists(lists) {
             overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:default;">' + totalCount + ' &rsaquo;</div>';
           }
           const posterType = it.type || (l.contentType === 'series' ? 'series' : 'movie');
+          const tmdbTarget = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : 'custom');
+          const tmdbListId = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : listIdStr);
+          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="tmdb" data-target="' + tmdbTarget + '" data-list-id="' + escapeAttr(tmdbListId) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(posterType) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from TMDB">&times;</button>';
           return '<div class="list-card-mini-poster-tile">' +
             '<div class="list-card-mini-poster-img-wrap">' +
               '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+              removeBtn +
               overlays +
             '</div>' +
             '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
@@ -814,6 +970,9 @@ function renderMyTmdbLists(lists) {
         }).join('') +
       '</div>';
     }
+
+    const isCustomUserList = !isWatchlist && !isFavorites;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="tmdb" data-list-id="' + escapeAttr(listIdStr) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
 
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
@@ -827,6 +986,7 @@ function renderMyTmdbLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       posterThumbs +
@@ -849,11 +1009,257 @@ document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
     return;
   }
-  const posterImg = e.target.closest('.clickable-poster');
-  if (posterImg && posterImg.dataset.id) {
-    if (typeof openItemDetailsModal === 'function') {
-      openItemDetailsModal(posterImg.dataset.id, posterImg.dataset.type);
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+
+// --- Simkl OAuth & Personal Lists -----------------------------------------
+function startSimklConnect() {
+  window.location.href = ORIGIN + '/api/simkl/oauth/start';
+}
+
+function disconnectSimkl() {
+  const input = document.getElementById('simklKeyInput');
+  if (input) input.value = '';
+  simklAccessToken = '';
+  simklUsername = '';
+  try {
+    localStorage.removeItem('myListAddon:simklAccessToken');
+    localStorage.removeItem('myListAddon:simklUsername');
+    localStorage.removeItem('myListAddon:simklKey');
+  } catch (e) {}
+  saveState();
+  renderSimklConnectStatus();
+  scheduleMySimklListsRefresh();
+}
+
+function toggleListsSimklConnection() {
+  if (simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken')) {
+    disconnectSimkl();
+  } else {
+    startSimklConnect();
+  }
+}
+
+function pickUpSimklTokenFromUrl() {
+  const hash = window.location.hash || '';
+  const match = /(?:^|[#&])simkl_token=([^&]+)/.exec(hash);
+  if (match) {
+    simklAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.setItem('myListAddon:simklAccessToken', simklAccessToken);
+    } catch (e) {}
+    const userMatch = /(?:^|[#&])simkl_username=([^&]+)/.exec(hash);
+    if (userMatch) {
+      simklUsername = decodeURIComponent(userMatch[1]);
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+      } catch (e) {}
     }
+    saveState();
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connected', 'Your Simkl account was successfully connected.', true);
+    } else {
+      alert('Connected to Simkl.');
+    }
+    renderSimklConnectStatus();
+    scheduleMySimklListsRefresh();
+  }
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('simkl_error');
+  if (err) {
+    const detail = params.get('simkl_error_detail') || '';
+    const messages = {
+      not_configured: 'Simkl OAuth is not configured on this Worker.',
+      no_code: 'Simkl did not return an authorization code.',
+      exchange_failed: 'Failed to exchange authorization code for a Simkl token.',
+      access_denied: 'Simkl sign-in was cancelled.',
+      state_mismatch: 'Simkl sign-in state mismatch. Please try again.',
+      no_token: 'Simkl did not return an access token.',
+      network: 'Network error connecting to Simkl.',
+    };
+    const msg = messages[err] || ('Could not connect to Simkl (' + err + (detail ? ': ' + detail : '') + ').');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connection Error', msg + (detail ? '\\n\\nDetails: ' + detail : ''), false);
+    } else {
+      alert(msg + (detail ? '\\n' + detail : ''));
+    }
+    params.delete('simkl_error');
+    params.delete('simkl_error_detail');
+    const qs = params.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+  }
+}
+
+function renderSimklConnectStatus() {
+  const input = document.getElementById('simklKeyInput');
+  const statusEl = document.getElementById('simklConnectStatus');
+  const connectBtn = document.getElementById('simklConnectBtn');
+  const disconnectBtn = document.getElementById('simklDisconnectBtn');
+  const listsBtn = document.getElementById('listsSimklConnectBtn');
+
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  if (token) simklAccessToken = token;
+  const user = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+  const connected = !!(token || key);
+
+  if (listsBtn) {
+    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Simkl';
+  }
+
+  if (statusEl) {
+    if (token && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (token) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Simkl</span>';
+    } else if (key) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Simkl Client ID configured</span>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
+    }
+  }
+
+  if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
+  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (connected) {
+    scheduleMySimklListsRefresh();
+  }
+}
+
+let mySimklListsTimer = null;
+function scheduleMySimklListsRefresh() {
+  clearTimeout(mySimklListsTimer);
+  mySimklListsTimer = setTimeout(runMySimklLists, 600);
+}
+
+async function runMySimklLists() {
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  const token = simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const input = document.getElementById('simklKeyInput');
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  if (!token && !key) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Simkl account in Settings or click <strong>Connect Simkl</strong> above to see your watchlists and lists here.</small></p>';
+    return;
+  }
+
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Simkl lists\u2026</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/simkl/my-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, simklKey: key }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Simkl lists.') + '</p>';
+      return;
+    }
+    renderMySimklLists(data.lists);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Simkl lists.</p>';
+  }
+}
+
+function renderMySimklLists(lists) {
+  window._mySimklLists = lists || [];
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No items found on your Simkl account.</small></p>';
+    return;
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  window._simklListsMap = window._simklListsMap || {};
+  lists.forEach(function(l) {
+    if (l && l.url) window._simklListsMap[l.url] = l;
+  });
+
+  const cardsHtml = lists.map((l) => {
+    const type = l.type === 'series' ? 'series' : 'movie';
+    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
+    const totalCount = l.itemCount || (l.items || []).length;
+    const added = alreadyAdded.has(l.url + '|' + type);
+
+    const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
+    const addBtn = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+
+    const previewItems = (l.items || []).slice(0, 9);
+    let posterThumbs = '';
+    if (previewItems.length) {
+      posterThumbs = '<div class="list-card-posters poster-preview-static">' +
+        previewItems.map((it, i) => {
+          const isMobileEnd = (i === 2 && previewItems.length > 3);
+          const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+          let overlays = '';
+          if (isMobileEnd) {
+            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          if (isDesktopEnd) {
+            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          const simklStatus = l.statusKey || (l.url ? l.url.split(':')[3] : 'plantowatch');
+          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+            '<div class="list-card-mini-poster-img-wrap">' +
+              (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              removeBtn +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(it.name || '') + '</div>' +
+            (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+
+    return '<div class="list-card" data-list-type="' + type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          addBtn +
+        '</div>' +
+      '</div>' +
+      posterThumbs +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml;
+}
+
+document.getElementById('mySimklListsResult')?.addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
   }
 });
 
@@ -861,6 +1267,7 @@ function updateConnectionStatusBadges() {
   if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
   if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
 }
 
 

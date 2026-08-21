@@ -112,7 +112,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -137,6 +137,8 @@ function decodeConfig(config) {
       traktKey: (!Array.isArray(parsed) && parsed.traktKey) || "",
       traktUsername: (!Array.isArray(parsed) && parsed.traktUsername) || "",
       traktAccessToken: (!Array.isArray(parsed) && parsed.traktAccessToken) || "",
+      simklKey: (!Array.isArray(parsed) && parsed.simklKey) || "",
+      simklAccessToken: (!Array.isArray(parsed) && parsed.simklAccessToken) || "",
       track: !!(!Array.isArray(parsed) && parsed.track),
       trackCreatorName: (!Array.isArray(parsed) && parsed.trackCreatorName) || "",
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
@@ -315,5 +317,106 @@ async function hashStringForKey(s) {
   const data = new TextEncoder().encode(String(s || ""));
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+// --- Per-User Cache & Circuit Breaker Shield ---------------------------------
+// Safe in-memory LRU cache with rolling window and Stale-If-Error degradation.
+// Ensures bearer-authenticated user data is safely isolated and never leaks between users.
+const PER_USER_CACHE_MAP = new Map();
+const PER_USER_CACHE_MAX_ENTRIES = 1000;
+
+function safeUserHash(token = "", username = "") {
+  const input = `${token}:${username}`;
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) - hash) + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return (Math.abs(hash) || 1).toString(36);
+}
+
+function getPerUserCache(key) {
+  if (!key) return null;
+  const entry = PER_USER_CACHE_MAP.get(key);
+  if (!entry) return null;
+  const now = Date.now();
+  if (now <= entry.freshUntil) {
+    return { data: entry.data, isFresh: true, isStale: false };
+  }
+  if (now <= entry.staleUntil) {
+    return { data: entry.data, isFresh: false, isStale: true };
+  }
+  PER_USER_CACHE_MAP.delete(key);
+  return null;
+}
+
+function setPerUserCache(key, data, freshTtlSec = 60, staleTtlSec = 1800) {
+  if (!key || data === undefined || data === null) return;
+  if (PER_USER_CACHE_MAP.size >= PER_USER_CACHE_MAX_ENTRIES) {
+    const oldestKey = PER_USER_CACHE_MAP.keys().next().value;
+    if (oldestKey) PER_USER_CACHE_MAP.delete(oldestKey);
+  }
+  const now = Date.now();
+  PER_USER_CACHE_MAP.set(key, {
+    data,
+    freshUntil: now + freshTtlSec * 1000,
+    staleUntil: now + staleTtlSec * 1000,
+  });
+}
+
+function invalidatePerUserCache(provider, userHash = "") {
+  if (!provider) return;
+  const prefix = `user_cache:${provider}`;
+  for (const k of PER_USER_CACHE_MAP.keys()) {
+    if (k.startsWith(prefix) && (!userHash || k.includes(userHash))) {
+      PER_USER_CACHE_MAP.delete(k);
+    }
+  }
+}
+
+// Executes an external fetch with safe per-user caching and circuit-breaker fallback.
+// If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response if available.
+async function fetchWithPerUserCacheAndCircuitBreaker({
+  cacheKey,
+  fetchFn,
+  freshTtlSec = 60,
+  staleTtlSec = 1800,
+  providerLabel = "External API"
+}) {
+  const cached = getPerUserCache(cacheKey);
+  if (cached && cached.isFresh) {
+    return cached.data;
+  }
+
+  try {
+    const freshData = await fetchFn();
+    if (freshData !== null && freshData !== undefined) {
+      setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
+      return freshData;
+    }
+  } catch (err) {
+    const errMsg = String(err && err.message ? err.message : err);
+    if (cached && cached.data) {
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good cached data.`);
+      return cached.data;
+    }
+    throw err;
+  }
+
+  if (cached && cached.data) {
+    return cached.data;
+  }
+  return null;
+}
+
+async function fetchTraktWithRetry(url, options = {}, retries = 2) {
+  let res = await fetch(url, options);
+  if (res.status === 429 && retries > 0) {
+    const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
+    const delayMs = Math.min(3000, Math.max(1000, retrySec * 1000));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return fetchTraktWithRetry(url, options, retries - 1);
+  }
+  return res;
 }
 

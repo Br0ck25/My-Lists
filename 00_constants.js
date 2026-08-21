@@ -1,5 +1,5 @@
 const ADDON_ID = "app.my-list";
-const ADDON_VERSION = "1.39.0";
+const ADDON_VERSION = "1.4.0";
 const ADDON_NAME = "My Lists";
 
 // --- Env-backed API keys ----------------------------------------------------
@@ -21,9 +21,11 @@ const ADDON_NAME = "My Lists";
 // A per-user override still takes priority over these where one exists
 // (the MDBList key / Trakt Client ID boxes in the builder page) -- these
 // are only ever the fallback for someone who hasn't filled those in.
+let TMDB_API_KEY = "";
 let MDBLIST_API_KEY = "";
 let MDBLIST_POPULAR_KEY = "";
 let MDBLIST_CLIENT_ID = "";
 let TRAKT_CLIENT_ID = "";
-let TMDB_API_KEY = "5e183700244552be60b9a44cf5d7e7b9";
-let SIMKL_CLIENT_ID = "b331c5917e9f5b4e2f92fbfdf62de9b62e99c4c6fe743ff281e6c63be159e3b4";
+let SIMKL_CLIENT_ID = "";
+let SIMKL_CLIENT_SECRET = "";
+

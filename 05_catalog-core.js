@@ -118,8 +118,10 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
     else if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
+    else if (source === "tmdb-holiday") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHoliday(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:holiday:".length)); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
+    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
     else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env);
@@ -200,10 +202,6 @@ function parseChannelPayload(rawUrl) {
 
 function getPaddedChannelLogo(rawPoster, origin) {
   if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
-  const m = rawPoster.match(/https:\/\/image\.tmdb\.org\/t\/p\/(?:w\d+|original)\/(.+)/);
-  if (m && origin) {
-    return `${origin}/api/channel-logo?path=${encodeURIComponent('/' + m[1])}`;
-  }
   return rawPoster;
 }
 
@@ -212,13 +210,17 @@ function fetchChannelCatalog(entry, origin) {
   if (!payload || !payload.items.length) return [];
   const channelId = payload.channelId || entry.id;
   const name = payload.name || entry.name;
+  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
+  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
   return [
     {
       id: "channel_" + channelId,
       type: "series",
       name: name,
-      poster: getPaddedChannelLogo(payload.poster, origin),
-      posterShape: "landscape",
+      poster: getPaddedChannelLogo(channelPoster, origin),
+      background: getPaddedChannelLogo(channelBackdrop, origin),
+      thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
+      logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
     },
   ];
 }
@@ -662,8 +664,11 @@ function buildChannelMeta(entry, origin) {
     // to begin with) and matches the shape a known-working reference
     // implementation's meta responses use.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
+    const realSeason = typeof it.season === "number" ? it.season : parseInt(it.season, 10) || 1;
+    const realEpisode = typeof it.episode === "number" ? it.episode : parseInt(it.episode, 10) || 1;
+    const streamId = it.kind === "movie" ? it.imdbId : `${it.imdbId}:${realSeason}:${realEpisode}`;
     return {
-      id: it.kind === "movie" ? it.imdbId : `${it.imdbId}:${it.season}:${it.episode}`,
+      id: streamId,
       title: it.title,
       season: 1,
       episode: i + 1,
@@ -671,13 +676,16 @@ function buildChannelMeta(entry, origin) {
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });
+  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
+  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
   return {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: getPaddedChannelLogo(payload.poster, origin),
-    posterShape: "landscape",
-    background: getPaddedChannelLogo(payload.poster, origin),
+    poster: getPaddedChannelLogo(channelPoster, origin),
+    background: getPaddedChannelLogo(channelBackdrop, origin),
+    thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
+    logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
     videos,
   };
 }

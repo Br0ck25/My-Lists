@@ -476,6 +476,11 @@ async function populateSearchResultPosters() {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
             const totalCount = cardItems || data.count || (validPosters.length * 10);
+            const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
+            const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
+            const isTmdbSlot = !!slot.closest('#myTmdbListsResult');
+            const isSimklSlot = !!slot.closest('#mySimklListsResult');
+
             let inner = '';
             validPosters.forEach((s, i) => {
               const isMobileEnd = (i === 2 && validPosters.length > 3);
@@ -488,9 +493,24 @@ async function populateSearchResultPosters() {
               if (isDesktopEnd) {
                 overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
+
+              let removeBtn = '';
+              if (isTraktSlot) {
+                const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
+                const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
+                const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
+                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+              } else if (isMdblistSlot) {
+                const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+                const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
+                const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
+                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+              }
+
               inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
                 '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
+                  removeBtn +
                   '<div class="poster-add-overlay">+</div>' +
                   overlays +
                 '</div>' +
@@ -1353,7 +1373,11 @@ async function openItemDetailsModal(id, type, opts) {
   // A real, bookmarkable/shareable URL for this specific title.
   if (!opts.skipPushState) {
     const params = new URLSearchParams({ id: id, type: type || 'movie' });
-    history.pushState({ view: 'item', id: id, type: type, fromList: (currentActiveTab === 'list-details'), listScrollY: window._listScrollY }, '', '#/item?' + params.toString());
+    const targetHash = '#/item?' + params.toString();
+    const currentHash = location.hash || '';
+    if (currentHash !== targetHash) {
+      history.pushState({ view: 'item', id: id, type: type, fromList: (currentActiveTab === 'list-details'), listScrollY: window._listScrollY }, '', targetHash);
+    }
   }
   
   const body = document.getElementById('itemDetailsBody');
@@ -1527,9 +1551,145 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
   }
 }
 
+function getExternalListMembership() {
+  try {
+    return JSON.parse(localStorage.getItem('myListAddon:externalMembership') || '{}');
+  } catch(e) {
+    return {};
+  }
+}
+
+function setExternalListMembership(key, isMember) {
+  try {
+    const map = getExternalListMembership();
+    if (isMember) {
+      map[key] = true;
+    } else {
+      delete map[key];
+      map[key] = false;
+    }
+    localStorage.setItem('myListAddon:externalMembership', JSON.stringify(map));
+  } catch(e) {}
+}
+
+function makeExternalKey(provider, target, listId, id) {
+  const cleanId = String(id || '').replace(/^tmdb:/, '').trim();
+  return (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + cleanId;
+}
+
+function isItemInExternalList(provider, target, listId, id, fallbackList) {
+  const map = getExternalListMembership();
+  const rawId = String(id || '').trim();
+  const cleanId = rawId.replace(/^tmdb:/, '');
+  const key1 = (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + rawId;
+  const key2 = (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + cleanId;
+
+  if (map[key1] === true || map[key2] === true) return true;
+  if (map[key1] === false || map[key2] === false) return false;
+
+  if (fallbackList && Array.isArray(fallbackList.items)) {
+    return fallbackList.items.some(it => {
+      if (!it) return false;
+      const itId = String(it.id || '').trim();
+      const itCleanId = itId.replace(/^tmdb:/, '');
+      const itImdb = String(it.imdbId || '').trim();
+      const itTmdb = String(it.tmdbId || '').trim();
+      return itId === rawId || itCleanId === cleanId || itImdb === rawId || itImdb === cleanId || itTmdb === rawId || itTmdb === cleanId;
+    });
+  }
+  return false;
+}
+
+async function removeSingleExternalItemDirect(provider, target, listId, id, type, btn) {
+  if (!id) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+
+  const key1 = makeExternalKey(provider, target, listId, id);
+  const key2 = makeExternalKey(provider, target, listId, String(id).replace(/^tmdb:/, ''));
+  setExternalListMembership(key1, false);
+  setExternalListMembership(key2, false);
+
+  const row = btn ? btn.closest('.select-list-row') : null;
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    btn.style.display = 'none';
+  }
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+  const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+  try {
+    await fetch(ORIGIN + '/api/external-list/item-mutate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'remove',
+        provider: provider,
+        target: target,
+        listId: listId,
+        id: id,
+        imdbId: String(id).startsWith('tt') ? id : '',
+        tmdbId: String(id).startsWith('tmdb:') ? String(id).slice(5) : (String(id).startsWith('tt') ? '' : id),
+        type: type || 'movie',
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        traktUsername: traktUser,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+        tmdbSessionId: tmdbSess,
+        tmdbAccountId: tmdbAcc,
+        tmdbKey: tmdbKey,
+        mdblistAccessToken: mdbToken,
+        mdblistKey: mdbKey
+      })
+    });
+  } catch(e) {}
+
+  showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
+}
+
+function removeSingleCustomItemDirect(listIdx, id, type, btn) {
+  if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return;
+  const list = window._selectListModalTempLists[listIdx];
+  let cleanId = String(id || '').trim();
+  while (cleanId.startsWith('tmdb:')) cleanId = cleanId.slice(5).trim();
+  const finalImdbId = cleanId.startsWith('tt') ? cleanId : ('tmdb:' + cleanId);
+  toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, false);
+  const row = btn ? btn.closest('.select-list-row') : null;
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    btn.style.display = 'none';
+  }
+  showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
+}
+
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
+  if (!modal || !body) return;
   
   // Ensure Watchlist exists locally
   if (typeof loadLocalCustomLists === 'function' && typeof backfillAutoTrackedListSlugs === 'function') {
@@ -1537,7 +1697,7 @@ function openSelectListModal(id, type, title, poster) {
     backfillAutoTrackedListSlugs(m);
   }
 
-  // Scrape available Custom Lists from the configured lists DOM, local lists, and creator lists
+  // 1. Custom Lists (local & creator)
   const customLists = [];
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
@@ -1589,13 +1749,212 @@ function openSelectListModal(id, type, title, poster) {
     });
   }
 
+  // 2. External Provider Lists
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const hasTrakt = !!traktToken;
+
+  const simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+  const hasSimkl = !!simklToken;
+
+  const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const tmdbUser = (typeof tmdbUsername !== 'undefined' && tmdbUsername) || localStorage.getItem('myListAddon:tmdbUsername') || '';
+  const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const hasTmdb = !!(tmdbSess || tmdbAcc || tmdbKey);
+
+  const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+  const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const hasMdblist = !!(mdbToken || mdbKey);
+
   // Store globally so submitCreateListModal and addSelectedListsBtn can access it
   window._selectListModalTempLists = customLists;
   window._selectListModalCurrentItem = { id: id, type: type, title: title, poster: poster };
 
   let html = '';
-  if (customLists.length === 0) {
-    html += '<p style="text-align:center; padding:20px; color:var(--text);">You have not created any Custom Lists yet. <a href="#" id="emptyCreateListLink" style="color:var(--brand); font-weight:600;">Create one now</a></p>';
+
+  // SECTION: Custom Lists
+  if (customLists.length > 0) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:4px 0 6px;">Custom Lists</div>';
+    customLists.forEach((list, idx) => {
+      let isChecked = false;
+      try {
+        const payloadStr = list.url.slice('customlist:v1:'.length);
+        const payload = JSON.parse(payloadStr);
+        isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id) || (it.id === 'tmdb:' + id));
+      } catch(e) {}
+      
+      html += 
+        '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+          '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+            '<input type="checkbox" class="list-select-cb" data-type="custom" data-idx="' + idx + '" data-initially-checked="' + (isChecked ? 'true' : 'false') + '" ' + (isChecked ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+            '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
+            (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+          '</label>' +
+          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        '</div>';
+    });
+  }
+
+  // SECTION: Trakt
+  if (hasTrakt) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#ed1c24; font-weight:bold;">\u25CF</span> Trakt ' + (traktUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(traktUser) + ')</small>' : '') +
+    '</div>';
+
+    const traktWl = Array.isArray(window._myTraktLists) ? window._myTraktLists.find(l => l.slug === 'watchlist' || l.url === 'trakt:watchlist') : null;
+    const inTraktWatchlist = isItemInExternalList('trakt', 'watchlist', 'watchlist', id, traktWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="trakt" data-target="watchlist" data-list-id="watchlist" data-name="Trakt Watchlist" data-initially-checked="' + (inTraktWatchlist ? 'true' : 'false') + '" ' + (inTraktWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>Trakt Watchlist</span>' +
+          (inTraktWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myTraktLists)) {
+      window._myTraktLists.forEach(tl => {
+        if (!tl || tl.slug === 'watchlist' || tl.url === 'trakt:watchlist') return;
+        const inList = isItemInExternalList('trakt', 'custom', tl.id || tl.slug || '', id, tl);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="trakt" data-target="custom" data-list-id="' + escapeAttr(tl.id || tl.slug || '') + '" data-name="' + escapeAttr(tl.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(tl.name || 'Trakt List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  // SECTION: Simkl
+  if (hasSimkl) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#00e699; font-weight:bold;">\u25CF</span> Simkl ' + (simklUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(simklUser) + ')</small>' : '') +
+    '</div>';
+
+    const simklStatuses = [
+      { key: 'plantowatch', label: 'Plan to Watch' },
+      { key: 'watching', label: 'Watching' },
+      { key: 'completed', label: 'Completed' },
+      { key: 'hold', label: 'On Hold' },
+      { key: 'dropped', label: 'Dropped' }
+    ];
+
+    simklStatuses.forEach(st => {
+      const foundList = Array.isArray(window._mySimklLists) ? window._mySimklLists.find(l => l.url && l.url.includes(st.key) && (type === 'series' ? l.type === 'series' : l.type === 'movie')) : null;
+      const isPresent = isItemInExternalList('simkl', 'status', st.key, id, foundList);
+      html += 
+        '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+          '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+            '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="simkl" data-target="status" data-status="' + st.key + '" data-list-id="' + st.key + '" data-name="Simkl ' + escapeAttr(st.label) + '" data-initially-checked="' + (isPresent ? 'true' : 'false') + '" ' + (isPresent ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+            '<span>' + escapeHtml(st.label) + '</span>' +
+            (isPresent ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+          '</label>' +
+          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        '</div>';
+    });
+  }
+
+  // SECTION: TMDB
+  if (hasTmdb) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#01b4e4; font-weight:bold;">\u25CF</span> TMDB ' + (tmdbUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(tmdbUser) + ')</small>' : '') +
+    '</div>';
+
+    const tmdbWl = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('watchlist')) : null;
+    const inTmdbWatchlist = isItemInExternalList('tmdb', 'watchlist', 'watchlist', id, tmdbWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="watchlist" data-list-id="watchlist" data-name="TMDB Watchlist" data-initially-checked="' + (inTmdbWatchlist ? 'true' : 'false') + '" ' + (inTmdbWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>TMDB Watchlist</span>' +
+          (inTmdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    const tmdbFav = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('favorites')) : null;
+    const inTmdbFav = isItemInExternalList('tmdb', 'favorite', 'favorite', id, tmdbFav);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="favorite" data-list-id="favorite" data-name="TMDB Favorites" data-initially-checked="' + (inTmdbFav ? 'true' : 'false') + '" ' + (inTmdbFav ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>TMDB Favorites</span>' +
+          (inTmdbFav ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myTmdbLists)) {
+      window._myTmdbLists.forEach(tml => {
+        if (!tml || (tml.url && (tml.url.includes('watchlist') || tml.url.includes('favorites')))) return;
+        const inList = isItemInExternalList('tmdb', 'custom', tml.id || '', id, tml);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="custom" data-list-id="' + escapeAttr(tml.id || '') + '" data-name="' + escapeAttr(tml.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(tml.name || 'TMDB List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tml.id || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  // SECTION: MDBList
+  if (hasMdblist) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#f5c518; font-weight:bold;">\u25CF</span> MDBList ' + (mdbUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(mdbUser) + ')</small>' : '') +
+    '</div>';
+
+    const mdbWl = Array.isArray(window._myMdblistLists) ? window._myMdblistLists.find(l => l.slug === 'watchlist' || l.url === 'mdblist:watchlist') : null;
+    const inMdbWatchlist = isItemInExternalList('mdblist', 'watchlist', 'watchlist', id, mdbWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="mdblist" data-target="watchlist" data-list-id="watchlist" data-name="MDBList Watchlist" data-initially-checked="' + (inMdbWatchlist ? 'true' : 'false') + '" ' + (inMdbWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>MDBList Watchlist</span>' +
+          (inMdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myMdblistLists)) {
+      window._myMdblistLists.forEach(ml => {
+        if (!ml || ml.slug === 'watchlist' || ml.slug === 'history' || ml.url === 'mdblist:watchlist' || ml.url === 'mdblist:history') return;
+        const inList = isItemInExternalList('mdblist', 'custom', ml.id || ml.slug || '', id, ml);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="mdblist" data-target="custom" data-list-id="' + escapeAttr(ml.id || ml.slug || '') + '" data-name="' + escapeAttr(ml.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(ml.name || 'MDBList List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  if (html) {
+    html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+    '</div>';
+  }
+
+  if (html === '') {
+    html = '<p style="text-align:center; padding:20px; color:var(--muted); font-size:0.95rem;">You do not have any Custom Lists or connected external accounts yet.<br><br>' +
+      '<a href="#" id="emptyCreateListLink" style="color:var(--accent); font-weight:600;">Create a Custom List</a> or connect Trakt/Simkl/TMDB/MDBList in <strong>Settings</strong>.</p>';
     document.getElementById('addSelectedListsBtn').style.display = 'none';
     setTimeout(() => {
       const lnk = document.getElementById('emptyCreateListLink');
@@ -1604,54 +1963,167 @@ function openSelectListModal(id, type, title, poster) {
           e.preventDefault();
           document.getElementById('selectListModal').style.display = 'none';
           document.body.style.overflow = '';
-          if (typeof openCreateListModal === 'function') {
-            openCreateListModal();
-          }
+          if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
     }, 0);
   } else {
     document.getElementById('addSelectedListsBtn').style.display = 'block';
-    customLists.forEach((list, idx) => {
-      let isChecked = false;
-      try {
-        const payloadStr = list.url.slice('customlist:v1:'.length);
-        const payload = JSON.parse(payloadStr);
-        isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
-      } catch(e) {}
-      
-      html += 
-        '<label style="display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom: 1px solid rgba(0,0,0,0.05); cursor:pointer; color:#001f3f; font-size:1rem;">' +
-          '<span>' + escapeHtml(list.name) + '</span>' +
-          '<input type="checkbox" class="list-select-cb" data-idx="' + idx + '" ' + (isChecked ? 'checked ' : '') + 'style="width:20px; height:20px; cursor:pointer; accent-color:#003366;">' +
-        '</label>';
-    });
   }
   
   body.innerHTML = html;
   modal.style.display = 'flex';
   document.body.style.overflow = 'hidden';
+
+  // Background check for Simkl lists membership if not cached yet
+  if (hasSimkl && !window._mySimklLists) {
+    fetch(ORIGIN + '/api/simkl/my-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: simklToken, simklKey: simklKey }),
+    }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._mySimklLists = data.lists;
+        window._simklListsMap = window._simklListsMap || {};
+        data.lists.forEach(l => { if (l && l.url) window._simklListsMap[l.url] = l; });
+        document.querySelectorAll('.list-select-cb[data-provider="simkl"]').forEach(cb => {
+          const st = cb.dataset.status;
+          const found = data.lists.find(l => l.url && l.url.includes(st) && (type === 'series' ? l.type === 'series' : l.type === 'movie'));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('simkl', 'status', st, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for Trakt lists membership if not cached yet
+  if (hasTrakt && traktUser && !window._myTraktLists) {
+    const params = 'username=' + encodeURIComponent(traktUser) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : '');
+    fetch(ORIGIN + '/api/trakt-my-lists?' + params, { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myTraktLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="trakt"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && (l.slug === 'watchlist' || l.url === 'trakt:watchlist')) || (target === 'custom' && (l.id === listId || l.slug === listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('trakt', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for TMDB lists membership if not cached yet
+  if (hasTmdb && !window._myTmdbLists) {
+    const params = new URLSearchParams();
+    if (tmdbSess) params.set('sessionId', tmdbSess);
+    if (tmdbAcc) params.set('accountId', tmdbAcc);
+    if (tmdbKey) params.set('tmdbKey', tmdbKey);
+    fetch(ORIGIN + '/api/tmdb-my-lists?' + params.toString(), { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myTmdbLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="tmdb"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && l.url && l.url.includes('watchlist')) || (target === 'favorite' && l.url && l.url.includes('favorites')) || (target === 'custom' && String(l.id) === String(listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('tmdb', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for MDBList lists membership if not cached yet
+  if (hasMdblist && !window._myMdblistLists) {
+    const keyParam = mdbToken || mdbKey;
+    fetch(ORIGIN + '/api/mdblist-my-lists?key=' + encodeURIComponent(keyParam) + (mdbUser ? '&user=' + encodeURIComponent(mdbUser) : ''), { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myMdblistLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="mdblist"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && (l.slug === 'watchlist' || l.url === 'mdblist:watchlist')) || (target === 'custom' && (l.id === listId || l.slug === listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('mdblist', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
 }
 
-  document.getElementById('selectListModal').addEventListener('click', (e) => {
-    if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-      document.getElementById('selectListModal').style.display = 'none';
-      document.body.style.overflow = '';
-    }
-  });
+document.getElementById('selectListModal').addEventListener('click', (e) => {
+  if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
+    document.getElementById('selectListModal').style.display = 'none';
+    document.body.style.overflow = '';
+  }
+});
 
 document.getElementById('addSelectedListsBtn').addEventListener('click', async () => {
-  if (!window._selectListModalTempLists || !window._selectListModalCurrentItem) return;
+  if (!window._selectListModalCurrentItem) return;
   const { id, type, title, poster } = window._selectListModalCurrentItem;
   
   const btn = document.getElementById('addSelectedListsBtn');
   btn.disabled = true;
-  btn.textContent = 'Saving...';
+  btn.textContent = 'Saving\u2026';
   
   let cleanId = String(id || '').trim();
   while (cleanId.startsWith('tmdb:')) cleanId = cleanId.slice(5).trim();
   let finalImdbId = cleanId;
+  let cleanTmdbId = '';
   if (!String(finalImdbId).startsWith('tt')) {
+    cleanTmdbId = cleanId;
     const endpoint = (type === 'series' || type === 'tv') ? '/api/resolve-show?tmdbId=' : '/api/resolve-movie?tmdbId=';
     try {
       const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanId));
@@ -1666,16 +2138,89 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   const checkboxes = document.querySelectorAll('.list-select-cb');
   let anyAdded = false;
   let anyRemoved = false;
+  const changedExternalOperations = [];
   
   checkboxes.forEach(cb => {
-    const listIdx = parseInt(cb.dataset.idx, 10);
+    const cbType = cb.dataset.type;
     const isChecked = cb.checked;
-    const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
-    if (changed) {
-      if (isChecked) anyAdded = true;
-      else anyRemoved = true;
+    const initiallyChecked = cb.dataset.initiallyChecked === 'true';
+
+    if (cbType === 'custom') {
+      const listIdx = parseInt(cb.dataset.idx, 10);
+      const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
+      if (changed) {
+        if (isChecked) anyAdded = true;
+        else anyRemoved = true;
+      }
+    } else if (cbType === 'external') {
+      if (isChecked !== initiallyChecked) {
+        const op = {
+          action: isChecked ? 'add' : 'remove',
+          provider: cb.dataset.provider,
+          target: cb.dataset.target,
+          listId: cb.dataset.listId || cb.dataset.status || '',
+          status: cb.dataset.status || '',
+          name: cb.dataset.name || 'List'
+        };
+        changedExternalOperations.push(op);
+        
+        // Update local membership map immediately
+        setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, id), isChecked);
+        if (finalImdbId) setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, finalImdbId), isChecked);
+        if (cleanTmdbId) setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, cleanTmdbId), isChecked);
+
+        if (isChecked) anyAdded = true;
+        else anyRemoved = true;
+      }
     }
   });
+
+  // Execute external modifications concurrently
+  if (changedExternalOperations.length > 0) {
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+    const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+    const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+    await Promise.allSettled(changedExternalOperations.map(op => {
+      return fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: op.action,
+          provider: op.provider,
+          target: op.target,
+          listId: op.listId,
+          status: op.status,
+          id: id,
+          imdbId: finalImdbId,
+          tmdbId: cleanTmdbId,
+          type: type,
+          title: title,
+          poster: poster,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          traktUsername: traktUser,
+          simklAccessToken: simklToken,
+          simklKey: simklKey,
+          tmdbSessionId: tmdbSess,
+          tmdbAccountId: tmdbAcc,
+          tmdbKey: tmdbKey,
+          mdblistAccessToken: mdbToken,
+          mdblistKey: mdbKey
+        })
+      });
+    }));
+  }
   
   document.getElementById('selectListModal').style.display = 'none';
   document.body.style.overflow = '';

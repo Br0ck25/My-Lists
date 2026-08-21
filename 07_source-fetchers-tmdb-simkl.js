@@ -62,6 +62,62 @@ async function fetchSimklChart(entry, skip, clientId, chartKey) {
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
+async function fetchSimklUserList(entry, skip, token, clientId, spec) {
+  if (!token) {
+    throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
+  }
+  const cid = clientId || SIMKL_CLIENT_ID;
+  const parts = (spec || "").split(":");
+  const category = parts[0] || "movies"; // "movies", "shows", "anime"
+  const status = parts[1] || "plantowatch"; // "plantowatch", "watching", "completed", "hold", "dropped"
+
+  const userHash = safeUserHash(token);
+  const cacheKey = `user_cache:simkl:all_items:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Simkl User Sync",
+    fetchFn: async () => {
+      const res = await fetch("https://api.simkl.com/sync/all-items/", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "simkl-api-key": cid,
+          "User-Agent": `my-lists-addon/${ADDON_VERSION}`,
+          "Accept": "application/json",
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        throw new Error(`Simkl user sync request failed (HTTP ${res.status}).`);
+      }
+      return await res.json();
+    }
+  });
+  const arr = Array.isArray(data[category]) ? data[category] : [];
+  const filtered = arr.filter((it) => (it.status || "plantowatch") === status);
+  const metas = [];
+  filtered.forEach((it) => {
+    const mediaObj = it.movie || it.show || it.anime;
+    if (mediaObj && mediaObj.ids) {
+      const imdbId = mediaObj.ids.imdb || "";
+      const tmdbId = mediaObj.ids.tmdb || "";
+      const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "");
+      if (id) {
+        metas.push({
+          id,
+          type: entry.type || (category === "movies" ? "movie" : "series"),
+          name: mediaObj.title || "",
+          poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+          releaseInfo: mediaObj.year ? String(mediaObj.year) : undefined,
+        });
+      }
+    }
+  });
+  return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+}
+
 // Maps our own entry.type ("movie"/"series") to the right path for each of
 // Trakt's official chart endpoints. box_office has no shows equivalent --
 // weekly box-office gross is inherently a theatrical-movies concept.
@@ -652,6 +708,77 @@ async function fetchTmdbKids(entry, skip, apiKey, ratingGroup) {
     "&include_adult=false";
 
   const windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
+
+  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    if (!imdbId) return null;
+    return mapTmdbItem(it, imdbId, entry.type, videos);
+  });
+
+  return resolved.filter(Boolean);
+}
+
+const TMDB_HOLIDAY_CONFIG = {
+  christmas: {
+    keywords: "207317|6513|9799|236|157545",
+    query: "Christmas",
+  },
+  easter: {
+    keywords: "9937|229891|228968",
+    query: "Easter",
+  },
+  july4: {
+    keywords: "10084|6091|208453",
+    query: "Fourth of July",
+  },
+  halloween: {
+    keywords: "3335|10292|224636|12332",
+    query: "Halloween",
+  },
+  newyear: {
+    keywords: "613|228970",
+    query: "New Year",
+  },
+  thanksgiving: {
+    keywords: "10085|228969",
+    query: "Thanksgiving",
+  },
+  valentine: {
+    keywords: "9798|12377|208940",
+    query: "Valentine",
+  },
+};
+
+async function fetchTmdbHoliday(entry, skip, apiKey, holidayKey) {
+  if (!apiKey) {
+    throw new Error(
+      "Holiday lists aren't configured on this add-on yet - the Worker owner needs to set TMDB_API_KEY."
+    );
+  }
+  const wantKind = entry.type === "series" ? "tv" : "movie";
+  const key = String(holidayKey || "").toLowerCase();
+  const config = TMDB_HOLIDAY_CONFIG[key] || { keywords: "", query: key };
+
+  const discoverPath =
+    "discover/" + wantKind + "?sort_by=popularity.desc" +
+    (config.keywords ? "&with_keywords=" + encodeURIComponent(config.keywords) : "") +
+    "&include_adult=false";
+
+  let windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
+
+  if (windowItems.length < 15 && config.query) {
+    try {
+      const searchPath = "search/" + wantKind + "?query=" + encodeURIComponent(config.query) + "&include_adult=false";
+      const searchItems = await fetchTmdbPagedResults(searchPath, apiKey, 0, 0);
+      const seenIds = new Set(windowItems.map((it) => it.id));
+      for (const item of searchItems) {
+        if (!seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          windowItems.push(item);
+        }
+      }
+    } catch (e) {}
+  }
 
   const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);

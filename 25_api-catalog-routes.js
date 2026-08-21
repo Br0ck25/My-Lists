@@ -12,12 +12,13 @@ export default {
     // that message). `|| ""` guards against `env` not having the property
     // at all, same as a missing Worker secret/var normally reads as
     // undefined rather than an empty string.
-    TMDB_API_KEY = env.TMDB_API_KEY || "5e183700244552be60b9a44cf5d7e7b9";
-    TRAKT_CLIENT_ID = env.TRAKT_CLIENT_ID || "";
-    SIMKL_CLIENT_ID = env.SIMKL_CLIENT_ID || "b331c5917e9f5b4e2f92fbfdf62de9b62e99c4c6fe743ff281e6c63be159e3b4";
-    MDBLIST_API_KEY = env.MDBLIST_API_KEY || "";
-    MDBLIST_POPULAR_KEY = env.MDBLIST_POPULAR_KEY || "";
-    MDBLIST_CLIENT_ID = env.MDBLIST_CLIENT_ID || "";
+    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -333,7 +334,7 @@ self.addEventListener('fetch', e => {
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, sampleSize, skip, creatorName;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -348,6 +349,8 @@ self.addEventListener('fetch', e => {
         mdblistAccessToken = reqBody.mdblistAccessToken || "";
         traktKey = reqBody.traktKey || "";
         traktAccessToken = reqBody.traktAccessToken || "";
+        simklKey = reqBody.simklKey || "";
+        simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
@@ -359,13 +362,15 @@ self.addEventListener('fetch', e => {
         mdblistAccessToken = url.searchParams.get("mdblistAccessToken") || "";
         traktKey = url.searchParams.get("traktKey") || "";
         traktAccessToken = url.searchParams.get("traktAccessToken") || "";
+        simklKey = url.searchParams.get("simklKey") || "";
+        simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, creatorName, env, ctx });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx });
         body = {
           ok: true,
           count: metas.length,
@@ -575,6 +580,7 @@ self.addEventListener('fetch', e => {
           title: it.title || it.name,
           year: (it.release_date || it.first_air_date || "").slice(0, 4),
           poster: it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null,
+          backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
           type: kind,
         }));
         return json({ ok: true, results });
@@ -614,7 +620,8 @@ self.addEventListener('fetch', e => {
           ok: true,
           imdbId: details.imdbId,
           name: data.name,
-          poster: data.poster_path ? `https://image.tmdb.org/t/p/w300${data.poster_path}` : null,
+          poster: data.poster_path ? `https://image.tmdb.org/t/p/w500${data.poster_path}` : null,
+          backdrop: data.backdrop_path ? `https://image.tmdb.org/t/p/w780${data.backdrop_path}` : null,
           seasons,
         });
       } catch (err) {
@@ -645,7 +652,7 @@ self.addEventListener('fetch', e => {
           episode: e.episode_number,
           name: e.name,
           released: e.air_date || null,
-          thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w300${e.still_path}` : null,
+          thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w780${e.still_path}` : null,
         }));
         return json({ ok: true, episodes });
       } catch (err) {
@@ -665,6 +672,143 @@ self.addEventListener('fetch', e => {
     // request should be doing; spreading that across many small
     // client-driven requests keeps each one fast and avoids leaning on
     // Cloudflare's per-request subrequest ceiling.
+    if (path === "/api/channel-preset") {
+      const networkId = url.searchParams.get("networkId") || "";
+      const name = url.searchParams.get("name") || "TV Channel";
+      if (!networkId) return json({ ok: false, error: "Missing networkId." }, 400);
+
+      const cacheKey = `channel:preset:v2:${networkId}`;
+      try {
+        if (env && env.CONFIGS) {
+          const cached = await env.CONFIGS.get(cacheKey);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed && Array.isArray(parsed.items) && parsed.items.length) {
+              return json({ ok: true, channel: parsed }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+            }
+          }
+        }
+      } catch (e) {}
+
+      try {
+        const discoverRes = await fetch(
+          `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+            `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=1&include_adult=false`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!discoverRes.ok) return json({ ok: false, error: "TMDB network request failed." }, 502);
+        const discoverData = await discoverRes.json();
+        let topShows = (discoverData.results || []).slice(0, 10);
+        const nameLower = name.toLowerCase();
+        if (!topShows.length) {
+          if (nameLower.includes("metv")) {
+            topShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
+          } else if (nameLower.includes("food")) {
+            topShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
+          } else if (nameLower.includes("ion")) {
+            topShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
+          }
+        }
+        if (!topShows.length) return json({ ok: false, error: "No shows found for that network." });
+
+        let networkLogo = null;
+        try {
+          const networkRes = await fetch(
+            `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+          );
+          if (networkRes.ok) {
+            const networkData = await networkRes.json();
+            if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+          }
+        } catch (e) {}
+
+        const allEpisodes = [];
+        let poster = networkLogo;
+        let backdrop = null;
+
+        const assembleFromShows = async (showsList) => {
+          await mapWithConcurrency(showsList, 4, async (show) => {
+            if (allEpisodes.length >= 200) return;
+            try {
+              const showRes = await fetch(
+                `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+                { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+              );
+              if (!showRes.ok) return;
+              const fullShow = await showRes.json();
+              const imdbId = (fullShow.external_ids && fullShow.external_ids.imdb_id) || fullShow.imdb_id || (`tmdb:${show.id}`);
+
+              if (!poster && fullShow.poster_path) poster = `https://image.tmdb.org/t/p/w500${fullShow.poster_path}`;
+              if (!backdrop && fullShow.backdrop_path) backdrop = `https://image.tmdb.org/t/p/w780${fullShow.backdrop_path}`;
+
+              const showPosterUrl = fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "";
+              const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
+
+              for (const s of validSeasons) {
+                if (allEpisodes.length >= 200) break;
+                const sRes = await fetch(
+                  `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+                  { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+                );
+                if (!sRes.ok) continue;
+                const sData = await sRes.json();
+                for (const ep of (sData.episodes || [])) {
+                  if (allEpisodes.length >= 200) break;
+                  const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+                  allEpisodes.push({
+                    kind: "episode",
+                    imdbId: imdbId,
+                    season: s.season_number,
+                    episode: ep.episode_number,
+                    showName: fullShow.name || show.name || "",
+                    epName: ep.name || (`Episode ${ep.episode_number}`),
+                    title: `${fullShow.name || show.name} S${s.season_number}E${ep.episode_number} \u2014 ${ep.name || (`Episode ${ep.episode_number}`)}`,
+                    released: ep.air_date || "",
+                    thumbnail: stillUrl || showPosterUrl,
+                    poster: showPosterUrl || stillUrl,
+                    showPoster: showPosterUrl,
+                  });
+                }
+              }
+            } catch (e) {}
+          });
+        };
+
+        await assembleFromShows(topShows);
+
+        if (!allEpisodes.length && (nameLower.includes("metv") || nameLower.includes("food") || nameLower.includes("ion"))) {
+          let fallbackShows = [];
+          if (nameLower.includes("metv")) {
+            fallbackShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
+          } else if (nameLower.includes("food")) {
+            fallbackShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
+          } else if (nameLower.includes("ion")) {
+            fallbackShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
+          }
+          await assembleFromShows(fallbackShows);
+        }
+
+        if (!allEpisodes.length) return json({ ok: false, error: "Could not assemble episodes for this network." });
+
+        const channelPayload = {
+          name: name,
+          poster: poster || (url.origin + "/icon.png"),
+          backdrop: backdrop || poster || (url.origin + "/icon.png"),
+          items: allEpisodes,
+          shuffle: false,
+          dailyRotate: true,
+        };
+
+        if (env && env.CONFIGS && ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(env.CONFIGS.put(cacheKey, JSON.stringify(channelPayload), { expirationTtl: 86400 }));
+        }
+        return json({ ok: true, channel: channelPayload }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+      } catch (err) {
+        return json({ ok: false, error: err.message || "Failed to build network channel preset." }, 500);
+      }
+    }
+
     //
     // Three sources feed this: any mdblist.com/trakt.tv/themoviedb.org list
     // link (someone else's hand-picked lineup, or "Import from link"'s own
@@ -737,7 +881,8 @@ self.addEventListener('fetch', e => {
               imdbId: details.imdbId,
               tmdbId: show.id,
               name: show.name,
-              poster: show.poster_path ? `https://image.tmdb.org/t/p/w300${show.poster_path}` : null,
+              poster: show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : null,
+              backdrop: show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : null,
             };
           });
           // Always the shared key -- the discover page loop
@@ -776,7 +921,13 @@ self.addEventListener('fetch', e => {
             const findData = await findRes.json();
             const match = (findData.tv_results || [])[0];
             if (!match) return null;
-            return { imdbId: m.id, tmdbId: match.id, name: m.name, poster: m.poster };
+            return {
+              imdbId: m.id,
+              tmdbId: match.id,
+              name: m.name,
+              poster: m.poster || (match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : null),
+              backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : (m.poster || null),
+            };
           } catch {
             return null;
           }
@@ -1166,7 +1317,7 @@ self.addEventListener('fetch', e => {
       }
       try {
         const src = `https://api.trakt.tv/users/${encodeURIComponent(username)}/lists`;
-        const res = await fetch(src, {
+        const res = await fetchTraktWithRetry(src, {
           headers: {
             "Content-Type": "application/json",
             "trakt-api-version": "2",
@@ -1187,26 +1338,30 @@ self.addEventListener('fetch', e => {
                 : "Trakt rejected this add-on's API key (HTTP 403 = invalid or unapproved app). Enter your own Trakt Client ID above to bypass this, or ask the Worker owner to fix TRAKT_CLIENT_ID.",
             });
           }
+          if (res.status === 429) {
+            return json({ ok: false, error: "Trakt is temporarily busy (rate limit). Please wait a few seconds and try again." });
+          }
           return json({ ok: false, error: `Trakt request failed (HTTP ${res.status}).` });
         }
         const data = await res.json();
         const lists = (Array.isArray(data) ? data : [])
           .filter((l) => l && l.ids && l.ids.slug)
-          .map((l) => ({
-            name: l.name,
-            slug: l.ids.slug,
-            items: l.item_count || 0,
-            likes: l.likes || 0,
-            url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(l.ids.slug)}`,
-          }));
-        const classified = await mapWithConcurrency(lists, 8, async (l) => ({
-          ...l,
-          contentType: await classifyTraktListContentType(username, l.slug, traktKey),
-        }));
-        // Always the shared key when traktKeyParam wasn't supplied -- 1
-        // call for the lists index above, plus 1 classify call per list.
-        if (!traktKeyParam) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + classified.length));
-        return json({ ok: true, lists: classified });
+          .map((l) => {
+            const name = l.name || "";
+            const isMovie = /\bmovie(s)?\b/i.test(name);
+            const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+            const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+            return {
+              name: l.name,
+              slug: l.ids.slug,
+              items: l.item_count || 0,
+              likes: l.likes || 0,
+              contentType,
+              url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(l.ids.slug)}`,
+            };
+          });
+        if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
+        return json({ ok: true, lists });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -1305,43 +1460,54 @@ self.addEventListener('fetch', e => {
 
       try {
         const redirectUri = `${url.origin}/api/trakt/oauth/callback`;
-        const tokenRes = await fetch("https://api.trakt.tv/oauth/token", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          body: JSON.stringify({
-            code,
-            client_id: TRAKT_CLIENT_ID,
-            client_secret: env.TRAKT_CLIENT_SECRET,
-            redirect_uri: redirectUri,
-            grant_type: "authorization_code",
-          }),
+        const traktHeaders = {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": TRAKT_CLIENT_ID,
+          "User-Agent": "my-list-addon/1.4",
+        };
+        const tokenBody = JSON.stringify({
+          code,
+          client_id: TRAKT_CLIENT_ID,
+          client_secret: env.TRAKT_CLIENT_SECRET,
+          redirect_uri: redirectUri,
+          grant_type: "authorization_code",
         });
-        if (!tokenRes.ok) {
-          // Trakt's token endpoint returns a standard OAuth2-shaped error
-          // body ({error, error_description}) on failure -- surface that
-          // verbatim rather than a generic message, since the actual cause
-          // (bad client_secret, expired/already-used code, redirect_uri
-          // mismatch specifically on this step, etc.) is otherwise
-          // invisible and turns every failure into a guessing game.
-          let detail = `HTTP ${tokenRes.status}`;
+
+        let tokenRes = null;
+        const delays = [0, 1000, 2000, 3000];
+        for (const delay of delays) {
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
           try {
-            const text = await tokenRes.text();
-            try {
-              const errBody = JSON.parse(text);
-              if (errBody && (errBody.error || errBody.error_description)) {
-                detail = [errBody.error, errBody.error_description].filter(Boolean).join(": ");
-              } else if (text) {
-                detail = text.slice(0, 200);
-              }
-            } catch {
-              if (text) detail = text.slice(0, 200);
+            tokenRes = await fetch("https://api.trakt.tv/oauth/token", {
+              method: "POST",
+              headers: traktHeaders,
+              body: tokenBody,
+            });
+            if (tokenRes.ok) break;
+            if (tokenRes.status !== 429 && tokenRes.status !== 403 && tokenRes.status !== 503) {
+              break;
             }
-          } catch {
-            // keep the HTTP-status-only detail
-          }
+          } catch {}
+        }
+        if (!tokenRes || !tokenRes.ok) {
+          let detail = tokenRes ? `HTTP ${tokenRes.status}` : "Network failed";
+          try {
+            if (tokenRes) {
+              const text = await tokenRes.text();
+              try {
+                const errBody = JSON.parse(text);
+                if (errBody && (errBody.error || errBody.error_description)) {
+                  detail = [errBody.error, errBody.error_description].filter(Boolean).join(": ");
+                } else if (text) {
+                  detail = text.slice(0, 200);
+                }
+              } catch {
+                if (text) detail = text.slice(0, 200);
+              }
+            }
+          } catch {}
           return failWith("exchange_failed", detail);
         }
         const tokenData = await tokenRes.json();
@@ -1354,7 +1520,7 @@ self.addEventListener('fetch', e => {
               "Authorization": `Bearer ${tokenData.access_token}`,
               "trakt-api-version": "2",
               "trakt-api-key": clientId || TRAKT_CLIENT_ID,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "User-Agent": "my-list-addon/1.4",
             },
           });
           if (meRes.ok) {
@@ -1371,6 +1537,126 @@ self.addEventListener('fetch', e => {
         });
       } catch {
         return failWith("network");
+      }
+    }
+
+    // /api/trakt/device/code -> starts Trakt device activation flow (bypasses browser redirects & 1015)
+    if (path === "/api/trakt/device/code" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const userKey = String(body.traktKey || body.clientId || "").trim();
+      const clientId = userKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+      if (!clientId) return json({ ok: false, error: "Trakt Client ID is not configured. Add your Trakt Client ID in Settings." }, 400);
+      try {
+        let res = await fetch("https://api.trakt.tv/oauth/device/code", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          body: JSON.stringify({ client_id: clientId }),
+        });
+
+        // If rate limited by Trakt (429), automatically wait and retry once
+        if (res.status === 429) {
+          const retrySec = parseInt(res.headers.get("Retry-After") || "2", 10);
+          await new Promise((resolve) => setTimeout(resolve, Math.min(3000, Math.max(1000, retrySec * 1000))));
+          res = await fetch("https://api.trakt.tv/oauth/device/code", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({ client_id: clientId }),
+          });
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const errMsg = data.error_description || data.error || (res.status === 429 ? "Trakt is busy (rate limit). Please wait a few seconds and try again." : `Trakt error (HTTP ${res.status})`);
+          return json({ ok: false, error: errMsg }, res.status);
+        }
+        return json({ ok: true, ...data });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
+      }
+    }
+
+    // /api/trakt/device/token -> polls for authorization of device code
+    if (path === "/api/trakt/device/token" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const code = String(body.code || "").trim();
+      const userKey = String(body.traktKey || body.clientId || "").trim();
+      const clientId = userKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+      const clientSecret = (env && env.TRAKT_CLIENT_SECRET) || "";
+      if (!code) return json({ ok: false, error: "Device code is required." }, 400);
+      if (!clientId || !clientSecret) return json({ ok: false, error: "TRAKT_CLIENT_SECRET not configured on worker." }, 500);
+
+      try {
+        const res = await fetch("https://api.trakt.tv/oauth/device/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          body: JSON.stringify({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+          }),
+        });
+
+        if (res.status === 400) {
+          return json({ ok: false, pending: true, error: "Pending authorization." }, 200);
+        }
+        if (res.status === 404) {
+          return json({ ok: false, error: "Invalid device code." }, 404);
+        }
+        if (res.status === 409) {
+          return json({ ok: false, error: "Code already approved or expired." }, 409);
+        }
+        if (res.status === 410) {
+          return json({ ok: false, error: "Code expired. Please request a new code." }, 410);
+        }
+        if (res.status === 418) {
+          return json({ ok: false, error: "Authorization was denied by user." }, 418);
+        }
+        if (res.status === 429) {
+          return json({ ok: false, slowDown: true, error: "Slow down polling." }, 200);
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.access_token) {
+          return json({ ok: false, error: data.error || `HTTP ${res.status}` }, res.status);
+        }
+
+        let traktUsername = "";
+        try {
+          const meRes = await fetch("https://api.trakt.tv/users/me", {
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${data.access_token}`,
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": "my-list-addon/1.4",
+            },
+          });
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            if (meData && meData.username) traktUsername = meData.username;
+          }
+        } catch {}
+
+        return json({ ok: true, access_token: data.access_token, username: traktUsername });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
       }
     }
 
@@ -1518,6 +1804,829 @@ self.addEventListener('fetch', e => {
       } catch (err) {
         return failWith("network", String(err.message || err));
       }
+    }
+
+    // /api/simkl/oauth/start -> redirects to Simkl login/authorization
+    if (path === "/api/simkl/oauth/start") {
+      const clientId = SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      if (!clientId) {
+        return new Response("Simkl OAuth isn't configured on this Worker (missing SIMKL_CLIENT_ID).", { status: 500 });
+      }
+      const state = generateShortId();
+      const redirectUri = url.hostname.includes("mylistsaddon.com")
+        ? "https://mylistsaddon.com/api/simkl/oauth/callback"
+        : `${url.origin}/api/simkl/oauth/callback`;
+      const authorizeUrl = `https://simkl.com/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}&app-name=MyListsAddon&app-version=${encodeURIComponent(ADDON_VERSION)}`;
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: authorizeUrl,
+          "Set-Cookie": `mla_simkl_state=${state}; Path=/api/simkl/oauth; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+        },
+      });
+    }
+
+    // /api/simkl/oauth/callback -> exchanges authorization code for Simkl access token
+    if (path === "/api/simkl/oauth/callback") {
+      const cookies = parseCookies(request);
+      const stateCookie = cookies.mla_simkl_state || "";
+      const clearStateCookie = "mla_simkl_state=; Path=/api/simkl/oauth; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+      const failWith = (code, detail) => {
+        const dest = `${url.origin}/#settings&simkl_error=${encodeURIComponent(code)}` +
+          (detail ? `&simkl_error_detail=${encodeURIComponent(detail)}` : "");
+        return new Response(null, { status: 302, headers: { Location: dest, "Set-Cookie": clearStateCookie } });
+      };
+
+      const clientId = SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      const clientSecret = SIMKL_CLIENT_SECRET || (env && env.SIMKL_CLIENT_SECRET) || "";
+      if (!clientId) return failWith("not_configured");
+
+      const q = new URLSearchParams(url.search);
+      const code = q.get("code");
+      const state = q.get("state");
+      const err = q.get("error");
+      if (err) return failWith("access_denied", q.get("error_description") || err);
+      if (!code) return failWith("no_code");
+      if (!stateCookie) return failWith("state_mismatch", "missing cookie");
+      if (state !== stateCookie) return failWith("state_mismatch", "state mismatch");
+
+      const redirectUri = url.hostname.includes("mylistsaddon.com")
+        ? "https://mylistsaddon.com/api/simkl/oauth/callback"
+        : `${url.origin}/api/simkl/oauth/callback`;
+
+      try {
+        const tokenRes = await fetch("https://api.simkl.com/oauth/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            "Accept": "application/json",
+          },
+          body: JSON.stringify({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            grant_type: "authorization_code",
+          }),
+        });
+
+        if (!tokenRes.ok) {
+          let detail = `HTTP ${tokenRes.status}`;
+          try {
+            const text = await tokenRes.text();
+            try {
+              const errBody = JSON.parse(text);
+              if (errBody && (errBody.error || errBody.error_description || errBody.message)) {
+                detail = [errBody.error, errBody.error_description, errBody.message].filter(Boolean).join(": ");
+              } else if (text) {
+                detail = text.slice(0, 200);
+              }
+            } catch {
+              if (text) detail = text.slice(0, 200);
+            }
+          } catch {}
+          return failWith("exchange_failed", detail);
+        }
+        const tokenData = await tokenRes.json();
+        const token = tokenData.access_token || tokenData.token;
+        if (!token) return failWith("no_token");
+        let simklUsername = "";
+        try {
+          const uRes = await fetch("https://api.simkl.com/users/settings", {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "Accept": "application/json",
+            },
+          });
+          if (uRes.ok) {
+            const uData = await uRes.json();
+            if (uData && uData.user && (uData.user.username || uData.user.name)) {
+              simklUsername = uData.user.username || uData.user.name;
+            }
+          }
+        } catch {}
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `${url.origin}/#simkl_token=${encodeURIComponent(token)}${simklUsername ? `&simkl_username=${encodeURIComponent(simklUsername)}` : ""}`,
+            "Set-Cookie": clearStateCookie,
+          },
+        });
+      } catch (err) {
+        return failWith("network", String(err.message || err));
+      }
+    }
+
+    // /api/simkl/my-lists -> returns authenticated user's personal Simkl watchlists
+    if (path === "/api/simkl/my-lists") {
+      let token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+      let manualKey = url.searchParams.get("simklKey") || "";
+      if (request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (body.token) token = body.token;
+          if (body.simklKey) manualKey = body.simklKey;
+        } catch {}
+      }
+      const clientId = manualKey || SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      if (!token) {
+        return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+      }
+      try {
+        const res = await fetch("https://api.simkl.com/sync/all-items/", {
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "simkl-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            "Accept": "application/json",
+          },
+        });
+        if (!res.ok) {
+          return json({ ok: false, error: `Simkl sync request failed (HTTP ${res.status}).` }, res.status);
+        }
+        const data = await res.json();
+        const statusLabels = {
+          plantowatch: "Plan to Watch",
+          watching: "Watching",
+          completed: "Completed",
+          hold: "On Hold",
+          dropped: "Dropped",
+        };
+
+        const lists = [];
+        const categories = [
+          { key: "movies", type: "movie", label: "Movies" },
+          { key: "shows", type: "series", label: "Shows" },
+          { key: "anime", type: "series", label: "Anime" },
+        ];
+
+        for (const cat of categories) {
+          const itemsArr = Array.isArray(data[cat.key]) ? data[cat.key] : [];
+          if (!itemsArr.length) continue;
+          const byStatus = {};
+          for (const item of itemsArr) {
+            const st = item.status || "plantowatch";
+            if (!byStatus[st]) byStatus[st] = [];
+            const mediaObj = item.movie || item.show || item.anime;
+            if (mediaObj) {
+              const ids = mediaObj.ids || {};
+              const imdbId = ids.imdb || "";
+              const tmdbId = ids.tmdb || "";
+              const simklId = ids.simkl || "";
+              const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : (simklId ? `simkl:${simklId}` : ""));
+              if (bestId) {
+                byStatus[st].push({
+                  id: bestId,
+                  imdbId: imdbId || null,
+                  tmdbId: tmdbId || null,
+                  name: mediaObj.title || "",
+                  year: mediaObj.year || "",
+                  poster: ids.poster ? `https://simkl.in/posters/${ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+                  type: cat.type,
+                });
+              }
+            }
+          }
+
+          for (const [stKey, stItems] of Object.entries(byStatus)) {
+            if (!stItems.length) continue;
+            const stLabel = statusLabels[stKey] || stKey;
+            lists.push({
+              name: `Simkl ${stLabel} (${cat.label})`,
+              type: cat.type,
+              itemCount: stItems.length,
+              statusKey: stKey,
+              categoryKey: cat.key,
+              items: stItems,
+              url: `simkl:user:${cat.key}:${stKey}`,
+            });
+          }
+        }
+
+        return json({ ok: true, lists });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
+      }
+    }
+
+    // /api/external-list/item-mutate -> adds or removes items on external provider accounts (Trakt, Simkl, TMDB, MDBList)
+    if ((path === "/api/external-list/item-mutate" || path === "/api/external-list/item-add" || path === "/api/external-list/item-remove") && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const action = (path.endsWith("/item-remove") || body.action === "remove") ? "remove" : "add";
+      const provider = (body.provider || "").toLowerCase().trim();
+      const target = (body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
+      const listId = body.listId || body.status || "";
+      const mediaType = (body.type === "series" || body.type === "tv") ? "series" : "movie";
+      const title = body.title || "";
+      const year = body.year || "";
+      let id = String(body.id || "").trim();
+      let imdbId = String(body.imdbId || "").trim();
+      let tmdbId = String(body.tmdbId || "").trim();
+
+      if (!imdbId && id.startsWith("tt")) imdbId = id;
+      if (!tmdbId && id.startsWith("tmdb:")) tmdbId = id.slice(5);
+
+      const apiKeyTmdb = TMDB_API_KEY || (env && env.TMDB_API_KEY) || body.tmdbKey || "";
+
+      // Resolve TMDB ID or IMDb ID if missing
+      if (!tmdbId && imdbId && apiKeyTmdb) {
+        try {
+          const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(apiKeyTmdb)}&external_source=imdb_id`);
+          if (findRes.ok) {
+            const findData = await findRes.json();
+            const hit = (mediaType === "series" ? (findData.tv_results && findData.tv_results[0]) : (findData.movie_results && findData.movie_results[0])) || (findData.movie_results && findData.movie_results[0]) || (findData.tv_results && findData.tv_results[0]);
+            if (hit && hit.id) tmdbId = String(hit.id);
+          }
+        } catch {}
+      }
+
+      if (!imdbId && tmdbId && apiKeyTmdb) {
+        try {
+          const detRes = await fetch(`https://api.themoviedb.org/3/${mediaType === "series" ? "tv" : "movie"}/${encodeURIComponent(tmdbId)}/external_ids?api_key=${encodeURIComponent(apiKeyTmdb)}`);
+          if (detRes.ok) {
+            const detData = await detRes.json();
+            if (detData && detData.imdb_id) imdbId = detData.imdb_id;
+          }
+        } catch {}
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const clientId = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        const username = body.traktUsername || "me";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        const idsObj = {};
+        if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
+        if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+
+        const mediaKey = mediaType === "series" ? "shows" : "movies";
+        const traktPayload = {
+          [mediaKey]: [{
+            ids: idsObj,
+            title: title || undefined,
+            year: year ? parseInt(year, 10) : undefined,
+          }],
+        };
+
+        let traktUrl = `https://api.trakt.tv/sync/watchlist${action === "remove" ? "/remove" : ""}`;
+        if (target === "history") {
+          traktUrl = `https://api.trakt.tv/sync/history${action === "remove" ? "/remove" : ""}`;
+        } else if (target === "collection") {
+          traktUrl = `https://api.trakt.tv/sync/collection${action === "remove" ? "/remove" : ""}`;
+        } else if (target === "custom" && listId) {
+          traktUrl = `https://api.trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(listId)}/items${action === "remove" ? "/remove" : ""}`;
+        }
+
+        try {
+          const tRes = await fetch(traktUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(traktPayload),
+          });
+          const tData = await tRes.json().catch(() => ({}));
+          if (!tRes.ok) {
+            return json({ ok: false, error: tData.error || `Trakt API error (HTTP ${tRes.status})` }, tRes.status);
+          }
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({ ok: true, provider: "trakt", action, target, data: tData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. SIMKL
+      if (provider === "simkl") {
+        const token = body.simklAccessToken || body.token || "";
+        const clientId = body.simklKey || SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+
+        const idsObj = {};
+        if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
+        if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+
+        const mediaKey = mediaType === "series" ? "shows" : "movies";
+        const targetStatus = target || "plantowatch";
+
+        let simklUrl = "https://api.simkl.com/sync/add-to-list";
+        let simklBody = {};
+
+        if (action === "remove") {
+          simklUrl = "https://api.simkl.com/sync/history/remove";
+          simklBody = {
+            [mediaKey]: [{
+              ids: idsObj,
+              title: title || undefined,
+            }],
+          };
+        } else {
+          simklBody = {
+            [mediaKey]: [{
+              ids: idsObj,
+              to: targetStatus,
+            }],
+          };
+        }
+
+        try {
+          const sRes = await fetch(simklUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(simklBody),
+          });
+          const sData = await sRes.json().catch(() => ({}));
+          if (!sRes.ok) {
+            return json({ ok: false, error: sData.error || `Simkl API error (HTTP ${sRes.status})` }, sRes.status);
+          }
+          invalidatePerUserCache("simkl", safeUserHash(token));
+          return json({ ok: true, provider: "simkl", action, target: targetStatus, data: sData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. TMDB
+      if (provider === "tmdb") {
+        const apiKey = apiKeyTmdb;
+        const sessionId = body.tmdbSessionId || body.sessionId || "";
+        const accountId = body.tmdbAccountId || "null";
+        const v4Token = body.tmdbAccessToken || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API Key missing." }, 400);
+        if (!sessionId && !v4Token) return json({ ok: false, error: "Please connect your TMDB account first." }, 400);
+        if (!tmdbId) return json({ ok: false, error: "Could not find a valid TMDB media ID for this title." }, 400);
+
+        const tmdbType = mediaType === "series" ? "tv" : "movie";
+        const numId = parseInt(tmdbId, 10);
+
+        if (target === "watchlist") {
+          const wUrl = `https://api.themoviedb.org/3/account/${encodeURIComponent(accountId)}/watchlist?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(wUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_type: tmdbType, media_id: numId, watchlist: (action === "add") }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "watchlist", data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "favorite") {
+          const fUrl = `https://api.themoviedb.org/3/account/${encodeURIComponent(accountId)}/favorite?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(fUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_type: tmdbType, media_id: numId, favorite: (action === "add") }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "favorite", data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "custom" && listId) {
+          const lUrl = `https://api.themoviedb.org/3/list/${encodeURIComponent(listId)}/${action === "add" ? "add_item" : "remove_item"}?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(lUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_id: numId }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "custom", listId, data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+      }
+
+      // 4. MDBLIST
+      if (provider === "mdblist") {
+        const token = body.mdblistAccessToken || body.mdblistKey || body.token || "";
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
+
+        const mdbId = imdbId || tmdbId || id;
+        const mdbType = mediaType === "series" ? "show" : "movie";
+
+        if (target === "watchlist") {
+          const mUrl = `https://api.mdblist.com/watchlist/${action === "add" ? "add" : "remove"}`;
+          try {
+            const mRes = await fetch(mUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ apikey: token, access_token: token, id: mdbId, mediatype: mdbType }),
+            });
+            const mData = await mRes.json().catch(() => ({}));
+            if (!mRes.ok) {
+              return json({ ok: false, error: mData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+            }
+            invalidatePerUserCache("mdblist", safeUserHash(token));
+            return json({ ok: true, provider: "mdblist", action, target: "watchlist", data: mData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "custom" && listId) {
+          const mUrl = `https://api.mdblist.com/lists/${encodeURIComponent(listId)}/items/${action === "add" ? "add" : "remove"}`;
+          try {
+            const mRes = await fetch(mUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ apikey: token, access_token: token, id: mdbId, mediatype: mdbType }),
+            });
+            const mData = await mRes.json().catch(() => ({}));
+            if (!mRes.ok) {
+              return json({ ok: false, error: mData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+            }
+            invalidatePerUserCache("mdblist", safeUserHash(token));
+            return json({ ok: true, provider: "mdblist", action, target: "custom", listId, data: mData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+      }
+
+      return json({ ok: false, error: "Unsupported provider or target." }, 400);
+    }
+
+    // /api/external-list/create -> creates a new custom list on Trakt, TMDB, or MDBList
+    if (path === "/api/external-list/create" && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const provider = (body.provider || "").toLowerCase().trim();
+      const name = (body.name || "").trim();
+      const description = (body.description || "").trim();
+      const privacy = (body.privacy || "private").toLowerCase().trim();
+      const listType = (body.type || "mixed").toLowerCase().trim();
+
+      if (!name) {
+        return json({ ok: false, error: "List name is required." }, 400);
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const traktKey = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        const username = body.traktUsername || "me";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        try {
+          const res = await fetch("https://api.trakt.tv/users/me/lists", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-key": traktKey,
+              "trakt-api-version": "2",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              name: name,
+              description: description,
+              privacy: privacy === "public" ? "public" : "private",
+              display_numbers: false,
+              allow_comments: true,
+              sort_by: "rank",
+              sort_how: "asc"
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            return json({ ok: false, error: data.error || data.message || `Trakt error (HTTP ${res.status})` }, res.status);
+          }
+          const slug = data.ids?.slug || data.slug || name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+          const traktUser = data.user?.ids?.slug || username || "me";
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({
+            ok: true,
+            provider: "trakt",
+            list: {
+              id: data.ids?.trakt || data.id || slug,
+              slug: slug,
+              name: data.name || name,
+              description: data.description || description,
+              privacy: data.privacy || privacy,
+              url: `https://trakt.tv/users/${traktUser}/lists/${slug}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. TMDB
+      if (provider === "tmdb") {
+        const sessionId = body.tmdbSessionId || "";
+        const apiKey = body.tmdbKey || TMDB_API_KEY || (env && env.TMDB_API_KEY) || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API key is missing." }, 400);
+        if (!sessionId) return json({ ok: false, error: "Please connect your TMDB account in Settings first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.themoviedb.org/3/list?api_key=${encodeURIComponent(apiKey)}&session_id=${encodeURIComponent(sessionId)}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              name: name,
+              description: description,
+              language: "en"
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.success === false) {
+            return json({ ok: false, error: data.status_message || `TMDB error (HTTP ${res.status})` }, res.status || 400);
+          }
+          const listId = String(data.list_id || data.id);
+          invalidatePerUserCache("tmdb", safeUserHash(sessionId));
+          return json({
+            ok: true,
+            provider: "tmdb",
+            list: {
+              id: listId,
+              name: name,
+              description: description,
+              url: `https://www.themoviedb.org/list/${listId}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. MDBLIST
+      if (provider === "mdblist") {
+        const token = body.mdblistAccessToken || body.mdblistKey || body.apikey || "";
+        const username = body.mdblistUsername || "";
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
+
+        try {
+          const res = await fetch("https://api.mdblist.com/lists/create", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              apikey: token,
+              access_token: token,
+              name: name,
+              description: description,
+              private: privacy !== "public",
+              dynamic: false
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false || data.error) {
+            return json({ ok: false, error: data.error || `MDBList error (HTTP ${res.status})` }, res.status || 400);
+          }
+          const listId = String(data.id || data.slug || "");
+          const slug = data.slug || listId;
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({
+            ok: true,
+            provider: "mdblist",
+            list: {
+              id: listId,
+              slug: slug,
+              name: data.name || name,
+              description: description,
+              url: username ? `https://mdblist.com/lists/${username}/${slug}` : `mdblist:list:${listId}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 4. SIMKL
+      if (provider === "simkl") {
+        const token = body.simklAccessToken || body.token || "";
+        if (!token) return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const simklUrl = `simkl:user:${listType === "series" ? "shows" : "movies"}:${slug || "plantowatch"}`;
+        invalidatePerUserCache("simkl", safeUserHash(token));
+        return json({
+          ok: true,
+          provider: "simkl",
+          list: {
+            id: slug,
+            slug: slug,
+            name: name,
+            description: description,
+            url: simklUrl,
+            type: listType
+          }
+        });
+      }
+
+      return json({ ok: false, error: "Unsupported provider for creating lists." }, 400);
+    }
+
+    // /api/external-list/delete -> deletes a custom list from Trakt, TMDB, or MDBList
+    if (path === "/api/external-list/delete" && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const provider = (body.provider || "").toLowerCase().trim();
+      const listId = String(body.listId || "").trim();
+
+      if (!listId) {
+        return json({ ok: false, error: "List ID is required for deletion." }, 400);
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const traktKey = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.trakt.tv/users/me/lists/${encodeURIComponent(listId)}`, {
+            method: "DELETE",
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-key": traktKey,
+              "trakt-api-version": "2",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+          });
+          if (!res.ok && res.status !== 204 && res.status !== 200) {
+            const data = await res.json().catch(() => ({}));
+            return json({ ok: false, error: data.error || `Trakt error (HTTP ${res.status})` }, res.status);
+          }
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({ ok: true, provider: "trakt", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. TMDB
+      if (provider === "tmdb") {
+        const sessionId = body.tmdbSessionId || "";
+        const apiKey = body.tmdbKey || TMDB_API_KEY || (env && env.TMDB_API_KEY) || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API key is missing." }, 400);
+        if (!sessionId) return json({ ok: false, error: "Please connect your TMDB account in Settings first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.themoviedb.org/3/list/${encodeURIComponent(listId)}?api_key=${encodeURIComponent(apiKey)}&session_id=${encodeURIComponent(sessionId)}`, {
+            method: "DELETE",
+            headers: {
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok && data.success === false) {
+            return json({ ok: false, error: data.status_message || `TMDB error (HTTP ${res.status})` }, res.status || 400);
+          }
+          invalidatePerUserCache("tmdb", safeUserHash(sessionId));
+          return json({ ok: true, provider: "tmdb", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. MDBLIST
+      if (provider === "mdblist") {
+        const accessToken = (body.mdblistAccessToken || "").trim();
+        const apiKey = (body.mdblistKey || body.apikey || "").trim();
+        const token = accessToken || apiKey;
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
+
+        try {
+          const headers = {
+            "Accept": "application/json",
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          };
+          let deleteUrl = `https://api.mdblist.com/lists/${encodeURIComponent(listId)}`;
+          if (accessToken) {
+            headers["Authorization"] = `Bearer ${accessToken}`;
+          } else {
+            headers["x-api-key"] = apiKey;
+            deleteUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+          }
+
+          let res = await fetch(deleteUrl, {
+            method: "DELETE",
+            headers,
+          });
+
+          // Fallback: If slug was passed or initial attempt returned 404, resolve numeric id via /lists/user
+          if (!res.ok && (res.status === 404 || res.status === 400 || res.status === 405)) {
+            try {
+              let userListsUrl = "https://api.mdblist.com/lists/user";
+              const userHeaders = {
+                "Accept": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              };
+              if (accessToken) {
+                userHeaders["Authorization"] = `Bearer ${accessToken}`;
+              } else {
+                userHeaders["x-api-key"] = apiKey;
+                userListsUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+              }
+              const userRes = await fetch(userListsUrl, { headers: userHeaders });
+              if (userRes.ok) {
+                const udata = await userRes.json();
+                const raw = Array.isArray(udata) ? udata : (Array.isArray(udata.lists) ? udata.lists : []);
+                const match = raw.find((l) => l && (String(l.id) === listId || l.slug === listId || l.name === listId));
+                if (match && match.id && String(match.id) !== listId) {
+                  let retryUrl = `https://api.mdblist.com/lists/${encodeURIComponent(match.id)}`;
+                  if (!accessToken) retryUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+                  res = await fetch(retryUrl, { method: "DELETE", headers });
+                }
+              }
+            } catch {}
+          }
+
+          if (!res.ok && res.status !== 204 && res.status !== 200) {
+            const errData = await res.json().catch(() => ({}));
+            const errMsg = errData.error || errData.message || `MDBList error (HTTP ${res.status})`;
+            return json({ ok: false, error: errMsg }, res.status || 400);
+          }
+
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({ ok: true, provider: "mdblist", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      return json({ ok: false, error: "Unsupported provider for deleting lists." }, 400);
     }
 
     // /api/tmdb/oauth/start -> requests temporary request token from TMDB & redirects to authenticate page
@@ -1838,130 +2947,118 @@ self.addEventListener('fetch', e => {
       const accessToken = String(body.accessToken || "").trim();
       if (!accessToken) return json({ ok: false, error: "Not connected to Trakt." }, 400);
       try {
-        const res = await fetch("https://api.trakt.tv/users/me/lists", {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          // Never cache an authenticated, per-person response -- see the
-          // same caching note on fetchTrakt above.
-          cf: { cacheTtl: 0, cacheEverything: false },
-        });
-        if (res.status === 401) {
-          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
-        }
-        if (!res.ok) return json({ ok: false, error: `Trakt request failed (HTTP ${res.status}).` });
-        const data = await res.json();
-        const meRes = await fetch("https://api.trakt.tv/users/me", {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          cf: { cacheTtl: 0, cacheEverything: false },
-        });
-        const me = meRes.ok ? await meRes.json() : null;
-        const meSlug = me && me.ids && me.ids.slug ? me.ids.slug : "me";
-        const lists = (Array.isArray(data) ? data : [])
-          .filter((l) => l && l.ids && l.ids.slug)
-          .map((l) => ({
-            name: l.name,
-            slug: l.ids.slug,
-            items: l.item_count || 0,
-            likes: l.likes || 0,
-            private: l.privacy !== "public",
-            url: `https://trakt.tv/users/${encodeURIComponent(meSlug)}/lists/${encodeURIComponent(l.ids.slug)}`,
-          }));
-        const classified = await mapWithConcurrency(lists, 8, async (l) => ({
-          ...l,
-          contentType: await classifyTraktListContentType(meSlug, l.slug, TRAKT_CLIENT_ID, accessToken),
-        }));
+        const userHash = safeUserHash(accessToken);
+        const cacheKey = `user_cache:trakt:private_lists:${userHash}`;
 
-        // The watchlist is a genuinely different endpoint from a list --
-        // Trakt never includes it in /users/me/lists above, so it has to
-        // be fetched and prepended separately to actually show up here at
-        // all. A cheap limit=1 request is enough to read the true total
-        // count off Trakt's own pagination header without pulling any
-        // real item data. contentType is left as "unknown" deliberately
-        // (rather than trying to classify it): a watchlist is almost
-        // always a mix of movies and shows for most people, and "unknown"
-        // is exactly the signal the client already uses to offer both
-        // +Movies/+Shows buttons and to auto-split into two Custom Lists
-        // when copying.
-        let watchlistCount = 0;
-        try {
-          const watchlistRes = await fetch("https://api.trakt.tv/users/me/watchlist?limit=1&page=1", {
-            headers: {
-              "Content-Type": "application/json",
-              "trakt-api-version": "2",
-              "trakt-api-key": TRAKT_CLIENT_ID,
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-            },
-            cf: { cacheTtl: 0, cacheEverything: false },
-          });
-          if (watchlistRes.ok) {
-            watchlistCount = parseInt(watchlistRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+        const lists = await fetchWithPerUserCacheAndCircuitBreaker({
+          cacheKey,
+          freshTtlSec: 60,
+          staleTtlSec: 1800,
+          providerLabel: "Trakt Private Lists",
+          fetchFn: async () => {
+            const res = await fetchTraktWithRetry("https://api.trakt.tv/users/me/lists", {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            if (res.status === 401) {
+              throw new Error("Your Trakt connection has expired or was revoked -- reconnect in Settings.");
+            }
+            if (!res.ok) throw new Error(`Trakt request failed (HTTP ${res.status}).`);
+            const data = await res.json();
+            const meRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me", {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            const me = meRes.ok ? await meRes.json() : null;
+            const meSlug = me && me.ids && me.ids.slug ? me.ids.slug : "me";
+            const rawLists = (Array.isArray(data) ? data : [])
+              .filter((l) => l && l.ids && l.ids.slug)
+              .map((l) => {
+                const name = l.name || "";
+                const isMovie = /\bmovie(s)?\b/i.test(name);
+                const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+                const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+                return {
+                  name: l.name,
+                  slug: l.ids.slug,
+                  items: l.item_count || 0,
+                  likes: l.likes || 0,
+                  private: l.privacy !== "public",
+                  contentType,
+                  url: `https://trakt.tv/users/${encodeURIComponent(meSlug)}/lists/${encodeURIComponent(l.ids.slug)}`,
+                };
+              });
+
+            let watchlistCount = 0;
+            try {
+              const watchlistRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me/watchlist?limit=1&page=1", {
+                headers: {
+                  "Content-Type": "application/json",
+                  "trakt-api-version": "2",
+                  "trakt-api-key": TRAKT_CLIENT_ID,
+                  Authorization: `Bearer ${accessToken}`,
+                  "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                },
+                cf: { cacheTtl: 0, cacheEverything: false },
+              });
+              if (watchlistRes.ok) {
+                watchlistCount = parseInt(watchlistRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+              }
+            } catch {}
+            const watchlistEntry = {
+              name: "Watchlist",
+              slug: "watchlist",
+              items: watchlistCount,
+              likes: 0,
+              private: true,
+              url: "trakt:watchlist",
+              contentType: "unknown",
+            };
+
+            let historyCount = 0;
+            try {
+              const historyRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me/history?limit=1&page=1", {
+                headers: {
+                  "Content-Type": "application/json",
+                  "trakt-api-version": "2",
+                  "trakt-api-key": TRAKT_CLIENT_ID,
+                  Authorization: `Bearer ${accessToken}`,
+                  "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                },
+                cf: { cacheTtl: 0, cacheEverything: false },
+              });
+              if (historyRes.ok) {
+                historyCount = parseInt(historyRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+              }
+            } catch {}
+            const historyEntry = {
+              name: "Watch History",
+              slug: "history",
+              items: historyCount,
+              likes: 0,
+              private: true,
+              url: "trakt:history",
+              contentType: "unknown",
+            };
+
+            ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4));
+            return [watchlistEntry, historyEntry, ...rawLists];
           }
-        } catch {
-          // best-effort -- the watchlist entry still shows below, just
-          // without a count, rather than failing the whole request over it
-        }
-        const watchlistEntry = {
-          name: "Watchlist",
-          slug: "watchlist",
-          items: watchlistCount,
-          likes: 0,
-          private: true,
-          url: "trakt:watchlist",
-          contentType: "unknown",
-        };
+        });
 
-        // Same idea as the watchlist above -- History is yet another
-        // endpoint Trakt keeps separate from /users/me/lists, so it's
-        // fetched and prepended the same way. contentType stays "unknown"
-        // since a watch history is basically always a mix of movies and
-        // shows, same reasoning as the watchlist.
-        let historyCount = 0;
-        try {
-          const historyRes = await fetch("https://api.trakt.tv/users/me/history?limit=1&page=1", {
-            headers: {
-              "Content-Type": "application/json",
-              "trakt-api-version": "2",
-              "trakt-api-key": TRAKT_CLIENT_ID,
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-            },
-            cf: { cacheTtl: 0, cacheEverything: false },
-          });
-          if (historyRes.ok) {
-            historyCount = parseInt(historyRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
-          }
-        } catch {
-          // best-effort -- the history entry still shows below, just
-          // without a count, rather than failing the whole request over it
-        }
-        const historyEntry = {
-          name: "Watch History",
-          slug: "history",
-          items: historyCount,
-          likes: 0,
-          private: true,
-          url: "trakt:history",
-          contentType: "unknown",
-        };
-
-        // Always the shared TRAKT_CLIENT_ID (OAuth calls always identify
-        // via this add-on's own app, never a per-user override) -- lists,
-        // me, watchlist, and history are 4 fixed calls, plus 1 classify
-        // call per list.
-        ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4 + classified.length));
-        return json({ ok: true, lists: [watchlistEntry, historyEntry, ...classified] });
+        return json({ ok: true, lists });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -1969,15 +3066,6 @@ self.addEventListener('fetch', e => {
 
     // /api/trakt-history-raw  (POST)  { accessToken, type: 'movies'|'episodes', page, limit }
     // -> { ok, items: [...raw Trakt history rows...], hasMore }
-    // Deliberately returns Trakt's raw, unmapped rows rather than going
-    // through mapTraktHistoryItems (used everywhere else this add-on reads
-    // history) -- that mapping folds each row into a display-ready catalog
-    // meta and throws away the real per-episode TMDB id and season/episode
-    // numbers along the way, which is exactly what the client's "Mark all
-    // as Watched" needs to build proper Watch History/Continue Watching
-    // entries. This is the same raw shape a Trakt Export JSON file already
-    // uses (Trakt's export is generated from this same API), so the client
-    // reuses mapTraktExportEntryToWatchHistoryItem unchanged for both.
     if (path === "/api/trakt-history-raw" && request.method === "POST") {
       let body;
       try {
@@ -1991,26 +3079,37 @@ self.addEventListener('fetch', e => {
       const page = Math.max(1, parseInt(body.page, 10) || 1);
       const limit = Math.min(100, Math.max(1, parseInt(body.limit, 10) || 100));
       try {
-        ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
-        const res = await fetch(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          // Never cache an authenticated, per-person response -- see the
-          // same caching note on fetchTrakt above.
-          cf: { cacheTtl: 0, cacheEverything: false },
+        const userHash = safeUserHash(accessToken);
+        const cacheKey = `user_cache:trakt:history_raw:${itemKind}:${page}:${limit}:${userHash}`;
+
+        const historyResult = await fetchWithPerUserCacheAndCircuitBreaker({
+          cacheKey,
+          freshTtlSec: 60,
+          staleTtlSec: 1800,
+          providerLabel: "Trakt History Raw",
+          fetchFn: async () => {
+            ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
+            const res = await fetchTraktWithRetry(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            if (res.status === 401) {
+              throw new Error("Your Trakt connection has expired or was revoked -- reconnect in Settings.");
+            }
+            if (!res.ok) throw new Error(`Trakt history request failed (HTTP ${res.status}).`);
+            const items = await res.json();
+            const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
+            return { items: Array.isArray(items) ? items : [], hasMore: page < totalPages };
+          }
         });
-        if (res.status === 401) {
-          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
-        }
-        if (!res.ok) return json({ ok: false, error: `Trakt history request failed (HTTP ${res.status}).` });
-        const items = await res.json();
-        const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
-        return json({ ok: true, items: Array.isArray(items) ? items : [], hasMore: page < totalPages });
+
+        return json({ ok: true, items: historyResult.items || [], hasMore: !!historyResult.hasMore });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -2159,10 +3258,12 @@ self.addEventListener('fetch', e => {
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
         const lists = rawLists
-          .filter((l) => l && l.slug && l.user_name)
+          .filter((l) => l && (l.slug || l.id) && l.user_name)
           .map((l) => ({
+            id: l.id != null ? String(l.id) : (l.slug || ""),
             name: l.name || l.slug,
             slug: l.slug,
+            dynamic: !!l.dynamic,
             mediatype: l.mediatype || "",
             contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
             items: l.items || 0,

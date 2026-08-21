@@ -470,6 +470,7 @@ function collectEntries() {
 function collectKeys() {
   let track = false;
   try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+
   const tmdbKeyEl = document.getElementById('tmdbKeyInput');
   let tmdbKey = tmdbKeyEl ? tmdbKeyEl.value.trim() : '';
   if (!tmdbKey) {
@@ -487,16 +488,64 @@ function collectKeys() {
   if (!tmdbUser) {
     try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
   }
+
+  const mdblistKeyEl = document.getElementById('mdblistKeyInput');
+  let mdblistKey = mdblistKeyEl ? mdblistKeyEl.value.trim() : '';
+  if (!mdblistKey) {
+    try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
+  }
+  let mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || '';
+  if (!mdblistToken) {
+    try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+  }
+  let mdblistUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || '';
+  if (!mdblistUser) {
+    try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
+  }
+
+  const traktKeyEl = document.getElementById('traktKeyInput');
+  let traktKey = traktKeyEl ? traktKeyEl.value.trim() : '';
+  if (!traktKey) {
+    try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
+  }
+  const traktUserEl = document.getElementById('traktUsernameInput');
+  let traktUser = traktUserEl ? traktUserEl.value.trim() : '';
+  if (!traktUser) {
+    try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
+  }
+  let traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || '';
+  if (!traktToken) {
+    try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+  }
+
+  const simklKeyEl = document.getElementById('simklKeyInput');
+  let simklKey = simklKeyEl ? simklKeyEl.value.trim() : '';
+  if (!simklKey) {
+    try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
+  }
+  let simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || '';
+  if (!simklToken) {
+    try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+  }
+  let simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || '';
+  if (!simklUser) {
+    try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
+  }
+
   const keys = {
     tmdbKey: tmdbKey,
     tmdbSessionId: tmdbSession,
     tmdbAccountId: tmdbAcc,
     tmdbUsername: tmdbUser,
-    mdblistKey: document.getElementById('mdblistKeyInput') ? document.getElementById('mdblistKeyInput').value.trim() : '',
-    mdblistAccessToken: mdblistAccessToken,
-    traktKey: document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '',
-    traktUsername: document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '',
-    traktAccessToken: traktAccessToken,
+    mdblistKey: mdblistKey,
+    mdblistAccessToken: mdblistToken,
+    mdblistUsername: mdblistUser,
+    traktKey: traktKey,
+    traktUsername: traktUser,
+    traktAccessToken: traktToken,
+    simklKey: simklKey,
+    simklAccessToken: simklToken,
+    simklUsername: simklUser,
     shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
     shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
   };
@@ -601,7 +650,7 @@ async function renderLivePreview() {
         });
         const data = await res.json();
         if (!data.ok) {
-          postersContainer.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not load this shelf.') + '</p>';
+          postersContainer.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not load this catalog.') + '</p>';
           continue;
         }
         if (!data.sample || !data.sample.length) {
@@ -612,7 +661,7 @@ async function renderLivePreview() {
         postersContainer.innerHTML = data.sample.slice(0, visibleCount).map(livePreviewPosterHtml).join('');
         if (seeAllBtn && data.sample.length > visibleCount) seeAllBtn.disabled = false;
       } catch (e) {
-        postersContainer.innerHTML = '<p class="testresult err">✗ Network error loading this shelf.</p>';
+        postersContainer.innerHTML = '<p class="testresult err">✗ Network error loading this catalog.</p>';
       }
     }
   }
@@ -637,10 +686,12 @@ function livePreviewPosterHtml(m) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
   } else if (m.removeCustomListSlug) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
+  } else if (m.removeExternalProvider) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
   }
 
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
-  const addOverlay = '<div class="poster-add-overlay" title="Add to Custom List">+</div>';
+  const addOverlay = '<div class="poster-add-overlay" title="Add to Lists">+</div>';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
@@ -660,7 +711,7 @@ function removeListItemFromDetails(btn) {
   const extra = btn.dataset.removeSlug || '';
   if (!id) return;
   const targetId = String(id);
-  const card = btn.closest('.live-preview-poster-card');
+  const card = btn.closest('.live-preview-poster-card, .list-card-mini-poster-tile');
   if (card) {
     card.style.opacity = '0';
     card.style.transform = 'scale(0.85)';
@@ -673,7 +724,7 @@ function removeListItemFromDetails(btn) {
         if (typeof window._updateListDetailsItemCount === 'function') {
           window._updateListDetailsItemCount(remaining);
         }
-        if (remaining === 0) {
+        if (remaining === 0 && grid) {
           const statusEl = document.getElementById('detailStatus');
           if (statusEl) statusEl.innerHTML = '<small>No items left.</small>';
         }
@@ -699,6 +750,54 @@ function removeListItemFromDetails(btn) {
     if (typeof removeWatchHistoryItemDirect === 'function') removeWatchHistoryItemDirect(targetId, btn);
   } else if (type === 'custom' && extra) {
     if (typeof removeCustomListItemDirect === 'function') removeCustomListItemDirect(targetId, extra, btn);
+  } else if (type === 'external') {
+    const provider = btn.dataset.provider || '';
+    const target = btn.dataset.target || '';
+    const listId = btn.dataset.listId || '';
+    const mediaType = btn.dataset.mediaType || 'movie';
+
+    if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
+      setExternalListMembership(makeExternalKey(provider, target, listId, targetId), false);
+      setExternalListMembership(makeExternalKey(provider, target, listId, targetId.replace(/^tmdb:/, '')), false);
+    }
+
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+    const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+    const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+    fetch(ORIGIN + '/api/external-list/item-mutate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'remove',
+        provider: provider,
+        target: target,
+        listId: listId,
+        id: targetId,
+        imdbId: targetId.startsWith('tt') ? targetId : '',
+        tmdbId: targetId.startsWith('tmdb:') ? targetId.slice(5) : (targetId.startsWith('tt') ? '' : targetId),
+        type: mediaType,
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        traktUsername: traktUser,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+        tmdbSessionId: tmdbSess,
+        tmdbAccountId: tmdbAcc,
+        tmdbKey: tmdbKey,
+        mdblistAccessToken: mdbToken,
+        mdblistKey: mdbKey
+      })
+    }).catch(() => {});
+
+    showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
   }
 }
 
@@ -724,15 +823,27 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
   }
   switchTab('list-details');
+  if (typeof opts.restoreScrollY === 'number') {
+    window.scrollTo({ top: opts.restoreScrollY, behavior: 'instant' });
+  } else {
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
 
   if (!opts.skipPushState) {
-    const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
-    if (cleanPath) {
-      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
-    } else {
-      const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: listUrl || '' });
-      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl || '' }, '', '/#/list?' + params.toString());
-    }
+    try {
+      const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
+      const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
+      const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
+      const currentLoc = window.location.pathname + window.location.search + window.location.hash;
+      if (window.location.hash !== targetUrl && currentLoc !== targetUrl) {
+        if (cleanPath) {
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
+        } else {
+          const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
+          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam }, '', '/#/list?' + params.toString());
+        }
+      }
+    } catch (e) {}
   }
 
   const cacheKey = (name || '') + '::' + (listUrl || '');
@@ -746,6 +857,83 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     } else if (listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
       const rec = window._curatedRecs[listUrl];
       preloaded = { sample: rec.items, count: rec.items.length, maybeMore: false };
+    } else if (listUrl && window._simklListsMap && window._simklListsMap[listUrl]) {
+      const simklList = window._simklListsMap[listUrl];
+      const parts = (listUrl || '').split(':');
+      const stKey = parts[3] || 'plantowatch';
+      const sample = (simklList.items || []).map((it) => Object.assign({}, it, {
+        removeExternalProvider: 'simkl',
+        removeExternalTarget: 'status',
+        removeExternalListId: stKey,
+      }));
+      preloaded = { sample: sample, count: sample.length, maybeMore: false };
+    } else if (listUrl && listUrl.startsWith('channel:')) {
+      try {
+        const map = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+        let ch = null;
+        if (listUrl.startsWith('channel:id:')) {
+          const id = listUrl.slice('channel:id:'.length);
+          ch = map[id];
+        } else if (listUrl.startsWith('channel:v1:')) {
+          try {
+            ch = JSON.parse(listUrl.slice('channel:v1:'.length));
+          } catch (e) {}
+        }
+        if (!ch) {
+          ch = Object.values(map).find((c) => c && c.name === name);
+        }
+        if (ch && Array.isArray(ch.items)) {
+          const sample = ch.items.map((it, idx) => {
+            let showName = it.showName || '';
+            let epName = it.epName || '';
+            let seasonEp = '';
+            if (it.season != null && it.episode != null) {
+              seasonEp = 'S' + it.season + 'E' + it.episode;
+            }
+            if (!showName && it.title) {
+              if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+                const sIdx = it.title.indexOf(' S');
+                showName = it.title.slice(0, sIdx).trim();
+                const rest = it.title.slice(sIdx + 1).trim();
+                const dashIdx = rest.indexOf(' \u2014 ') !== -1 ? rest.indexOf(' \u2014 ') : (rest.indexOf(' - ') !== -1 ? rest.indexOf(' - ') : rest.indexOf(': '));
+                if (dashIdx !== -1) {
+                  if (!seasonEp) seasonEp = rest.slice(0, dashIdx).trim();
+                  if (!epName) epName = rest.slice(dashIdx + (rest.indexOf(': ') === dashIdx ? 2 : 3)).trim();
+                } else {
+                  if (!seasonEp) seasonEp = rest.trim();
+                }
+              } else if (it.title.indexOf(' \u2014 ') !== -1) {
+                const parts = it.title.split(' \u2014 ');
+                showName = parts[0].trim();
+                if (!epName) epName = parts[1].trim();
+              } else {
+                showName = it.title.trim();
+              }
+            }
+            if (!showName) showName = ch.name || 'TV Channel';
+            if (!epName) {
+              if (it.epName) epName = it.epName;
+              else if (it.title && it.title !== showName) epName = it.title;
+              else if (seasonEp) epName = 'Episode ' + (it.episode != null ? it.episode : '');
+              else epName = 'Episode';
+            }
+            const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
+            const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
+            return {
+              id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
+              type: 'series',
+              name: displayTitle,
+              subtitle: epName,
+              title: fullTitle,
+              poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '',
+              thumbnail: it.thumbnail || it.backdrop || it.poster || it.showPoster || '',
+              year: it.year || (it.released ? it.released.slice(0, 4) : ''),
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      } catch (e) {}
     } else if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       // Look up local custom lists or creator lists by name or slug
       try {
@@ -890,7 +1078,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   updateDetailAddBtn();
 
   if (likeBtn) {
-    if (listUrl && !listUrl.startsWith('custom:')) {
+    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
@@ -931,8 +1119,116 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   let pagesLoaded = 0;
   const MAX_PAGES = 20;
 
+  const isSimklUserList = listUrl && listUrl.startsWith('simkl:user:');
+  const simklStatusMatch = isSimklUserList ? (listUrl.split(':')[3] || 'plantowatch') : '';
+
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const isTraktWatchlist = listUrl && (listUrl === 'trakt:watchlist' || listUrl.includes('trakt.tv/users/' + traktUser + '/watchlist') || (listUrl.includes('/watchlist') && listUrl.includes('trakt')));
+  const isTraktHistory = listUrl && (listUrl === 'trakt:history' || listUrl.includes('/history'));
+  const isTraktUserList = listUrl && (listUrl.startsWith('trakt:user:') || listUrl.includes('trakt.tv/users/'));
+  const traktListSlug = isTraktUserList ? (listUrl.includes('/lists/') ? (listUrl.split('/lists/')[1] || '').split('/')[0] : (listUrl.split(':')[3] || '')) : '';
+
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const isTmdbWatchlist = listUrl && (listUrl === 'tmdb:watchlist' || listUrl.startsWith('tmdb:account:watchlist') || (listUrl.includes('watchlist') && listUrl.includes('tmdb')));
+  const isTmdbFavorites = listUrl && (listUrl === 'tmdb:favorites' || listUrl.startsWith('tmdb:account:favorites') || (listUrl.includes('favorite') && listUrl.includes('tmdb')));
+  const isTmdbUserList = listUrl && (listUrl.includes('themoviedb.org/list/') || listUrl.startsWith('tmdb:list:'));
+  const tmdbListId = isTmdbUserList ? (listUrl.match(new RegExp('list(?:/|:)([0-9]+)', 'i'))?.[1] || '') : '';
+
+  const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+  const isMdbWatchlist = listUrl && (listUrl === 'mdblist:watchlist' || (listUrl.includes('watchlist') && listUrl.includes('mdblist')));
+  const isMdbHistory = listUrl && (listUrl === 'mdblist:history' || (listUrl.includes('history') && listUrl.includes('mdblist')));
+  const isMdbUserList = listUrl && (listUrl.includes('mdblist.com/lists/') || listUrl.startsWith('mdblist:list:'));
+  const mdbListId = isMdbUserList ? (listUrl.includes('mdblist.com/lists/') ? (listUrl.split('/lists/')[1] || '').split('/')[1] || (listUrl.split('/lists/')[1] || '').split('/')[0] : (listUrl.split(':')[2] || '')) : '';
+
+  function annotatePersonalItem(it) {
+    if (!it) return it;
+    if (isSimklUserList) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'simkl',
+        removeExternalTarget: 'status',
+        removeExternalListId: simklStatusMatch,
+      });
+    }
+    if (isTraktWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'watchlist',
+        removeExternalListId: 'watchlist',
+      });
+    }
+    if (isTraktHistory) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'history',
+        removeExternalListId: 'history',
+      });
+    }
+    if (isTraktUserList && traktListSlug) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'custom',
+        removeExternalListId: traktListSlug,
+      });
+    }
+    if (isMdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'watchlist',
+        removeExternalListId: 'watchlist',
+      });
+    }
+    if (isMdbHistory) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'history',
+        removeExternalListId: 'history',
+      });
+    }
+    if (isMdbUserList && mdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'custom',
+        removeExternalListId: mdbListId,
+      });
+    }
+    if (isTmdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'watchlist',
+      });
+    }
+    if (isTmdbFavorites) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'favorite',
+      });
+    }
+    if (isTmdbUserList && tmdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'custom',
+        removeExternalListId: tmdbListId,
+      });
+    }
+    if (isMdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'watchlist',
+      });
+    }
+    if (isMdbUserList && mdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'custom',
+        removeExternalListId: mdbListId,
+      });
+    }
+    return it;
+  }
+
   function appendItems(items) {
-    gridEl.insertAdjacentHTML('beforeend', items.map(livePreviewPosterHtml).join(''));
+    const annotated = items.map(annotatePersonalItem);
+    gridEl.insertAdjacentHTML('beforeend', annotated.map(livePreviewPosterHtml).join(''));
     loadedCount += items.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
@@ -959,6 +1255,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
       if (keys.traktKey) body.traktKey = keys.traktKey;
       if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+      if (keys.simklKey) body.simklKey = keys.simklKey;
+      if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -84,11 +84,14 @@ function renderCustomListSearchResults(results, searchType) {
   box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
 }
 
-document.getElementById('customListSearchResult').addEventListener('click', (e) => {
-  const btn = e.target.closest('.customListAddBtn');
-  if (!btn) return;
-  addToCustomListDraft(btn.dataset.searchtype, btn.dataset.tmdbid, btn.dataset.title, btn.dataset.year, btn.dataset.poster, btn);
-});
+const customListSearchBox = document.getElementById('customListSearchResult');
+if (customListSearchBox) {
+  customListSearchBox.addEventListener('click', (e) => {
+    const btn = e.target.closest('.customListAddBtn');
+    if (!btn) return;
+    addToCustomListDraft(btn.dataset.searchtype, btn.dataset.tmdbid, btn.dataset.title, btn.dataset.year, btn.dataset.poster, btn);
+  });
+}
 
 async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
   const itemType = searchType === 'tv' ? 'series' : 'movie';
@@ -140,32 +143,34 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
 function renderCustomListDraftList() {
   const box = document.getElementById('customListDraftList');
   const badge = document.getElementById('customListDraftCountBadge');
-  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
   if (!customListDraftItems.length) {
-    box.innerHTML = '<p><small>Nothing added yet -- search above to get started.</small></p>';
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p>';
     return;
   }
-  box.innerHTML = customListDraftItems.map((it, i) => {
+  const cardsHtml = customListDraftItems.map((it, i) => {
     const itType = it.type || (it.kind === 'series' || it.kind === 'tv' ? 'series' : 'movie');
-    const typeBadge = '<span style="font-size:0.68rem; font-weight:600; padding:2px 6px; border-radius:4px; background:var(--bg); border:1px solid var(--border); color:var(--muted); margin-left:6px; flex:none;">' + (itType === 'series' ? 'Show' : 'Movie') + '</span>';
-    const label = escapeHtml(it.title || it.name || 'Untitled') + (it.year ? ' (' + escapeHtml(it.year) + ')' : '');
-    const idStr = it.imdbId || it.id || '';
-    const onClickStr = idStr ? ' onclick="showItemDetails(&quot;' + escapeAttr(idStr) + '&quot;, &quot;' + escapeAttr(itType) + '&quot;)"' : '';
-    const posterImg = it.poster
-      ? '<img src="' + escapeAttr(it.poster) + '" alt="" loading="lazy" class="custom-list-pick-poster"' + onClickStr + '>'
-      : '<span class="custom-list-pick-poster empty-poster"></span>';
-    return '<div class="custom-list-pick" data-idx="' + i + '" style="display:flex; flex-direction:row; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px; width:100%;">' +
-      '<span class="drag-handle" draggable="true" style="cursor:grab; touch-action:none; padding:6px; flex:none;">\u2630</span>' +
-      '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" style="width:50px; flex:none; text-align:center;" title="Type a position to move this pick there">' +
-      posterImg +
-      '<span style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="' + escapeAttr(label) + '">' + label + '</span>' +
-      typeBadge +
-      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="-1"' + (i === 0 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2191</button>' +
-      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="1"' + (i === customListDraftItems.length - 1 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2193</button>' +
-      '<button type="button" class="secondary customListRemovePickBtn" style="flex:none; padding:8px 12px;">Remove</button>' +
-      '</div>';
+    const label = it.title || it.name || 'Untitled';
+    const typeLabel = itType === 'series' ? 'Show' : 'Movie';
+    const yearSub = (it.year ? it.year + ' \u2022 ' : '') + typeLabel;
+    const posterEl = it.poster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(it.poster) + '" alt="" loading="lazy">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    
+    return '<div class="live-preview-poster-card custom-list-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
+      '<div style="position:relative; width:100%;">' +
+        posterEl +
+        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+          '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+        '</div>' +
+        '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" style="z-index:4;">&times;</button>' +
+      '</div>' +
+      '<div class="live-preview-poster-name" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</div>' +
+      '<div class="live-preview-poster-year">' + escapeHtml(yearSub) + '</div>' +
+    '</div>';
   }).join('');
-  document.querySelectorAll('#customListDraftList .drag-handle').forEach((h) => initCustomListTouchDrag(h));
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+  initCustomListHoldDrag();
 }
 
 document.getElementById('customListDraftList').addEventListener('click', (e) => {
@@ -177,22 +182,9 @@ document.getElementById('customListDraftList').addEventListener('click', (e) => 
     renderCustomListDraftList();
     return;
   }
-  const moveBtn = e.target.closest('.customListMoveBtn');
-  if (moveBtn) {
-    const row = moveBtn.closest('.custom-list-pick');
-    const idx = parseInt(row.dataset.idx, 10);
-    const swapWith = idx + parseInt(moveBtn.dataset.dir, 10);
-    if (swapWith < 0 || swapWith >= customListDraftItems.length) return;
-    const tmp = customListDraftItems[idx];
-    customListDraftItems[idx] = customListDraftItems[swapWith];
-    customListDraftItems[swapWith] = tmp;
-    renderCustomListDraftList();
-  }
 });
 
 // Lets someone type a new position directly into a pick's number box
-// instead of clicking the up arrow repeatedly -- same idea as movePosTo()
-// for the main list, adapted for this array-backed draft.
 document.getElementById('customListDraftList').addEventListener('change', (e) => {
   const posInput = e.target.closest('.customListPosInput');
   if (!posInput) return;
@@ -213,86 +205,181 @@ document.getElementById('customListDraftList').addEventListener('change', (e) =>
   renderCustomListDraftList();
 });
 
-// Mouse drag-and-drop -- same live-DOM-reorder-then-read-back-order
-// technique the main list's drag uses, adapted for this array-backed
-// draft rather than persistent .entry elements: rows move around freely
-// during the drag, and the final DOM order (via each row's data-idx,
-// which still points at its ORIGINAL array index) gets read back into
-// customListDraftItems once the drag ends.
-let customListDragRow = null;
+let customListHoldDragBound = false;
 
-document.getElementById('customListDraftList').addEventListener('dragstart', (e) => {
-  const handle = e.target.closest('.drag-handle');
-  if (!handle) { e.preventDefault(); return; }
-  customListDragRow = handle.closest('.custom-list-pick');
-  customListDragRow.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-});
-
-document.getElementById('customListDraftList').addEventListener('dragend', () => {
-  if (customListDragRow) customListDragRow.classList.remove('dragging');
-  customListDragRow = null;
+function initCustomListHoldDrag() {
   const container = document.getElementById('customListDraftList');
-  const newOrder = [...container.querySelectorAll('.custom-list-pick')].map((r) => customListDraftItems[parseInt(r.dataset.idx, 10)]);
-  customListDraftItems = newOrder;
-  renderCustomListDraftList();
-});
+  if (!container || customListHoldDragBound) return;
+  customListHoldDragBound = true;
 
-document.getElementById('customListDraftList').addEventListener('dragover', (e) => {
-  if (!customListDragRow) return;
-  e.preventDefault();
-  const container = document.getElementById('customListDraftList');
-  const afterEl = getCustomListDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(customListDragRow);
-  } else if (afterEl !== customListDragRow) {
-    container.insertBefore(customListDragRow, afterEl);
-  }
-});
+  let activeCard = null;
+  let isDragging = false;
+  let holdTimer = null;
+  let startX = 0;
+  let startY = 0;
 
-function getCustomListDragAfterElement(container, y) {
-  const els = [...container.querySelectorAll('.custom-list-pick:not(.dragging)')];
-  return els.reduce((closest, child) => {
-    const box = child.getBoundingClientRect();
-    const offset = y - box.top - box.height / 2;
-    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
-    return closest;
-  }, { offset: -Infinity, element: null }).element;
-}
+  const cancelHold = () => {
+    if (holdTimer) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
+  };
 
-// position number both still work fine on touch regardless.
-let customListTouchDragRow = null;
+  const stopDrag = () => {
+    cancelHold();
+    if (isDragging && activeCard) {
+      activeCard.classList.remove('dragging');
+      reorderCustomListDraftFromDom();
+    }
+    isDragging = false;
+    activeCard = null;
+    document.body.style.userSelect = '';
+  };
 
-function initCustomListTouchDrag(handle) {
-  if (!handle) return;
-  handle.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    e.preventDefault();
-    customListTouchDragRow = handle.closest('.custom-list-pick');
-    customListTouchDragRow.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    document.addEventListener('pointermove', onCustomListTouchDragMove);
-    document.addEventListener('pointerup', onCustomListTouchDragEnd, { once: true });
-    document.addEventListener('pointercancel', onCustomListTouchDragEnd, { once: true });
+  const startDrag = (card) => {
+    isDragging = true;
+    activeCard = card;
+    card.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      try { navigator.vibrate(30); } catch (err) {}
+    }
+  };
+
+  const handleMove = (clientX, clientY, e) => {
+    if (!activeCard) return;
+
+    if (!isDragging) {
+      const dist = Math.hypot(clientX - startX, clientY - startY);
+      if (dist > 12) {
+        cancelHold();
+        activeCard = null;
+      }
+      return;
+    }
+
+    if (e && e.cancelable) {
+      e.preventDefault();
+    }
+
+    const grid = container.querySelector('.poster-grid-3') || container;
+    const targetCard = getCustomListDragAfterElement(grid, clientX, clientY);
+    if (targetCard && targetCard !== activeCard) {
+      const box = targetCard.getBoundingClientRect();
+      const isAfter = (clientY > box.top + box.height / 2) || (clientY >= box.top && clientX > box.left + box.width / 2);
+      if (isAfter) {
+        grid.insertBefore(activeCard, targetCard.nextSibling);
+      } else {
+        grid.insertBefore(activeCard, targetCard);
+      }
+    }
+  };
+
+  container.addEventListener('dragstart', (e) => { e.preventDefault(); });
+
+  // Pointer events for desktop & unified pointer handling
+  container.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
+    const card = e.target.closest('.custom-list-pick');
+    if (!card) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, isTouch ? 180 : 120);
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!activeCard) return;
+    handleMove(e.clientX, e.clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('pointerup', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('pointercancel', (e) => {
+    if (!isDragging) {
+      cancelHold();
+      activeCard = null;
+    } else if (e.pointerType !== 'touch') {
+      stopDrag();
+    }
+  });
+
+  // Dedicated touch listeners for guaranteed mobile gesture prevention
+  container.addEventListener('touchstart', (e) => {
+    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
+    const card = e.target.closest('.custom-list-pick');
+    if (!card || e.touches.length !== 1) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, 180);
+  }, { passive: true });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!activeCard || !e.touches || e.touches.length !== 1) return;
+    if (isDragging && e.cancelable) {
+      e.preventDefault();
+    }
+    handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('touchend', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('touchcancel', () => {
+    if (activeCard) stopDrag();
   });
 }
 
-function onCustomListTouchDragMove(e) {
-  if (!customListTouchDragRow) return;
-  const container = document.getElementById('customListDraftList');
-  const afterEl = getCustomListDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(customListTouchDragRow);
-  } else if (afterEl !== customListTouchDragRow) {
-    container.insertBefore(customListTouchDragRow, afterEl);
+function getCustomListDragAfterElement(container, x, y) {
+  const els = [...container.querySelectorAll('.custom-list-pick:not(.dragging)')];
+  if (!els.length) return null;
+
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+      return child;
+    }
   }
+
+  let closest = null;
+  let closestDistance = Infinity;
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    const dist = Math.hypot(x - cx, y - cy);
+    if (dist < closestDistance) {
+      closestDistance = dist;
+      closest = child;
+    }
+  }
+  return closest;
 }
 
-function onCustomListTouchDragEnd() {
-  document.removeEventListener('pointermove', onCustomListTouchDragMove);
-  if (customListTouchDragRow) customListTouchDragRow.classList.remove('dragging');
-  customListTouchDragRow = null;
-  reorderCustomListDraftFromDom();
+function reorderCustomListDraftFromDom() {
+  const container = document.getElementById('customListDraftList');
+  const rows = [...container.querySelectorAll('.custom-list-pick')];
+  if (rows.length) {
+    customListDraftItems = rows.map((row) => customListDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+  }
+  renderCustomListDraftList();
 }
 
 function shuffleCustomListDraft() {
@@ -396,9 +483,10 @@ function saveCustomList() {
   updateCustomListTypeRadio('movie');
   customListDraftListId = null;
   nameInput.value = '';
-  document.getElementById('customListRandomizeCheck').checked = false;
-  document.getElementById('customListSearchInput').value = '';
-  document.getElementById('customListSearchResult').innerHTML = '';
+  const searchInput = document.getElementById('customListSearchInput');
+  if (searchInput) searchInput.value = '';
+  const searchRes = document.getElementById('customListSearchResult');
+  if (searchRes) searchRes.innerHTML = '';
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
 
@@ -512,7 +600,8 @@ function editCustomList(btn) {
     ? rowDiv.querySelector('.name').value.trim()
     : '';
   document.getElementById('customListNameInput').value = currentName;
-  document.getElementById('customListSearchType').value = payload.type === 'series' ? 'tv' : 'movie';
+  const searchTypeEl = document.getElementById('customListSearchType');
+  if (searchTypeEl) searchTypeEl.value = payload.type === 'series' ? 'tv' : 'movie';
   document.getElementById('customListRandomizeCheck').checked = !!payload.shuffle;
   editingCustomListUrlInput = urlInput;
   editingCreatorListSlug = null;
@@ -561,25 +650,16 @@ function updateCustomListSaveButtonLabel() {
     titleEl.innerHTML = (isEditing ? 'Edit Custom List' : 'Create a Custom List') + ' <span class="badge" id="customListDraftCountBadge"></span>';
     // Must update badge text again since we just rewrote innerHTML
     const badge = document.getElementById('customListDraftCountBadge');
-    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
   }
 
-  if (editingCreatorListSlug) {
-    saveBtn.textContent = 'Save changes to your Creator list';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = '';
-  } else if (editingLocalCustomListSlug) {
-    saveBtn.textContent = 'Save changes to this list';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = 'none';
-  } else if (editingCustomListUrlInput) {
-    saveBtn.textContent = 'Save changes to this List';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = 'none';
-  } else {
-    saveBtn.textContent = 'Save as a List';
-    if (cancelBtn) cancelBtn.style.display = 'none';
-    if (visRow) visRow.style.display = 'none';
+  saveBtn.textContent = 'Save';
+  if (cancelBtn) {
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.display = isEditing ? '' : 'none';
+  }
+  if (visRow) {
+    visRow.style.display = editingCreatorListSlug ? '' : 'none';
   }
 }
 

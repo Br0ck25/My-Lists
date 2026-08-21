@@ -43,7 +43,7 @@
  * No environment variables or bindings required.
  */
 const ADDON_ID = "app.my-list";
-const ADDON_VERSION = "1.39.0";
+const ADDON_VERSION = "1.4.0";
 const ADDON_NAME = "My Lists";
 
 // --- Env-backed API keys ----------------------------------------------------
@@ -65,12 +65,14 @@ const ADDON_NAME = "My Lists";
 // A per-user override still takes priority over these where one exists
 // (the MDBList key / Trakt Client ID boxes in the builder page) -- these
 // are only ever the fallback for someone who hasn't filled those in.
+let TMDB_API_KEY = "";
 let MDBLIST_API_KEY = "";
 let MDBLIST_POPULAR_KEY = "";
 let MDBLIST_CLIENT_ID = "";
 let TRAKT_CLIENT_ID = "";
-let TMDB_API_KEY = "5e183700244552be60b9a44cf5d7e7b9";
-let SIMKL_CLIENT_ID = "b331c5917e9f5b4e2f92fbfdf62de9b62e99c4c6fe743ff281e6c63be159e3b4";
+let SIMKL_CLIENT_ID = "";
+let SIMKL_CLIENT_SECRET = "";
+
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -1578,7 +1580,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -1603,6 +1605,8 @@ function decodeConfig(config) {
       traktKey: (!Array.isArray(parsed) && parsed.traktKey) || "",
       traktUsername: (!Array.isArray(parsed) && parsed.traktUsername) || "",
       traktAccessToken: (!Array.isArray(parsed) && parsed.traktAccessToken) || "",
+      simklKey: (!Array.isArray(parsed) && parsed.simklKey) || "",
+      simklAccessToken: (!Array.isArray(parsed) && parsed.simklAccessToken) || "",
       track: !!(!Array.isArray(parsed) && parsed.track),
       trackCreatorName: (!Array.isArray(parsed) && parsed.trackCreatorName) || "",
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
@@ -1781,6 +1785,107 @@ async function hashStringForKey(s) {
   const data = new TextEncoder().encode(String(s || ""));
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+// --- Per-User Cache & Circuit Breaker Shield ---------------------------------
+// Safe in-memory LRU cache with rolling window and Stale-If-Error degradation.
+// Ensures bearer-authenticated user data is safely isolated and never leaks between users.
+const PER_USER_CACHE_MAP = new Map();
+const PER_USER_CACHE_MAX_ENTRIES = 1000;
+
+function safeUserHash(token = "", username = "") {
+  const input = `${token}:${username}`;
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) - hash) + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return (Math.abs(hash) || 1).toString(36);
+}
+
+function getPerUserCache(key) {
+  if (!key) return null;
+  const entry = PER_USER_CACHE_MAP.get(key);
+  if (!entry) return null;
+  const now = Date.now();
+  if (now <= entry.freshUntil) {
+    return { data: entry.data, isFresh: true, isStale: false };
+  }
+  if (now <= entry.staleUntil) {
+    return { data: entry.data, isFresh: false, isStale: true };
+  }
+  PER_USER_CACHE_MAP.delete(key);
+  return null;
+}
+
+function setPerUserCache(key, data, freshTtlSec = 60, staleTtlSec = 1800) {
+  if (!key || data === undefined || data === null) return;
+  if (PER_USER_CACHE_MAP.size >= PER_USER_CACHE_MAX_ENTRIES) {
+    const oldestKey = PER_USER_CACHE_MAP.keys().next().value;
+    if (oldestKey) PER_USER_CACHE_MAP.delete(oldestKey);
+  }
+  const now = Date.now();
+  PER_USER_CACHE_MAP.set(key, {
+    data,
+    freshUntil: now + freshTtlSec * 1000,
+    staleUntil: now + staleTtlSec * 1000,
+  });
+}
+
+function invalidatePerUserCache(provider, userHash = "") {
+  if (!provider) return;
+  const prefix = `user_cache:${provider}`;
+  for (const k of PER_USER_CACHE_MAP.keys()) {
+    if (k.startsWith(prefix) && (!userHash || k.includes(userHash))) {
+      PER_USER_CACHE_MAP.delete(k);
+    }
+  }
+}
+
+// Executes an external fetch with safe per-user caching and circuit-breaker fallback.
+// If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response if available.
+async function fetchWithPerUserCacheAndCircuitBreaker({
+  cacheKey,
+  fetchFn,
+  freshTtlSec = 60,
+  staleTtlSec = 1800,
+  providerLabel = "External API"
+}) {
+  const cached = getPerUserCache(cacheKey);
+  if (cached && cached.isFresh) {
+    return cached.data;
+  }
+
+  try {
+    const freshData = await fetchFn();
+    if (freshData !== null && freshData !== undefined) {
+      setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
+      return freshData;
+    }
+  } catch (err) {
+    const errMsg = String(err && err.message ? err.message : err);
+    if (cached && cached.data) {
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good cached data.`);
+      return cached.data;
+    }
+    throw err;
+  }
+
+  if (cached && cached.data) {
+    return cached.data;
+  }
+  return null;
+}
+
+async function fetchTraktWithRetry(url, options = {}, retries = 2) {
+  let res = await fetch(url, options);
+  if (res.status === 429 && retries > 0) {
+    const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
+    const delayMs = Math.min(3000, Math.max(1000, retrySec * 1000));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return fetchTraktWithRetry(url, options, retries - 1);
+  }
+  return res;
 }
 
 // --- Admin stats (page views, install links generated) -----------------
@@ -2648,52 +2753,118 @@ async function renderAdminDashboard(env) {
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin \u2014 My Lists Addon</title>
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
 <style>
-  body { background:#F2F2F7; color:#1C1C1E; font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; box-sizing:border-box; }
-  h1 { margin-bottom:4px; font-size:1.6rem; }
-  h2 { font-size:1.1rem; }
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --danger: #FF3B30;
+    --success: #34C759;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow: 0 2px 10px rgba(0,0,0,0.08);
+    --shadow-md: 0 8px 30px rgba(0,0,0,0.18);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-pill: 999px;
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; }
+  h1 { margin-bottom:4px; font-size:1.6rem; color:var(--text); }
+  h2 { font-size:1.1rem; color:var(--text); }
   .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:12px; margin:16px 0; }
-  .stat-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  .stat-value { font-size:1.6rem; font-weight:700; }
-  .stat-label { color:#8E8E93; font-size:0.82rem; margin-top:4px; }
-  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-  table { width:100%; border-collapse:collapse; background:#FFFFFF; border:none; margin:0; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(0,0,0,0.08); font-size:0.85rem; white-space:nowrap; }
-  th { color:#8E8E93; font-weight:600; background:#FAFAFC; }
-  a { color:#007AFF; }
-  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid rgba(0,0,0,0.08); margin-top:20px; flex-wrap:wrap; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px; box-shadow:var(--shadow-sm); }
+  .stat-value { font-size:1.6rem; font-weight:700; color:var(--text); }
+  .stat-label { color:var(--muted); font-size:0.82rem; margin-top:4px; }
+  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); }
+  table { width:100%; border-collapse:collapse; background:var(--surface); border:none; margin:0; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:0.85rem; white-space:nowrap; color:var(--text); }
+  th { color:var(--muted); font-weight:600; background:var(--panel-strong); }
+  a { color:var(--accent); }
+  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid var(--border); margin-top:20px; flex-wrap:wrap; }
   .admin-main-tab-btn {
-    background:none; border:none; color:#8E8E93; font-size:0.95rem; font-weight:700; cursor:pointer;
+    background:none; border:none; color:var(--muted); font-size:0.95rem; font-weight:700; cursor:pointer;
     padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent; transition:color 0.15s ease;
   }
-  .admin-main-tab-btn:hover { color:#1C1C1E; }
-  .admin-main-tab-btn.active { color:#1C1C1E; border-bottom-color:#007AFF; }
+  .admin-main-tab-btn:hover { color:var(--text); }
+  .admin-main-tab-btn.active { color:var(--text); border-bottom-color:var(--accent); }
   .admin-subnav-bar { display:flex; gap:8px; margin:14px 0 16px; flex-wrap:wrap; }
   .subnav-pill {
-    background:#FFFFFF; border:1px solid rgba(0,0,0,0.1); border-radius:20px; padding:6px 14px;
-    font-size:0.85rem; font-weight:600; color:#8E8E93; cursor:pointer; transition:all 0.15s ease;
+    background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:6px 14px;
+    font-size:0.85rem; font-weight:600; color:var(--muted); cursor:pointer; transition:all 0.15s ease;
   }
-  .subnav-pill:hover { border-color:rgba(0,0,0,0.25); color:#1C1C1E; }
-  .subnav-pill.active { background:#007AFF; color:#FFFFFF; border-color:#007AFF; }
+  .subnav-pill:hover { border-color:var(--border-strong); color:var(--text); }
+  .subnav-pill.active { background:var(--accent); color:#FFFFFF; border-color:var(--accent); }
   .admin-tab-panel { display:none; }
   .admin-tab-panel.active { display:block; }
-  .admin-select { padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); background:#FFFFFF; font-size:0.85rem; margin-right:6px; }
+  .admin-select { padding:6px 10px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--surface); color:var(--text); font-size:0.85rem; margin-right:6px; outline:none; }
   .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
-  .admin-badge.bug { background:rgba(255,59,48,0.12); color:#FF3B30; }
-  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:#007AFF; }
+  .admin-badge.bug { background:rgba(255,59,48,0.12); color:var(--danger); }
+  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:var(--accent); }
   .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
-  .admin-badge.other { background:rgba(142,142,147,0.15); color:#636366; }
-  .feedback-card { background:#FFFFFF; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:14px 16px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .admin-badge.other { background:rgba(142,142,147,0.15); color:var(--muted); }
+  .feedback-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-top:10px; box-shadow:var(--shadow-sm); }
   .feedback-card.completed { opacity:0.55; }
   .feedback-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; }
   .feedback-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
-  .feedback-meta { color:#8E8E93; font-size:0.8rem; margin-top:6px; }
-  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; }
+  .feedback-meta { color:var(--muted); font-size:0.8rem; margin-top:6px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; color:var(--text); }
   .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap:10px; margin-top:10px; }
-  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:#E5E5EA; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
-  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:#E5E5EA; display:flex; align-items:center; justify-content:center; color:#8E8E93; font-size:0.75rem; text-align:center; padding:6px; box-sizing:border-box; }
-  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; }
-  .netflix-preview-year { color:#8E8E93; font-size:0.75rem; }
+  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:var(--panel-strong); box-shadow:var(--shadow-sm); }
+  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.75rem; text-align:center; padding:6px; }
+  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; color:var(--text); }
+  .netflix-preview-year { color:var(--muted); font-size:0.75rem; }
+
+  /* Standard Modals & Buttons */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; z-index: 1000;
+  }
+  .modal-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 22px; max-width: 440px; width: 100%;
+    max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-md);
+    color: var(--text);
+  }
+  .modal-close-x {
+    float: right; background: var(--bg); border: 1px solid var(--border-strong);
+    color: var(--muted); font-size: 1rem; cursor: pointer;
+    padding: 4px 10px; border-radius: 8px;
+  }
+  .modal-close-x:hover { color: var(--text); border-color: var(--text-2); }
+  .lc-btn {
+    padding: 10px 18px; min-height: 38px; border-radius: var(--radius-pill);
+    border: none; background: var(--accent); color: #fff; cursor: pointer;
+    font-weight: 600; font-size: 0.925rem; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: opacity 0.12s; text-decoration: none;
+  }
+  .lc-btn.secondary {
+    background: var(--surface); color: var(--text);
+    border: 1.5px solid var(--border-strong);
+  }
+  .lc-btn.danger {
+    background: var(--danger); color: #fff; border: none;
+  }
+  .lc-btn:hover:not(:disabled) { opacity: 0.85; }
+  .lc-btn:disabled { opacity: 0.4; cursor: default; }
+
   @media (max-width: 600px) {
     body { padding: 14px 10px; }
     .stat-cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -2886,22 +3057,25 @@ async function renderAdminDashboard(env) {
   </div>
 
   <!-- Edit Feedback Modal -->
-  <div id="editFeedbackModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center; padding:16px;">
-    <div style="background:#fff; border-radius:14px; padding:20px; max-width:500px; width:100%; box-shadow:0 4px 20px rgba(0,0,0,0.15);">
-      <h3 style="margin:0 0 12px; font-size:1.1rem; color:#001f3f;">Edit Feedback</h3>
+  <div id="editFeedbackModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card" style="max-width:500px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 style="margin:0; font-size:1.15rem; font-weight:700; color:var(--text);">Edit Feedback</h3>
+        <button type="button" class="modal-close-x" onclick="closeEditFeedbackModal()">&#x2715;</button>
+      </div>
       <input type="hidden" id="editFeedbackId">
-      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Category</label>
-      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:12px; width:100%;">
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Category</label>
+      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:14px; width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text);">
         <option value="bug">bug</option>
         <option value="improvement">improvement</option>
         <option value="idea">idea</option>
         <option value="other">other</option>
       </select>
-      <label style="display:block; font-size:0.8rem; font-weight:600; color:#8E8E93; margin-bottom:4px;">Message</label>
-      <textarea id="editFeedbackMessage" style="width:100%; min-height:100px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical; margin-bottom:12px;"></textarea>
-      <div style="display:flex; justify-content:flex-end; gap:8px;">
-        <button type="button" class="admin-select" style="cursor:pointer;" onclick="closeEditFeedbackModal()">Cancel</button>
-        <button type="button" class="admin-select" id="editFeedbackSaveBtn" style="cursor:pointer; background:#001f3f; color:#fff;" onclick="saveEditFeedback()">Save Changes</button>
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Message</label>
+      <textarea id="editFeedbackMessage" style="width:100%; min-height:120px; box-sizing:border-box; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text); font-family:inherit; font-size:0.92rem; resize:vertical; margin-bottom:16px; outline:none;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:10px;">
+        <button type="button" class="lc-btn secondary" onclick="closeEditFeedbackModal()">Cancel</button>
+        <button type="button" class="lc-btn primary" id="editFeedbackSaveBtn" onclick="saveEditFeedback()">Save Changes</button>
       </div>
     </div>
   </div>
@@ -3435,6 +3609,65 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    function closeAdminModal() {
+      const existing = document.getElementById('activeAdminModalOverlay');
+      if (existing) existing.remove();
+    }
+
+    function showAdminModal(innerHtml) {
+      closeAdminModal();
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.id = 'activeAdminModalOverlay';
+      overlay.innerHTML = '<div class="modal-card"><div class="modal-body">' + innerHtml + '</div></div>';
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) closeAdminModal();
+      });
+      document.body.appendChild(overlay);
+    }
+
+    function showAdminAlert(title, message, isSuccess = false) {
+      const icon = isSuccess ? '\u2713' : '\u2715';
+      const iconColor = isSuccess ? 'var(--success, #34C759)' : 'var(--danger, #FF3B30)';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+          '<button type="button" class="lc-btn primary" onclick="closeAdminModal()" style="min-width:80px;">OK</button>' +
+        '</div>';
+      showAdminModal(html);
+    }
+
+    function showAdminConfirm(title, message, confirmBtnText, onConfirm, isDanger = true) {
+      const icon = isDanger ? '\u26A0' : '?';
+      const iconColor = isDanger ? 'var(--danger, #FF3B30)' : 'var(--accent, #007AFF)';
+      const btnClass = isDanger ? 'lc-btn danger' : 'lc-btn primary';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:10px;">' +
+          '<button type="button" class="lc-btn secondary" onclick="closeAdminModal()">Cancel</button>' +
+          '<button type="button" class="' + btnClass + '" id="adminConfirmOkBtn">' + escapeHtmlAdmin(confirmBtnText || 'Confirm') + '</button>' +
+        '</div>';
+      showAdminModal(html);
+      document.getElementById('adminConfirmOkBtn')?.addEventListener('click', () => {
+        closeAdminModal();
+        if (typeof onConfirm === 'function') onConfirm();
+      });
+    }
+
     // Optimistic: flips the entry's completed flag (and re-renders,
     // moving the card between the Open/Completed groups) the instant
     // it's clicked, then sends the real change to the server in the
@@ -3459,7 +3692,8 @@ async function renderAdminDashboard(env) {
             feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
             renderFeedbackList();
           }
-          alert((data && data.error) || 'Could not update -- try again.');
+          const err = (data && data.error) || 'Could not update -- try again.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Update Failed', err, false);
           return;
         }
       } catch (e) {
@@ -3468,7 +3702,7 @@ async function renderAdminDashboard(env) {
           feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
           renderFeedbackList();
         }
-        alert('Could not update -- check your connection.');
+        showAdminAlert('Connection Error', 'Could not update -- check your connection.', false);
       }
     }
 
@@ -3493,7 +3727,7 @@ async function renderAdminDashboard(env) {
       const message = document.getElementById('editFeedbackMessage').value.trim();
       const saveBtn = document.getElementById('editFeedbackSaveBtn');
       if (!message) {
-        alert('Please enter a message.');
+        showAdminAlert('Missing Message', 'Please enter a message.', false);
         return;
       }
       saveBtn.disabled = true;
@@ -3506,7 +3740,8 @@ async function renderAdminDashboard(env) {
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {
-          alert((data && data.error) || 'Could not save feedback edits.');
+          const err = (data && data.error) || 'Could not save feedback edits.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Save Error', err, false);
           saveBtn.disabled = false;
           saveBtn.textContent = 'Save Changes';
           return;
@@ -3518,7 +3753,7 @@ async function renderAdminDashboard(env) {
         }
         closeEditFeedbackModal();
       } catch (err) {
-        alert('Network error while saving feedback edits.');
+        showAdminAlert('Network Error', 'Network error while saving feedback edits.', false);
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save Changes';
       }
@@ -3535,35 +3770,37 @@ async function renderAdminDashboard(env) {
           btn.style.color = '';
         }, 1800);
       } catch (e) {
-        alert('Could not copy message to clipboard.');
+        showAdminAlert('Copy Failed', 'Could not copy message to clipboard.', false);
       }
     }
 
     async function deleteFeedbackEntry(id) {
-      if (!confirm('Permanently delete this feedback entry?')) return;
-      const idx = feedbackEntries.findIndex((f) => f.id === id);
-      if (idx === -1) return;
-      const removedEntry = feedbackEntries[idx];
-      feedbackEntries.splice(idx, 1);
-      renderFeedbackList();
+      showAdminConfirm('Delete Feedback', 'Permanently delete this feedback entry?', 'Delete', async () => {
+        const idx = feedbackEntries.findIndex((f) => f.id === id);
+        if (idx === -1) return;
+        const removedEntry = feedbackEntries[idx];
+        feedbackEntries.splice(idx, 1);
+        renderFeedbackList();
 
-      try {
-        const res = await fetch('/admin/api/feedback/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: id }),
-        });
-        const data = await res.json().catch(() => null);
-        if (!data || !data.ok) {
+        try {
+          const res = await fetch('/admin/api/feedback/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id }),
+          });
+          const data = await res.json().catch(() => null);
+          if (!data || !data.ok) {
+            feedbackEntries.splice(idx, 0, removedEntry);
+            renderFeedbackList();
+            const err = (data && data.error) || 'Could not delete feedback entry.';
+            showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Delete Failed', err, false);
+          }
+        } catch (err) {
           feedbackEntries.splice(idx, 0, removedEntry);
           renderFeedbackList();
-          alert((data && data.error) || 'Could not delete feedback entry.');
+          showAdminAlert('Network Error', 'Network error while deleting feedback entry.', false);
         }
-      } catch (err) {
-        feedbackEntries.splice(idx, 0, removedEntry);
-        renderFeedbackList();
-        alert('Network error while deleting feedback entry.');
-      }
+      }, true);
     }
   </script>
 </body></html>`;
@@ -3589,6 +3826,8 @@ async function resolveConfig(configParam, env) {
           traktKey: parsed.traktKey || "",
           traktUsername: parsed.traktUsername || "",
           traktAccessToken: parsed.traktAccessToken || "",
+          simklKey: parsed.simklKey || "",
+          simklAccessToken: parsed.simklAccessToken || "",
           track: !!parsed.track,
           trackCreatorName: parsed.trackCreatorName || "",
           trackCreatorKey: parsed.trackCreatorKey || "",
@@ -3693,8 +3932,10 @@ function detectSource(input) {
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
+  if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
+  if (s.startsWith("simkl:user:")) return "simkl-user";
   if (s.startsWith("channel:v1:")) return "channel";
   if (s.startsWith("customlist:v1:")) return "custom-list";
   if (s.startsWith("autotrack:")) return "autotrack";
@@ -3799,17 +4040,11 @@ async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
       "Content-Type": "application/json",
       "trakt-api-version": "2",
       "trakt-api-key": traktKey || TRAKT_CLIENT_ID,
-      "User-Agent": "my-list-addon/1.12",
+      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
     };
     if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-    const res = await fetch(src, {
+    const res = await fetchTraktWithRetry(src, {
       headers,
-      // List composition virtually never changes once a list is public, so
-      // this is cached hard and shared across every search that surfaces
-      // the same list -- but never for an authenticated (private-list)
-      // request, since Cloudflare's cache key ignores headers and would
-      // otherwise risk serving one person's private list classification
-      // back to an unrelated, unauthenticated request for the same URL.
       cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 86400, cacheEverything: true },
     });
     if (!res.ok) return "unknown";
@@ -3835,26 +4070,16 @@ async function searchTraktLists(query, traktKeyOverride) {
   }
 
   const src = `https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=20`;
-  const res = await fetch(src, {
+  const res = await fetchTraktWithRetry(src, {
     headers: {
       "Content-Type": "application/json",
       "trakt-api-version": "2",
       "trakt-api-key": traktKey,
-      "User-Agent": "my-list-addon/1.6",
+      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
     },
     cf: { cacheTtl: 900, cacheEverything: true },
   });
   if (!res.ok) {
-    // Trakt's API uses 403 specifically to mean "invalid API key or
-    // unapproved app" (their own client libraries document this exact
-    // mapping) -- distinct from a 401 (malformed key) or 429 (rate
-    // limited). If TRAKT_CLIENT_ID starts failing with this code, the
-    // request itself isn't the problem: the API application behind that
-    // Client ID needs checking at https://trakt.tv/oauth/applications
-    // (revoked/expired/needs re-approval), or a fresh one created there --
-    // or the person searching can supply their own Client ID (see the
-    // Trakt API key box in the builder) to bypass this add-on's credential
-    // entirely.
     if (res.status === 403) {
       throw new Error(
         traktKeyOverride
@@ -3863,6 +4088,9 @@ async function searchTraktLists(query, traktKeyOverride) {
             "This isn't fixable from a search query -- either the Worker owner needs to check the app behind TRAKT_CLIENT_ID at https://trakt.tv/oauth/applications, or you can enter your own Trakt Client ID in the box above to bypass it."
       );
     }
+    if (res.status === 429) {
+      throw new Error("Trakt is temporarily busy (rate limit). Please wait a few seconds and try again.");
+    }
     throw new Error(`Trakt list search failed (HTTP ${res.status}).`);
   }
 
@@ -3870,24 +4098,25 @@ async function searchTraktLists(query, traktKeyOverride) {
   const lists = (Array.isArray(data) ? data : [])
     .map((r) => r.list)
     .filter((l) => l && l.ids && l.ids.slug && l.user && l.user.ids && l.user.ids.slug)
-    .map((l) => ({
-      name: l.name,
-      user: l.user.username || l.user.ids.slug,
-      slug: l.ids.slug,
-      items: l.item_count || 0,
-      likes: l.likes || 0,
-      url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
-        l.ids.slug
-      )}`,
-    }));
+    .map((l) => {
+      const name = l.name || "";
+      const isMovie = /\bmovie(s)?\b/i.test(name);
+      const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+      const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+      return {
+        name: l.name,
+        user: l.user.username || l.user.ids.slug,
+        slug: l.ids.slug,
+        items: l.item_count || 0,
+        likes: l.likes || 0,
+        contentType,
+        url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
+          l.ids.slug
+        )}`,
+      };
+    });
 
-  // Classify each result's actual content type (movie/series/mixed) so the
-  // builder can offer just the relevant Add button instead of defaulting
-  // to both -- throttled to stay well under Trakt's connection limits.
-  return mapWithConcurrency(lists, 8, async (l) => ({
-    ...l,
-    contentType: await classifyTraktListContentType(l.user, l.slug, traktKey),
-  }));
+  return lists;
 }
 // --- manifest ----------------------------------------------------------
 
@@ -4009,8 +4238,10 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
     else if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
+    else if (source === "tmdb-holiday") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHoliday(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:holiday:".length)); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
+    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
     else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env);
@@ -4091,10 +4322,6 @@ function parseChannelPayload(rawUrl) {
 
 function getPaddedChannelLogo(rawPoster, origin) {
   if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
-  const m = rawPoster.match(/https:\/\/image\.tmdb\.org\/t\/p\/(?:w\d+|original)\/(.+)/);
-  if (m && origin) {
-    return `${origin}/api/channel-logo?path=${encodeURIComponent('/' + m[1])}`;
-  }
   return rawPoster;
 }
 
@@ -4103,13 +4330,17 @@ function fetchChannelCatalog(entry, origin) {
   if (!payload || !payload.items.length) return [];
   const channelId = payload.channelId || entry.id;
   const name = payload.name || entry.name;
+  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
+  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
   return [
     {
       id: "channel_" + channelId,
       type: "series",
       name: name,
-      poster: getPaddedChannelLogo(payload.poster, origin),
-      posterShape: "landscape",
+      poster: getPaddedChannelLogo(channelPoster, origin),
+      background: getPaddedChannelLogo(channelBackdrop, origin),
+      thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
+      logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
     },
   ];
 }
@@ -4553,8 +4784,11 @@ function buildChannelMeta(entry, origin) {
     // to begin with) and matches the shape a known-working reference
     // implementation's meta responses use.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
+    const realSeason = typeof it.season === "number" ? it.season : parseInt(it.season, 10) || 1;
+    const realEpisode = typeof it.episode === "number" ? it.episode : parseInt(it.episode, 10) || 1;
+    const streamId = it.kind === "movie" ? it.imdbId : `${it.imdbId}:${realSeason}:${realEpisode}`;
     return {
-      id: it.kind === "movie" ? it.imdbId : `${it.imdbId}:${it.season}:${it.episode}`,
+      id: streamId,
       title: it.title,
       season: 1,
       episode: i + 1,
@@ -4562,13 +4796,16 @@ function buildChannelMeta(entry, origin) {
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });
+  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
+  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
   return {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: getPaddedChannelLogo(payload.poster, origin),
-    posterShape: "landscape",
-    background: getPaddedChannelLogo(payload.poster, origin),
+    poster: getPaddedChannelLogo(channelPoster, origin),
+    background: getPaddedChannelLogo(channelBackdrop, origin),
+    thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
+    logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
     videos,
   };
 }
@@ -4845,10 +5082,11 @@ function mapTraktItems(data, type) {
 // the page length — this only lines up cleanly if skip always arrives as a
 // multiple of PAGE_SIZE, which is how wako/Stremio drive the `skip` extra.
 // Every request — public or private — needs a Client ID; there's no
-// keyless public feed the way mdblist.com has one. A private list
-// additionally needs accessToken (the OAuth token from "Connect Trakt" --
-// see /api/trakt/oauth/* below), sent as a Bearer token alongside the
-// Client ID.
+// Dispatches to the right backend based on what kind of URL was pasted in.
+// `keys` is { mdblistKey, traktKey } — per-user keys decoded from their
+// install link, if any. A key the user didn't supply falls back to the
+// Worker-wide MDBLIST_API_KEY/TRAKT_CLIENT_ID constants at the top of the
+// file.
 async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!traktKey) {
     throw new Error(
@@ -4877,40 +5115,40 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
   };
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
-  const res = await fetch(src, {
-    headers,
-    // A Bearer-authenticated request must never be edge-cached the same
-    // way a public one is: Cloudflare's default cache key is the URL
-    // alone and ignores headers, so caching this could serve one person's
-    // private list response back to a completely different, unauthenticated
-    // request for that same URL path later. Only cache when there's no
-    // token attached (a genuinely public request).
-    cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 900, cacheEverything: true },
-  });
-  if (!res.ok) {
-    const hint =
-      res.status === 404
-        ? accessToken
-          ? " If this is a private list, make sure you're connected as its owner (see Connect Trakt in Settings)."
-          : " Double-check the list URL and that the list is public."
-        : res.status === 401 || res.status === 403
-        ? accessToken
-          ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-          : " Double-check your Trakt Client ID."
-        : "";
-    throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
-  }
+  const userHash = accessToken ? safeUserHash(accessToken, parsed.user) : "public";
+  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${skip}:${userHash}`;
 
-  const data = await res.json();
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: accessToken ? 60 : 300,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt List",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers,
+        cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 900, cacheEverything: true },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 404
+            ? accessToken
+              ? " If this is a private list, make sure you're connected as its owner (see Connect Trakt in Settings)."
+              : " Double-check the list URL and that the list is public."
+            : res.status === 401 || res.status === 403
+            ? accessToken
+              ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+              : " Double-check your Trakt Client ID."
+            : "";
+        throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
+  });
+
   return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
-// Pulls the connected account's Trakt watchlist -- a genuinely different
-// endpoint from a Trakt list (Trakt treats "the watchlist" as its own
-// separate thing, never returned alongside /users/me/lists, see
-// /api/trakt-my-private-lists below where it's fetched and prepended
-// separately). Always needs the OAuth access token from Connect Trakt --
-// unlike a list, a watchlist has no public/unauthenticated form at all.
+// Pulls the connected account's Trakt watchlist
 async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!accessToken) {
     throw new Error(
@@ -4925,44 +5163,43 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
   const itemKind = entry.type === "series" ? "shows" : "movies";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/me/watchlist/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
-  const res = await fetch(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    // Always authenticated/per-person -- never cached, same reasoning as
-    // fetchTrakt above (a shared cache key would risk leaking one
-    // person's watchlist into a different, unrelated request).
-    cf: { cacheTtl: 0, cacheEverything: false },
+
+  const userHash = safeUserHash(accessToken);
+  const cacheKey = `user_cache:trakt:watchlist:${itemKind}:${skip}:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt Watchlist",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers: {
+          "Content-Type": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": traktKey,
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403
+            ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : "";
+        throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
   });
-  if (!res.ok) {
-    const hint =
-      res.status === 401 || res.status === 403
-        ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-        : "";
-    throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
-  }
-  const data = await res.json();
+
   return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
 // History's shape is different from a plain list/watchlist -- each row is
 // { watched_at, action, movie } or { watched_at, action, episode, show }
 // instead of the { movie } / { show } wrapper mapTraktItems expects.
-// Movies map basically like any other Trakt item. TV history is logged
-// per-episode by Trakt (there's no per-episode imdb id), so each row keeps
-// the show's own imdb id -- same as any other series tile, so it opens the
-// real show normally -- with the season/episode/watched date folded into
-// the title so a watch event still reads as its own row even when several
-// share that id. James wants every watch event shown (rewatches included),
-// so this deliberately doesn't dedupe -- the same show/episode can appear
-// more than once, same id and all. Known tradeoff: a few Stremio/wako
-// clients key catalog rows by id for rendering, so a show watched several
-// times in a row could in principle render oddly there; left as-is since
-// collapsing to one row per title was explicitly not what was wanted here.
 function mapTraktHistoryItems(data, type) {
   const items = Array.isArray(data) ? data : [];
   const watchedLabel = (watchedAt) => {
@@ -4982,12 +5219,6 @@ function mapTraktHistoryItems(data, type) {
           id: imdbId,
           type,
           name: `${it.show.title} S${s}E${e}${epTitle}`,
-          // Plain show title, kept alongside the folded per-episode `name`
-          // above -- lets a caller that wants "one tile per show" (Copy to
-          // Custom List's Shows mode, see copyListToCustomList) recover
-          // the clean title without having to string-parse it back out of
-          // "Show S1E5 \u2014 Episode Title". Not used by the live catalog
-          // row itself (Stremio/wako only ever see `name`).
           showTitle: it.show.title,
           poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
           releaseInfo: watchedLabel(it.watched_at),
@@ -5005,12 +5236,7 @@ function mapTraktHistoryItems(data, type) {
     }));
 }
 
-// Pulls the connected account's Trakt watch history -- a chronological log
-// of every watch event, as opposed to fetchTraktWatchlist (queued-to-watch)
-// or fetchTrakt (a saved list). Rewatches show up as separate entries here
-// since Trakt logs a fresh row every time something's marked watched.
-// Always needs the OAuth access token from Connect Trakt -- same as the
-// watchlist, there's no public/unauthenticated form of a personal history.
+// Pulls the connected account's Trakt watch history
 async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!accessToken) {
     throw new Error(
@@ -5022,32 +5248,40 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
       "Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
     );
   }
-  // Movies use Trakt's /history/movies; shows use /history/episodes (Trakt
-  // logs individual episode watches, not whole shows -- see
-  // mapTraktHistoryItems for how that's folded back into a series tile).
   const itemKind = entry.type === "series" ? "episodes" : "movies";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/me/history/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
-  const res = await fetch(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    // Always authenticated/per-person -- never cached, same reasoning as
-    // fetchTraktWatchlist above.
-    cf: { cacheTtl: 0, cacheEverything: false },
+
+  const userHash = safeUserHash(accessToken);
+  const cacheKey = `user_cache:trakt:history:${itemKind}:${skip}:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt History",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers: {
+          "Content-Type": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": traktKey,
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403
+            ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : "";
+        throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
   });
-  if (!res.ok) {
-    const hint =
-      res.status === 401 || res.status === 403
-        ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-        : "";
-    throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
-  }
-  const data = await res.json();
+
   return enrichTrailers(mapTraktHistoryItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
@@ -5112,6 +5346,62 @@ async function fetchSimklChart(entry, skip, clientId, chartKey) {
 
   const data = await res.json();
   const metas = mapSimklItems(data, entry.type);
+  return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+}
+
+async function fetchSimklUserList(entry, skip, token, clientId, spec) {
+  if (!token) {
+    throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
+  }
+  const cid = clientId || SIMKL_CLIENT_ID;
+  const parts = (spec || "").split(":");
+  const category = parts[0] || "movies"; // "movies", "shows", "anime"
+  const status = parts[1] || "plantowatch"; // "plantowatch", "watching", "completed", "hold", "dropped"
+
+  const userHash = safeUserHash(token);
+  const cacheKey = `user_cache:simkl:all_items:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Simkl User Sync",
+    fetchFn: async () => {
+      const res = await fetch("https://api.simkl.com/sync/all-items/", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "simkl-api-key": cid,
+          "User-Agent": `my-lists-addon/${ADDON_VERSION}`,
+          "Accept": "application/json",
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        throw new Error(`Simkl user sync request failed (HTTP ${res.status}).`);
+      }
+      return await res.json();
+    }
+  });
+  const arr = Array.isArray(data[category]) ? data[category] : [];
+  const filtered = arr.filter((it) => (it.status || "plantowatch") === status);
+  const metas = [];
+  filtered.forEach((it) => {
+    const mediaObj = it.movie || it.show || it.anime;
+    if (mediaObj && mediaObj.ids) {
+      const imdbId = mediaObj.ids.imdb || "";
+      const tmdbId = mediaObj.ids.tmdb || "";
+      const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "");
+      if (id) {
+        metas.push({
+          id,
+          type: entry.type || (category === "movies" ? "movie" : "series"),
+          name: mediaObj.title || "",
+          poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+          releaseInfo: mediaObj.year ? String(mediaObj.year) : undefined,
+        });
+      }
+    }
+  });
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
@@ -5705,6 +5995,77 @@ async function fetchTmdbKids(entry, skip, apiKey, ratingGroup) {
     "&include_adult=false";
 
   const windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
+
+  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    if (!imdbId) return null;
+    return mapTmdbItem(it, imdbId, entry.type, videos);
+  });
+
+  return resolved.filter(Boolean);
+}
+
+const TMDB_HOLIDAY_CONFIG = {
+  christmas: {
+    keywords: "207317|6513|9799|236|157545",
+    query: "Christmas",
+  },
+  easter: {
+    keywords: "9937|229891|228968",
+    query: "Easter",
+  },
+  july4: {
+    keywords: "10084|6091|208453",
+    query: "Fourth of July",
+  },
+  halloween: {
+    keywords: "3335|10292|224636|12332",
+    query: "Halloween",
+  },
+  newyear: {
+    keywords: "613|228970",
+    query: "New Year",
+  },
+  thanksgiving: {
+    keywords: "10085|228969",
+    query: "Thanksgiving",
+  },
+  valentine: {
+    keywords: "9798|12377|208940",
+    query: "Valentine",
+  },
+};
+
+async function fetchTmdbHoliday(entry, skip, apiKey, holidayKey) {
+  if (!apiKey) {
+    throw new Error(
+      "Holiday lists aren't configured on this add-on yet - the Worker owner needs to set TMDB_API_KEY."
+    );
+  }
+  const wantKind = entry.type === "series" ? "tv" : "movie";
+  const key = String(holidayKey || "").toLowerCase();
+  const config = TMDB_HOLIDAY_CONFIG[key] || { keywords: "", query: key };
+
+  const discoverPath =
+    "discover/" + wantKind + "?sort_by=popularity.desc" +
+    (config.keywords ? "&with_keywords=" + encodeURIComponent(config.keywords) : "") +
+    "&include_adult=false";
+
+  let windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
+
+  if (windowItems.length < 15 && config.query) {
+    try {
+      const searchPath = "search/" + wantKind + "?query=" + encodeURIComponent(config.query) + "&include_adult=false";
+      const searchItems = await fetchTmdbPagedResults(searchPath, apiKey, 0, 0);
+      const seenIds = new Set(windowItems.map((it) => it.id));
+      for (const item of searchItems) {
+        if (!seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          windowItems.push(item);
+        }
+      }
+    } catch (e) {}
+  }
 
   const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
@@ -6399,7 +6760,7 @@ function buildMdblistChartsHtml() {
 // row; entry.type (set by which button was clicked) picks the right side
 // of that chart's path map at fetch time.
 const TMDB_CHART_LISTS = [
-  { name: "New Releases (Last 30 Days)", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_shows" },
+  { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_shows" },
   { name: "TMDB Trending", movieUrl: "tmdb:chart:trending", showUrl: "tmdb:chart:trending" },
   { name: "TMDB Popular", movieUrl: "tmdb:chart:popular", showUrl: "tmdb:chart:popular" },
   { name: "TMDB Top Rated", movieUrl: "tmdb:chart:top_rated", showUrl: "tmdb:chart:top_rated" },
@@ -6619,6 +6980,19 @@ function buildKidsHtml() {
   return buildStreamingRowsHtml(KIDS_LISTS, "", "Kids");
 }
 
+const HOLIDAY_LISTS = [
+  { name: "Christmas", movieUrl: "tmdb:holiday:christmas", showUrl: "tmdb:holiday:christmas" },
+  { name: "Easter", movieUrl: "tmdb:holiday:easter", showUrl: "tmdb:holiday:easter" },
+  { name: "Fourth of July", movieUrl: "tmdb:holiday:july4", showUrl: "tmdb:holiday:july4" },
+  { name: "Halloween", movieUrl: "tmdb:holiday:halloween", showUrl: "tmdb:holiday:halloween" },
+  { name: "New Year’s Eve", movieUrl: "tmdb:holiday:newyear", showUrl: "tmdb:holiday:newyear" },
+  { name: "Thanksgiving", movieUrl: "tmdb:holiday:thanksgiving", showUrl: "tmdb:holiday:thanksgiving" },
+  { name: "Valentine’s Day", movieUrl: "tmdb:holiday:valentine", showUrl: "tmdb:holiday:valentine" },
+];
+function buildHolidaysHtml() {
+  return buildStreamingRowsHtml(HOLIDAY_LISTS, "", "Holidays");
+}
+
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
 //
 // "TMDB Trending" -> "TMDB-Trending" -- title case preserved, everything
@@ -6660,6 +7034,7 @@ const CHART_SLUG_ENTRIES = (() => {
     ...STREAMING_ALL,
     ...HIDDEN_GEMS_LIST,
     ...KIDS_LISTS,
+    ...HOLIDAY_LISTS,
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));
@@ -6686,6 +7061,9 @@ function renderBuilder(
   const initialTraktKey = initialKeys.traktKey || "";
   const initialTraktUsername = initialKeys.traktUsername || "";
   const initialTraktAccessToken = initialKeys.traktAccessToken || "";
+  const initialSimklKey = initialKeys.simklKey || "";
+  const initialSimklAccessToken = initialKeys.simklAccessToken || "";
+  const initialSimklUsername = initialKeys.simklUsername || "";
   const initialShuffleShelves = !!initialKeys.shuffleShelves;
   const initialShuffleItems = !!initialKeys.shuffleItems;
   const streamingTop10Html = buildStreamingTop10Html();
@@ -6697,6 +7075,7 @@ function renderBuilder(
   const combinedChartsHtml = buildCombinedChartsHtml();
   const hiddenGemsHtml = buildHiddenGemsHtml();
   const kidsHtml = buildKidsHtml();
+  const holidaysHtml = buildHolidaysHtml();
   const hasInitial = initialEntries.length > 0;
   const initialEntriesJson = JSON.stringify(
     hasInitial
@@ -6930,7 +7309,7 @@ function renderBuilder(
   .bottom-nav { display: none; }
   @media (max-width: 640px) {
     .tab-bar { display: none; }
-    body { padding: 12px 12px calc(84px + env(safe-area-inset-bottom)); }
+    body { padding: 12px 12px calc(96px + env(safe-area-inset-bottom)); }
     .bottom-nav {
       display: flex;
       position: fixed !important;
@@ -6942,7 +7321,7 @@ function renderBuilder(
       -webkit-backdrop-filter: saturate(180%) blur(20px);
       backdrop-filter: saturate(180%) blur(20px);
       border-top: 1px solid var(--border);
-      padding: 5px 0 calc(5px + env(safe-area-inset-bottom));
+      padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
       box-shadow: 0 -1px 0 rgba(0,0,0,0.08), 0 -4px 16px rgba(0,0,0,0.05);
     }
     :root.dark-theme .bottom-nav, html.dark-theme .bottom-nav, body.dark-theme .bottom-nav {
@@ -6956,29 +7335,37 @@ function renderBuilder(
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 2px;
-      padding: 3px 1px;
-      min-height: 48px;
+      gap: 3px;
+      padding: 4px 1px;
+      min-height: 62px;
       background: none;
       border: none;
       border-radius: 0;
       color: var(--muted);
-      font-size: 0.60rem;
+      font-size: 0.78rem;
       font-weight: 600;
       letter-spacing: 0.01em;
       cursor: pointer;
       transition: color 0.12s ease;
       white-space: nowrap;
-      line-height: 1;
+      line-height: 1.1;
     }
     .bottom-nav-item svg {
-      width: 22px; height: 22px; flex: none;
+      width: 28.5px; height: 28.5px; flex: none;
       transition: transform 0.12s ease;
       stroke-width: 1.8;
     }
     .bottom-nav-item.active { color: var(--accent); }
     .bottom-nav-item.active svg { transform: translateY(-1px); stroke-width: 2.2; }
     .bottom-nav-item:active { opacity: 0.6; }
+  }
+
+  .live-preview-poster-card.dragging {
+    opacity: 0.55 !important;
+    transform: scale(1.05) !important;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.4) !important;
+    z-index: 100 !important;
+    pointer-events: none !important;
   }
 
   /* --- Segmented Top Submenus (Matching Screenshot 3) --------------------- */
@@ -7316,6 +7703,71 @@ function renderBuilder(
     }
   }
 
+  /* --- Channel Accordions & Grid ------------------------------------------- */
+  .channel-card-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow-sm);
+  }
+  .channel-accordion {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 14px;
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+  .channel-accordion summary {
+    padding: 12px 16px;
+    font-weight: 700;
+    font-size: 0.92rem;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+  }
+  .channel-accordion summary::-webkit-details-marker {
+    display: none;
+  }
+  .channel-accordion summary::after {
+    content: '\u25be';
+    font-size: 1rem;
+    color: var(--muted);
+    transition: transform 0.2s ease;
+  }
+  .channel-accordion[open] summary::after {
+    transform: rotate(180deg);
+  }
+  .channel-accordion[open] summary {
+    border-bottom: 1px solid var(--border);
+  }
+  .channel-accordion-body {
+    padding: 14px 16px;
+  }
+  .channel-quick-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 8px;
+  }
+  .channel-season-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-top: 8px;
+  }
+  @media (min-width: 641px) {
+    .channel-season-grid {
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    }
+  }
+
   /* --- Wako List Cards Feed (Lists Tab - Matching Screenshot 3) ------------ */
   .list-card {
     background: var(--surface);
@@ -7607,6 +8059,47 @@ function renderBuilder(
     }
   }
 
+  /* --- Merged Channels Chips & Inline Add Selector ------------------------ */
+  .merge-chip-remove-btn {
+    background: transparent !important;
+    border: none !important;
+    color: var(--muted) !important;
+    font-size: 0.95rem !important;
+    font-weight: 700 !important;
+    line-height: 1 !important;
+    cursor: pointer !important;
+    padding: 0 0 0 4px !important;
+    margin: 0 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    transition: color 0.15s !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    width: auto !important;
+    height: auto !important;
+  }
+  .merge-chip-remove-btn:hover {
+    color: var(--danger) !important;
+  }
+  .merge-add-channel-select {
+    padding: 3px 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--border);
+    background: var(--surface);
+    color: var(--accent);
+    cursor: pointer;
+    max-width: 220px;
+    outline: none;
+    transition: border-color 0.15s, color 0.15s;
+    margin: 2px 0 2px 4px;
+  }
+  .merge-add-channel-select:hover {
+    border-color: var(--accent);
+  }
+
   /* --- Cards & Panels ---------------------------------------------------- */
   .panel {
     background: var(--surface);
@@ -7743,8 +8236,8 @@ function renderBuilder(
     box-shadow: var(--shadow-sm);
   }
   button:hover:not(:disabled), .actions a:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.38; cursor: default; }
   .btn-stremio { background: linear-gradient(135deg, #9B8FFF, #6D48FF); color: #fff; }
+  .btn-nuvio   { background: linear-gradient(135deg, #FF5E3A, #FF2A68); color: #fff; }
   .btn-wako    { background: linear-gradient(135deg, #007AFF, #34AADC); color: #fff; }
   .actions { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 
@@ -8140,8 +8633,6 @@ function renderBuilder(
         <span class="app-header-sub" id="pageSubtitle">Explore Popular &amp; Streaming</span>
       </div>
     </div>
-    <button type="button" id="headerCreateListBtn" class="header-icon-btn" style="display:none; flex: 0 0 auto; font-size: 1.4rem; font-weight: 300; cursor:pointer;" onclick="openCreateListModal()" title="Create List">+</button>
-    <button type="button" id="headerAddShelfBtn" class="header-icon-btn" style="display:none; flex: 0 0 auto; font-size: 1.4rem; font-weight: 300; cursor:pointer;" onclick="openAddShelfModal()" title="Add Custom Shelf">+</button>
     <div class="app-header-actions">
       <div id="creatorProfileBar"></div>
     </div>
@@ -8149,8 +8640,9 @@ function renderBuilder(
 
   <!-- Top Tab Bar (Desktop View) -->
   <div class="tab-bar" role="tablist">
-    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">My Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">My Lists</button>
+    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
+    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" data-tab="channels" onclick="switchTab('channels')">Channels</button>
     <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
     <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
     <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
@@ -8158,19 +8650,26 @@ function renderBuilder(
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->
   <nav class="bottom-nav" role="tablist" aria-label="Main navigation">
-    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="My Catalogs">
+    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="My Lists">
+    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
         <line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line>
       </svg>
-      My Lists
+      Lists
+    </button>
+    <button type="button" class="bottom-nav-item" data-tab="channels" onclick="switchTab('channels')" title="Channels">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>
+        <polyline points="17 2 12 7 7 2"></polyline>
+      </svg>
+      Channels
     </button>
     <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -8226,22 +8725,43 @@ function renderBuilder(
   </div>
 
   <div id="createListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
-    <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
-      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Create List</h2>
-      
-      <div style="margin-top: 16px;">
-        <input type="text" id="createListModalName" placeholder="List name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;" oninput="document.getElementById('createListModalBtn').disabled = !this.value.trim(); document.getElementById('createListModalBtn').style.opacity = this.value.trim() ? '1' : '0.5';">
+    <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
+        <button type="button" class="modal-close-x" onclick="document.getElementById('createListModal').style.display = 'none';">&#x2715;</button>
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Destination</label>
+        <select id="createListModalDestination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
+          <option value="custom">Custom List</option>
+          <option value="trakt">Trakt List</option>
+          <option value="tmdb">TMDB List</option>
+          <option value="mdblist">MDBList List</option>
+          <option value="simkl">Simkl List</option>
+        </select>
       </div>
       
-      <div style="margin-top: 14px;">
-        <select id="createListModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;">
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">List Name *</label>
+        <input type="text" id="createListModalName" placeholder="e.g. My Favorite Sci-Fi" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" oninput="document.getElementById('createListModalBtn').disabled = !this.value.trim(); document.getElementById('createListModalBtn').style.opacity = this.value.trim() ? '1' : '0.5';">
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Description (Optional)</label>
+        <textarea id="createListModalDesc" placeholder="Brief summary of what is in this list..." rows="2" style="width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.9rem; resize:vertical; font-family:inherit;"></textarea>
+      </div>
+      
+      <div style="margin-bottom: 14px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Content Type</label>
+        <select id="createListModalType" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
           <option value="mixed">Mixed (Movies &amp; Shows)</option>
         </select>
       </div>
       
-      <div style="margin-top: 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+      <div id="createListModalPublicWrap" style="margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center;">
         <span style="font-size: 0.95rem; font-weight:500; color: var(--text);">Public</span>
         <label class="ui-toggle">
           <input type="checkbox" id="createListModalPublic" checked>
@@ -8249,20 +8769,20 @@ function renderBuilder(
         </label>
       </div>
       
-      <div style="display: flex; justify-content: flex-end; gap: 20px;">
-        <button type="button" style="background:none; border:none; color:var(--text); font-weight:600; font-size:1rem; cursor:pointer;" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
-        <button type="button" id="createListModalBtn" style="background:none; border:none; color:var(--accent); font-weight:600; font-size:1rem; cursor:pointer; opacity: 0.5;" disabled onclick="submitCreateListModal()">Create</button>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
+        <button type="button" class="lc-btn primary" id="createListModalBtn" style="opacity: 0.5; min-width: 80px;" disabled onclick="submitCreateListModal()">Create</button>
       </div>
     </div>
   </div>
 
-  <!-- Add Shelf Modal -->
+  <!-- Add Catalog Modal -->
   <div id="addShelfModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
-      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Shelf</h2>
+      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
       <div style="margin: 16px 0;">
-        <input type="text" id="addShelfModalName" placeholder="Shelf name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" oninput="validateAddShelfModal()">
+        <input type="text" id="addShelfModalName" placeholder="Catalog name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" oninput="validateAddShelfModal()">
         
         <div id="addShelfModalLinksContainer">
           <div class="add-shelf-link-row" style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
@@ -8285,17 +8805,50 @@ function renderBuilder(
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
-    <div class="modal-card" style="width: 100%; max-width: 440px; padding: 22px; background: #fff; border-radius: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); display: flex; flex-direction: column; max-height: 90vh;">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-        <h2 style="margin-top:0; color:#001f3f;">Lists</h2>
-        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">\u2715</button>
+  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+    <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
+        <div>
+          <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Add / Remove from Lists</h2>
+          <p style="margin:4px 0 0; font-size:0.85rem; color:var(--muted);">Check to add, uncheck to remove.</p>
+        </div>
+        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">&#x2715;</button>
       </div>
-      <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 40vh; overflow-y: auto; margin-bottom: 24px;">
+      <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 55vh; overflow-y: auto; margin-bottom: 18px; padding-right: 4px;">
         <!-- Filled dynamically -->
       </div>
-      <div style="display: flex; justify-content: flex-end;">
-        <button type="button" id="addSelectedListsBtn" style="background: transparent; color: #003366; font-weight: 600; border: none; padding: 8px 16px; font-size: 1rem; cursor: pointer;">Done</button>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="document.getElementById('selectListModal').style.display = 'none'; document.body.style.overflow = '';">Cancel</button>
+        <button type="button" class="lc-btn primary" id="addSelectedListsBtn" style="min-width: 90px;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trakt Device Activation Modal -->
+  <div id="traktDeviceModal" class="modal-overlay" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+    <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
+        <button type="button" class="modal-close-x" onclick="closeTraktDeviceModal()">&#x2715;</button>
+      </div>
+      <p style="margin: 0 0 16px; color: var(--muted); font-size: 0.9rem;">To authorize your Trakt account without redirects or rate limits, enter the code below on Trakt:</p>
+      
+      <div id="traktDeviceCodeBox" style="background: var(--panel-strong); border: 2px dashed var(--accent); border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+        <div id="traktDeviceUserCode" style="font-size: 2rem; font-weight: 800; letter-spacing: 4px; color: var(--accent); font-family: monospace;">LOADING...</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px;">
+        <a id="traktDeviceActivateLink" href="https://trakt.tv/activate" target="_blank" rel="noopener noreferrer" class="lc-btn primary" style="padding: 12px; font-weight: 700; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+          Open trakt.tv/activate &#x2197;
+        </a>
+      </div>
+
+      <div id="traktDevicePollingStatus" style="font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 8px;">
+        Waiting for authorization on Trakt...
+      </div>
+
+      <div style="margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" style="width: 100%;" onclick="closeTraktDeviceModal()">Cancel</button>
       </div>
     </div>
   </div>
@@ -8311,6 +8864,7 @@ window._CHARTS_SIMKL_ANIME = ${JSON.stringify(SIMKL_ANIME_LIST)};
 window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
 window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
 window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
+window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }
@@ -8319,9 +8873,8 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
-    <button type="button" class="subnav-pill active" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> Shelves</button>
+    <button type="button" class="subnav-pill active" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
     <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('quickadd', this)">Quick Add</button>
-    <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('channels', this)">Channels</button>
     <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('bulk', this)">Bulk Add</button>
   </div>
 
@@ -8331,15 +8884,14 @@ if ('serviceWorker' in navigator) {
     <div class="shelf-header" style="margin-bottom:12px;">
       <h2 class="shelf-title">Live Preview &amp; Editor</h2>
       <div class="actions" style="flex-direction:row; flex-wrap:wrap; align-items:center; gap:6px;">
+        <button type="button" class="primary lc-btn" onclick="openAddShelfModal()">+ Catalog</button>
         <button type="button" class="secondary lc-btn" id="livePreviewEditBtn" onclick="toggleLivePreviewEdit()">Edit</button>
         <button type="button" class="secondary lc-btn" onclick="renderLivePreview()">Refresh Preview</button>
-        <button type="button" class="secondary lc-btn" id="compactToggleBtn" onclick="toggleCompactView(this)">Compact</button>
-        <button type="button" class="secondary lc-btn" id="testAllBtn" onclick="testAllSources()">Test all</button>
       </div>
     </div>
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
-      <input type="text" id="listFilterInput" placeholder="Filter shelves by name..." oninput="filterLists()">
+      <input type="text" id="listFilterInput" placeholder="Filter catalogs by name..." oninput="filterLists()">
       <select id="listGroupFilterSelect" onchange="filterLists()" style="flex:none; width:auto;">
         <option value="">All groups</option>
       </select>
@@ -8356,11 +8908,11 @@ if ('serviceWorker' in navigator) {
       <div style="display:flex; flex-direction:column; gap:8px;">
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem; margin:0; user-select:none;">
           <input type="checkbox" id="shuffleShelvesCheckbox" onchange="saveState()" style="cursor:pointer; width:16px; height:16px;">
-          <span>Shuffle Shelves daily (every 24h)</span>
+          <span>Shuffle Catalogs daily (every 24h)</span>
         </label>
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem; margin:0; user-select:none;">
           <input type="checkbox" id="shuffleItemsCheckbox" onchange="saveState()" style="cursor:pointer; width:16px; height:16px;">
-          <span>Shuffle Items in Shelves daily (every 24h)</span>
+          <span>Shuffle items in Catalogs daily (every 24h)</span>
         </label>
       </div>
     </div>
@@ -8458,105 +9010,23 @@ if ('serviceWorker' in navigator) {
       </div>
       ${streamingHtml}
     </div>
-  </div>
-  </div>
 
-  <div class="lists-subpanel" id="catalogsSubChannels" style="display:none;">
-    <div class="panel">
-      <div class="shelf-header" style="margin-bottom:10px;">
-        <h2 class="shelf-title">TV Channel Creator <span class="badge" id="channelDraftCountBadge"></span></h2>
+    <!-- Kids Shelf -->
+    <div class="shelf-section discover-shelf" data-shelf-type="all">
+      <div class="shelf-header">
+        <h2 class="shelf-title">Kids</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="kids">+ Add all</button>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Turn any show into a 24/7 style continuous episode stream channel catalog item.</p>
-
-      <div style="margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid var(--border);">
-        <p style="margin:0 0 8px; font-weight:700; font-size:0.88rem;">My Created Channels:</p>
-        <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No created channels yet.</small></p></div>
-      </div>
-
-    <div style="margin-bottom:16px;">
-      <p style="margin:0 0 8px; font-weight:700; font-size:0.88rem;">Quick Add Popular TV Channels:</p>
-      <div class="actions" style="flex-direction:row; flex-wrap:wrap; gap:6px;">
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="CBS Network" data-networkid="16">CBS</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="NBC Network" data-networkid="6">NBC</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="ABC Network" data-networkid="2">ABC</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="FOX Network" data-networkid="19">FOX</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="The CW" data-networkid="71">The CW</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="HBO Classics" data-networkid="49">HBO</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Disney Channel" data-networkid="54">Disney Channel</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Nickelodeon" data-networkid="13">Nickelodeon</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Comedy Central" data-networkid="47">Comedy Central</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="USA Network" data-networkid="30">USA Network</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Adult Swim" data-networkid="80">Adult Swim</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Cartoon Network" data-networkid="56">Cartoon Network</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="FX Hits" data-networkid="88">FX</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="AMC Series" data-networkid="174">AMC</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Syfy" data-networkid="149">Syfy</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="MTV" data-networkid="33">MTV</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Discovery" data-networkid="64">Discovery Channel</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="History Channel" data-networkid="65">History</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="A&amp;E" data-networkid="129">A&amp;E</button>
-        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="BBC One" data-networkid="4">BBC One</button>
-      </div>
-      <div id="channelQuickAddStatus" style="margin-top:6px;"></div>
+      ${kidsHtml}
     </div>
 
-    <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:14px;">
-      <p style="margin:0 0 6px; font-weight:700; font-size:0.88rem;">Search and Build Channel Episodes:</p>
-      <div class="row">
-        <input type="text" id="channelSearchInput" placeholder="Search a show by name" onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
-        <button type="button" class="secondary" onclick="runChannelTitleSearch()">Search</button>
+    <!-- Holidays Shelf -->
+    <div class="shelf-section discover-shelf" data-shelf-type="all">
+      <div class="shelf-header">
+        <h2 class="shelf-title">Holidays</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="holidays">+ Add all</button>
       </div>
-      <div id="channelSearchResult"></div>
-      <div id="channelEpisodePicker"></div>
-
-      <div id="channelDraftPicksDetails" style="margin-top:12px;">
-        <p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Channel Picks <span class="badge" id="channelDraftPicksCountBadge"></span>:</p>
-        <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
-        <div class="actions" style="margin-top:8px;">
-          <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks</button>
-          <button type="button" class="secondary lc-btn" onclick="removeAllChannelDraftPicks()">Remove all</button>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top:8px; align-items:center;">
-        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-          <input type="checkbox" id="channelRandomizeCheck">
-          <span style="font-size:0.85rem;">Randomize play order (daily reshuffle)</span>
-        </label>
-      </div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Cartoon Central)">
-        <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save as Channel</button>
-        <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel edit</button>
-      </div>
-    </div>
-
-    <div style="margin-top:18px; border-top:1px solid var(--border); padding-top:14px;">
-      <p style="margin:0 0 8px; font-weight:700; font-size:0.88rem;">Import Channel from a Link:</p>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Paste any show list URL (MDBList or Trakt) to automatically generate a TV channel shelf.</p>
-      <div class="row">
-        <input type="text" id="channelImportUrlInput" placeholder="Show list URL (mdblist.com or trakt.tv)">
-      </div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
-        <button type="button" class="secondary" onclick="importChannelFromLink(this)">Import channel</button>
-      </div>
-    </div>
-
-    <div style="margin-top:18px; border-top:1px solid var(--border); padding-top:14px;">
-      <p style="margin:0 0 6px; font-weight:700; font-size:0.88rem;">Merge Saved Channels into One Shelf:</p>
-      <div class="actions" style="margin-bottom:8px;">
-        <button type="button" class="secondary lc-btn" onclick="renderChannelMergeList()">Refresh list</button>
-        <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:0.85rem;">
-          <input type="checkbox" id="channelMergeSelectAllCheck" onchange="toggleAllChannelMergeChecks(this)">
-          <span>Select all</span>
-        </label>
-      </div>
-      <div id="channelMergeList"><p style="color:var(--muted); font-size:0.85rem;"><small>No saved channels yet.</small></p></div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" id="channelMergeNameInput" placeholder="Combined shelf name (e.g. Live TV)">
-        <button type="button" class="secondary" onclick="mergeChannelsIntoRow()">Merge into shelf</button>
-      </div>
+      ${holidaysHtml}
     </div>
   </div>
   </div>
@@ -8572,6 +9042,7 @@ if ('serviceWorker' in navigator) {
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('curated', this)">Curated</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('kids', this)">Kids</button>
+    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
   </div>
 
   <!-- Discover Shelves Feed -->
@@ -8602,6 +9073,9 @@ if ('serviceWorker' in navigator) {
 
     <!-- Kids Shelf -->
     ${kidsHtml}
+
+    <!-- Holidays Shelf -->
+    ${holidaysHtml}
   </div>
 
   <!-- Discover Lists Feed (Movies / Shows list view matching search) -->
@@ -8629,7 +9103,7 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> Custom Lists</button>
+    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
     <button type="button" class="subnav-pill" onclick="switchListsSubmenu('liked', this)">Liked</button>
     <button type="button" class="subnav-pill" onclick="switchListsSubmenu('import', this)">Import</button>
   </div>
@@ -8639,7 +9113,10 @@ if ('serviceWorker' in navigator) {
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title">Your Custom Lists</h2>
-        <button type="button" class="secondary lc-btn" onclick="renderCreatorDashboard()">Refresh</button>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="primary lc-btn" onclick="openCreateListModal('custom')">+ New List</button>
+          <button type="button" class="secondary lc-btn" onclick="renderCreatorDashboard()">Refresh</button>
+        </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Custom lists you've created locally or on your profile.</p>
       <div id="creatorDashboard"></div>
@@ -8648,7 +9125,10 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your MDBList Lists</h2>
-        <button type="button" class="secondary lc-btn" id="listsMdblistConnectBtn" onclick="toggleListsMdblistConnection()">Connect MDBList</button>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="primary lc-btn" onclick="openCreateListModal('mdblist')">+ New List</button>
+          <button type="button" class="secondary lc-btn" id="listsMdblistConnectBtn" onclick="toggleListsMdblistConnection()">Connect MDBList</button>
+        </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists belonging to your connected MDBList account or API key configured in Settings.</p>
       <div id="myMdblistListsResult"></div>
@@ -8657,7 +9137,10 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Trakt Lists</h2>
-        <button type="button" class="secondary lc-btn" id="listsTraktConnectBtn" onclick="toggleListsTraktConnection()">Connect Trakt</button>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="primary lc-btn" onclick="openCreateListModal('trakt')">+ New List</button>
+          <button type="button" class="secondary lc-btn" id="listsTraktConnectBtn" onclick="toggleListsTraktConnection()">Connect Trakt</button>
+        </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Public and personal lists from your Trakt username/account.</p>
       <div id="myTraktListsResult"></div>
@@ -8667,10 +9150,25 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your TMDB Lists</h2>
-        <button type="button" class="secondary lc-btn" id="listsTmdbConnectBtn" onclick="toggleListsTmdbConnection()">Connect TMDB</button>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="primary lc-btn" onclick="openCreateListModal('tmdb')">+ New List</button>
+          <button type="button" class="secondary lc-btn" id="listsTmdbConnectBtn" onclick="toggleListsTmdbConnection()">Connect TMDB</button>
+        </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists, Watchlist, and Favorites from your connected TMDB account.</p>
       <div id="myTmdbListsResult"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="panel-title" style="margin-bottom:0;">Your Simkl Lists</h2>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="primary lc-btn" onclick="openCreateListModal('simkl')">+ New List</button>
+          <button type="button" class="secondary lc-btn" id="listsSimklConnectBtn" onclick="toggleListsSimklConnection()">Connect Simkl</button>
+        </div>
+      </div>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Watchlists and personal lists from your connected Simkl account.</p>
+      <div id="mySimklListsResult"></div>
     </div>
   </div>
 
@@ -8687,22 +9185,12 @@ if ('serviceWorker' in navigator) {
   <div class="lists-subpanel" id="listsSubCreateList" style="display:none;">
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
-        <h2 class="shelf-title" id="customListEditorTitle">Create a Custom List <span class="badge" id="customListDraftCountBadge"></span></h2>
+        <h2 class="shelf-title" id="customListEditorTitle">Edit Custom List <span class="badge" id="customListDraftCountBadge"></span></h2>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Build a hand-picked list of movies or shows by searching and adding them one at a time. After saving, your list will appear under <strong>My Lists</strong>.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Manage items and settings for this custom list. You can reorder items by dragging or typing a position number, remove items with the &times; button, or add new items from Search, Discover, or Charts.</p>
 
-      <div class="row">
-        <input type="text" id="customListSearchInput" placeholder="Search a movie or show by name" onkeydown="if(event.key==='Enter'){event.preventDefault();runCustomListSearch();}">
-        <select id="customListSearchType" style="flex:none; width:auto;">
-          <option value="movie">&#x1F3AC; Movies</option>
-          <option value="tv">&#x1F4FA; Shows</option>
-        </select>
-        <button type="button" class="secondary" onclick="runCustomListSearch()">Search</button>
-      </div>
-      <div id="customListSearchResult"></div>
-
-      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks so far (in play order):</p>
-      <div id="customListDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this list:</p>
+      <div id="customListDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p></div>
       <div class="actions" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="shuffleCustomListDraft()">Shuffle picks now</button>
       </div>
@@ -8736,8 +9224,8 @@ if ('serviceWorker' in navigator) {
       </div>
       <div class="row" style="margin-top:10px;">
         <input type="text" id="customListNameInput" placeholder="List name (e.g. My Favorites)">
-        <button type="button" class="primary" id="customListSaveBtn" onclick="saveCustomList()">Save List</button>
-        <button type="button" id="customListCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditCustomList()">Cancel edit</button>
+        <button type="button" class="primary" id="customListSaveBtn" onclick="saveCustomList()">Save</button>
+        <button type="button" id="customListCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditCustomList()">Cancel</button>
       </div>
     </div>
   </div>
@@ -8766,6 +9254,147 @@ if ('serviceWorker' in navigator) {
 
 
 </div>
+<div class="tab-panel" data-tab-panel="channels" hidden>
+  <!-- Top Submenu Pills for Channels -->
+  <div class="subnav-pills-bar" id="channelsSubnavBar">
+    <button type="button" class="subnav-pill active" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
+    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('import', this)">Import</button>
+  </div>
+
+  <!-- Submenu 1: My Channels -->
+  <div class="channels-subpanel" id="channelsSubMyChannels">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title">My Channels</h2>
+        <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Merge Saved Channels into One Catalog</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Combine multiple saved TV channels into a single catalog row on your Catalogs shelf.</p>
+      
+      <div id="savedMergedChannelsSection" style="margin-bottom:16px;">
+        <div id="savedMergedChannelsList"></div>
+      </div>
+
+      <div style="border-top:1px solid var(--border); padding-top:12px; margin-top:12px;">
+        <div class="shelf-header" style="margin-bottom:8px;">
+          <h3 style="font-size:0.95rem; font-weight:700; margin:0;">Create Merged Catalog</h3>
+        </div>
+        <div class="actions" style="margin-bottom:8px; justify-content:space-between;">
+          <button type="button" class="secondary lc-btn" onclick="renderChannelMergeList()">Refresh list</button>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:0.85rem; user-select:none;">
+            <input type="checkbox" id="channelMergeSelectAllCheck" onchange="toggleAllChannelMergeChecks(this)">
+            <span>Select all</span>
+          </label>
+        </div>
+        <div id="channelMergeList"><p style="color:var(--muted); font-size:0.85rem;"><small>No saved channels yet.</small></p></div>
+        <div class="row" style="margin-top:8px;">
+          <input type="text" id="channelMergeNameInput" placeholder="Combined catalog name (e.g. Live TV)">
+          <button type="button" class="secondary" onclick="mergeChannelsIntoRow()">Merge into catalog</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Submenu 2: Quick Add Popular Networks -->
+  <div class="channels-subpanel" id="channelsSubQuickAdd" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Quick Add Popular Networks</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Instant 1-click TV channels with automatic daily episode rotation:</p>
+      <div class="channel-quick-grid">
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="A&amp;E" data-networkid="129">A&amp;E</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="ABC" data-networkid="2">ABC</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Adult Swim" data-networkid="80">Adult Swim</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="AMC" data-networkid="174">AMC</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="BBC One" data-networkid="4">BBC One</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Cartoon Network" data-networkid="56">Cartoon Network</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="CBS" data-networkid="16">CBS</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Comedy Central" data-networkid="47">Comedy Central</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Discovery" data-networkid="64">Discovery</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Disney Channel" data-networkid="54">Disney Channel</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Food Network" data-networkid="143">Food Network</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="FOX" data-networkid="19">FOX</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="FX" data-networkid="88">FX</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Hallmark Channel" data-networkid="384">Hallmark Channel</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="HBO" data-networkid="49">HBO</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="HGTV" data-networkid="209">HGTV</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="History" data-networkid="65">History</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Ion Television" data-networkid="436">Ion Television</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="MeTV" data-networkid="738">MeTV</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="MTV" data-networkid="33">MTV</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="NBC" data-networkid="6">NBC</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Nickelodeon" data-networkid="13">Nickelodeon</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="Syfy" data-networkid="149">Syfy</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="TBS" data-networkid="68">TBS</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="The CW" data-networkid="71">The CW</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="TLC" data-networkid="84">TLC</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="TNT" data-networkid="41">TNT</button>
+        <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="USA Network" data-networkid="30">USA Network</button>
+      </div>
+      <div id="channelQuickAddStatus" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <!-- Submenu 3: Import & Merge Tools -->
+  <div class="channels-subpanel" id="channelsSubImport" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Import Channel from a Link</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste any show list URL (MDBList or Trakt) to automatically generate a TV channel catalog.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="channelImportUrlInput" placeholder="Show list URL (mdblist.com or trakt.tv)">
+      </div>
+      <div class="row">
+        <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
+        <button type="button" class="secondary" onclick="importChannelFromLink(this)">Import channel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Channel Builder / Editor -->
+  <div class="channels-subpanel" id="channelsSubBuild" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title" id="channelEditorTitle">Edit TV Channel <span class="badge" id="channelDraftCountBadge"></span></h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search any TV show or movie to add episodes to your channel, and reorder or remove picks:</p>
+      <div class="row">
+        <input type="text" id="channelSearchInput" placeholder="Search a show by name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
+        <button type="button" class="secondary" onclick="runChannelTitleSearch()">Search</button>
+      </div>
+      <div id="channelSearchResult"></div>
+      <div id="channelEpisodePicker"></div>
+
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
+      <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
+      <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
+        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Clear All</button>
+      </div>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
+        <input type="checkbox" id="channelRandomizeCheck">
+        <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
+      </label>
+
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
+        <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
+        <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="tab-panel" data-tab-panel="search" hidden>
   <div class="panel">
     <div class="shelf-header" style="margin-bottom:10px;">
@@ -8844,7 +9473,7 @@ if ('serviceWorker' in navigator) {
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Auto-Track Playback</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them in Stremio or wako &mdash; from any addon, not just this one. Works by declaring a subtitles resource that Stremio/wako call whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them from any addon, not just this one. Works by declaring a subtitles resource that is called whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
       <div id="trackPlaybackSection"></div>
     </div>
   </div>
@@ -8879,6 +9508,7 @@ if ('serviceWorker' in navigator) {
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Trakt account to import your personal lists, watchlist, and collection, or use a custom Client ID.</p>
         <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
           <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()">Connect Trakt Account</button>
+          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()">Connect with PIN / Code</button>
           <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none;" onclick="disconnectTrakt()">Disconnect</button>
         </div>
         <p id="traktConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
@@ -8897,7 +9527,7 @@ if ('serviceWorker' in navigator) {
       </div>
 
       <!-- MDBList Section -->
-      <div id="mdblistSection" style="padding-bottom:14px; margin-bottom:14px;">
+      <div id="mdblistSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">MDBList</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your MDBList account to import your personal lists, watchlist, and watch history, or use a custom API key.</p>
         <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
@@ -8910,6 +9540,24 @@ if ('serviceWorker' in navigator) {
           <div style="margin-top:8px;">
             <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Simkl Section -->
+      <div id="simklSection" style="padding-bottom:14px; margin-bottom:14px;">
+        <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Simkl</p>
+        <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Simkl account to import your personal lists, watchlist, and history, or use a custom Client ID.</p>
+        <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+          <button type="button" class="secondary" id="simklConnectBtn" onclick="startSimklConnect()">Connect Simkl Account</button>
+          <button type="button" class="secondary" id="simklDisconnectBtn" style="display:none;" onclick="disconnectSimkl()">Disconnect</button>
+        </div>
+        <p id="simklConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
+        <details style="font-size:0.85rem; color:var(--muted);">
+          <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
+          <div style="margin-top:8px;">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
       </div>
@@ -9191,6 +9839,8 @@ var livePreviewShelfData = [];
 var activeTraktToken = null;
 let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
 let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
+let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
+let simklUsername = ${JSON.stringify(initialSimklUsername)};
 
 async function compressJsonToBase64(obj) {
   try {
@@ -9242,7 +9892,7 @@ function switchTab(name) {
 
   const titles = {
     discover: { title: 'Discover', sub: 'Explore Popular & Streaming' },
-    catalogs: { title: 'My Catalogs', sub: 'Manage Configured Shelves' },
+    catalogs: { title: 'Catalogs', sub: 'Manage Configured Catalogs' },
     lists: { title: 'Lists', sub: 'Community & Curated Lists' },
     channels: { title: 'Channels', sub: '24/7 Continuous TV Streaming' },
     search: { title: 'Search', sub: 'Find Movies, Shows & Lists' },
@@ -9253,15 +9903,6 @@ function switchTab(name) {
   const subEl = document.getElementById('pageSubtitle');
   if (titleEl) titleEl.textContent = t.title;
   if (subEl) subEl.textContent = t.sub;
-
-  const createListBtn = document.getElementById('headerCreateListBtn');
-  if (createListBtn) {
-    createListBtn.style.display = name === 'lists' ? 'block' : 'none';
-  }
-  const addShelfBtn = document.getElementById('headerAddShelfBtn');
-  if (addShelfBtn) {
-    addShelfBtn.style.display = name === 'catalogs' ? 'block' : 'none';
-  }
 
   document.querySelectorAll('.tab-panel').forEach(function(p) {
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
@@ -9316,6 +9957,28 @@ function switchTab(name) {
         }
       });
       switchSettingsSubmenu(savedSub, targetBtn || pills[0]);
+    }
+  }
+  if (name === 'channels') {
+    if (!window._channelsInitializedOnce) {
+      window._channelsInitializedOnce = true;
+      let savedSub = 'my-channels';
+      try {
+        savedSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+      } catch (e) {}
+      const pills = document.querySelectorAll('#channelsSubnavBar .subnav-pill');
+      let targetBtn = null;
+      pills.forEach((p) => {
+        const oc = p.getAttribute('onclick') || '';
+        if (oc.indexOf("'" + savedSub + "'") !== -1 || oc.indexOf('"' + savedSub + '"') !== -1) {
+          targetBtn = p;
+        }
+      });
+      if (typeof switchChannelsSubmenu === 'function') {
+        switchChannelsSubmenu(savedSub, targetBtn || pills[0]);
+      }
+    } else {
+      if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
     }
   }
   if (name === 'catalogs') {
@@ -9729,6 +10392,15 @@ function renderDiscoverChartsList(type, forceRefresh) {
     }
   }
 
+  if (type === 'holidays' || type === 'all') {
+    if (window._CHARTS_HOLIDAYS) {
+      window._CHARTS_HOLIDAYS.forEach(function(item) {
+        pushSingle(item.name, item.movieUrl, 'movie', 'Holiday Movies');
+        pushSingle(item.name, item.showUrl, 'series', 'Holiday Shows');
+      });
+    }
+  }
+
   if (typeof render5PosterListsFeed === 'function') {
     render5PosterListsFeed(container, lists);
   } else {
@@ -9737,6 +10409,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
 }
 
 function switchCatalogsSubmenu(filter, btn) {
+  if (filter === 'channels') {
+    switchTab('channels');
+    return;
+  }
   if (btn) {
     document.querySelectorAll('#catalogsFilterBar .subnav-pill').forEach(function(p) {
       p.classList.remove('active');
@@ -9750,7 +10426,6 @@ function switchCatalogsSubmenu(filter, btn) {
   const panels = {
     'all': document.getElementById('catalogsSubShelves'),
     'quickadd': document.getElementById('catalogsSubQuickAdd'),
-    'channels': document.getElementById('catalogsSubChannels'),
     'bulk': document.getElementById('catalogsSubBulk')
   };
 
@@ -10095,6 +10770,9 @@ function addRow(name, url, type, enabled, group, channelId) {
   }
   
   if (isChannel) {
+    if (channelId && String(channelId).startsWith('merged-')) {
+      div.dataset.mergedId = channelId;
+    }
     div.dataset.channelId = channelId || generateChannelId();
   }
   const urlList = isWatchlist
@@ -10148,7 +10826,7 @@ function addRow(name, url, type, enabled, group, channelId) {
       ? '<p class="watchlist-note"><small>Uses the MDBList API key from Settings.</small></p>'
       : (isChannel || isCustomList || isPremade)
         ? ''
-        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one shelf)</button>'}
+        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>'}
     <div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>\${escapeHtml(name||'Unnamed')} - \${type === 'series' ? 'Series' : 'Movies'}</span><button type="button" class="text-action-btn" disabled>See All \›</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>
   \`;
   container.appendChild(div);
@@ -10158,7 +10836,7 @@ function addRow(name, url, type, enabled, group, channelId) {
   checkAllDuplicateUrls();
   renumber();
   if (!suppressSave) {
-    showAddedToast('"' + (name || 'Shelf') + '" added to My Catalogs \u2713');
+    showAddedToast('"' + (name || 'Catalog') + '" added to My Catalogs \u2713');
   }
   return div;
 }
@@ -10216,6 +10894,9 @@ ${buildAddAllFnJs("addAllStreamingTop10", buildAddAllPairsCallsJs(STREAMING_TOP1
 // fixes that and makes a repeat impossible.
 ${buildAddAllCombinedChartsJs()}
 
+${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
+${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
+
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
   addRow("Hidden Gems", "tmdb:hidden-gems", "series", true, "Hidden Gems");
@@ -10232,10 +10913,12 @@ document.addEventListener('click', (e) => {
   else if (action === 'tmdb-charts') addAllTmdbCharts();
   else if (action === 'trakt-charts') addAllTraktCharts();
   else if (action === 'simkl-charts') addAllSimklCharts();
-  else if (action === 'streaming') addAllStreaming();
+  else if (action === 'streaming' || action === 'streaming-catalogs') addAllStreaming();
   else if (action === 'streaming-top10') addAllStreamingTop10();
   else if (action === 'combined-charts') addAllCombinedCharts();
   else if (action === 'hidden-gems') addAllHiddenGems();
+  else if (action === 'kids') addAllKidsCharts();
+  else if (action === 'holidays') addAllHolidayCharts();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal
@@ -10390,6 +11073,7 @@ async function runMyMdblistLists() {
 }
 
 function renderMyMdblistLists(lists) {
+  window._myMdblistLists = lists || [];
   const box = document.getElementById('myMdblistListsResult');
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No lists found on your MDBList account.</small></p>';
@@ -10431,6 +11115,9 @@ function renderMyMdblistLists(lists) {
       return 'movie';
     }
 
+    const isCustomUserList = !isHistory && !isWatchlist && !l.dynamic;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="mdblist" data-list-id="' + escapeAttr(l.id || l.slug) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -10444,6 +11131,7 @@ function renderMyMdblistLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'mixed') + '"></div>' +
@@ -10465,6 +11153,12 @@ document.getElementById('myMdblistListsResult').addEventListener('click', (e) =>
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -10492,6 +11186,7 @@ async function runMyTraktLists() {
 }
 
 function renderMyTraktLists(lists) {
+  window._myTraktLists = lists || [];
   const box = document.getElementById('myTraktListsResult');
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No public lists found for that Trakt username.</small></p>';
@@ -10521,6 +11216,10 @@ function renderMyTraktLists(lists) {
       addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedMovie ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' + (addedMovie ? '&#10003;' : '+ Movies') + '</button>' +
         '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
     }
+    const isCustomUserList = l.slug !== 'watchlist' && l.url !== 'trakt:watchlist';
+    const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -10534,6 +11233,7 @@ function renderMyTraktLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
@@ -10555,6 +11255,12 @@ document.getElementById('myTraktListsResult').addEventListener('click', (e) => {
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -10591,7 +11297,8 @@ function renderMdblistConnectStatus() {
   const connectBtn = document.getElementById('mdblistConnectBtn');
   const disconnectBtn = document.getElementById('mdblistDisconnectBtn');
   const listsBtn = document.getElementById('listsMdblistConnectBtn');
-  const token = mdblistAccessToken || '';
+  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  if (token) mdblistAccessToken = token;
   const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
   const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
   const connected = !!(token || key);
@@ -10700,7 +11407,8 @@ function renderTraktConnectStatus() {
   const connectBtn = document.getElementById('traktConnectBtn');
   const disconnectBtn = document.getElementById('traktDisconnectBtn');
   const listsBtn = document.getElementById('listsTraktConnectBtn');
-  const token = traktAccessToken || '';
+  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  if (token) traktAccessToken = token;
   const user = (userInput ? userInput.value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '';
   const key = (keyInput ? keyInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
   const connected = !!(token || key || user);
@@ -10770,9 +11478,13 @@ function pickUpTraktTokenFromUrl() {
       token_exchange_failed: 'Failed to exchange authorization code for a Trakt token.',
       access_denied: 'Trakt sign-in was cancelled.',
     };
-    const msg = messages[err] || ('Could not connect to Trakt (' + err + (detail ? ': ' + detail : '') + ').');
+    const isRateLimit = detail.includes('1015') || detail.includes('429') || err === 'exchange_failed';
+    const msg = isRateLimit 
+      ? 'Trakt web redirect was rate-limited by Cloudflare (1015). Opening direct PIN code activation instead...'
+      : (messages[err] || ('Could not connect to Trakt (' + err + (detail ? ': ' + detail : '') + ').'));
+
     if (typeof showAppAlert === 'function') {
-      showAppAlert('Trakt Connection Error', msg, false);
+      showAppAlert('Trakt Connection', msg, !isRateLimit);
     } else {
       alert(msg);
     }
@@ -10780,6 +11492,117 @@ function pickUpTraktTokenFromUrl() {
     params.delete('trakt_error_detail');
     const qs = params.toString();
     history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+
+    if (isRateLimit) {
+      setTimeout(() => {
+        startTraktDeviceLogin();
+      }, 500);
+    }
+  }
+}
+
+let _traktDevicePollTimer = null;
+
+function closeTraktDeviceModal() {
+  if (_traktDevicePollTimer) {
+    clearInterval(_traktDevicePollTimer);
+    _traktDevicePollTimer = null;
+  }
+  const modal = document.getElementById('traktDeviceModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function startTraktDeviceLogin() {
+  const modal = document.getElementById('traktDeviceModal');
+  const codeEl = document.getElementById('traktDeviceUserCode');
+  const statusEl = document.getElementById('traktDevicePollingStatus');
+  const linkEl = document.getElementById('traktDeviceActivateLink');
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  
+  if (modal) modal.style.display = 'flex';
+  if (codeEl) codeEl.innerText = 'LOADING...';
+  if (statusEl) statusEl.innerText = 'Requesting activation code from Trakt...';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/trakt/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ traktKey: traktKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.user_code) {
+      if (codeEl) codeEl.innerText = 'ERROR';
+      if (statusEl) {
+        statusEl.innerHTML = '<span style="color:var(--danger);">' + escapeHtml(data.error || 'Could not get device code.') + '</span> <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
+      }
+      return;
+    }
+
+    if (codeEl) codeEl.innerText = data.user_code;
+    if (linkEl) {
+      linkEl.href = data.verification_url || 'https://trakt.tv/activate';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span style="color:var(--accent); font-weight:600;">Code ready!</span> Enter code at trakt.tv/activate &bull; Waiting for approval...';
+    }
+
+    const deviceCode = data.device_code;
+    const intervalSec = Math.max(4, data.interval || 5);
+    const expiresAt = Date.now() + ((data.expires_in || 600) * 1000);
+
+    if (_traktDevicePollTimer) clearInterval(_traktDevicePollTimer);
+
+    _traktDevicePollTimer = setInterval(async () => {
+      if (Date.now() > expiresAt) {
+        clearInterval(_traktDevicePollTimer);
+        _traktDevicePollTimer = null;
+        if (statusEl) statusEl.innerHTML = 'Activation code expired. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Get New Code</button>';
+        return;
+      }
+
+      try {
+        const pollRes = await fetch(ORIGIN + '/api/trakt/device/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: deviceCode, traktKey: traktKey }),
+        });
+        const pollData = await pollRes.json();
+
+        if (pollData.ok && pollData.access_token) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          traktAccessToken = pollData.access_token;
+          try {
+            localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+          } catch(e) {}
+          if (pollData.username) {
+            try {
+              localStorage.setItem('myListAddon:traktUsername', pollData.username);
+            } catch(e) {}
+            const uInput = document.getElementById('traktUsernameInput');
+            if (uInput) uInput.value = pollData.username;
+          }
+          saveState();
+          closeTraktDeviceModal();
+          if (typeof showAppAlert === 'function') {
+            showAppAlert('Trakt Connected', 'Successfully connected to Trakt' + (pollData.username ? ' as @' + pollData.username : '') + '.', true);
+          }
+          renderTraktConnectStatus();
+        } else if (pollData.pending) {
+          // Still waiting for user confirmation
+        } else if (pollData.slowDown) {
+          // Slow down polling
+        } else if (pollData.error && !pollData.pending) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          if (statusEl) statusEl.innerText = pollData.error;
+        }
+      } catch (e) {}
+    }, intervalSec * 1000);
+
+  } catch (err) {
+    if (codeEl) codeEl.innerText = 'ERROR';
+    if (statusEl) statusEl.innerHTML = 'Network error requesting device code. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
   }
 }
 
@@ -10863,6 +11686,10 @@ function renderMyPrivateTraktLists(lists) {
         '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
     }
 
+    const isCustomUserList = !isHistory && l.slug !== 'watchlist' && l.url !== 'trakt:watchlist';
+    const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
@@ -10876,6 +11703,7 @@ function renderMyPrivateTraktLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>' +
@@ -10897,6 +11725,12 @@ document.getElementById('myPrivateTraktListsResult').addEventListener('click', (
   const copyBtn = e.target.closest('.myPrivateListCopyToCustomBtn');
   if (copyBtn) {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
   }
 });
 
@@ -11050,7 +11884,7 @@ function renderTmdbConnectStatus() {
 
   if (connectBtn) connectBtn.textContent = sess ? 'Re-connect TMDB' : (key ? 'Update Key' : 'Connect TMDB Account');
   if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
-  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect TMDB' : 'Connect TMDB';
+  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect' : 'Connect TMDB';
 }
 
 let myTmdbListsTimer = null;
@@ -11097,6 +11931,7 @@ async function runMyTmdbLists() {
 }
 
 function renderMyTmdbLists(lists) {
+  window._myTmdbLists = lists || [];
   const box = document.getElementById('myTmdbListsResult');
   if (!box) return;
   if (!lists || !lists.length) {
@@ -11150,9 +11985,13 @@ function renderMyTmdbLists(lists) {
             overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:default;">' + totalCount + ' &rsaquo;</div>';
           }
           const posterType = it.type || (l.contentType === 'series' ? 'series' : 'movie');
+          const tmdbTarget = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : 'custom');
+          const tmdbListId = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : listIdStr);
+          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="tmdb" data-target="' + tmdbTarget + '" data-list-id="' + escapeAttr(tmdbListId) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(posterType) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from TMDB">&times;</button>';
           return '<div class="list-card-mini-poster-tile">' +
             '<div class="list-card-mini-poster-img-wrap">' +
               '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+              removeBtn +
               overlays +
             '</div>' +
             '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
@@ -11161,6 +12000,9 @@ function renderMyTmdbLists(lists) {
         }).join('') +
       '</div>';
     }
+
+    const isCustomUserList = !isWatchlist && !isFavorites;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="tmdb" data-list-id="' + escapeAttr(listIdStr) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
 
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
@@ -11174,6 +12016,7 @@ function renderMyTmdbLists(lists) {
         '<div class="list-card-actions">' +
           copyBtn +
           addBtns +
+          deleteBtn +
         '</div>' +
       '</div>' +
       posterThumbs +
@@ -11196,11 +12039,257 @@ document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
     copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
     return;
   }
-  const posterImg = e.target.closest('.clickable-poster');
-  if (posterImg && posterImg.dataset.id) {
-    if (typeof openItemDetailsModal === 'function') {
-      openItemDetailsModal(posterImg.dataset.id, posterImg.dataset.type);
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+
+// --- Simkl OAuth & Personal Lists -----------------------------------------
+function startSimklConnect() {
+  window.location.href = ORIGIN + '/api/simkl/oauth/start';
+}
+
+function disconnectSimkl() {
+  const input = document.getElementById('simklKeyInput');
+  if (input) input.value = '';
+  simklAccessToken = '';
+  simklUsername = '';
+  try {
+    localStorage.removeItem('myListAddon:simklAccessToken');
+    localStorage.removeItem('myListAddon:simklUsername');
+    localStorage.removeItem('myListAddon:simklKey');
+  } catch (e) {}
+  saveState();
+  renderSimklConnectStatus();
+  scheduleMySimklListsRefresh();
+}
+
+function toggleListsSimklConnection() {
+  if (simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken')) {
+    disconnectSimkl();
+  } else {
+    startSimklConnect();
+  }
+}
+
+function pickUpSimklTokenFromUrl() {
+  const hash = window.location.hash || '';
+  const match = /(?:^|[#&])simkl_token=([^&]+)/.exec(hash);
+  if (match) {
+    simklAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.setItem('myListAddon:simklAccessToken', simklAccessToken);
+    } catch (e) {}
+    const userMatch = /(?:^|[#&])simkl_username=([^&]+)/.exec(hash);
+    if (userMatch) {
+      simklUsername = decodeURIComponent(userMatch[1]);
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+      } catch (e) {}
     }
+    saveState();
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connected', 'Your Simkl account was successfully connected.', true);
+    } else {
+      alert('Connected to Simkl.');
+    }
+    renderSimklConnectStatus();
+    scheduleMySimklListsRefresh();
+  }
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('simkl_error');
+  if (err) {
+    const detail = params.get('simkl_error_detail') || '';
+    const messages = {
+      not_configured: 'Simkl OAuth is not configured on this Worker.',
+      no_code: 'Simkl did not return an authorization code.',
+      exchange_failed: 'Failed to exchange authorization code for a Simkl token.',
+      access_denied: 'Simkl sign-in was cancelled.',
+      state_mismatch: 'Simkl sign-in state mismatch. Please try again.',
+      no_token: 'Simkl did not return an access token.',
+      network: 'Network error connecting to Simkl.',
+    };
+    const msg = messages[err] || ('Could not connect to Simkl (' + err + (detail ? ': ' + detail : '') + ').');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connection Error', msg + (detail ? '\\n\\nDetails: ' + detail : ''), false);
+    } else {
+      alert(msg + (detail ? '\\n' + detail : ''));
+    }
+    params.delete('simkl_error');
+    params.delete('simkl_error_detail');
+    const qs = params.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+  }
+}
+
+function renderSimklConnectStatus() {
+  const input = document.getElementById('simklKeyInput');
+  const statusEl = document.getElementById('simklConnectStatus');
+  const connectBtn = document.getElementById('simklConnectBtn');
+  const disconnectBtn = document.getElementById('simklDisconnectBtn');
+  const listsBtn = document.getElementById('listsSimklConnectBtn');
+
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  if (token) simklAccessToken = token;
+  const user = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+  const connected = !!(token || key);
+
+  if (listsBtn) {
+    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Simkl';
+  }
+
+  if (statusEl) {
+    if (token && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (token) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Simkl</span>';
+    } else if (key) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Simkl Client ID configured</span>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
+    }
+  }
+
+  if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
+  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (connected) {
+    scheduleMySimklListsRefresh();
+  }
+}
+
+let mySimklListsTimer = null;
+function scheduleMySimklListsRefresh() {
+  clearTimeout(mySimklListsTimer);
+  mySimklListsTimer = setTimeout(runMySimklLists, 600);
+}
+
+async function runMySimklLists() {
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  const token = simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const input = document.getElementById('simklKeyInput');
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  if (!token && !key) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Simkl account in Settings or click <strong>Connect Simkl</strong> above to see your watchlists and lists here.</small></p>';
+    return;
+  }
+
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Simkl lists\u2026</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/simkl/my-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, simklKey: key }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Simkl lists.') + '</p>';
+      return;
+    }
+    renderMySimklLists(data.lists);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Simkl lists.</p>';
+  }
+}
+
+function renderMySimklLists(lists) {
+  window._mySimklLists = lists || [];
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No items found on your Simkl account.</small></p>';
+    return;
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  window._simklListsMap = window._simklListsMap || {};
+  lists.forEach(function(l) {
+    if (l && l.url) window._simklListsMap[l.url] = l;
+  });
+
+  const cardsHtml = lists.map((l) => {
+    const type = l.type === 'series' ? 'series' : 'movie';
+    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
+    const totalCount = l.itemCount || (l.items || []).length;
+    const added = alreadyAdded.has(l.url + '|' + type);
+
+    const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
+    const addBtn = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+
+    const previewItems = (l.items || []).slice(0, 9);
+    let posterThumbs = '';
+    if (previewItems.length) {
+      posterThumbs = '<div class="list-card-posters poster-preview-static">' +
+        previewItems.map((it, i) => {
+          const isMobileEnd = (i === 2 && previewItems.length > 3);
+          const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+          let overlays = '';
+          if (isMobileEnd) {
+            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          if (isDesktopEnd) {
+            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          const simklStatus = l.statusKey || (l.url ? l.url.split(':')[3] : 'plantowatch');
+          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+            '<div class="list-card-mini-poster-img-wrap">' +
+              (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              removeBtn +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(it.name || '') + '</div>' +
+            (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+
+    return '<div class="list-card" data-list-type="' + type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          addBtn +
+        '</div>' +
+      '</div>' +
+      posterThumbs +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml;
+}
+
+document.getElementById('mySimklListsResult')?.addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
   }
 });
 
@@ -11208,6 +12297,7 @@ function updateConnectionStatusBadges() {
   if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
   if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
 }
 
 
@@ -13436,6 +14526,11 @@ async function populateSearchResultPosters() {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
             const totalCount = cardItems || data.count || (validPosters.length * 10);
+            const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
+            const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
+            const isTmdbSlot = !!slot.closest('#myTmdbListsResult');
+            const isSimklSlot = !!slot.closest('#mySimklListsResult');
+
             let inner = '';
             validPosters.forEach((s, i) => {
               const isMobileEnd = (i === 2 && validPosters.length > 3);
@@ -13448,9 +14543,24 @@ async function populateSearchResultPosters() {
               if (isDesktopEnd) {
                 overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
+
+              let removeBtn = '';
+              if (isTraktSlot) {
+                const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
+                const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
+                const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
+                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+              } else if (isMdblistSlot) {
+                const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+                const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
+                const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
+                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+              }
+
               inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
                 '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
+                  removeBtn +
                   '<div class="poster-add-overlay">+</div>' +
                   overlays +
                 '</div>' +
@@ -14313,7 +15423,11 @@ async function openItemDetailsModal(id, type, opts) {
   // A real, bookmarkable/shareable URL for this specific title.
   if (!opts.skipPushState) {
     const params = new URLSearchParams({ id: id, type: type || 'movie' });
-    history.pushState({ view: 'item', id: id, type: type, fromList: (currentActiveTab === 'list-details'), listScrollY: window._listScrollY }, '', '#/item?' + params.toString());
+    const targetHash = '#/item?' + params.toString();
+    const currentHash = location.hash || '';
+    if (currentHash !== targetHash) {
+      history.pushState({ view: 'item', id: id, type: type, fromList: (currentActiveTab === 'list-details'), listScrollY: window._listScrollY }, '', targetHash);
+    }
   }
   
   const body = document.getElementById('itemDetailsBody');
@@ -14487,9 +15601,145 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
   }
 }
 
+function getExternalListMembership() {
+  try {
+    return JSON.parse(localStorage.getItem('myListAddon:externalMembership') || '{}');
+  } catch(e) {
+    return {};
+  }
+}
+
+function setExternalListMembership(key, isMember) {
+  try {
+    const map = getExternalListMembership();
+    if (isMember) {
+      map[key] = true;
+    } else {
+      delete map[key];
+      map[key] = false;
+    }
+    localStorage.setItem('myListAddon:externalMembership', JSON.stringify(map));
+  } catch(e) {}
+}
+
+function makeExternalKey(provider, target, listId, id) {
+  const cleanId = String(id || '').replace(/^tmdb:/, '').trim();
+  return (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + cleanId;
+}
+
+function isItemInExternalList(provider, target, listId, id, fallbackList) {
+  const map = getExternalListMembership();
+  const rawId = String(id || '').trim();
+  const cleanId = rawId.replace(/^tmdb:/, '');
+  const key1 = (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + rawId;
+  const key2 = (provider || '') + ':' + (target || '') + ':' + (listId || '') + '::' + cleanId;
+
+  if (map[key1] === true || map[key2] === true) return true;
+  if (map[key1] === false || map[key2] === false) return false;
+
+  if (fallbackList && Array.isArray(fallbackList.items)) {
+    return fallbackList.items.some(it => {
+      if (!it) return false;
+      const itId = String(it.id || '').trim();
+      const itCleanId = itId.replace(/^tmdb:/, '');
+      const itImdb = String(it.imdbId || '').trim();
+      const itTmdb = String(it.tmdbId || '').trim();
+      return itId === rawId || itCleanId === cleanId || itImdb === rawId || itImdb === cleanId || itTmdb === rawId || itTmdb === cleanId;
+    });
+  }
+  return false;
+}
+
+async function removeSingleExternalItemDirect(provider, target, listId, id, type, btn) {
+  if (!id) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+
+  const key1 = makeExternalKey(provider, target, listId, id);
+  const key2 = makeExternalKey(provider, target, listId, String(id).replace(/^tmdb:/, ''));
+  setExternalListMembership(key1, false);
+  setExternalListMembership(key2, false);
+
+  const row = btn ? btn.closest('.select-list-row') : null;
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    btn.style.display = 'none';
+  }
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+  const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+  try {
+    await fetch(ORIGIN + '/api/external-list/item-mutate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'remove',
+        provider: provider,
+        target: target,
+        listId: listId,
+        id: id,
+        imdbId: String(id).startsWith('tt') ? id : '',
+        tmdbId: String(id).startsWith('tmdb:') ? String(id).slice(5) : (String(id).startsWith('tt') ? '' : id),
+        type: type || 'movie',
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        traktUsername: traktUser,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+        tmdbSessionId: tmdbSess,
+        tmdbAccountId: tmdbAcc,
+        tmdbKey: tmdbKey,
+        mdblistAccessToken: mdbToken,
+        mdblistKey: mdbKey
+      })
+    });
+  } catch(e) {}
+
+  showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
+}
+
+function removeSingleCustomItemDirect(listIdx, id, type, btn) {
+  if (!window._selectListModalTempLists || !window._selectListModalTempLists[listIdx]) return;
+  const list = window._selectListModalTempLists[listIdx];
+  let cleanId = String(id || '').trim();
+  while (cleanId.startsWith('tmdb:')) cleanId = cleanId.slice(5).trim();
+  const finalImdbId = cleanId.startsWith('tt') ? cleanId : ('tmdb:' + cleanId);
+  toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, false);
+  const row = btn ? btn.closest('.select-list-row') : null;
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    btn.style.display = 'none';
+  }
+  showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
+}
+
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
+  if (!modal || !body) return;
   
   // Ensure Watchlist exists locally
   if (typeof loadLocalCustomLists === 'function' && typeof backfillAutoTrackedListSlugs === 'function') {
@@ -14497,7 +15747,7 @@ function openSelectListModal(id, type, title, poster) {
     backfillAutoTrackedListSlugs(m);
   }
 
-  // Scrape available Custom Lists from the configured lists DOM, local lists, and creator lists
+  // 1. Custom Lists (local & creator)
   const customLists = [];
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
@@ -14549,13 +15799,212 @@ function openSelectListModal(id, type, title, poster) {
     });
   }
 
+  // 2. External Provider Lists
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const hasTrakt = !!traktToken;
+
+  const simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+  const hasSimkl = !!simklToken;
+
+  const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const tmdbUser = (typeof tmdbUsername !== 'undefined' && tmdbUsername) || localStorage.getItem('myListAddon:tmdbUsername') || '';
+  const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const hasTmdb = !!(tmdbSess || tmdbAcc || tmdbKey);
+
+  const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+  const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const hasMdblist = !!(mdbToken || mdbKey);
+
   // Store globally so submitCreateListModal and addSelectedListsBtn can access it
   window._selectListModalTempLists = customLists;
   window._selectListModalCurrentItem = { id: id, type: type, title: title, poster: poster };
 
   let html = '';
-  if (customLists.length === 0) {
-    html += '<p style="text-align:center; padding:20px; color:var(--text);">You have not created any Custom Lists yet. <a href="#" id="emptyCreateListLink" style="color:var(--brand); font-weight:600;">Create one now</a></p>';
+
+  // SECTION: Custom Lists
+  if (customLists.length > 0) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:4px 0 6px;">Custom Lists</div>';
+    customLists.forEach((list, idx) => {
+      let isChecked = false;
+      try {
+        const payloadStr = list.url.slice('customlist:v1:'.length);
+        const payload = JSON.parse(payloadStr);
+        isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id) || (it.id === 'tmdb:' + id));
+      } catch(e) {}
+      
+      html += 
+        '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+          '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+            '<input type="checkbox" class="list-select-cb" data-type="custom" data-idx="' + idx + '" data-initially-checked="' + (isChecked ? 'true' : 'false') + '" ' + (isChecked ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+            '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
+            (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+          '</label>' +
+          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        '</div>';
+    });
+  }
+
+  // SECTION: Trakt
+  if (hasTrakt) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#ed1c24; font-weight:bold;">\u25CF</span> Trakt ' + (traktUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(traktUser) + ')</small>' : '') +
+    '</div>';
+
+    const traktWl = Array.isArray(window._myTraktLists) ? window._myTraktLists.find(l => l.slug === 'watchlist' || l.url === 'trakt:watchlist') : null;
+    const inTraktWatchlist = isItemInExternalList('trakt', 'watchlist', 'watchlist', id, traktWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="trakt" data-target="watchlist" data-list-id="watchlist" data-name="Trakt Watchlist" data-initially-checked="' + (inTraktWatchlist ? 'true' : 'false') + '" ' + (inTraktWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>Trakt Watchlist</span>' +
+          (inTraktWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myTraktLists)) {
+      window._myTraktLists.forEach(tl => {
+        if (!tl || tl.slug === 'watchlist' || tl.url === 'trakt:watchlist') return;
+        const inList = isItemInExternalList('trakt', 'custom', tl.id || tl.slug || '', id, tl);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="trakt" data-target="custom" data-list-id="' + escapeAttr(tl.id || tl.slug || '') + '" data-name="' + escapeAttr(tl.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(tl.name || 'Trakt List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  // SECTION: Simkl
+  if (hasSimkl) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#00e699; font-weight:bold;">\u25CF</span> Simkl ' + (simklUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(simklUser) + ')</small>' : '') +
+    '</div>';
+
+    const simklStatuses = [
+      { key: 'plantowatch', label: 'Plan to Watch' },
+      { key: 'watching', label: 'Watching' },
+      { key: 'completed', label: 'Completed' },
+      { key: 'hold', label: 'On Hold' },
+      { key: 'dropped', label: 'Dropped' }
+    ];
+
+    simklStatuses.forEach(st => {
+      const foundList = Array.isArray(window._mySimklLists) ? window._mySimklLists.find(l => l.url && l.url.includes(st.key) && (type === 'series' ? l.type === 'series' : l.type === 'movie')) : null;
+      const isPresent = isItemInExternalList('simkl', 'status', st.key, id, foundList);
+      html += 
+        '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+          '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+            '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="simkl" data-target="status" data-status="' + st.key + '" data-list-id="' + st.key + '" data-name="Simkl ' + escapeAttr(st.label) + '" data-initially-checked="' + (isPresent ? 'true' : 'false') + '" ' + (isPresent ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+            '<span>' + escapeHtml(st.label) + '</span>' +
+            (isPresent ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+          '</label>' +
+          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        '</div>';
+    });
+  }
+
+  // SECTION: TMDB
+  if (hasTmdb) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#01b4e4; font-weight:bold;">\u25CF</span> TMDB ' + (tmdbUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(tmdbUser) + ')</small>' : '') +
+    '</div>';
+
+    const tmdbWl = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('watchlist')) : null;
+    const inTmdbWatchlist = isItemInExternalList('tmdb', 'watchlist', 'watchlist', id, tmdbWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="watchlist" data-list-id="watchlist" data-name="TMDB Watchlist" data-initially-checked="' + (inTmdbWatchlist ? 'true' : 'false') + '" ' + (inTmdbWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>TMDB Watchlist</span>' +
+          (inTmdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    const tmdbFav = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('favorites')) : null;
+    const inTmdbFav = isItemInExternalList('tmdb', 'favorite', 'favorite', id, tmdbFav);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="favorite" data-list-id="favorite" data-name="TMDB Favorites" data-initially-checked="' + (inTmdbFav ? 'true' : 'false') + '" ' + (inTmdbFav ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>TMDB Favorites</span>' +
+          (inTmdbFav ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myTmdbLists)) {
+      window._myTmdbLists.forEach(tml => {
+        if (!tml || (tml.url && (tml.url.includes('watchlist') || tml.url.includes('favorites')))) return;
+        const inList = isItemInExternalList('tmdb', 'custom', tml.id || '', id, tml);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="tmdb" data-target="custom" data-list-id="' + escapeAttr(tml.id || '') + '" data-name="' + escapeAttr(tml.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(tml.name || 'TMDB List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tml.id || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  // SECTION: MDBList
+  if (hasMdblist) {
+    html += '<div style="font-size:0.8rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin:16px 0 6px; display:flex; align-items:center; gap:6px;">' +
+      '<span style="color:#f5c518; font-weight:bold;">\u25CF</span> MDBList ' + (mdbUser ? '<small style="text-transform:none; font-weight:normal; opacity:0.8;">(@' + escapeHtml(mdbUser) + ')</small>' : '') +
+    '</div>';
+
+    const mdbWl = Array.isArray(window._myMdblistLists) ? window._myMdblistLists.find(l => l.slug === 'watchlist' || l.url === 'mdblist:watchlist') : null;
+    const inMdbWatchlist = isItemInExternalList('mdblist', 'watchlist', 'watchlist', id, mdbWl);
+    html += 
+      '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+          '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="mdblist" data-target="watchlist" data-list-id="watchlist" data-name="MDBList Watchlist" data-initially-checked="' + (inMdbWatchlist ? 'true' : 'false') + '" ' + (inMdbWatchlist ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+          '<span>MDBList Watchlist</span>' +
+          (inMdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+        '</label>' +
+        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+      '</div>';
+
+    if (Array.isArray(window._myMdblistLists)) {
+      window._myMdblistLists.forEach(ml => {
+        if (!ml || ml.slug === 'watchlist' || ml.slug === 'history' || ml.url === 'mdblist:watchlist' || ml.url === 'mdblist:history') return;
+        const inList = isItemInExternalList('mdblist', 'custom', ml.id || ml.slug || '', id, ml);
+        html += 
+          '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
+            '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
+              '<input type="checkbox" class="list-select-cb" data-type="external" data-provider="mdblist" data-target="custom" data-list-id="' + escapeAttr(ml.id || ml.slug || '') + '" data-name="' + escapeAttr(ml.name) + '" data-initially-checked="' + (inList ? 'true' : 'false') + '" ' + (inList ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
+              '<span>' + escapeHtml(ml.name || 'MDBList List') + '</span>' +
+              (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
+            '</label>' +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          '</div>';
+      });
+    }
+  }
+
+  if (html) {
+    html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+    '</div>';
+  }
+
+  if (html === '') {
+    html = '<p style="text-align:center; padding:20px; color:var(--muted); font-size:0.95rem;">You do not have any Custom Lists or connected external accounts yet.<br><br>' +
+      '<a href="#" id="emptyCreateListLink" style="color:var(--accent); font-weight:600;">Create a Custom List</a> or connect Trakt/Simkl/TMDB/MDBList in <strong>Settings</strong>.</p>';
     document.getElementById('addSelectedListsBtn').style.display = 'none';
     setTimeout(() => {
       const lnk = document.getElementById('emptyCreateListLink');
@@ -14564,54 +16013,167 @@ function openSelectListModal(id, type, title, poster) {
           e.preventDefault();
           document.getElementById('selectListModal').style.display = 'none';
           document.body.style.overflow = '';
-          if (typeof openCreateListModal === 'function') {
-            openCreateListModal();
-          }
+          if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
     }, 0);
   } else {
     document.getElementById('addSelectedListsBtn').style.display = 'block';
-    customLists.forEach((list, idx) => {
-      let isChecked = false;
-      try {
-        const payloadStr = list.url.slice('customlist:v1:'.length);
-        const payload = JSON.parse(payloadStr);
-        isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id));
-      } catch(e) {}
-      
-      html += 
-        '<label style="display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom: 1px solid rgba(0,0,0,0.05); cursor:pointer; color:#001f3f; font-size:1rem;">' +
-          '<span>' + escapeHtml(list.name) + '</span>' +
-          '<input type="checkbox" class="list-select-cb" data-idx="' + idx + '" ' + (isChecked ? 'checked ' : '') + 'style="width:20px; height:20px; cursor:pointer; accent-color:#003366;">' +
-        '</label>';
-    });
   }
   
   body.innerHTML = html;
   modal.style.display = 'flex';
   document.body.style.overflow = 'hidden';
+
+  // Background check for Simkl lists membership if not cached yet
+  if (hasSimkl && !window._mySimklLists) {
+    fetch(ORIGIN + '/api/simkl/my-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: simklToken, simklKey: simklKey }),
+    }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._mySimklLists = data.lists;
+        window._simklListsMap = window._simklListsMap || {};
+        data.lists.forEach(l => { if (l && l.url) window._simklListsMap[l.url] = l; });
+        document.querySelectorAll('.list-select-cb[data-provider="simkl"]').forEach(cb => {
+          const st = cb.dataset.status;
+          const found = data.lists.find(l => l.url && l.url.includes(st) && (type === 'series' ? l.type === 'series' : l.type === 'movie'));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('simkl', 'status', st, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for Trakt lists membership if not cached yet
+  if (hasTrakt && traktUser && !window._myTraktLists) {
+    const params = 'username=' + encodeURIComponent(traktUser) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : '');
+    fetch(ORIGIN + '/api/trakt-my-lists?' + params, { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myTraktLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="trakt"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && (l.slug === 'watchlist' || l.url === 'trakt:watchlist')) || (target === 'custom' && (l.id === listId || l.slug === listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('trakt', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for TMDB lists membership if not cached yet
+  if (hasTmdb && !window._myTmdbLists) {
+    const params = new URLSearchParams();
+    if (tmdbSess) params.set('sessionId', tmdbSess);
+    if (tmdbAcc) params.set('accountId', tmdbAcc);
+    if (tmdbKey) params.set('tmdbKey', tmdbKey);
+    fetch(ORIGIN + '/api/tmdb-my-lists?' + params.toString(), { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myTmdbLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="tmdb"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && l.url && l.url.includes('watchlist')) || (target === 'favorite' && l.url && l.url.includes('favorites')) || (target === 'custom' && String(l.id) === String(listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('tmdb', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
+
+  // Background check for MDBList lists membership if not cached yet
+  if (hasMdblist && !window._myMdblistLists) {
+    const keyParam = mdbToken || mdbKey;
+    fetch(ORIGIN + '/api/mdblist-my-lists?key=' + encodeURIComponent(keyParam) + (mdbUser ? '&user=' + encodeURIComponent(mdbUser) : ''), { cache: 'no-store' }).then(r => r.json()).then(data => {
+      if (data && data.ok && Array.isArray(data.lists)) {
+        window._myMdblistLists = data.lists;
+        document.querySelectorAll('.list-select-cb[data-provider="mdblist"]').forEach(cb => {
+          const target = cb.dataset.target;
+          const listId = cb.dataset.listId;
+          const found = data.lists.find(l => (target === 'watchlist' && (l.slug === 'watchlist' || l.url === 'mdblist:watchlist')) || (target === 'custom' && (l.id === listId || l.slug === listId)));
+          if (found && Array.isArray(found.items)) {
+            const isPres = isItemInExternalList('mdblist', target, listId, id, found);
+            if (isPres) {
+              cb.checked = true;
+              cb.dataset.initiallyChecked = 'true';
+              const row = cb.closest('.select-list-row');
+              if (row && !row.querySelector('.in-list-badge')) {
+                const label = row.querySelector('label');
+                if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
+                if (!row.querySelector('button')) {
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                }
+              }
+            }
+          }
+        });
+      }
+    }).catch(() => {});
+  }
 }
 
-  document.getElementById('selectListModal').addEventListener('click', (e) => {
-    if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-      document.getElementById('selectListModal').style.display = 'none';
-      document.body.style.overflow = '';
-    }
-  });
+document.getElementById('selectListModal').addEventListener('click', (e) => {
+  if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
+    document.getElementById('selectListModal').style.display = 'none';
+    document.body.style.overflow = '';
+  }
+});
 
 document.getElementById('addSelectedListsBtn').addEventListener('click', async () => {
-  if (!window._selectListModalTempLists || !window._selectListModalCurrentItem) return;
+  if (!window._selectListModalCurrentItem) return;
   const { id, type, title, poster } = window._selectListModalCurrentItem;
   
   const btn = document.getElementById('addSelectedListsBtn');
   btn.disabled = true;
-  btn.textContent = 'Saving...';
+  btn.textContent = 'Saving\u2026';
   
   let cleanId = String(id || '').trim();
   while (cleanId.startsWith('tmdb:')) cleanId = cleanId.slice(5).trim();
   let finalImdbId = cleanId;
+  let cleanTmdbId = '';
   if (!String(finalImdbId).startsWith('tt')) {
+    cleanTmdbId = cleanId;
     const endpoint = (type === 'series' || type === 'tv') ? '/api/resolve-show?tmdbId=' : '/api/resolve-movie?tmdbId=';
     try {
       const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanId));
@@ -14626,16 +16188,89 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   const checkboxes = document.querySelectorAll('.list-select-cb');
   let anyAdded = false;
   let anyRemoved = false;
+  const changedExternalOperations = [];
   
   checkboxes.forEach(cb => {
-    const listIdx = parseInt(cb.dataset.idx, 10);
+    const cbType = cb.dataset.type;
     const isChecked = cb.checked;
-    const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
-    if (changed) {
-      if (isChecked) anyAdded = true;
-      else anyRemoved = true;
+    const initiallyChecked = cb.dataset.initiallyChecked === 'true';
+
+    if (cbType === 'custom') {
+      const listIdx = parseInt(cb.dataset.idx, 10);
+      const changed = toggleItemInCustomListUrl(id, finalImdbId, type, listIdx, isChecked, title, poster);
+      if (changed) {
+        if (isChecked) anyAdded = true;
+        else anyRemoved = true;
+      }
+    } else if (cbType === 'external') {
+      if (isChecked !== initiallyChecked) {
+        const op = {
+          action: isChecked ? 'add' : 'remove',
+          provider: cb.dataset.provider,
+          target: cb.dataset.target,
+          listId: cb.dataset.listId || cb.dataset.status || '',
+          status: cb.dataset.status || '',
+          name: cb.dataset.name || 'List'
+        };
+        changedExternalOperations.push(op);
+        
+        // Update local membership map immediately
+        setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, id), isChecked);
+        if (finalImdbId) setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, finalImdbId), isChecked);
+        if (cleanTmdbId) setExternalListMembership(makeExternalKey(op.provider, op.target, op.listId, cleanTmdbId), isChecked);
+
+        if (isChecked) anyAdded = true;
+        else anyRemoved = true;
+      }
     }
   });
+
+  // Execute external modifications concurrently
+  if (changedExternalOperations.length > 0) {
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+    const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+    const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+    await Promise.allSettled(changedExternalOperations.map(op => {
+      return fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: op.action,
+          provider: op.provider,
+          target: op.target,
+          listId: op.listId,
+          status: op.status,
+          id: id,
+          imdbId: finalImdbId,
+          tmdbId: cleanTmdbId,
+          type: type,
+          title: title,
+          poster: poster,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          traktUsername: traktUser,
+          simklAccessToken: simklToken,
+          simklKey: simklKey,
+          tmdbSessionId: tmdbSess,
+          tmdbAccountId: tmdbAcc,
+          tmdbKey: tmdbKey,
+          mdblistAccessToken: mdbToken,
+          mdblistKey: mdbKey
+        })
+      });
+    }));
+  }
   
   document.getElementById('selectListModal').style.display = 'none';
   document.body.style.overflow = '';
@@ -14890,6 +16525,7 @@ async function runCatalogSearch() {
 // year, thumbnail }.
 let channelDraftItems = [];
 let channelDraftPoster = null;
+let channelDraftBackdrop = null;
 
 async function runChannelTitleSearch() {
   const q = document.getElementById('channelSearchInput').value.trim();
@@ -14916,30 +16552,34 @@ async function runChannelTitleSearch() {
 function renderChannelTitleResults(results) {
   const box = document.getElementById('channelSearchResult');
   if (!results.length) {
-    box.innerHTML = '<p><small>No matches.</small></p>';
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
     return;
   }
-  box.innerHTML = results.map((r) => {
-    const label = r.year ? escapeHtml(r.title) + ' (' + escapeHtml(r.year) + ')' : escapeHtml(r.title);
+  const cardsHtml = results.map((r) => {
     const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
-      : '';
-    return '<div class="row searchresult-row">' +
-      '<div style="display:flex; gap:10px; align-items:center;">' + posterImg + '<strong>' + label + '</strong></div>' +
-      '<button type="button" class="secondary channelTitleBtn"' +
-      ' data-tmdbid="' + r.tmdbId + '"' +
-      ' data-title="' + escapeAttr(r.title) + '" data-poster="' + escapeAttr(r.poster || '') + '">+ Browse episodes</button>' +
+      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No poster</div>';
+    return '<div class="custom-list-search-item channelTitleCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' +
+      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">' +
+      posterImg +
+      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
+        escapeHtml(r.title) +
+      '</div>' +
+      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
+      '<button type="button" class="lc-btn secondary channelTitleBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
+      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">+ Browse</button>' +
       '</div>';
   }).join('');
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
 }
 
 document.getElementById('channelSearchResult').addEventListener('click', (e) => {
-  const btn = e.target.closest('.channelTitleBtn');
-  if (!btn) return;
-  browseChannelShow(btn.dataset.tmdbid, btn.dataset.title, btn.dataset.poster);
+  const target = e.target.closest('.channelTitleCard, .channelTitleBtn');
+  if (!target) return;
+  browseChannelShow(target.dataset.tmdbid, target.dataset.title, target.dataset.poster, target.dataset.backdrop);
 });
 
-async function browseChannelShow(tmdbId, showName, showPoster) {
+async function browseChannelShow(tmdbId, showName, showPoster, showBackdrop) {
   const box = document.getElementById('channelEpisodePicker');
   box.innerHTML = '<p><small>Loading seasons\u2026</small></p>';
   try {
@@ -14950,11 +16590,15 @@ async function browseChannelShow(tmdbId, showName, showPoster) {
       return;
     }
     const poster = data.poster || showPoster || '';
+    const backdrop = data.backdrop || showBackdrop || '';
+    if (backdrop) channelDraftBackdrop = backdrop;
+    if (poster) channelDraftPoster = poster;
     const seasonNumbers = data.seasons.map((s) => s.season).join(',');
     const seasonButtons = data.seasons.map((s) =>
       '<button type="button" class="secondary channelSeasonBtn"' +
       ' data-tmdbid="' + tmdbId + '" data-imdbid="' + escapeAttr(data.imdbId) + '"' +
       ' data-showname="' + escapeAttr(showName) + '" data-poster="' + escapeAttr(poster) + '"' +
+      ' data-backdrop="' + escapeAttr(backdrop) + '"' +
       ' data-season="' + s.season + '">' +
       escapeHtml(s.name || ('Season ' + s.season)) + ' (' + s.episodeCount + ')</button>'
     ).join(' ');
@@ -14963,9 +16607,10 @@ async function browseChannelShow(tmdbId, showName, showPoster) {
       '<button type="button" class="secondary channelAddAllSeasonsBtn"' +
       ' data-tmdbid="' + tmdbId + '" data-imdbid="' + escapeAttr(data.imdbId) + '"' +
       ' data-showname="' + escapeAttr(showName) + '" data-poster="' + escapeAttr(poster) + '"' +
+      ' data-backdrop="' + escapeAttr(backdrop) + '"' +
       ' data-seasons="' + seasonNumbers + '">Add every season (all episodes)</button>' +
       '</div>' +
-      '<div class="actions" style="flex-wrap:wrap;">' + seasonButtons + '</div>' +
+      '<div class="channel-season-grid">' + seasonButtons + '</div>' +
       '<div id="channelEpisodeList"></div>';
     box.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
@@ -14978,7 +16623,7 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
   if (seasonBtn) {
     loadChannelSeasonEpisodes(
       seasonBtn.dataset.tmdbid, seasonBtn.dataset.imdbid, seasonBtn.dataset.showname,
-      seasonBtn.dataset.poster, seasonBtn.dataset.season
+      seasonBtn.dataset.poster, seasonBtn.dataset.backdrop, seasonBtn.dataset.season
     );
     return;
   }
@@ -14986,18 +16631,18 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
   if (addAllSeasonsBtn) {
     addAllSeasonsToChannel(
       addAllSeasonsBtn.dataset.tmdbid, addAllSeasonsBtn.dataset.imdbid, addAllSeasonsBtn.dataset.showname,
-      addAllSeasonsBtn.dataset.poster, addAllSeasonsBtn.dataset.seasons, addAllSeasonsBtn
+      addAllSeasonsBtn.dataset.poster, addAllSeasonsBtn.dataset.backdrop, addAllSeasonsBtn.dataset.seasons, addAllSeasonsBtn
     );
     return;
   }
   const addAllBtn = e.target.closest('.channelAddAllEpisodesBtn');
   if (addAllBtn) {
-    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster);
+    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster, addAllBtn.dataset.backdrop);
     return;
   }
   const addBtn = e.target.closest('.channelAddEpisodesBtn');
   if (addBtn) {
-    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster);
+    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster, addBtn.dataset.backdrop);
   }
 });
 
@@ -15005,7 +16650,7 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
 // see /api/show-episodes) and adds all of them in original broadcast order,
 // for "just give me the whole show" instead of clicking through season by
 // season.
-async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, seasonsCsv, btn) {
+async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn) {
   const seasons = String(seasonsCsv || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!seasons.length) return;
   if (btn) {
@@ -15029,34 +16674,35 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, seas
             imdbId: imdbId,
             season: season,
             episode: ep.episode,
+            showName: showName || '',
+            epName: ep.name || ('Episode ' + ep.episode),
             title: (showName ? showName + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
             released: ep.released,
-            thumbnail: ep.thumbnail || showPoster,
+            thumbnail: ep.thumbnail || showBackdrop || showPoster,
+            poster: showPoster || ep.thumbnail || showBackdrop || '',
+            showPoster: showPoster || '',
           });
         });
       });
-    // Same safety caps as Quick Add Channel -- a single long-running show
-    // (soap, game show, talk show, news magazine) can have thousands of
-    // episodes, which is exactly what crashed Stremio the last time this
-    // wasn't capped.
-    let finalEpisodes = showEpisodes.length > CHANNEL_MAX_EPISODES_PER_SHOW
-      ? showEpisodes.slice(-CHANNEL_MAX_EPISODES_PER_SHOW)
-      : showEpisodes;
-    const trimmedForShowLength = finalEpisodes.length < showEpisodes.length;
+    let finalEpisodes = showEpisodes;
     const remainingBudget = CHANNEL_MAX_TOTAL_ITEMS - channelDraftItems.length;
     const trimmedForTotalBudget = finalEpisodes.length > remainingBudget;
     if (trimmedForTotalBudget) finalEpisodes = finalEpisodes.slice(0, Math.max(0, remainingBudget));
     finalEpisodes.forEach((it) => channelDraftItems.push(it));
-    if (!channelDraftPoster) channelDraftPoster = showPoster || null;
+    if (!channelDraftBackdrop && showBackdrop) channelDraftBackdrop = showBackdrop;
+    if (!channelDraftPoster && showPoster) channelDraftPoster = showPoster;
     renderChannelDraftList();
     if (btn) {
-      let label = 'Added ' + finalEpisodes.length + ' episodes \u2713';
-      if (trimmedForShowLength) label = 'Added most recent ' + CHANNEL_MAX_EPISODES_PER_SHOW + ' episodes \u2713';
+      let label = 'Added all ' + finalEpisodes.length + ' episodes \u2713';
       if (trimmedForTotalBudget) label = 'Added ' + finalEpisodes.length + ' (channel size limit reached)';
       btn.textContent = label;
     }
   } catch (e) {
-    alert('Something went wrong adding every season -- try again, or add seasons one at a time.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Something went wrong adding every season -- try again, or add seasons one at a time.');
+    } else {
+      alert('Something went wrong adding every season -- try again, or add seasons one at a time.');
+    }
     if (btn) {
       btn.disabled = false;
       btn.textContent = 'Add every season (all episodes)';
@@ -15064,7 +16710,7 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, seas
   }
 }
 
-async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, season) {
+async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, showBackdrop, season) {
   const listBox = document.getElementById('channelEpisodeList');
   if (!listBox) return;
   listBox.innerHTML = '<p><small>Loading episodes\u2026</small></p>';
@@ -15091,10 +16737,10 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
       '<div class="actions" style="margin-top:8px;">' +
       '<button type="button" class="secondary channelAddEpisodesBtn"' +
       ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
-      ' data-poster="' + escapeAttr(showPoster) + '">Add checked episodes</button>' +
+      ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add checked episodes</button>' +
       '<button type="button" class="secondary channelAddAllEpisodesBtn"' +
       ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
-      ' data-poster="' + escapeAttr(showPoster) + '">Add all episodes</button>' +
+      ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add all episodes</button>' +
       '</div>';
     listBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
@@ -15102,10 +16748,14 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
   }
 }
 
-function addCheckedEpisodesToChannel(imdbId, showName, showPoster) {
+function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
   const checks = document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck:checked');
   if (!checks.length) {
-    alert('Check at least one episode first.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Check at least one episode first.');
+    } else {
+      alert('Check at least one episode first.');
+    }
     return;
   }
   checks.forEach((cb) => {
@@ -15120,56 +16770,310 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster) {
       imdbId: imdbId,
       season: ep.season,
       episode: ep.episode,
+      showName: showName || '',
+      epName: ep.title || ('Episode ' + ep.episode),
       title: (showName ? showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.title || ('Episode ' + ep.episode)),
       released: ep.released,
-      thumbnail: ep.thumbnail || showPoster,
+      thumbnail: ep.thumbnail || showBackdrop || showPoster,
+      poster: showPoster || ep.thumbnail || showBackdrop || '',
+      showPoster: showPoster || '',
     });
   });
-  if (!channelDraftPoster) channelDraftPoster = showPoster || null;
+  if (!channelDraftBackdrop && showBackdrop) channelDraftBackdrop = showBackdrop;
+  if (!channelDraftPoster && showPoster) channelDraftPoster = showPoster;
   renderChannelDraftList();
 }
 
 // Checks every episode box for the currently-loaded season, then reuses
 // addCheckedEpisodesToChannel above rather than duplicating its logic.
-function addAllEpisodesToChannel(imdbId, showName, showPoster) {
+function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
   document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck').forEach((cb) => {
     cb.checked = true;
   });
-  addCheckedEpisodesToChannel(imdbId, showName, showPoster);
+  addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop);
+}
+
+const LOCAL_CHANNELS_KEY = 'myListAddon:localChannels';
+
+function loadLocalChannels() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_CHANNELS_KEY) || '{}');
+  } catch (e) {
+    return {};
+  }
+}
+
+function compressChannelItemsForStorage(items) {
+  if (!Array.isArray(items)) return [];
+  return items.slice(0, 200).map((it) => ({
+    kind: it.kind || 'episode',
+    imdbId: it.imdbId || '',
+    season: it.season != null ? it.season : 1,
+    episode: it.episode != null ? it.episode : 1,
+    showName: it.showName || '',
+    epName: it.epName || '',
+    title: it.title || '',
+    released: it.released || '',
+    thumbnail: it.thumbnail || it.poster || '',
+    poster: it.poster || it.thumbnail || '',
+    showPoster: it.showPoster || '',
+  }));
+}
+
+function saveLocalChannelsMap(map) {
+  try {
+    localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(map));
+    if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+    return true;
+  } catch (e) {
+    console.warn('saveLocalChannelsMap initial attempt failed, compressing...', e);
+    try {
+      const compressed = {};
+      for (const [id, ch] of Object.entries(map || {})) {
+        if (!ch) continue;
+        compressed[id] = {
+          channelId: ch.channelId,
+          name: ch.name || 'Channel',
+          poster: ch.poster || null,
+          backdrop: ch.backdrop || null,
+          items: compressChannelItemsForStorage(ch.items),
+          shuffle: !!ch.shuffle,
+          dailyRotate: !!ch.dailyRotate,
+          createdAt: ch.createdAt || Date.now(),
+          updatedAt: ch.updatedAt || Date.now(),
+        };
+      }
+      localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(compressed));
+      if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+      return true;
+    } catch (err2) {
+      console.error('saveLocalChannelsMap failed even after compression:', err2);
+      return false;
+    }
+  }
+}
+
+function ensureAllChannelsSyncedFromRows(map) {
+  if (!map || typeof map !== 'object') map = loadLocalChannels();
+  let modified = false;
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  rows.forEach((div) => {
+    const nameEl = div.querySelector('.name');
+    const rowName = (nameEl && nameEl.value.trim()) || '';
+    const urlInputs = [...div.querySelectorAll('.url')];
+    urlInputs.forEach((u) => {
+      const rawVal = u.value || '';
+      const lines = rawVal.split('\\n').map((s) => s.trim()).filter(Boolean);
+      lines.forEach((line) => {
+        if (line.startsWith('channel:v1:')) {
+          try {
+            const payload = JSON.parse(line.slice('channel:v1:'.length));
+            if (payload && (payload.channelId || payload.name)) {
+              const chId = payload.channelId || ('channel-' + Math.random().toString(36).slice(2, 9));
+              payload.channelId = chId;
+              const chName = payload.name || rowName || 'Channel';
+              if (!map[chId]) {
+                map[chId] = {
+                  channelId: chId,
+                  name: chName,
+                  poster: payload.poster || null,
+                  backdrop: payload.backdrop || null,
+                  items: compressChannelItemsForStorage(payload.items),
+                  shuffle: !!payload.shuffle,
+                  dailyRotate: !!payload.dailyRotate,
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                };
+                modified = true;
+              } else if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
+                map[chId].name = chName;
+                modified = true;
+              }
+            }
+          } catch (e) {}
+        }
+      });
+    });
+  });
+  if (modified) saveLocalChannelsMap(map);
+  return map;
+}
+
+function saveLocalChannel(payload) {
+  const map = loadLocalChannels();
+  const channelId = payload.channelId || generateChannelId();
+  const now = Date.now();
+  const existing = map[channelId];
+  map[channelId] = {
+    channelId: channelId,
+    name: payload.name || 'Untitled Channel',
+    poster: payload.poster || null,
+    backdrop: payload.backdrop || null,
+    items: compressChannelItemsForStorage(payload.items),
+    shuffle: !!payload.shuffle,
+    dailyRotate: !!payload.dailyRotate,
+    createdAt: existing ? existing.createdAt : now,
+    updatedAt: now,
+  };
+  saveLocalChannelsMap(map);
+  return map[channelId];
+}
+
+function deleteLocalChannel(channelId, fallbackName) {
+  const map = loadLocalChannels();
+  const channel = map[channelId];
+  let name = (channel && channel.name && channel.name !== 'Channel') ? channel.name : (fallbackName || '');
+  if (!name || name === 'Channel') {
+    const row = [...document.querySelectorAll('#lists .entry')].find((div) =>
+      [...div.querySelectorAll('.url')].some((u) => u.value.includes(channelId))
+    );
+    if (row) {
+      const nameInput = row.querySelector('.name');
+      if (nameInput && nameInput.value.trim()) name = nameInput.value.trim();
+    }
+  }
+  if (!name || name === 'Channel') name = (channel && channel.name) || 'Channel';
+
+  const performDelete = () => {
+    delete map[channelId];
+    saveLocalChannelsMap(map);
+    
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    rows.forEach((row) => {
+      const urlInputs = [...row.querySelectorAll('.url')];
+      urlInputs.forEach((u) => {
+        if (u.value.includes(channelId)) {
+          row.remove();
+        }
+      });
+    });
+    saveState();
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('Deleted channel "' + name + '".');
+  };
+
+  if (typeof showAppConfirm === 'function') {
+    showAppConfirm(
+      'Delete Channel',
+      'Delete channel "' + name + '"? This will permanently remove it from your saved channels.',
+      'Delete Channel',
+      performDelete,
+      true
+    );
+  } else {
+    if (confirm('Delete channel "' + name + '"? This will permanently remove it from your saved channels.')) {
+      performDelete();
+    }
+  }
+}
+
+function toggleChannelInCatalog(channelId) {
+  const map = loadLocalChannels();
+  const channel = map[channelId];
+  if (!channel) return;
+  
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  let foundRow = null;
+  for (const row of rows) {
+    const urlInputs = [...row.querySelectorAll('.url')];
+    if (urlInputs.some((u) => u.value.includes(channelId))) {
+      foundRow = row;
+      break;
+    }
+  }
+  
+  if (foundRow) {
+    foundRow.remove();
+    saveState();
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('Removed "' + channel.name + '" from your Catalogs.');
+  } else {
+    const url = 'channel:v1:' + JSON.stringify(channel);
+    addRow(channel.name, url, 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('Added "' + channel.name + '" to your Catalogs.');
+  }
 }
 
 function renderChannelDraftList() {
   const box = document.getElementById('channelDraftList');
   const badge = document.getElementById('channelDraftCountBadge');
-  if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ' picked)' : '';
-  const picksBadge = document.getElementById('channelDraftPicksCountBadge');
-  if (picksBadge) picksBadge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
+  if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
   if (!channelDraftItems.length) {
-    box.innerHTML = '<p><small>Nothing added yet -- search above to get started.</small></p>';
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p>';
     return;
   }
-  box.innerHTML = channelDraftItems.map((it, i) => {
-    const label = it.kind === 'movie'
-      ? escapeHtml(it.title) + (it.year ? ' (' + escapeHtml(it.year) + ')' : '') + ' \u2014 Movie'
-      : escapeHtml(it.title) + ' \u2014 S' + it.season + 'E' + it.episode;
-    return '<div class="row quick-row channel-pick" data-idx="' + i + '" style="align-items:center; flex-wrap:nowrap;">' +
-      '<span class="drag-handle" draggable="true" style="cursor:grab; touch-action:none; padding:6px;">\u2630</span>' +
-      '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" style="width:60px; flex:none;" title="Type a position to move this pick there">' +
-      '<span style="flex:1;">' + label + '</span>' +
-      '<button type="button" class="movebtn secondary channelMoveBtn" data-dir="-1"' + (i === 0 ? ' disabled' : '') + '>\u2191</button>' +
-      '<button type="button" class="movebtn secondary channelMoveBtn" data-dir="1"' + (i === channelDraftItems.length - 1 ? ' disabled' : '') + '>\u2193</button>' +
-      '<button type="button" class="secondary channelRemovePickBtn">Remove</button>' +
-      '</div>';
+  const cardsHtml = channelDraftItems.map((it, i) => {
+    let showName = it.showName || '';
+    let epName = it.epName || '';
+    let seasonEp = '';
+    
+    if (it.kind === 'movie') {
+      showName = it.title ? (it.title + (it.year && !it.title.includes(String(it.year)) ? ' (' + it.year + ')' : '')) : 'Movie';
+      epName = 'Movie';
+    } else {
+      if (it.season != null && it.episode != null) {
+        seasonEp = 'S' + it.season + 'E' + it.episode;
+      }
+      if (!showName && it.title) {
+        if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+          const sIdx = it.title.indexOf(' S');
+          showName = it.title.slice(0, sIdx).trim();
+          const rest = it.title.slice(sIdx + 1).trim();
+          const dashIdx = rest.indexOf(' \u2014 ') !== -1 ? rest.indexOf(' \u2014 ') : (rest.indexOf(' - ') !== -1 ? rest.indexOf(' - ') : rest.indexOf(': '));
+          if (dashIdx !== -1) {
+            if (!seasonEp) seasonEp = rest.slice(0, dashIdx).trim();
+            if (!epName) epName = rest.slice(dashIdx + (rest.indexOf(': ') === dashIdx ? 2 : 3)).trim();
+          } else {
+            if (!seasonEp) seasonEp = rest.trim();
+          }
+        } else if (it.title.indexOf(' \u2014 ') !== -1) {
+          const parts = it.title.split(' \u2014 ');
+          showName = parts[0].trim();
+          if (!epName) epName = parts[1].trim();
+        } else {
+          showName = it.title.trim();
+        }
+      }
+      if (!epName) epName = it.epName || (seasonEp ? ('Episode ' + it.episode) : 'Episode');
+    }
+    
+    const firstLine = seasonEp ? (showName + ' ' + seasonEp) : showName;
+    const secondLine = epName;
+    const posterSrc = it.thumbnail || it.poster || it.showPoster || it.backdrop || '';
+    const posterEl = posterSrc
+      ? '<img class="live-preview-poster" src="' + escapeAttr(posterSrc) + '" alt="" loading="lazy">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+
+    return '<div class="live-preview-poster-card channel-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
+      '<div style="position:relative; width:100%;">' +
+        posterEl +
+        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+          '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+        '</div>' +
+        '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>' +
+      '</div>' +
+      '<div class="live-preview-poster-name" title="' + escapeAttr(firstLine) + '">' + escapeHtml(firstLine) + '</div>' +
+      '<div class="live-preview-poster-year" title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</div>' +
+    '</div>';
   }).join('');
-  document.querySelectorAll('#channelDraftList .drag-handle').forEach((h) => initChannelTouchDrag(h));
+  
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+  initChannelHoldDrag();
 }
 
-// A channel built from a whole show (or several) can easily run into the
-// hundreds of picks -- letting someone clear the slate in one click beats
-// hitting Remove hundreds of times to start over.
+function reverseChannelDraft() {
+  if (!channelDraftItems.length) return;
+  channelDraftItems.reverse();
+  renderChannelDraftList();
+}
+
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
-  if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This can\\'t be undone.')) return;
+  if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;
   channelDraftItems = [];
   renderChannelDraftList();
 }
@@ -15183,23 +17087,8 @@ document.getElementById('channelDraftList').addEventListener('click', (e) => {
     renderChannelDraftList();
     return;
   }
-  const moveBtn = e.target.closest('.channelMoveBtn');
-  if (moveBtn) {
-    const row = moveBtn.closest('.channel-pick');
-    const idx = parseInt(row.dataset.idx, 10);
-    const swapWith = idx + parseInt(moveBtn.dataset.dir, 10);
-    if (swapWith < 0 || swapWith >= channelDraftItems.length) return;
-    const tmp = channelDraftItems[idx];
-    channelDraftItems[idx] = channelDraftItems[swapWith];
-    channelDraftItems[swapWith] = tmp;
-    renderChannelDraftList();
-  }
 });
 
-// Lets someone type a new position directly into a pick's number box
-// instead of clicking the up arrow repeatedly -- same idea as
-// movePosTo()/the Custom List draft's own position input, adapted for
-// this array-backed draft.
 document.getElementById('channelDraftList').addEventListener('change', (e) => {
   const posInput = e.target.closest('.channelPosInput');
   if (!posInput) return;
@@ -15220,98 +17109,183 @@ document.getElementById('channelDraftList').addEventListener('change', (e) => {
   renderChannelDraftList();
 });
 
-// Mouse drag-and-drop -- same live-DOM-reorder-then-read-back-order
-// technique the Custom List draft's own drag uses (see
-// reorderCustomListDraftFromDom's own comment for the full rationale),
-// adapted for channelDraftItems/.channel-pick instead.
-let channelDragRow = null;
+let channelHoldDragBound = false;
 
-document.getElementById('channelDraftList').addEventListener('dragstart', (e) => {
-  const handle = e.target.closest('.drag-handle');
-  if (!handle) { e.preventDefault(); return; }
-  channelDragRow = handle.closest('.channel-pick');
-  channelDragRow.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-});
-
-document.getElementById('channelDraftList').addEventListener('dragend', () => {
-  if (channelDragRow) channelDragRow.classList.remove('dragging');
-  channelDragRow = null;
-  reorderChannelDraftFromDom();
-});
-
-document.getElementById('channelDraftList').addEventListener('dragover', (e) => {
-  if (!channelDragRow) return;
-  e.preventDefault();
+function initChannelHoldDrag() {
   const container = document.getElementById('channelDraftList');
-  const afterEl = getChannelDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(channelDragRow);
-  } else if (afterEl !== channelDragRow) {
-    container.insertBefore(channelDragRow, afterEl);
-  }
-});
+  if (!container || channelHoldDragBound) return;
+  channelHoldDragBound = true;
 
-function getChannelDragAfterElement(container, y) {
-  const els = [...container.querySelectorAll('.channel-pick:not(.dragging)')];
-  return els.reduce((closest, child) => {
-    const box = child.getBoundingClientRect();
-    const offset = y - box.top - box.height / 2;
-    if (offset < 0 && offset > closest.offset) {
-      return { offset: offset, element: child };
+  let activeCard = null;
+  let isDragging = false;
+  let holdTimer = null;
+  let startX = 0;
+  let startY = 0;
+
+  const cancelHold = () => {
+    if (holdTimer) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
     }
-    return closest;
-  }, { offset: -Infinity, element: null }).element;
+  };
+
+  const stopDrag = () => {
+    cancelHold();
+    if (isDragging && activeCard) {
+      activeCard.classList.remove('dragging');
+      reorderChannelDraftFromDom();
+    }
+    isDragging = false;
+    activeCard = null;
+    document.body.style.userSelect = '';
+  };
+
+  const startDrag = (card) => {
+    isDragging = true;
+    activeCard = card;
+    card.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      try { navigator.vibrate(30); } catch (err) {}
+    }
+  };
+
+  const handleMove = (clientX, clientY, e) => {
+    if (!activeCard) return;
+
+    if (!isDragging) {
+      const dist = Math.hypot(clientX - startX, clientY - startY);
+      if (dist > 12) {
+        cancelHold();
+        activeCard = null;
+      }
+      return;
+    }
+
+    if (e && e.cancelable) {
+      e.preventDefault();
+    }
+
+    const grid = container.querySelector('.poster-grid-3') || container;
+    const targetCard = getChannelDragAfterElement(grid, clientX, clientY);
+    if (targetCard && targetCard !== activeCard) {
+      const box = targetCard.getBoundingClientRect();
+      const isAfter = (clientY > box.top + box.height / 2) || (clientY >= box.top && clientX > box.left + box.width / 2);
+      if (isAfter) {
+        grid.insertBefore(activeCard, targetCard.nextSibling);
+      } else {
+        grid.insertBefore(activeCard, targetCard);
+      }
+    }
+  };
+
+  container.addEventListener('dragstart', (e) => { e.preventDefault(); });
+
+  // Pointer events for desktop & unified pointer handling
+  container.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
+    const card = e.target.closest('.channel-pick');
+    if (!card) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, isTouch ? 180 : 120);
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!activeCard) return;
+    handleMove(e.clientX, e.clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('pointerup', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('pointercancel', (e) => {
+    if (!isDragging) {
+      cancelHold();
+      activeCard = null;
+    } else if (e.pointerType !== 'touch') {
+      stopDrag();
+    }
+  });
+
+  // Dedicated touch listeners for guaranteed mobile gesture prevention
+  container.addEventListener('touchstart', (e) => {
+    if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
+    const card = e.target.closest('.channel-pick');
+    if (!card || e.touches.length !== 1) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, 180);
+  }, { passive: true });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!activeCard || !e.touches || e.touches.length !== 1) return;
+    if (isDragging && e.cancelable) {
+      e.preventDefault();
+    }
+    handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('touchend', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('touchcancel', () => {
+    if (activeCard) stopDrag();
+  });
+}
+
+function getChannelDragAfterElement(container, x, y) {
+  const els = [...container.querySelectorAll('.channel-pick:not(.dragging)')];
+  if (!els.length) return null;
+
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+      return child;
+    }
+  }
+
+  let closest = null;
+  let closestDistance = Infinity;
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    const dist = Math.hypot(x - cx, y - cy);
+    if (dist < closestDistance) {
+      closestDistance = dist;
+      closest = child;
+    }
+  }
+  return closest;
 }
 
 function reorderChannelDraftFromDom() {
   const container = document.getElementById('channelDraftList');
   const rows = [...container.querySelectorAll('.channel-pick')];
-  channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]);
+  if (rows.length) {
+    channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+  }
   renderChannelDraftList();
 }
 
-// Touch/pen drag-to-reorder -- native HTML5 drag-and-drop above generally
-// doesn't fire on touch devices at all; the \u2191/\u2193 buttons and
-// editable position number both still work fine on touch regardless.
-let channelTouchDragRow = null;
-
-function initChannelTouchDrag(handle) {
-  if (!handle) return;
-  handle.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    e.preventDefault();
-    channelTouchDragRow = handle.closest('.channel-pick');
-    channelTouchDragRow.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    document.addEventListener('pointermove', onChannelTouchDragMove);
-    document.addEventListener('pointerup', onChannelTouchDragEnd, { once: true });
-    document.addEventListener('pointercancel', onChannelTouchDragEnd, { once: true });
-  });
-}
-
-function onChannelTouchDragMove(e) {
-  if (!channelTouchDragRow) return;
-  const container = document.getElementById('channelDraftList');
-  const afterEl = getChannelDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(channelTouchDragRow);
-  } else if (afterEl !== channelTouchDragRow) {
-    container.insertBefore(channelTouchDragRow, afterEl);
-  }
-}
-
-function onChannelTouchDragEnd() {
-  document.removeEventListener('pointermove', onChannelTouchDragMove);
-  if (channelTouchDragRow) channelTouchDragRow.classList.remove('dragging');
-  channelTouchDragRow = null;
-  reorderChannelDraftFromDom();
-}
-
-// One-time shuffle of the picks *while building* -- separate from the
-// "Randomize play order" checkbox below, which reshuffles the saved
-// channel itself once a day. This one just saves having to drag everything
-// into a random order by hand before saving.
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
@@ -15323,175 +17297,465 @@ function shuffleChannelDraft() {
   renderChannelDraftList();
 }
 
-// Set by editChannel below while an existing channel's picks are loaded
-// into the draft for editing; null means "Save" creates a brand new
-// channel, same as always.
+let editingChannelId = null;
 let editingChannelUrlInput = null;
 
 function saveChannel() {
   const nameInput = document.getElementById('channelNameInput');
   const name = nameInput.value.trim();
   if (!name) {
-    alert('Name this channel first.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Name this channel first.');
+    } else {
+      alert('Name this channel first.');
+    }
     return;
   }
   if (!channelDraftItems.length) {
-    alert('Add at least one episode or movie first.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Add at least one episode or movie first.');
+    } else {
+      alert('Add at least one episode or movie first.');
+    }
     return;
   }
-  const poster = channelDraftPoster || (channelDraftItems[0] && channelDraftItems[0].thumbnail) || null;
+  const verticalPoster = channelDraftPoster || (channelDraftItems[0] && channelDraftItems[0].poster) || null;
+  const horizontalBackdrop = channelDraftBackdrop || (channelDraftItems[0] && (channelDraftItems[0].thumbnail || channelDraftItems[0].backdrop)) || channelDraftPoster || null;
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 
-  if (editingChannelUrlInput) {
-    // Update in place: reuse the channel's existing channelId so any
-    // merged siblings (see mergeChannelsIntoRow) and its own already-
-    // generated meta id keep resolving to the same channel, just with
-    // fresh contents.
-    const oldPayload = parseChannelPayloadClient(editingChannelUrlInput.value) || {};
-    const channelId = oldPayload.channelId || generateChannelId();
-    const payload = { channelId: channelId, name: name, poster: poster, items: channelDraftItems, shuffle: shuffle };
-    const newUrl = 'channel:v1:' + JSON.stringify(payload);
-    const sourceRow = editingChannelUrlInput.closest('.source-row');
-    if (sourceRow) sourceRow.outerHTML = channelSourceRowHtml(newUrl);
-    // A row holding just this one channel also uses its own name as the
-    // row's name -- keep those in sync. A merged row's name is the shared
-    // shelf name instead, so that's left alone.
-    const rowDiv = editingChannelUrlInput.closest('.entry');
-    if (rowDiv && rowDiv.querySelectorAll('.url').length === 1) {
-      const rowNameInput = rowDiv.querySelector('.name');
-      if (rowNameInput) rowNameInput.value = name;
-    }
-    editingChannelUrlInput = null;
-    renumber();
-    checkAllDuplicateUrls();
-    saveState();
-    alert('Channel "' + name + '" updated.');
-  } else {
-    // channelId AND name are both embedded in the payload itself (not just
-    // the row's own id/name) so this channel keeps its own identity even if
-    // it's later merged with other channels into one row -- see
-    // mergeChannelsIntoRow, where multiple channel payloads get newline-
-    // joined into a single entry's url and fetched independently server-
-    // side. In that context there's no single "entry.id"/"entry.name" to
-    // fall back on for any individual channel -- only the merged row's own,
-    // which every channel in it would otherwise incorrectly share.
-    const channelId = generateChannelId();
-    const payload = { channelId: channelId, name: name, poster: poster, items: channelDraftItems, shuffle: shuffle };
+  const map = loadLocalChannels();
+  const channelId = editingChannelId || generateChannelId();
+  const existing = map[channelId] || {};
+  
+  const payload = {
+    channelId: channelId,
+    name: name,
+    poster: verticalPoster,
+    backdrop: horizontalBackdrop,
+    items: channelDraftItems,
+    shuffle: shuffle,
+    dailyRotate: existing.dailyRotate || false
+  };
+
+  saveLocalChannel(payload);
+
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  let foundRow = false;
+  rows.forEach((row) => {
+    const urlInputs = [...row.querySelectorAll('.url')];
+    urlInputs.forEach((u) => {
+      if (u.value.includes(channelId)) {
+        foundRow = true;
+        u.value = 'channel:v1:' + JSON.stringify(payload);
+        const nameEl = row.querySelector('.name');
+        if (nameEl && urlInputs.length === 1) nameEl.value = name;
+      }
+    });
+  });
+
+  if (!foundRow && !editingChannelId) {
     addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
-    alert('Channel "' + name + '" added to your list below.');
+    showAddedToast('Channel "' + name + '" saved and added to your Catalogs.');
+  } else {
+    showAddedToast('Channel "' + name + '" saved.');
   }
 
+  saveState();
+  
+  editingChannelId = null;
+  editingChannelUrlInput = null;
   channelDraftItems = [];
   channelDraftPoster = null;
+  channelDraftBackdrop = null;
   nameInput.value = '';
   document.getElementById('channelRandomizeCheck').checked = false;
-  document.getElementById('channelSearchInput').value = '';
-  document.getElementById('channelSearchResult').innerHTML = '';
-  document.getElementById('channelEpisodePicker').innerHTML = '';
+  const searchInput = document.getElementById('channelSearchInput');
+  if (searchInput) searchInput.value = '';
+  const searchRes = document.getElementById('channelSearchResult');
+  if (searchRes) searchRes.innerHTML = '';
+  const epPicker = document.getElementById('channelEpisodePicker');
+  if (epPicker) epPicker.innerHTML = '';
+  
   renderChannelDraftList();
+  renderMyCreatedChannelsList();
   renderChannelMergeList();
   updateChannelSaveButtonLabel();
+  switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
 }
 
-// Loads an existing channel's picks back into the draft picker so they can
-// be adjusted and saved back over the same channel, instead of needing to
-// delete and rebuild it from scratch.
+function switchChannelsSubmenu(name, btn) {
+  if (btn) {
+    document.querySelectorAll('#channelsSubnavBar .subnav-pill').forEach((p) => {
+      p.classList.remove('active');
+      const c = p.querySelector('.check-icon');
+      if (c) c.remove();
+    });
+    btn.classList.add('active');
+    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+  }
+
+  const panels = {
+    'my-channels': document.getElementById('channelsSubMyChannels'),
+    'quickadd': document.getElementById('channelsSubQuickAdd'),
+    'import': document.getElementById('channelsSubImport'),
+    'build': document.getElementById('channelsSubBuild')
+  };
+
+  for (const key in panels) {
+    if (panels[key]) {
+      panels[key].style.display = (key === name) ? 'block' : 'none';
+    }
+  }
+
+  try {
+    localStorage.setItem('myListAddon:channelsSubmenu', name);
+  } catch (e) {}
+
+  if (name === 'my-channels') {
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+  } else if (name === 'import') {
+    renderChannelMergeList();
+  }
+}
+
+function openBuildCustomChannel() {
+  editingChannelId = null;
+  editingChannelUrlInput = null;
+  channelDraftItems = [];
+  channelDraftPoster = null;
+  channelDraftBackdrop = null;
+  const nameInput = document.getElementById('channelNameInput');
+  if (nameInput) nameInput.value = '';
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  if (randCheck) randCheck.checked = false;
+  const searchInput = document.getElementById('channelSearchInput');
+  if (searchInput) searchInput.value = '';
+  const searchRes = document.getElementById('channelSearchResult');
+  if (searchRes) searchRes.innerHTML = '';
+  const epPicker = document.getElementById('channelEpisodePicker');
+  if (epPicker) epPicker.innerHTML = '';
+  renderChannelDraftList();
+  updateChannelSaveButtonLabel();
+  switchChannelsSubmenu('build', null);
+  const panel = document.getElementById('channelsSubBuild');
+  if (panel) {
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+function editChannelById(channelId) {
+  const map = loadLocalChannels();
+  const channel = map[channelId];
+  if (!channel) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Channel not found.');
+    } else {
+      alert('Channel not found.');
+    }
+    return;
+  }
+  editingChannelId = channelId;
+  editingChannelUrlInput = null;
+  channelDraftItems = (channel.items || []).slice();
+  channelDraftPoster = channel.poster || null;
+  channelDraftBackdrop = channel.backdrop || null;
+  
+  const nameInput = document.getElementById('channelNameInput');
+  if (nameInput) nameInput.value = channel.name || '';
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  if (randCheck) randCheck.checked = !!channel.shuffle;
+  
+  renderChannelDraftList();
+  updateChannelSaveButtonLabel();
+  
+  switchTab('channels');
+  switchChannelsSubmenu('build', null);
+  const panel = document.getElementById('channelsSubBuild');
+  if (panel) {
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  const searchInput = document.getElementById('channelSearchInput');
+  if (searchInput) searchInput.focus();
+}
+
 function editChannel(btnOrRow) {
   const sourceRow = btnOrRow.closest ? btnOrRow.closest('.source-row') || btnOrRow : btnOrRow;
   const urlInput = sourceRow && sourceRow.querySelector('.url');
   if (!urlInput) {
-    alert('Could not read this channel to edit it.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Could not read this channel to edit it.');
+    } else {
+      alert('Could not read this channel to edit it.');
+    }
     return;
   }
   const payload = parseChannelPayloadClient(urlInput.value);
   if (!payload) {
-    alert('Could not read this channel to edit it.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Builder', 'Could not read this channel to edit it.');
+    } else {
+      alert('Could not read this channel to edit it.');
+    }
     return;
   }
-  channelDraftItems = (payload.items || []).slice();
-  channelDraftPoster = payload.poster || null;
-  document.getElementById('channelNameInput').value = payload.name || '';
-  document.getElementById('channelRandomizeCheck').checked = !!payload.shuffle;
-  editingChannelUrlInput = urlInput;
-  renderChannelDraftList();
-  updateChannelSaveButtonLabel();
-  
-  const picksDetails = document.getElementById('channelDraftPicksDetails');
-  if (picksDetails) picksDetails.open = false;
+  if (payload.channelId) {
+    saveLocalChannel(payload);
+    editChannelById(payload.channelId);
+  } else {
+    const channelId = generateChannelId();
+    payload.channelId = channelId;
+    saveLocalChannel(payload);
+    editChannelById(channelId);
+  }
+}
 
-  window.scrollTo({ top: document.getElementById('catalogsSubChannels').offsetTop - 20, behavior: 'smooth' });
-  const searchInput = document.getElementById('channelSearchInput');
-  if (searchInput) searchInput.focus();
+function openChannelDetailsPage(channelIdOrDivId) {
+  const map = loadLocalChannels();
+  let channel = map[channelIdOrDivId];
+  if (!channel) {
+    const div = document.getElementById(channelIdOrDivId);
+    if (div) {
+      const u = div.querySelector('.url');
+      if (u) {
+        try {
+          const payload = JSON.parse(u.value.trim().slice('channel:v1:'.length));
+          if (payload && payload.channelId && map[payload.channelId]) {
+            channel = map[payload.channelId];
+          } else if (payload) {
+            channel = payload;
+          }
+        } catch (e) {}
+      }
+    }
+  }
+  if (!channel) return;
+  
+  const sample = (channel.items || []).map((it, idx) => {
+    let showName = it.showName || '';
+    let epName = it.epName || '';
+    let seasonEp = '';
+    
+    if (it.season != null && it.episode != null) {
+      seasonEp = 'S' + it.season + 'E' + it.episode;
+    }
+    
+    if (!showName && it.title) {
+      if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+        const sIdx = it.title.indexOf(' S');
+        showName = it.title.slice(0, sIdx).trim();
+        const rest = it.title.slice(sIdx + 1).trim();
+        const dashIdx = rest.indexOf(' \u2014 ') !== -1 ? rest.indexOf(' \u2014 ') : (rest.indexOf(' - ') !== -1 ? rest.indexOf(' - ') : rest.indexOf(': '));
+        if (dashIdx !== -1) {
+          if (!seasonEp) seasonEp = rest.slice(0, dashIdx).trim();
+          if (!epName) epName = rest.slice(dashIdx + (rest.indexOf(': ') === dashIdx ? 2 : 3)).trim();
+        } else {
+          if (!seasonEp) seasonEp = rest.trim();
+        }
+      } else if (it.title.indexOf(' \u2014 ') !== -1) {
+        const parts = it.title.split(' \u2014 ');
+        showName = parts[0].trim();
+        if (!epName) epName = parts[1].trim();
+      } else {
+        showName = it.title.trim();
+      }
+    }
+    if (!showName) showName = channel.name || 'TV Channel';
+    
+    if (!epName) {
+      if (it.epName) {
+        epName = it.epName;
+      } else if (it.title && it.title !== showName) {
+        epName = it.title;
+      } else if (seasonEp) {
+        epName = 'Episode ' + (it.episode != null ? it.episode : '');
+      } else {
+        epName = 'Episode';
+      }
+    }
+    
+    const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
+    const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
+
+    return {
+      id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
+      type: 'series',
+      name: displayTitle,
+      subtitle: epName,
+      title: fullTitle,
+      poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || channel.poster || channel.backdrop || '',
+      thumbnail: it.thumbnail || it.backdrop || it.poster || it.showPoster || '',
+      year: it.year || (it.released ? it.released.slice(0, 4) : ''),
+    };
+  });
+
+  const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
+  if (typeof openListDetailsPage === 'function') {
+    openListDetailsPage(channel.name || 'TV Channel', 'series', channelUrl, { sample: sample, count: sample.length, maybeMore: false });
+  }
 }
 
 function renderMyCreatedChannelsList() {
   const box = document.getElementById('myCreatedChannelsList');
   if (!box) return;
-  const rows = [...document.querySelectorAll('#lists .entry')].filter((div) =>
-    [...div.querySelectorAll('.url')].some((el) => el.value.trim().startsWith('channel:v1:'))
-  );
-  if (!rows.length) {
-    box.innerHTML = '<p><small>No created channels yet.</small></p>';
+  
+  const map = ensureAllChannelsSyncedFromRows(loadLocalChannels());
+  const channels = Object.values(map);
+  if (!channels.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p>';
     return;
   }
-  box.innerHTML = rows.map((div, i) => {
-    const nameEl = div.querySelector('.name');
-    const name = (nameEl && nameEl.value.trim()) || 'Untitled channel';
-    const channelCount = [...div.querySelectorAll('.url')].filter((el) => el.value.trim().startsWith('channel:v1:')).length;
-    const label = channelCount > 1
-      ? escapeHtml(name) + ' (Combined: ' + channelCount + ' channels)'
-      : escapeHtml(name);
+  
+  channels.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+
+  box.innerHTML = channels.map((ch) => {
+    const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
+    const allItems = ch.items || [];
+    const totalEpisodes = allItems.length;
+    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's');
     
-    // We assign an ID to the row so we can reliably find it when Edit or Delete is clicked
-    if (!div.id) div.id = 'channel-row-' + i + '-' + Date.now();
+    const allPosters = allItems.slice(0, 9);
+    const posterThumbs = allPosters.map((it, i) => {
+      const isMobileEnd = (i === 2 && allItems.length > 3);
+      const isDesktopEnd = (i === allPosters.length - 1 && allItems.length >= 4);
+      let overlays = '';
+      if (isMobileEnd) {
+        overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+      }
+      if (isDesktopEnd) {
+        overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+      }
+
+      const p = it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '';
+      
+      let showName = it.showName || '';
+      let epName = it.epName || '';
+      let seasonEp = '';
+      
+      if (it.season != null && it.episode != null) {
+        seasonEp = 'S' + it.season + 'E' + it.episode;
+      }
+      
+      if (!showName && it.title) {
+        if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+          const sIdx = it.title.indexOf(' S');
+          showName = it.title.slice(0, sIdx).trim();
+          const rest = it.title.slice(sIdx + 1).trim();
+          const dashIdx = rest.indexOf(' \u2014 ') !== -1 ? rest.indexOf(' \u2014 ') : (rest.indexOf(' - ') !== -1 ? rest.indexOf(' - ') : rest.indexOf(': '));
+          if (dashIdx !== -1) {
+            if (!seasonEp) seasonEp = rest.slice(0, dashIdx).trim();
+            if (!epName) epName = rest.slice(dashIdx + (rest.indexOf(': ') === dashIdx ? 2 : 3)).trim();
+          } else {
+            if (!seasonEp) seasonEp = rest.trim();
+          }
+        } else if (it.title.indexOf(' \u2014 ') !== -1) {
+          const parts = it.title.split(' \u2014 ');
+          showName = parts[0].trim();
+          if (!epName) epName = parts[1].trim();
+        } else {
+          showName = it.title.trim();
+        }
+      }
+      if (!showName) showName = ch.name;
+      
+      if (!epName) {
+        if (it.epName) {
+          epName = it.epName;
+        } else if (it.title && it.title !== showName) {
+          epName = it.title;
+        } else if (seasonEp) {
+          epName = 'Episode ' + (it.episode != null ? it.episode : '');
+        } else {
+          epName = 'Episode';
+        }
+      }
+      
+      const firstLine = seasonEp ? (showName + ' ' + seasonEp) : showName;
+      const secondLine = epName;
+      
+      const imgHtml = p
+        ? '<img src="' + escapeAttr(p) + '" alt="" loading="lazy">'
+        : '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:0.65rem;text-align:center;padding:4px;">No poster</div>';
+      
+      return '<div class="list-card-mini-poster-tile">' +
+        '<div class="list-card-mini-poster-img-wrap">' +
+          imgHtml +
+          overlays +
+        '</div>' +
+        '<div class="list-card-mini-poster-name" title="' + escapeAttr(firstLine) + '">' + escapeHtml(firstLine) + '</div>' +
+        '<div class="list-card-mini-poster-subtitle" title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</div>' +
+      '</div>';
+    }).join('');
     
-    return '<div class="row quick-row" style="display:flex; justify-content:space-between; align-items:center;">' +
-      '<div style="font-weight:600; font-size:0.9rem; flex:1;">' + label + '</div>' +
-      '<div class="actions" style="flex-wrap:nowrap; gap:8px;">' +
-        '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannel(document.getElementById(&quot;' + div.id + '&quot;).querySelector(&quot;.source-row&quot;))">Edit</button>' +
-        '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--red);" onclick="document.getElementById(&quot;' + div.id + '&quot;).remove(); saveState(); renderMyCreatedChannelsList(); renderChannelMergeList();">Delete</button>' +
+    const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleChannelInCatalog(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' +
+      (isAdded ? 'Remove' : '+ Add') +
+    '</button>';
+
+    return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + metaText + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeAttr(ch.channelId) + '&quot;)">Edit</button>' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeAttr(ch.channelId) + '&quot;, &quot;' + escapeAttr(ch.name) + '&quot;)">Delete</button>' +
+          addBtnHtml +
+        '</div>' +
       '</div>' +
+      (posterThumbs ? '<div class="list-card-posters poster-preview-static" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
 }
 
 function cancelEditChannel() {
+  editingChannelId = null;
   editingChannelUrlInput = null;
   channelDraftItems = [];
   channelDraftPoster = null;
-  document.getElementById('channelNameInput').value = '';
-  document.getElementById('channelRandomizeCheck').checked = false;
+  channelDraftBackdrop = null;
+  const nameInput = document.getElementById('channelNameInput');
+  if (nameInput) nameInput.value = '';
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  if (randCheck) randCheck.checked = false;
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
-  const picksDetails = document.getElementById('channelDraftPicksDetails');
-  if (picksDetails) picksDetails.open = true;
+  switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
 }
 
-// Swaps the Save button's label/behavior hint between "new channel" and
-// "updating an existing one", and shows/hides the Cancel-edit button next
-// to it, so it's obvious which mode the picker is in.
 function updateChannelSaveButtonLabel() {
   const saveBtn = document.getElementById('channelSaveBtn');
   const cancelBtn = document.getElementById('channelCancelEditBtn');
+  const titleEl = document.getElementById('channelEditorTitle');
+  if (titleEl) {
+    titleEl.innerHTML = (editingChannelId || editingChannelUrlInput ? 'Edit TV Channel' : 'Build Custom Channel') + ' <span class="badge" id="channelDraftCountBadge"></span>';
+    const badge = document.getElementById('channelDraftCountBadge');
+    if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
+  }
   if (!saveBtn) return;
-  if (editingChannelUrlInput) {
-    saveBtn.textContent = 'Save changes to this Channel';
-    if (cancelBtn) cancelBtn.style.display = '';  } else {
-    saveBtn.textContent = 'Save as a Channel';
+  if (editingChannelId || editingChannelUrlInput) {
+    saveBtn.textContent = 'Save';
+    if (cancelBtn) {
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.display = '';
+    }
+  } else {
+    saveBtn.textContent = 'Save';
     if (cancelBtn) cancelBtn.style.display = 'none';
   }
 }
 
-document.querySelectorAll('.channelQuickAddBtn').forEach((btn) => {
-  btn.addEventListener('click', () => quickAddChannel(btn.dataset.name, btn.dataset.listurl || null, btn.dataset.networkid || null, btn));
+document.addEventListener('click', (e) => {
+  const quickBtn = e.target.closest('.channelQuickAddBtn');
+  if (quickBtn) {
+    quickAddChannel(quickBtn.dataset.name, quickBtn.dataset.listurl || null, quickBtn.dataset.networkid || null, quickBtn);
+  }
 });
 
-// Builds a whole channel automatically from either a curated mdblist.com
-// show list or a TMDB network id directly: resolves every show to TMDB
-// (one request, server-side -- see /api/quick-channel-shows), then walks
-// each show's seasons/episodes via the same /api/show-seasons +
-// /api/show-episodes endpoints the manual picker uses. Deliberately
-// sequential across shows (one at a time, each show's own seasons fetched
 // in parallel) rather than firing everything at once -- slower, but keeps
 // a live "show 4 of 18" status line honest and avoids hammering either
 // this Worker or TMDB with a burst of concurrent requests for a large
@@ -15524,37 +17788,62 @@ const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
 async function quickAddChannel(name, listUrl, networkId, btn) {
   const statusBox = document.getElementById('channelQuickAddStatus');
-  // Restored on the way out below -- this is called both from the fixed
-  // Quick Add network buttons ("Quick Add CBS") and from "Import from
-  // link", each with its own resting label, so hardcoding one back would
-  // leave the other mislabeled after its first use.
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Building ' + name + '\u2026';
+    btn.textContent = 'Adding ' + name + '\u2026';
   }
-  if (statusBox) statusBox.innerHTML = '<p><small>Fetching ' + escapeHtml(name) + ' show list\u2026</small></p>';
+  if (statusBox) statusBox.innerHTML = '<p><small>Adding ' + escapeHtml(name) + '\u2026</small></p>';
   try {
-    let params = networkId ? 'networkId=' + encodeURIComponent(networkId) : 'url=' + encodeURIComponent(listUrl);
-    if (!networkId) {
-      // Only the link-import path needs these -- a curated network id never
-      // touches a personal mdblist/Trakt list, but a pasted link might be a
-      // private one.
-      const keys = collectKeys();
-      if (keys.mdblistKey) params += '&mdblistKey=' + encodeURIComponent(keys.mdblistKey);
-      if (keys.traktKey) params += '&traktKey=' + encodeURIComponent(keys.traktKey);
-      if (keys.traktAccessToken) params += '&traktAccessToken=' + encodeURIComponent(keys.traktAccessToken);
+    if (networkId) {
+      const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+      const data = await res.json();
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+      }
+      if (data.ok && data.channel) {
+        const channelId = generateChannelId();
+        const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
+        saveLocalChannel(payload);
+        addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+        renderMyCreatedChannelsList();
+        renderChannelMergeList();
+        showAddedToast('Channel "' + name + '" added to your Catalogs.');
+        if (statusBox) {
+          statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + (payload.items ? payload.items.length : 0) + ' episodes with daily rotation)!</p>';
+          setTimeout(() => {
+            if (statusBox) statusBox.innerHTML = '';
+          }, 4000);
+        }
+      } else {
+        if (statusBox) statusBox.innerHTML = '';
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Add Channel', 'Could not add ' + name + ': ' + (data.error || 'unknown error'));
+        } else {
+          alert('Could not add ' + name + ': ' + (data.error || 'unknown error'));
+        }
+      }
+      return;
     }
+
+    let params = 'url=' + encodeURIComponent(listUrl);
+    const keys = collectKeys();
+    if (keys.mdblistKey) params += '&mdblistKey=' + encodeURIComponent(keys.mdblistKey);
+    if (keys.traktKey) params += '&traktKey=' + encodeURIComponent(keys.traktKey);
+    if (keys.traktAccessToken) params += '&traktAccessToken=' + encodeURIComponent(keys.traktAccessToken);
+    
     const res = await fetch(ORIGIN + '/api/quick-channel-shows?' + params, { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
-      alert('Could not build ' + name + ': ' + (data.error || 'unknown error'));
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Could Not Build Channel', 'Could not build ' + name + ': ' + (data.error || 'unknown error'));
+      } else {
+        alert('Could not build ' + name + ': ' + (data.error || 'unknown error'));
+      }
       return;
     }
-    // Shuffled so repeated clicks surface different shows -- otherwise the
-    // total-item cap below always cuts off at the same point in list order,
-    // meaning the same handful of shows (whatever happens to sort first)
-    // would win every single time.
+
     const shows = data.shows.slice();
     for (let i = shows.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -15563,17 +17852,8 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
       shows[j] = tmp;
     }
     const items = [];
-    // Used to be routed through /api/logo-pad, an SVG that referenced the
-    // network's logo (CBS eye, NBC peacock, etc.) by URL and drew it
-    // smaller within a padded frame -- looked fine in this page's own Live
-    // Preview (a real browser will happily fetch that nested image), but
-    // wako and Stremio's own apps never actually loaded it, since neither
-    // one's meta-poster pipeline fetches/renders an SVG that itself points
-    // at another remote image. Using the network's logo URL directly here
-    // instead -- exactly the same kind of plain TMDB image URL every other
-    // poster in this add-on already uses successfully -- trades away the
-    // padded/shrunk look for actually showing up everywhere.
     let poster = data.networkLogo || null;
+    let backdrop = null;
     let showsIncluded = 0;
     let showsTrimmed = 0;
     let stoppedEarly = false;
@@ -15588,6 +17868,7 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
           ' (' + escapeHtml(show.name) + ')</small></p>';
       }
       if (!poster && show.poster) poster = show.poster;
+      if (!backdrop && (show.backdrop || show.thumbnail)) backdrop = show.backdrop || show.thumbnail;
       try {
         const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
         const seasonsData = await seasonsRes.json();
@@ -15603,21 +17884,23 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
           .sort((a, b) => a.season - b.season)
           .forEach(({ season, episodes }) => {
             episodes.forEach((ep) => {
+              const stillUrl = ep.thumbnail || show.backdrop || show.poster || '';
+              const showPosterUrl = show.poster || '';
               showEpisodes.push({
                 kind: 'episode',
                 imdbId: show.imdbId,
                 season: season,
                 episode: ep.episode,
+                showName: show.name || '',
+                epName: ep.name || ('Episode ' + ep.episode),
                 title: (show.name ? show.name + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
-                released: ep.released,
-                thumbnail: ep.thumbnail || show.poster,
+                released: ep.released || '',
+                thumbnail: stillUrl || showPosterUrl,
+                poster: showPosterUrl || stillUrl,
+                showPoster: showPosterUrl,
               });
             });
           });
-        // A show that's run for decades (soaps, game shows, talk shows,
-        // news magazines) can rack up thousands of episodes on its own --
-        // keep the most recent ones rather than pulling in its entire
-        // history wholesale.
         let finalShowEpisodes = showEpisodes.length > CHANNEL_MAX_EPISODES_PER_SHOW
           ? showEpisodes.slice(-CHANNEL_MAX_EPISODES_PER_SHOW)
           : showEpisodes;
@@ -15630,36 +17913,35 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
         if (finalShowEpisodes.length) showsIncluded++;
         items.push(...finalShowEpisodes);
       } catch (e) {
-        // One show failing (network hiccup, no seasons data, etc.) shouldn't
-        // abort the whole channel -- just skip it and keep going.
         continue;
       }
     }
     if (!items.length) {
-      alert('Could not build ' + name + ' -- no episodes were found.');
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Could Not Build Channel', 'Could not build ' + name + ' -- no episodes were found.');
+      } else {
+        alert('Could not build ' + name + ' -- no episodes were found.');
+      }
       return;
     }
     const channelId = generateChannelId();
-    // dailyRotate: the server picks a fresh random 2000-item slice of this
-    // stored pool each day (see buildChannelMeta) rather than always
-    // showing the exact same fixed set -- so the actual lineup someone
-    // sees changes over time, drawn from everything gathered here.
-    const payload = { channelId: channelId, name: name, poster: poster, items: items, shuffle: false, dailyRotate: true };
+    const payload = { channelId: channelId, name: name, poster: poster, backdrop: backdrop || poster, items: items, shuffle: false, dailyRotate: true };
+    saveLocalChannel(payload);
     addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
     renderChannelMergeList();
-    let summary = name + ' channel added \u2014 ' + items.length + ' episodes across ' + showsIncluded + ' show(s) gathered. ' +
-      'It\\'ll show ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' + CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each from that pool, refreshed daily.';
-    if (showsTrimmed) summary += ' ' + showsTrimmed + ' long-running show(s) were trimmed to their most recent ' + CHANNEL_MAX_EPISODES_PER_SHOW + ' episodes.';
-    if (stoppedEarly) summary += ' Stopped gathering early to keep the pool a safe size (some shows in the list weren\\'t included).';
-    alert(summary);
+    showAddedToast('Channel "' + name + '" added to your Catalogs.');
   } catch (e) {
-    alert('Network error while building ' + name + '.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Network Error', 'Network error while adding ' + name + '.');
+    } else {
+      alert('Network error while adding ' + name + '.');
+    }
   } finally {
     if (btn) {
       btn.disabled = false;
       btn.textContent = originalLabel;
     }
-    if (statusBox) statusBox.innerHTML = '';
   }
 }
 
@@ -15674,11 +17956,19 @@ async function importChannelFromLink(btn) {
   const listUrl = urlInput.value.trim();
   const name = nameInput.value.trim();
   if (!listUrl) {
-    alert('Paste a list URL first.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Import Channel', 'Paste a list URL first.');
+    } else {
+      alert('Paste a list URL first.');
+    }
     return;
   }
   if (!name) {
-    alert('Name this channel first.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Import Channel', 'Name this channel first.');
+    } else {
+      alert('Name this channel first.');
+    }
     return;
   }
   await quickAddChannel(name, listUrl, null, btn);
@@ -15688,86 +17978,353 @@ async function importChannelFromLink(btn) {
 
 
 //
-// A channel is already just one item (one poster tile) in whatever catalog
-// it belongs to -- so putting several channels side by side in one shelf is
-// the exact same "merge multiple sources into one row" mechanism every
-// other list type here already uses (newline-joined urls, fanned out and
-// concatenated by fetchMergedCatalog server-side). This just needs a UI for
-// picking which already-saved channels to fold together.
-let channelMergeRows = [];
+const LOCAL_MERGED_CHANNELS_KEY = 'myListAddon:localMergedChannels';
 
-function renderChannelMergeList() {
-  renderMyCreatedChannelsList();
-  const box = document.getElementById('channelMergeList');
-  if (!box) return;
-  const selectAllCheck = document.getElementById('channelMergeSelectAllCheck');
-  if (selectAllCheck) selectAllCheck.checked = false;
-  const rows = [...document.querySelectorAll('#lists .entry')].filter((div) =>
-    [...div.querySelectorAll('.url')].some((el) => el.value.trim().startsWith('channel:v1:'))
-  );
-  channelMergeRows = rows;
-  if (!rows.length) {
-    box.innerHTML = '<p><small>No saved channels yet -- build one above first.</small></p>';
-    return;
+function loadLocalMergedChannels() {
+  try {
+    const raw = localStorage.getItem(LOCAL_MERGED_CHANNELS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (e) {
+    return {};
   }
-  box.innerHTML = rows.map((div, i) => {
-    const nameEl = div.querySelector('.name');
-    const name = (nameEl && nameEl.value.trim()) || 'Untitled channel';
-    const channelCount = [...div.querySelectorAll('.url')].filter((el) => el.value.trim().startsWith('channel:v1:')).length;
-    const label = channelCount > 1
-      ? escapeHtml(name) + ' (' + channelCount + ' channels already merged here)'
-      : escapeHtml(name);
-    return '<label class="row quick-row" style="cursor:pointer;">' +
-      '<span><input type="checkbox" class="channelMergeCheck" data-rowidx="' + i + '"> ' + label + '</span>' +
-      '</label>';
-  }).join('');
 }
 
-// Bulk-checks (or unchecks) every saved channel in the merge list -- the
-// individual checkboxes get wiped out on every renderChannelMergeList()
-// re-render, so this checkbox is reset there too rather than trying to
-// track a stale "was everything checked" state across a refresh.
+function saveLocalMergedChannelsMap(map) {
+  try {
+    localStorage.setItem(LOCAL_MERGED_CHANNELS_KEY, JSON.stringify(map));
+    if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+    return true;
+  } catch (e) {
+    console.error('saveLocalMergedChannelsMap failed:', e);
+    return false;
+  }
+}
+
+function saveLocalMergedChannel(payload) {
+  const map = loadLocalMergedChannels();
+  const mergedId = payload.mergedId || ('merged-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7));
+  const now = Date.now();
+  const existing = map[mergedId];
+  map[mergedId] = {
+    mergedId: mergedId,
+    name: payload.name || 'Merged Channel',
+    channelIds: Array.isArray(payload.channelIds) ? payload.channelIds : [],
+    createdAt: existing ? existing.createdAt : now,
+    updatedAt: now,
+  };
+  saveLocalMergedChannelsMap(map);
+  return map[mergedId];
+}
+
+function deleteLocalMergedChannel(mergedId) {
+  const map = loadLocalMergedChannels();
+  const merged = map[mergedId];
+  const name = merged ? merged.name : 'Merged Catalog';
+  
+  const performDelete = () => {
+    delete map[mergedId];
+    saveLocalMergedChannelsMap(map);
+    
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    rows.forEach((row) => {
+      if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
+        row.remove();
+      }
+    });
+    saveState();
+    renderChannelMergeList();
+    showAddedToast('Deleted merged catalog "' + name + '".');
+  };
+
+  if (typeof showAppConfirm === 'function') {
+    showAppConfirm(
+      'Delete Merged Catalog',
+      'Delete merged catalog "' + name + '"? This will permanently remove this merged catalog.',
+      'Delete Merged Catalog',
+      performDelete,
+      true
+    );
+  } else {
+    if (confirm('Delete merged catalog "' + name + '"? This will permanently remove this merged catalog.')) {
+      performDelete();
+    }
+  }
+}
+
+function removeChannelFromMerge(mergedId, channelIdToRemove) {
+  const map = loadLocalMergedChannels();
+  const merged = map[mergedId];
+  if (!merged) return;
+  
+  merged.channelIds = (merged.channelIds || []).filter((id) => id !== channelIdToRemove);
+  merged.updatedAt = Date.now();
+  
+  if (merged.channelIds.length === 0) {
+    delete map[mergedId];
+  } else {
+    map[mergedId] = merged;
+  }
+  saveLocalMergedChannelsMap(map);
+  
+  const channelsMap = loadLocalChannels();
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  rows.forEach((row) => {
+    if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
+      if (merged.channelIds.length === 0) {
+        row.remove();
+      } else {
+        const urls = merged.channelIds.map((id) => {
+          const ch = channelsMap[id];
+          return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+        }).filter(Boolean);
+        const urlInput = row.querySelector('.url');
+        if (urlInput) urlInput.value = urls.join('\\n');
+      }
+    }
+  });
+  saveState();
+  renderChannelMergeList();
+  showAddedToast('Removed channel from merged catalog.');
+}
+
+function addChannelToMerge(mergedId, channelIdToAdd) {
+  if (!channelIdToAdd) return;
+  const map = loadLocalMergedChannels();
+  const merged = map[mergedId];
+  if (!merged) return;
+  
+  merged.channelIds = merged.channelIds || [];
+  if (!merged.channelIds.includes(channelIdToAdd)) {
+    merged.channelIds.push(channelIdToAdd);
+    merged.updatedAt = Date.now();
+    map[mergedId] = merged;
+    saveLocalMergedChannelsMap(map);
+    
+    const channelsMap = loadLocalChannels();
+    const ch = channelsMap[channelIdToAdd];
+    const chName = ch ? ch.name : 'Channel';
+    
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    rows.forEach((row) => {
+      if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
+        const urls = merged.channelIds.map((id) => {
+          const c = channelsMap[id];
+          return c ? ('channel:v1:' + JSON.stringify(c)) : null;
+        }).filter(Boolean);
+        const urlInput = row.querySelector('.url');
+        if (urlInput) urlInput.value = urls.join('\\n');
+      }
+    });
+    saveState();
+    renderChannelMergeList();
+    showAddedToast('Added "' + chName + '" to "' + merged.name + '".');
+  }
+}
+
+function toggleMergedChannelInCatalog(mergedId) {
+  const map = loadLocalMergedChannels();
+  const merged = map[mergedId];
+  if (!merged) return;
+  
+  const channelsMap = loadLocalChannels();
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  let foundRow = null;
+  for (const row of rows) {
+    if (row.dataset.mergedId === mergedId || row.dataset.channelId === mergedId || (row.id && row.id === mergedId)) {
+      foundRow = row;
+      break;
+    }
+    const nameInput = row.querySelector('.name');
+    if (nameInput && nameInput.value.trim() === merged.name) {
+      const urls = [...row.querySelectorAll('.url')].map((u) => u.value.trim()).filter(Boolean);
+      if (urls.length && urls.every((u) => u.startsWith('channel:v1:'))) {
+        foundRow = row;
+        break;
+      }
+    }
+  }
+  
+  if (foundRow) {
+    foundRow.remove();
+    saveState();
+    renderChannelMergeList();
+    showAddedToast('Removed "' + merged.name + '" from Catalogs shelf.');
+  } else {
+    const urls = (merged.channelIds || []).map((id) => {
+      const ch = channelsMap[id];
+      return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+    }).filter(Boolean);
+    
+    if (!urls.length) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Merge Channels', 'Could not find the channels for this merged catalog.');
+      } else {
+        alert('Could not find the channels for this merged catalog.');
+      }
+      return;
+    }
+    addRow(merged.name, urls.join('\\n'), 'series', true, 'Channels', mergedId);
+    saveState();
+    renderChannelMergeList();
+    showAddedToast('Added "' + merged.name + '" to Catalogs shelf.');
+  }
+}
+
+function mergeChannelsIntoRow() {
+  const checks = document.querySelectorAll('#channelMergeList .channelMergeCheck:checked');
+  if (checks.length < 2) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Merge Channels', 'Check at least two channels to merge.');
+    } else {
+      alert('Check at least two channels to merge.');
+    }
+    return;
+  }
+  const nameInput = document.getElementById('channelMergeNameInput');
+  const combinedName = nameInput.value.trim();
+  if (!combinedName) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Merge Channels', 'Name the combined catalog first.');
+    } else {
+      alert('Name the combined catalog first.');
+    }
+    return;
+  }
+  
+  const channelsMap = loadLocalChannels();
+  const channelIds = [...checks].map((cb) => cb.dataset.channelid).filter(Boolean);
+  const urls = channelIds.map((id) => {
+    const ch = channelsMap[id];
+    return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+  }).filter(Boolean);
+
+  if (urls.length < 2) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Merge Channels', 'Could not read the selected channels. Please try again.');
+    } else {
+      alert('Could not read the selected channels. Please try again.');
+    }
+    return;
+  }
+  
+  const merged = saveLocalMergedChannel({
+    name: combinedName,
+    channelIds: channelIds,
+  });
+  
+  addRow(combinedName, urls.join('\\n'), 'series', true, 'Channels', merged.mergedId);
+  nameInput.value = '';
+  saveState();
+  renderChannelMergeList();
+  showAddedToast('Merged ' + channelIds.length + ' channels into "' + combinedName + '".');
+}
+
 function toggleAllChannelMergeChecks(checkbox) {
   document.querySelectorAll('#channelMergeList .channelMergeCheck').forEach((cb) => {
     cb.checked = checkbox.checked;
   });
 }
 
-function mergeChannelsIntoRow() {
-  const checks = document.querySelectorAll('#channelMergeList .channelMergeCheck:checked');
-  if (checks.length < 2) {
-    alert('Check at least two channels to merge.');
+function renderChannelMergeList() {
+  const channelsMap = ensureAllChannelsSyncedFromRows(loadLocalChannels());
+  const mergedMap = loadLocalMergedChannels();
+  
+  // 1. Render Saved Merged Catalogs List
+  const savedBox = document.getElementById('savedMergedChannelsList');
+  if (savedBox) {
+    const mergedList = Object.values(mergedMap);
+    if (!mergedList.length) {
+      savedBox.innerHTML = '<p style="color:var(--muted); font-size:0.85rem; margin:0;"><small>No merged catalogs created yet. Select channels below to combine them.</small></p>';
+    } else {
+      mergedList.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+      savedBox.innerHTML = mergedList.map((merged) => {
+        const isAdded = [...document.querySelectorAll('#lists .entry')].some((r) => {
+          if (r.dataset.mergedId === merged.mergedId || r.dataset.channelId === merged.mergedId || (r.id && r.id === merged.mergedId)) return true;
+          const nameInput = r.querySelector('.name');
+          if (nameInput && nameInput.value.trim() === merged.name) {
+            const urls = [...r.querySelectorAll('.url')].map((u) => u.value.trim()).filter(Boolean);
+            if (urls.length && urls.every((u) => u.startsWith('channel:v1:'))) return true;
+          }
+          return false;
+        });
+        
+        let totalEpisodes = 0;
+        const channelChips = (merged.channelIds || []).map((chId) => {
+          const ch = channelsMap[chId];
+          const chName = ch ? ch.name : 'Unknown Channel';
+          if (ch && Array.isArray(ch.items)) totalEpisodes += ch.items.length;
+          return '<span class="badge" style="display:inline-flex; align-items:center; gap:5px; padding:3px 8px; font-size:0.8rem; background:var(--panel-strong); border:1px solid var(--border); border-radius:6px; margin:2px 4px 2px 0;">' +
+            escapeHtml(chName) +
+            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, &quot;' + escapeAttr(chId) + '&quot;)">&times;</button>' +
+          '</span>';
+        }).join('');
+        
+        const remainingChannels = Object.values(channelsMap).filter((c) => c && !(merged.channelIds || []).includes(c.channelId));
+        let addSelectHtml = '';
+        if (remainingChannels.length) {
+          remainingChannels.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+          const options = remainingChannels.map((c) => '<option value="' + escapeAttr(c.channelId) + '">' + escapeHtml(c.name) + ' (' + (c.items ? c.items.length : 0) + ' ep)</option>').join('');
+          addSelectHtml = '<select class="merge-add-channel-select" onchange="addChannelToMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, this.value); this.value=&quot;&quot;;">' +
+            '<option value="">+ Add channel...</option>' +
+            options +
+          '</select>';
+        } else {
+          addSelectHtml = '<select class="merge-add-channel-select" disabled title="All your current saved channels are already in this merge. Build or Quick Add more channels to add them here." style="opacity:0.65; cursor:not-allowed;">' +
+            '<option value="">All saved channels added</option>' +
+          '</select>' +
+          ' <button type="button" class="lc-btn secondary" style="padding:2px 8px; font-size:0.75rem; margin-left:4px;" onclick="switchChannelsSubmenu(&quot;quickadd&quot;, document.querySelector(&quot;#channelsSubnavBar button:nth-child(2)&quot;))">+ Quick Add</button>';
+        }
+        
+        const countText = (merged.channelIds ? merged.channelIds.length : 0) + ' channels &middot; ' + totalEpisodes + ' episodes';
+        
+        const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleMergedChannelInCatalog(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">' +
+          (isAdded ? 'Remove' : '+ Add') +
+        '</button>';
+
+        return '<div class="list-card" style="margin-bottom:10px;" data-merged-id="' + escapeAttr(merged.mergedId) + '">' +
+          '<div class="list-card-header">' +
+            '<div class="list-card-body">' +
+              '<div class="list-card-title">' + escapeHtml(merged.name) + '</div>' +
+              '<div class="list-card-meta"><span>' + countText + '</span></div>' +
+              '<div style="margin-top:6px; display:flex; flex-wrap:wrap; align-items:center;">' +
+                '<strong style="font-size:0.75rem; color:var(--muted); margin-right:6px;">Merged:</strong>' +
+                (channelChips || '<span style="color:var(--muted); font-size:0.8rem; margin-right:4px;">None</span>') +
+                addSelectHtml +
+              '</div>' +
+            '</div>' +
+            '<div class="list-card-actions">' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalMergedChannel(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">Delete</button>' +
+              addBtnHtml +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+  }
+
+  // 2. Render Checkboxes for Channels to Merge
+  const box = document.getElementById('channelMergeList');
+  if (!box) return;
+  const selectAllCheck = document.getElementById('channelMergeSelectAllCheck');
+  if (selectAllCheck) selectAllCheck.checked = false;
+  
+  const channels = Object.values(channelsMap);
+  if (!channels.length) {
+    box.innerHTML = '<p><small>No saved channels yet -- add or build a channel above first.</small></p>';
     return;
   }
-  const nameInput = document.getElementById('channelMergeNameInput');
-  const combinedName = nameInput.value.trim();
-  if (!combinedName) {
-    alert('Name the combined shelf first.');
-    return;
-  }
-  const selectedRows = [...checks].map((cb) => channelMergeRows[parseInt(cb.dataset.rowidx, 10)]).filter(Boolean);
-  const urls = [];
-  selectedRows.forEach((div) => {
-    [...div.querySelectorAll('.url')].forEach((el) => {
-      const v = el.value.trim();
-      if (v.startsWith('channel:v1:')) urls.push(v);
-    });
-  });
-  if (!urls.length) {
-    alert('Could not read those channels -- try refreshing the list and try again.');
-    return;
-  }
-  // The originals are folded into the new merged row, so they'd otherwise
-  // just be exact duplicates left behind -- same brief-undo safety net as
-  // any other row removal, in case this was a misclick.
-  captureUndoSnapshot();
-  selectedRows.forEach((div) => div.remove());
-  addRow(combinedName, urls.join('\\n'), 'series', true, 'Channels');
-  nameInput.value = '';
-  renumber();
-  checkAllDuplicateUrls();
-  renderChannelMergeList();
-  showUndoToast('Merged ' + urls.length + ' channel(s) into "' + combinedName + '".');
+  
+  channels.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  
+  box.innerHTML = channels.map((ch) => {
+    const epCount = (ch.items || []).length;
+    const label = escapeHtml(ch.name) + ' <span style="color:var(--muted); font-size:0.8rem;">(' + epCount + ' ep)</span>';
+    return '<label class="row quick-row" style="cursor:pointer; margin-bottom:4px;">' +
+      '<span><input type="checkbox" class="channelMergeCheck" data-channelid="' + escapeAttr(ch.channelId) + '"> ' + label + '</span>' +
+      '</label>';
+  }).join('');
 }
 
 
@@ -15861,11 +18418,14 @@ function renderCustomListSearchResults(results, searchType) {
   box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
 }
 
-document.getElementById('customListSearchResult').addEventListener('click', (e) => {
-  const btn = e.target.closest('.customListAddBtn');
-  if (!btn) return;
-  addToCustomListDraft(btn.dataset.searchtype, btn.dataset.tmdbid, btn.dataset.title, btn.dataset.year, btn.dataset.poster, btn);
-});
+const customListSearchBox = document.getElementById('customListSearchResult');
+if (customListSearchBox) {
+  customListSearchBox.addEventListener('click', (e) => {
+    const btn = e.target.closest('.customListAddBtn');
+    if (!btn) return;
+    addToCustomListDraft(btn.dataset.searchtype, btn.dataset.tmdbid, btn.dataset.title, btn.dataset.year, btn.dataset.poster, btn);
+  });
+}
 
 async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
   const itemType = searchType === 'tv' ? 'series' : 'movie';
@@ -15917,32 +18477,34 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
 function renderCustomListDraftList() {
   const box = document.getElementById('customListDraftList');
   const badge = document.getElementById('customListDraftCountBadge');
-  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
   if (!customListDraftItems.length) {
-    box.innerHTML = '<p><small>Nothing added yet -- search above to get started.</small></p>';
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p>';
     return;
   }
-  box.innerHTML = customListDraftItems.map((it, i) => {
+  const cardsHtml = customListDraftItems.map((it, i) => {
     const itType = it.type || (it.kind === 'series' || it.kind === 'tv' ? 'series' : 'movie');
-    const typeBadge = '<span style="font-size:0.68rem; font-weight:600; padding:2px 6px; border-radius:4px; background:var(--bg); border:1px solid var(--border); color:var(--muted); margin-left:6px; flex:none;">' + (itType === 'series' ? 'Show' : 'Movie') + '</span>';
-    const label = escapeHtml(it.title || it.name || 'Untitled') + (it.year ? ' (' + escapeHtml(it.year) + ')' : '');
-    const idStr = it.imdbId || it.id || '';
-    const onClickStr = idStr ? ' onclick="showItemDetails(&quot;' + escapeAttr(idStr) + '&quot;, &quot;' + escapeAttr(itType) + '&quot;)"' : '';
-    const posterImg = it.poster
-      ? '<img src="' + escapeAttr(it.poster) + '" alt="" loading="lazy" class="custom-list-pick-poster"' + onClickStr + '>'
-      : '<span class="custom-list-pick-poster empty-poster"></span>';
-    return '<div class="custom-list-pick" data-idx="' + i + '" style="display:flex; flex-direction:row; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px; width:100%;">' +
-      '<span class="drag-handle" draggable="true" style="cursor:grab; touch-action:none; padding:6px; flex:none;">\u2630</span>' +
-      '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" style="width:50px; flex:none; text-align:center;" title="Type a position to move this pick there">' +
-      posterImg +
-      '<span style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="' + escapeAttr(label) + '">' + label + '</span>' +
-      typeBadge +
-      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="-1"' + (i === 0 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2191</button>' +
-      '<button type="button" class="movebtn secondary customListMoveBtn" data-dir="1"' + (i === customListDraftItems.length - 1 ? ' disabled' : '') + ' style="flex:none; padding:8px;">\u2193</button>' +
-      '<button type="button" class="secondary customListRemovePickBtn" style="flex:none; padding:8px 12px;">Remove</button>' +
-      '</div>';
+    const label = it.title || it.name || 'Untitled';
+    const typeLabel = itType === 'series' ? 'Show' : 'Movie';
+    const yearSub = (it.year ? it.year + ' \u2022 ' : '') + typeLabel;
+    const posterEl = it.poster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(it.poster) + '" alt="" loading="lazy">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    
+    return '<div class="live-preview-poster-card custom-list-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
+      '<div style="position:relative; width:100%;">' +
+        posterEl +
+        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+          '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+        '</div>' +
+        '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" style="z-index:4;">&times;</button>' +
+      '</div>' +
+      '<div class="live-preview-poster-name" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</div>' +
+      '<div class="live-preview-poster-year">' + escapeHtml(yearSub) + '</div>' +
+    '</div>';
   }).join('');
-  document.querySelectorAll('#customListDraftList .drag-handle').forEach((h) => initCustomListTouchDrag(h));
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+  initCustomListHoldDrag();
 }
 
 document.getElementById('customListDraftList').addEventListener('click', (e) => {
@@ -15954,22 +18516,9 @@ document.getElementById('customListDraftList').addEventListener('click', (e) => 
     renderCustomListDraftList();
     return;
   }
-  const moveBtn = e.target.closest('.customListMoveBtn');
-  if (moveBtn) {
-    const row = moveBtn.closest('.custom-list-pick');
-    const idx = parseInt(row.dataset.idx, 10);
-    const swapWith = idx + parseInt(moveBtn.dataset.dir, 10);
-    if (swapWith < 0 || swapWith >= customListDraftItems.length) return;
-    const tmp = customListDraftItems[idx];
-    customListDraftItems[idx] = customListDraftItems[swapWith];
-    customListDraftItems[swapWith] = tmp;
-    renderCustomListDraftList();
-  }
 });
 
 // Lets someone type a new position directly into a pick's number box
-// instead of clicking the up arrow repeatedly -- same idea as movePosTo()
-// for the main list, adapted for this array-backed draft.
 document.getElementById('customListDraftList').addEventListener('change', (e) => {
   const posInput = e.target.closest('.customListPosInput');
   if (!posInput) return;
@@ -15990,86 +18539,181 @@ document.getElementById('customListDraftList').addEventListener('change', (e) =>
   renderCustomListDraftList();
 });
 
-// Mouse drag-and-drop -- same live-DOM-reorder-then-read-back-order
-// technique the main list's drag uses, adapted for this array-backed
-// draft rather than persistent .entry elements: rows move around freely
-// during the drag, and the final DOM order (via each row's data-idx,
-// which still points at its ORIGINAL array index) gets read back into
-// customListDraftItems once the drag ends.
-let customListDragRow = null;
+let customListHoldDragBound = false;
 
-document.getElementById('customListDraftList').addEventListener('dragstart', (e) => {
-  const handle = e.target.closest('.drag-handle');
-  if (!handle) { e.preventDefault(); return; }
-  customListDragRow = handle.closest('.custom-list-pick');
-  customListDragRow.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-});
-
-document.getElementById('customListDraftList').addEventListener('dragend', () => {
-  if (customListDragRow) customListDragRow.classList.remove('dragging');
-  customListDragRow = null;
+function initCustomListHoldDrag() {
   const container = document.getElementById('customListDraftList');
-  const newOrder = [...container.querySelectorAll('.custom-list-pick')].map((r) => customListDraftItems[parseInt(r.dataset.idx, 10)]);
-  customListDraftItems = newOrder;
-  renderCustomListDraftList();
-});
+  if (!container || customListHoldDragBound) return;
+  customListHoldDragBound = true;
 
-document.getElementById('customListDraftList').addEventListener('dragover', (e) => {
-  if (!customListDragRow) return;
-  e.preventDefault();
-  const container = document.getElementById('customListDraftList');
-  const afterEl = getCustomListDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(customListDragRow);
-  } else if (afterEl !== customListDragRow) {
-    container.insertBefore(customListDragRow, afterEl);
-  }
-});
+  let activeCard = null;
+  let isDragging = false;
+  let holdTimer = null;
+  let startX = 0;
+  let startY = 0;
 
-function getCustomListDragAfterElement(container, y) {
-  const els = [...container.querySelectorAll('.custom-list-pick:not(.dragging)')];
-  return els.reduce((closest, child) => {
-    const box = child.getBoundingClientRect();
-    const offset = y - box.top - box.height / 2;
-    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
-    return closest;
-  }, { offset: -Infinity, element: null }).element;
-}
+  const cancelHold = () => {
+    if (holdTimer) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
+  };
 
-// position number both still work fine on touch regardless.
-let customListTouchDragRow = null;
+  const stopDrag = () => {
+    cancelHold();
+    if (isDragging && activeCard) {
+      activeCard.classList.remove('dragging');
+      reorderCustomListDraftFromDom();
+    }
+    isDragging = false;
+    activeCard = null;
+    document.body.style.userSelect = '';
+  };
 
-function initCustomListTouchDrag(handle) {
-  if (!handle) return;
-  handle.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    e.preventDefault();
-    customListTouchDragRow = handle.closest('.custom-list-pick');
-    customListTouchDragRow.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    document.addEventListener('pointermove', onCustomListTouchDragMove);
-    document.addEventListener('pointerup', onCustomListTouchDragEnd, { once: true });
-    document.addEventListener('pointercancel', onCustomListTouchDragEnd, { once: true });
+  const startDrag = (card) => {
+    isDragging = true;
+    activeCard = card;
+    card.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      try { navigator.vibrate(30); } catch (err) {}
+    }
+  };
+
+  const handleMove = (clientX, clientY, e) => {
+    if (!activeCard) return;
+
+    if (!isDragging) {
+      const dist = Math.hypot(clientX - startX, clientY - startY);
+      if (dist > 12) {
+        cancelHold();
+        activeCard = null;
+      }
+      return;
+    }
+
+    if (e && e.cancelable) {
+      e.preventDefault();
+    }
+
+    const grid = container.querySelector('.poster-grid-3') || container;
+    const targetCard = getCustomListDragAfterElement(grid, clientX, clientY);
+    if (targetCard && targetCard !== activeCard) {
+      const box = targetCard.getBoundingClientRect();
+      const isAfter = (clientY > box.top + box.height / 2) || (clientY >= box.top && clientX > box.left + box.width / 2);
+      if (isAfter) {
+        grid.insertBefore(activeCard, targetCard.nextSibling);
+      } else {
+        grid.insertBefore(activeCard, targetCard);
+      }
+    }
+  };
+
+  container.addEventListener('dragstart', (e) => { e.preventDefault(); });
+
+  // Pointer events for desktop & unified pointer handling
+  container.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
+    const card = e.target.closest('.custom-list-pick');
+    if (!card) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, isTouch ? 180 : 120);
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!activeCard) return;
+    handleMove(e.clientX, e.clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('pointerup', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('pointercancel', (e) => {
+    if (!isDragging) {
+      cancelHold();
+      activeCard = null;
+    } else if (e.pointerType !== 'touch') {
+      stopDrag();
+    }
+  });
+
+  // Dedicated touch listeners for guaranteed mobile gesture prevention
+  container.addEventListener('touchstart', (e) => {
+    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
+    const card = e.target.closest('.custom-list-pick');
+    if (!card || e.touches.length !== 1) return;
+
+    cancelHold();
+    activeCard = card;
+    isDragging = false;
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+
+    holdTimer = setTimeout(() => {
+      startDrag(card);
+    }, 180);
+  }, { passive: true });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!activeCard || !e.touches || e.touches.length !== 1) return;
+    if (isDragging && e.cancelable) {
+      e.preventDefault();
+    }
+    handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
+  }, { passive: false });
+
+  window.addEventListener('touchend', () => {
+    if (activeCard) stopDrag();
+  });
+
+  window.addEventListener('touchcancel', () => {
+    if (activeCard) stopDrag();
   });
 }
 
-function onCustomListTouchDragMove(e) {
-  if (!customListTouchDragRow) return;
-  const container = document.getElementById('customListDraftList');
-  const afterEl = getCustomListDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(customListTouchDragRow);
-  } else if (afterEl !== customListTouchDragRow) {
-    container.insertBefore(customListTouchDragRow, afterEl);
+function getCustomListDragAfterElement(container, x, y) {
+  const els = [...container.querySelectorAll('.custom-list-pick:not(.dragging)')];
+  if (!els.length) return null;
+
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+      return child;
+    }
   }
+
+  let closest = null;
+  let closestDistance = Infinity;
+  for (const child of els) {
+    const box = child.getBoundingClientRect();
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    const dist = Math.hypot(x - cx, y - cy);
+    if (dist < closestDistance) {
+      closestDistance = dist;
+      closest = child;
+    }
+  }
+  return closest;
 }
 
-function onCustomListTouchDragEnd() {
-  document.removeEventListener('pointermove', onCustomListTouchDragMove);
-  if (customListTouchDragRow) customListTouchDragRow.classList.remove('dragging');
-  customListTouchDragRow = null;
-  reorderCustomListDraftFromDom();
+function reorderCustomListDraftFromDom() {
+  const container = document.getElementById('customListDraftList');
+  const rows = [...container.querySelectorAll('.custom-list-pick')];
+  if (rows.length) {
+    customListDraftItems = rows.map((row) => customListDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+  }
+  renderCustomListDraftList();
 }
 
 function shuffleCustomListDraft() {
@@ -16173,9 +18817,10 @@ function saveCustomList() {
   updateCustomListTypeRadio('movie');
   customListDraftListId = null;
   nameInput.value = '';
-  document.getElementById('customListRandomizeCheck').checked = false;
-  document.getElementById('customListSearchInput').value = '';
-  document.getElementById('customListSearchResult').innerHTML = '';
+  const searchInput = document.getElementById('customListSearchInput');
+  if (searchInput) searchInput.value = '';
+  const searchRes = document.getElementById('customListSearchResult');
+  if (searchRes) searchRes.innerHTML = '';
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
 
@@ -16289,7 +18934,8 @@ function editCustomList(btn) {
     ? rowDiv.querySelector('.name').value.trim()
     : '';
   document.getElementById('customListNameInput').value = currentName;
-  document.getElementById('customListSearchType').value = payload.type === 'series' ? 'tv' : 'movie';
+  const searchTypeEl = document.getElementById('customListSearchType');
+  if (searchTypeEl) searchTypeEl.value = payload.type === 'series' ? 'tv' : 'movie';
   document.getElementById('customListRandomizeCheck').checked = !!payload.shuffle;
   editingCustomListUrlInput = urlInput;
   editingCreatorListSlug = null;
@@ -16338,25 +18984,16 @@ function updateCustomListSaveButtonLabel() {
     titleEl.innerHTML = (isEditing ? 'Edit Custom List' : 'Create a Custom List') + ' <span class="badge" id="customListDraftCountBadge"></span>';
     // Must update badge text again since we just rewrote innerHTML
     const badge = document.getElementById('customListDraftCountBadge');
-    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ' picked)' : '';
+    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
   }
 
-  if (editingCreatorListSlug) {
-    saveBtn.textContent = 'Save changes to your Creator list';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = '';
-  } else if (editingLocalCustomListSlug) {
-    saveBtn.textContent = 'Save changes to this list';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = 'none';
-  } else if (editingCustomListUrlInput) {
-    saveBtn.textContent = 'Save changes to this List';
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (visRow) visRow.style.display = 'none';
-  } else {
-    saveBtn.textContent = 'Save as a List';
-    if (cancelBtn) cancelBtn.style.display = 'none';
-    if (visRow) visRow.style.display = 'none';
+  saveBtn.textContent = 'Save';
+  if (cancelBtn) {
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.display = isEditing ? '' : 'none';
+  }
+  if (visRow) {
+    visRow.style.display = editingCreatorListSlug ? '' : 'none';
   }
 }
 
@@ -17993,6 +20630,38 @@ function schedulePresetsSync() {
   presetsSyncTimer = setTimeout(() => { pushPresetsDirectly(loadPresetsMap()); }, 1200);
 }
 
+// Debounced sibling of scheduleCreatorSyncSave, just for TV Channels --
+// syncs the user's saved local channels to the server so they roam across
+// browsers seamlessly when signed in.
+let channelsSyncTimer = null;
+function scheduleChannelsSync() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (channelsSyncTimer) clearTimeout(channelsSyncTimer);
+  channelsSyncTimer = setTimeout(pushChannelsSync, 1200);
+}
+
+async function pushChannelsSync() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  try {
+    const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+    await fetch(ORIGIN + '/api/creator/sync/save-channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        channels: localChannels,
+        mergedChannels: localMerged,
+      }),
+    });
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
 // Debounced sibling of scheduleCreatorSyncSave, just for Watch History/
 // Continue Watching tracking data -- split out for the same reason
 // presets were: watchHistory in particular can grow into the thousands of
@@ -18094,6 +20763,11 @@ async function loadCreatorSync() {
       pushCreatorSync();
       const localPresets = loadPresetsMap();
       if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
+      const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+      const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+      if ((localChannels && Object.keys(localChannels).length) || (localMerged && Object.keys(localMerged).length)) {
+        pushChannelsSync();
+      }
       pushTrackingSync();
       return;
     }
@@ -18105,7 +20779,19 @@ async function loadCreatorSync() {
     }
     renumber();
     suppressSave = false;
-    renderChannelMergeList();
+    
+    if (synced.channels && typeof synced.channels === 'object') {
+      if (typeof saveLocalChannelsMap === 'function') {
+        saveLocalChannelsMap(synced.channels);
+      }
+    }
+    if (synced.mergedChannels && typeof synced.mergedChannels === 'object') {
+      if (typeof saveLocalMergedChannelsMap === 'function') {
+        saveLocalMergedChannelsMap(synced.mergedChannels);
+      }
+    }
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
     
     if (synced.presetsB64) {
       decompressBase64ToJson(synced.presetsB64).then(parsedPresets => {
@@ -18159,6 +20845,11 @@ async function loadCreatorSync() {
         if (synced.keys.mdblistAccessToken) {
           localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
           window.mdblistAccessToken = synced.keys.mdblistAccessToken;
+          mdblistAccessToken = synced.keys.mdblistAccessToken;
+        }
+        if (synced.keys.mdblistUsername) {
+          localStorage.setItem('myListAddon:mdblistUsername', synced.keys.mdblistUsername);
+          window.mdblistUsername = synced.keys.mdblistUsername;
         }
         if (synced.keys.traktKey) {
           localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
@@ -18173,11 +20864,27 @@ async function loadCreatorSync() {
         if (synced.keys.traktAccessToken) {
           localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
           window.traktAccessToken = synced.keys.traktAccessToken;
+          traktAccessToken = synced.keys.traktAccessToken;
+        }
+        if (synced.keys.simklKey) {
+          localStorage.setItem('myListAddon:simklKey', synced.keys.simklKey);
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = synced.keys.simklKey;
+        }
+        if (synced.keys.simklAccessToken) {
+          localStorage.setItem('myListAddon:simklAccessToken', synced.keys.simklAccessToken);
+          window.simklAccessToken = synced.keys.simklAccessToken;
+          simklAccessToken = synced.keys.simklAccessToken;
+        }
+        if (synced.keys.simklUsername) {
+          localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
+          window.simklUsername = synced.keys.simklUsername;
         }
         if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
         if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
         if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
         if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
+        if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
       } catch (e) {}
     }
 
@@ -19192,7 +21899,8 @@ function editCreatorList(slug) {
   editingCreatorListSlug = slug;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  const stEl1 = document.getElementById('customListSearchType');
+  if (stEl1) stEl1.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   const visSelect = document.getElementById('customListVisibilitySelect');
   if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
@@ -19227,7 +21935,8 @@ function editLocalCustomList(slug) {
   editingCreatorListSlug = null;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  const stEl2 = document.getElementById('customListSearchType');
+  if (stEl2) stEl2.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
@@ -19337,13 +22046,41 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
-function openCreateListModal() {
+function openCreateListModal(presetDestination) {
+  const destEl = document.getElementById('createListModalDestination');
+  if (destEl) {
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+
+    let optsHtml = '<option value="custom">Custom List (Local / Creator)</option>';
+    if (traktToken) optsHtml += '<option value="trakt">Trakt List</option>';
+    if (tmdbSess || tmdbAcc) optsHtml += '<option value="tmdb">TMDB List</option>';
+    if (mdbToken || mdbKey) optsHtml += '<option value="mdblist">MDBList List</option>';
+    if (simklToken) optsHtml += '<option value="simkl">Simkl List</option>';
+    destEl.innerHTML = optsHtml;
+
+    if (presetDestination && destEl.querySelector('option[value="' + presetDestination + '"]')) {
+      destEl.value = presetDestination;
+    } else {
+      destEl.value = 'custom';
+    }
+  }
+
   const nameEl = document.getElementById('createListModalName');
   if (nameEl) nameEl.value = '';
+  const descEl = document.getElementById('createListModalDesc');
+  if (descEl) descEl.value = '';
   const typeEl = document.getElementById('createListModalType');
   if (typeEl) typeEl.value = 'movie';
   const pubEl = document.getElementById('createListModalPublic');
   if (pubEl) pubEl.checked = true;
+  
+  if (typeof onChangeCreateListDestination === 'function') onChangeCreateListDestination();
+
   const btn = document.getElementById('createListModalBtn');
   if (btn) {
     btn.disabled = true;
@@ -19352,12 +22089,23 @@ function openCreateListModal() {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (nameEl) nameEl.focus();
+}
+
+function onChangeCreateListDestination() {
+  const pubWrap = document.getElementById('createListModalPublicWrap');
+  if (pubWrap) {
+    pubWrap.style.display = 'flex';
+  }
 }
 
 async function submitCreateListModal() {
   const name = document.getElementById('createListModalName').value.trim();
   if (!name) return;
-  const isPublic = document.getElementById('createListModalPublic').checked;
+  const desc = document.getElementById('createListModalDesc') ? document.getElementById('createListModalDesc').value.trim() : '';
+  const destEl = document.getElementById('createListModalDestination');
+  const dest = destEl ? destEl.value : 'custom';
+  const isPublic = document.getElementById('createListModalPublic') ? document.getElementById('createListModalPublic').checked : true;
   const visibility = isPublic ? 'public' : 'private';
   const typeEl = document.getElementById('createListModalType');
   const type = typeEl ? typeEl.value : 'movie';
@@ -19366,20 +22114,34 @@ async function submitCreateListModal() {
   let initialItems = [];
   
   const btn = document.getElementById('createListModalBtn');
-  btn.innerText = 'Saving...';
+  btn.innerText = 'Creating...';
   btn.disabled = true;
-  
+
   try {
+    let finalImdbId = '';
+    let cleanTmdbId = '';
     if (currentPendingItem && currentPendingItem.title) {
-      let finalImdbId = currentPendingItem.id;
+      finalImdbId = currentPendingItem.id;
       if (finalImdbId && !String(finalImdbId).startsWith('tt')) {
+        cleanTmdbId = String(finalImdbId).replace(/^tmdb:/, '');
         const endpoint = currentPendingItem.type === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
         try {
-          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(finalImdbId));
+          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanTmdbId));
           const data = await res.json();
           if (data.ok && data.imdbId) finalImdbId = data.imdbId;
         } catch(e) {}
+      } else if (finalImdbId && String(finalImdbId).startsWith('tt')) {
+        const apiKeyTmdb = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+        if (apiKeyTmdb) {
+          try {
+            const findRes = await fetch('https://api.themoviedb.org/3/find/' + encodeURIComponent(finalImdbId) + '?api_key=' + encodeURIComponent(apiKeyTmdb) + '&external_source=imdb_id');
+            const findData = await findRes.json();
+            const hit = (findData.movie_results && findData.movie_results[0]) || (findData.tv_results && findData.tv_results[0]);
+            if (hit && hit.id) cleanTmdbId = String(hit.id);
+          } catch(e) {}
+        }
       }
+
       initialItems.push({
         imdbId: finalImdbId || currentPendingItem.id,
         type: currentPendingItem.type || (type === 'series' ? 'series' : 'movie'),
@@ -19388,67 +22150,149 @@ async function submitCreateListModal() {
       });
     }
 
-    const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
-    const newUrl = 'customlist:v1:' + JSON.stringify(payload);
-
-    if (activeCreator) {
-      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-      const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creatorName: activeCreator.creatorName,
-          creatorKey: creatorKey,
+    if (dest === 'custom') {
+      const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
+      if (activeCreator) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            name: name,
+            type: type,
+            items: initialItems,
+            visibility: visibility
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+          btn.innerText = 'Create';
+          btn.disabled = false;
+          return;
+        }
+        const updatedPayload = Object.assign({}, payload, {
+          listName: name,
+          publishedUrl: visibility === 'public' ? data.url : undefined,
+          creatorSlug: data.slug,
+          creatorOwner: activeCreator.creatorName,
+          visibility: visibility
+        });
+        addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
+      } else {
+        const slug = payload.listId;
+        payload.localSlug = slug;
+        const map = loadLocalCustomLists();
+        map[slug] = {
           name: name,
           type: type,
           items: initialItems,
-          visibility: visibility
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        saveLocalCustomListsMap(map);
+        addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+      }
+    } else {
+      // External Provider Creation (Trakt, TMDB, MDBList)
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+      const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+      const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+      const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+      const res = await fetch(ORIGIN + '/api/external-list/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: dest,
+          name: name,
+          description: desc,
+          privacy: visibility,
+          type: type,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          traktUsername: traktUser,
+          tmdbSessionId: tmdbSess,
+          tmdbKey: tmdbKey,
+          mdblistAccessToken: mdbToken,
+          mdblistKey: mdbKey,
+          mdblistUsername: mdbUser,
+          simklAccessToken: simklToken,
+          simklKey: simklKey
         })
       });
       const data = await res.json();
-      if (!data.ok) {
-        showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+      if (!data.ok || !data.list) {
+        showAppNoticeModal('Could Not Create List', data.error || 'Failed to create list on ' + dest.toUpperCase() + '.', true);
         btn.innerText = 'Create';
         btn.disabled = false;
         return;
       }
-      
-      const updatedPayload = Object.assign({}, payload, {
-        listName: name,
-        publishedUrl: visibility === 'public' ? data.url : undefined,
-        creatorSlug: data.slug,
-        creatorOwner: activeCreator.creatorName,
-        visibility: visibility
-      });
-      addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
-    } else {
-      // Local list
-      const slug = payload.listId;
-      payload.localSlug = slug;
-      
-      const map = loadLocalCustomLists();
-      map[slug] = {
-        name: name,
-        type: type,
-        items: initialItems,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      saveLocalCustomListsMap(map);
-      
-      addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+
+      const createdList = data.list;
+      const groupLabel = dest === 'trakt' ? 'Trakt' : (dest === 'tmdb' ? 'TMDB' : (dest === 'simkl' ? 'Simkl' : 'MDBList'));
+      addRow(name, createdList.url, type, true, groupLabel);
+
+      // If pending item, add it to the newly created list
+      if (currentPendingItem && currentPendingItem.id) {
+        if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
+          const newKey = makeExternalKey(dest, 'custom', createdList.id || createdList.slug, currentPendingItem.id);
+          setExternalListMembership(newKey, true);
+          if (finalImdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, finalImdbId), true);
+          if (cleanTmdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, cleanTmdbId), true);
+        }
+
+        fetch(ORIGIN + '/api/external-list/item-mutate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'add',
+            provider: dest,
+            target: 'custom',
+            listId: createdList.id || createdList.slug,
+            id: currentPendingItem.id,
+            imdbId: finalImdbId,
+            tmdbId: cleanTmdbId,
+            type: currentPendingItem.type || type,
+            title: currentPendingItem.title,
+            poster: currentPendingItem.poster,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            traktUsername: traktUser,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey,
+            simklAccessToken: simklToken,
+            simklKey: simklKey
+          })
+        }).catch(() => {});
+      }
+
+      // Refresh list caches
+      if (dest === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+      if (dest === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+      if (dest === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+      if (dest === 'simkl' && typeof loadMySimklLists === 'function') loadMySimklLists();
     }
-    
+
     saveState();
     document.getElementById('createListModal').style.display = 'none';
-    renderCreatorDashboard();
-    
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+
     if (currentPendingItem && currentPendingItem.title) {
-      showAddedToast('Added "' + currentPendingItem.title + '" to "' + name + '".');
-      if (typeof trackEvent === 'function') trackEvent('list-add', initialItems[0] ? initialItems[0].imdbId : currentPendingItem.id, currentPendingItem.title, currentPendingItem.type);
+      showAddedToast('Created list "' + name + '" and added "' + currentPendingItem.title + '".');
       window._selectListModalCurrentItem = null;
     } else {
-      showAddedToast('Created list "' + name + '".');
+      showAddedToast('Created list "' + name + '" on ' + (dest === 'custom' ? 'Custom Lists' : dest.toUpperCase()) + '.');
       switchTab('lists');
     }
   } catch (err) {
@@ -19457,6 +22301,95 @@ async function submitCreateListModal() {
     btn.innerText = 'Create';
     btn.disabled = false;
   }
+}
+
+function deleteExternalListDirect(provider, listId, listName, btn) {
+  if (!provider || !listId) return;
+  const providerLabel = provider === 'trakt' ? 'Trakt' : (provider === 'tmdb' ? 'TMDB' : (provider === 'mdblist' ? 'MDBList' : provider));
+  
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  
+  confirmFn(
+    'Delete List',
+    'Are you sure you want to permanently delete the list "' + (listName || 'Custom List') + '" from your ' + providerLabel + ' account? This action cannot be undone.',
+    'Delete Permanently',
+    async () => {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Deleting...';
+      }
+
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+      try {
+        const res = await fetch(ORIGIN + '/api/external-list/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: provider,
+            listId: listId,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Delete List', data.error || 'Failed to delete list from ' + providerLabel + '.', true);
+          if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+          return;
+        }
+
+        // Animate card removal if present
+        const card = btn ? btn.closest('.list-card, .creator-list-row') : null;
+        if (card) {
+          card.style.opacity = '0';
+          card.style.transform = 'scale(0.9)';
+          card.style.transition = 'all 0.2s ease';
+          setTimeout(() => { if (card && card.parentNode) card.parentNode.removeChild(card); }, 200);
+        }
+
+        // Remove row entries from #lists
+        let removedFromConfig = false;
+        document.querySelectorAll('#lists .entry').forEach(row => {
+          const u = row.querySelector('.url')?.value || '';
+          if (u && (u.includes(listId) || (provider === 'trakt' && u.includes('/lists/' + listId)))) {
+            row.remove();
+            removedFromConfig = true;
+          }
+        });
+        if (removedFromConfig) {
+          renumber();
+          saveState();
+        }
+
+        // If currently in list-details view of this list, go back
+        const detailsPanel = document.getElementById('content-list-details');
+        if (detailsPanel && !detailsPanel.hidden) {
+          navigateBackFromDetail();
+        }
+
+        // Refresh caches
+        if (provider === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+        if (provider === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+        if (provider === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+
+        showAddedToast('Deleted list "' + (listName || 'List') + '" from ' + providerLabel + '.');
+      } catch (err) {
+        showAppNoticeModal('Network Error', 'A network error occurred while deleting the list. Please check your connection and try again.', true);
+        if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+      }
+    },
+    true
+  );
 }
 
 function removeWatchlistItemDirect(id, btn) {
@@ -20049,6 +22982,7 @@ function collectEntries() {
 function collectKeys() {
   let track = false;
   try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+
   const tmdbKeyEl = document.getElementById('tmdbKeyInput');
   let tmdbKey = tmdbKeyEl ? tmdbKeyEl.value.trim() : '';
   if (!tmdbKey) {
@@ -20066,16 +23000,64 @@ function collectKeys() {
   if (!tmdbUser) {
     try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
   }
+
+  const mdblistKeyEl = document.getElementById('mdblistKeyInput');
+  let mdblistKey = mdblistKeyEl ? mdblistKeyEl.value.trim() : '';
+  if (!mdblistKey) {
+    try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
+  }
+  let mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || '';
+  if (!mdblistToken) {
+    try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+  }
+  let mdblistUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || '';
+  if (!mdblistUser) {
+    try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
+  }
+
+  const traktKeyEl = document.getElementById('traktKeyInput');
+  let traktKey = traktKeyEl ? traktKeyEl.value.trim() : '';
+  if (!traktKey) {
+    try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
+  }
+  const traktUserEl = document.getElementById('traktUsernameInput');
+  let traktUser = traktUserEl ? traktUserEl.value.trim() : '';
+  if (!traktUser) {
+    try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
+  }
+  let traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || '';
+  if (!traktToken) {
+    try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+  }
+
+  const simklKeyEl = document.getElementById('simklKeyInput');
+  let simklKey = simklKeyEl ? simklKeyEl.value.trim() : '';
+  if (!simklKey) {
+    try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
+  }
+  let simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || '';
+  if (!simklToken) {
+    try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+  }
+  let simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || '';
+  if (!simklUser) {
+    try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
+  }
+
   const keys = {
     tmdbKey: tmdbKey,
     tmdbSessionId: tmdbSession,
     tmdbAccountId: tmdbAcc,
     tmdbUsername: tmdbUser,
-    mdblistKey: document.getElementById('mdblistKeyInput') ? document.getElementById('mdblistKeyInput').value.trim() : '',
-    mdblistAccessToken: mdblistAccessToken,
-    traktKey: document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '',
-    traktUsername: document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '',
-    traktAccessToken: traktAccessToken,
+    mdblistKey: mdblistKey,
+    mdblistAccessToken: mdblistToken,
+    mdblistUsername: mdblistUser,
+    traktKey: traktKey,
+    traktUsername: traktUser,
+    traktAccessToken: traktToken,
+    simklKey: simklKey,
+    simklAccessToken: simklToken,
+    simklUsername: simklUser,
     shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
     shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
   };
@@ -20180,7 +23162,7 @@ async function renderLivePreview() {
         });
         const data = await res.json();
         if (!data.ok) {
-          postersContainer.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not load this shelf.') + '</p>';
+          postersContainer.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not load this catalog.') + '</p>';
           continue;
         }
         if (!data.sample || !data.sample.length) {
@@ -20191,7 +23173,7 @@ async function renderLivePreview() {
         postersContainer.innerHTML = data.sample.slice(0, visibleCount).map(livePreviewPosterHtml).join('');
         if (seeAllBtn && data.sample.length > visibleCount) seeAllBtn.disabled = false;
       } catch (e) {
-        postersContainer.innerHTML = '<p class="testresult err">✗ Network error loading this shelf.</p>';
+        postersContainer.innerHTML = '<p class="testresult err">✗ Network error loading this catalog.</p>';
       }
     }
   }
@@ -20216,10 +23198,12 @@ function livePreviewPosterHtml(m) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
   } else if (m.removeCustomListSlug) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
+  } else if (m.removeExternalProvider) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
   }
 
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
-  const addOverlay = '<div class="poster-add-overlay" title="Add to Custom List">+</div>';
+  const addOverlay = '<div class="poster-add-overlay" title="Add to Lists">+</div>';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
@@ -20239,7 +23223,7 @@ function removeListItemFromDetails(btn) {
   const extra = btn.dataset.removeSlug || '';
   if (!id) return;
   const targetId = String(id);
-  const card = btn.closest('.live-preview-poster-card');
+  const card = btn.closest('.live-preview-poster-card, .list-card-mini-poster-tile');
   if (card) {
     card.style.opacity = '0';
     card.style.transform = 'scale(0.85)';
@@ -20252,7 +23236,7 @@ function removeListItemFromDetails(btn) {
         if (typeof window._updateListDetailsItemCount === 'function') {
           window._updateListDetailsItemCount(remaining);
         }
-        if (remaining === 0) {
+        if (remaining === 0 && grid) {
           const statusEl = document.getElementById('detailStatus');
           if (statusEl) statusEl.innerHTML = '<small>No items left.</small>';
         }
@@ -20278,6 +23262,54 @@ function removeListItemFromDetails(btn) {
     if (typeof removeWatchHistoryItemDirect === 'function') removeWatchHistoryItemDirect(targetId, btn);
   } else if (type === 'custom' && extra) {
     if (typeof removeCustomListItemDirect === 'function') removeCustomListItemDirect(targetId, extra, btn);
+  } else if (type === 'external') {
+    const provider = btn.dataset.provider || '';
+    const target = btn.dataset.target || '';
+    const listId = btn.dataset.listId || '';
+    const mediaType = btn.dataset.mediaType || 'movie';
+
+    if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
+      setExternalListMembership(makeExternalKey(provider, target, listId, targetId), false);
+      setExternalListMembership(makeExternalKey(provider, target, listId, targetId.replace(/^tmdb:/, '')), false);
+    }
+
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+    const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+    const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+    fetch(ORIGIN + '/api/external-list/item-mutate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'remove',
+        provider: provider,
+        target: target,
+        listId: listId,
+        id: targetId,
+        imdbId: targetId.startsWith('tt') ? targetId : '',
+        tmdbId: targetId.startsWith('tmdb:') ? targetId.slice(5) : (targetId.startsWith('tt') ? '' : targetId),
+        type: mediaType,
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        traktUsername: traktUser,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+        tmdbSessionId: tmdbSess,
+        tmdbAccountId: tmdbAcc,
+        tmdbKey: tmdbKey,
+        mdblistAccessToken: mdbToken,
+        mdblistKey: mdbKey
+      })
+    }).catch(() => {});
+
+    showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
   }
 }
 
@@ -20303,15 +23335,27 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
   }
   switchTab('list-details');
+  if (typeof opts.restoreScrollY === 'number') {
+    window.scrollTo({ top: opts.restoreScrollY, behavior: 'instant' });
+  } else {
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
 
   if (!opts.skipPushState) {
-    const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
-    if (cleanPath) {
-      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
-    } else {
-      const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: listUrl || '' });
-      history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl || '' }, '', '/#/list?' + params.toString());
-    }
+    try {
+      const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
+      const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
+      const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
+      const currentLoc = window.location.pathname + window.location.search + window.location.hash;
+      if (window.location.hash !== targetUrl && currentLoc !== targetUrl) {
+        if (cleanPath) {
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
+        } else {
+          const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
+          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam }, '', '/#/list?' + params.toString());
+        }
+      }
+    } catch (e) {}
   }
 
   const cacheKey = (name || '') + '::' + (listUrl || '');
@@ -20325,6 +23369,83 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     } else if (listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
       const rec = window._curatedRecs[listUrl];
       preloaded = { sample: rec.items, count: rec.items.length, maybeMore: false };
+    } else if (listUrl && window._simklListsMap && window._simklListsMap[listUrl]) {
+      const simklList = window._simklListsMap[listUrl];
+      const parts = (listUrl || '').split(':');
+      const stKey = parts[3] || 'plantowatch';
+      const sample = (simklList.items || []).map((it) => Object.assign({}, it, {
+        removeExternalProvider: 'simkl',
+        removeExternalTarget: 'status',
+        removeExternalListId: stKey,
+      }));
+      preloaded = { sample: sample, count: sample.length, maybeMore: false };
+    } else if (listUrl && listUrl.startsWith('channel:')) {
+      try {
+        const map = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+        let ch = null;
+        if (listUrl.startsWith('channel:id:')) {
+          const id = listUrl.slice('channel:id:'.length);
+          ch = map[id];
+        } else if (listUrl.startsWith('channel:v1:')) {
+          try {
+            ch = JSON.parse(listUrl.slice('channel:v1:'.length));
+          } catch (e) {}
+        }
+        if (!ch) {
+          ch = Object.values(map).find((c) => c && c.name === name);
+        }
+        if (ch && Array.isArray(ch.items)) {
+          const sample = ch.items.map((it, idx) => {
+            let showName = it.showName || '';
+            let epName = it.epName || '';
+            let seasonEp = '';
+            if (it.season != null && it.episode != null) {
+              seasonEp = 'S' + it.season + 'E' + it.episode;
+            }
+            if (!showName && it.title) {
+              if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+                const sIdx = it.title.indexOf(' S');
+                showName = it.title.slice(0, sIdx).trim();
+                const rest = it.title.slice(sIdx + 1).trim();
+                const dashIdx = rest.indexOf(' \u2014 ') !== -1 ? rest.indexOf(' \u2014 ') : (rest.indexOf(' - ') !== -1 ? rest.indexOf(' - ') : rest.indexOf(': '));
+                if (dashIdx !== -1) {
+                  if (!seasonEp) seasonEp = rest.slice(0, dashIdx).trim();
+                  if (!epName) epName = rest.slice(dashIdx + (rest.indexOf(': ') === dashIdx ? 2 : 3)).trim();
+                } else {
+                  if (!seasonEp) seasonEp = rest.trim();
+                }
+              } else if (it.title.indexOf(' \u2014 ') !== -1) {
+                const parts = it.title.split(' \u2014 ');
+                showName = parts[0].trim();
+                if (!epName) epName = parts[1].trim();
+              } else {
+                showName = it.title.trim();
+              }
+            }
+            if (!showName) showName = ch.name || 'TV Channel';
+            if (!epName) {
+              if (it.epName) epName = it.epName;
+              else if (it.title && it.title !== showName) epName = it.title;
+              else if (seasonEp) epName = 'Episode ' + (it.episode != null ? it.episode : '');
+              else epName = 'Episode';
+            }
+            const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
+            const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
+            return {
+              id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
+              type: 'series',
+              name: displayTitle,
+              subtitle: epName,
+              title: fullTitle,
+              poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '',
+              thumbnail: it.thumbnail || it.backdrop || it.poster || it.showPoster || '',
+              year: it.year || (it.released ? it.released.slice(0, 4) : ''),
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      } catch (e) {}
     } else if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       // Look up local custom lists or creator lists by name or slug
       try {
@@ -20469,7 +23590,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   updateDetailAddBtn();
 
   if (likeBtn) {
-    if (listUrl && !listUrl.startsWith('custom:')) {
+    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
@@ -20510,8 +23631,116 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   let pagesLoaded = 0;
   const MAX_PAGES = 20;
 
+  const isSimklUserList = listUrl && listUrl.startsWith('simkl:user:');
+  const simklStatusMatch = isSimklUserList ? (listUrl.split(':')[3] || 'plantowatch') : '';
+
+  const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+  const isTraktWatchlist = listUrl && (listUrl === 'trakt:watchlist' || listUrl.includes('trakt.tv/users/' + traktUser + '/watchlist') || (listUrl.includes('/watchlist') && listUrl.includes('trakt')));
+  const isTraktHistory = listUrl && (listUrl === 'trakt:history' || listUrl.includes('/history'));
+  const isTraktUserList = listUrl && (listUrl.startsWith('trakt:user:') || listUrl.includes('trakt.tv/users/'));
+  const traktListSlug = isTraktUserList ? (listUrl.includes('/lists/') ? (listUrl.split('/lists/')[1] || '').split('/')[0] : (listUrl.split(':')[3] || '')) : '';
+
+  const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const isTmdbWatchlist = listUrl && (listUrl === 'tmdb:watchlist' || listUrl.startsWith('tmdb:account:watchlist') || (listUrl.includes('watchlist') && listUrl.includes('tmdb')));
+  const isTmdbFavorites = listUrl && (listUrl === 'tmdb:favorites' || listUrl.startsWith('tmdb:account:favorites') || (listUrl.includes('favorite') && listUrl.includes('tmdb')));
+  const isTmdbUserList = listUrl && (listUrl.includes('themoviedb.org/list/') || listUrl.startsWith('tmdb:list:'));
+  const tmdbListId = isTmdbUserList ? (listUrl.match(new RegExp('list(?:/|:)([0-9]+)', 'i'))?.[1] || '') : '';
+
+  const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+  const isMdbWatchlist = listUrl && (listUrl === 'mdblist:watchlist' || (listUrl.includes('watchlist') && listUrl.includes('mdblist')));
+  const isMdbHistory = listUrl && (listUrl === 'mdblist:history' || (listUrl.includes('history') && listUrl.includes('mdblist')));
+  const isMdbUserList = listUrl && (listUrl.includes('mdblist.com/lists/') || listUrl.startsWith('mdblist:list:'));
+  const mdbListId = isMdbUserList ? (listUrl.includes('mdblist.com/lists/') ? (listUrl.split('/lists/')[1] || '').split('/')[1] || (listUrl.split('/lists/')[1] || '').split('/')[0] : (listUrl.split(':')[2] || '')) : '';
+
+  function annotatePersonalItem(it) {
+    if (!it) return it;
+    if (isSimklUserList) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'simkl',
+        removeExternalTarget: 'status',
+        removeExternalListId: simklStatusMatch,
+      });
+    }
+    if (isTraktWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'watchlist',
+        removeExternalListId: 'watchlist',
+      });
+    }
+    if (isTraktHistory) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'history',
+        removeExternalListId: 'history',
+      });
+    }
+    if (isTraktUserList && traktListSlug) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'trakt',
+        removeExternalTarget: 'custom',
+        removeExternalListId: traktListSlug,
+      });
+    }
+    if (isMdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'watchlist',
+        removeExternalListId: 'watchlist',
+      });
+    }
+    if (isMdbHistory) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'history',
+        removeExternalListId: 'history',
+      });
+    }
+    if (isMdbUserList && mdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'custom',
+        removeExternalListId: mdbListId,
+      });
+    }
+    if (isTmdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'watchlist',
+      });
+    }
+    if (isTmdbFavorites) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'favorite',
+      });
+    }
+    if (isTmdbUserList && tmdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'tmdb',
+        removeExternalTarget: 'custom',
+        removeExternalListId: tmdbListId,
+      });
+    }
+    if (isMdbWatchlist) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'watchlist',
+      });
+    }
+    if (isMdbUserList && mdbListId) {
+      return Object.assign({}, it, {
+        removeExternalProvider: 'mdblist',
+        removeExternalTarget: 'custom',
+        removeExternalListId: mdbListId,
+      });
+    }
+    return it;
+  }
+
   function appendItems(items) {
-    gridEl.insertAdjacentHTML('beforeend', items.map(livePreviewPosterHtml).join(''));
+    const annotated = items.map(annotatePersonalItem);
+    gridEl.insertAdjacentHTML('beforeend', annotated.map(livePreviewPosterHtml).join(''));
     loadedCount += items.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
@@ -20538,6 +23767,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
       if (keys.traktKey) body.traktKey = keys.traktKey;
       if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+      if (keys.simklKey) body.simklKey = keys.simklKey;
+      if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -20632,6 +23863,9 @@ function exportConfigJson() {
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
   document.getElementById('configJsonBox').value = JSON.stringify(payload, null, 2);
 }
 
@@ -20690,6 +23924,12 @@ function applyImportedConfig(data) {
     traktAccessToken = data.traktAccessToken;
     renderTraktConnectStatus();
   }
+  if (data.simklKey) document.getElementById('simklKeyInput').value = data.simklKey;
+  if (data.simklAccessToken) {
+    simklAccessToken = data.simklAccessToken;
+    if (data.simklUsername) simklUsername = data.simklUsername;
+    if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+  }
   renumber();
   checkAllDuplicateUrls();
   saveState();
@@ -20697,6 +23937,7 @@ function applyImportedConfig(data) {
   if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
   scheduleMyMdblistListsRefresh();
   scheduleMyTraktListsRefresh();
+  if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
   alert('Imported ' + data.entries.length + ' list(s).');
 }
 
@@ -20716,7 +23957,7 @@ async function importFromLink() {
     alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
     return;
   }
-  const cleaned = raw.replace(/^stremio:\\/\\//, 'https://').replace(/^wako:\\/\\//, 'https://');
+  const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
   const m = cleaned.match(/\\/([^/]+)\\/(?:manifest\\.json|configure)(?:[/?#]|$)/);
   let config = null;
   if (m) {
@@ -20955,12 +24196,28 @@ function sharePreset(name) {
 }
 
 function deletePreset(name) {
-  if (!confirm('Delete preset "' + name + '"?')) return;
-  const map = loadPresetsMap();
-  delete map[name];
-  savePresetsMap(map);
-  renderPresetsList();
-  schedulePresetsSync();
+  const performDelete = () => {
+    const map = loadPresetsMap();
+    delete map[name];
+    savePresetsMap(map);
+    renderPresetsList();
+    schedulePresetsSync();
+    showAddedToast('Deleted preset "' + name + '".');
+  };
+
+  if (typeof showAppConfirm === 'function') {
+    showAppConfirm(
+      'Delete Preset',
+      'Delete preset "' + name + '"? This will permanently remove this preset.',
+      'Delete Preset',
+      performDelete,
+      true
+    );
+  } else {
+    if (confirm('Delete preset "' + name + '"?')) {
+      performDelete();
+    }
+  }
 }
 
 // --- file download/upload (Backup/Restore and My Presets) -------------------
@@ -21014,10 +24271,17 @@ function downloadConfigJson() {
   }
   const keys = collectKeys();
   const payload = { entries };
+  if (keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
+  if (keys.tmdbSessionId) payload.tmdbSessionId = keys.tmdbSessionId;
+  if (keys.tmdbAccountId) payload.tmdbAccountId = keys.tmdbAccountId;
+  if (keys.tmdbUsername) payload.tmdbUsername = keys.tmdbUsername;
   if (keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
   downloadJsonFile('my-lists-config.json', payload);
 }
 
@@ -21095,6 +24359,12 @@ function copyLink(url) {
   }).catch(() => alert(url));
 }
 
+function openInNuvio(installUrl, e) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(installUrl).catch(() => {});
+  }
+}
+
 async function generate() {
   const entries = collectEntries();
   if (!entries.length) { alert('Add at least one list.'); return; }
@@ -21115,6 +24385,7 @@ async function generate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         entries, mdblistKey: keys.mdblistKey, mdblistAccessToken: keys.mdblistAccessToken, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
+        simklKey: keys.simklKey, simklAccessToken: keys.simklAccessToken,
         track: keys.track, trackCreatorName: keys.trackCreatorName, trackCreatorKey: keys.trackCreatorKey,
         shuffleShelves: keys.shuffleShelves, shuffleItems: keys.shuffleItems,
       }),
@@ -21138,7 +24409,7 @@ async function generate() {
 
   const installUrl = ORIGIN + '/' + config + '/manifest.json';
   const stremioUrl = 'stremio://' + installUrl.replace(/^https?:\\/\\//, '');
-  const wakoUrl = 'wako://' + installUrl.replace(/^https?:\\/\\//, '');
+  const nuvioUrl = 'nuvio://' + installUrl.replace(/^https?:\\/\\//, '');
   // A group breakdown alongside the plain install-count beacon -- each
   // row's own .group ("MDBList Charts", "Custom Lists", "Channels", etc.)
   // is already a meaningful "what kind of source is this" label, no need
@@ -21164,9 +24435,9 @@ async function generate() {
     <div class="actions">
       <button class="btn-copy secondary" id="copyBtn" onclick="copyLink('\${installUrl}')">Copy link</button>
       <a class="btn-stremio" href="\${stremioUrl}">Open in Stremio</a>
-      <a class="btn-wako" href="\${wakoUrl}">Open in wako</a>
+      <a class="btn-nuvio" href="\${nuvioUrl}" onclick="openInNuvio('\${installUrl}', event)">Open in Nuvio</a>
     </div>
-    <p class="hint"><small>If "Open in wako" doesn't do anything on your device, wako may not register a URL scheme yet &mdash; copy the link instead and paste it into wako &rarr; Settings &gt; Extensions &gt; Install an add-on.</small></p>\`;
+    <p class="hint"><small>If "Open in Nuvio" doesn't automatically open on your device, the manifest link was copied &mdash; paste it in Nuvio &rarr; Settings &gt; Content & Discovery &gt; Addons.</small></p>\`;
   // The mobile sticky CTA bar can be tapped from anywhere on a long page of
   // rows, so bring the result into view rather than leaving it rendered
   // off-screen above the fold the person's currently scrolled past.
@@ -21201,31 +24472,56 @@ if (serverEntries.length) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
   }
   if (saved && saved.keys && saved.keys.mdblistKey) {
-    document.getElementById('mdblistKeyInput').value = saved.keys.mdblistKey;
+    const el = document.getElementById('mdblistKeyInput');
+    if (el) el.value = saved.keys.mdblistKey;
   }
   if (saved && saved.keys && saved.keys.mdblistAccessToken) {
     mdblistAccessToken = saved.keys.mdblistAccessToken;
   }
   if (saved && saved.keys && saved.keys.traktKey) {
-    document.getElementById('traktKeyInput').value = saved.keys.traktKey;
+    const el = document.getElementById('traktKeyInput');
+    if (el) el.value = saved.keys.traktKey;
   }
   if (saved && saved.keys && saved.keys.traktUsername) {
-    document.getElementById('traktUsernameInput').value = saved.keys.traktUsername;
+    const el = document.getElementById('traktUsernameInput');
+    if (el) el.value = saved.keys.traktUsername;
   }
   if (saved && saved.keys && saved.keys.traktAccessToken) {
     traktAccessToken = saved.keys.traktAccessToken;
+  }
+  if (saved && saved.keys && saved.keys.simklKey) {
+    const el = document.getElementById('simklKeyInput');
+    if (el) el.value = saved.keys.simklKey;
+  }
+  if (saved && saved.keys && saved.keys.simklAccessToken) {
+    simklAccessToken = saved.keys.simklAccessToken;
+  }
+  if (saved && saved.keys && saved.keys.simklUsername) {
+    simklUsername = saved.keys.simklUsername;
   }
 }
 if (!mdblistAccessToken) {
   const savedForMdblist = loadSavedState();
   if (savedForMdblist && savedForMdblist.keys && savedForMdblist.keys.mdblistAccessToken) {
     mdblistAccessToken = savedForMdblist.keys.mdblistAccessToken;
+  } else {
+    try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
 }
 if (!traktAccessToken) {
   const savedForTrakt = loadSavedState();
   if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
     traktAccessToken = savedForTrakt.keys.traktAccessToken;
+  } else {
+    try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+  }
+}
+if (!simklAccessToken) {
+  const savedForSimkl = loadSavedState();
+  if (savedForSimkl && savedForSimkl.keys && savedForSimkl.keys.simklAccessToken) {
+    simklAccessToken = savedForSimkl.keys.simklAccessToken;
+  } else {
+    try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
 }
 suppressSave = false;
@@ -21245,6 +24541,9 @@ renderTraktConnectStatus();
 if (typeof pickUpTmdbTokenFromUrl === 'function') pickUpTmdbTokenFromUrl();
 if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
 if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+if (typeof pickUpSimklTokenFromUrl === 'function') pickUpSimklTokenFromUrl();
+if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
 if (typeof populateImportTargetLists === 'function') populateImportTargetLists();
 document.querySelectorAll('details.panel.collapsible').forEach((d) => {
   d.addEventListener('toggle', scheduleCreatorSyncSave);
@@ -21403,12 +24702,13 @@ export default {
     // that message). `|| ""` guards against `env` not having the property
     // at all, same as a missing Worker secret/var normally reads as
     // undefined rather than an empty string.
-    TMDB_API_KEY = env.TMDB_API_KEY || "5e183700244552be60b9a44cf5d7e7b9";
-    TRAKT_CLIENT_ID = env.TRAKT_CLIENT_ID || "";
-    SIMKL_CLIENT_ID = env.SIMKL_CLIENT_ID || "b331c5917e9f5b4e2f92fbfdf62de9b62e99c4c6fe743ff281e6c63be159e3b4";
-    MDBLIST_API_KEY = env.MDBLIST_API_KEY || "";
-    MDBLIST_POPULAR_KEY = env.MDBLIST_POPULAR_KEY || "";
-    MDBLIST_CLIENT_ID = env.MDBLIST_CLIENT_ID || "";
+    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -21724,7 +25024,7 @@ self.addEventListener('fetch', e => {
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, sampleSize, skip, creatorName;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -21739,6 +25039,8 @@ self.addEventListener('fetch', e => {
         mdblistAccessToken = reqBody.mdblistAccessToken || "";
         traktKey = reqBody.traktKey || "";
         traktAccessToken = reqBody.traktAccessToken || "";
+        simklKey = reqBody.simklKey || "";
+        simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
@@ -21750,13 +25052,15 @@ self.addEventListener('fetch', e => {
         mdblistAccessToken = url.searchParams.get("mdblistAccessToken") || "";
         traktKey = url.searchParams.get("traktKey") || "";
         traktAccessToken = url.searchParams.get("traktAccessToken") || "";
+        simklKey = url.searchParams.get("simklKey") || "";
+        simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, creatorName, env, ctx });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx });
         body = {
           ok: true,
           count: metas.length,
@@ -21966,6 +25270,7 @@ self.addEventListener('fetch', e => {
           title: it.title || it.name,
           year: (it.release_date || it.first_air_date || "").slice(0, 4),
           poster: it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null,
+          backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
           type: kind,
         }));
         return json({ ok: true, results });
@@ -22005,7 +25310,8 @@ self.addEventListener('fetch', e => {
           ok: true,
           imdbId: details.imdbId,
           name: data.name,
-          poster: data.poster_path ? `https://image.tmdb.org/t/p/w300${data.poster_path}` : null,
+          poster: data.poster_path ? `https://image.tmdb.org/t/p/w500${data.poster_path}` : null,
+          backdrop: data.backdrop_path ? `https://image.tmdb.org/t/p/w780${data.backdrop_path}` : null,
           seasons,
         });
       } catch (err) {
@@ -22036,7 +25342,7 @@ self.addEventListener('fetch', e => {
           episode: e.episode_number,
           name: e.name,
           released: e.air_date || null,
-          thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w300${e.still_path}` : null,
+          thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w780${e.still_path}` : null,
         }));
         return json({ ok: true, episodes });
       } catch (err) {
@@ -22056,6 +25362,143 @@ self.addEventListener('fetch', e => {
     // request should be doing; spreading that across many small
     // client-driven requests keeps each one fast and avoids leaning on
     // Cloudflare's per-request subrequest ceiling.
+    if (path === "/api/channel-preset") {
+      const networkId = url.searchParams.get("networkId") || "";
+      const name = url.searchParams.get("name") || "TV Channel";
+      if (!networkId) return json({ ok: false, error: "Missing networkId." }, 400);
+
+      const cacheKey = `channel:preset:v2:${networkId}`;
+      try {
+        if (env && env.CONFIGS) {
+          const cached = await env.CONFIGS.get(cacheKey);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed && Array.isArray(parsed.items) && parsed.items.length) {
+              return json({ ok: true, channel: parsed }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+            }
+          }
+        }
+      } catch (e) {}
+
+      try {
+        const discoverRes = await fetch(
+          `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+            `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=1&include_adult=false`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!discoverRes.ok) return json({ ok: false, error: "TMDB network request failed." }, 502);
+        const discoverData = await discoverRes.json();
+        let topShows = (discoverData.results || []).slice(0, 10);
+        const nameLower = name.toLowerCase();
+        if (!topShows.length) {
+          if (nameLower.includes("metv")) {
+            topShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
+          } else if (nameLower.includes("food")) {
+            topShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
+          } else if (nameLower.includes("ion")) {
+            topShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
+          }
+        }
+        if (!topShows.length) return json({ ok: false, error: "No shows found for that network." });
+
+        let networkLogo = null;
+        try {
+          const networkRes = await fetch(
+            `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+          );
+          if (networkRes.ok) {
+            const networkData = await networkRes.json();
+            if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+          }
+        } catch (e) {}
+
+        const allEpisodes = [];
+        let poster = networkLogo;
+        let backdrop = null;
+
+        const assembleFromShows = async (showsList) => {
+          await mapWithConcurrency(showsList, 4, async (show) => {
+            if (allEpisodes.length >= 200) return;
+            try {
+              const showRes = await fetch(
+                `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+                { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+              );
+              if (!showRes.ok) return;
+              const fullShow = await showRes.json();
+              const imdbId = (fullShow.external_ids && fullShow.external_ids.imdb_id) || fullShow.imdb_id || (`tmdb:${show.id}`);
+
+              if (!poster && fullShow.poster_path) poster = `https://image.tmdb.org/t/p/w500${fullShow.poster_path}`;
+              if (!backdrop && fullShow.backdrop_path) backdrop = `https://image.tmdb.org/t/p/w780${fullShow.backdrop_path}`;
+
+              const showPosterUrl = fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "";
+              const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
+
+              for (const s of validSeasons) {
+                if (allEpisodes.length >= 200) break;
+                const sRes = await fetch(
+                  `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+                  { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+                );
+                if (!sRes.ok) continue;
+                const sData = await sRes.json();
+                for (const ep of (sData.episodes || [])) {
+                  if (allEpisodes.length >= 200) break;
+                  const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+                  allEpisodes.push({
+                    kind: "episode",
+                    imdbId: imdbId,
+                    season: s.season_number,
+                    episode: ep.episode_number,
+                    showName: fullShow.name || show.name || "",
+                    epName: ep.name || (`Episode ${ep.episode_number}`),
+                    title: `${fullShow.name || show.name} S${s.season_number}E${ep.episode_number} \u2014 ${ep.name || (`Episode ${ep.episode_number}`)}`,
+                    released: ep.air_date || "",
+                    thumbnail: stillUrl || showPosterUrl,
+                    poster: showPosterUrl || stillUrl,
+                    showPoster: showPosterUrl,
+                  });
+                }
+              }
+            } catch (e) {}
+          });
+        };
+
+        await assembleFromShows(topShows);
+
+        if (!allEpisodes.length && (nameLower.includes("metv") || nameLower.includes("food") || nameLower.includes("ion"))) {
+          let fallbackShows = [];
+          if (nameLower.includes("metv")) {
+            fallbackShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
+          } else if (nameLower.includes("food")) {
+            fallbackShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
+          } else if (nameLower.includes("ion")) {
+            fallbackShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
+          }
+          await assembleFromShows(fallbackShows);
+        }
+
+        if (!allEpisodes.length) return json({ ok: false, error: "Could not assemble episodes for this network." });
+
+        const channelPayload = {
+          name: name,
+          poster: poster || (url.origin + "/icon.png"),
+          backdrop: backdrop || poster || (url.origin + "/icon.png"),
+          items: allEpisodes,
+          shuffle: false,
+          dailyRotate: true,
+        };
+
+        if (env && env.CONFIGS && ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(env.CONFIGS.put(cacheKey, JSON.stringify(channelPayload), { expirationTtl: 86400 }));
+        }
+        return json({ ok: true, channel: channelPayload }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+      } catch (err) {
+        return json({ ok: false, error: err.message || "Failed to build network channel preset." }, 500);
+      }
+    }
+
     //
     // Three sources feed this: any mdblist.com/trakt.tv/themoviedb.org list
     // link (someone else's hand-picked lineup, or "Import from link"'s own
@@ -22128,7 +25571,8 @@ self.addEventListener('fetch', e => {
               imdbId: details.imdbId,
               tmdbId: show.id,
               name: show.name,
-              poster: show.poster_path ? `https://image.tmdb.org/t/p/w300${show.poster_path}` : null,
+              poster: show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : null,
+              backdrop: show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : null,
             };
           });
           // Always the shared key -- the discover page loop
@@ -22167,7 +25611,13 @@ self.addEventListener('fetch', e => {
             const findData = await findRes.json();
             const match = (findData.tv_results || [])[0];
             if (!match) return null;
-            return { imdbId: m.id, tmdbId: match.id, name: m.name, poster: m.poster };
+            return {
+              imdbId: m.id,
+              tmdbId: match.id,
+              name: m.name,
+              poster: m.poster || (match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : null),
+              backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : (m.poster || null),
+            };
           } catch {
             return null;
           }
@@ -22557,7 +26007,7 @@ self.addEventListener('fetch', e => {
       }
       try {
         const src = `https://api.trakt.tv/users/${encodeURIComponent(username)}/lists`;
-        const res = await fetch(src, {
+        const res = await fetchTraktWithRetry(src, {
           headers: {
             "Content-Type": "application/json",
             "trakt-api-version": "2",
@@ -22578,26 +26028,30 @@ self.addEventListener('fetch', e => {
                 : "Trakt rejected this add-on's API key (HTTP 403 = invalid or unapproved app). Enter your own Trakt Client ID above to bypass this, or ask the Worker owner to fix TRAKT_CLIENT_ID.",
             });
           }
+          if (res.status === 429) {
+            return json({ ok: false, error: "Trakt is temporarily busy (rate limit). Please wait a few seconds and try again." });
+          }
           return json({ ok: false, error: `Trakt request failed (HTTP ${res.status}).` });
         }
         const data = await res.json();
         const lists = (Array.isArray(data) ? data : [])
           .filter((l) => l && l.ids && l.ids.slug)
-          .map((l) => ({
-            name: l.name,
-            slug: l.ids.slug,
-            items: l.item_count || 0,
-            likes: l.likes || 0,
-            url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(l.ids.slug)}`,
-          }));
-        const classified = await mapWithConcurrency(lists, 8, async (l) => ({
-          ...l,
-          contentType: await classifyTraktListContentType(username, l.slug, traktKey),
-        }));
-        // Always the shared key when traktKeyParam wasn't supplied -- 1
-        // call for the lists index above, plus 1 classify call per list.
-        if (!traktKeyParam) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + classified.length));
-        return json({ ok: true, lists: classified });
+          .map((l) => {
+            const name = l.name || "";
+            const isMovie = /\bmovie(s)?\b/i.test(name);
+            const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+            const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+            return {
+              name: l.name,
+              slug: l.ids.slug,
+              items: l.item_count || 0,
+              likes: l.likes || 0,
+              contentType,
+              url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(l.ids.slug)}`,
+            };
+          });
+        if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
+        return json({ ok: true, lists });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -22696,43 +26150,54 @@ self.addEventListener('fetch', e => {
 
       try {
         const redirectUri = `${url.origin}/api/trakt/oauth/callback`;
-        const tokenRes = await fetch("https://api.trakt.tv/oauth/token", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          body: JSON.stringify({
-            code,
-            client_id: TRAKT_CLIENT_ID,
-            client_secret: env.TRAKT_CLIENT_SECRET,
-            redirect_uri: redirectUri,
-            grant_type: "authorization_code",
-          }),
+        const traktHeaders = {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": TRAKT_CLIENT_ID,
+          "User-Agent": "my-list-addon/1.4",
+        };
+        const tokenBody = JSON.stringify({
+          code,
+          client_id: TRAKT_CLIENT_ID,
+          client_secret: env.TRAKT_CLIENT_SECRET,
+          redirect_uri: redirectUri,
+          grant_type: "authorization_code",
         });
-        if (!tokenRes.ok) {
-          // Trakt's token endpoint returns a standard OAuth2-shaped error
-          // body ({error, error_description}) on failure -- surface that
-          // verbatim rather than a generic message, since the actual cause
-          // (bad client_secret, expired/already-used code, redirect_uri
-          // mismatch specifically on this step, etc.) is otherwise
-          // invisible and turns every failure into a guessing game.
-          let detail = `HTTP ${tokenRes.status}`;
+
+        let tokenRes = null;
+        const delays = [0, 1000, 2000, 3000];
+        for (const delay of delays) {
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
           try {
-            const text = await tokenRes.text();
-            try {
-              const errBody = JSON.parse(text);
-              if (errBody && (errBody.error || errBody.error_description)) {
-                detail = [errBody.error, errBody.error_description].filter(Boolean).join(": ");
-              } else if (text) {
-                detail = text.slice(0, 200);
-              }
-            } catch {
-              if (text) detail = text.slice(0, 200);
+            tokenRes = await fetch("https://api.trakt.tv/oauth/token", {
+              method: "POST",
+              headers: traktHeaders,
+              body: tokenBody,
+            });
+            if (tokenRes.ok) break;
+            if (tokenRes.status !== 429 && tokenRes.status !== 403 && tokenRes.status !== 503) {
+              break;
             }
-          } catch {
-            // keep the HTTP-status-only detail
-          }
+          } catch {}
+        }
+        if (!tokenRes || !tokenRes.ok) {
+          let detail = tokenRes ? `HTTP ${tokenRes.status}` : "Network failed";
+          try {
+            if (tokenRes) {
+              const text = await tokenRes.text();
+              try {
+                const errBody = JSON.parse(text);
+                if (errBody && (errBody.error || errBody.error_description)) {
+                  detail = [errBody.error, errBody.error_description].filter(Boolean).join(": ");
+                } else if (text) {
+                  detail = text.slice(0, 200);
+                }
+              } catch {
+                if (text) detail = text.slice(0, 200);
+              }
+            }
+          } catch {}
           return failWith("exchange_failed", detail);
         }
         const tokenData = await tokenRes.json();
@@ -22745,7 +26210,7 @@ self.addEventListener('fetch', e => {
               "Authorization": `Bearer ${tokenData.access_token}`,
               "trakt-api-version": "2",
               "trakt-api-key": clientId || TRAKT_CLIENT_ID,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "User-Agent": "my-list-addon/1.4",
             },
           });
           if (meRes.ok) {
@@ -22762,6 +26227,126 @@ self.addEventListener('fetch', e => {
         });
       } catch {
         return failWith("network");
+      }
+    }
+
+    // /api/trakt/device/code -> starts Trakt device activation flow (bypasses browser redirects & 1015)
+    if (path === "/api/trakt/device/code" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const userKey = String(body.traktKey || body.clientId || "").trim();
+      const clientId = userKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+      if (!clientId) return json({ ok: false, error: "Trakt Client ID is not configured. Add your Trakt Client ID in Settings." }, 400);
+      try {
+        let res = await fetch("https://api.trakt.tv/oauth/device/code", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          body: JSON.stringify({ client_id: clientId }),
+        });
+
+        // If rate limited by Trakt (429), automatically wait and retry once
+        if (res.status === 429) {
+          const retrySec = parseInt(res.headers.get("Retry-After") || "2", 10);
+          await new Promise((resolve) => setTimeout(resolve, Math.min(3000, Math.max(1000, retrySec * 1000))));
+          res = await fetch("https://api.trakt.tv/oauth/device/code", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({ client_id: clientId }),
+          });
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const errMsg = data.error_description || data.error || (res.status === 429 ? "Trakt is busy (rate limit). Please wait a few seconds and try again." : `Trakt error (HTTP ${res.status})`);
+          return json({ ok: false, error: errMsg }, res.status);
+        }
+        return json({ ok: true, ...data });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
+      }
+    }
+
+    // /api/trakt/device/token -> polls for authorization of device code
+    if (path === "/api/trakt/device/token" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const code = String(body.code || "").trim();
+      const userKey = String(body.traktKey || body.clientId || "").trim();
+      const clientId = userKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+      const clientSecret = (env && env.TRAKT_CLIENT_SECRET) || "";
+      if (!code) return json({ ok: false, error: "Device code is required." }, 400);
+      if (!clientId || !clientSecret) return json({ ok: false, error: "TRAKT_CLIENT_SECRET not configured on worker." }, 500);
+
+      try {
+        const res = await fetch("https://api.trakt.tv/oauth/device/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          },
+          body: JSON.stringify({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+          }),
+        });
+
+        if (res.status === 400) {
+          return json({ ok: false, pending: true, error: "Pending authorization." }, 200);
+        }
+        if (res.status === 404) {
+          return json({ ok: false, error: "Invalid device code." }, 404);
+        }
+        if (res.status === 409) {
+          return json({ ok: false, error: "Code already approved or expired." }, 409);
+        }
+        if (res.status === 410) {
+          return json({ ok: false, error: "Code expired. Please request a new code." }, 410);
+        }
+        if (res.status === 418) {
+          return json({ ok: false, error: "Authorization was denied by user." }, 418);
+        }
+        if (res.status === 429) {
+          return json({ ok: false, slowDown: true, error: "Slow down polling." }, 200);
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.access_token) {
+          return json({ ok: false, error: data.error || `HTTP ${res.status}` }, res.status);
+        }
+
+        let traktUsername = "";
+        try {
+          const meRes = await fetch("https://api.trakt.tv/users/me", {
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${data.access_token}`,
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": "my-list-addon/1.4",
+            },
+          });
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            if (meData && meData.username) traktUsername = meData.username;
+          }
+        } catch {}
+
+        return json({ ok: true, access_token: data.access_token, username: traktUsername });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
       }
     }
 
@@ -22909,6 +26494,829 @@ self.addEventListener('fetch', e => {
       } catch (err) {
         return failWith("network", String(err.message || err));
       }
+    }
+
+    // /api/simkl/oauth/start -> redirects to Simkl login/authorization
+    if (path === "/api/simkl/oauth/start") {
+      const clientId = SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      if (!clientId) {
+        return new Response("Simkl OAuth isn't configured on this Worker (missing SIMKL_CLIENT_ID).", { status: 500 });
+      }
+      const state = generateShortId();
+      const redirectUri = url.hostname.includes("mylistsaddon.com")
+        ? "https://mylistsaddon.com/api/simkl/oauth/callback"
+        : `${url.origin}/api/simkl/oauth/callback`;
+      const authorizeUrl = `https://simkl.com/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}&app-name=MyListsAddon&app-version=${encodeURIComponent(ADDON_VERSION)}`;
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: authorizeUrl,
+          "Set-Cookie": `mla_simkl_state=${state}; Path=/api/simkl/oauth; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+        },
+      });
+    }
+
+    // /api/simkl/oauth/callback -> exchanges authorization code for Simkl access token
+    if (path === "/api/simkl/oauth/callback") {
+      const cookies = parseCookies(request);
+      const stateCookie = cookies.mla_simkl_state || "";
+      const clearStateCookie = "mla_simkl_state=; Path=/api/simkl/oauth; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+      const failWith = (code, detail) => {
+        const dest = `${url.origin}/#settings&simkl_error=${encodeURIComponent(code)}` +
+          (detail ? `&simkl_error_detail=${encodeURIComponent(detail)}` : "");
+        return new Response(null, { status: 302, headers: { Location: dest, "Set-Cookie": clearStateCookie } });
+      };
+
+      const clientId = SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      const clientSecret = SIMKL_CLIENT_SECRET || (env && env.SIMKL_CLIENT_SECRET) || "";
+      if (!clientId) return failWith("not_configured");
+
+      const q = new URLSearchParams(url.search);
+      const code = q.get("code");
+      const state = q.get("state");
+      const err = q.get("error");
+      if (err) return failWith("access_denied", q.get("error_description") || err);
+      if (!code) return failWith("no_code");
+      if (!stateCookie) return failWith("state_mismatch", "missing cookie");
+      if (state !== stateCookie) return failWith("state_mismatch", "state mismatch");
+
+      const redirectUri = url.hostname.includes("mylistsaddon.com")
+        ? "https://mylistsaddon.com/api/simkl/oauth/callback"
+        : `${url.origin}/api/simkl/oauth/callback`;
+
+      try {
+        const tokenRes = await fetch("https://api.simkl.com/oauth/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            "Accept": "application/json",
+          },
+          body: JSON.stringify({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            grant_type: "authorization_code",
+          }),
+        });
+
+        if (!tokenRes.ok) {
+          let detail = `HTTP ${tokenRes.status}`;
+          try {
+            const text = await tokenRes.text();
+            try {
+              const errBody = JSON.parse(text);
+              if (errBody && (errBody.error || errBody.error_description || errBody.message)) {
+                detail = [errBody.error, errBody.error_description, errBody.message].filter(Boolean).join(": ");
+              } else if (text) {
+                detail = text.slice(0, 200);
+              }
+            } catch {
+              if (text) detail = text.slice(0, 200);
+            }
+          } catch {}
+          return failWith("exchange_failed", detail);
+        }
+        const tokenData = await tokenRes.json();
+        const token = tokenData.access_token || tokenData.token;
+        if (!token) return failWith("no_token");
+        let simklUsername = "";
+        try {
+          const uRes = await fetch("https://api.simkl.com/users/settings", {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "Accept": "application/json",
+            },
+          });
+          if (uRes.ok) {
+            const uData = await uRes.json();
+            if (uData && uData.user && (uData.user.username || uData.user.name)) {
+              simklUsername = uData.user.username || uData.user.name;
+            }
+          }
+        } catch {}
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `${url.origin}/#simkl_token=${encodeURIComponent(token)}${simklUsername ? `&simkl_username=${encodeURIComponent(simklUsername)}` : ""}`,
+            "Set-Cookie": clearStateCookie,
+          },
+        });
+      } catch (err) {
+        return failWith("network", String(err.message || err));
+      }
+    }
+
+    // /api/simkl/my-lists -> returns authenticated user's personal Simkl watchlists
+    if (path === "/api/simkl/my-lists") {
+      let token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+      let manualKey = url.searchParams.get("simklKey") || "";
+      if (request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (body.token) token = body.token;
+          if (body.simklKey) manualKey = body.simklKey;
+        } catch {}
+      }
+      const clientId = manualKey || SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+      if (!token) {
+        return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+      }
+      try {
+        const res = await fetch("https://api.simkl.com/sync/all-items/", {
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "simkl-api-key": clientId,
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            "Accept": "application/json",
+          },
+        });
+        if (!res.ok) {
+          return json({ ok: false, error: `Simkl sync request failed (HTTP ${res.status}).` }, res.status);
+        }
+        const data = await res.json();
+        const statusLabels = {
+          plantowatch: "Plan to Watch",
+          watching: "Watching",
+          completed: "Completed",
+          hold: "On Hold",
+          dropped: "Dropped",
+        };
+
+        const lists = [];
+        const categories = [
+          { key: "movies", type: "movie", label: "Movies" },
+          { key: "shows", type: "series", label: "Shows" },
+          { key: "anime", type: "series", label: "Anime" },
+        ];
+
+        for (const cat of categories) {
+          const itemsArr = Array.isArray(data[cat.key]) ? data[cat.key] : [];
+          if (!itemsArr.length) continue;
+          const byStatus = {};
+          for (const item of itemsArr) {
+            const st = item.status || "plantowatch";
+            if (!byStatus[st]) byStatus[st] = [];
+            const mediaObj = item.movie || item.show || item.anime;
+            if (mediaObj) {
+              const ids = mediaObj.ids || {};
+              const imdbId = ids.imdb || "";
+              const tmdbId = ids.tmdb || "";
+              const simklId = ids.simkl || "";
+              const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : (simklId ? `simkl:${simklId}` : ""));
+              if (bestId) {
+                byStatus[st].push({
+                  id: bestId,
+                  imdbId: imdbId || null,
+                  tmdbId: tmdbId || null,
+                  name: mediaObj.title || "",
+                  year: mediaObj.year || "",
+                  poster: ids.poster ? `https://simkl.in/posters/${ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+                  type: cat.type,
+                });
+              }
+            }
+          }
+
+          for (const [stKey, stItems] of Object.entries(byStatus)) {
+            if (!stItems.length) continue;
+            const stLabel = statusLabels[stKey] || stKey;
+            lists.push({
+              name: `Simkl ${stLabel} (${cat.label})`,
+              type: cat.type,
+              itemCount: stItems.length,
+              statusKey: stKey,
+              categoryKey: cat.key,
+              items: stItems,
+              url: `simkl:user:${cat.key}:${stKey}`,
+            });
+          }
+        }
+
+        return json({ ok: true, lists });
+      } catch (err) {
+        return json({ ok: false, error: String(err.message || err) }, 500);
+      }
+    }
+
+    // /api/external-list/item-mutate -> adds or removes items on external provider accounts (Trakt, Simkl, TMDB, MDBList)
+    if ((path === "/api/external-list/item-mutate" || path === "/api/external-list/item-add" || path === "/api/external-list/item-remove") && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const action = (path.endsWith("/item-remove") || body.action === "remove") ? "remove" : "add";
+      const provider = (body.provider || "").toLowerCase().trim();
+      const target = (body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
+      const listId = body.listId || body.status || "";
+      const mediaType = (body.type === "series" || body.type === "tv") ? "series" : "movie";
+      const title = body.title || "";
+      const year = body.year || "";
+      let id = String(body.id || "").trim();
+      let imdbId = String(body.imdbId || "").trim();
+      let tmdbId = String(body.tmdbId || "").trim();
+
+      if (!imdbId && id.startsWith("tt")) imdbId = id;
+      if (!tmdbId && id.startsWith("tmdb:")) tmdbId = id.slice(5);
+
+      const apiKeyTmdb = TMDB_API_KEY || (env && env.TMDB_API_KEY) || body.tmdbKey || "";
+
+      // Resolve TMDB ID or IMDb ID if missing
+      if (!tmdbId && imdbId && apiKeyTmdb) {
+        try {
+          const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(apiKeyTmdb)}&external_source=imdb_id`);
+          if (findRes.ok) {
+            const findData = await findRes.json();
+            const hit = (mediaType === "series" ? (findData.tv_results && findData.tv_results[0]) : (findData.movie_results && findData.movie_results[0])) || (findData.movie_results && findData.movie_results[0]) || (findData.tv_results && findData.tv_results[0]);
+            if (hit && hit.id) tmdbId = String(hit.id);
+          }
+        } catch {}
+      }
+
+      if (!imdbId && tmdbId && apiKeyTmdb) {
+        try {
+          const detRes = await fetch(`https://api.themoviedb.org/3/${mediaType === "series" ? "tv" : "movie"}/${encodeURIComponent(tmdbId)}/external_ids?api_key=${encodeURIComponent(apiKeyTmdb)}`);
+          if (detRes.ok) {
+            const detData = await detRes.json();
+            if (detData && detData.imdb_id) imdbId = detData.imdb_id;
+          }
+        } catch {}
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const clientId = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        const username = body.traktUsername || "me";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        const idsObj = {};
+        if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
+        if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+
+        const mediaKey = mediaType === "series" ? "shows" : "movies";
+        const traktPayload = {
+          [mediaKey]: [{
+            ids: idsObj,
+            title: title || undefined,
+            year: year ? parseInt(year, 10) : undefined,
+          }],
+        };
+
+        let traktUrl = `https://api.trakt.tv/sync/watchlist${action === "remove" ? "/remove" : ""}`;
+        if (target === "history") {
+          traktUrl = `https://api.trakt.tv/sync/history${action === "remove" ? "/remove" : ""}`;
+        } else if (target === "collection") {
+          traktUrl = `https://api.trakt.tv/sync/collection${action === "remove" ? "/remove" : ""}`;
+        } else if (target === "custom" && listId) {
+          traktUrl = `https://api.trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(listId)}/items${action === "remove" ? "/remove" : ""}`;
+        }
+
+        try {
+          const tRes = await fetch(traktUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(traktPayload),
+          });
+          const tData = await tRes.json().catch(() => ({}));
+          if (!tRes.ok) {
+            return json({ ok: false, error: tData.error || `Trakt API error (HTTP ${tRes.status})` }, tRes.status);
+          }
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({ ok: true, provider: "trakt", action, target, data: tData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. SIMKL
+      if (provider === "simkl") {
+        const token = body.simklAccessToken || body.token || "";
+        const clientId = body.simklKey || SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+
+        const idsObj = {};
+        if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
+        if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+
+        const mediaKey = mediaType === "series" ? "shows" : "movies";
+        const targetStatus = target || "plantowatch";
+
+        let simklUrl = "https://api.simkl.com/sync/add-to-list";
+        let simklBody = {};
+
+        if (action === "remove") {
+          simklUrl = "https://api.simkl.com/sync/history/remove";
+          simklBody = {
+            [mediaKey]: [{
+              ids: idsObj,
+              title: title || undefined,
+            }],
+          };
+        } else {
+          simklBody = {
+            [mediaKey]: [{
+              ids: idsObj,
+              to: targetStatus,
+            }],
+          };
+        }
+
+        try {
+          const sRes = await fetch(simklUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(simklBody),
+          });
+          const sData = await sRes.json().catch(() => ({}));
+          if (!sRes.ok) {
+            return json({ ok: false, error: sData.error || `Simkl API error (HTTP ${sRes.status})` }, sRes.status);
+          }
+          invalidatePerUserCache("simkl", safeUserHash(token));
+          return json({ ok: true, provider: "simkl", action, target: targetStatus, data: sData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. TMDB
+      if (provider === "tmdb") {
+        const apiKey = apiKeyTmdb;
+        const sessionId = body.tmdbSessionId || body.sessionId || "";
+        const accountId = body.tmdbAccountId || "null";
+        const v4Token = body.tmdbAccessToken || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API Key missing." }, 400);
+        if (!sessionId && !v4Token) return json({ ok: false, error: "Please connect your TMDB account first." }, 400);
+        if (!tmdbId) return json({ ok: false, error: "Could not find a valid TMDB media ID for this title." }, 400);
+
+        const tmdbType = mediaType === "series" ? "tv" : "movie";
+        const numId = parseInt(tmdbId, 10);
+
+        if (target === "watchlist") {
+          const wUrl = `https://api.themoviedb.org/3/account/${encodeURIComponent(accountId)}/watchlist?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(wUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_type: tmdbType, media_id: numId, watchlist: (action === "add") }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "watchlist", data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "favorite") {
+          const fUrl = `https://api.themoviedb.org/3/account/${encodeURIComponent(accountId)}/favorite?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(fUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_type: tmdbType, media_id: numId, favorite: (action === "add") }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "favorite", data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "custom" && listId) {
+          const lUrl = `https://api.themoviedb.org/3/list/${encodeURIComponent(listId)}/${action === "add" ? "add_item" : "remove_item"}?api_key=${encodeURIComponent(apiKey)}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`;
+          try {
+            const tmdbRes = await fetch(lUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(v4Token ? { "Authorization": `Bearer ${v4Token}` } : {}),
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ media_id: numId }),
+            });
+            const tmdbData = await tmdbRes.json().catch(() => ({}));
+            if (!tmdbRes.ok || (tmdbData.success === false)) {
+              return json({ ok: false, error: tmdbData.status_message || `TMDB error (HTTP ${tmdbRes.status})` }, tmdbRes.status);
+            }
+            invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
+            return json({ ok: true, provider: "tmdb", action, target: "custom", listId, data: tmdbData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+      }
+
+      // 4. MDBLIST
+      if (provider === "mdblist") {
+        const token = body.mdblistAccessToken || body.mdblistKey || body.token || "";
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
+
+        const mdbId = imdbId || tmdbId || id;
+        const mdbType = mediaType === "series" ? "show" : "movie";
+
+        if (target === "watchlist") {
+          const mUrl = `https://api.mdblist.com/watchlist/${action === "add" ? "add" : "remove"}`;
+          try {
+            const mRes = await fetch(mUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ apikey: token, access_token: token, id: mdbId, mediatype: mdbType }),
+            });
+            const mData = await mRes.json().catch(() => ({}));
+            if (!mRes.ok) {
+              return json({ ok: false, error: mData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+            }
+            invalidatePerUserCache("mdblist", safeUserHash(token));
+            return json({ ok: true, provider: "mdblist", action, target: "watchlist", data: mData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
+        if (target === "custom" && listId) {
+          const mUrl = `https://api.mdblist.com/lists/${encodeURIComponent(listId)}/items/${action === "add" ? "add" : "remove"}`;
+          try {
+            const mRes = await fetch(mUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              body: JSON.stringify({ apikey: token, access_token: token, id: mdbId, mediatype: mdbType }),
+            });
+            const mData = await mRes.json().catch(() => ({}));
+            if (!mRes.ok) {
+              return json({ ok: false, error: mData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+            }
+            invalidatePerUserCache("mdblist", safeUserHash(token));
+            return json({ ok: true, provider: "mdblist", action, target: "custom", listId, data: mData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+      }
+
+      return json({ ok: false, error: "Unsupported provider or target." }, 400);
+    }
+
+    // /api/external-list/create -> creates a new custom list on Trakt, TMDB, or MDBList
+    if (path === "/api/external-list/create" && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const provider = (body.provider || "").toLowerCase().trim();
+      const name = (body.name || "").trim();
+      const description = (body.description || "").trim();
+      const privacy = (body.privacy || "private").toLowerCase().trim();
+      const listType = (body.type || "mixed").toLowerCase().trim();
+
+      if (!name) {
+        return json({ ok: false, error: "List name is required." }, 400);
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const traktKey = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        const username = body.traktUsername || "me";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        try {
+          const res = await fetch("https://api.trakt.tv/users/me/lists", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-key": traktKey,
+              "trakt-api-version": "2",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              name: name,
+              description: description,
+              privacy: privacy === "public" ? "public" : "private",
+              display_numbers: false,
+              allow_comments: true,
+              sort_by: "rank",
+              sort_how: "asc"
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            return json({ ok: false, error: data.error || data.message || `Trakt error (HTTP ${res.status})` }, res.status);
+          }
+          const slug = data.ids?.slug || data.slug || name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+          const traktUser = data.user?.ids?.slug || username || "me";
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({
+            ok: true,
+            provider: "trakt",
+            list: {
+              id: data.ids?.trakt || data.id || slug,
+              slug: slug,
+              name: data.name || name,
+              description: data.description || description,
+              privacy: data.privacy || privacy,
+              url: `https://trakt.tv/users/${traktUser}/lists/${slug}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. TMDB
+      if (provider === "tmdb") {
+        const sessionId = body.tmdbSessionId || "";
+        const apiKey = body.tmdbKey || TMDB_API_KEY || (env && env.TMDB_API_KEY) || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API key is missing." }, 400);
+        if (!sessionId) return json({ ok: false, error: "Please connect your TMDB account in Settings first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.themoviedb.org/3/list?api_key=${encodeURIComponent(apiKey)}&session_id=${encodeURIComponent(sessionId)}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              name: name,
+              description: description,
+              language: "en"
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.success === false) {
+            return json({ ok: false, error: data.status_message || `TMDB error (HTTP ${res.status})` }, res.status || 400);
+          }
+          const listId = String(data.list_id || data.id);
+          invalidatePerUserCache("tmdb", safeUserHash(sessionId));
+          return json({
+            ok: true,
+            provider: "tmdb",
+            list: {
+              id: listId,
+              name: name,
+              description: description,
+              url: `https://www.themoviedb.org/list/${listId}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. MDBLIST
+      if (provider === "mdblist") {
+        const token = body.mdblistAccessToken || body.mdblistKey || body.apikey || "";
+        const username = body.mdblistUsername || "";
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
+
+        try {
+          const res = await fetch("https://api.mdblist.com/lists/create", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify({
+              apikey: token,
+              access_token: token,
+              name: name,
+              description: description,
+              private: privacy !== "public",
+              dynamic: false
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false || data.error) {
+            return json({ ok: false, error: data.error || `MDBList error (HTTP ${res.status})` }, res.status || 400);
+          }
+          const listId = String(data.id || data.slug || "");
+          const slug = data.slug || listId;
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({
+            ok: true,
+            provider: "mdblist",
+            list: {
+              id: listId,
+              slug: slug,
+              name: data.name || name,
+              description: description,
+              url: username ? `https://mdblist.com/lists/${username}/${slug}` : `mdblist:list:${listId}`,
+              type: listType
+            }
+          });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 4. SIMKL
+      if (provider === "simkl") {
+        const token = body.simklAccessToken || body.token || "";
+        if (!token) return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const simklUrl = `simkl:user:${listType === "series" ? "shows" : "movies"}:${slug || "plantowatch"}`;
+        invalidatePerUserCache("simkl", safeUserHash(token));
+        return json({
+          ok: true,
+          provider: "simkl",
+          list: {
+            id: slug,
+            slug: slug,
+            name: name,
+            description: description,
+            url: simklUrl,
+            type: listType
+          }
+        });
+      }
+
+      return json({ ok: false, error: "Unsupported provider for creating lists." }, 400);
+    }
+
+    // /api/external-list/delete -> deletes a custom list from Trakt, TMDB, or MDBList
+    if (path === "/api/external-list/delete" && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const provider = (body.provider || "").toLowerCase().trim();
+      const listId = String(body.listId || "").trim();
+
+      if (!listId) {
+        return json({ ok: false, error: "List ID is required for deletion." }, 400);
+      }
+
+      // 1. TRAKT
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const traktKey = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.trakt.tv/users/me/lists/${encodeURIComponent(listId)}`, {
+            method: "DELETE",
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-key": traktKey,
+              "trakt-api-version": "2",
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+          });
+          if (!res.ok && res.status !== 204 && res.status !== 200) {
+            const data = await res.json().catch(() => ({}));
+            return json({ ok: false, error: data.error || `Trakt error (HTTP ${res.status})` }, res.status);
+          }
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({ ok: true, provider: "trakt", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. TMDB
+      if (provider === "tmdb") {
+        const sessionId = body.tmdbSessionId || "";
+        const apiKey = body.tmdbKey || TMDB_API_KEY || (env && env.TMDB_API_KEY) || "";
+        if (!apiKey) return json({ ok: false, error: "TMDB API key is missing." }, 400);
+        if (!sessionId) return json({ ok: false, error: "Please connect your TMDB account in Settings first." }, 400);
+
+        try {
+          const res = await fetch(`https://api.themoviedb.org/3/list/${encodeURIComponent(listId)}?api_key=${encodeURIComponent(apiKey)}&session_id=${encodeURIComponent(sessionId)}`, {
+            method: "DELETE",
+            headers: {
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok && data.success === false) {
+            return json({ ok: false, error: data.status_message || `TMDB error (HTTP ${res.status})` }, res.status || 400);
+          }
+          invalidatePerUserCache("tmdb", safeUserHash(sessionId));
+          return json({ ok: true, provider: "tmdb", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. MDBLIST
+      if (provider === "mdblist") {
+        const accessToken = (body.mdblistAccessToken || "").trim();
+        const apiKey = (body.mdblistKey || body.apikey || "").trim();
+        const token = accessToken || apiKey;
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
+
+        try {
+          const headers = {
+            "Accept": "application/json",
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          };
+          let deleteUrl = `https://api.mdblist.com/lists/${encodeURIComponent(listId)}`;
+          if (accessToken) {
+            headers["Authorization"] = `Bearer ${accessToken}`;
+          } else {
+            headers["x-api-key"] = apiKey;
+            deleteUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+          }
+
+          let res = await fetch(deleteUrl, {
+            method: "DELETE",
+            headers,
+          });
+
+          // Fallback: If slug was passed or initial attempt returned 404, resolve numeric id via /lists/user
+          if (!res.ok && (res.status === 404 || res.status === 400 || res.status === 405)) {
+            try {
+              let userListsUrl = "https://api.mdblist.com/lists/user";
+              const userHeaders = {
+                "Accept": "application/json",
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              };
+              if (accessToken) {
+                userHeaders["Authorization"] = `Bearer ${accessToken}`;
+              } else {
+                userHeaders["x-api-key"] = apiKey;
+                userListsUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+              }
+              const userRes = await fetch(userListsUrl, { headers: userHeaders });
+              if (userRes.ok) {
+                const udata = await userRes.json();
+                const raw = Array.isArray(udata) ? udata : (Array.isArray(udata.lists) ? udata.lists : []);
+                const match = raw.find((l) => l && (String(l.id) === listId || l.slug === listId || l.name === listId));
+                if (match && match.id && String(match.id) !== listId) {
+                  let retryUrl = `https://api.mdblist.com/lists/${encodeURIComponent(match.id)}`;
+                  if (!accessToken) retryUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+                  res = await fetch(retryUrl, { method: "DELETE", headers });
+                }
+              }
+            } catch {}
+          }
+
+          if (!res.ok && res.status !== 204 && res.status !== 200) {
+            const errData = await res.json().catch(() => ({}));
+            const errMsg = errData.error || errData.message || `MDBList error (HTTP ${res.status})`;
+            return json({ ok: false, error: errMsg }, res.status || 400);
+          }
+
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({ ok: true, provider: "mdblist", listId });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      return json({ ok: false, error: "Unsupported provider for deleting lists." }, 400);
     }
 
     // /api/tmdb/oauth/start -> requests temporary request token from TMDB & redirects to authenticate page
@@ -23229,130 +27637,118 @@ self.addEventListener('fetch', e => {
       const accessToken = String(body.accessToken || "").trim();
       if (!accessToken) return json({ ok: false, error: "Not connected to Trakt." }, 400);
       try {
-        const res = await fetch("https://api.trakt.tv/users/me/lists", {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          // Never cache an authenticated, per-person response -- see the
-          // same caching note on fetchTrakt above.
-          cf: { cacheTtl: 0, cacheEverything: false },
-        });
-        if (res.status === 401) {
-          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
-        }
-        if (!res.ok) return json({ ok: false, error: `Trakt request failed (HTTP ${res.status}).` });
-        const data = await res.json();
-        const meRes = await fetch("https://api.trakt.tv/users/me", {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          cf: { cacheTtl: 0, cacheEverything: false },
-        });
-        const me = meRes.ok ? await meRes.json() : null;
-        const meSlug = me && me.ids && me.ids.slug ? me.ids.slug : "me";
-        const lists = (Array.isArray(data) ? data : [])
-          .filter((l) => l && l.ids && l.ids.slug)
-          .map((l) => ({
-            name: l.name,
-            slug: l.ids.slug,
-            items: l.item_count || 0,
-            likes: l.likes || 0,
-            private: l.privacy !== "public",
-            url: `https://trakt.tv/users/${encodeURIComponent(meSlug)}/lists/${encodeURIComponent(l.ids.slug)}`,
-          }));
-        const classified = await mapWithConcurrency(lists, 8, async (l) => ({
-          ...l,
-          contentType: await classifyTraktListContentType(meSlug, l.slug, TRAKT_CLIENT_ID, accessToken),
-        }));
+        const userHash = safeUserHash(accessToken);
+        const cacheKey = `user_cache:trakt:private_lists:${userHash}`;
 
-        // The watchlist is a genuinely different endpoint from a list --
-        // Trakt never includes it in /users/me/lists above, so it has to
-        // be fetched and prepended separately to actually show up here at
-        // all. A cheap limit=1 request is enough to read the true total
-        // count off Trakt's own pagination header without pulling any
-        // real item data. contentType is left as "unknown" deliberately
-        // (rather than trying to classify it): a watchlist is almost
-        // always a mix of movies and shows for most people, and "unknown"
-        // is exactly the signal the client already uses to offer both
-        // +Movies/+Shows buttons and to auto-split into two Custom Lists
-        // when copying.
-        let watchlistCount = 0;
-        try {
-          const watchlistRes = await fetch("https://api.trakt.tv/users/me/watchlist?limit=1&page=1", {
-            headers: {
-              "Content-Type": "application/json",
-              "trakt-api-version": "2",
-              "trakt-api-key": TRAKT_CLIENT_ID,
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-            },
-            cf: { cacheTtl: 0, cacheEverything: false },
-          });
-          if (watchlistRes.ok) {
-            watchlistCount = parseInt(watchlistRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+        const lists = await fetchWithPerUserCacheAndCircuitBreaker({
+          cacheKey,
+          freshTtlSec: 60,
+          staleTtlSec: 1800,
+          providerLabel: "Trakt Private Lists",
+          fetchFn: async () => {
+            const res = await fetchTraktWithRetry("https://api.trakt.tv/users/me/lists", {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            if (res.status === 401) {
+              throw new Error("Your Trakt connection has expired or was revoked -- reconnect in Settings.");
+            }
+            if (!res.ok) throw new Error(`Trakt request failed (HTTP ${res.status}).`);
+            const data = await res.json();
+            const meRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me", {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            const me = meRes.ok ? await meRes.json() : null;
+            const meSlug = me && me.ids && me.ids.slug ? me.ids.slug : "me";
+            const rawLists = (Array.isArray(data) ? data : [])
+              .filter((l) => l && l.ids && l.ids.slug)
+              .map((l) => {
+                const name = l.name || "";
+                const isMovie = /\bmovie(s)?\b/i.test(name);
+                const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+                const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+                return {
+                  name: l.name,
+                  slug: l.ids.slug,
+                  items: l.item_count || 0,
+                  likes: l.likes || 0,
+                  private: l.privacy !== "public",
+                  contentType,
+                  url: `https://trakt.tv/users/${encodeURIComponent(meSlug)}/lists/${encodeURIComponent(l.ids.slug)}`,
+                };
+              });
+
+            let watchlistCount = 0;
+            try {
+              const watchlistRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me/watchlist?limit=1&page=1", {
+                headers: {
+                  "Content-Type": "application/json",
+                  "trakt-api-version": "2",
+                  "trakt-api-key": TRAKT_CLIENT_ID,
+                  Authorization: `Bearer ${accessToken}`,
+                  "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                },
+                cf: { cacheTtl: 0, cacheEverything: false },
+              });
+              if (watchlistRes.ok) {
+                watchlistCount = parseInt(watchlistRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+              }
+            } catch {}
+            const watchlistEntry = {
+              name: "Watchlist",
+              slug: "watchlist",
+              items: watchlistCount,
+              likes: 0,
+              private: true,
+              url: "trakt:watchlist",
+              contentType: "unknown",
+            };
+
+            let historyCount = 0;
+            try {
+              const historyRes = await fetchTraktWithRetry("https://api.trakt.tv/users/me/history?limit=1&page=1", {
+                headers: {
+                  "Content-Type": "application/json",
+                  "trakt-api-version": "2",
+                  "trakt-api-key": TRAKT_CLIENT_ID,
+                  Authorization: `Bearer ${accessToken}`,
+                  "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                },
+                cf: { cacheTtl: 0, cacheEverything: false },
+              });
+              if (historyRes.ok) {
+                historyCount = parseInt(historyRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
+              }
+            } catch {}
+            const historyEntry = {
+              name: "Watch History",
+              slug: "history",
+              items: historyCount,
+              likes: 0,
+              private: true,
+              url: "trakt:history",
+              contentType: "unknown",
+            };
+
+            ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4));
+            return [watchlistEntry, historyEntry, ...rawLists];
           }
-        } catch {
-          // best-effort -- the watchlist entry still shows below, just
-          // without a count, rather than failing the whole request over it
-        }
-        const watchlistEntry = {
-          name: "Watchlist",
-          slug: "watchlist",
-          items: watchlistCount,
-          likes: 0,
-          private: true,
-          url: "trakt:watchlist",
-          contentType: "unknown",
-        };
+        });
 
-        // Same idea as the watchlist above -- History is yet another
-        // endpoint Trakt keeps separate from /users/me/lists, so it's
-        // fetched and prepended the same way. contentType stays "unknown"
-        // since a watch history is basically always a mix of movies and
-        // shows, same reasoning as the watchlist.
-        let historyCount = 0;
-        try {
-          const historyRes = await fetch("https://api.trakt.tv/users/me/history?limit=1&page=1", {
-            headers: {
-              "Content-Type": "application/json",
-              "trakt-api-version": "2",
-              "trakt-api-key": TRAKT_CLIENT_ID,
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-            },
-            cf: { cacheTtl: 0, cacheEverything: false },
-          });
-          if (historyRes.ok) {
-            historyCount = parseInt(historyRes.headers.get("X-Pagination-Item-Count") || "0", 10) || 0;
-          }
-        } catch {
-          // best-effort -- the history entry still shows below, just
-          // without a count, rather than failing the whole request over it
-        }
-        const historyEntry = {
-          name: "Watch History",
-          slug: "history",
-          items: historyCount,
-          likes: 0,
-          private: true,
-          url: "trakt:history",
-          contentType: "unknown",
-        };
-
-        // Always the shared TRAKT_CLIENT_ID (OAuth calls always identify
-        // via this add-on's own app, never a per-user override) -- lists,
-        // me, watchlist, and history are 4 fixed calls, plus 1 classify
-        // call per list.
-        ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4 + classified.length));
-        return json({ ok: true, lists: [watchlistEntry, historyEntry, ...classified] });
+        return json({ ok: true, lists });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -23360,15 +27756,6 @@ self.addEventListener('fetch', e => {
 
     // /api/trakt-history-raw  (POST)  { accessToken, type: 'movies'|'episodes', page, limit }
     // -> { ok, items: [...raw Trakt history rows...], hasMore }
-    // Deliberately returns Trakt's raw, unmapped rows rather than going
-    // through mapTraktHistoryItems (used everywhere else this add-on reads
-    // history) -- that mapping folds each row into a display-ready catalog
-    // meta and throws away the real per-episode TMDB id and season/episode
-    // numbers along the way, which is exactly what the client's "Mark all
-    // as Watched" needs to build proper Watch History/Continue Watching
-    // entries. This is the same raw shape a Trakt Export JSON file already
-    // uses (Trakt's export is generated from this same API), so the client
-    // reuses mapTraktExportEntryToWatchHistoryItem unchanged for both.
     if (path === "/api/trakt-history-raw" && request.method === "POST") {
       let body;
       try {
@@ -23382,26 +27769,37 @@ self.addEventListener('fetch', e => {
       const page = Math.max(1, parseInt(body.page, 10) || 1);
       const limit = Math.min(100, Math.max(1, parseInt(body.limit, 10) || 100));
       try {
-        ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
-        const res = await fetch(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
-          headers: {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-          },
-          // Never cache an authenticated, per-person response -- see the
-          // same caching note on fetchTrakt above.
-          cf: { cacheTtl: 0, cacheEverything: false },
+        const userHash = safeUserHash(accessToken);
+        const cacheKey = `user_cache:trakt:history_raw:${itemKind}:${page}:${limit}:${userHash}`;
+
+        const historyResult = await fetchWithPerUserCacheAndCircuitBreaker({
+          cacheKey,
+          freshTtlSec: 60,
+          staleTtlSec: 1800,
+          providerLabel: "Trakt History Raw",
+          fetchFn: async () => {
+            ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
+            const res = await fetchTraktWithRetry(`https://api.trakt.tv/users/me/history/${itemKind}?limit=${limit}&page=${page}`, {
+              headers: {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              },
+              cf: { cacheTtl: 0, cacheEverything: false },
+            });
+            if (res.status === 401) {
+              throw new Error("Your Trakt connection has expired or was revoked -- reconnect in Settings.");
+            }
+            if (!res.ok) throw new Error(`Trakt history request failed (HTTP ${res.status}).`);
+            const items = await res.json();
+            const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
+            return { items: Array.isArray(items) ? items : [], hasMore: page < totalPages };
+          }
         });
-        if (res.status === 401) {
-          return json({ ok: false, error: "Your Trakt connection has expired or was revoked -- reconnect in Settings." });
-        }
-        if (!res.ok) return json({ ok: false, error: `Trakt history request failed (HTTP ${res.status}).` });
-        const items = await res.json();
-        const totalPages = parseInt(res.headers.get("x-pagination-page-count") || "1", 10) || 1;
-        return json({ ok: true, items: Array.isArray(items) ? items : [], hasMore: page < totalPages });
+
+        return json({ ok: true, items: historyResult.items || [], hasMore: !!historyResult.hasMore });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -23550,10 +27948,12 @@ self.addEventListener('fetch', e => {
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
         const lists = rawLists
-          .filter((l) => l && l.slug && l.user_name)
+          .filter((l) => l && (l.slug || l.id) && l.user_name)
           .map((l) => ({
+            id: l.id != null ? String(l.id) : (l.slug || ""),
             name: l.name || l.slug,
             slug: l.slug,
+            dynamic: !!l.dynamic,
             mediatype: l.mediatype || "",
             contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
             items: l.items || 0,
@@ -24604,6 +29004,33 @@ self.addEventListener('fetch', e => {
       return json({ ok: true });
     }
 
+    // /api/creator/sync/save-channels (POST) { creatorName, creatorKey, channels, mergedChannels }
+    if (path === "/api/creator/sync/save-channels" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const channelsBlob = {
+        channels: body.channels && typeof body.channels === "object" ? body.channels : {},
+        mergedChannels: body.mergedChannels && typeof body.mergedChannels === "object" ? body.mergedChannels : {},
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(channelsBlob);
+      if (serialized.length > 24 * 1024 * 1024) {
+        return json({ ok: false, error: "Your saved channels are too large to store (over the 25MB limit)." });
+      }
+      try {
+        await env.CONFIGS.put(`creatorsyncchannels:${auth.username}`, serialized);
+      } catch (e) {
+        return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
+      }
+      return json({ ok: true });
+    }
+
     // /api/creator/sync/load -> { ok, data: blob | null }
     // null specifically (rather than an empty blob) distinguishes "this
     // account has never synced from any device" from "this account synced
@@ -24654,6 +29081,23 @@ self.addEventListener('fetch', e => {
           }
           data.presets = presetsBlob.presets || {};
           data.presetsB64 = presetsBlob.presetsB64 || null;
+        }
+      }
+      // Channels & merged channels live in their own key -- merge them back in for signed-in sync across browsers.
+      const channelsRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      if (channelsRaw) {
+        let channelsBlob = null;
+        try {
+          channelsBlob = JSON.parse(channelsRaw);
+        } catch {
+          channelsBlob = null;
+        }
+        if (channelsBlob) {
+          if (!data) {
+            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+          }
+          data.channels = channelsBlob.channels || {};
+          data.mergedChannels = channelsBlob.mergedChannels || {};
         }
       }
       // Tracking data (Watch History/Continue Watching/etc) also lives in

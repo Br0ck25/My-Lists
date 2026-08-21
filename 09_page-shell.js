@@ -8,6 +8,9 @@ function renderBuilder(
   const initialTraktKey = initialKeys.traktKey || "";
   const initialTraktUsername = initialKeys.traktUsername || "";
   const initialTraktAccessToken = initialKeys.traktAccessToken || "";
+  const initialSimklKey = initialKeys.simklKey || "";
+  const initialSimklAccessToken = initialKeys.simklAccessToken || "";
+  const initialSimklUsername = initialKeys.simklUsername || "";
   const initialShuffleShelves = !!initialKeys.shuffleShelves;
   const initialShuffleItems = !!initialKeys.shuffleItems;
   const streamingTop10Html = buildStreamingTop10Html();
@@ -19,6 +22,7 @@ function renderBuilder(
   const combinedChartsHtml = buildCombinedChartsHtml();
   const hiddenGemsHtml = buildHiddenGemsHtml();
   const kidsHtml = buildKidsHtml();
+  const holidaysHtml = buildHolidaysHtml();
   const hasInitial = initialEntries.length > 0;
   const initialEntriesJson = JSON.stringify(
     hasInitial
@@ -252,7 +256,7 @@ function renderBuilder(
   .bottom-nav { display: none; }
   @media (max-width: 640px) {
     .tab-bar { display: none; }
-    body { padding: 12px 12px calc(84px + env(safe-area-inset-bottom)); }
+    body { padding: 12px 12px calc(96px + env(safe-area-inset-bottom)); }
     .bottom-nav {
       display: flex;
       position: fixed !important;
@@ -264,7 +268,7 @@ function renderBuilder(
       -webkit-backdrop-filter: saturate(180%) blur(20px);
       backdrop-filter: saturate(180%) blur(20px);
       border-top: 1px solid var(--border);
-      padding: 5px 0 calc(5px + env(safe-area-inset-bottom));
+      padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
       box-shadow: 0 -1px 0 rgba(0,0,0,0.08), 0 -4px 16px rgba(0,0,0,0.05);
     }
     :root.dark-theme .bottom-nav, html.dark-theme .bottom-nav, body.dark-theme .bottom-nav {
@@ -278,29 +282,37 @@ function renderBuilder(
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 2px;
-      padding: 3px 1px;
-      min-height: 48px;
+      gap: 3px;
+      padding: 4px 1px;
+      min-height: 62px;
       background: none;
       border: none;
       border-radius: 0;
       color: var(--muted);
-      font-size: 0.60rem;
+      font-size: 0.78rem;
       font-weight: 600;
       letter-spacing: 0.01em;
       cursor: pointer;
       transition: color 0.12s ease;
       white-space: nowrap;
-      line-height: 1;
+      line-height: 1.1;
     }
     .bottom-nav-item svg {
-      width: 22px; height: 22px; flex: none;
+      width: 28.5px; height: 28.5px; flex: none;
       transition: transform 0.12s ease;
       stroke-width: 1.8;
     }
     .bottom-nav-item.active { color: var(--accent); }
     .bottom-nav-item.active svg { transform: translateY(-1px); stroke-width: 2.2; }
     .bottom-nav-item:active { opacity: 0.6; }
+  }
+
+  .live-preview-poster-card.dragging {
+    opacity: 0.55 !important;
+    transform: scale(1.05) !important;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.4) !important;
+    z-index: 100 !important;
+    pointer-events: none !important;
   }
 
   /* --- Segmented Top Submenus (Matching Screenshot 3) --------------------- */
@@ -638,6 +650,71 @@ function renderBuilder(
     }
   }
 
+  /* --- Channel Accordions & Grid ------------------------------------------- */
+  .channel-card-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow-sm);
+  }
+  .channel-accordion {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 14px;
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+  .channel-accordion summary {
+    padding: 12px 16px;
+    font-weight: 700;
+    font-size: 0.92rem;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+  }
+  .channel-accordion summary::-webkit-details-marker {
+    display: none;
+  }
+  .channel-accordion summary::after {
+    content: '\u25be';
+    font-size: 1rem;
+    color: var(--muted);
+    transition: transform 0.2s ease;
+  }
+  .channel-accordion[open] summary::after {
+    transform: rotate(180deg);
+  }
+  .channel-accordion[open] summary {
+    border-bottom: 1px solid var(--border);
+  }
+  .channel-accordion-body {
+    padding: 14px 16px;
+  }
+  .channel-quick-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 8px;
+  }
+  .channel-season-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-top: 8px;
+  }
+  @media (min-width: 641px) {
+    .channel-season-grid {
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    }
+  }
+
   /* --- Wako List Cards Feed (Lists Tab - Matching Screenshot 3) ------------ */
   .list-card {
     background: var(--surface);
@@ -929,6 +1006,47 @@ function renderBuilder(
     }
   }
 
+  /* --- Merged Channels Chips & Inline Add Selector ------------------------ */
+  .merge-chip-remove-btn {
+    background: transparent !important;
+    border: none !important;
+    color: var(--muted) !important;
+    font-size: 0.95rem !important;
+    font-weight: 700 !important;
+    line-height: 1 !important;
+    cursor: pointer !important;
+    padding: 0 0 0 4px !important;
+    margin: 0 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    transition: color 0.15s !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    width: auto !important;
+    height: auto !important;
+  }
+  .merge-chip-remove-btn:hover {
+    color: var(--danger) !important;
+  }
+  .merge-add-channel-select {
+    padding: 3px 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--border);
+    background: var(--surface);
+    color: var(--accent);
+    cursor: pointer;
+    max-width: 220px;
+    outline: none;
+    transition: border-color 0.15s, color 0.15s;
+    margin: 2px 0 2px 4px;
+  }
+  .merge-add-channel-select:hover {
+    border-color: var(--accent);
+  }
+
   /* --- Cards & Panels ---------------------------------------------------- */
   .panel {
     background: var(--surface);
@@ -1065,8 +1183,8 @@ function renderBuilder(
     box-shadow: var(--shadow-sm);
   }
   button:hover:not(:disabled), .actions a:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.38; cursor: default; }
   .btn-stremio { background: linear-gradient(135deg, #9B8FFF, #6D48FF); color: #fff; }
+  .btn-nuvio   { background: linear-gradient(135deg, #FF5E3A, #FF2A68); color: #fff; }
   .btn-wako    { background: linear-gradient(135deg, #007AFF, #34AADC); color: #fff; }
   .actions { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 
@@ -1462,8 +1580,6 @@ function renderBuilder(
         <span class="app-header-sub" id="pageSubtitle">Explore Popular &amp; Streaming</span>
       </div>
     </div>
-    <button type="button" id="headerCreateListBtn" class="header-icon-btn" style="display:none; flex: 0 0 auto; font-size: 1.4rem; font-weight: 300; cursor:pointer;" onclick="openCreateListModal()" title="Create List">+</button>
-    <button type="button" id="headerAddShelfBtn" class="header-icon-btn" style="display:none; flex: 0 0 auto; font-size: 1.4rem; font-weight: 300; cursor:pointer;" onclick="openAddShelfModal()" title="Add Custom Shelf">+</button>
     <div class="app-header-actions">
       <div id="creatorProfileBar"></div>
     </div>
@@ -1471,8 +1587,9 @@ function renderBuilder(
 
   <!-- Top Tab Bar (Desktop View) -->
   <div class="tab-bar" role="tablist">
-    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">My Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">My Lists</button>
+    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
+    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" data-tab="channels" onclick="switchTab('channels')">Channels</button>
     <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
     <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
     <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
@@ -1480,19 +1597,26 @@ function renderBuilder(
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->
   <nav class="bottom-nav" role="tablist" aria-label="Main navigation">
-    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="My Catalogs">
+    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="My Lists">
+    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
         <line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line>
       </svg>
-      My Lists
+      Lists
+    </button>
+    <button type="button" class="bottom-nav-item" data-tab="channels" onclick="switchTab('channels')" title="Channels">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>
+        <polyline points="17 2 12 7 7 2"></polyline>
+      </svg>
+      Channels
     </button>
     <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1548,22 +1672,43 @@ function renderBuilder(
   </div>
 
   <div id="createListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
-    <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
-      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Create List</h2>
-      
-      <div style="margin-top: 16px;">
-        <input type="text" id="createListModalName" placeholder="List name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;" oninput="document.getElementById('createListModalBtn').disabled = !this.value.trim(); document.getElementById('createListModalBtn').style.opacity = this.value.trim() ? '1' : '0.5';">
+    <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
+        <button type="button" class="modal-close-x" onclick="document.getElementById('createListModal').style.display = 'none';">&#x2715;</button>
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Destination</label>
+        <select id="createListModalDestination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
+          <option value="custom">Custom List</option>
+          <option value="trakt">Trakt List</option>
+          <option value="tmdb">TMDB List</option>
+          <option value="mdblist">MDBList List</option>
+          <option value="simkl">Simkl List</option>
+        </select>
       </div>
       
-      <div style="margin-top: 14px;">
-        <select id="createListModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;">
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">List Name *</label>
+        <input type="text" id="createListModalName" placeholder="e.g. My Favorite Sci-Fi" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" oninput="document.getElementById('createListModalBtn').disabled = !this.value.trim(); document.getElementById('createListModalBtn').style.opacity = this.value.trim() ? '1' : '0.5';">
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Description (Optional)</label>
+        <textarea id="createListModalDesc" placeholder="Brief summary of what is in this list..." rows="2" style="width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.9rem; resize:vertical; font-family:inherit;"></textarea>
+      </div>
+      
+      <div style="margin-bottom: 14px;">
+        <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Content Type</label>
+        <select id="createListModalType" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
           <option value="mixed">Mixed (Movies &amp; Shows)</option>
         </select>
       </div>
       
-      <div style="margin-top: 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+      <div id="createListModalPublicWrap" style="margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center;">
         <span style="font-size: 0.95rem; font-weight:500; color: var(--text);">Public</span>
         <label class="ui-toggle">
           <input type="checkbox" id="createListModalPublic" checked>
@@ -1571,20 +1716,20 @@ function renderBuilder(
         </label>
       </div>
       
-      <div style="display: flex; justify-content: flex-end; gap: 20px;">
-        <button type="button" style="background:none; border:none; color:var(--text); font-weight:600; font-size:1rem; cursor:pointer;" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
-        <button type="button" id="createListModalBtn" style="background:none; border:none; color:var(--accent); font-weight:600; font-size:1rem; cursor:pointer; opacity: 0.5;" disabled onclick="submitCreateListModal()">Create</button>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
+        <button type="button" class="lc-btn primary" id="createListModalBtn" style="opacity: 0.5; min-width: 80px;" disabled onclick="submitCreateListModal()">Create</button>
       </div>
     </div>
   </div>
 
-  <!-- Add Shelf Modal -->
+  <!-- Add Catalog Modal -->
   <div id="addShelfModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
-      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Shelf</h2>
+      <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
       <div style="margin: 16px 0;">
-        <input type="text" id="addShelfModalName" placeholder="Shelf name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" oninput="validateAddShelfModal()">
+        <input type="text" id="addShelfModalName" placeholder="Catalog name" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" oninput="validateAddShelfModal()">
         
         <div id="addShelfModalLinksContainer">
           <div class="add-shelf-link-row" style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
@@ -1607,17 +1752,50 @@ function renderBuilder(
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
-    <div class="modal-card" style="width: 100%; max-width: 440px; padding: 22px; background: #fff; border-radius: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); display: flex; flex-direction: column; max-height: 90vh;">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-        <h2 style="margin-top:0; color:#001f3f;">Lists</h2>
-        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">\u2715</button>
+  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+    <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
+        <div>
+          <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Add / Remove from Lists</h2>
+          <p style="margin:4px 0 0; font-size:0.85rem; color:var(--muted);">Check to add, uncheck to remove.</p>
+        </div>
+        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">&#x2715;</button>
       </div>
-      <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 40vh; overflow-y: auto; margin-bottom: 24px;">
+      <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 55vh; overflow-y: auto; margin-bottom: 18px; padding-right: 4px;">
         <!-- Filled dynamically -->
       </div>
-      <div style="display: flex; justify-content: flex-end;">
-        <button type="button" id="addSelectedListsBtn" style="background: transparent; color: #003366; font-weight: 600; border: none; padding: 8px 16px; font-size: 1rem; cursor: pointer;">Done</button>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="document.getElementById('selectListModal').style.display = 'none'; document.body.style.overflow = '';">Cancel</button>
+        <button type="button" class="lc-btn primary" id="addSelectedListsBtn" style="min-width: 90px;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trakt Device Activation Modal -->
+  <div id="traktDeviceModal" class="modal-overlay" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+    <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
+        <button type="button" class="modal-close-x" onclick="closeTraktDeviceModal()">&#x2715;</button>
+      </div>
+      <p style="margin: 0 0 16px; color: var(--muted); font-size: 0.9rem;">To authorize your Trakt account without redirects or rate limits, enter the code below on Trakt:</p>
+      
+      <div id="traktDeviceCodeBox" style="background: var(--panel-strong); border: 2px dashed var(--accent); border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+        <div id="traktDeviceUserCode" style="font-size: 2rem; font-weight: 800; letter-spacing: 4px; color: var(--accent); font-family: monospace;">LOADING...</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px;">
+        <a id="traktDeviceActivateLink" href="https://trakt.tv/activate" target="_blank" rel="noopener noreferrer" class="lc-btn primary" style="padding: 12px; font-weight: 700; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+          Open trakt.tv/activate &#x2197;
+        </a>
+      </div>
+
+      <div id="traktDevicePollingStatus" style="font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 8px;">
+        Waiting for authorization on Trakt...
+      </div>
+
+      <div style="margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <button type="button" class="lc-btn secondary" style="width: 100%;" onclick="closeTraktDeviceModal()">Cancel</button>
       </div>
     </div>
   </div>
@@ -1633,6 +1811,7 @@ window._CHARTS_SIMKL_ANIME = ${JSON.stringify(SIMKL_ANIME_LIST)};
 window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
 window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
 window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
+window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }

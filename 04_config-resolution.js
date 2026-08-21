@@ -14,6 +14,8 @@ async function resolveConfig(configParam, env) {
           traktKey: parsed.traktKey || "",
           traktUsername: parsed.traktUsername || "",
           traktAccessToken: parsed.traktAccessToken || "",
+          simklKey: parsed.simklKey || "",
+          simklAccessToken: parsed.simklAccessToken || "",
           track: !!parsed.track,
           trackCreatorName: parsed.trackCreatorName || "",
           trackCreatorKey: parsed.trackCreatorKey || "",
@@ -118,8 +120,10 @@ function detectSource(input) {
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
+  if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
+  if (s.startsWith("simkl:user:")) return "simkl-user";
   if (s.startsWith("channel:v1:")) return "channel";
   if (s.startsWith("customlist:v1:")) return "custom-list";
   if (s.startsWith("autotrack:")) return "autotrack";
@@ -224,17 +228,11 @@ async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
       "Content-Type": "application/json",
       "trakt-api-version": "2",
       "trakt-api-key": traktKey || TRAKT_CLIENT_ID,
-      "User-Agent": "my-list-addon/1.12",
+      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
     };
     if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-    const res = await fetch(src, {
+    const res = await fetchTraktWithRetry(src, {
       headers,
-      // List composition virtually never changes once a list is public, so
-      // this is cached hard and shared across every search that surfaces
-      // the same list -- but never for an authenticated (private-list)
-      // request, since Cloudflare's cache key ignores headers and would
-      // otherwise risk serving one person's private list classification
-      // back to an unrelated, unauthenticated request for the same URL.
       cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 86400, cacheEverything: true },
     });
     if (!res.ok) return "unknown";
@@ -260,26 +258,16 @@ async function searchTraktLists(query, traktKeyOverride) {
   }
 
   const src = `https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=20`;
-  const res = await fetch(src, {
+  const res = await fetchTraktWithRetry(src, {
     headers: {
       "Content-Type": "application/json",
       "trakt-api-version": "2",
       "trakt-api-key": traktKey,
-      "User-Agent": "my-list-addon/1.6",
+      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
     },
     cf: { cacheTtl: 900, cacheEverything: true },
   });
   if (!res.ok) {
-    // Trakt's API uses 403 specifically to mean "invalid API key or
-    // unapproved app" (their own client libraries document this exact
-    // mapping) -- distinct from a 401 (malformed key) or 429 (rate
-    // limited). If TRAKT_CLIENT_ID starts failing with this code, the
-    // request itself isn't the problem: the API application behind that
-    // Client ID needs checking at https://trakt.tv/oauth/applications
-    // (revoked/expired/needs re-approval), or a fresh one created there --
-    // or the person searching can supply their own Client ID (see the
-    // Trakt API key box in the builder) to bypass this add-on's credential
-    // entirely.
     if (res.status === 403) {
       throw new Error(
         traktKeyOverride
@@ -288,6 +276,9 @@ async function searchTraktLists(query, traktKeyOverride) {
             "This isn't fixable from a search query -- either the Worker owner needs to check the app behind TRAKT_CLIENT_ID at https://trakt.tv/oauth/applications, or you can enter your own Trakt Client ID in the box above to bypass it."
       );
     }
+    if (res.status === 429) {
+      throw new Error("Trakt is temporarily busy (rate limit). Please wait a few seconds and try again.");
+    }
     throw new Error(`Trakt list search failed (HTTP ${res.status}).`);
   }
 
@@ -295,22 +286,23 @@ async function searchTraktLists(query, traktKeyOverride) {
   const lists = (Array.isArray(data) ? data : [])
     .map((r) => r.list)
     .filter((l) => l && l.ids && l.ids.slug && l.user && l.user.ids && l.user.ids.slug)
-    .map((l) => ({
-      name: l.name,
-      user: l.user.username || l.user.ids.slug,
-      slug: l.ids.slug,
-      items: l.item_count || 0,
-      likes: l.likes || 0,
-      url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
-        l.ids.slug
-      )}`,
-    }));
+    .map((l) => {
+      const name = l.name || "";
+      const isMovie = /\bmovie(s)?\b/i.test(name);
+      const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+      const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+      return {
+        name: l.name,
+        user: l.user.username || l.user.ids.slug,
+        slug: l.ids.slug,
+        items: l.item_count || 0,
+        likes: l.likes || 0,
+        contentType,
+        url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
+          l.ids.slug
+        )}`,
+      };
+    });
 
-  // Classify each result's actual content type (movie/series/mixed) so the
-  // builder can offer just the relevant Add button instead of defaulting
-  // to both -- throttled to stay well under Trakt's connection limits.
-  return mapWithConcurrency(lists, 8, async (l) => ({
-    ...l,
-    contentType: await classifyTraktListContentType(l.user, l.slug, traktKey),
-  }));
+  return lists;
 }

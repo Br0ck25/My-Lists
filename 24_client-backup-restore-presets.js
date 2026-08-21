@@ -21,6 +21,9 @@ function exportConfigJson() {
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
   document.getElementById('configJsonBox').value = JSON.stringify(payload, null, 2);
 }
 
@@ -79,6 +82,12 @@ function applyImportedConfig(data) {
     traktAccessToken = data.traktAccessToken;
     renderTraktConnectStatus();
   }
+  if (data.simklKey) document.getElementById('simklKeyInput').value = data.simklKey;
+  if (data.simklAccessToken) {
+    simklAccessToken = data.simklAccessToken;
+    if (data.simklUsername) simklUsername = data.simklUsername;
+    if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+  }
   renumber();
   checkAllDuplicateUrls();
   saveState();
@@ -86,6 +95,7 @@ function applyImportedConfig(data) {
   if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
   scheduleMyMdblistListsRefresh();
   scheduleMyTraktListsRefresh();
+  if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
   alert('Imported ' + data.entries.length + ' list(s).');
 }
 
@@ -105,7 +115,7 @@ async function importFromLink() {
     alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
     return;
   }
-  const cleaned = raw.replace(/^stremio:\\/\\//, 'https://').replace(/^wako:\\/\\//, 'https://');
+  const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
   const m = cleaned.match(/\\/([^/]+)\\/(?:manifest\\.json|configure)(?:[/?#]|$)/);
   let config = null;
   if (m) {
@@ -344,12 +354,28 @@ function sharePreset(name) {
 }
 
 function deletePreset(name) {
-  if (!confirm('Delete preset "' + name + '"?')) return;
-  const map = loadPresetsMap();
-  delete map[name];
-  savePresetsMap(map);
-  renderPresetsList();
-  schedulePresetsSync();
+  const performDelete = () => {
+    const map = loadPresetsMap();
+    delete map[name];
+    savePresetsMap(map);
+    renderPresetsList();
+    schedulePresetsSync();
+    showAddedToast('Deleted preset "' + name + '".');
+  };
+
+  if (typeof showAppConfirm === 'function') {
+    showAppConfirm(
+      'Delete Preset',
+      'Delete preset "' + name + '"? This will permanently remove this preset.',
+      'Delete Preset',
+      performDelete,
+      true
+    );
+  } else {
+    if (confirm('Delete preset "' + name + '"?')) {
+      performDelete();
+    }
+  }
 }
 
 // --- file download/upload (Backup/Restore and My Presets) -------------------
@@ -403,10 +429,17 @@ function downloadConfigJson() {
   }
   const keys = collectKeys();
   const payload = { entries };
+  if (keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
+  if (keys.tmdbSessionId) payload.tmdbSessionId = keys.tmdbSessionId;
+  if (keys.tmdbAccountId) payload.tmdbAccountId = keys.tmdbAccountId;
+  if (keys.tmdbUsername) payload.tmdbUsername = keys.tmdbUsername;
   if (keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
   downloadJsonFile('my-lists-config.json', payload);
 }
 
@@ -484,6 +517,12 @@ function copyLink(url) {
   }).catch(() => alert(url));
 }
 
+function openInNuvio(installUrl, e) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(installUrl).catch(() => {});
+  }
+}
+
 async function generate() {
   const entries = collectEntries();
   if (!entries.length) { alert('Add at least one list.'); return; }
@@ -504,6 +543,7 @@ async function generate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         entries, mdblistKey: keys.mdblistKey, mdblistAccessToken: keys.mdblistAccessToken, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
+        simklKey: keys.simklKey, simklAccessToken: keys.simklAccessToken,
         track: keys.track, trackCreatorName: keys.trackCreatorName, trackCreatorKey: keys.trackCreatorKey,
         shuffleShelves: keys.shuffleShelves, shuffleItems: keys.shuffleItems,
       }),
@@ -527,7 +567,7 @@ async function generate() {
 
   const installUrl = ORIGIN + '/' + config + '/manifest.json';
   const stremioUrl = 'stremio://' + installUrl.replace(/^https?:\\/\\//, '');
-  const wakoUrl = 'wako://' + installUrl.replace(/^https?:\\/\\//, '');
+  const nuvioUrl = 'nuvio://' + installUrl.replace(/^https?:\\/\\//, '');
   // A group breakdown alongside the plain install-count beacon -- each
   // row's own .group ("MDBList Charts", "Custom Lists", "Channels", etc.)
   // is already a meaningful "what kind of source is this" label, no need
@@ -553,9 +593,9 @@ async function generate() {
     <div class="actions">
       <button class="btn-copy secondary" id="copyBtn" onclick="copyLink('\${installUrl}')">Copy link</button>
       <a class="btn-stremio" href="\${stremioUrl}">Open in Stremio</a>
-      <a class="btn-wako" href="\${wakoUrl}">Open in wako</a>
+      <a class="btn-nuvio" href="\${nuvioUrl}" onclick="openInNuvio('\${installUrl}', event)">Open in Nuvio</a>
     </div>
-    <p class="hint"><small>If "Open in wako" doesn't do anything on your device, wako may not register a URL scheme yet &mdash; copy the link instead and paste it into wako &rarr; Settings &gt; Extensions &gt; Install an add-on.</small></p>\`;
+    <p class="hint"><small>If "Open in Nuvio" doesn't automatically open on your device, the manifest link was copied &mdash; paste it in Nuvio &rarr; Settings &gt; Content & Discovery &gt; Addons.</small></p>\`;
   // The mobile sticky CTA bar can be tapped from anywhere on a long page of
   // rows, so bring the result into view rather than leaving it rendered
   // off-screen above the fold the person's currently scrolled past.
@@ -590,31 +630,56 @@ if (serverEntries.length) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
   }
   if (saved && saved.keys && saved.keys.mdblistKey) {
-    document.getElementById('mdblistKeyInput').value = saved.keys.mdblistKey;
+    const el = document.getElementById('mdblistKeyInput');
+    if (el) el.value = saved.keys.mdblistKey;
   }
   if (saved && saved.keys && saved.keys.mdblistAccessToken) {
     mdblistAccessToken = saved.keys.mdblistAccessToken;
   }
   if (saved && saved.keys && saved.keys.traktKey) {
-    document.getElementById('traktKeyInput').value = saved.keys.traktKey;
+    const el = document.getElementById('traktKeyInput');
+    if (el) el.value = saved.keys.traktKey;
   }
   if (saved && saved.keys && saved.keys.traktUsername) {
-    document.getElementById('traktUsernameInput').value = saved.keys.traktUsername;
+    const el = document.getElementById('traktUsernameInput');
+    if (el) el.value = saved.keys.traktUsername;
   }
   if (saved && saved.keys && saved.keys.traktAccessToken) {
     traktAccessToken = saved.keys.traktAccessToken;
+  }
+  if (saved && saved.keys && saved.keys.simklKey) {
+    const el = document.getElementById('simklKeyInput');
+    if (el) el.value = saved.keys.simklKey;
+  }
+  if (saved && saved.keys && saved.keys.simklAccessToken) {
+    simklAccessToken = saved.keys.simklAccessToken;
+  }
+  if (saved && saved.keys && saved.keys.simklUsername) {
+    simklUsername = saved.keys.simklUsername;
   }
 }
 if (!mdblistAccessToken) {
   const savedForMdblist = loadSavedState();
   if (savedForMdblist && savedForMdblist.keys && savedForMdblist.keys.mdblistAccessToken) {
     mdblistAccessToken = savedForMdblist.keys.mdblistAccessToken;
+  } else {
+    try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
 }
 if (!traktAccessToken) {
   const savedForTrakt = loadSavedState();
   if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
     traktAccessToken = savedForTrakt.keys.traktAccessToken;
+  } else {
+    try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+  }
+}
+if (!simklAccessToken) {
+  const savedForSimkl = loadSavedState();
+  if (savedForSimkl && savedForSimkl.keys && savedForSimkl.keys.simklAccessToken) {
+    simklAccessToken = savedForSimkl.keys.simklAccessToken;
+  } else {
+    try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
 }
 suppressSave = false;
@@ -634,6 +699,9 @@ renderTraktConnectStatus();
 if (typeof pickUpTmdbTokenFromUrl === 'function') pickUpTmdbTokenFromUrl();
 if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
 if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+if (typeof pickUpSimklTokenFromUrl === 'function') pickUpSimklTokenFromUrl();
+if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
 if (typeof populateImportTargetLists === 'function') populateImportTargetLists();
 document.querySelectorAll('details.panel.collapsible').forEach((d) => {
   d.addEventListener('toggle', scheduleCreatorSyncSave);

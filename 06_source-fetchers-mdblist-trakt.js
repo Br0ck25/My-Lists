@@ -267,10 +267,11 @@ function mapTraktItems(data, type) {
 // the page length — this only lines up cleanly if skip always arrives as a
 // multiple of PAGE_SIZE, which is how wako/Stremio drive the `skip` extra.
 // Every request — public or private — needs a Client ID; there's no
-// keyless public feed the way mdblist.com has one. A private list
-// additionally needs accessToken (the OAuth token from "Connect Trakt" --
-// see /api/trakt/oauth/* below), sent as a Bearer token alongside the
-// Client ID.
+// Dispatches to the right backend based on what kind of URL was pasted in.
+// `keys` is { mdblistKey, traktKey } — per-user keys decoded from their
+// install link, if any. A key the user didn't supply falls back to the
+// Worker-wide MDBLIST_API_KEY/TRAKT_CLIENT_ID constants at the top of the
+// file.
 async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!traktKey) {
     throw new Error(
@@ -299,40 +300,40 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
   };
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
-  const res = await fetch(src, {
-    headers,
-    // A Bearer-authenticated request must never be edge-cached the same
-    // way a public one is: Cloudflare's default cache key is the URL
-    // alone and ignores headers, so caching this could serve one person's
-    // private list response back to a completely different, unauthenticated
-    // request for that same URL path later. Only cache when there's no
-    // token attached (a genuinely public request).
-    cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 900, cacheEverything: true },
-  });
-  if (!res.ok) {
-    const hint =
-      res.status === 404
-        ? accessToken
-          ? " If this is a private list, make sure you're connected as its owner (see Connect Trakt in Settings)."
-          : " Double-check the list URL and that the list is public."
-        : res.status === 401 || res.status === 403
-        ? accessToken
-          ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-          : " Double-check your Trakt Client ID."
-        : "";
-    throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
-  }
+  const userHash = accessToken ? safeUserHash(accessToken, parsed.user) : "public";
+  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${skip}:${userHash}`;
 
-  const data = await res.json();
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: accessToken ? 60 : 300,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt List",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers,
+        cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 900, cacheEverything: true },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 404
+            ? accessToken
+              ? " If this is a private list, make sure you're connected as its owner (see Connect Trakt in Settings)."
+              : " Double-check the list URL and that the list is public."
+            : res.status === 401 || res.status === 403
+            ? accessToken
+              ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+              : " Double-check your Trakt Client ID."
+            : "";
+        throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
+  });
+
   return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
-// Pulls the connected account's Trakt watchlist -- a genuinely different
-// endpoint from a Trakt list (Trakt treats "the watchlist" as its own
-// separate thing, never returned alongside /users/me/lists, see
-// /api/trakt-my-private-lists below where it's fetched and prepended
-// separately). Always needs the OAuth access token from Connect Trakt --
-// unlike a list, a watchlist has no public/unauthenticated form at all.
+// Pulls the connected account's Trakt watchlist
 async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!accessToken) {
     throw new Error(
@@ -347,44 +348,43 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
   const itemKind = entry.type === "series" ? "shows" : "movies";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/me/watchlist/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
-  const res = await fetch(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    // Always authenticated/per-person -- never cached, same reasoning as
-    // fetchTrakt above (a shared cache key would risk leaking one
-    // person's watchlist into a different, unrelated request).
-    cf: { cacheTtl: 0, cacheEverything: false },
+
+  const userHash = safeUserHash(accessToken);
+  const cacheKey = `user_cache:trakt:watchlist:${itemKind}:${skip}:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt Watchlist",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers: {
+          "Content-Type": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": traktKey,
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403
+            ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : "";
+        throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
   });
-  if (!res.ok) {
-    const hint =
-      res.status === 401 || res.status === 403
-        ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-        : "";
-    throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
-  }
-  const data = await res.json();
+
   return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
 // History's shape is different from a plain list/watchlist -- each row is
 // { watched_at, action, movie } or { watched_at, action, episode, show }
 // instead of the { movie } / { show } wrapper mapTraktItems expects.
-// Movies map basically like any other Trakt item. TV history is logged
-// per-episode by Trakt (there's no per-episode imdb id), so each row keeps
-// the show's own imdb id -- same as any other series tile, so it opens the
-// real show normally -- with the season/episode/watched date folded into
-// the title so a watch event still reads as its own row even when several
-// share that id. James wants every watch event shown (rewatches included),
-// so this deliberately doesn't dedupe -- the same show/episode can appear
-// more than once, same id and all. Known tradeoff: a few Stremio/wako
-// clients key catalog rows by id for rendering, so a show watched several
-// times in a row could in principle render oddly there; left as-is since
-// collapsing to one row per title was explicitly not what was wanted here.
 function mapTraktHistoryItems(data, type) {
   const items = Array.isArray(data) ? data : [];
   const watchedLabel = (watchedAt) => {
@@ -404,12 +404,6 @@ function mapTraktHistoryItems(data, type) {
           id: imdbId,
           type,
           name: `${it.show.title} S${s}E${e}${epTitle}`,
-          // Plain show title, kept alongside the folded per-episode `name`
-          // above -- lets a caller that wants "one tile per show" (Copy to
-          // Custom List's Shows mode, see copyListToCustomList) recover
-          // the clean title without having to string-parse it back out of
-          // "Show S1E5 \u2014 Episode Title". Not used by the live catalog
-          // row itself (Stremio/wako only ever see `name`).
           showTitle: it.show.title,
           poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
           releaseInfo: watchedLabel(it.watched_at),
@@ -427,12 +421,7 @@ function mapTraktHistoryItems(data, type) {
     }));
 }
 
-// Pulls the connected account's Trakt watch history -- a chronological log
-// of every watch event, as opposed to fetchTraktWatchlist (queued-to-watch)
-// or fetchTrakt (a saved list). Rewatches show up as separate entries here
-// since Trakt logs a fresh row every time something's marked watched.
-// Always needs the OAuth access token from Connect Trakt -- same as the
-// watchlist, there's no public/unauthenticated form of a personal history.
+// Pulls the connected account's Trakt watch history
 async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "") {
   if (!accessToken) {
     throw new Error(
@@ -444,32 +433,40 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
       "Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
     );
   }
-  // Movies use Trakt's /history/movies; shows use /history/episodes (Trakt
-  // logs individual episode watches, not whole shows -- see
-  // mapTraktHistoryItems for how that's folded back into a series tile).
   const itemKind = entry.type === "series" ? "episodes" : "movies";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/me/history/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
-  const res = await fetch(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    // Always authenticated/per-person -- never cached, same reasoning as
-    // fetchTraktWatchlist above.
-    cf: { cacheTtl: 0, cacheEverything: false },
+
+  const userHash = safeUserHash(accessToken);
+  const cacheKey = `user_cache:trakt:history:${itemKind}:${skip}:${userHash}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 60,
+    staleTtlSec: 1800,
+    providerLabel: "Trakt History",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers: {
+          "Content-Type": "application/json",
+          "trakt-api-version": "2",
+          "trakt-api-key": traktKey,
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403
+            ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : "";
+        throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    }
   });
-  if (!res.ok) {
-    const hint =
-      res.status === 401 || res.status === 403
-        ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
-        : "";
-    throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
-  }
-  const data = await res.json();
+
   return enrichTrailers(mapTraktHistoryItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 

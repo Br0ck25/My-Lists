@@ -8,6 +8,7 @@
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('curated', this)">Curated</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
     <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('kids', this)">Kids</button>
+    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
   </div>
 
   <!-- Discover Shelves Feed -->
@@ -38,6 +39,9 @@
 
     <!-- Kids Shelf -->
     ${kidsHtml}
+
+    <!-- Holidays Shelf -->
+    ${holidaysHtml}
   </div>
 
   <!-- Discover Lists Feed (Movies / Shows list view matching search) -->

@@ -237,7 +237,7 @@ function buildMdblistChartsHtml() {
 // row; entry.type (set by which button was clicked) picks the right side
 // of that chart's path map at fetch time.
 const TMDB_CHART_LISTS = [
-  { name: "New Releases (Last 30 Days)", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_shows" },
+  { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_shows" },
   { name: "TMDB Trending", movieUrl: "tmdb:chart:trending", showUrl: "tmdb:chart:trending" },
   { name: "TMDB Popular", movieUrl: "tmdb:chart:popular", showUrl: "tmdb:chart:popular" },
   { name: "TMDB Top Rated", movieUrl: "tmdb:chart:top_rated", showUrl: "tmdb:chart:top_rated" },
@@ -457,6 +457,19 @@ function buildKidsHtml() {
   return buildStreamingRowsHtml(KIDS_LISTS, "", "Kids");
 }
 
+const HOLIDAY_LISTS = [
+  { name: "Christmas", movieUrl: "tmdb:holiday:christmas", showUrl: "tmdb:holiday:christmas" },
+  { name: "Easter", movieUrl: "tmdb:holiday:easter", showUrl: "tmdb:holiday:easter" },
+  { name: "Fourth of July", movieUrl: "tmdb:holiday:july4", showUrl: "tmdb:holiday:july4" },
+  { name: "Halloween", movieUrl: "tmdb:holiday:halloween", showUrl: "tmdb:holiday:halloween" },
+  { name: "New Year’s Eve", movieUrl: "tmdb:holiday:newyear", showUrl: "tmdb:holiday:newyear" },
+  { name: "Thanksgiving", movieUrl: "tmdb:holiday:thanksgiving", showUrl: "tmdb:holiday:thanksgiving" },
+  { name: "Valentine’s Day", movieUrl: "tmdb:holiday:valentine", showUrl: "tmdb:holiday:valentine" },
+];
+function buildHolidaysHtml() {
+  return buildStreamingRowsHtml(HOLIDAY_LISTS, "", "Holidays");
+}
+
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
 //
 // "TMDB Trending" -> "TMDB-Trending" -- title case preserved, everything
@@ -498,6 +511,7 @@ const CHART_SLUG_ENTRIES = (() => {
     ...STREAMING_ALL,
     ...HIDDEN_GEMS_LIST,
     ...KIDS_LISTS,
+    ...HOLIDAY_LISTS,
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));

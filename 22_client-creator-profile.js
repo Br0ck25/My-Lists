@@ -580,6 +580,38 @@ function schedulePresetsSync() {
   presetsSyncTimer = setTimeout(() => { pushPresetsDirectly(loadPresetsMap()); }, 1200);
 }
 
+// Debounced sibling of scheduleCreatorSyncSave, just for TV Channels --
+// syncs the user's saved local channels to the server so they roam across
+// browsers seamlessly when signed in.
+let channelsSyncTimer = null;
+function scheduleChannelsSync() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (channelsSyncTimer) clearTimeout(channelsSyncTimer);
+  channelsSyncTimer = setTimeout(pushChannelsSync, 1200);
+}
+
+async function pushChannelsSync() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  try {
+    const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+    await fetch(ORIGIN + '/api/creator/sync/save-channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        channels: localChannels,
+        mergedChannels: localMerged,
+      }),
+    });
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
 // Debounced sibling of scheduleCreatorSyncSave, just for Watch History/
 // Continue Watching tracking data -- split out for the same reason
 // presets were: watchHistory in particular can grow into the thousands of
@@ -681,6 +713,11 @@ async function loadCreatorSync() {
       pushCreatorSync();
       const localPresets = loadPresetsMap();
       if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
+      const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+      const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+      if ((localChannels && Object.keys(localChannels).length) || (localMerged && Object.keys(localMerged).length)) {
+        pushChannelsSync();
+      }
       pushTrackingSync();
       return;
     }
@@ -692,7 +729,19 @@ async function loadCreatorSync() {
     }
     renumber();
     suppressSave = false;
-    renderChannelMergeList();
+    
+    if (synced.channels && typeof synced.channels === 'object') {
+      if (typeof saveLocalChannelsMap === 'function') {
+        saveLocalChannelsMap(synced.channels);
+      }
+    }
+    if (synced.mergedChannels && typeof synced.mergedChannels === 'object') {
+      if (typeof saveLocalMergedChannelsMap === 'function') {
+        saveLocalMergedChannelsMap(synced.mergedChannels);
+      }
+    }
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
     
     if (synced.presetsB64) {
       decompressBase64ToJson(synced.presetsB64).then(parsedPresets => {
@@ -746,6 +795,11 @@ async function loadCreatorSync() {
         if (synced.keys.mdblistAccessToken) {
           localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
           window.mdblistAccessToken = synced.keys.mdblistAccessToken;
+          mdblistAccessToken = synced.keys.mdblistAccessToken;
+        }
+        if (synced.keys.mdblistUsername) {
+          localStorage.setItem('myListAddon:mdblistUsername', synced.keys.mdblistUsername);
+          window.mdblistUsername = synced.keys.mdblistUsername;
         }
         if (synced.keys.traktKey) {
           localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
@@ -760,11 +814,27 @@ async function loadCreatorSync() {
         if (synced.keys.traktAccessToken) {
           localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
           window.traktAccessToken = synced.keys.traktAccessToken;
+          traktAccessToken = synced.keys.traktAccessToken;
+        }
+        if (synced.keys.simklKey) {
+          localStorage.setItem('myListAddon:simklKey', synced.keys.simklKey);
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = synced.keys.simklKey;
+        }
+        if (synced.keys.simklAccessToken) {
+          localStorage.setItem('myListAddon:simklAccessToken', synced.keys.simklAccessToken);
+          window.simklAccessToken = synced.keys.simklAccessToken;
+          simklAccessToken = synced.keys.simklAccessToken;
+        }
+        if (synced.keys.simklUsername) {
+          localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
+          window.simklUsername = synced.keys.simklUsername;
         }
         if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
         if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
         if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
         if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
+        if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
       } catch (e) {}
     }
 
@@ -1779,7 +1849,8 @@ function editCreatorList(slug) {
   editingCreatorListSlug = slug;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  const stEl1 = document.getElementById('customListSearchType');
+  if (stEl1) stEl1.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   const visSelect = document.getElementById('customListVisibilitySelect');
   if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
@@ -1814,7 +1885,8 @@ function editLocalCustomList(slug) {
   editingCreatorListSlug = null;
   editingCustomListUrlInput = null;
   document.getElementById('customListNameInput').value = listMeta.name;
-  document.getElementById('customListSearchType').value = customListDraftType === 'series' ? 'tv' : 'movie';
+  const stEl2 = document.getElementById('customListSearchType');
+  if (stEl2) stEl2.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
@@ -1924,13 +1996,41 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
-function openCreateListModal() {
+function openCreateListModal(presetDestination) {
+  const destEl = document.getElementById('createListModalDestination');
+  if (destEl) {
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+
+    let optsHtml = '<option value="custom">Custom List (Local / Creator)</option>';
+    if (traktToken) optsHtml += '<option value="trakt">Trakt List</option>';
+    if (tmdbSess || tmdbAcc) optsHtml += '<option value="tmdb">TMDB List</option>';
+    if (mdbToken || mdbKey) optsHtml += '<option value="mdblist">MDBList List</option>';
+    if (simklToken) optsHtml += '<option value="simkl">Simkl List</option>';
+    destEl.innerHTML = optsHtml;
+
+    if (presetDestination && destEl.querySelector('option[value="' + presetDestination + '"]')) {
+      destEl.value = presetDestination;
+    } else {
+      destEl.value = 'custom';
+    }
+  }
+
   const nameEl = document.getElementById('createListModalName');
   if (nameEl) nameEl.value = '';
+  const descEl = document.getElementById('createListModalDesc');
+  if (descEl) descEl.value = '';
   const typeEl = document.getElementById('createListModalType');
   if (typeEl) typeEl.value = 'movie';
   const pubEl = document.getElementById('createListModalPublic');
   if (pubEl) pubEl.checked = true;
+  
+  if (typeof onChangeCreateListDestination === 'function') onChangeCreateListDestination();
+
   const btn = document.getElementById('createListModalBtn');
   if (btn) {
     btn.disabled = true;
@@ -1939,12 +2039,23 @@ function openCreateListModal() {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (nameEl) nameEl.focus();
+}
+
+function onChangeCreateListDestination() {
+  const pubWrap = document.getElementById('createListModalPublicWrap');
+  if (pubWrap) {
+    pubWrap.style.display = 'flex';
+  }
 }
 
 async function submitCreateListModal() {
   const name = document.getElementById('createListModalName').value.trim();
   if (!name) return;
-  const isPublic = document.getElementById('createListModalPublic').checked;
+  const desc = document.getElementById('createListModalDesc') ? document.getElementById('createListModalDesc').value.trim() : '';
+  const destEl = document.getElementById('createListModalDestination');
+  const dest = destEl ? destEl.value : 'custom';
+  const isPublic = document.getElementById('createListModalPublic') ? document.getElementById('createListModalPublic').checked : true;
   const visibility = isPublic ? 'public' : 'private';
   const typeEl = document.getElementById('createListModalType');
   const type = typeEl ? typeEl.value : 'movie';
@@ -1953,20 +2064,34 @@ async function submitCreateListModal() {
   let initialItems = [];
   
   const btn = document.getElementById('createListModalBtn');
-  btn.innerText = 'Saving...';
+  btn.innerText = 'Creating...';
   btn.disabled = true;
-  
+
   try {
+    let finalImdbId = '';
+    let cleanTmdbId = '';
     if (currentPendingItem && currentPendingItem.title) {
-      let finalImdbId = currentPendingItem.id;
+      finalImdbId = currentPendingItem.id;
       if (finalImdbId && !String(finalImdbId).startsWith('tt')) {
+        cleanTmdbId = String(finalImdbId).replace(/^tmdb:/, '');
         const endpoint = currentPendingItem.type === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
         try {
-          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(finalImdbId));
+          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanTmdbId));
           const data = await res.json();
           if (data.ok && data.imdbId) finalImdbId = data.imdbId;
         } catch(e) {}
+      } else if (finalImdbId && String(finalImdbId).startsWith('tt')) {
+        const apiKeyTmdb = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+        if (apiKeyTmdb) {
+          try {
+            const findRes = await fetch('https://api.themoviedb.org/3/find/' + encodeURIComponent(finalImdbId) + '?api_key=' + encodeURIComponent(apiKeyTmdb) + '&external_source=imdb_id');
+            const findData = await findRes.json();
+            const hit = (findData.movie_results && findData.movie_results[0]) || (findData.tv_results && findData.tv_results[0]);
+            if (hit && hit.id) cleanTmdbId = String(hit.id);
+          } catch(e) {}
+        }
       }
+
       initialItems.push({
         imdbId: finalImdbId || currentPendingItem.id,
         type: currentPendingItem.type || (type === 'series' ? 'series' : 'movie'),
@@ -1975,67 +2100,149 @@ async function submitCreateListModal() {
       });
     }
 
-    const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
-    const newUrl = 'customlist:v1:' + JSON.stringify(payload);
-
-    if (activeCreator) {
-      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-      const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creatorName: activeCreator.creatorName,
-          creatorKey: creatorKey,
+    if (dest === 'custom') {
+      const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
+      if (activeCreator) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            name: name,
+            type: type,
+            items: initialItems,
+            visibility: visibility
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+          btn.innerText = 'Create';
+          btn.disabled = false;
+          return;
+        }
+        const updatedPayload = Object.assign({}, payload, {
+          listName: name,
+          publishedUrl: visibility === 'public' ? data.url : undefined,
+          creatorSlug: data.slug,
+          creatorOwner: activeCreator.creatorName,
+          visibility: visibility
+        });
+        addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
+      } else {
+        const slug = payload.listId;
+        payload.localSlug = slug;
+        const map = loadLocalCustomLists();
+        map[slug] = {
           name: name,
           type: type,
           items: initialItems,
-          visibility: visibility
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        saveLocalCustomListsMap(map);
+        addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+      }
+    } else {
+      // External Provider Creation (Trakt, TMDB, MDBList)
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+      const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+      const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+      const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+      const res = await fetch(ORIGIN + '/api/external-list/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: dest,
+          name: name,
+          description: desc,
+          privacy: visibility,
+          type: type,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          traktUsername: traktUser,
+          tmdbSessionId: tmdbSess,
+          tmdbKey: tmdbKey,
+          mdblistAccessToken: mdbToken,
+          mdblistKey: mdbKey,
+          mdblistUsername: mdbUser,
+          simklAccessToken: simklToken,
+          simklKey: simklKey
         })
       });
       const data = await res.json();
-      if (!data.ok) {
-        showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+      if (!data.ok || !data.list) {
+        showAppNoticeModal('Could Not Create List', data.error || 'Failed to create list on ' + dest.toUpperCase() + '.', true);
         btn.innerText = 'Create';
         btn.disabled = false;
         return;
       }
-      
-      const updatedPayload = Object.assign({}, payload, {
-        listName: name,
-        publishedUrl: visibility === 'public' ? data.url : undefined,
-        creatorSlug: data.slug,
-        creatorOwner: activeCreator.creatorName,
-        visibility: visibility
-      });
-      addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
-    } else {
-      // Local list
-      const slug = payload.listId;
-      payload.localSlug = slug;
-      
-      const map = loadLocalCustomLists();
-      map[slug] = {
-        name: name,
-        type: type,
-        items: initialItems,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      saveLocalCustomListsMap(map);
-      
-      addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+
+      const createdList = data.list;
+      const groupLabel = dest === 'trakt' ? 'Trakt' : (dest === 'tmdb' ? 'TMDB' : (dest === 'simkl' ? 'Simkl' : 'MDBList'));
+      addRow(name, createdList.url, type, true, groupLabel);
+
+      // If pending item, add it to the newly created list
+      if (currentPendingItem && currentPendingItem.id) {
+        if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
+          const newKey = makeExternalKey(dest, 'custom', createdList.id || createdList.slug, currentPendingItem.id);
+          setExternalListMembership(newKey, true);
+          if (finalImdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, finalImdbId), true);
+          if (cleanTmdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, cleanTmdbId), true);
+        }
+
+        fetch(ORIGIN + '/api/external-list/item-mutate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'add',
+            provider: dest,
+            target: 'custom',
+            listId: createdList.id || createdList.slug,
+            id: currentPendingItem.id,
+            imdbId: finalImdbId,
+            tmdbId: cleanTmdbId,
+            type: currentPendingItem.type || type,
+            title: currentPendingItem.title,
+            poster: currentPendingItem.poster,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            traktUsername: traktUser,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey,
+            simklAccessToken: simklToken,
+            simklKey: simklKey
+          })
+        }).catch(() => {});
+      }
+
+      // Refresh list caches
+      if (dest === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+      if (dest === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+      if (dest === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+      if (dest === 'simkl' && typeof loadMySimklLists === 'function') loadMySimklLists();
     }
-    
+
     saveState();
     document.getElementById('createListModal').style.display = 'none';
-    renderCreatorDashboard();
-    
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+
     if (currentPendingItem && currentPendingItem.title) {
-      showAddedToast('Added "' + currentPendingItem.title + '" to "' + name + '".');
-      if (typeof trackEvent === 'function') trackEvent('list-add', initialItems[0] ? initialItems[0].imdbId : currentPendingItem.id, currentPendingItem.title, currentPendingItem.type);
+      showAddedToast('Created list "' + name + '" and added "' + currentPendingItem.title + '".');
       window._selectListModalCurrentItem = null;
     } else {
-      showAddedToast('Created list "' + name + '".');
+      showAddedToast('Created list "' + name + '" on ' + (dest === 'custom' ? 'Custom Lists' : dest.toUpperCase()) + '.');
       switchTab('lists');
     }
   } catch (err) {
@@ -2044,6 +2251,95 @@ async function submitCreateListModal() {
     btn.innerText = 'Create';
     btn.disabled = false;
   }
+}
+
+function deleteExternalListDirect(provider, listId, listName, btn) {
+  if (!provider || !listId) return;
+  const providerLabel = provider === 'trakt' ? 'Trakt' : (provider === 'tmdb' ? 'TMDB' : (provider === 'mdblist' ? 'MDBList' : provider));
+  
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  
+  confirmFn(
+    'Delete List',
+    'Are you sure you want to permanently delete the list "' + (listName || 'Custom List') + '" from your ' + providerLabel + ' account? This action cannot be undone.',
+    'Delete Permanently',
+    async () => {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Deleting...';
+      }
+
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+      try {
+        const res = await fetch(ORIGIN + '/api/external-list/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: provider,
+            listId: listId,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Delete List', data.error || 'Failed to delete list from ' + providerLabel + '.', true);
+          if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+          return;
+        }
+
+        // Animate card removal if present
+        const card = btn ? btn.closest('.list-card, .creator-list-row') : null;
+        if (card) {
+          card.style.opacity = '0';
+          card.style.transform = 'scale(0.9)';
+          card.style.transition = 'all 0.2s ease';
+          setTimeout(() => { if (card && card.parentNode) card.parentNode.removeChild(card); }, 200);
+        }
+
+        // Remove row entries from #lists
+        let removedFromConfig = false;
+        document.querySelectorAll('#lists .entry').forEach(row => {
+          const u = row.querySelector('.url')?.value || '';
+          if (u && (u.includes(listId) || (provider === 'trakt' && u.includes('/lists/' + listId)))) {
+            row.remove();
+            removedFromConfig = true;
+          }
+        });
+        if (removedFromConfig) {
+          renumber();
+          saveState();
+        }
+
+        // If currently in list-details view of this list, go back
+        const detailsPanel = document.getElementById('content-list-details');
+        if (detailsPanel && !detailsPanel.hidden) {
+          navigateBackFromDetail();
+        }
+
+        // Refresh caches
+        if (provider === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+        if (provider === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+        if (provider === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+
+        showAddedToast('Deleted list "' + (listName || 'List') + '" from ' + providerLabel + '.');
+      } catch (err) {
+        showAppNoticeModal('Network Error', 'A network error occurred while deleting the list. Please check your connection and try again.', true);
+        if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+      }
+    },
+    true
+  );
 }
 
 function removeWatchlistItemDirect(id, btn) {

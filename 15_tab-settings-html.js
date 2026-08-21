@@ -7,7 +7,7 @@
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Auto-Track Playback</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them in Stremio or wako &mdash; from any addon, not just this one. Works by declaring a subtitles resource that Stremio/wako call whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them from any addon, not just this one. Works by declaring a subtitles resource that is called whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
       <div id="trackPlaybackSection"></div>
     </div>
   </div>
@@ -42,6 +42,7 @@
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Trakt account to import your personal lists, watchlist, and collection, or use a custom Client ID.</p>
         <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
           <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()">Connect Trakt Account</button>
+          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()">Connect with PIN / Code</button>
           <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none;" onclick="disconnectTrakt()">Disconnect</button>
         </div>
         <p id="traktConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
@@ -60,7 +61,7 @@
       </div>
 
       <!-- MDBList Section -->
-      <div id="mdblistSection" style="padding-bottom:14px; margin-bottom:14px;">
+      <div id="mdblistSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">MDBList</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your MDBList account to import your personal lists, watchlist, and watch history, or use a custom API key.</p>
         <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
@@ -73,6 +74,24 @@
           <div style="margin-top:8px;">
             <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Simkl Section -->
+      <div id="simklSection" style="padding-bottom:14px; margin-bottom:14px;">
+        <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Simkl</p>
+        <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Simkl account to import your personal lists, watchlist, and history, or use a custom Client ID.</p>
+        <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+          <button type="button" class="secondary" id="simklConnectBtn" onclick="startSimklConnect()">Connect Simkl Account</button>
+          <button type="button" class="secondary" id="simklDisconnectBtn" style="display:none;" onclick="disconnectSimkl()">Disconnect</button>
+        </div>
+        <p id="simklConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
+        <details style="font-size:0.85rem; color:var(--muted);">
+          <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
+          <div style="margin-top:8px;">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
       </div>
