@@ -548,6 +548,9 @@ function collectKeys() {
     simklUsername: simklUser,
     shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
     shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
+    syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
+    syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
+    syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     keys.creatorName = activeCreator.creatorName;
@@ -670,11 +673,24 @@ async function renderLivePreview() {
   await Promise.all(workers);
 }
 
+function handlePosterImgError(img) {
+  if (!img) return;
+  img.onerror = null;
+  const imdb = img.getAttribute('data-imdb') || '';
+  if (img.src.indexOf('images.metahub.space') === -1 && imdb && imdb.startsWith('tt')) {
+    img.src = 'https://images.metahub.space/poster/medium/' + imdb + '/img';
+  } else {
+    img.style.display = 'none';
+    const ph = img.nextElementSibling;
+    if (ph) ph.style.display = 'flex';
+  }
+}
+
 function livePreviewPosterHtml(m) {
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
   const posterEl = m.poster
-    ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy">'
+    ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
   let removeBtn = '';
@@ -692,9 +708,17 @@ function livePreviewPosterHtml(m) {
 
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
   const addOverlay = '<div class="poster-add-overlay" title="Add to Lists">+</div>';
+  let dateBadge = '';
+  if (m.airDate && (m.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: m.airDate })))) {
+    const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : m.airDate;
+    if (badgeText) {
+      dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+    }
+  }
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
+      dateBadge +
       removeBtn +
       addOverlay +
     '</div>' +
@@ -801,6 +825,213 @@ function removeListItemFromDetails(btn) {
   }
 }
 
+window.setWatchHistoryFilter = function(filterType, btn) {
+  window._watchHistoryFilter = filterType || 'all';
+  const filterBar = document.getElementById('detailFilterBar');
+  if (filterBar) {
+    filterBar.querySelectorAll('.wh-filter-pill').forEach((b) => {
+      b.classList.toggle('active', b.dataset.whFilter === window._watchHistoryFilter);
+    });
+  }
+  if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+};
+
+window.setWatchHistorySort = function(sortVal) {
+  window._watchHistorySort = sortVal || 'recent';
+  if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+};
+
+window.toggleWatchHistoryGroupShows = function(checked) {
+  localStorage.setItem('myListAddon:watchHistoryGroupShows', checked ? 'true' : 'false');
+  if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+};
+
+window.renderWatchHistoryGrid = function() {
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const subEl = document.getElementById('detailSubtitle');
+  if (!gridEl) return;
+
+  const rawItems = window._rawWatchHistoryItems || [];
+  if (!rawItems.length) {
+    gridEl.innerHTML = '';
+    if (statusEl) statusEl.innerHTML = '<small>No items in watch history.</small>';
+    if (subEl) subEl.textContent = '0 items';
+    return;
+  }
+
+  const filter = window._watchHistoryFilter || 'all';
+  const sortMode = window._watchHistorySort || 'recent';
+  const groupShows = (localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true');
+
+  let processed = [];
+
+  if (groupShows) {
+    const showMap = new Map();
+    rawItems.forEach((it) => {
+      if (!it) return;
+      const isEp = it.type === 'episode' || !!it.showId;
+      if (isEp) {
+        const showKey = String(it.showId || it.showTitle || it.id);
+        const sId = it.showId || (String(it.id).startsWith('tt') ? it.id : null);
+        let showPosterUrl = it.showPoster || '';
+        if (!showPosterUrl && sId) {
+          showPosterUrl = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(sId) + '/img';
+        }
+        if (!showMap.has(showKey)) {
+          showMap.set(showKey, {
+            id: sId || it.id,
+            type: 'series',
+            name: it.showTitle || it.title || it.name || 'Show',
+            showTitle: it.showTitle || it.title || it.name || 'Show',
+            poster: showPosterUrl,
+            showPoster: showPosterUrl,
+            year: it.year,
+            watchedCount: 0,
+            watchedAt: it.watchedAt || 0,
+            removeShowId: sId || it.id,
+          });
+        }
+        const entry = showMap.get(showKey);
+        entry.watchedCount++;
+        if ((it.watchedAt || 0) > (entry.watchedAt || 0)) {
+          entry.watchedAt = it.watchedAt || 0;
+        }
+        if (!entry.poster && showPosterUrl) {
+          entry.poster = showPosterUrl;
+        }
+      } else {
+        let movPoster = it.poster || it.showPoster || '';
+        if (!movPoster && (it.imdbId || it.id)) {
+          movPoster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(it.imdbId || it.id) + '/img';
+        }
+        processed.push({
+          id: it.imdbId || it.id,
+          type: 'movie',
+          name: it.title || it.name || 'Movie',
+          subtitle: '',
+          poster: movPoster,
+          year: it.year,
+          watchedAt: it.watchedAt || 0,
+          removeHistoryId: it.id || it.imdbId,
+        });
+      }
+    });
+
+    showMap.forEach((entry) => {
+      if (!entry.poster && entry.id) {
+        entry.poster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(entry.id) + '/img';
+      }
+      entry.subtitle = entry.watchedCount + ' episode' + (entry.watchedCount === 1 ? '' : 's') + ' watched';
+      processed.push(entry);
+    });
+  } else {
+    processed = rawItems.map((it) => {
+      const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+      return {
+        id: it.showId || it.imdbId || it.id,
+        type: it.showId ? 'series' : (it.type || 'movie'),
+        name: label.title,
+        subtitle: label.subtitle,
+        poster: it.poster || it.showPoster || '',
+        year: it.year,
+        watchedAt: it.watchedAt || 0,
+        removeHistoryId: it.id || it.imdbId,
+      };
+    });
+  }
+
+  if (filter === 'movie') {
+    processed = processed.filter((it) => it.type === 'movie');
+  } else if (filter === 'series') {
+    processed = processed.filter((it) => it.type === 'series' || it.type === 'episode');
+  }
+
+  if (sortMode === 'recent') {
+    processed.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+  } else if (sortMode === 'oldest') {
+    processed.sort((a, b) => (a.watchedAt || 0) - (b.watchedAt || 0));
+  } else if (sortMode === 'title-asc') {
+    processed.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  } else if (sortMode === 'title-desc') {
+    processed.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
+  }
+
+  gridEl.innerHTML = processed.map(livePreviewPosterHtml).join('');
+  if (subEl) {
+    subEl.textContent = processed.length + ' item' + (processed.length === 1 ? '' : 's');
+  }
+  if (statusEl) {
+    statusEl.innerHTML = processed.length ? '' : '<small>No matching items found.</small>';
+  }
+};
+
+window.switchListDetailsType = function(newType) {
+  if (!window._currentListDetailsParams) return;
+  const p = window._currentListDetailsParams;
+  window._currentListDetailsFilter = newType;
+
+  // Update pill active states
+  const aBtn = document.getElementById('detailTypeAllBtn');
+  const mBtn = document.getElementById('detailTypeMovieBtn');
+  const sBtn = document.getElementById('detailTypeSeriesBtn');
+  if (aBtn) aBtn.classList.toggle('active', newType === 'all');
+  if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
+  if (sBtn) sBtn.classList.toggle('active', newType === 'series');
+
+  // If this is a dual-type chart (separate endpoint for movies vs series)
+  let isDualTypeChart = false;
+  let targetUrl = p.listUrl;
+  let targetName = p.name;
+
+  if (p.listUrl === 'tmdb:chart:new_movies' || p.listUrl === 'tmdb:chart:new_shows') {
+    isDualTypeChart = true;
+    if (newType === 'series') {
+      targetUrl = 'tmdb:chart:new_shows';
+      targetName = 'New Shows';
+    } else if (newType === 'movie') {
+      targetUrl = 'tmdb:chart:new_movies';
+      targetName = 'New Movies';
+    }
+  } else if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
+    const match = CHART_SLUG_ENTRIES.find((e) => e.name === p.name || e.movieUrl === p.listUrl || e.showUrl === p.listUrl);
+    if (match && match.movieUrl && match.showUrl) {
+      isDualTypeChart = true;
+      targetName = match.name || p.name;
+      if (newType === 'series') targetUrl = match.showUrl;
+      else if (newType === 'movie') targetUrl = match.movieUrl;
+    }
+  }
+  if (!isDualTypeChart && p.listUrl && (p.listUrl.startsWith('tmdb:genre:') || p.listUrl.startsWith('tmdb:chart:') || p.listUrl.startsWith('trakt:chart:') || p.listUrl.startsWith('simkl:chart:') || p.listUrl.startsWith('tmdb:kids:') || p.listUrl.startsWith('tmdb:holiday:'))) {
+    isDualTypeChart = true;
+  }
+
+  if (isDualTypeChart && (newType === 'movie' || newType === 'series') && (p.type !== newType || p.listUrl !== targetUrl)) {
+    openListDetailsPage(targetName, newType, targetUrl, null, {
+      skipPushState: true
+    });
+    return;
+  }
+
+  // Instant client filter for mixed lists (e.g. Watchlist, Custom Mixed Lists):
+  if (window._currentListDetailsAllItems && Array.isArray(window._currentListDetailsAllItems)) {
+    let filtered = window._currentListDetailsAllItems;
+    if (newType === 'movie') {
+      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+    } else if (newType === 'series') {
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+    }
+    const gridEl = document.getElementById('detailGrid');
+    const statusEl = document.getElementById('detailStatus');
+    if (gridEl) {
+      gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+    }
+    if (statusEl) {
+      statusEl.innerHTML = filtered.length ? '' : '<small>No matching items found.</small>';
+    }
+  }
+};
+
 // The full-page "See All" view for any single, already-known list url --
 // used by the Catalogs/Shelves Live Preview, Search results, and My Lists'
 // own "view list" buttons alike, so there's one paginated list view in the
@@ -818,31 +1049,40 @@ function removeListItemFromDetails(btn) {
 async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   opts = opts || {};
   const currentActiveTab = window._originTab || localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
-  if (currentActiveTab !== 'list-details' && currentActiveTab !== 'item-details') {
-    window._previousTab = currentActiveTab;
-    window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-  }
-  switchTab('list-details');
-  if (typeof opts.restoreScrollY === 'number') {
-    window.scrollTo({ top: opts.restoreScrollY, behavior: 'instant' });
-  } else {
-    window.scrollTo({ top: 0, behavior: 'instant' });
+  const currentSubmenu = window._currentCatalogsSubmenu || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+  
+  if (!opts.preserveScroll) {
+    if (currentActiveTab !== 'list-details' && currentActiveTab !== 'item-details') {
+      window._previousTab = currentActiveTab;
+      window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+    }
+    switchTab('list-details');
+    if (typeof opts.restoreScrollY === 'number') {
+      window.scrollTo({ top: opts.restoreScrollY, behavior: 'instant' });
+    } else {
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
   }
 
   if (!opts.skipPushState) {
     try {
-      const cleanPath = (listUrl && typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
+      const cleanPath = (typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
       const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
       const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
       const currentLoc = window.location.pathname + window.location.search + window.location.hash;
       if (window.location.hash !== targetUrl && currentLoc !== targetUrl) {
         if (cleanPath) {
-          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl }, '', cleanPath);
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '', cleanPath);
         } else {
           const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
-          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam }, '', '/#/list?' + params.toString());
+          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '', '/#/list?' + params.toString());
         }
       }
+    } catch (e) {}
+  } else if (opts.preserveScroll) {
+    try {
+      const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
+      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '');
     } catch (e) {}
   }
 
@@ -920,35 +1160,41 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
             const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
             return {
-              id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
-              type: 'series',
+              id: it.showId || it.id || ('channel_item_' + idx),
+              type: it.type || (it.season != null ? 'episode' : 'series'),
               name: displayTitle,
-              subtitle: epName,
-              title: fullTitle,
-              poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '',
-              thumbnail: it.thumbnail || it.backdrop || it.poster || it.showPoster || '',
-              year: it.year || (it.released ? it.released.slice(0, 4) : ''),
+              fullTitle: fullTitle,
+              subtitle: '',
+              poster: it.showPoster || it.poster || '',
+              year: it.year,
+              airDate: it.airDate,
+              isUnaired: it.isUnaired,
+              showId: it.showId,
+              seasonNum: it.season,
+              epNum: it.episode,
             };
           });
           preloaded = { sample: sample, count: sample.length, maybeMore: false };
-          window._listPreloadedCache[cacheKey] = preloaded;
         }
       } catch (e) {}
-    } else if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
+    } else if (listUrl && listUrl.startsWith('autotrack:')) {
+      const parts = listUrl.split(':');
+      const slug = parts[1];
+      const kind = parts[2];
+      const creator = parts[3];
+      if (typeof getAutoTrackChannelItems === 'function') {
+        const sample = getAutoTrackChannelItems(slug, kind, creator);
+        preloaded = { sample: sample, count: sample.length, maybeMore: false };
+      }
+    } else if (!listUrl && name) {
       // Look up local custom lists or creator lists by name or slug
       try {
-        const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
-        let match = Object.values(localMap).find((l) => l && (l.name === name || l.slug === name || (name && l.name && l.name.toLowerCase() === name.toLowerCase())));
-        if (!match && listUrl) {
-          if (listUrl === 'autotrack:continue-watching' || listUrl === 'custom:continue-watching') match = localMap['continue-watching'];
-          else if (listUrl === 'autotrack:watch-history' || listUrl === 'custom:watch-history') match = localMap['watch-history'];
-          else if (listUrl === 'autotrack:watchlist' || listUrl === 'custom:watchlist') match = localMap['watchlist'];
-        }
+        const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        let match = Object.values(map).find((l) => l && (l.name === name || l.slug === name || (name && l.name && l.name.toLowerCase() === name.toLowerCase())));
         if (match && Array.isArray(match.items) && match.items.length) {
           const isCw = match.slug === 'continue-watching';
           const isWatchlist = match.slug === 'watchlist' || match.isWatchlist || (match.name && match.name.toLowerCase() === 'watchlist');
           const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
-
           const sample = match.items.map((it) => {
             const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
             return {
@@ -958,6 +1204,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
               subtitle: label.subtitle,
               poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
               year: it.year,
+              airDate: it.airDate,
+              isUnaired: it.isUnaired,
               removeShowId: isCw ? (it.showId || it.id) : null,
               removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
               removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
@@ -984,6 +1232,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
               subtitle: label.subtitle,
               poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
               year: it.year,
+              airDate: it.airDate,
+              isUnaired: it.isUnaired,
               removeShowId: isCw ? (it.showId || it.id) : null,
               removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
               removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
@@ -1006,32 +1256,112 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   if (!gridEl) return;
 
   let creatorName = (opts && opts.creatorName) || (preloaded && preloaded.creatorName) || null;
-  if (!creatorName && listUrl) {
-    const mdb = listUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?mdblist\\.com/lists/([^/]+)', 'i'));
-    if (mdb) creatorName = mdb[1];
-    const trakt = listUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?trakt\\.tv/users/([^/]+)', 'i'));
-    if (trakt) creatorName = trakt[1];
-    const internal = listUrl.match(new RegExp('^/lists/([^/]+)/[^/]+', 'i'));
+  const nLower = (name || '').trim().toLowerCase();
+  const urlStr = (listUrl || '').trim();
+  const urlLower = urlStr.toLowerCase();
+
+  // 1. Explicitly requested "My Lists Addon" lists (Combined, Streaming Catalogs, Genres, Holidays, Kids except Netflix Kids):
+  if (
+    nLower === 'popular' ||
+    nLower === 'trending' ||
+    nLower === 'streaming top 10 (all services)' ||
+    nLower === 'streaming (all services)' ||
+    urlLower.startsWith('tmdb:genre:') ||
+    urlLower.startsWith('tmdb:holiday:') ||
+    urlLower === 'tmdb:chart:appletv' ||
+    urlLower === 'tmdb:chart:disney' ||
+    urlLower === 'tmdb:chart:discovery' ||
+    urlLower === 'tmdb:chart:hbomax' ||
+    urlLower === 'tmdb:chart:hulu' ||
+    urlLower === 'tmdb:chart:netflix' ||
+    urlLower === 'tmdb:chart:paramount' ||
+    urlLower === 'tmdb:chart:primevideo' ||
+    urlLower === 'tmdb:chart:peacock' ||
+    (urlLower.startsWith('tmdb:kids:') && !nLower.includes('netflix kids') && urlLower !== 'tmdb:chart:netflixkids')
+  ) {
+    creatorName = 'My Lists Addon';
+  }
+  // 2. MDBList lists: Extract username or official -> MDBList
+  else if (urlLower.includes('mdblist.com/lists/')) {
+    const mdb = urlStr.match(new RegExp('(?:https?:)?(?://(?:www\\.)?mdblist\\.com/lists/([^/]+))', 'i'));
+    if (mdb) {
+      const u = mdb[1];
+      if (u.toLowerCase() === 'official') {
+        creatorName = 'MDBList';
+      } else {
+        creatorName = u;
+      }
+    } else {
+      creatorName = 'MDBList';
+    }
+  }
+  // 3. Trakt user lists & charts:
+  else if (urlLower.includes('trakt.tv/users/')) {
+    const trakt = urlStr.match(new RegExp('(?:https?:)?(?://(?:www\\.)?trakt\\.tv/users/([^/]+))', 'i'));
+    if (trakt) {
+      creatorName = trakt[1];
+    } else {
+      creatorName = 'Trakt';
+    }
+  } else if (urlLower.startsWith('trakt:chart:') || urlLower.startsWith('trakt:watchlist') || urlLower.startsWith('trakt:history')) {
+    creatorName = 'Trakt';
+  }
+  // 4. Simkl charts & user lists:
+  else if (urlLower.startsWith('simkl:chart:')) {
+    creatorName = 'Simkl';
+  } else if (urlLower.startsWith('simkl:user:')) {
+    const parts = urlStr.split(':');
+    creatorName = parts[2] || 'Simkl';
+  }
+  // 5. TMDB provider streaming & official charts:
+  else if (urlLower === 'tmdb:chart:netflixkids' || nLower.includes('netflix kids')) {
+    creatorName = 'Netflix';
+  } else if (urlLower.startsWith('tmdb:chart:') || urlLower === 'tmdb:hidden-gems' || urlLower.startsWith('tmdb:top10:')) {
+    creatorName = 'TMDB';
+  }
+  // 6. Creator profile lists or custom lists:
+  else if (urlLower.startsWith('channel:') || urlLower.startsWith('channel:v1:') || urlLower.startsWith('autotrack:')) {
+    if (!creatorName) creatorName = 'My Lists Addon';
+  } else if (urlLower.startsWith('custom:')) {
+    if (!creatorName) creatorName = 'My Lists Addon';
+  } else if (!creatorName) {
+    const internal = urlStr.match(new RegExp('^/lists/([^/]+)/[^/]+', 'i'));
     if (internal && internal[1] !== 'mdblist' && internal[1] !== 'trakt' && internal[1] !== 'tmdb') {
       creatorName = internal[1];
+    } else {
+      creatorName = 'My Lists Addon';
     }
   }
 
-  const knownTotalItems = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) || (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  let knownTotalItems = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) || (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
   let likesCount = (opts && opts.likes !== undefined && opts.likes !== null && opts.likes !== '') ? opts.likes : ((preloaded && preloaded.likes !== undefined && preloaded.likes !== null) ? preloaded.likes : null);
+
+  const isNoLikesList =
+    nLower.includes('recommended movies') ||
+    nLower.includes('recommended shows') ||
+    nLower.includes('continue watching') ||
+    nLower.includes('watch history') ||
+    urlLower.startsWith('custom:curated:') ||
+    urlLower.startsWith('autotrack:') ||
+    urlLower === 'custom:continue-watching' ||
+    urlLower === 'custom:watch-history';
+
+  if (isNoLikesList) {
+    likesCount = null;
+  }
 
   function formatSubtitle(count, maybeMore, itemsThisPage) {
     const parts = [];
     if (creatorName) parts.push('by ' + creatorName);
     parts.push(type === 'series' ? 'Shows' : 'Movies');
-    if (knownTotalItems) {
-      parts.push(knownTotalItems + ' items');
+    if (knownTotalItems != null && knownTotalItems > 0) {
+      parts.push(knownTotalItems.toLocaleString() + ' item' + (knownTotalItems === 1 ? '' : 's'));
     } else if (count !== undefined && count !== null) {
-      parts.push(count + (maybeMore && itemsThisPage > 0 && pagesLoaded < MAX_PAGES ? '+' : '') + ' item' + (count === 1 ? '' : 's'));
+      parts.push(count.toLocaleString() + ' item' + (count === 1 ? '' : 's'));
     } else {
       parts.push('Loading\u2026');
     }
-    if (likesCount !== null && likesCount !== undefined && likesCount !== '') {
+    if (likesCount !== null && likesCount !== undefined && likesCount !== '' && !isNoLikesList) {
       parts.push('\u2665 ' + likesCount);
     }
     return parts.join(' \u2022 ');
@@ -1077,8 +1407,102 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
   updateDetailAddBtn();
 
+  window._currentListDetailsParams = { name, type, listUrl };
+  window._currentListDetailsFilter = (type === 'movie' || type === 'series') ? type : 'all';
+  window._currentListDetailsAllItems = [];
+  const filterBar = document.getElementById('detailFilterBar');
+  const isWatchHistory = (name && name.toLowerCase().includes('watch history')) || (listUrl === 'autotrack:watch-history' || listUrl === 'custom:watch-history');
+
+  let isDualTypeChart = false;
+  if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
+    const match = CHART_SLUG_ENTRIES.find((e) => e.name === name || e.movieUrl === listUrl || e.showUrl === listUrl);
+    if (match && match.movieUrl && match.showUrl) {
+      isDualTypeChart = true;
+    }
+  }
+  if (!isDualTypeChart && listUrl && (listUrl.startsWith('tmdb:genre:') || listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('trakt:chart:') || listUrl.startsWith('simkl:chart:') || listUrl.startsWith('tmdb:kids:') || listUrl.startsWith('tmdb:holiday:'))) {
+    isDualTypeChart = true;
+  }
+
+  const isMixedList = type === 'mixed' || isDualTypeChart || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+
+  const whControls = document.getElementById('whFilterControls');
+  const whSortControls = document.getElementById('whSortControls');
+  const genericTypeControls = document.getElementById('genericTypeFilterControls');
+
+  if (filterBar) {
+    if (isWatchHistory) {
+      filterBar.style.display = 'flex';
+      if (whControls) whControls.style.display = 'flex';
+      if (whSortControls) whSortControls.style.display = 'flex';
+      if (genericTypeControls) genericTypeControls.style.display = 'none';
+
+      const groupShowsCb = document.getElementById('whGroupShowsCheckbox');
+      if (groupShowsCb) {
+        groupShowsCb.checked = localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true';
+      }
+      const sortSel = document.getElementById('whSortSelect');
+      if (sortSel) {
+        sortSel.value = window._watchHistorySort || 'recent';
+      }
+      const curFilter = window._watchHistoryFilter || 'all';
+      filterBar.querySelectorAll('.wh-filter-pill').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.whFilter === curFilter);
+      });
+    } else if (isDualTypeChart || isMixedList) {
+      filterBar.style.display = 'flex';
+      if (whControls) whControls.style.display = 'none';
+      if (whSortControls) whSortControls.style.display = 'none';
+      if (genericTypeControls) {
+        genericTypeControls.style.display = 'flex';
+        const aBtn = document.getElementById('detailTypeAllBtn');
+        const mBtn = document.getElementById('detailTypeMovieBtn');
+        const sBtn = document.getElementById('detailTypeSeriesBtn');
+        if (isDualTypeChart) {
+          // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
+          if (aBtn) aBtn.style.display = 'none';
+          if (mBtn) {
+            mBtn.style.display = '';
+            mBtn.classList.toggle('active', type === 'movie');
+          }
+          if (sBtn) {
+            sBtn.style.display = '';
+            sBtn.classList.toggle('active', type === 'series');
+          }
+        } else {
+          // On mixed lists, show 'All', 'Movies', and 'Shows'
+          const curFilter = window._currentListDetailsFilter || (type === 'movie' || type === 'series' ? type : 'all');
+          if (aBtn) {
+            aBtn.style.display = '';
+            aBtn.classList.toggle('active', curFilter === 'all');
+          }
+          if (mBtn) {
+            mBtn.style.display = '';
+            mBtn.classList.toggle('active', curFilter === 'movie');
+          }
+          if (sBtn) {
+            sBtn.style.display = '';
+            sBtn.classList.toggle('active', curFilter === 'series');
+          }
+        }
+      }
+    } else {
+      filterBar.style.display = 'none';
+    }
+  }
+
+  if (isWatchHistory) {
+    if (likeBtn) likeBtn.style.display = 'none';
+    if (addBtn) addBtn.style.display = 'none';
+    const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    const hist = localMap['watch-history'];
+    window._rawWatchHistoryItems = (hist && Array.isArray(hist.items)) ? hist.items : [];
+    renderWatchHistoryGrid();
+    return;
+  }
+
   if (likeBtn) {
-    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:')) {
+    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
@@ -1228,8 +1652,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 
   function appendItems(items) {
     const annotated = items.map(annotatePersonalItem);
-    gridEl.insertAdjacentHTML('beforeend', annotated.map(livePreviewPosterHtml).join(''));
-    loadedCount += items.length;
+    window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
+    const curFilter = window._currentListDetailsFilter || 'all';
+    let filtered = window._currentListDetailsAllItems;
+    if (curFilter === 'movie') {
+      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+    } else if (curFilter === 'series') {
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+    }
+    gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+    loadedCount = window._currentListDetailsAllItems.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
     subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
@@ -1252,11 +1684,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     statusEl.innerHTML = '<small>Loading\u2026</small>';
     try {
       const body = { url: listUrl, type: type, skip: skip, sample: 100 };
+      if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
       if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+      if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
       if (keys.traktKey) body.traktKey = keys.traktKey;
       if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
       if (keys.simklKey) body.simklKey = keys.simklKey;
       if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
+      if (creatorName) body.creatorName = creatorName;
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1269,13 +1704,17 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         done = true;
         return;
       }
+      if (typeof data.totalItems === 'number' && data.totalItems > 0) {
+        knownTotalItems = data.totalItems;
+      }
       const items = data.sample || [];
       appendItems(items);
       skip += items.length;
       pagesLoaded++;
       updateStatusAfterPage(data.maybeMore, items.length);
     } catch (e) {
-      statusEl.innerHTML = '<p class="testresult err">\u2717 Network error loading this list.</p>';
+      console.error('List preview fetch error:', e);
+      statusEl.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(e && e.message ? e.message : 'Network error loading this list.') + '</p>';
       done = true;
     } finally {
       loading = false;
@@ -1323,8 +1762,3 @@ function openLivePreviewSeeAll(i) {
   if (!shelf) return;
   openListDetailsPage(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore });
 }
-
-
-
-
-

@@ -80,9 +80,20 @@ function mdblistJsonUrl(input, apikey) {
 function parsePublishedListUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   if (/^https?:\/\/(www\.)?mdblist\.com\//i.test(s)) return null;
-  const m = s.match(/\/lists\/([a-z0-9-]+)\/([a-z0-9-]+)(?:\.json)?\/?(?:[?#].*)?$/i);
+  const m = s.match(/\/lists\/([^/?#]+)\/([^/?#]+)(?:\.json)?\/?(?:[?#].*)?$/i);
   if (!m) return null;
-  return { username: m[1].toLowerCase(), listName: m[2].toLowerCase() };
+  let username = m[1];
+  let listName = m[2];
+  try {
+    username = decodeURIComponent(username);
+    listName = decodeURIComponent(listName);
+  } catch {}
+  return {
+    username: username.toLowerCase(),
+    listName: listName.toLowerCase(),
+    rawUsername: m[1],
+    rawListName: m[2],
+  };
 }
 
 function parseTmdbWebChartUrl(rawUrl) {
@@ -121,6 +132,7 @@ function detectSource(input) {
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
   if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
+  if (s.startsWith("tmdb:genre:")) return "tmdb-genre";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";

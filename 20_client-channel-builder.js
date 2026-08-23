@@ -803,8 +803,8 @@ function saveChannel() {
     }
     return;
   }
-  const verticalPoster = channelDraftPoster || (channelDraftItems[0] && channelDraftItems[0].poster) || null;
-  const horizontalBackdrop = channelDraftBackdrop || (channelDraftItems[0] && (channelDraftItems[0].thumbnail || channelDraftItems[0].backdrop)) || channelDraftPoster || null;
+  const verticalPoster = channelDraftPoster || null;
+  const horizontalBackdrop = channelDraftBackdrop || (channelDraftItems[0] && (channelDraftItems[0].thumbnail || channelDraftItems[0].backdrop)) || null;
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 
   const map = loadLocalChannels();
@@ -837,14 +837,13 @@ function saveChannel() {
     });
   });
 
-  if (!foundRow && !editingChannelId) {
-    addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
-    showAddedToast('Channel "' + name + '" saved and added to your Catalogs.');
-  } else {
-    showAddedToast('Channel "' + name + '" saved.');
+  if (foundRow) {
+    if (typeof saveState === 'function') saveState();
   }
+  showAddedToast('Channel "' + name + '" saved.');
 
-  saveState();
+  renderMyCreatedChannelsList();
+  renderChannelMergeList();
   
   editingChannelId = null;
   editingChannelUrlInput = null;
@@ -865,6 +864,9 @@ function saveChannel() {
   renderChannelMergeList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  const myChPanel = document.getElementById('channelsSubMyChannels');
+  if (myChPanel) myChPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function switchChannelsSubmenu(name, btn) {
@@ -1215,10 +1217,21 @@ function updateChannelSaveButtonLabel() {
   const saveBtn = document.getElementById('channelSaveBtn');
   const cancelBtn = document.getElementById('channelCancelEditBtn');
   const titleEl = document.getElementById('channelEditorTitle');
+  const nameInput = document.getElementById('channelNameInput');
+  const rawName = (nameInput ? nameInput.value : '').trim();
   if (titleEl) {
-    titleEl.innerHTML = (editingChannelId || editingChannelUrlInput ? 'Edit TV Channel' : 'Build Custom Channel') + ' <span class="badge" id="channelDraftCountBadge"></span>';
-    const badge = document.getElementById('channelDraftCountBadge');
-    if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
+    if (editingChannelId || editingChannelUrlInput) {
+      let chName = rawName;
+      if (!chName && editingChannelId) {
+        const map = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+        if (map[editingChannelId] && map[editingChannelId].name) chName = map[editingChannelId].name.trim();
+      }
+      if (!chName) chName = 'TV';
+      if (!chName.toLowerCase().endsWith('channel')) chName += ' Channel';
+      titleEl.textContent = 'Edit ' + chName;
+    } else {
+      titleEl.textContent = 'Build Custom Channel';
+    }
   }
   if (!saveBtn) return;
   if (editingChannelId || editingChannelUrlInput) {
@@ -1231,6 +1244,12 @@ function updateChannelSaveButtonLabel() {
     saveBtn.textContent = 'Save';
     if (cancelBtn) cancelBtn.style.display = 'none';
   }
+}
+
+// Keep the editor title in sync as the channel name is edited
+const _channelNameInputEl = document.getElementById('channelNameInput');
+if (_channelNameInputEl) {
+  _channelNameInputEl.addEventListener('input', updateChannelSaveButtonLabel);
 }
 
 document.addEventListener('click', (e) => {
@@ -1698,10 +1717,31 @@ function mergeChannelsIntoRow() {
     channelIds: channelIds,
   });
   
+  // Remove the individual merged channel rows from #lists so only the combined catalog shelf remains
+  const existingRows = [...document.querySelectorAll('#lists .entry')];
+  existingRows.forEach((row) => {
+    const rowChId = row.dataset.channelId || row.id;
+    if (channelIds.includes(rowChId)) {
+      row.remove();
+      return;
+    }
+    const uInput = row.querySelector('.url');
+    if (uInput && uInput.value) {
+      const uVal = uInput.value.trim();
+      for (const chId of channelIds) {
+        if (uVal === 'channel:id:' + chId || uVal.includes('"channelId":"' + chId + '"')) {
+          row.remove();
+          break;
+        }
+      }
+    }
+  });
+
   addRow(combinedName, urls.join('\\n'), 'series', true, 'Channels', merged.mergedId);
   nameInput.value = '';
   saveState();
   renderChannelMergeList();
+  renderMyCreatedChannelsList();
   showAddedToast('Merged ' + channelIds.length + ' channels into "' + combinedName + '".');
 }
 

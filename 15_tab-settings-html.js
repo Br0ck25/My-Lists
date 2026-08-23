@@ -6,8 +6,14 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Auto-Track Playback</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically marks episodes and movies as watched the moment you start playing them from any addon, not just this one. Works by declaring a subtitles resource that is called whenever any video starts playing; this addon returns no real subtitles, it just uses that request as a "just started playing" signal.</p>
+      <h2 class="panel-title">Watchlist Preferences</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Customize how watched movies and TV shows are managed in your personal Watchlist.</p>
+      <div id="watchlistPreferencesSection"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Auto-Track &amp; Media Server Scrobbling</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically scrobble and track watched movies and TV episodes across your streaming apps (Stremio, Nuvio, Wako, etc.) and home media servers (Plex, Jellyfin, Emby) into your personal Watch History and Continue Watching.</p>
       <div id="trackPlaybackSection"></div>
     </div>
   </div>
@@ -40,12 +46,22 @@
       <div id="traktSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Trakt</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Trakt account to import your personal lists, watchlist, and collection, or use a custom Client ID.</p>
-        <div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
-          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()">Connect Trakt Account</button>
-          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()">Connect with PIN / Code</button>
-          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none;" onclick="disconnectTrakt()">Disconnect</button>
+        <div class="actions trakt-connect-actions" style="display:flex; flex-direction:row; width:100%; gap:8px; flex-wrap:nowrap; margin-bottom:10px;">
+          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect Trakt Account</button>
+          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect with PIN / Code</button>
+          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none; flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem;" onclick="disconnectTrakt()">Disconnect</button>
         </div>
         <p id="traktConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
+        <div id="traktSyncHistoryWrap" style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid var(--border);">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0;">
+            <input type="checkbox" id="syncTraktHistoryCheckbox" onchange="toggleProviderHistorySync('trakt', this.checked)" style="width:16px; height:16px; cursor:pointer;">
+            <span style="font-weight:600;">Sync Watch History to Trakt</span>
+          </label>
+          <p style="margin:4px 0 8px 24px; color:var(--muted); font-size:0.78rem;">Automatically sync items marked as watched or played to your Trakt account history.</p>
+          <div style="margin-left:24px;">
+            <button type="button" class="secondary lc-btn" id="syncTraktHistoryNowBtn" onclick="syncWatchHistoryToProviderNow('trakt', this)" style="padding:4px 10px; font-size:0.8rem;">Sync Current Watch History Now</button>
+          </div>
+        </div>
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
@@ -69,6 +85,16 @@
           <button type="button" class="secondary" id="mdblistDisconnectBtn" style="display:none;" onclick="disconnectMdblist()">Disconnect</button>
         </div>
         <p id="mdblistConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
+        <div id="mdblistSyncHistoryWrap" style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid var(--border);">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0;">
+            <input type="checkbox" id="syncMdblistHistoryCheckbox" onchange="toggleProviderHistorySync('mdblist', this.checked)" style="width:16px; height:16px; cursor:pointer;">
+            <span style="font-weight:600;">Sync Watch History to MDBList</span>
+          </label>
+          <p style="margin:4px 0 8px 24px; color:var(--muted); font-size:0.78rem;">Automatically sync items marked as watched or played to your MDBList account history.</p>
+          <div style="margin-left:24px;">
+            <button type="button" class="secondary lc-btn" id="syncMdblistHistoryNowBtn" onclick="syncWatchHistoryToProviderNow('mdblist', this)" style="padding:4px 10px; font-size:0.8rem;">Sync Current Watch History Now</button>
+          </div>
+        </div>
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
@@ -87,6 +113,16 @@
           <button type="button" class="secondary" id="simklDisconnectBtn" style="display:none;" onclick="disconnectSimkl()">Disconnect</button>
         </div>
         <p id="simklConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
+        <div id="simklSyncHistoryWrap" style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid var(--border);">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0;">
+            <input type="checkbox" id="syncSimklHistoryCheckbox" onchange="toggleProviderHistorySync('simkl', this.checked)" style="width:16px; height:16px; cursor:pointer;">
+            <span style="font-weight:600;">Sync Watch History to Simkl</span>
+          </label>
+          <p style="margin:4px 0 8px 24px; color:var(--muted); font-size:0.78rem;">Automatically sync items marked as watched or played to your Simkl account history.</p>
+          <div style="margin-left:24px;">
+            <button type="button" class="secondary lc-btn" id="syncSimklHistoryNowBtn" onclick="syncWatchHistoryToProviderNow('simkl', this)" style="padding:4px 10px; font-size:0.8rem;">Sync Current Watch History Now</button>
+          </div>
+        </div>
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
@@ -152,10 +188,10 @@
     </div>
   </div>
 
-  <!-- Submenu 3: Feedback -->
+  <!-- Submenu 3: Feedback & Support -->
   <div class="settings-subpanel" id="settingsSubFeedback" style="display:none;">
     <div class="panel">
-      <h2 class="panel-title">Send Feedback</h2>
+      <h2 class="panel-title">Send Feedback &amp; Support</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Found a bug, have an idea, or want to see something improved? This goes straight to the developer.</p>
       <div class="row">
         <select id="feedbackCategorySelect">
@@ -176,7 +212,17 @@
       </div>
       <p id="feedbackStatus" style="margin-top:8px;"></p>
     </div>
+
+    <!-- Buy Me a Coffee Support Section -->
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Support</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon.</p>
+      <div class="actions" style="flex-direction:row; width:auto;">
+        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">&#x2615; Buy me a coffee</a>
+      </div>
+    </div>
   </div>
 </div>
 </div>
+
 

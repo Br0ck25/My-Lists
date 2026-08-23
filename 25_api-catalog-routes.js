@@ -1,7 +1,13 @@
 // --- router ---------------------------------------------------------------
-
-export default {
-  async fetch(request, env, ctx) {
+//
+// This is the real fetch handler, but it isn't the exported one -- see the
+// export default { fetch(...) {...} } wrapper at the very end of
+// 26_api-creator-and-admin-routes.js (this function's body actually spans
+// both files; build.ps1 just concatenates them back into one). The wrapper
+// exists purely to run every response back through withSecurityHeaders
+// (02_http-and-creator-utils.js) on the way out, without needing to touch
+// any of the dozens of individual `new Response(...)` call sites below.
+async function handleFetch(request, env, ctx) {
     // Populate the env-backed API key globals declared in 00_constants.js
     // for this request. Every helper function elsewhere in this add-on
     // already references these five by name (TMDB_API_KEY, TRAKT_CLIENT_ID,
@@ -103,7 +109,62 @@ export default {
     // distinct from /lists/:username/:listname below (always two segments,
     // a person's own published Custom List) -- an unrecognized slug here
     // just lands on the normal default builder page rather than a hard
-    // 404, since a stale or mistyped link shouldn't dead-end someone.
+    // /lists/public.json or /api/public-lists.json -> JSON directory of all published public lists
+    if (path === "/lists/public.json" || path === "/api/public-lists.json") {
+      if (!env || !env.CONFIGS) {
+        return json({ ok: true, lists: [] }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
+      }
+      const fetchLimit = 150;
+      const [pubRes, creatorRes] = await Promise.all([
+        env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
+        env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
+      ]);
+      const listKeys = [];
+      (pubRes.keys || []).forEach(k => listKeys.push({ key: k.name, isCreator: false }));
+      (creatorRes.keys || []).forEach(k => {
+        const rest = k.name.slice("creatorlist:".length);
+        if (rest.includes(":")) listKeys.push({ key: k.name, isCreator: true });
+      });
+
+      const listPromises = listKeys.slice(0, 100).map(async ({ key, isCreator }) => {
+        const raw = await env.CONFIGS.get(key);
+        if (!raw) return null;
+        try {
+          const l = JSON.parse(raw);
+          if (l.visibility === "private") return null;
+          let username = "Anonymous";
+          let slug = l.slug || "";
+          if (isCreator) {
+            const parts = key.slice("creatorlist:".length).split(":");
+            username = parts[0] || "creator";
+            slug = parts[1] || slug;
+          } else {
+            slug = key.slice("publishedlist:user:".length);
+          }
+          const cleanSlug = slug || slugifyServer(l.name) || "list";
+          return {
+            name: l.name,
+            slug: cleanSlug,
+            creator: username,
+            type: l.type || "mixed",
+            itemCount: Array.isArray(l.items) ? l.items.length : (l.itemCount || 0),
+            likes: l.likes || 0,
+            updatedAt: l.updatedAt || l.createdAt || null,
+            url: `${url.origin}/lists/${username}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+          };
+        } catch {
+          return null;
+        }
+      });
+
+      const lists = (await Promise.all(listPromises)).filter(Boolean);
+      return json({ ok: true, count: lists.length, lists }, 200, {
+        "Cache-Control": "public, max-age=120",
+        ...corsHeaders(),
+      });
+    }
+
     m = path.match(/^\/lists\/curated\/([A-Za-z0-9-]+)$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
@@ -132,6 +193,23 @@ export default {
         renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: (chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie", url: chart.movieUrl } } : {}),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
+    }
+
+    // Catch-all for browser navigation on provider/custom list paths (e.g. /lists/mdblist/..., /lists/trakt/..., /lists/tmdb/..., /lists/simkl/..., /lists/custom/...)
+    // Note: Creator/user public lists (/lists/:user/:slug) and .json endpoints pass through to creator routes.
+    if (path.startsWith("/lists/") && !path.endsWith(".json") && (path.startsWith("/lists/mdblist/") || path.startsWith("/lists/trakt/") || path.startsWith("/lists/tmdb/") || path.startsWith("/lists/simkl/") || path.startsWith("/lists/custom/") || path.startsWith("/lists/curated/"))) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(renderBuilder(url.origin), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
+      });
+    }
+
+    // Browser navigation for channels (/channels/:slug)
+    if (path.startsWith("/channels/")) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(renderBuilder(url.origin), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
+      });
     }
 
     // /:config/manifest.json
@@ -176,7 +254,7 @@ export default {
       // and the actual tracking write (a TMDB lookup plus a KV read/write)
       // shouldn't hold up how fast this responds. ctx.waitUntil lets it
       // keep running after the response is already on its way.
-      ctx.waitUntil(handleSubtitlesTrack(configParam, stremioType, decodeURIComponent(rawId), env));
+      ctx.waitUntil(handleSubtitlesTrack(configParam, stremioType, decodeURIComponent(rawId), env, request));
       return json({ subtitles: [] });
     }
 
@@ -370,22 +448,13 @@ self.addEventListener('fetch', e => {
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx, origin: url.origin });
+        const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
           count: metas.length,
-          maybeMore: metas.length >= PAGE_SIZE,
-          // id+poster (not just name) so the builder can show small poster
-          // thumbnails as a more satisfying "yes, this is the right list"
-          // confirmation than a plain name list. posterShape carries a
-          // Channel's "landscape" hint through too -- without it, Live
-          // Preview/View List had no way to know a logo shouldn't be forced
-          // into the same portrait 2:3 box every other poster uses, and
-          // cropped it down to almost nothing. season/episode (only ever
-          // present on Trakt history's per-episode rows -- see
-          // mapTraktHistoryItems) let "Mark as Watched" on the live Trakt
-          // Connect panel look up each episode's real TMDB id without
-          // parsing them back out of the folded "Show S1E5" display name.
+          totalItems: totalItems,
+          maybeMore: totalItems != null ? (skip + metas.length < totalItems) : (metas.length >= PAGE_SIZE),
           sample: metas.slice(0, sampleSize).map((m) => ({ id: m.id, type: type, name: m.name, poster: m.poster, year: m.releaseInfo, showTitle: m.showTitle, posterShape: m.posterShape, season: m.season, episode: m.episode })),
         };
       } catch (err) {
@@ -398,6 +467,34 @@ self.addEventListener('fetch', e => {
           ...corsHeaders(),
         },
       });
+    }
+
+    // /api/channel-poster -> Returns branded SVG channel poster or landscape backdrop
+    if (path === "/api/channel-poster") {
+      const name = url.searchParams.get("name") || "TV Channel";
+      const bg = url.searchParams.get("bg") || "";
+      const format = url.searchParams.get("format") || "";
+      const svg = format === "landscape"
+        ? generateChannelBackdropSvg(name, bg)
+        : generateChannelPosterSvg(name, bg);
+      return new Response(svg, {
+        headers: {
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Pragma": "no-cache",
+          "Expires": "0",
+          ...corsHeaders(),
+        },
+      });
+    }
+
+    // /api/scrobble (and subpaths /api/scrobble/webhook, /api/scrobble/plex, /api/scrobble/jellyfin, /api/scrobble/emby)
+    // Automated scrobbling endpoint for media servers (Plex, Jellyfin, Emby)
+    if (path.startsWith("/api/scrobble")) {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { headers: corsHeaders() });
+      }
+      return handleMediaServerScrobble(request, url, env, ctx);
     }
 
     // /:config/meta/:type/:id.json (or /meta/:type/:id.json)
@@ -458,12 +555,14 @@ self.addEventListener('fetch', e => {
       return json({ meta: null });
     }
 
-    // /api/channel-logo?path=...
-    // Generates a self-contained 16:9 landscape channel poster with the network
-    // logo scaled down by 50% and centered on a sleek dark canvas. Uses embedded base64
-    // so it renders reliably across Stremio, Nuvio, wako, and web clients without CORS issues.
+    // /api/channel-logo?path=...[&format=landscape]
+    // Generates a self-contained SVG channel poster with the network's official
+    // logo. Uses format=landscape for 16:9 widescreen banners (600x338) and default
+    // for vertical 2:3 posters (600x900). Uses embedded base64 so it renders reliably across
+    // Stremio, Nuvio, wako, and web clients without CORS issues.
     if (path === "/api/channel-logo") {
       const logoPath = url.searchParams.get("path");
+      const format = url.searchParams.get("format") || "";
       if (!logoPath) return new Response("Missing path", { status: 400 });
       try {
         const tmdbUrl = `https://image.tmdb.org/t/p/w500${logoPath.startsWith("/") ? logoPath : "/" + logoPath}`;
@@ -482,14 +581,53 @@ self.addEventListener('fetch', e => {
         }
         const base64 = btoa(binary);
         const dataUri = `data:${contentType};base64,${base64}`;
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="338" viewBox="0 0 600 338">
-  <rect width="100%" height="100%" fill="#12151f"/>
-  <image x="150" y="84.5" width="300" height="169" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
+
+        const svg = format === "landscape"
+          ? `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="338" viewBox="0 0 600 338">
+  <defs>
+    <linearGradient id="bgGradL" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0d14"/>
+      <stop offset="50%" stop-color="#131726"/>
+      <stop offset="100%" stop-color="#06070a"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="338" fill="url(#bgGradL)"/>
+  <rect x="12" y="12" width="576" height="314" rx="20" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2"/>
+  <image x="150" y="69" width="300" height="200" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
+</svg>`
+          : `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="900" viewBox="0 0 600 900">
+  <defs>
+    <linearGradient id="bgGradP" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0d14"/>
+      <stop offset="50%" stop-color="#131726"/>
+      <stop offset="100%" stop-color="#06070a"/>
+    </linearGradient>
+    <linearGradient id="accentGradP" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#007AFF"/>
+      <stop offset="50%" stop-color="#5856D6"/>
+      <stop offset="100%" stop-color="#AF52DE"/>
+    </linearGradient>
+    <filter id="glowP" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+  <rect width="600" height="900" fill="url(#bgGradP)"/>
+  <rect x="20" y="20" width="560" height="860" rx="32" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3"/>
+  <rect x="80" y="280" width="440" height="280" rx="24" fill="#141829" stroke="rgba(0,122,255,0.4)" stroke-width="2"/>
+  <image x="100" y="300" width="400" height="240" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
+  <g transform="translate(300, 780)">
+    <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGradP)"/>
+    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+  </g>
 </svg>`;
+
         return new Response(svg, {
           headers: {
-            "Content-Type": "image/svg+xml",
-            "Cache-Control": "public, max-age=604800, immutable",
+            "Content-Type": "image/svg+xml; charset=utf-8",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
             ...corsHeaders(),
           },
         });
@@ -1213,6 +1351,28 @@ self.addEventListener('fetch', e => {
           { name: "Hidden Gems", url: "tmdb:hidden-gems", type: "movie", tags: ["hidden gems", "underrated", "gems", "cult"] },
           { name: "Kids Movies", url: "tmdb:kids:movie", type: "movie", tags: ["kids", "children", "family", "animation", "disney"] },
           { name: "Kids Shows", url: "tmdb:kids:tv", type: "series", tags: ["kids", "children", "family", "animation", "cartoons"] },
+          { name: "Family Movies", url: "tmdb:genre:family", type: "movie", tags: ["family", "genre", "newest", "tmdb"] },
+          { name: "Family Shows", url: "tmdb:genre:family", type: "series", tags: ["family", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Fantasy Movies", url: "tmdb:genre:fantasy", type: "movie", tags: ["fantasy", "genre", "newest", "tmdb"] },
+          { name: "Fantasy Shows", url: "tmdb:genre:fantasy", type: "series", tags: ["fantasy", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "History Movies", url: "tmdb:genre:history", type: "movie", tags: ["history", "historical", "genre", "newest", "tmdb"] },
+          { name: "History Shows", url: "tmdb:genre:history", type: "series", tags: ["history", "historical", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Horror Movies", url: "tmdb:genre:horror", type: "movie", tags: ["horror", "scary", "genre", "newest", "tmdb"] },
+          { name: "Horror Shows", url: "tmdb:genre:horror", type: "series", tags: ["horror", "scary", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Mystery Movies", url: "tmdb:genre:mystery", type: "movie", tags: ["mystery", "detective", "genre", "newest", "tmdb"] },
+          { name: "Mystery Shows", url: "tmdb:genre:mystery", type: "series", tags: ["mystery", "detective", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Romance Movies", url: "tmdb:genre:romance", type: "movie", tags: ["romance", "romantic", "love", "genre", "newest", "tmdb"] },
+          { name: "Romance Shows", url: "tmdb:genre:romance", type: "series", tags: ["romance", "romantic", "love", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Science Fiction Movies", url: "tmdb:genre:science-fiction", type: "movie", tags: ["science fiction", "scifi", "sci-fi", "genre", "newest", "tmdb"] },
+          { name: "Science Fiction Shows", url: "tmdb:genre:science-fiction", type: "series", tags: ["science fiction", "scifi", "sci-fi", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Stream Releases Movies", url: "tmdb:genre:stream-releases", type: "movie", tags: ["stream releases", "streaming", "newest", "tmdb"] },
+          { name: "Stream Releases Shows", url: "tmdb:genre:stream-releases", type: "series", tags: ["stream releases", "streaming", "newest", "shows", "tv", "tmdb"] },
+          { name: "Thriller Movies", url: "tmdb:genre:thriller", type: "movie", tags: ["thriller", "suspense", "genre", "newest", "tmdb"] },
+          { name: "Thriller Shows", url: "tmdb:genre:thriller", type: "series", tags: ["thriller", "suspense", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "War Movies", url: "tmdb:genre:war", type: "movie", tags: ["war", "military", "genre", "newest", "tmdb"] },
+          { name: "War Shows", url: "tmdb:genre:war", type: "series", tags: ["war", "military", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Western Movies", url: "tmdb:genre:western", type: "movie", tags: ["western", "cowboy", "genre", "newest", "tmdb"] },
+          { name: "Western Shows", url: "tmdb:genre:western", type: "series", tags: ["western", "cowboy", "genre", "newest", "shows", "tv", "tmdb"] },
         ];
 
         for (const chart of builtinTmdbCharts) {
@@ -2026,15 +2186,31 @@ self.addEventListener('fetch', e => {
       const provider = (body.provider || "").toLowerCase().trim();
       const target = (body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
       const listId = body.listId || body.status || "";
-      const mediaType = (body.type === "series" || body.type === "tv") ? "series" : "movie";
-      const title = body.title || "";
+      const mediaType = (body.mediaType === "series" || body.type === "series" || body.type === "tv" || body.type === "episode") ? "series" : "movie";
+      const title = body.title || body.name || "";
       const year = body.year || "";
       let id = String(body.id || "").trim();
       let imdbId = String(body.imdbId || "").trim();
       let tmdbId = String(body.tmdbId || "").trim();
 
+      let seasonNum = body.season != null ? parseInt(body.season, 10) : (body.seasonNum != null ? parseInt(body.seasonNum, 10) : null);
+      let episodeNum = body.episode != null ? parseInt(body.episode, 10) : (body.episodeNum != null ? parseInt(body.episodeNum, 10) : null);
+
+      if (id.includes(":")) {
+        const parts = id.split(":");
+        if (parts[0].startsWith("tt") || parts[0].startsWith("tmdb")) {
+          if (!imdbId && parts[0].startsWith("tt")) imdbId = parts[0];
+          if (!tmdbId && parts[0].startsWith("tmdb:")) tmdbId = parts[0].slice(5);
+          if (seasonNum == null && !isNaN(parseInt(parts[1], 10))) seasonNum = parseInt(parts[1], 10);
+          if (episodeNum == null && !isNaN(parseInt(parts[2], 10))) episodeNum = parseInt(parts[2], 10);
+        }
+      }
+
       if (!imdbId && id.startsWith("tt")) imdbId = id;
       if (!tmdbId && id.startsWith("tmdb:")) tmdbId = id.slice(5);
+
+      if (imdbId.includes(":")) imdbId = imdbId.split(":")[0];
+      if (tmdbId.includes(":")) tmdbId = tmdbId.split(":")[0];
 
       const apiKeyTmdb = TMDB_API_KEY || (env && env.TMDB_API_KEY) || body.tmdbKey || "";
 
@@ -2070,16 +2246,27 @@ self.addEventListener('fetch', e => {
         const idsObj = {};
         if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
         if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
-        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id.split(":")[0];
 
-        const mediaKey = mediaType === "series" ? "shows" : "movies";
-        const traktPayload = {
-          [mediaKey]: [{
-            ids: idsObj,
-            title: title || undefined,
-            year: year ? parseInt(year, 10) : undefined,
-          }],
-        };
+        let traktPayload = {};
+        if (target === "history" && mediaType === "series" && seasonNum != null && episodeNum != null) {
+          traktPayload = {
+            shows: [{
+              ids: idsObj,
+              title: title || undefined,
+              seasons: [{ number: seasonNum, episodes: [{ number: episodeNum }] }],
+            }],
+          };
+        } else {
+          const mediaKey = mediaType === "series" ? "shows" : "movies";
+          traktPayload = {
+            [mediaKey]: [{
+              ids: idsObj,
+              title: title || undefined,
+              year: year ? parseInt(year, 10) : undefined,
+            }],
+          };
+        }
 
         let traktUrl = `https://api.trakt.tv/sync/watchlist${action === "remove" ? "/remove" : ""}`;
         if (target === "history") {
@@ -2122,7 +2309,7 @@ self.addEventListener('fetch', e => {
         const idsObj = {};
         if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
         if (tmdbId && !isNaN(parseInt(tmdbId, 10))) idsObj.tmdb = parseInt(tmdbId, 10);
-        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id;
+        if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.imdb = id.split(":")[0];
 
         const mediaKey = mediaType === "series" ? "shows" : "movies";
         const targetStatus = target || "plantowatch";
@@ -2130,7 +2317,32 @@ self.addEventListener('fetch', e => {
         let simklUrl = "https://api.simkl.com/sync/add-to-list";
         let simklBody = {};
 
-        if (action === "remove") {
+        if (target === "history") {
+          simklUrl = action === "remove" ? "https://api.simkl.com/sync/history/remove" : "https://api.simkl.com/sync/history";
+          if (mediaType === "series" && seasonNum != null && episodeNum != null) {
+            simklBody = {
+              shows: [{
+                ids: idsObj,
+                title: title || undefined,
+                seasons: [{ number: seasonNum, episodes: [{ number: episodeNum }] }],
+              }],
+            };
+          } else if (mediaType === "series") {
+            simklBody = {
+              shows: [{
+                ids: idsObj,
+                title: title || undefined,
+              }],
+            };
+          } else {
+            simklBody = {
+              movies: [{
+                ids: idsObj,
+                title: title || undefined,
+              }],
+            };
+          }
+        } else if (action === "remove") {
           simklUrl = "https://api.simkl.com/sync/history/remove";
           simklBody = {
             [mediaKey]: [{
@@ -2282,6 +2494,57 @@ self.addEventListener('fetch', e => {
           }
         }
 
+        if (target === "history") {
+          const accessToken = (body.mdblistAccessToken || "").trim();
+          const apiKey = (body.mdblistKey || body.apikey || "").trim();
+          const headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+          };
+          let mUrl = `https://api.mdblist.com/sync/watched`;
+          if (accessToken) {
+            headers["Authorization"] = `Bearer ${accessToken}`;
+          } else {
+            headers["x-api-key"] = apiKey;
+            mUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+          }
+
+          const isMovie = mediaType === "movie" || body.type === "movie";
+          const idsObj = {};
+          if (imdbId && imdbId.startsWith("tt")) idsObj.imdb = imdbId;
+          if (tmdbId) idsObj.tmdb = parseInt(tmdbId, 10);
+          if (!idsObj.imdb && !idsObj.tmdb && id) idsObj.id = id;
+
+          const payload = isMovie ? { movies: [idsObj] } : { shows: [idsObj] };
+
+          try {
+            const mRes = await fetch(mUrl, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(payload),
+            });
+            const mData = await mRes.json().catch(() => ({}));
+            if (!mRes.ok) {
+              let fallbackUrl = `https://api.mdblist.com/history/${action === "add" ? "add" : "remove"}`;
+              if (!accessToken && apiKey) fallbackUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+              const fbRes = await fetch(fallbackUrl, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ id: mdbId, mediatype: mdbType }),
+              });
+              const fbData = await fbRes.json().catch(() => ({}));
+              if (!fbRes.ok) {
+                return json({ ok: false, error: mData.error || fbData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+              }
+            }
+            invalidatePerUserCache("mdblist", safeUserHash(token));
+            return json({ ok: true, provider: "mdblist", action, target: "history", data: mData });
+          } catch (err) {
+            return json({ ok: false, error: String(err.message || err) }, 500);
+          }
+        }
+
         if (target === "custom" && listId) {
           const mUrl = `https://api.mdblist.com/lists/${encodeURIComponent(listId)}/items/${action === "add" ? "add" : "remove"}`;
           try {
@@ -2306,6 +2569,320 @@ self.addEventListener('fetch', e => {
       }
 
       return json({ ok: false, error: "Unsupported provider or target." }, 400);
+    }
+
+    // /api/external-sync/history -> bulk syncs Watch History items to Trakt, MDBList, or Simkl
+    if (path === "/api/external-sync/history" && request.method === "POST") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const provider = (body.provider || "").toLowerCase().trim();
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (!items.length) {
+        return json({ ok: true, syncedCount: 0, message: "No items to sync." });
+      }
+
+      function parseWatchItem(it) {
+        const isMovie = it.type === "movie" || it.kind === "movie" || it.mediaType === "movie";
+        let rawId = String(it.id || "").trim();
+        let showId = String(it.showId || "").trim();
+        let imdbId = String(it.imdbId || "").trim();
+        let tmdbId = String(it.tmdbId || "").trim();
+
+        let parsedSeason = it.seasonNum != null ? parseInt(it.seasonNum, 10) : (it.season != null ? parseInt(it.season, 10) : null);
+        let parsedEpisode = it.episodeNum != null ? parseInt(it.episodeNum, 10) : (it.episode != null ? parseInt(it.episode, 10) : (it.number != null ? parseInt(it.number, 10) : null));
+
+        if (rawId.includes(":")) {
+          const parts = rawId.split(":");
+          if (parts[0].startsWith("tt") || parts[0].startsWith("tmdb")) {
+            if (!showId) showId = parts[0];
+            if (parsedSeason == null && !isNaN(parseInt(parts[1], 10))) parsedSeason = parseInt(parts[1], 10);
+            if (parsedEpisode == null && !isNaN(parseInt(parts[2], 10))) parsedEpisode = parseInt(parts[2], 10);
+          }
+        }
+
+        let cleanImdb = "";
+        if (imdbId && imdbId.startsWith("tt")) cleanImdb = imdbId.split(":")[0];
+        else if (showId && showId.startsWith("tt")) cleanImdb = showId.split(":")[0];
+        else if (rawId.startsWith("tt")) cleanImdb = rawId.split(":")[0];
+
+        let cleanTmdb = null;
+        if (tmdbId && !isNaN(parseInt(tmdbId, 10))) cleanTmdb = parseInt(tmdbId, 10);
+        else if (showId && showId.startsWith("tmdb:")) cleanTmdb = parseInt(showId.slice(5), 10);
+        else if (rawId.startsWith("tmdb:")) cleanTmdb = parseInt(rawId.slice(5).split(":")[0], 10);
+        else if (!isNaN(parseInt(rawId, 10))) cleanTmdb = parseInt(rawId, 10);
+
+        const title = it.title || it.name || it.showTitle || "";
+        const showTitle = it.showTitle || it.title || it.name || "";
+
+        let watchedAtIso = "";
+        if (it.watchedAt || it.watched_at || it.date) {
+          try {
+            const d = new Date(it.watchedAt || it.watched_at || it.date);
+            if (!isNaN(d.getTime())) watchedAtIso = d.toISOString();
+          } catch {}
+        }
+
+        return {
+          isMovie,
+          cleanImdb,
+          cleanTmdb,
+          title,
+          showTitle,
+          season: parsedSeason,
+          episode: parsedEpisode,
+          watchedAtIso
+        };
+      }
+
+      // 1. TRAKT BATCH HISTORY SYNC
+      if (provider === "trakt") {
+        const token = body.traktAccessToken || body.token || "";
+        const clientId = body.traktKey || TRAKT_CLIENT_ID || (env && env.TRAKT_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Trakt account first." }, 400);
+
+        const traktMovies = [];
+        const traktShowMap = new Map();
+
+        items.forEach((it) => {
+          const p = parseWatchItem(it);
+          const ids = {};
+          if (p.cleanImdb) ids.imdb = p.cleanImdb;
+          if (p.cleanTmdb) ids.tmdb = p.cleanTmdb;
+
+          if (p.isMovie) {
+            const movieObj = { ids, title: p.title };
+            if (p.watchedAtIso) movieObj.watched_at = p.watchedAtIso;
+            traktMovies.push(movieObj);
+          } else {
+            const showKey = p.cleanImdb || (p.cleanTmdb ? "tmdb:" + p.cleanTmdb : p.showTitle);
+            if (!traktShowMap.has(showKey)) {
+              traktShowMap.set(showKey, {
+                ids,
+                title: p.showTitle,
+                seasonMap: new Map(),
+              });
+            }
+            const showEntry = traktShowMap.get(showKey);
+            const sNum = p.season || 1;
+            const eNum = p.episode || 1;
+            if (!showEntry.seasonMap.has(sNum)) {
+              showEntry.seasonMap.set(sNum, []);
+            }
+            const epObj = { number: eNum };
+            if (p.watchedAtIso) epObj.watched_at = p.watchedAtIso;
+            showEntry.seasonMap.get(sNum).push(epObj);
+          }
+        });
+
+        const traktShows = [];
+        traktShowMap.forEach((showEntry) => {
+          const seasons = [];
+          showEntry.seasonMap.forEach((eps, sNum) => {
+            seasons.push({ number: sNum, episodes: eps });
+          });
+          traktShows.push({
+            ids: showEntry.ids,
+            title: showEntry.title,
+            seasons: seasons,
+          });
+        });
+
+        const traktPayload = {};
+        if (traktMovies.length) traktPayload.movies = traktMovies;
+        if (traktShows.length) traktPayload.shows = traktShows;
+
+        try {
+          const tRes = await fetch("https://api.trakt.tv/sync/history", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "trakt-api-version": "2",
+              "trakt-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(traktPayload),
+          });
+          const tData = await tRes.json().catch(() => ({}));
+          if (!tRes.ok) {
+            return json({ ok: false, error: tData.error || `Trakt sync error (HTTP ${tRes.status})` }, tRes.status);
+          }
+          invalidatePerUserCache("trakt", safeUserHash(token));
+          return json({ ok: true, provider: "trakt", syncedCount: items.length, data: tData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 2. SIMKL BATCH HISTORY SYNC
+      if (provider === "simkl") {
+        const token = body.simklAccessToken || body.token || "";
+        const clientId = body.simklKey || SIMKL_CLIENT_ID || (env && env.SIMKL_CLIENT_ID) || "";
+        if (!token) return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
+
+        const simklMovies = [];
+        const simklShowMap = new Map();
+
+        items.forEach((it) => {
+          const p = parseWatchItem(it);
+          const ids = {};
+          if (p.cleanImdb) ids.imdb = p.cleanImdb;
+          if (p.cleanTmdb) ids.tmdb = p.cleanTmdb;
+
+          if (p.isMovie) {
+            const movieObj = { ids, title: p.title };
+            if (p.watchedAtIso) movieObj.watched_at = p.watchedAtIso;
+            simklMovies.push(movieObj);
+          } else {
+            const showKey = p.cleanImdb || (p.cleanTmdb ? "tmdb:" + p.cleanTmdb : p.showTitle);
+            if (!simklShowMap.has(showKey)) {
+              simklShowMap.set(showKey, {
+                ids,
+                title: p.showTitle,
+                seasonMap: new Map(),
+              });
+            }
+            const showEntry = simklShowMap.get(showKey);
+            const sNum = p.season || 1;
+            const eNum = p.episode || 1;
+            if (!showEntry.seasonMap.has(sNum)) {
+              showEntry.seasonMap.set(sNum, []);
+            }
+            const epObj = { number: eNum };
+            if (p.watchedAtIso) epObj.watched_at = p.watchedAtIso;
+            showEntry.seasonMap.get(sNum).push(epObj);
+          }
+        });
+
+        const simklShows = [];
+        simklShowMap.forEach((showEntry) => {
+          const seasons = [];
+          showEntry.seasonMap.forEach((eps, sNum) => {
+            seasons.push({ number: sNum, episodes: eps });
+          });
+          simklShows.push({
+            ids: showEntry.ids,
+            title: showEntry.title,
+            seasons: seasons,
+          });
+        });
+
+        const simklPayload = {};
+        if (simklMovies.length) simklPayload.movies = simklMovies;
+        if (simklShows.length) simklPayload.shows = simklShows;
+
+        try {
+          const sRes = await fetch("https://api.simkl.com/sync/history", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+            },
+            body: JSON.stringify(simklPayload),
+          });
+          const sData = await sRes.json().catch(() => ({}));
+          if (!sRes.ok) {
+            return json({ ok: false, error: sData.error || `Simkl sync error (HTTP ${sRes.status})` }, sRes.status);
+          }
+          invalidatePerUserCache("simkl", safeUserHash(token));
+          return json({ ok: true, provider: "simkl", syncedCount: items.length, data: sData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // 3. MDBLIST BATCH HISTORY SYNC
+      if (provider === "mdblist") {
+        const accessToken = (body.mdblistAccessToken || "").trim();
+        const apiKey = (body.mdblistKey || body.apikey || "").trim();
+        const token = accessToken || apiKey || body.token || "";
+        if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
+
+        const movies = [];
+        const episodes = [];
+
+        items.forEach((it) => {
+          const p = parseWatchItem(it);
+          const obj = {};
+          if (p.cleanImdb) obj.imdb = p.cleanImdb;
+          if (p.cleanTmdb) obj.tmdb = p.cleanTmdb;
+
+          if (p.isMovie) {
+            movies.push(obj);
+          } else {
+            episodes.push({
+              ...obj,
+              season: p.season || 1,
+              episode: p.episode || 1,
+            });
+          }
+        });
+
+        const mdblistPayload = {};
+        if (movies.length) mdblistPayload.movies = movies;
+        if (episodes.length) mdblistPayload.episodes = episodes;
+
+        const headers = {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+        };
+        let mUrl = "https://api.mdblist.com/sync/watched";
+        if (accessToken) {
+          headers["Authorization"] = `Bearer ${accessToken}`;
+        } else {
+          headers["x-api-key"] = apiKey;
+          mUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+        }
+
+        try {
+          const mRes = await fetch(mUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(mdblistPayload),
+          });
+          const mData = await mRes.json().catch(() => ({}));
+          if (!mRes.ok) {
+            let successCount = 0;
+            await mapWithConcurrency(items.slice(0, 50), 6, async (it) => {
+              const isMovie = it.type === "movie" || it.kind === "movie" || it.mediaType === "movie";
+              const mdbId = (it.imdbId && it.imdbId.startsWith("tt")) ? it.imdbId : (it.id || it.tmdbId);
+              if (!mdbId) return;
+              try {
+                let singleUrl = `https://api.mdblist.com/history/add`;
+                if (!accessToken && apiKey) singleUrl += `?apikey=${encodeURIComponent(apiKey)}`;
+                const sRes = await fetch(singleUrl, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify({
+                    id: mdbId,
+                    mediatype: isMovie ? "movie" : "show",
+                  }),
+                });
+                if (sRes.ok) successCount++;
+              } catch {}
+            });
+            if (successCount > 0) {
+              invalidatePerUserCache("mdblist", safeUserHash(token));
+              return json({ ok: true, provider: "mdblist", syncedCount: successCount });
+            }
+            return json({ ok: false, error: mData.error || `MDBList sync error (HTTP ${mRes.status})` }, mRes.status);
+          }
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({ ok: true, provider: "mdblist", syncedCount: items.length, data: mData });
+        } catch (err) {
+          return json({ ok: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      return json({ ok: false, error: "Unsupported provider." }, 400);
     }
 
     // /api/external-list/create -> creates a new custom list on Trakt, TMDB, or MDBList

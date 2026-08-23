@@ -26,12 +26,17 @@ function deslugify(s) {
 
 function getListCleanPath(listUrl, name) {
   const normName = String(name || '').toLowerCase().trim();
-  if (normName === 'continue watching') return '/lists/continue-watching';
-  if (normName === 'watch history') return '/lists/watch-history';
+  if (normName === 'continue watching' || normName === 'continue-watching' || normName === 'continue_watching') return '/lists/continue-watching';
+  if (normName === 'watch history' || normName === 'watch-history' || normName === 'watch_history') return '/lists/watch-history';
   if (normName === 'watchlist') return '/lists/watchlist';
 
-  if (!listUrl) return null;
-  const rawUrl = String(listUrl).trim();
+  const cleanSlug = name ? String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
+  const rawUrl = String(listUrl || '').trim();
+
+  if (!rawUrl) {
+    if (cleanSlug) return '/lists/custom/' + cleanSlug;
+    return null;
+  }
 
   if (rawUrl.startsWith('autotrack:')) {
     const parts = rawUrl.split(':');
@@ -46,14 +51,21 @@ function getListCleanPath(listUrl, name) {
       if (slug === 'continue-watching' || slug === 'watch-history' || slug === 'watchlist') {
         return '/lists/' + slug;
       }
+      if (slug) return '/lists/custom/' + slug;
     } catch (e) {}
   }
 
-  // 1. Curated list
-  if (rawUrl.startsWith('custom:curated:')) {
-    const slug = rawUrl.slice('custom:curated:'.length);
-    return '/lists/curated/' + slug;
+  if (rawUrl.startsWith('custom:')) {
+    const slug = rawUrl.slice(7);
+    if (slug === 'continue-watching' || slug === 'watch-history' || slug === 'watchlist') {
+      return '/lists/' + slug;
+    }
+    if (slug.startsWith('curated:')) {
+      return '/lists/curated/' + slug.slice(8);
+    }
+    return '/lists/custom/' + slug;
   }
+
   if (rawUrl === 'tmdb:chart:new_movies') return '/lists/new-movies';
   if (rawUrl === 'tmdb:chart:new_shows') return '/lists/new-shows';
 
@@ -71,31 +83,96 @@ function getListCleanPath(listUrl, name) {
     return rawUrl;
   }
 
-  // 3. MDBList list: https://mdblist.com/lists/:user/:slug
+  // 4. MDBList list
   const mdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?mdblist\\.com/lists/([^/]+)/([^/?#]+)', 'i'));
   if (mdbMatch) {
     return '/lists/mdblist/' + mdbMatch[1] + '/' + mdbMatch[2];
   }
+  if (rawUrl === 'mdblist:watchlist' || (rawUrl.startsWith('mdblist:') && normName.includes('watchlist'))) {
+    return '/lists/mdblist/watchlist';
+  }
+  if (rawUrl === 'mdblist:history' || (rawUrl.startsWith('mdblist:') && normName.includes('history'))) {
+    return '/lists/mdblist/history';
+  }
+  if (rawUrl.startsWith('mdblist:list:')) {
+    const listId = rawUrl.slice('mdblist:list:'.length);
+    return '/lists/mdblist/' + listId + (cleanSlug && cleanSlug !== '-' ? '-' + cleanSlug : '');
+  }
+  if (rawUrl.startsWith('mdblist:')) {
+    const parts = rawUrl.slice(8).split(':');
+    if (parts.length >= 2) return '/lists/mdblist/' + parts[0] + '/' + parts[1];
+    return '/lists/mdblist/' + (cleanSlug || parts[0]);
+  }
 
-  // 4. Trakt list: https://trakt.tv/users/:user/lists/:slug
-  const traktMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?trakt\\.tv/users/([^/]+)/lists/([^/?#]+)', 'i'));
+  // 5. Trakt list
+  const traktMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?(?:api\\.)?trakt\\.tv/users/([^/]+)/lists/([^/?#]+)', 'i'));
   if (traktMatch) {
     return '/lists/trakt/' + traktMatch[1] + '/' + traktMatch[2];
   }
+  if (rawUrl === 'trakt:watchlist' || (rawUrl.startsWith('trakt:') && normName.includes('watchlist'))) {
+    return '/lists/trakt/watchlist';
+  }
+  if (rawUrl === 'trakt:history' || (rawUrl.startsWith('trakt:') && normName.includes('history'))) {
+    return '/lists/trakt/history';
+  }
+  if (rawUrl === 'trakt:collection' || (rawUrl.startsWith('trakt:') && normName.includes('collection'))) {
+    return '/lists/trakt/collection';
+  }
+  if (rawUrl.startsWith('trakt:users/')) {
+    return '/lists/trakt/' + rawUrl.slice(12).replace('/lists/', '/');
+  }
+  if (rawUrl.startsWith('trakt:')) {
+    const parts = rawUrl.slice(6).split(':');
+    if (parts.length >= 2) return '/lists/trakt/' + parts[0] + '/' + parts[1];
+    return '/lists/trakt/' + (cleanSlug || parts[0]);
+  }
 
-  // 5. TMDB collection: https://www.themoviedb.org/collection/:id or tmdb:collection::id
+  // 6. TMDB
   const tmdbCollMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/collection/([0-9]+)', 'i')) ||
     (rawUrl.startsWith('tmdb:collection:') ? [null, rawUrl.slice('tmdb:collection:'.length).split(/[^0-9]/)[0]] : null);
   if (tmdbCollMatch && tmdbCollMatch[1]) {
-    const cleanSlug = name ? '-' + String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
-    return '/lists/tmdb/collection/' + tmdbCollMatch[1] + (cleanSlug && cleanSlug !== '-' ? cleanSlug : '');
+    return '/lists/tmdb/collection/' + tmdbCollMatch[1] + (cleanSlug && cleanSlug !== '-' ? '-' + cleanSlug : '');
+  }
+  const tmdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/list/([0-9]+)', 'i')) ||
+    (rawUrl.startsWith('tmdb:list:') ? [null, rawUrl.slice('tmdb:list:'.length).split(/[^0-9]/)[0]] : null);
+  if (tmdbMatch && tmdbMatch[1]) {
+    return '/lists/tmdb/' + tmdbMatch[1] + (cleanSlug && cleanSlug !== '-' ? '-' + cleanSlug : '');
+  }
+  if (rawUrl === 'tmdb:watchlist' || (rawUrl.startsWith('tmdb:') && normName.includes('watchlist'))) {
+    return '/lists/tmdb/watchlist';
+  }
+  if (rawUrl === 'tmdb:favorites' || (rawUrl.startsWith('tmdb:') && normName.includes('favorites'))) {
+    return '/lists/tmdb/favorites';
   }
 
-  // 6. TMDB list: https://www.themoviedb.org/list/:id
-  const tmdbMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?themoviedb\\.org/list/([0-9]+)', 'i'));
-  if (tmdbMatch && tmdbMatch[1]) {
-    const cleanSlug = name ? '-' + String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
-    return '/lists/tmdb/' + tmdbMatch[1] + (cleanSlug && cleanSlug !== '-' ? cleanSlug : '');
+  // 7. Simkl
+  if (rawUrl.startsWith('simkl:completed:movies') || normName === 'simkl completed (movies)') return '/lists/simkl/completed-movies';
+  if (rawUrl.startsWith('simkl:completed:shows') || normName === 'simkl completed (shows)') return '/lists/simkl/completed-shows';
+  if (rawUrl.startsWith('simkl:watching:movies') || normName === 'simkl watching (movies)') return '/lists/simkl/watching-movies';
+  if (rawUrl.startsWith('simkl:watching:shows') || normName === 'simkl watching (shows)') return '/lists/simkl/watching-shows';
+  if (rawUrl.startsWith('simkl:plantowatch:movies') || normName === 'simkl plan to watch (movies)') return '/lists/simkl/plantowatch-movies';
+  if (rawUrl.startsWith('simkl:plantowatch:shows') || normName === 'simkl plan to watch (shows)') return '/lists/simkl/plantowatch-shows';
+  if (rawUrl.startsWith('simkl:hold:movies') || normName === 'simkl on hold (movies)') return '/lists/simkl/hold-movies';
+  if (rawUrl.startsWith('simkl:hold:shows') || normName === 'simkl on hold (shows)') return '/lists/simkl/hold-shows';
+  if (rawUrl.startsWith('simkl:dropped:movies') || normName === 'simkl not interesting (movies)') return '/lists/simkl/dropped-movies';
+  if (rawUrl.startsWith('simkl:dropped:shows') || normName === 'simkl not interesting (shows)') return '/lists/simkl/dropped-shows';
+  const simklMatch = rawUrl.match(new RegExp('(?:https?:)?(?://)?(?:www\\.)?simkl\\.com/[^/]+/list/([0-9]+)(?:/([^/?#]+))?', 'i'));
+  if (simklMatch && simklMatch[1]) {
+    return '/lists/simkl/' + simklMatch[1] + (simklMatch[2] ? '-' + simklMatch[2] : (cleanSlug ? '-' + cleanSlug : ''));
+  }
+  if (rawUrl.startsWith('simkl:custom:')) {
+    const listId = rawUrl.slice(13);
+    return '/lists/simkl/' + listId + (cleanSlug ? '-' + cleanSlug : '');
+  }
+  // 8. Channels (My Channels / TV Channels)
+  if (rawUrl.startsWith('channel:')) {
+    if (cleanSlug) return '/channels/' + cleanSlug;
+    const chId = rawUrl.replace(/^channel:(?:id:|v1:)?/, '');
+    if (chId) return '/channels/' + chId;
+  }
+
+  if (cleanSlug) {
+    return '/lists/custom/' + cleanSlug;
   }
 
   return null;
@@ -231,9 +308,9 @@ function switchTab(name) {
     switchSettingsSubmenu('backup', document.querySelector('#settingsSubnavBar button:nth-child(4)'));
     return;
   }
-  if (name === 'keys') {
+  if (name === 'keys' || name === 'account') {
     switchTab('settings');
-    switchSettingsSubmenu('keys', document.querySelector('#settingsSubnavBar button:nth-child(1)'));
+    switchSettingsSubmenu('account', document.querySelector('#settingsSubnavBar button:nth-child(1)'));
     return;
   }
   if (name === 'quick-add' || name === 'toplists') {
@@ -245,7 +322,7 @@ function switchTab(name) {
   const titles = {
     discover: { title: 'Discover', sub: 'Explore Popular & Streaming' },
     catalogs: { title: 'Catalogs', sub: 'Manage Configured Catalogs' },
-    lists: { title: 'Lists', sub: 'Community & Curated Lists' },
+    lists: { title: 'Lists', sub: 'Custom, Connected & Liked Lists' },
     channels: { title: 'Channels', sub: '24/7 Continuous TV Streaming' },
     search: { title: 'Search', sub: 'Find Movies, Shows & Lists' },
     settings: { title: 'Settings', sub: 'Accounts, API Keys & Tools' }
@@ -267,12 +344,27 @@ function switchTab(name) {
   });
   if (name !== 'list-details' && name !== 'item-details') {
     window._originTab = name;
+    window._previousTab = name;
     try {
       localStorage.setItem('myListAddon:activeTab', name);
     } catch (e) {}
-    if (location.pathname.startsWith('/lists/')) {
-      history.pushState({ view: 'tab', tab: name }, '', '/');
-    }
+    const hash = location.hash || '';
+    const isDetailUrl = hash.startsWith('#/item?') || hash.startsWith('#/list?') || (location.pathname.startsWith('/lists/') && location.pathname !== '/lists');
+    try {
+      if (isDetailUrl) {
+        history.pushState({ view: 'tab', tab: name, fromCatalogsSubmenu: window._currentCatalogsSubmenu }, '', '/');
+      } else {
+        history.replaceState({ view: 'tab', tab: name, fromCatalogsSubmenu: window._currentCatalogsSubmenu }, '', '/');
+      }
+    } catch (e) {}
+  }
+
+  if (name === 'catalogs') {
+    let savedSub = 'all';
+    try {
+      savedSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+    } catch (e) {}
+    if (typeof switchCatalogsSubmenu === 'function') switchCatalogsSubmenu(savedSub);
   }
 
   if (name === 'lists') {
@@ -403,7 +495,7 @@ function showAppAlert(title, message, isSuccess = false) {
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="font-size:1.1rem; line-height:1; padding:2px 8px; cursor:pointer;">\u2715</button>' +
+      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -422,7 +514,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="font-size:1.1rem; line-height:1; padding:2px 8px; cursor:pointer;">\u2715</button>' +
+      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -497,6 +589,11 @@ function switchListsSubmenu(name, btn) {
     if (!hasTmdbContent && typeof runMyTmdbLists === 'function') {
       runMyTmdbLists();
     }
+    const simklBox = document.getElementById('mySimklListsResult');
+    const hasSimklContent = simklBox && simklBox.children.length > 0;
+    if (!hasSimklContent && typeof runMySimklLists === 'function') {
+      runMySimklLists();
+    }
   }
   if (name === 'liked') {
     const likedBox = document.getElementById('likedListsFeed');
@@ -522,7 +619,7 @@ function switchSettingsSubmenu(name, btn) {
   }
   const subpanels = {
     'account': 'settingsSubAccount',
-    'keys': 'settingsSubExternal',
+    'keys': 'settingsSubAccount',
     'external': 'settingsSubExternal',
     'backup': 'settingsSubBackup',
     'feedback': 'settingsSubFeedback'
@@ -648,7 +745,11 @@ function filterDiscoverShelves(filter, btn) {
   } else {
     if (feedContainer) {
       feedContainer.style.display = 'block';
-      if (typeof renderDiscoverChartsList === 'function') {
+      window._discoverFeedsCache = window._discoverFeedsCache || {};
+      if (window._discoverFeedsCache[filter]) {
+        feedContainer.innerHTML = window._discoverFeedsCache[filter];
+        window._currentDiscoverRenderedFilter = filter;
+      } else if (typeof renderDiscoverChartsList === 'function') {
         renderDiscoverChartsList(filter);
       }
     }
@@ -661,7 +762,14 @@ function filterDiscoverShelves(filter, btn) {
 function renderDiscoverChartsList(type, forceRefresh) {
   const container = document.getElementById('discoverListsFeed');
   if (!container) return;
+  window._discoverFeedsCache = window._discoverFeedsCache || {};
+  if (!forceRefresh && window._discoverFeedsCache[type]) {
+    container.innerHTML = window._discoverFeedsCache[type];
+    window._currentDiscoverRenderedFilter = type;
+    return;
+  }
   if (!forceRefresh && window._currentDiscoverRenderedFilter === type && container.children.length > 0 && !container.innerText.includes('Loading')) {
+    window._discoverFeedsCache[type] = container.innerHTML;
     return;
   }
   window._currentDiscoverRenderedFilter = type;
@@ -681,13 +789,7 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
   // Helper: push single-type entry
   function pushSingle(name, url, entryType, group) {
-    if (type === entryType || type === 'all') {
-      lists.push({ name: name, url: url, type: entryType, user: group, likes: 0 });
-    } else if (type === 'gems' && entryType === 'movie') {
-      // Hidden Gems only has movies, but if they click gems tab, show it
-      lists.push({ name: name, url: url, type: entryType, user: group, likes: 0 });
-    } else if (type === 'kids') {
-      // Kids tab shows all items in kids lists
+    if (type === entryType || type === 'all' || type === 'gems' || type === 'kids' || type === 'holidays' || type === 'genres' || type === 'curated') {
       lists.push({ name: name, url: url, type: entryType, user: group, likes: 0 });
     }
   }
@@ -695,7 +797,7 @@ function renderDiscoverChartsList(type, forceRefresh) {
   // Each data table is baked in at render time via the server-side template.
   // They are exposed as window._CHARTS_* globals by 09_page-shell.js.
 
-  if (type !== 'gems' && type !== 'kids') {
+  if (type !== 'gems' && type !== 'kids' && type !== 'holidays' && type !== 'genres' && type !== 'curated') {
     if (type === 'movie' || type === 'all') {
       pushSingle('New Movies', 'tmdb:chart:new_movies', 'movie', 'TMDB');
     }
@@ -727,19 +829,40 @@ function renderDiscoverChartsList(type, forceRefresh) {
       window._CHARTS_STREAMING_TOP10.forEach(function(p) { pushPair(p.name + ' Top 10', p.movieUrl, p.showUrl, 'Streaming Top 10'); });
     }
     if (window._CHARTS_STREAMING_ALL) {
-      window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'Streaming'); });
+      window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
     }
   }
 
+  if (type === 'curated' || type === 'all') {
+    const curatedPresets = [
+      { name: 'Recommended Movies', url: 'custom:curated:recommended-movies', type: 'movie', user: 'Curated' },
+      { name: 'Recommended Shows', url: 'custom:curated:recommended-shows', type: 'series', user: 'Curated' },
+      { name: 'Curated: Hidden Gems', url: 'custom:curated:hidden-gems', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Top Rated Classics', url: 'custom:curated:top-rated-classics', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Cult Favorites', url: 'custom:curated:cult-favorites', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Binge-Worthy Series', url: 'custom:curated:binge-worthy-series', type: 'series', user: 'Curated' },
+      { name: 'Curated: Award Winners', url: 'custom:curated:award-winners', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Feel-Good Hits', url: 'custom:curated:feel-good-hits', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Action & Thrills', url: 'custom:curated:action-thrills', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Sci-Fi Journeys', url: 'custom:curated:sci-fi-journeys', type: 'movie', user: 'Curated' },
+      { name: 'Curated: Family Movie Night', url: 'custom:curated:family-movie-night', type: 'movie', user: 'Curated' },
+      { name: 'Curated: True Crime & Mystery', url: 'custom:curated:true-crime-mystery', type: 'series', user: 'Curated' },
+    ];
+    curatedPresets.forEach(function(item) {
+      pushSingle(item.name, item.url, item.type, 'Curated');
+    });
+  }
+
   if (type === 'gems' || type === 'all') {
-    pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
+    pushSingle('Hidden Gems (Movies)', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
+    pushSingle('Hidden Gems (Shows)', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
   }
 
   if (type === 'kids' || type === 'all') {
     if (window._CHARTS_KIDS) {
       window._CHARTS_KIDS.forEach(function(item) {
-        pushSingle(item.name, item.movieUrl, 'movie', 'Kids Movies');
-        pushSingle(item.name, item.showUrl, 'series', 'Kids Shows');
+        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Kids');
+        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Kids');
       });
     }
   }
@@ -747,14 +870,29 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'holidays' || type === 'all') {
     if (window._CHARTS_HOLIDAYS) {
       window._CHARTS_HOLIDAYS.forEach(function(item) {
-        pushSingle(item.name, item.movieUrl, 'movie', 'Holiday Movies');
-        pushSingle(item.name, item.showUrl, 'series', 'Holiday Shows');
+        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Holidays');
+        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Holidays');
+      });
+    }
+  }
+
+  if (type === 'genres' || type === 'all') {
+    if (window._CHARTS_GENRES) {
+      window._CHARTS_GENRES.forEach(function(item) {
+        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Genres');
+        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Genres');
       });
     }
   }
 
   if (typeof render5PosterListsFeed === 'function') {
     render5PosterListsFeed(container, lists);
+    window._discoverFeedsCache[type] = container.innerHTML;
+    setTimeout(() => {
+      if (container && window._currentDiscoverRenderedFilter === type) {
+        window._discoverFeedsCache[type] = container.innerHTML;
+      }
+    }, 400);
   } else {
     container.innerHTML = '<p style="color:var(--muted); font-size:0.88rem;">Could not load chart lists.</p>';
   }
@@ -764,6 +902,21 @@ function switchCatalogsSubmenu(filter, btn) {
   if (filter === 'channels') {
     switchTab('channels');
     return;
+  }
+  window._currentCatalogsSubmenu = filter || 'all';
+  try {
+    localStorage.setItem('myListAddon:catalogsSubmenu', filter || 'all');
+  } catch (e) {}
+  const hash = location.hash || '';
+  const isDetailUrl = hash.startsWith('#/item?') || hash.startsWith('#/list?') || (location.pathname.startsWith('/lists/') && location.pathname !== '/lists');
+  if (!isDetailUrl) {
+    try {
+      history.replaceState({ view: 'tab', tab: 'catalogs', fromCatalogsSubmenu: filter || 'all' }, '', '/');
+    } catch (e) {}
+  }
+  if (!btn) {
+    const selector = filter === 'quickadd' ? '#catalogsFilterBar button:nth-child(2)' : (filter === 'bulk' ? '#catalogsFilterBar button:nth-child(3)' : '#catalogsFilterBar button:nth-child(1)');
+    btn = document.querySelector(selector);
   }
   if (btn) {
     document.querySelectorAll('#catalogsFilterBar .subnav-pill').forEach(function(p) {
@@ -1140,47 +1293,46 @@ function addRow(name, url, type, enabled, group, channelId) {
   const avatarLetter = escapeHtml(((name || group || 'L').trim()[0] || 'L'));
   const avatarBg = entryAvatarColor(group || name || '');
 
-  div.innerHTML = \`
-    <div class="entry-card-top" style="flex-direction: column;">
-      <div class="entry-ctrl-row" style="width: 100%; justify-content: flex-start; margin-bottom: 2px;">
-        <div class="entry-pos-wrap" style="display:flex; align-items:center;">
-          <input type="number" class="pos" min="1" title="Type a position number to move this list there" onchange="movePosTo(this)">
-        </div>
-        <span class="drag-handle ec-btn" draggable="true" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>
-        <button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, -1)" title="Move up">&#8593;</button>
-        <button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, 1)" title="Move down">&#8595;</button>
-        \${(isCustomList || isChannel) ? \`<button type="button" class="ec-btn secondary" style="margin-left: auto; margin-right: 6px; font-weight:600; padding: 2px 10px;" onclick="\${isCustomList ? 'editEntryCustomList(this)' : 'editEntryChannel(this)'}">Edit</button>\` : ''}
-        <button type="button" class="ec-btn movebtn removebtn danger" onclick="removeEntryWithUndo(this)" title="Remove this list" aria-label="Remove this list" style="\${!(isCustomList || isChannel) ? 'margin-left: auto;' : ''}">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;">
-            <polyline points="3 6 5 6 21 6"></polyline>
-            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
-            <path d="M10 11v6"></path><path d="M14 11v6"></path>
-            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
-          </svg>
-        </button>
-      </div>
-      <div style="display: flex; gap: 8px; width: 100%; align-items: center;">
-        <div class="entry-card-body" style="flex-direction: row; gap: 10px; align-items: center; width: 100%;">
-          <div class="entry-name-row" style="flex: 1;">
-            <input type="text" placeholder="Name (e.g. Trending Movies)" class="name" value="\${escapeHtml(name||'')}">
-          </div>
-          <div class="entry-type-row" style="width: auto;">
-            <select class="type" \${(isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : ''}>
-              <option value="movie" \${(type==='movie'||(isCustomList&&type==='movie'))?'selected':''}>Movies</option>
-              <option value="series" \${(type==='series'||isChannel||(isCustomList&&type==='series'))?'selected':''}>Shows</option>
-            </select>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="sources">\${rowsHtml}</div>
-    \${isWatchlist
+  div.innerHTML =
+    '<div class="entry-card-top" style="flex-direction: column;">' +
+      '<div class="entry-ctrl-row" style="width: 100%; justify-content: flex-start; margin-bottom: 2px;">' +
+        '<div class="entry-pos-wrap" style="display:flex; align-items:center;">' +
+          '<input type="number" class="pos" min="1" title="Type a position number to move this list there" onchange="movePosTo(this)">' +
+        '</div>' +
+        '<span class="drag-handle ec-btn" draggable="true" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>' +
+        '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, -1)" title="Move up">&#8593;</button>' +
+        '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, 1)" title="Move down">&#8595;</button>' +
+        ((isCustomList || isChannel) ? ('<button type="button" class="ec-btn secondary" style="margin-left: auto; margin-right: 6px; font-weight:600; padding: 2px 10px;" onclick="' + (isCustomList ? 'editEntryCustomList(this)' : 'editEntryChannel(this)') + '">Edit</button>') : '') +
+        '<button type="button" class="ec-btn movebtn removebtn danger" onclick="removeEntryWithUndo(this)" title="Remove this list" aria-label="Remove this list" style="' + (!(isCustomList || isChannel) ? 'margin-left: auto;' : '') + '">' +
+          '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;">' +
+            '<polyline points="3 6 5 6 21 6"></polyline>' +
+            '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>' +
+            '<path d="M10 11v6"></path><path d="M14 11v6"></path>' +
+            '<path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>' +
+          '</svg>' +
+        '</button>' +
+      '</div>' +
+      '<div style="display: flex; gap: 8px; width: 100%; align-items: center;">' +
+        '<div class="entry-card-body" style="flex-direction: row; gap: 10px; align-items: center; width: 100%;">' +
+          '<div class="entry-name-row" style="flex: 1;">' +
+            '<input type="text" placeholder="Name (e.g. Trending Movies)" class="name" value="' + escapeAttr(name || '') + '">' +
+          '</div>' +
+          '<div class="entry-type-row" style="width: auto;">' +
+            '<select class="type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
+              '<option value="movie" ' + ((type === 'movie' || (isCustomList && type === 'movie')) ? 'selected' : '') + '>Movies</option>' +
+              '<option value="series" ' + ((type === 'series' || isChannel || (isCustomList && type === 'series')) ? 'selected' : '') + '>Shows</option>' +
+            '</select>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="sources">' + rowsHtml + '</div>' +
+    (isWatchlist
       ? '<p class="watchlist-note"><small>Uses the MDBList API key from Settings.</small></p>'
       : (isChannel || isCustomList || isPremade)
         ? ''
-        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>'}
-    <div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>\${escapeHtml(name||'Unnamed')} - \${type === 'series' ? 'Series' : 'Movies'}</span><button type="button" class="text-action-btn" disabled>See All \›</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>
-  \`;
+        : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>') +
+    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
   container.appendChild(div);
   updateSourceRemoveButtons(div);
   relocateAddSourceBtn(div);
@@ -1248,6 +1400,7 @@ ${buildAddAllCombinedChartsJs()}
 
 ${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
 ${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
+${buildAddAllFnJs("addAllGenreCharts", buildAddAllPairsCallsJs(GENRE_LISTS, "Genres", ""))}
 
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
@@ -1271,6 +1424,7 @@ document.addEventListener('click', (e) => {
   else if (action === 'hidden-gems') addAllHiddenGems();
   else if (action === 'kids') addAllKidsCharts();
   else if (action === 'holidays') addAllHolidayCharts();
+  else if (action === 'genres') addAllGenreCharts();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal

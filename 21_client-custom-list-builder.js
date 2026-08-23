@@ -142,8 +142,6 @@ async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn
 
 function renderCustomListDraftList() {
   const box = document.getElementById('customListDraftList');
-  const badge = document.getElementById('customListDraftCountBadge');
-  if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
   if (!customListDraftItems.length) {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p>';
     return;
@@ -393,6 +391,13 @@ function shuffleCustomListDraft() {
   renderCustomListDraftList();
 }
 
+function removeAllCustomListDraftPicks() {
+  if (!customListDraftItems.length) return;
+  if (!confirm('Remove all ' + customListDraftItems.length + ' picks? This cannot be undone.')) return;
+  customListDraftItems = [];
+  renderCustomListDraftList();
+}
+
 // Set by editCustomList below while an existing Custom List's picks are
 // loaded into the draft for editing; null means "Save" creates a brand
 // new list, same as always.
@@ -539,6 +544,16 @@ async function saveCreatorListEdit(name) {
       }
       return;
     }
+    if (editingCreatorListSlug === 'watchlist') {
+      const map = loadLocalCustomLists();
+      if (map['watchlist']) {
+        map['watchlist'].items = customListDraftItems;
+        map['watchlist'].visibility = visibility;
+        map['watchlist'].updatedAt = Date.now();
+        saveLocalCustomListsMap(map);
+      }
+      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    }
     if (typeof showSavedCustomListModal === 'function') {
       showSavedCustomListModal(name, visibility, data.url);
     } else {
@@ -558,20 +573,63 @@ async function saveCreatorListEdit(name) {
 // Local equivalent of saveCreatorListEdit above -- same role, writes to
 // the local store instead of the server, no visibility to preserve since
 // local lists don't have one.
-function saveLocalCustomListEdit(name) {
+async function saveLocalCustomListEdit(name) {
   const map = loadLocalCustomLists();
   const slug = editingLocalCustomListSlug;
   const existing = map[slug];
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  const visibility = visSelect && visSelect.value === 'public' ? 'public' : 'private';
   map[slug] = {
     slug: slug,
     name: name,
     type: customListDraftType,
     items: customListDraftItems,
+    visibility: visibility,
     createdAt: existing ? existing.createdAt : Date.now(),
     updatedAt: Date.now(),
   };
   saveLocalCustomListsMap(map);
-  showAddedToast('"' + name + '" updated \u2713');
+  if (slug === 'watchlist') {
+    if (typeof pushTrackingSync === 'function') pushTrackingSync();
+  }
+  if (typeof scheduleCreatorSyncSave === 'function') {
+    scheduleCreatorSyncSave();
+  }
+
+  let finalUrl = ((typeof activeCreator !== 'undefined' && activeCreator)
+    ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (slug || 'watchlist'))
+    : (location.origin + '/lists/' + (slug === 'watchlist' ? 'watchlist' : ('custom/' + slug))));
+
+  if (typeof activeCreator !== 'undefined' && activeCreator) {
+    const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    if (creatorKey) {
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slug: slug,
+            name: name,
+            type: customListDraftType,
+            items: customListDraftItems,
+            visibility: visibility,
+          }),
+        });
+        const data = await res.json();
+        if (data.ok && data.url) {
+          finalUrl = data.url;
+        }
+      } catch (e) {}
+    }
+  }
+
+  if (typeof showSavedCustomListModal === 'function') {
+    showSavedCustomListModal(name, visibility, finalUrl);
+  } else {
+    showAddedToast('"' + name + '" updated \u2713');
+  }
   cancelEditCustomList();
   renderCreatorDashboard();
 }
@@ -645,12 +703,15 @@ function updateCustomListSaveButtonLabel() {
   const visRow = document.getElementById('customListVisibilityRow');
   if (!saveBtn) return;
   const titleEl = document.getElementById('customListEditorTitle');
-  const isEditing = editingCreatorListSlug || editingLocalCustomListSlug || editingCustomListUrlInput;
+  const nameInput = document.getElementById('customListNameInput');
+  const currentListName = nameInput ? nameInput.value.trim() : '';
+  const isEditing = !!(editingCreatorListSlug || editingLocalCustomListSlug || editingCustomListUrlInput);
   if (titleEl) {
-    titleEl.innerHTML = (isEditing ? 'Edit Custom List' : 'Create a Custom List') + ' <span class="badge" id="customListDraftCountBadge"></span>';
-    // Must update badge text again since we just rewrote innerHTML
-    const badge = document.getElementById('customListDraftCountBadge');
-    if (badge) badge.textContent = customListDraftItems.length ? '(' + customListDraftItems.length + ')' : '';
+    if (isEditing) {
+      titleEl.textContent = currentListName ? ('Edit ' + currentListName) : 'Edit List';
+    } else {
+      titleEl.textContent = 'Create a Custom List';
+    }
   }
 
   saveBtn.textContent = 'Save';
@@ -659,7 +720,7 @@ function updateCustomListSaveButtonLabel() {
     cancelBtn.style.display = isEditing ? '' : 'none';
   }
   if (visRow) {
-    visRow.style.display = editingCreatorListSlug ? '' : 'none';
+    visRow.style.display = '';
   }
 }
 
@@ -892,6 +953,9 @@ function setShowFullyWatched(showId, isFullyWatched) {
     }
   }
   refreshWatchBadge(showId, 'series');
+  if (isFullyWatched && typeof cleanWatchedFromWatchlists === 'function') {
+    cleanWatchedFromWatchlists();
+  }
 }
 
 // Companion to setShowFullyWatched above -- marks a show as having an
@@ -911,10 +975,16 @@ function setShowInProgress(showId, isInProgress) {
   refreshWatchBadge(showId, 'series');
 }
 
-// Automatically removes a watched item (by its ID, IMDb ID, or parent show ID)
-// from any Custom List designated as the Watchlist.
+// Automatically removes a watched item from any Custom List designated as the Watchlist.
+// Movies are removed as soon as they are watched.
+// TV shows are ONLY removed when every episode is watched (in _fullyWatchedShowIds).
 function removeWatchedItemFromWatchlist(id, showId, extraIds) {
   if (!id && !showId && (!extraIds || !extraIds.length)) return;
+  const shouldRemove = (function() {
+    try { return localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0'; }
+    catch (e) { return true; }
+  })();
+  if (!shouldRemove) return;
   const targetIds = new Set();
   const addId = (raw) => {
     if (!raw) return;
@@ -925,13 +995,14 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
     else if (/^\d+$/.test(s)) targetIds.add('tmdb:' + s);
   };
   addId(id);
-  addId(showId);
   if (Array.isArray(extraIds)) extraIds.forEach(addId);
   if (window._currentItemDetails) {
     addId(window._currentItemDetails.id);
     addId(window._currentItemDetails.imdbId);
     addId(window._currentItemDetails.tmdbId);
   }
+
+  const fullyWatchedShowIds = window._fullyWatchedShowIds || new Set();
 
   const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
   let localChanged = false;
@@ -949,10 +1020,20 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
       const itImdbId = String(it.imdbId || '');
       const itShowId = String(it.showId || '');
       const itTmdbId = String(it.tmdbId || '');
+      const isSeries = it.type === 'series' || it.type === 'tv' || it.type === 'show';
+
+      if (isSeries) {
+        if (itId && fullyWatchedShowIds.has(itId)) return false;
+        if (itImdbId && fullyWatchedShowIds.has(itImdbId)) return false;
+        if (itShowId && fullyWatchedShowIds.has(itShowId)) return false;
+        if (itTmdbId && fullyWatchedShowIds.has(itTmdbId)) return false;
+        if (itId && itId.startsWith('tmdb:') && fullyWatchedShowIds.has(itId.slice(5))) return false;
+        if (itId && /^\d+$/.test(itId) && fullyWatchedShowIds.has('tmdb:' + itId)) return false;
+        return true;
+      }
 
       if (itId && (targetIds.has(itId) || (/^\d+$/.test(itId) && targetIds.has('tmdb:' + itId)) || (itId.startsWith('tmdb:') && targetIds.has(itId.slice(5))))) return false;
       if (itImdbId && targetIds.has(itImdbId)) return false;
-      if (itShowId && targetIds.has(itShowId)) return false;
       if (itTmdbId && (targetIds.has(itTmdbId) || targetIds.has('tmdb:' + itTmdbId))) return false;
       return true;
     });
@@ -989,8 +1070,8 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
 
   if (localChanged) {
     if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
-    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
   }
 
   // Also check Creator profile lists if signed in
@@ -1006,10 +1087,20 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
         const itImdbId = String(it.imdbId || '');
         const itShowId = String(it.showId || '');
         const itTmdbId = String(it.tmdbId || '');
+        const isSeries = it.type === 'series' || it.type === 'tv' || it.type === 'show';
+
+        if (isSeries) {
+          if (itId && fullyWatchedShowIds.has(itId)) return false;
+          if (itImdbId && fullyWatchedShowIds.has(itImdbId)) return false;
+          if (itShowId && fullyWatchedShowIds.has(itShowId)) return false;
+          if (itTmdbId && fullyWatchedShowIds.has(itTmdbId)) return false;
+          if (itId && itId.startsWith('tmdb:') && fullyWatchedShowIds.has(itId.slice(5))) return false;
+          if (itId && /^\d+$/.test(itId) && fullyWatchedShowIds.has('tmdb:' + itId)) return false;
+          return true;
+        }
 
         if (itId && (targetIds.has(itId) || (/^\d+$/.test(itId) && targetIds.has('tmdb:' + itId)) || (itId.startsWith('tmdb:') && targetIds.has(itId.slice(5))))) return false;
         if (itImdbId && targetIds.has(itImdbId)) return false;
-        if (itShowId && targetIds.has(itShowId)) return false;
         if (itTmdbId && (targetIds.has(itTmdbId) || targetIds.has('tmdb:' + itTmdbId))) return false;
         return true;
       });
@@ -1034,15 +1125,28 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
   }
 }
 
-// Scans Watch History and removes any watched movies, shows, or episodes from all Watchlists
+// Scans Watch History and removes watched items from the user's Watchlist.
+// Rule: movies are removed as soon as they appear in Watch History.
+//       TV shows are removed ONLY when every episode has been watched
+//       (i.e. the show appears in window._fullyWatchedShowIds). A show with
+//       even one unwatched episode stays in the Watchlist so the user doesn't
+//       lose track of it mid-series.
 function cleanWatchedFromWatchlists() {
+  const shouldRemove = (function() {
+    try { return localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0'; }
+    catch (e) { return true; }
+  })();
+  if (!shouldRemove) return;
+
   const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
   const historyList = map['watch-history'];
   const watchedItems = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
-  if (!watchedItems.length && (!window._watchedItemIds || !window._watchedItemIds.size)) return;
+  const hasWatchedIds = watchedItems.length > 0 || (window._watchedItemIds && window._watchedItemIds.size > 0);
+  const hasFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.size > 0;
+  if (!hasWatchedIds && !hasFullyWatched) return;
 
+  // Build the set of watched movie/episode IDs (used only for movies).
   const watchedIds = new Set(window._watchedItemIds ? Array.from(window._watchedItemIds) : []);
-  const watchedShowIds = new Set();
   watchedItems.forEach((w) => {
     if (w.id) {
       const s = String(w.id);
@@ -1056,8 +1160,11 @@ function cleanWatchedFromWatchlists() {
       watchedIds.add(s);
       watchedIds.add('tmdb:' + s);
     }
-    if (w.showId) watchedShowIds.add(String(w.showId));
   });
+
+  // Fully-watched show IDs (only populated once the cron/logic marks a
+  // show as completely done -- a partially-watched show is NOT included).
+  const fullyWatchedShowIds = window._fullyWatchedShowIds || new Set();
 
   let localChanged = false;
 
@@ -1072,16 +1179,24 @@ function cleanWatchedFromWatchlists() {
       if (!it) return false;
       const itId = String(it.id || '');
       const itImdbId = String(it.imdbId || '');
-      const itShowId = String(it.showId || '');
       const itTmdbId = String(it.tmdbId || '');
+      const isSeries = it.type === 'series' || it.type === 'tv' || it.type === 'show';
 
-      if (itId && (watchedIds.has(itId) || (/^\d+$/.test(itId) && watchedIds.has('tmdb:' + itId)) || (itId.startsWith('tmdb:') && watchedIds.has(itId.slice(5))))) return false;
-      if (itImdbId && watchedIds.has(itImdbId)) return false;
-      if (itShowId && (watchedShowIds.has(itShowId) || watchedIds.has(itShowId))) return false;
-      if (itTmdbId && (watchedIds.has(itTmdbId) || watchedIds.has('tmdb:' + itTmdbId))) return false;
-      if (itId && watchedShowIds.has(itId)) return false;
-
-      return true;
+      if (isSeries) {
+        // TV shows: only remove when fully watched (all episodes done).
+        if (itId && fullyWatchedShowIds.has(itId)) return false;
+        if (itImdbId && fullyWatchedShowIds.has(itImdbId)) return false;
+        if (itTmdbId && fullyWatchedShowIds.has(itTmdbId)) return false;
+        if (itId && itId.startsWith('tmdb:') && fullyWatchedShowIds.has(itId.slice(5))) return false;
+        if (itId && /^\d+$/.test(itId) && fullyWatchedShowIds.has('tmdb:' + itId)) return false;
+        return true;
+      } else {
+        // Movies: remove as soon as they appear in Watch History.
+        if (itId && (watchedIds.has(itId) || (/^\d+$/.test(itId) && watchedIds.has('tmdb:' + itId)) || (itId.startsWith('tmdb:') && watchedIds.has(itId.slice(5))))) return false;
+        if (itImdbId && watchedIds.has(itImdbId)) return false;
+        if (itTmdbId && (watchedIds.has(itTmdbId) || watchedIds.has('tmdb:' + itTmdbId))) return false;
+        return true;
+      }
     });
 
     if (list.items.length !== initialLen) {
@@ -1092,8 +1207,8 @@ function cleanWatchedFromWatchlists() {
 
   if (localChanged) {
     if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
-    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
   }
 }
 
@@ -1246,7 +1361,12 @@ window.toggleBatchWatchStatus = function(items) {
 
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
-  items.forEach(it => refreshWatchBadge(it.id, it.type));
+  items.forEach((it) => {
+    refreshWatchBadge(it.id, it.type);
+    if (typeof syncSingleItemToConnectedProviders === 'function') {
+      syncSingleItemToConnectedProviders(it, !allWatched ? 'add' : 'remove');
+    }
+  });
 
   return { added: added, removed: removed, nowWatched: !allWatched };
 };
@@ -1295,11 +1415,14 @@ window.markShowWatched = async function(imdbId) {
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
+              const epStill = ep.still_path
+                ? (ep.still_path.startsWith('http') ? ep.still_path : 'https://image.tmdb.org/t/p/w500' + ep.still_path)
+                : (d.poster || '');
               allEpisodes.push({
                 id: String(ep.id),
                 type: 'episode',
                 name: ep.name,
-                poster: d.poster || '',
+                poster: epStill,
                 showId: String(d.id),
                 showTitle: d.title,
                 showPoster: d.poster || '',
@@ -1345,6 +1468,17 @@ window.markShowWatched = async function(imdbId) {
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
+  document.querySelectorAll('.btn-mark-season-watched').forEach((seasonBtn) => {
+    if (nowWatched) {
+      seasonBtn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
+      seasonBtn.classList.remove('primary');
+      seasonBtn.classList.add('secondary');
+    } else {
+      seasonBtn.innerHTML = 'Mark Season Watched';
+      seasonBtn.classList.remove('secondary');
+      seasonBtn.classList.add('primary');
+    }
+  });
 };
 
 // One-way add to Watch History as watched -- unlike toggleBatchWatchStatus
@@ -1397,7 +1531,12 @@ window.addItemsToWatchHistory = async function(items) {
   // cwTotal below let it report real numbers instead of assuming success.
   const cwResult = await updateContinueWatchingForBatch(items);
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
-  items.forEach(it => refreshWatchBadge(it.id, it.type));
+  items.forEach((it) => {
+    refreshWatchBadge(it.id, it.type);
+    if (typeof syncSingleItemToConnectedProviders === 'function') {
+      syncSingleItemToConnectedProviders(it, 'add');
+    }
+  });
   return { added: added, cwSucceeded: cwResult.succeeded, cwTotal: cwResult.total };
 };
 
@@ -1535,37 +1674,35 @@ async function updateContinueWatching(showId) {
     const data = await res.json();
     if (!data.ok || !data.season || !data.season.episodes) throw new Error('no data');
 
-    const eps = data.season.episodes.filter(ep => isEpisodeAired(ep));
-    const nextInSeason = eps.find(ep => ep.episode_number > latest.episodeNum);
+    const allEps = data.season.episodes;
+    const nextInSeason = allEps.find((ep) => ep.episode_number > latest.episodeNum);
 
     if (nextInSeason) {
+      const aired = isEpisodeAired(nextInSeason);
       newEntry = {
         id: String(nextInSeason.id),
         type: 'episode',
-        // Bare episode name -- matching Watch History's own item.name
-        // convention. formatWatchItemLabel already reconstructs "Show
-        // SxxExx" from showTitle/seasonNum/episodeNum for display, so a
-        // pre-formatted composite string here would show that same
-        // show/season/episode prefix twice (once from formatWatchItemLabel
-        // itself, once baked into this string as its subtitle).
         name: nextInSeason.name,
         poster: latest.showPoster || '',
         showId: showId,
         showTitle: latest.showTitle || '',
         showPoster: latest.showPoster || '',
         seasonNum: latest.seasonNum,
-        episodeNum: nextInSeason.episode_number
+        episodeNum: nextInSeason.episode_number,
+        airDate: nextInSeason.air_date || null,
+        isUnaired: !aired,
       };
-      showFullyWatched = false;
+      // If the next episode has not aired yet, all currently aired episodes have been watched
+      showFullyWatched = !aired;
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
       const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
         '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
       const data2 = await res2.json();
-      if (data2.ok && data2.season && data2.season.episodes) {
-        const nextEps = data2.season.episodes.filter(ep => isEpisodeAired(ep));
-        const firstNext = nextEps[0];
+      if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
+        const firstNext = data2.season.episodes[0];
         if (firstNext) {
+          const aired = isEpisodeAired(firstNext);
           newEntry = {
             id: String(firstNext.id),
             type: 'episode',
@@ -1575,12 +1712,12 @@ async function updateContinueWatching(showId) {
             showTitle: latest.showTitle || '',
             showPoster: latest.showPoster || '',
             seasonNum: nextSeasonNum,
-            episodeNum: firstNext.episode_number
+            episodeNum: firstNext.episode_number,
+            airDate: firstNext.air_date || null,
+            isUnaired: !aired,
           };
-          showFullyWatched = false;
+          showFullyWatched = !aired;
         } else {
-          // TMDB knows about the next season but it hasn't started airing
-          // yet -- nothing unwatched-and-aired remains right now.
           showFullyWatched = true;
         }
       } else {

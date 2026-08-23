@@ -1,5 +1,5 @@
 async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
-  const keys = collectKeys();
+  const keys = (typeof collectKeys === 'function') ? collectKeys() : {};
   const items = [];
   let skip = 0;
   let pagesLoaded = 0;
@@ -8,10 +8,17 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   // several numbered lists instead of silently truncating (see copyListToCustomList)
   while (pagesLoaded < MAX_PAGES) {
     const body = { url: listUrl, type: type, skip: skip, sample: 100 };
+    if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
     if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
     if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
     if (keys.traktKey) body.traktKey = keys.traktKey;
     if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+    if (keys.simklKey) body.simklKey = keys.simklKey;
+    if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
+    if (keys.simklUsername) body.simklUsername = keys.simklUsername;
+    if (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) {
+      body.creatorName = activeCreator.creatorName;
+    }
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -22,7 +29,17 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     if (!data.ok) throw new Error(data.error || 'unknown error');
     const pageItems = data.sample || [];
     pageItems.forEach((m) => {
-      items.push({ imdbId: m.id, title: m.name, year: m.year || '', poster: m.poster || null, showTitle: m.showTitle || null });
+      items.push({
+        id: m.id,
+        imdbId: m.id,
+        title: m.name,
+        year: m.year || '',
+        poster: m.poster || null,
+        showTitle: m.showTitle || null,
+        type: m.type || type,
+        seasonNum: m.season != null ? m.season : null,
+        episodeNum: m.episode != null ? m.episode : null
+      });
     });
     skip += pageItems.length;
     pagesLoaded++;
@@ -95,33 +112,13 @@ async function saveItemsAsNewCustomList(name, type, items, visibility, extraProp
 // Copies a Trakt (or any) list straight into a saved Custom List -- no
 // detour through the draft picker for a manual "Save as a List" click,
 // since there's nothing to review here that isn't already decided (the
-// whole list, as-is). Unlike the live "+ Add" button (which keeps
-// re-fetching the source every time the catalog loads), this is a one-time
-// snapshot: useful for a private Trakt list specifically, since the copy
-// keeps working on its own even after the Trakt connection eventually
-// expires, where a live row referencing that same private list would stop
-// resolving once it does.
-//
-// A Custom List can only ever be one type (movies or shows, never mixed --
-// same rule the manual picker already enforces), but a source list often
-// isn't -- a Trakt watchlist especially. So an ambiguous/mixed source
-// (contentType anything other than a clean 'movie' or 'series') gets
-// copied as *two* separate Custom Lists instead of one, each named with a
-// "(Movies)"/"(Shows)" suffix to tell them apart, silently skipping
-// whichever half turns out to have nothing in it (e.g. a "mixed"-looking
-// list that's actually all movies).
-// Per-list item cap for Copy to Custom List -- a source bigger than this
-// splits across multiple numbered lists (see copyListToCustomList) rather
-// than truncating or growing one list without bound.
+// whole list, as-is). Mixed lists and watch history copy as a unified mixed
+// custom list with movies and episodes/shows intact.
 const CUSTOM_LIST_CHUNK_SIZE = 6000;
 
 async function copyListToCustomList(name, listUrl, contentType, btn, historyMode, extraProps) {
-  const typesToCopy = contentType === 'movie' || contentType === 'series' ? [contentType] : ['movie', 'series'];
-  const isSplit = typesToCopy.length > 1;
-  // Restored on the way out below -- this is called from several different
-  // buttons (search results, My Lists, and the Custom List panel's own
-  // "Import from link"), each with its own resting label, so hardcoding one
-  // back would leave the others mislabeled after their first use.
+  const isSingle = contentType === 'movie' || contentType === 'series';
+  const typesToFetch = isSingle ? [contentType] : ['movie', 'series'];
   const originalLabel = btn ? btn.textContent : '';
 
   if (btn) {
@@ -129,54 +126,75 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
     btn.textContent = 'Copying\u2026';
   }
 
-  const created = [];
+  const allItems = [];
+  let hasMovies = false;
+  let hasShows = false;
   const failed = [];
-  for (const type of typesToCopy) {
+
+  for (const type of typesToFetch) {
     const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
     let items;
     try {
-      items = await fetchAllItemsForList(listUrl, type, btn, isSplit ? typeLabel : '');
+      items = await fetchAllItemsForList(listUrl, type, btn, !isSingle ? typeLabel : '');
     } catch (e) {
-      failed.push({ name: isSplit ? name + ' (' + typeLabel + ')' : name, error: e.message || 'network error' });
+      failed.push({ name: !isSingle ? name + ' (' + typeLabel + ')' : name, error: e.message || 'network error' });
       continue;
     }
-    if (!items.length) continue; // e.g. a "mixed" list that turns out to be all one type -- skip the empty half quietly
-    // Watch History's per-episode rows all carry the same show id with a
-    // "Show S1E5 \u2014 Title" name (see mapTraktHistoryItems) -- Shows mode
-    // collapses that down to one tile per show (first occurrence wins,
-    // since history comes back most-recently-watched first) using the
-    // plain showTitle field carried alongside each item for exactly this.
-    // Only ever applies to type 'series' items that actually have one;
-    // everything else (movies, any other list) passes through untouched.
-    if (historyMode === 'shows' && type === 'series') {
-      const seen = new Map();
-      items.forEach((it) => {
-        if (!seen.has(it.imdbId)) {
-          seen.set(it.imdbId, { imdbId: it.imdbId, title: it.showTitle || it.title, year: it.year, poster: it.poster });
-        }
+    if (!items.length) continue;
+    if (type === 'movie') hasMovies = true;
+    if (type === 'series') hasShows = true;
+
+    items.forEach((it) => {
+      allItems.push({
+        id: it.imdbId || it.id,
+        imdbId: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : ''),
+        tmdbId: it.tmdbId || '',
+        title: it.title || it.name || '',
+        year: it.year || '',
+        poster: it.poster || null,
+        showTitle: it.showTitle || null,
+        type: it.type || (it.seasonNum != null ? 'episode' : (type === 'series' ? 'series' : 'movie')),
+        seasonNum: it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null),
+        episodeNum: it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null)
       });
-      items = Array.from(seen.values());
-    }
-    // showTitle was only ever needed for the dedupe step above -- strip it
-    // before saving so a Custom List's items stay the same shape they've
-    // always been.
-    items = items.map((it) => ({ imdbId: it.imdbId, title: it.title, year: it.year, poster: it.poster }));
-    const baseListName = isSplit ? name + ' (' + typeLabel + ')' : name;
-    // A single Custom List is capped at CUSTOM_LIST_CHUNK_SIZE items. A
-    // source bigger than that (mainly a large Watch History copy, since
-    // that source is the raw undeduped episode-watch feed -- see
-    // fetchTraktHistory) gets split across multiple numbered lists
-    // ("Name", "Name 2", "Name 3"...) instead of the old flat 2000-item
-    // cap, which silently truncated mid-history with no way to get the rest.
-    for (let i = 0; i * CUSTOM_LIST_CHUNK_SIZE < items.length; i++) {
-      const chunk = items.slice(i * CUSTOM_LIST_CHUNK_SIZE, (i + 1) * CUSTOM_LIST_CHUNK_SIZE);
-      const listName = i === 0 ? baseListName : baseListName + ' ' + (i + 1);
-      const result = await saveItemsAsNewCustomList(listName, type, chunk, 'private', extraProps);
-      if (result.ok) {
-        created.push({ name: listName, count: chunk.length });
+    });
+  }
+
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+
+  if (!allItems.length) {
+    if (failed.length) {
+      const errMsg = 'Could not copy: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Copy Incomplete', errMsg, false);
       } else {
-        failed.push({ name: listName, error: result.error });
+        alert(errMsg);
       }
+    } else {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('No Items', 'That list has no items to copy.', false);
+      } else {
+        alert('That list has no items to copy.');
+      }
+    }
+    return;
+  }
+
+  const finalType = (hasMovies && hasShows) ? 'mixed' : (hasShows ? 'series' : 'movie');
+  const baseListName = name;
+  const created = [];
+
+  for (let i = 0; i * CUSTOM_LIST_CHUNK_SIZE < allItems.length; i++) {
+    const chunk = allItems.slice(i * CUSTOM_LIST_CHUNK_SIZE, (i + 1) * CUSTOM_LIST_CHUNK_SIZE);
+    const listName = i === 0 ? baseListName : baseListName + ' ' + (i + 1);
+    const result = await saveItemsAsNewCustomList(listName, finalType, chunk, 'private', extraProps);
+    if (result.ok) {
+      created.push({ name: listName, count: chunk.length });
+    } else {
+      failed.push({ name: listName, error: result.error });
     }
   }
 
@@ -517,6 +535,110 @@ async function markMdblistHistoryAllWatched(btn) {
     showAppAlert('MDBList History Synced', msg, true);
   } else {
     alert(msg);
+  }
+}
+
+async function markSimklListAllWatched(btn) {
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  if (!token) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Not Connected', 'Please connect your Simkl account in Settings first.', false);
+    } else {
+      alert('Connect Simkl first.');
+    }
+    return;
+  }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Fetching items\u2026'; }
+
+  const listUrl = btn ? btn.getAttribute('data-url') : '';
+  const listName = btn ? btn.getAttribute('data-name') : 'Simkl Completed';
+  const listType = btn ? btn.getAttribute('data-type') : 'movie';
+
+  try {
+    const rawItems = await fetchAllItemsForList(listUrl, listType, btn);
+    if (!rawItems || !rawItems.length) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('No Items', 'No items found in ' + listName + '.', false);
+      } else {
+        alert('No items found in ' + listName + '.');
+      }
+      if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+      return;
+    }
+
+    const whItems = [];
+    const seenIds = new Set();
+
+    for (const it of rawItems) {
+      const isMovie = it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode');
+      const rootImdb = it.imdbId || (String(it.id || '').startsWith('tt') ? String(it.id).split(':')[0] : '');
+      const rootTmdb = it.tmdbId ? String(it.tmdbId).split(':')[0] : (!isNaN(parseInt(it.id, 10)) ? String(parseInt(it.id, 10)) : '');
+      const showId = it.showId || rootImdb || (rootTmdb ? 'tmdb:' + rootTmdb : it.id);
+      const title = it.title || it.name || it.showTitle || '';
+      const showTitle = it.showTitle || it.title || it.name || '';
+      const poster = it.poster || '';
+      const showPoster = it.showPoster || it.poster || '';
+
+      if (isMovie) {
+        const id = rootImdb || (rootTmdb ? 'tmdb:' + rootTmdb : it.id);
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          whItems.push({
+            id: id,
+            imdbId: rootImdb || undefined,
+            tmdbId: rootTmdb || undefined,
+            type: 'movie',
+            name: title,
+            title: title,
+            year: it.year || '',
+            poster: poster,
+            watchedAt: Date.now(),
+          });
+        }
+      } else {
+        const epKey = (it.seasonNum != null && it.episodeNum != null) ? (showId + ':' + it.seasonNum + ':' + it.episodeNum) : showId;
+        if (!seenIds.has(epKey)) {
+          seenIds.add(epKey);
+          whItems.push({
+            id: epKey,
+            imdbId: rootImdb || undefined,
+            tmdbId: rootTmdb || undefined,
+            type: it.seasonNum != null ? 'episode' : 'series',
+            name: title,
+            title: title,
+            showTitle: showTitle,
+            showId: showId,
+            showPoster: showPoster,
+            seasonNum: it.seasonNum || null,
+            episodeNum: it.episodeNum || null,
+            poster: poster || showPoster,
+            watchedAt: Date.now(),
+          });
+        }
+      }
+    }
+
+    if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
+    const whResult = await addItemsToWatchHistory(whItems);
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+    let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
+    if (whResult.cwTotal) {
+      msg += ' Continue Watching checked for ' + whResult.cwSucceeded + ' of ' + whResult.cwTotal + ' show' + (whResult.cwTotal === 1 ? '' : 's') + '.';
+    }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Completed Synced', msg, true);
+    } else {
+      alert(msg);
+    }
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Error', 'Could not mark items as watched: ' + (err.message || 'network error'), false);
+    } else {
+      alert('Could not mark items as watched: ' + (err.message || 'network error'));
+    }
   }
 }
 

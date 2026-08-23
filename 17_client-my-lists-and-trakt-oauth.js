@@ -18,11 +18,12 @@ function scheduleMyTraktListsRefresh() {
 
 async function runMyMdblistLists() {
   const box = document.getElementById('myMdblistListsResult');
+  if (!box) return;
   const keyInput = document.getElementById('mdblistKeyInput');
   const manualKey = keyInput ? keyInput.value.trim() : '';
-  const key = manualKey || mdblistAccessToken;
+  const key = manualKey || mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   if (!key) {
-    box.innerHTML = '';
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your MDBList account in Settings or click <strong>Connect MDBList</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
   box.innerHTML = '<p style="margin-top:10px;"><small>Loading your MDBList lists\u2026</small></p>';
@@ -65,8 +66,7 @@ function renderMyMdblistLists(lists) {
     const typeLabel = isHistory ? 'Watch History' : (isWatchlist ? 'Watchlist' : (l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed')));
     const viewType = isSingleType ? type : 'mixed';
     const copyBtn = isHistory
-      ? '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="shows">Copy (Shows)</button>' +
-        '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>' +
+      ? '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="mixed">Copy</button>' +
         '<button type="button" class="lc-btn secondary" onclick="markMdblistHistoryAllWatched(this)">Mark all as Watched</button>'
       : '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>';
 
@@ -134,10 +134,12 @@ document.getElementById('myMdblistListsResult').addEventListener('click', (e) =>
 
 async function runMyTraktLists() {
   const box = document.getElementById('myTraktListsResult');
-  const username = document.getElementById('traktUsernameInput').value.trim();
-  const traktKey = document.getElementById('traktKeyInput').value.trim();
-  if (!username) {
-    box.innerHTML = '';
+  if (!box) return;
+  const username = document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '';
+  const traktKey = document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '';
+  const token = traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  if (!username && !token) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Trakt account in Settings or click <strong>Connect Trakt</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
   box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Trakt lists\u2026</small></p>';
@@ -290,6 +292,12 @@ function renderMdblistConnectStatus() {
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect MDBList' : (key ? 'Update Key' : 'Connect MDBList Account');
   if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+
+  const syncCb = document.getElementById('syncMdblistHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
+  const syncWrap = document.getElementById('mdblistSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+
   if (connected) {
     scheduleMyMdblistListsRefresh();
   }
@@ -302,15 +310,18 @@ function pickUpMdblistTokenFromUrl() {
     mdblistAccessToken = decodeURIComponent(match[1]);
     const userMatch = /(?:^|[#&])mdblist_username=([^&]+)/.exec(hash);
     if (userMatch) {
-      const user = decodeURIComponent(userMatch[1]);
+      mdblistUsername = decodeURIComponent(userMatch[1]);
       try {
-        localStorage.setItem('myListAddon:mdblistUsername', user);
+        localStorage.setItem('myListAddon:mdblistUsername', mdblistUsername);
       } catch (e) {}
     }
+    try {
+      localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessToken);
+    } catch (e) {}
     saveState();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
-      showAppAlert('MDBList Connected', 'Your MDBList account was successfully connected.', true);
+      showAppAlert('MDBList Connected', 'Connected to MDBList.', true);
     } else {
       alert('Connected to MDBList.');
     }
@@ -400,6 +411,12 @@ function renderTraktConnectStatus() {
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Trakt' : (key ? 'Update Client ID' : 'Connect Trakt Account');
   if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+
+  const syncCb = document.getElementById('syncTraktHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
+  const syncWrap = document.getElementById('traktSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+
   const box = document.getElementById('myPrivateTraktListsResult');
   if (connected) {
     scheduleMyPrivateTraktListsRefresh();
@@ -629,19 +646,14 @@ function renderMyPrivateTraktLists(lists) {
   });
 
   const cardsHtml = lists.map((l) => {
-    const isHistory = l.url === 'trakt:history';
+    const isHistory = l.url === 'trakt:history' || l.slug === 'history';
+    const isWatchlist = l.url === 'trakt:watchlist' || l.slug === 'watchlist';
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
-    const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
+    const typeLabel = isHistory ? 'Watch History' : (isWatchlist ? 'Watchlist' : (l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed')));
     const viewType = isSingleType ? type : 'mixed';
     const copyBtn = isHistory
-      ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="shows">Copy (Shows)</button>' +
-        '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '" data-history-mode="episodes">Copy (Episodes)</button>' +
-        // Marks every watched movie/episode straight into this add-on's
-        // own Watch History (and Continue Watching, for shows) -- unlike
-        // the Copy buttons above, which just duplicate the data into a
-        // browsable Custom List, this actually feeds the watched-tracking
-        // system itself. See markTraktHistoryAllWatched.
+      ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="mixed">Copy</button>' +
         '<button type="button" class="lc-btn secondary" onclick="markTraktHistoryAllWatched(this)">Mark all as Watched</button>'
       : '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>';
 
@@ -656,18 +668,18 @@ function renderMyPrivateTraktLists(lists) {
         '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
     }
 
-    const isCustomUserList = !isHistory && l.slug !== 'watchlist' && l.url !== 'trakt:watchlist';
+    const isCustomUserList = !isHistory && !isWatchlist;
     const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
     const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
 
     return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(l.name) + (l.private ? ' <span class="badge">Private</span>' : '') + '</div>' +
+          '<div class="list-card-title">' + escapeHtml(l.name) + (l.private && !isWatchlist && !isHistory ? ' <span class="badge">Private</span>' : '') + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
-            '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
+            (!isHistory && !isWatchlist ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
@@ -1126,6 +1138,12 @@ function renderSimklConnectStatus() {
 
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
   if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+
+  const syncCb = document.getElementById('syncSimklHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
+  const syncWrap = document.getElementById('simklSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+
   if (connected) {
     scheduleMySimklListsRefresh();
   }
@@ -1145,7 +1163,7 @@ async function runMySimklLists() {
   const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
 
   if (!token && !key) {
-    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Simkl account in Settings or click <strong>Connect Simkl</strong> above to see your watchlists and lists here.</small></p>';
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Simkl account in Settings or click <strong>Connect Simkl</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
 
@@ -1195,7 +1213,11 @@ function renderMySimklLists(lists) {
     const totalCount = l.itemCount || (l.items || []).length;
     const added = alreadyAdded.has(l.url + '|' + type);
 
+    const isCompleted = (l.name && l.name.toLowerCase().includes('completed')) || (l.url && l.url.includes(':completed')) || l.statusKey === 'completed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
+    const markWatchedBtn = isCompleted
+      ? '<button type="button" class="lc-btn secondary" data-url="' + escapeAttr(l.url) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(type) + '" onclick="markSimklListAllWatched(this)">Mark all as Watched</button>'
+      : '';
     const addBtn = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
 
     const previewItems = (l.items || []).slice(0, 9);
@@ -1238,9 +1260,12 @@ function renderMySimklLists(lists) {
         '</div>' +
         '<div class="list-card-actions">' +
           copyBtn +
+          markWatchedBtn +
           addBtn +
         '</div>' +
       '</div>' +
+      posterThumbs +
+    '</div>';
       posterThumbs +
     '</div>';
   }).join('');
@@ -1268,6 +1293,206 @@ function updateConnectionStatusBadges() {
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
   if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
   if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+}
+
+function toggleProviderHistorySync(provider, enabled) {
+  const cap = provider.charAt(0).toUpperCase() + provider.slice(1);
+  try {
+    localStorage.setItem('myListAddon:sync' + cap + 'History', enabled ? 'true' : 'false');
+  } catch (e) {}
+  saveState();
+  if (provider === 'trakt') renderTraktConnectStatus();
+  if (provider === 'mdblist') renderMdblistConnectStatus();
+  if (provider === 'simkl') renderSimklConnectStatus();
+  if (typeof pushCreatorSync === 'function' && activeCreator) {
+    pushCreatorSync();
+  }
+}
+
+async function syncWatchHistoryToProviderNow(provider, btn) {
+  const cap = provider.charAt(0).toUpperCase() + provider.slice(1);
+  const localMap = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+  const historyList = localMap['watch-history'];
+  const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
+  
+  if (!items.length) {
+    if (typeof showToast === 'function') showToast('Your Watch History is currently empty.');
+    else alert('Your Watch History is currently empty.');
+    return;
+  }
+
+  const origText = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Syncing ' + items.length + ' items\u2026';
+  }
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdblistKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/external-sync/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: provider,
+        items: items,
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        mdblistAccessToken: mdblistToken,
+        mdblistKey: mdblistKey,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+    if (!res.ok || !data.ok) {
+      if (typeof showToast === 'function') showToast('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
+      else alert('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
+      return;
+    }
+    const count = data.syncedCount != null ? data.syncedCount : items.length;
+    const msg = '\u2713 Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
+    if (typeof showToast === 'function') showToast(msg);
+    else alert(msg);
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+    if (typeof showToast === 'function') showToast('Network error syncing to ' + cap + '.');
+    else alert('Network error syncing to ' + cap + '.');
+  }
+}
+
+async function syncAllConnectedAccountsNow(btn) {
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+
+  const connectedProviders = [];
+  if (traktToken) connectedProviders.push('trakt');
+  if (mdblistToken) connectedProviders.push('mdblist');
+  if (simklToken) connectedProviders.push('simkl');
+
+  if (!connectedProviders.length) {
+    if (typeof showToast === 'function') showToast('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
+    else alert('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
+    return;
+  }
+
+  for (const p of connectedProviders) {
+    await syncWatchHistoryToProviderNow(p, btn);
+  }
+}
+
+async function syncSingleItemToConnectedProviders(item, action) {
+  if (!item) return;
+  const act = action || 'add';
+  const traktSync = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
+  const mdblistSync = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
+  const simklSync = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKeyEl = document.getElementById('traktKeyInput');
+  const traktKey = (traktKeyEl ? traktKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdblistKeyEl = document.getElementById('mdblistKeyInput');
+  const mdblistKey = (mdblistKeyEl ? mdblistKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKeyEl = document.getElementById('simklKeyInput');
+  const simklKey = (simklKeyEl ? simklKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  const isMovie = item.type === 'movie' || item.kind === 'movie';
+  const mediaType = isMovie ? 'movie' : 'series';
+  const rootId = item.showId || item.id || item.imdbId;
+  const imdbId = item.showId && item.showId.startsWith('tt') ? item.showId : (item.imdbId || (String(item.id || '').startsWith('tt') ? item.id : ''));
+  const seasonNum = item.seasonNum != null ? item.seasonNum : (item.season != null ? item.season : null);
+  const episodeNum = item.episodeNum != null ? item.episodeNum : (item.episode != null ? item.episode : null);
+  const title = item.showTitle || item.title || item.name || '';
+
+  const promises = [];
+
+  if (traktSync && traktToken) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'trakt',
+          target: 'history',
+          action: act,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).catch(() => {})
+    );
+  }
+
+  if (mdblistSync && (mdblistToken || mdblistKey)) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'mdblist',
+          target: 'history',
+          action: act,
+          mdblistAccessToken: mdblistToken,
+          mdblistKey: mdblistKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).catch(() => {})
+    );
+  }
+
+  if (simklSync && simklToken) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'simkl',
+          target: 'history',
+          action: act,
+          simklAccessToken: simklToken,
+          simklKey: simklKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).catch(() => {})
+    );
+  }
+
+  if (promises.length) {
+    Promise.allSettled(promises);
+  }
 }
 
 

@@ -176,6 +176,24 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey) {
 // lookups (see fetchTmdb below) so a single catalog page (up to PAGE_SIZE
 // items) doesn't blow past TMDB's soft ~20-simultaneous-connections-per-IP
 // limit and start drawing 429s.
+//
+// TMDB_DETAIL_RESOLVE_CONCURRENCY (below) governs every catalog/chart
+// fetcher's per-item resolve fan-out. It used to be a bare 12 at every call
+// site -- more than half of TMDB's own ~20-connection budget from a single
+// page load, on its own. fetchTmdbDetails' results are already cached hard
+// (7 days) and shared across every user regardless of personal API key
+// (every TMDB catalog source always uses the one shared TMDB_API_KEY --
+// see fetchCatalog's dispatch table in 05_catalog-core.js), so in steady
+// state most of these resolve instantly from cache with no real TMDB
+// connection at all. The number below only matters for the genuinely cold
+// case -- a brand new chart, or a title nobody's looked at yet -- and
+// that's exactly the case where two different people's catalog loads
+// landing on the same Cloudflare edge IP at the same moment could stack up
+// against TMDB's real limit. Lower value = more headroom for concurrent
+// *users* before hitting that ceiling, at the cost of a slower cold-cache
+// page load for any one of them.
+const TMDB_DETAIL_RESOLVE_CONCURRENCY = 6;
+
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let next = 0;
@@ -378,7 +396,7 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
 
   const page = filtered.slice(skip, skip + PAGE_SIZE);
 
-  const resolved = await mapWithConcurrency(page, 12, async (it) => {
+  const resolved = await mapWithConcurrency(page, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
@@ -419,7 +437,7 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "") {
   parts.sort((a, b) => (a.release_date || "9999").localeCompare(b.release_date || "9999"));
 
   const windowItems = parts.slice(skip, skip + PAGE_SIZE);
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, "movie", apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, "movie", videos);
@@ -435,13 +453,19 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "") {
 // database -- preferred over metahub, with metahub only as a fallback for
 // the rare item missing a poster_path.
 function mapTmdbItem(it, imdbId, type, videos) {
+  let poster = undefined;
+  if (it.poster_path) {
+    poster = `https://image.tmdb.org/t/p/w500${it.poster_path}`;
+  } else if (it.backdrop_path) {
+    poster = `https://image.tmdb.org/t/p/w780${it.backdrop_path}`;
+  } else if (imdbId && String(imdbId).startsWith("tt")) {
+    poster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
+  }
   return {
     id: imdbId,
     type,
     name: it.title || it.name,
-    poster: it.poster_path
-      ? `https://image.tmdb.org/t/p/w500${it.poster_path}`
-      : `https://images.metahub.space/poster/medium/${imdbId}/img`,
+    poster,
     background: it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : undefined,
     releaseInfo: (it.release_date || it.first_air_date || "").slice(0, 4) || undefined,
     trailerStreams: trailerStreamsFor(pickTrailerKey(videos)),
@@ -521,9 +545,9 @@ async function fetchTmdbPagedResults(pathAndQuery, apiKey, skip, pageOffset = 0)
         headers: { "User-Agent": "my-list-addon/1.9" },
         cf: { cacheTtl: 900, cacheEverything: true },
       });
-      if (!res.ok) return { ok: false, status: res.status, items: [] };
+      if (!res.ok) return { ok: false, status: res.status, items: [], totalResults: null };
       const data = await res.json();
-      return { ok: true, items: Array.isArray(data.results) ? data.results : [] };
+      return { ok: true, items: Array.isArray(data.results) ? data.results : [], totalResults: (typeof data.total_results === 'number') ? data.total_results : null };
     })
   );
 
@@ -534,7 +558,9 @@ async function fetchTmdbPagedResults(pathAndQuery, apiKey, skip, pageOffset = 0)
   }
 
   const allItems = pageResults.flatMap((p) => p.items);
-  return allItems.slice(offsetWithinFirstPage, offsetWithinFirstPage + PAGE_SIZE);
+  const sliced = allItems.slice(offsetWithinFirstPage, offsetWithinFirstPage + PAGE_SIZE);
+  sliced.totalItems = pageResults[0]?.totalResults != null ? pageResults[0].totalResults : null;
+  return sliced;
 }
 
 function getTmdbNewReleasesChartPath(wantKind) {
@@ -571,13 +597,15 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
 
   const windowItems = await fetchTmdbPagedResults(chartPath, apiKey, skip);
 
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
-  return resolved.filter(Boolean);
+  const res = resolved.filter(Boolean);
+  res.totalItems = windowItems.totalItems;
+  return res;
 }
 
 // A hard-capped 10-item version of fetchTmdbChart, for the "Top 10" panel's
@@ -622,7 +650,7 @@ async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
   const data = await res.json();
   const windowItems = (Array.isArray(data.results) ? data.results : []).slice(0, TOP_N);
 
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
@@ -673,13 +701,15 @@ async function fetchTmdbHiddenGems(entry, skip, apiKey) {
   const pageOffset = daysSinceEpochUTC(new Date()) % HIDDEN_GEMS_PAGE_POOL;
   const windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, pageOffset);
 
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
-  return resolved.filter(Boolean);
+  const res = resolved.filter(Boolean);
+  res.totalItems = windowItems.totalItems;
+  return res;
 }
 
 
@@ -709,13 +739,15 @@ async function fetchTmdbKids(entry, skip, apiKey, ratingGroup) {
 
   const windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
 
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
-  return resolved.filter(Boolean);
+  const res = resolved.filter(Boolean);
+  res.totalItems = windowItems.totalItems;
+  return res;
 }
 
 const TMDB_HOLIDAY_CONFIG = {
@@ -780,16 +812,139 @@ async function fetchTmdbHoliday(entry, skip, apiKey, holidayKey) {
     } catch (e) {}
   }
 
-  const resolved = await mapWithConcurrency(windowItems, 12, async (it) => {
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
-  return resolved.filter(Boolean);
+  const res = resolved.filter(Boolean);
+  res.totalItems = windowItems.totalItems;
+  return res;
 }
 
+const TMDB_GENRE_CONFIG = {
+  family: {
+    movie: "with_genres=10751",
+    tv: "with_genres=10751,10762",
+  },
+  fantasy: {
+    movie: "with_genres=14",
+    tv: "with_genres=10765",
+  },
+  history: {
+    movie: "with_genres=36",
+    tv: "with_genres=10768,99",
+  },
+  horror: {
+    movie: "with_genres=27",
+    tv: "with_genres=9648,10765",
+  },
+  mystery: {
+    movie: "with_genres=9648",
+    tv: "with_genres=9648",
+  },
+  romance: {
+    movie: "with_genres=10749",
+    tv: "with_genres=10749,10766,18",
+  },
+  "science-fiction": {
+    movie: "with_genres=878",
+    tv: "with_genres=10765",
+  },
+  scifi: {
+    movie: "with_genres=878",
+    tv: "with_genres=10765",
+  },
+  "stream-releases": {
+    movie: "with_watch_monetization_types=flatrate|rent|buy&watch_region=US",
+    tv: "with_watch_monetization_types=flatrate|rent|buy&watch_region=US",
+  },
+  thriller: {
+    movie: "with_genres=53",
+    tv: "with_genres=9648,80",
+  },
+  war: {
+    movie: "with_genres=10752",
+    tv: "with_genres=10768",
+  },
+  western: {
+    movie: "with_genres=37",
+    tv: "with_genres=37",
+  },
+};
+
+async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
+  if (!apiKey) {
+    throw new Error(
+      "Genre lists aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
+    );
+  }
+  const wantKind = entry.type === "series" ? "tv" : "movie";
+  const key = String(genreKey || "").toLowerCase().trim();
+  const config = TMDB_GENRE_CONFIG[key] || { movie: "", tv: "" };
+  const queryPart = config[wantKind] || "";
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+
+  let discoverPath = "";
+  if (wantKind === "movie") {
+    discoverPath = "discover/movie?sort_by=primary_release_date.desc&primary_release_date.lte=" + today +
+      (queryPart ? "&" + queryPart : "") +
+      "&include_adult=false";
+  } else {
+    discoverPath = "discover/tv?sort_by=first_air_date.desc&first_air_date.lte=" + today +
+      (queryPart ? "&" + queryPart : "") +
+      "&include_adult=false";
+  }
+
+  const windowItems = await fetchTmdbPagedResults(discoverPath, apiKey, skip, 0);
+
+  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
+    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    const effectiveId = imdbId || ("tmdb:" + it.id);
+    return mapTmdbItem(it, effectiveId, entry.type, videos);
+  });
+
+  const res = resolved.filter(Boolean);
+  res.totalItems = windowItems.totalItems;
+  return res;
+}
+
+// Wraps the real resolution logic (fetchTmdbItemDetailsUncached below) in
+// the same shared, canonical-key cache Trakt already uses
+// (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
+// fetchers above, this function IS reachable with a personal TMDB key
+// (see /api/details in 25_api-catalog-routes.js, and handleSubtitlesTrack
+// in 26_api-creator-and-admin-routes.js, both of which pass
+// `tmdbKey || TMDB_API_KEY`). Every one of its internal fetch() calls
+// bakes that key straight into the URL, so Cloudflare's own URL-keyed edge
+// cache would otherwise give every personal-key user their own private,
+// permanently-cold cache for titles that are already warm under the
+// shared key -- the response itself (title, cast, rating, trailer...)
+// doesn't depend on whose key asked for it, so there's no reason for it
+// not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
+// rather than the internally-resolved tmdbId, since that's the only thing
+// known before the resolution work runs.
 async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
+  if (!apiKey || !imdbId) return null;
+  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}`;
+  return fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    // Matches the 7-day cacheTtl already on each individual fetch() below
+    // -- this is public, effectively-static title data (cast/rating/
+    // trailer rarely change), so a week-old copy is fine.
+    freshTtlSec: 604800,
+    // Longer than fresh on purpose: if TMDB is genuinely down or this
+    // specific title starts erroring, serving a month-old detail modal
+    // beats the modal failing to open at all.
+    staleTtlSec: 2592000,
+    providerLabel: "TMDB Item Details",
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType),
+  });
+}
+
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
   if (!apiKey || !imdbId) return null;
   let rawStr = String(imdbId).trim();
   let tmdbId = null;
@@ -911,12 +1066,42 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
   // different, unrelated ids.
   const realImdbId = (match.external_ids && match.external_ids.imdb_id) || (String(imdbId).startsWith("tt") ? String(imdbId).split(":")[0] : ("tmdb:" + tmdbId));
 
+  let poster = match.poster_path ? ("https://image.tmdb.org/t/p/w500" + match.poster_path) : (match.backdrop_path ? ("https://image.tmdb.org/t/p/w780" + match.backdrop_path) : "");
+  let background = match.backdrop_path ? ("https://image.tmdb.org/t/p/w1280" + match.backdrop_path) : "";
+  let overview = match.overview || "";
+  let genres = (match.genres || []).map(g => g.name).join(', ');
+
+  if ((!poster || !overview || !genres) && realImdbId.startsWith("tt")) {
+    try {
+      const cinemetaKind = type === "tv" ? "series" : "movie";
+      const cmRes = await fetch("https://v3-cinemeta.strem.io/meta/" + cinemetaKind + "/" + encodeURIComponent(realImdbId) + ".json", {
+        headers: { "User-Agent": "my-list-addon/1.14" },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (cmRes.ok) {
+        const cmData = await cmRes.json();
+        if (cmData && cmData.meta) {
+          const m = cmData.meta;
+          if (!poster && m.poster) poster = m.poster;
+          if (!background && m.background) background = m.background;
+          if (!overview && m.description) overview = m.description;
+          if (!genres && Array.isArray(m.genres)) genres = m.genres.join(', ');
+          if (!cast && Array.isArray(m.cast)) cast = m.cast;
+          if (!director && (m.director || Array.isArray(m.director))) director = Array.isArray(m.director) ? m.director : [m.director];
+        }
+      }
+    } catch {}
+    if (!poster && realImdbId.startsWith("tt")) {
+      poster = "https://images.metahub.space/poster/medium/" + realImdbId + "/img";
+    }
+  }
+
   return {
     id: realImdbId,
     title: match.title || match.name,
-    overview: match.overview || "",
-    poster: match.poster_path ? "https://image.tmdb.org/t/p/w500" + match.poster_path : "",
-    background: match.backdrop_path ? "https://image.tmdb.org/t/p/w1280" + match.backdrop_path : "",
+    overview: overview,
+    poster: poster,
+    background: background,
     rating: match.vote_average ? match.vote_average.toFixed(1) : null,
     releaseYear: (match.release_date || match.first_air_date || "").slice(0, 4),
     releaseDate: match.release_date || match.first_air_date || null,
@@ -926,14 +1111,33 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
     budget: match.budget || null,
     revenue: match.revenue || null,
     contentRating: contentRating || null,
-    genres: (match.genres || []).map(g => g.name).join(', '),
+    genres: genres,
     trailerKey: trailerKey,
     cast: cast,
     director: director
   };
 }
 
+// Same shared-cache wrapper as fetchTmdbItemDetails above, and for the same
+// reason -- this is the season/episode-list lookup behind Mark Whole Show
+// Watched and the episode grid, reachable with a personal key via the same
+// call sites. Keyed on whichever identity the caller actually has
+// (knownTmdbId when supplied, else the raw imdbId) plus the season number,
+// since a season's episode list is public, static-ish data no different
+// per requester.
 async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
+  if (!apiKey) return null;
+  const cacheKey = `tmdb:season:${knownTmdbId || imdbId}:${seasonNum}`;
+  return fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 604800,
+    staleTtlSec: 2592000,
+    providerLabel: "TMDB Season Details",
+    fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId),
+  });
+}
+
+async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId) {
   if (!apiKey) return null;
   // Shows opened from title search (Search Movies & TV Shows) carry a
   // "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
@@ -1075,16 +1279,14 @@ function isEpisodeAiredServer(ep) {
 async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisodeNum, apiKey) {
   const data = await fetchTmdbSeasonDetails(imdbId, latestSeasonNum, apiKey);
   if (data && data.episodes) {
-    const nextInSeason = data.episodes
-      .filter((ep) => isEpisodeAiredServer(ep))
-      .find((ep) => ep.episode_number > latestEpisodeNum);
-    if (nextInSeason) return { episode: nextInSeason, seasonNum: latestSeasonNum };
+    const nextInSeason = data.episodes.find((ep) => ep.episode_number > latestEpisodeNum);
+    if (nextInSeason) return { episode: nextInSeason, seasonNum: latestSeasonNum, isUnaired: !isEpisodeAiredServer(nextInSeason) };
   }
   const nextSeasonNum = latestSeasonNum + 1;
   const data2 = await fetchTmdbSeasonDetails(imdbId, nextSeasonNum, apiKey);
-  if (data2 && data2.episodes) {
-    const aired = data2.episodes.filter((ep) => isEpisodeAiredServer(ep)).sort((a, b) => a.episode_number - b.episode_number);
-    if (aired.length) return { episode: aired[0], seasonNum: nextSeasonNum };
+  if (data2 && data2.episodes && data2.episodes.length) {
+    const sorted = [...data2.episodes].sort((a, b) => a.episode_number - b.episode_number);
+    if (sorted.length) return { episode: sorted[0], seasonNum: nextSeasonNum, isUnaired: !isEpisodeAiredServer(sorted[0]) };
   }
   return null;
 }
@@ -1216,6 +1418,8 @@ async function checkForNewEpisodes(env) {
         showPoster: latest.showPoster || '',
         seasonNum: next.seasonNum,
         episodeNum: next.episode.episode_number,
+        airDate: next.episode.air_date || null,
+        isUnaired: !!next.isUnaired,
       });
       // No longer "fully watched" -- it has a known next episode now,
       // same as if updateContinueWatching had just found it client-side.

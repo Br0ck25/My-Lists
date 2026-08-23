@@ -28,7 +28,7 @@
           <button type="button" class="secondary lc-btn" id="listsMdblistConnectBtn" onclick="toggleListsMdblistConnection()">Connect MDBList</button>
         </div>
       </div>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists belonging to your connected MDBList account or API key configured in Settings.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists, Watchlist, and Watch History from your connected MDBList account.</p>
       <div id="myMdblistListsResult"></div>
     </div>
 
@@ -40,7 +40,7 @@
           <button type="button" class="secondary lc-btn" id="listsTraktConnectBtn" onclick="toggleListsTraktConnection()">Connect Trakt</button>
         </div>
       </div>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Public and personal lists from your Trakt username/account.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists, Watchlist, and Watch History from your connected Trakt account.</p>
       <div id="myTraktListsResult"></div>
       <div id="myPrivateTraktListsResult" style="margin-top:10px;"></div>
     </div>
@@ -65,7 +65,7 @@
           <button type="button" class="secondary lc-btn" id="listsSimklConnectBtn" onclick="toggleListsSimklConnection()">Connect Simkl</button>
         </div>
       </div>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Watchlists and personal lists from your connected Simkl account.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists, Watchlist, and Watch History from your connected Simkl account.</p>
       <div id="mySimklListsResult"></div>
     </div>
   </div>
@@ -83,21 +83,22 @@
   <div class="lists-subpanel" id="listsSubCreateList" style="display:none;">
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
-        <h2 class="shelf-title" id="customListEditorTitle">Edit Custom List <span class="badge" id="customListDraftCountBadge"></span></h2>
+        <h2 class="shelf-title" id="customListEditorTitle">Create a Custom List</h2>
       </div>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Manage items and settings for this custom list. You can reorder items by dragging or typing a position number, remove items with the &times; button, or add new items from Search, Discover, or Charts.</p>
 
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this list:</p>
       <div id="customListDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p></div>
-      <div class="actions" style="margin-top:8px;">
+      <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
         <button type="button" class="secondary lc-btn" onclick="shuffleCustomListDraft()">Shuffle picks now</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllCustomListDraftPicks()">Remove all</button>
       </div>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
         <input type="checkbox" id="customListRandomizeCheck">
         <span style="font-size:0.85rem;">Randomize order (reshuffles once a day)</span>
       </label>
 
-      <div class="row" id="customListVisibilityRow" style="display:none; margin-top:8px; align-items:center; gap:8px;">
+      <div class="row" id="customListVisibilityRow" style="margin-top:8px; align-items:center; gap:8px;">
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
           <span style="font-size:0.85rem;">Visibility:</span>
           <select id="customListVisibilitySelect" style="flex:none; width:auto;">
@@ -128,11 +129,11 @@
     </div>
   </div>
 
-  <!-- Submenu 7: Import from a Link -->
+  <!-- Submenu 7: Import list from a Link -->
   <div class="lists-subpanel" id="listsSubImport" style="display:none;">
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
-        <h2 class="shelf-title">Import from a link</h2>
+        <h2 class="shelf-title">Import list from a link</h2>
       </div>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste any MDBList, Trakt, or TMDB list URL to import directly as a Custom List.</p>
       <div class="row">
@@ -140,7 +141,7 @@
       </div>
       <div class="row" style="margin-top:8px;">
         <input type="text" id="customListImportNameInput" placeholder="Name (e.g. My Favorites)">
-        <button type="button" class="secondary" id="customListImportBtn" onclick="importCustomListFromLink(this)">Import from link</button>
+        <button type="button" class="secondary" id="customListImportBtn" onclick="importCustomListFromLink(this)">Import list</button>
       </div>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:10px;">
         <input type="checkbox" id="customListImportSyncCheck" checked>

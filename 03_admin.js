@@ -62,6 +62,127 @@ async function bumpStatBy(env, kind, amount) {
   }
 }
 
+// Bumps one or more named counters that all live inside a single JSON blob
+// at `key`, in one read + one write total -- rather than a separate KV key
+// (and separate bumpStat total+day pair) per counter. Used for genre/decade
+// playback telemetry (see recordPlaybackTelemetry below): a single ping
+// with up to 5 genres used to cost 10 writes just for the genre piece
+// (bumpStat's total+day pair x5); this costs 1, regardless of how many
+// fields are bumped in the same call.
+//
+// The tradeoff, on purpose: every field sharing one key means any two
+// concurrent playback pings -- even on completely different genres --
+// now race on the same read-modify-write, where before only two pings on
+// the *same* genre could collide. KV has no atomic increment either way
+// (see bumpStat's own comment), so this trades a wider collision surface
+// for a large write-count cut. Worth it here specifically because this
+// data was already "a reasonable running total, not an exact ledger" (see
+// computeAudienceAnalytics, which only ever reads the all-time snapshot --
+// there's no day-by-day genre/decade view for a dropped increment to be
+// conspicuously missing from), not because undercounting is free in
+// general.
+async function bumpJsonCounterBlob(env, key, fields) {
+  if (!env || !env.CONFIGS || !fields || !fields.length) return;
+  try {
+    const raw = await env.CONFIGS.get(key);
+    let counts = {};
+    if (raw) {
+      try {
+        counts = JSON.parse(raw) || {};
+      } catch {
+        counts = {};
+      }
+    }
+    for (const f of fields) {
+      if (!f) continue;
+      counts[f] = (parseInt(counts[f], 10) || 0) + 1;
+    }
+    await env.CONFIGS.put(key, JSON.stringify(counts));
+  } catch (e) {
+    // best-effort, see bumpStat above
+  }
+}
+
+// One-time migration: folds the old per-genre/per-decade
+// "stats:genre:X:total" / "stats:decade:X:total" keys (written by the
+// bumpStat-per-genre approach recordPlaybackTelemetry used before it
+// switched to bumpJsonCounterBlob above) into the new single-blob keys
+// (stats:genres:alltime / stats:decades:alltime), adding their values into
+// those all-time totals so switching formats didn't reset the Trending
+// Data tab's existing genre/decade counts back to zero.
+//
+// Guarded by its own sentinel key so the list()+N-gets below -- exactly
+// the expensive read pattern the new blob format exists to get away from
+// -- only ever runs once, no matter how many times the dashboard's
+// Audience tab gets loaded afterward. Old counts are added to (not
+// overwritten over) whatever the new blob already has, so any plays that
+// already landed in the new blob in the window before this migration ran
+// aren't double-counted away.
+async function migrateGenreDecadeStatsIfNeeded(env) {
+  if (!env || !env.CONFIGS) return;
+  const sentinelKey = "stats:genredecade:migrated";
+  try {
+    const already = await env.CONFIGS.get(sentinelKey);
+    if (already) return;
+
+    const [genreBlobRaw, decadeBlobRaw, genreList, decadeList] = await Promise.all([
+      env.CONFIGS.get("stats:genres:alltime"),
+      env.CONFIGS.get("stats:decades:alltime"),
+      env.CONFIGS.list({ prefix: "stats:genre:", limit: 1000 }),
+      env.CONFIGS.list({ prefix: "stats:decade:", limit: 1000 }),
+    ]);
+
+    let genreCounts = {};
+    try {
+      genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+    } catch {
+      genreCounts = {};
+    }
+    let decadeCounts = {};
+    try {
+      decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+    } catch {
+      decadeCounts = {};
+    }
+
+    const genreTotalKeys = (genreList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      genreTotalKeys.map(async (k) => {
+        const name = k.name.slice("stats:genre:".length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (name && count > 0) genreCounts[name] = (parseInt(genreCounts[name], 10) || 0) + count;
+      })
+    );
+
+    const decadeTotalKeys = (decadeList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      decadeTotalKeys.map(async (k) => {
+        const name = k.name.slice("stats:decade:".length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (name && count > 0) decadeCounts[name] = (parseInt(decadeCounts[name], 10) || 0) + count;
+      })
+    );
+
+    await Promise.all([
+      env.CONFIGS.put("stats:genres:alltime", JSON.stringify(genreCounts)),
+      env.CONFIGS.put("stats:decades:alltime", JSON.stringify(decadeCounts)),
+      // Written last and only after both blobs above succeed -- if this
+      // whole function throws partway through, the sentinel never gets
+      // set, so the next Audience tab load just retries the migration
+      // from scratch rather than a partial migration looking "done".
+      env.CONFIGS.put(sentinelKey, "1"),
+    ]);
+  } catch (e) {
+    // best-effort -- if this fails, the sentinel key was never written,
+    // so this just retries next time computeAudienceAnalytics runs. Old
+    // per-key data is untouched either way (this only ever adds to the
+    // new blob, never deletes the old keys), so nothing is lost by a
+    // failed attempt.
+  }
+}
+
 // Records roughly how recently a creator account was last active -- feeds
 // the "Last Active" column in the admin dashboard's Creator Accounts tab.
 // Throttled to at most once per 30 minutes per account (one extra read to
@@ -401,7 +522,13 @@ async function computeSearchLeaderboard(env, window) {
   return valid.slice(0, 100);
 }
 
-// Telemetry for Stremio playback tracking
+// Telemetry for Stremio playback tracking. Genre and decade counters are
+// batched into one JSON blob write each (bumpJsonCounterBlob above)
+// instead of a separate KV key per genre -- see that function's own
+// comment for the write-count math and the tradeoff it makes.
+// playback_pings and watch_type stay on bumpStat as-is: playback_pings is
+// the one kind here that actually has a day-by-day reader (loadStatsByDay,
+// used for the dashboard's 30-day trend table), so it needs its daily key.
 async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
   if (!env || !env.CONFIGS) return;
   try {
@@ -415,11 +542,9 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
       ? genres.split(",").map((s) => s.trim()).filter(Boolean)
       : [];
 
-    if (genreList.length) {
-      genreList.slice(0, 5).forEach((g) => {
-        const cleanG = String(g || "").trim();
-        if (cleanG) promises.push(bumpStat(env, `genre:${cleanG}`));
-      });
+    const cleanGenres = genreList.slice(0, 5).map((g) => String(g || "").trim()).filter(Boolean);
+    if (cleanGenres.length) {
+      promises.push(bumpJsonCounterBlob(env, "stats:genres:alltime", cleanGenres));
     }
 
     const yearNum = parseInt(releaseYear, 10);
@@ -431,7 +556,7 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
       else if (yearNum >= 1990) decade = "1990s";
       else if (yearNum >= 1980) decade = "1980s";
       else if (yearNum >= 1970) decade = "1970s";
-      promises.push(bumpStat(env, `decade:${decade}`));
+      promises.push(bumpJsonCounterBlob(env, "stats:decades:alltime", [decade]));
     }
     await Promise.all(promises);
   } catch (e) {}
@@ -504,13 +629,18 @@ async function computeCatalogAndCommunityLeaderboards(env) {
 
 async function computeAudienceAnalytics(env) {
   if (!env || !env.CONFIGS) return { watchTypes: {}, genres: [], decades: [] };
-  
-  const [movieRaw, seriesRaw, episodeRaw, genreList, decadeList] = await Promise.all([
+
+  // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
+  // add-on: runs the old-keys-into-new-blob migration once (see its own
+  // comment), a no-op single read on every call after that.
+  await migrateGenreDecadeStatsIfNeeded(env);
+
+  const [movieRaw, seriesRaw, episodeRaw, genreBlobRaw, decadeBlobRaw] = await Promise.all([
     env.CONFIGS.get("stats:watch_type:movie:total"),
     env.CONFIGS.get("stats:watch_type:series:total"),
     env.CONFIGS.get("stats:watch_type:episode:total"),
-    env.CONFIGS.list({ prefix: "stats:genre:", limit: 1000 }),
-    env.CONFIGS.list({ prefix: "stats:decade:", limit: 1000 }),
+    env.CONFIGS.get("stats:genres:alltime"),
+    env.CONFIGS.get("stats:decades:alltime"),
   ]);
 
   const movies = parseInt(movieRaw, 10) || 0;
@@ -518,26 +648,26 @@ async function computeAudienceAnalytics(env) {
   const episodes = parseInt(episodeRaw, 10) || 0;
   const totalWatch = movies + series + episodes;
 
-  const totalGenreKeys = (genreList.keys || []).filter((k) => k.name.endsWith(":total"));
-  const genres = await Promise.all(
-    totalGenreKeys.map(async (k) => {
-      const name = k.name.slice("stats:genre:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      return { name, count: parseInt(raw, 10) || 0 };
-    })
-  );
-  const validGenres = genres.filter((g) => g.count > 0 && g.name);
+  let genreCounts = {};
+  try {
+    genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+  } catch {
+    genreCounts = {};
+  }
+  const validGenres = Object.entries(genreCounts)
+    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+    .filter((g) => g.count > 0 && g.name);
   validGenres.sort((a, b) => b.count - a.count);
 
-  const totalDecadeKeys = (decadeList.keys || []).filter((k) => k.name.endsWith(":total"));
-  const decades = await Promise.all(
-    totalDecadeKeys.map(async (k) => {
-      const name = k.name.slice("stats:decade:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      return { name, count: parseInt(raw, 10) || 0 };
-    })
-  );
-  const validDecades = decades.filter((d) => d.count > 0 && d.name);
+  let decadeCounts = {};
+  try {
+    decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+  } catch {
+    decadeCounts = {};
+  }
+  const validDecades = Object.entries(decadeCounts)
+    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+    .filter((d) => d.count > 0 && d.name);
   validDecades.sort((a, b) => b.count - a.count);
 
   return {

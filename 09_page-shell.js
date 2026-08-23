@@ -23,6 +23,7 @@ function renderBuilder(
   const hiddenGemsHtml = buildHiddenGemsHtml();
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
+  const genresHtml = buildGenresHtml();
   const hasInitial = initialEntries.length > 0;
   const initialEntriesJson = JSON.stringify(
     hasInitial
@@ -774,6 +775,71 @@ function renderBuilder(
   .lc-btn.liked { color: var(--danger); border-color: rgba(255,59,48,0.4); }
   .lc-btn.view-btn { color: var(--accent); border-color: transparent; background: transparent; padding: 0; font-size: 0.82rem; }
 
+  /* --- Presets & Backup 2x2 Mobile Layout & Unified Sizing ---------------- */
+  .preset-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-shadow: var(--shadow-sm);
+  }
+  .preset-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .preset-card-title {
+    font-weight: 700;
+    font-size: 0.92rem;
+    color: var(--text);
+  }
+  .preset-actions-grid, .backup-actions-grid, .export-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px;
+    width: 100%;
+  }
+  @media (min-width: 641px) {
+    .preset-card {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .preset-actions-grid {
+      display: flex;
+      gap: 6px;
+      width: auto;
+    }
+    .backup-actions-grid, .export-actions-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      width: auto;
+    }
+  }
+  #settingsSubBackup .lc-btn,
+  #settingsSubBackup .preset-actions-grid button,
+  #settingsSubBackup .backup-actions-grid button,
+  #settingsSubBackup .export-actions-grid button,
+  #settingsSubBackup .row button {
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    min-height: 34px;
+    border-radius: var(--radius-pill);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    box-sizing: border-box;
+    white-space: nowrap;
+  }
+
   /* 9-Poster Preview Strip in List Cards (Desktop) / 3-Poster (Mobile) */
   .list-card-posters, .list-card-5posters {
     display: grid;
@@ -883,6 +949,24 @@ function renderBuilder(
   }
   .cw-remove-btn:hover {
     filter: brightness(0.88);
+  }
+  .cw-date-badge {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    background: var(--accent);
+    color: #ffffff;
+    font-size: 0.62rem;
+    font-weight: 800;
+    padding: 2px 5px;
+    border-radius: var(--radius-sm);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    z-index: 8;
+    pointer-events: none;
+    white-space: nowrap;
+    text-transform: uppercase;
   }
   .list-card-mini-poster-img-wrap img {
     width: 100%;
@@ -1046,6 +1130,38 @@ function renderBuilder(
   .merge-add-channel-select:hover {
     border-color: var(--accent);
   }
+  .detail-filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0 16px 0;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .detail-sort-select {
+    padding: 6px 28px 6px 12px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 14px;
+  }
+  .detail-sort-select:hover, .detail-sort-select:focus {
+    border-color: var(--accent);
+  }
 
   /* --- Cards & Panels ---------------------------------------------------- */
   .panel {
@@ -1181,6 +1297,14 @@ function renderBuilder(
     color: var(--text-2);
     border: 1.5px solid var(--border-strong);
     box-shadow: var(--shadow-sm);
+  }
+  button.modal-close-x {
+    width: 32px; height: 32px; min-height: unset;
+    padding: 0; border-radius: 50%;
+    background: var(--bg); color: var(--muted);
+    border: 1px solid var(--border-strong);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 1rem; line-height: 1; flex: none;
   }
   button:hover:not(:disabled), .actions a:hover { opacity: 0.85; }
   .btn-stremio { background: linear-gradient(135deg, #9B8FFF, #6D48FF); color: #fff; }
@@ -1451,7 +1575,8 @@ function renderBuilder(
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);
     color: var(--muted); font-size: 1rem; cursor: pointer;
-    padding: 4px 10px; border-radius: 8px;
+    width: 32px; height: 32px; padding: 0; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center; line-height: 1;
   }
   .undo-toast {
     position: fixed; left: 50%;
@@ -1571,16 +1696,13 @@ function renderBuilder(
   <!-- Top App Bar -->
   <header class="app-header">
     <div class="app-header-left">
-      <img class="app-header-avatar" src="${origin}/icon.png" alt="App Icon">
       <div class="app-header-title-group">
-        <div style="display:flex; align-items:center; gap:8px;">
-          <h1 class="app-header-title" id="pageMainTitle">Discover</h1>
-          <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:0; margin-top:2px;" title="Toggle Dark Mode">🌓</button>
-        </div>
+        <h1 class="app-header-title" id="pageMainTitle">Discover</h1>
         <span class="app-header-sub" id="pageSubtitle">Explore Popular &amp; Streaming</span>
       </div>
     </div>
     <div class="app-header-actions">
+      <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
       <div id="creatorProfileBar"></div>
     </div>
   </header>
@@ -1657,6 +1779,31 @@ function renderBuilder(
         </div>
       </div>
       <p id="detailSubtitle" style="margin-top:4px;">Loading&hellip;</p>
+    </div>
+    <div id="detailFilterBar" class="detail-filter-bar" style="display:none;">
+      <div id="whFilterControls" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+        <button type="button" class="subnav-pill active wh-filter-pill" data-wh-filter="all" onclick="setWatchHistoryFilter('all', this)">All</button>
+        <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="movie" onclick="setWatchHistoryFilter('movie', this)">Movies</button>
+        <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="series" onclick="setWatchHistoryFilter('series', this)">Shows</button>
+        <label class="wh-group-shows-toggle" style="display:inline-flex; align-items:center; gap:6px; margin-left:8px; cursor:pointer; font-size:0.84rem; color:var(--text); user-select:none;">
+          <input type="checkbox" id="whGroupShowsCheckbox" onchange="toggleWatchHistoryGroupShows(this.checked)" style="accent-color:var(--accent); cursor:pointer;">
+          <span>Shows instead of episodes</span>
+        </label>
+      </div>
+      <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center;">
+        <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+      </div>
+      <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
+        <label for="whSortSelect" style="font-size:0.75rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:0.02em;">Sort</label>
+        <select id="whSortSelect" class="detail-sort-select" onchange="setWatchHistorySort(this.value)">
+          <option value="recent">Recently Watched</option>
+          <option value="oldest">Oldest Watched</option>
+          <option value="title-asc">Title (A-Z)</option>
+          <option value="title-desc">Title (Z-A)</option>
+        </select>
+      </div>
     </div>
     <div class="poster-grid-3" id="detailGrid"></div>
     <p id="detailStatus" style="text-align:center; color:var(--muted); margin-top:14px;"><small>Loading&hellip;</small></p>
@@ -1812,6 +1959,7 @@ window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
 window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
 window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
 window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
+window._CHARTS_GENRES = ${JSON.stringify(GENRE_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }

@@ -6,6 +6,72 @@ function corsHeaders() {
   };
 }
 
+// --- security headers ----------------------------------------------------
+//
+// Applied once, globally, at the very edge of the fetch handler (see the
+// export default wrapper at the bottom of 26_api-creator-and-admin-routes.js)
+// rather than threaded through every individual `new Response(...)` call
+// site across the router -- there are dozens of those (HTML pages, JSON via
+// json(), the icon, generated SVGs, the manifest, /sw.js...), so wrapping
+// the single point everything already funnels back through is far less
+// risky than editing each one and keeps this from silently missing a
+// future route. `if (!headers.has(...))` guards mean a route that already
+// set a more specific value for one of these (none do today) would still
+// win, rather than this clobbering it.
+//
+// CSP is deliberately not the strict, script-src-locked-down kind: this
+// app relies on plenty of inline <script> blocks and inline onclick=/
+// onchange= handlers throughout the builder/admin pages (see the
+// verification pipeline's own "onclick/onchange handler resolution check"
+// step), which only work with 'unsafe-inline' on script-src. Tightening
+// that further would mean a nonce- or hash-based rewrite of every inline
+// handler -- a real project of its own, not a header tweak. What this CSP
+// still buys, even with 'unsafe-inline' allowed: no loading of scripts/
+// styles/fonts from any origin except the ones this app actually uses
+// (jsDelivr for fflate, Google Fonts, YouTube for trailer embeds), no
+// <object>/<embed> plugins, no <base> tag hijacking, and (via
+// frame-ancestors) this site can't be iframed by someone else's page for
+// a clickjacking attempt.
+function securityHeaders() {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(), payment=()",
+    "Strict-Transport-Security": "max-age=15552000; includeSubDomains",
+    "Content-Security-Policy": [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com data:",
+      "img-src 'self' https: data:",
+      "connect-src 'self' https:",
+      "frame-src https://www.youtube.com",
+      "frame-ancestors 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+    ].join("; "),
+  };
+}
+
+// Wraps a Response with the headers above, without disturbing anything the
+// route handler already set (status, statusText, body, its own headers
+// like Content-Type/Cache-Control/CORS) -- see securityHeaders' own
+// comment for why this is applied here, once, rather than at each call
+// site.
+function withSecurityHeaders(response) {
+  const headers = new Headers(response.headers);
+  const extra = securityHeaders();
+  for (const key in extra) {
+    if (!headers.has(key)) headers.set(key, extra[key]);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {

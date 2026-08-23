@@ -52,7 +52,35 @@
     // This addon's Watch History has no in-progress state to put a movie
     // into, only watched/not-watched, so there isn't a cleanly analogous
     // middle ground to preserve that distinction with.
-    async function handleSubtitlesTrack(configParam, stremioType, id, env) {
+    function detectClientApp(request) {
+      if (!request) return "Streaming App";
+      const ua = (request.headers.get("user-agent") || "").toLowerCase();
+      const referer = (request.headers.get("referer") || "").toLowerCase();
+      const origin = (request.headers.get("origin") || "").toLowerCase();
+      const appHeader = (request.headers.get("x-app-name") || request.headers.get("x-client-name") || request.headers.get("x-application") || "").toLowerCase();
+
+      if (appHeader.includes("nuvio") || ua.includes("nuvio") || referer.includes("nuvio") || origin.includes("nuvio")) {
+        return "Nuvio";
+      }
+      if (appHeader.includes("stremio") || ua.includes("stremio") || referer.includes("stremio") || origin.includes("stremio") || ua.includes("smarttv") || ua.includes("stremio-streaming-server")) {
+        return "Stremio";
+      }
+      if (appHeader.includes("wako") || ua.includes("wako") || referer.includes("wako") || origin.includes("wako")) {
+        return "Wako";
+      }
+      if (ua.includes("dart") || ua.includes("flutter")) {
+        return "Nuvio";
+      }
+      if (ua.includes("cfnetwork") || (ua.includes("darwin") && !ua.includes("stremio"))) {
+        return "Wako / iOS Player";
+      }
+      if (ua.includes("okhttp") && !ua.includes("stremio")) {
+        return "Nuvio";
+      }
+      return "Streaming App";
+    }
+
+    async function handleSubtitlesTrack(configParam, stremioType, id, env, request) {
       if (!env || !env.CONFIGS) return;
 
       let track, trackCreatorName, trackCreatorKey, tmdbKey;
@@ -230,7 +258,319 @@
         matched = "error: " + (err && err.message ? err.message : String(err));
       }
 
-      await env.CONFIGS.put(diagnosticsKey, JSON.stringify({ lastPingAt: Date.now(), lastPingId: pingId, matched }));
+      const clientApp = detectClientApp(request);
+      await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+        lastPingAt: Date.now(),
+        lastPingId: pingId,
+        lastServer: clientApp,
+        matched: matched,
+      }));
+    }
+
+    // Handles incoming webhooks from Plex, Jellyfin, and Emby media servers
+    // Automatically marks watched episodes/movies and advances Continue Watching
+    async function handleMediaServerScrobble(request, url, env, ctx) {
+      if (!env || !env.CONFIGS) {
+        return json({ ok: false, error: "Cloudflare KV storage (CONFIGS) not configured." }, 500);
+      }
+
+      // 1. Identify user / config
+      const configParam = url.searchParams.get("config") || url.searchParams.get("token") || "";
+      const queryCreator = url.searchParams.get("creator") || url.searchParams.get("user") || "";
+      const queryKey = url.searchParams.get("key") || "";
+
+      let authUser = null;
+      let effectiveTmdbKey = TMDB_API_KEY;
+
+      if (configParam) {
+        try {
+          const resolved = await resolveConfig(configParam, env);
+          if (resolved && resolved.trackCreatorName && resolved.trackCreatorKey) {
+            const auth = await authenticateCreator(resolved.trackCreatorName, resolved.trackCreatorKey);
+            if (auth.ok) {
+              authUser = auth.username;
+              if (resolved.tmdbKey) effectiveTmdbKey = resolved.tmdbKey;
+            }
+          }
+        } catch {}
+      }
+
+      if (!authUser && queryCreator && queryKey) {
+        const auth = await authenticateCreator(queryCreator, queryKey);
+        if (auth.ok) authUser = auth.username;
+      }
+
+      if (!authUser) {
+        return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
+      }
+
+      // 2. Parse payload from Plex, Jellyfin, or Emby
+      const contentType = request.headers.get("content-type") || "";
+      let payload = null;
+
+      if (contentType.includes("multipart/form-data")) {
+        try {
+          const formData = await request.formData();
+          const rawPayload = formData.get("payload");
+          if (rawPayload && typeof rawPayload === "string") {
+            payload = JSON.parse(rawPayload);
+          }
+        } catch {}
+      } else {
+        try {
+          payload = await request.json();
+        } catch {
+          try {
+            const text = await request.text();
+            payload = JSON.parse(text);
+          } catch {}
+        }
+      }
+
+      if (!payload || typeof payload !== "object") {
+        return json({ ok: false, error: "Invalid payload format. Expected JSON or multipart form." }, 400);
+      }
+
+      // 3. Detect Media Server Type & Event
+      let server = "Media Server";
+      let eventType = "";
+      let mediaType = "movie"; // "movie" or "series"
+      let imdbId = "";
+      let tmdbId = "";
+      let title = "";
+      let showTitle = "";
+      let season = null;
+      let episode = null;
+      let year = null;
+      let isPlayed = false;
+
+      // A. Plex Webhook format
+      if (payload.Metadata || payload.event) {
+        server = "Plex";
+        eventType = String(payload.event || "").toLowerCase();
+        isPlayed = eventType === "media.scrobble" || eventType === "media.play" || eventType === "media.stop" || eventType === "media.resume";
+        
+        const meta = payload.Metadata || {};
+        mediaType = meta.type === "episode" ? "series" : "movie";
+        title = meta.title || "";
+        showTitle = meta.grandparentTitle || meta.parentTitle || "";
+        season = meta.parentIndex != null ? Number(meta.parentIndex) : null;
+        episode = meta.index != null ? Number(meta.index) : null;
+        year = meta.year || null;
+
+        const guids = Array.isArray(meta.Guid) ? meta.Guid : (meta.guid ? [{ id: meta.guid }] : []);
+        for (const g of guids) {
+          const gid = String(g.id || "");
+          if (gid.includes("imdb://tt")) {
+            const m = gid.match(/tt\d+/);
+            if (m) imdbId = m[0];
+          } else if (gid.includes("tmdb://")) {
+            const m = gid.match(/tmdb:\/\/(\d+)/);
+            if (m) tmdbId = m[1];
+          }
+        }
+      }
+      // B. Jellyfin Webhook format
+      else if (payload.NotificationType || payload.ItemType || payload.ServerId) {
+        server = "Jellyfin";
+        eventType = String(payload.NotificationType || payload.Event || "").toLowerCase();
+        isPlayed = eventType.includes("playback") || eventType.includes("userdata") || eventType.includes("scrobble") || payload.Played === true;
+        
+        mediaType = (payload.ItemType === "Episode" || payload.SeriesName) ? "series" : "movie";
+        title = payload.Name || payload.ItemName || "";
+        showTitle = payload.SeriesName || "";
+        season = payload.SeasonNumber != null ? Number(payload.SeasonNumber) : null;
+        episode = payload.EpisodeNumber != null ? Number(payload.EpisodeNumber) : null;
+        year = payload.Year || null;
+
+        const pIds = payload.ProviderIds || {};
+        imdbId = pIds.Imdb || pIds.imdb || payload.Provider_imdb || "";
+        tmdbId = pIds.Tmdb || pIds.tmdb || payload.Provider_tmdb || "";
+      }
+      // C. Emby Webhook format
+      else if (payload.Item || (payload.Event && String(payload.Event).startsWith("playback."))) {
+        server = "Emby";
+        eventType = String(payload.Event || "").toLowerCase();
+        isPlayed = eventType.includes("scrobble") || eventType.includes("playback.start") || eventType.includes("playback.stop") || eventType.includes("markplayed");
+
+        const item = payload.Item || payload;
+        mediaType = (item.Type === "Episode" || item.SeriesName) ? "series" : "movie";
+        title = item.Name || "";
+        showTitle = item.SeriesName || "";
+        season = item.ParentIndexNumber != null ? Number(item.ParentIndexNumber) : null;
+        episode = item.IndexNumber != null ? Number(item.IndexNumber) : null;
+
+        const pIds = item.ProviderIds || {};
+        imdbId = pIds.Imdb || pIds.imdb || "";
+        tmdbId = pIds.Tmdb || pIds.tmdb || "";
+      }
+
+      if (!isPlayed) {
+        return json({ ok: true, ignored: `Event '${eventType}' is not a scrobble/play event.` });
+      }
+
+      // 4. Resolve IDs via TMDB if needed
+      if (!imdbId && tmdbId) {
+        try {
+          const tmdbType = mediaType === "series" ? "tv" : "movie";
+          const tmdbRes = await fetch(`https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${effectiveTmdbKey}&append_to_response=external_ids`);
+          if (tmdbRes.ok) {
+            const d = await tmdbRes.json();
+            imdbId = (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || "";
+          }
+        } catch {}
+      }
+
+      if (!imdbId && (showTitle || title)) {
+        try {
+          const q = showTitle || title;
+          const searchType = mediaType === "series" ? "tv" : "movie";
+          const searchRes = await fetch(`https://api.themoviedb.org/3/search/${searchType}?api_key=${effectiveTmdbKey}&query=${encodeURIComponent(q)}&page=1`);
+          if (searchRes.ok) {
+            const sd = await searchRes.json();
+            if (sd.results && sd.results.length) {
+              const first = sd.results[0];
+              tmdbId = String(first.id);
+              const extRes = await fetch(`https://api.themoviedb.org/3/${searchType}/${first.id}?api_key=${effectiveTmdbKey}&append_to_response=external_ids`);
+              if (extRes.ok) {
+                const ed = await extRes.json();
+                imdbId = (ed.external_ids && ed.external_ids.imdb_id) || ed.imdb_id || "";
+              }
+            }
+          }
+        } catch {}
+      }
+
+      const pingId = mediaType === "series" ? `${imdbId || tmdbId}:${season || 1}:${episode || 1}` : (imdbId || tmdbId || title);
+
+      // 5. Execute Watch Record
+      let matched = "no";
+      try {
+        await ensureTrackingMigrated(env, authUser);
+        const syncKey = `creatorsynctracking:${authUser}`;
+        const raw = await env.CONFIGS.get(syncKey);
+        let blob = null;
+        if (raw) {
+          try { blob = JSON.parse(raw); } catch {}
+        }
+        if (!blob || typeof blob !== "object") {
+          blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: true };
+        }
+        blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
+        blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
+        blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
+        blob.dismissedContinueWatching = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === "object" ? blob.dismissedContinueWatching : {};
+
+        if (mediaType === "series") {
+          const seasonNum = season != null ? season : 1;
+          const episodeNum = episode != null ? episode : 1;
+          
+          let epName = title;
+          let epPoster = "";
+          let sTitle = showTitle || title;
+          let sPoster = "";
+
+          if (imdbId) {
+            const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, effectiveTmdbKey).catch(() => null);
+            const ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episodeNum) : null;
+            if (ep) {
+              epName = ep.name || title;
+              epPoster = ep.still_path || "";
+            }
+            const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+            if (showDetails) {
+              sTitle = showDetails.title || sTitle;
+              sPoster = showDetails.poster || "";
+            }
+          }
+
+          const itemKey = `${imdbId || sTitle}:${seasonNum}:${episodeNum}`;
+          const alreadyWatched = blob.watchHistory.some((it) => (it.showId === imdbId || it.showTitle === sTitle) && it.seasonNum === seasonNum && it.episodeNum === episodeNum);
+          if (!alreadyWatched) {
+            blob.watchHistory.unshift({
+              id: itemKey,
+              type: "episode",
+              name: epName,
+              poster: epPoster || sPoster,
+              showId: imdbId || sTitle,
+              showTitle: sTitle,
+              showPoster: sPoster,
+              seasonNum: seasonNum,
+              episodeNum: episodeNum,
+            });
+          }
+
+          // Recompute Continue Watching for this show
+          blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== (imdbId || sTitle));
+          if (imdbId) {
+            const next = await findNextAiredEpisodeForShow(imdbId, seasonNum, episodeNum, effectiveTmdbKey).catch(() => null);
+            if (next) {
+              blob.continueWatching.unshift({
+                id: String(next.episode.id),
+                type: "episode",
+                name: next.episode.name,
+                poster: sPoster || "",
+                showId: imdbId,
+                showTitle: sTitle,
+                showPoster: sPoster,
+                seasonNum: next.seasonNum,
+                episodeNum: next.episode.episode_number,
+              });
+              blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
+            } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
+              blob.fullyWatchedShowIds.push(imdbId);
+            }
+          }
+          matched = `yes (${server}: ${sTitle} S${seasonNum}E${episodeNum})`;
+        } else {
+          // Movie
+          let movieTitle = title;
+          let moviePoster = "";
+          if (imdbId) {
+            const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+            if (details) {
+              movieTitle = details.title || movieTitle;
+              moviePoster = details.poster || "";
+            }
+          }
+          const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === imdbId || it.name === movieTitle);
+          if (!alreadyWatched) {
+            blob.watchHistory.unshift({
+              id: imdbId || movieTitle,
+              type: "movie",
+              name: movieTitle,
+              poster: moviePoster,
+            });
+          }
+          matched = `yes (${server}: ${movieTitle})`;
+        }
+
+        // Clean from watchlist if present
+        if (Array.isArray(blob.watchlist)) {
+          blob.watchlist = blob.watchlist.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || "") !== imdbId);
+        }
+
+        blob.updatedAt = Date.now();
+        await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+      } catch (err) {
+        matched = `error (${server}): ` + (err && err.message ? err.message : String(err));
+      }
+
+      // Update diagnostics
+      const diagnosticsKey = `creatortrack:${authUser}`;
+      await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+        lastPingAt: Date.now(),
+        lastPingId: pingId,
+        lastServer: server,
+        matched: matched,
+      }));
+
+      return json({
+        ok: true,
+        server: server,
+        event: eventType,
+        matched: matched,
+      });
     }
 
     // /api/creator/track-status  (POST)  { creatorName, creatorKey } ->
@@ -643,13 +983,16 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
       const blob = {
         watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
         continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
         watchlist: Array.isArray(body.watchlist) ? body.watchlist : [],
+        watchlistUpdatedAt: watchlistUpdatedAt,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
+        removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -658,6 +1001,17 @@
       }
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
+        if (Array.isArray(body.watchlist)) {
+          const wlRaw = await env.CONFIGS.get(`creatorlist:${auth.username}:watchlist`);
+          if (wlRaw) {
+            try {
+              const wlObj = JSON.parse(wlRaw);
+              wlObj.items = body.watchlist;
+              wlObj.updatedAt = watchlistUpdatedAt;
+              await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
+            } catch {}
+          }
+        }
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
@@ -824,9 +1178,11 @@
           data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
           data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
+          data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
+          data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
         }
       }
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
@@ -901,9 +1257,21 @@
       if (!env || !env.CONFIGS) return json({ ok: true, lists: [] });
       const rawQ = url.searchParams.get("q") || "";
       const q = rawQ.toLowerCase().trim();
-      const isMyListsSearch = (q === "my lists" || q === "mylists" || q === "my list" || q === "mylist");
+      
+      // Check if query is targeting My Lists platform lists and extract any username/term
+      const isMyListsSentinel = (q === "my lists" || q === "mylists" || q === "my list" || q === "mylist" || q.includes("my list") || q.includes("mylist"));
+      const userTerm = q
+        .replace(/\bmy\s+lists\b/gi, "")
+        .replace(/\bmylists\b/gi, "")
+        .replace(/\bmy\s+list\b/gi, "")
+        .replace(/\bmylist\b/gi, "")
+        .replace(/@+/g, "")
+        .trim();
+
+      const isMyListsSearch = isMyListsSentinel || !userTerm;
+
       try {
-        const fetchLimit = isMyListsSearch ? 250 : 50;
+        const fetchLimit = isMyListsSearch ? 250 : 80;
         const [anonResult, creatorResult] = await Promise.all([
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
           env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
@@ -914,22 +1282,17 @@
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              // "Private" on an anonymous list only ever means "hidden from
-              // search" (see /api/publish-list) -- there's no owner login to
-              // gate direct access by, so unlike a private Creator list this
-              // doesn't affect the GET /lists/... route at all, just this
-              // listing. (The client-side flow that used to create these no
-              // longer exists -- saving a list now always requires a Creator
-              // Profile -- but existing anonymous lists saved before that
-              // change still need to keep working.)
               if (data.visibility === "private") return null;
               const listSlug = k.name.slice("publishedlist:user:".length);
+              const itemCount = (data.items || []).length;
+              if (itemCount === 0) return null; // Never display lists with 0 items
               return {
                 name: data.name,
                 type: data.type,
-                items: (data.items || []).length,
+                items: itemCount,
                 likes: data.likes || 0,
                 creatorName: "Anonymous",
+                username: "user",
                 url: `${url.origin}/lists/user/${listSlug}`,
               };
             } catch {
@@ -944,6 +1307,8 @@
             try {
               const data = JSON.parse(raw);
               if (data.visibility === "private") return null;
+              const itemCount = (data.items || []).length;
+              if (itemCount === 0) return null; // Never display lists with 0 items
               // key shape is creatorlist:{username}:{slug}
               const rest = k.name.slice("creatorlist:".length);
               const sep = rest.indexOf(":");
@@ -960,9 +1325,10 @@
               return {
                 name: data.name,
                 type: data.type,
-                items: (data.items || []).length,
+                items: itemCount,
                 likes: data.likes || 0,
                 creatorName,
+                username,
                 url: `${url.origin}/lists/${username}/${listSlug}`,
               };
             } catch {
@@ -970,11 +1336,20 @@
             }
           })
         );
+        const targetFilter = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
         const matches = [...anonCandidates, ...creatorCandidates]
           .filter(Boolean)
-          .filter((l) => isMyListsSearch || !q || (l.name && l.name.toLowerCase().includes(q)) || (l.creatorName && l.creatorName.toLowerCase().includes(q)))
+          .filter((l) => (l.items || 0) > 0)
+          .filter((l) => {
+            if (!targetFilter) return true;
+            const nameMatch = l.name && l.name.toLowerCase().includes(targetFilter);
+            const creatorMatch = l.creatorName && l.creatorName.toLowerCase().includes(targetFilter);
+            const usernameMatch = l.username && l.username.toLowerCase().includes(targetFilter);
+            const urlMatch = l.url && l.url.toLowerCase().includes(targetFilter);
+            return nameMatch || creatorMatch || usernameMatch || urlMatch;
+          })
           .sort((a, b) => (b.likes || 0) - (a.likes || 0));
-        return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 30) });
+        return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -1094,40 +1469,64 @@
       );
     }
 
-    m = path.match(/^\/lists\/([a-z0-9-]+)\/([a-z0-9-]+)(?:\.json)?$/i);
+    m = path.match(/^\/lists\/([^/]+)\/([^/]+?)(?:\.json)?$/i);
     if (m) {
-      const username = m[1].toLowerCase();
-      const listName = m[2].toLowerCase();
+      let rawUser = m[1];
+      let rawList = m[2];
+      let decodedUser = rawUser;
+      let decodedList = rawList;
+      try {
+        decodedUser = decodeURIComponent(rawUser);
+        decodedList = decodeURIComponent(rawList);
+      } catch {}
+      const username = decodedUser.toLowerCase();
+      const listName = decodedList.toLowerCase();
       if (!env || !env.CONFIGS) {
         return json({ ok: false, error: "This Worker has no CONFIGS KV namespace bound, so nothing is published here." }, 404);
       }
       let listData = null;
       let isCreatorList = false;
-      const creatorRaw = await env.CONFIGS.get(`creatorlist:${username}:${listName}`);
-      if (creatorRaw) {
-        try {
-          const parsed = JSON.parse(creatorRaw);
-          // A private list returns exactly the same 404 as a list that
-          // doesn't exist at all -- anyone probing a guessed/leaked URL
-          // for a private list gets no signal either way that they've
-          // found something real, per the spec (404, never a distinct
-          // "access denied").
-          if (parsed.visibility !== "private") {
-            listData = parsed;
-            isCreatorList = true;
-          }
-        } catch {
-          // fall through to anonymous lookup below
+      const keysToTry = [
+        `creatorlist:${username}:${listName}`,
+        `creatorlist:${rawUser}:${rawList}`,
+        `publishedlist:${username}:${listName}`,
+        `publishedlist:${rawUser}:${rawList}`,
+      ];
+      for (const k of keysToTry) {
+        if (listData) break;
+        const raw = await env.CONFIGS.get(k);
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.visibility !== "private") {
+              listData = parsed;
+              isCreatorList = k.startsWith("creatorlist:");
+            }
+          } catch {}
         }
       }
-      if (!listData) {
-        const anonRaw = await env.CONFIGS.get(`publishedlist:${username}:${listName}`);
-        if (anonRaw) {
+      if (listName === "watchlist" || listName === "watch-history" || listName === "continue-watching") {
+        const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+        if (trackingRaw) {
           try {
-            listData = JSON.parse(anonRaw);
-          } catch {
-            return json({ ok: false, error: "That list's stored data is corrupted." }, 500);
-          }
+            const tracking = JSON.parse(trackingRaw);
+            const items = tracking[listName === "watch-history" ? "watchHistory" : (listName === "continue-watching" ? "continueWatching" : "watchlist")] || [];
+            if (Array.isArray(items)) {
+              if (!listData && items.length > 0) {
+                listData = {
+                  name: listName === "watch-history" ? "Watch History" : (listName === "continue-watching" ? "Continue Watching" : "Watchlist"),
+                  slug: listName,
+                  type: "mixed",
+                  visibility: "public",
+                  items: items,
+                  updatedAt: tracking.updatedAt || Date.now()
+                };
+                isCreatorList = true;
+              } else if (listData && Array.isArray(items) && items.length > 0 && (!listData.items || listData.items.length === 0)) {
+                listData.items = items;
+              }
+            }
+          } catch {}
         }
       }
       if (!listData) {
@@ -1144,9 +1543,53 @@
         }
       }
       const likes = listData.likes || 0;
-      const wantsJson = path.endsWith(".json") || !isBrowserNavigation(request);
+      const wantsJson = path.endsWith(".json") || (request.headers.get("Accept") || "").includes("application/json") || !isBrowserNavigation(request);
       if (wantsJson) {
-        return json({ ok: true, name: listData.name, type: listData.type, items: listData.items, creatorName: creatorDisplayName, likes });
+        const cleanItems = (listData.items || []).map((it) => {
+          const itId = it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : (it.id ? ('tt' + it.id) : ''));
+          let poster = it.poster || it.showPoster || "";
+          if (!poster && itId && itId.startsWith("tt")) {
+            poster = `https://images.metahub.space/poster/medium/${itId}/img`;
+          }
+          const itemTitle = it.name || it.title || '';
+          const itemType = it.type || (it.showId ? 'series' : (listData.type === 'mixed' ? 'movie' : (listData.type || 'movie')));
+          return {
+            id: itId || it.id,
+            imdb_id: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : null),
+            imdbId: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : null),
+            tmdb_id: it.tmdbId || it.tmdb_id || null,
+            tmdbId: it.tmdbId || it.tmdb_id || null,
+            title: itemTitle,
+            name: itemTitle,
+            year: it.year || null,
+            type: itemType,
+            poster: poster || null,
+            overview: it.overview || null,
+            genres: it.genres || null,
+            rating: it.rating || null
+          };
+        });
+
+        // If client specifically requests format=object or format=meta
+        if (url.searchParams.get("format") === "object" || url.searchParams.get("meta") === "1") {
+          return json({
+            ok: true,
+            name: listData.name,
+            slug: listName,
+            creator: creatorDisplayName,
+            type: listData.type,
+            visibility: "public",
+            itemCount: cleanItems.length,
+            likes: likes,
+            updatedAt: listData.updatedAt || listData.createdAt || null,
+            url: `${url.origin}/lists/${username}/${listName}`,
+            jsonUrl: `${url.origin}/lists/${username}/${listName}.json`,
+            items: cleanItems
+          }, 200, { "Cache-Control": "public, max-age=300", ...corsHeaders() });
+        }
+
+        // Standard JSON Array for Cinephage, Kometa, Jellyfin, and external list scrapers
+        return json(cleanItems, 200, { "Cache-Control": "public, max-age=300", ...corsHeaders() });
       }
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
@@ -1158,13 +1601,20 @@
             url: shareUrl,
             creatorName: creatorDisplayName,
             likes: likes,
-            sample: (listData.items || []).map((it) => ({
-              id: it.id || (it.tmdb_id ? String(it.tmdb_id) : ""),
-              name: it.title || it.name || "Item",
-              poster: it.poster || "",
-              year: it.year || it.releaseInfo || "",
-              type: it.type || listData.type || "movie",
-            })),
+            sample: (listData.items || []).map((it) => {
+              const itId = it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : (it.id ? `tt${it.id}` : ''));
+              let poster = it.poster || it.showPoster || "";
+              if (!poster && itId && itId.startsWith("tt")) {
+                poster = `https://images.metahub.space/poster/medium/${itId}/img`;
+              }
+              return {
+                id: itId || (it.tmdb_id ? String(it.tmdb_id) : String(it.id || "")),
+                name: it.title || it.name || "Item",
+                poster: poster,
+                year: it.year || it.releaseInfo || "",
+                type: it.type || listData.type || "movie",
+              };
+            }),
             maybeMore: false,
           },
         }),
@@ -1743,6 +2193,16 @@
     }
 
     return new Response("Not found", { status: 404, headers: corsHeaders() });
+}
+
+// The actual Worker export. Delegates to handleFetch (25_api-catalog-
+// routes.js) for everything, then runs the response back through
+// withSecurityHeaders (02_http-and-creator-utils.js) before it goes out --
+// see handleFetch's own opening comment for why it's split this way.
+export default {
+  async fetch(request, env, ctx) {
+    const response = await handleFetch(request, env, ctx);
+    return withSecurityHeaders(response);
   },
 
   // Runs on whatever schedule this Worker's owner configured under

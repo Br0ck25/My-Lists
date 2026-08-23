@@ -194,19 +194,13 @@ function renderCreatorProfileBar() {
   if (!bar) return;
   if (activeCreator) {
     bar.innerHTML =
-      '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
       '<div style="display:flex; align-items:center; gap:8px;">' +
-      '<span class="subnav-pill active" style="margin:0; font-size:0.82rem; padding:6px 12px; cursor:pointer;" onclick="switchTab(&quot;keys&quot;)">&#x1F464; ' + escapeHtml(activeCreator.displayName) + '</span>' +
-      '</div>' +
-      '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
+      '<button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + escapeHtml(activeCreator.displayName) + '</button>' +
       '</div>';
   } else {
     bar.innerHTML =
-      '<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">' +
       '<div style="display:flex; align-items:center; gap:6px;">' +
-      '<button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:6px 12px; font-size:0.82rem; font-weight:700;">Login</button>' +
-      '</div>' +
-      '<a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" style="font-size:0.8rem; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap;">&#x2615; Buy me a coffee</a>' +
+      '<button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button>' +
       '</div>';
   }
 }
@@ -368,25 +362,120 @@ function toggleAccountKeyVisibility() {
 // login of its own, so the only way the server-side handler for it knows
 // whose Watch History to update is whatever's baked into the install
 // link itself -- and a Creator Profile's Watch History is the only kind
+function renderWatchlistPreferencesSection() {
+  const box = document.getElementById('watchlistPreferencesSection');
+  if (!box) return;
+  let autoClean = true;
+  try {
+    const val = localStorage.getItem('myListAddon:removeWatchedFromWatchlist');
+    autoClean = val !== '0';
+  } catch (e) {}
+  box.innerHTML =
+    '<label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">' +
+      '<input type="checkbox" id="removeWatchedFromWatchlistCheck" ' + (autoClean ? 'checked' : '') + ' onchange="onRemoveWatchedFromWatchlistToggle(this)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">' +
+      '<div>' +
+        '<span style="font-weight:600;">Automatically remove watched items from Watchlist</span>' +
+        '<p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Movies are removed once watched. TV shows are only removed after every episode has been watched.</p>' +
+      '</div>' +
+    '</label>';
+}
+
+function onRemoveWatchedFromWatchlistToggle(cb) {
+  try {
+    localStorage.setItem('myListAddon:removeWatchedFromWatchlist', cb.checked ? '1' : '0');
+  } catch (e) {}
+  if (cb.checked && typeof cleanWatchedFromWatchlists === 'function') {
+    cleanWatchedFromWatchlists();
+  }
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+}
+
 // that persists anywhere outside a single browser for that link to
 // point at in the first place.
 function renderTrackPlaybackSection() {
   const box = document.getElementById('trackPlaybackSection');
   if (!box) return;
   if (!activeCreator) {
-    box.innerHTML = '<p><small>Sign in to a Creator Profile above to turn this on \u2014 without one, there\u2019s no account on file for a bare Stremio/wako request to update.</small></p>';
+    box.innerHTML = '<p><small>Sign in to a Creator Profile above to enable automatic scrobbling \u2014 without one, there\u2019s no account on file to sync playback to.</small></p>';
     return;
   }
   let enabled = false;
   try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  const webhookUrl = ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(activeCreator.creatorName) + '&key=' + encodeURIComponent(creatorKey);
+
   box.innerHTML =
-    '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.92rem;">' +
-      '<input type="checkbox" id="trackPlaybackCheck" ' + (enabled ? 'checked' : '') + ' onchange="onTrackPlaybackToggle(this)">' +
-      '<span>Enabled</span>' +
-    '</label>' +
-    '<p style="margin-top:8px;"><small>Takes effect on your next install link \u2014 generate a fresh one from Configure &amp; Install after turning this on or off.</small></p>' +
-    '<div id="trackPlaybackStatus" style="margin-top:10px;"></div>';
-  if (enabled) refreshTrackPlaybackStatus();
+    '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
+      '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Streaming Apps &amp; Addon Players (Stremio, Nuvio, Wako, etc.)</p>' +
+      '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.9rem;">' +
+        '<input type="checkbox" id="trackPlaybackCheck" ' + (enabled ? 'checked' : '') + ' onchange="onTrackPlaybackToggle(this)">' +
+        '<span>Enable In-App Playback Auto-Tracking</span>' +
+      '</label>' +
+      '<p style="margin:6px 0 0; color:var(--muted); font-size:0.8rem;">Automatically marks movies and episodes as watched whenever playback starts in any supported streaming app or addon player (Stremio, Nuvio, Wako, etc.) via the built-in playback hook. Takes effect on your next install link.</p>' +
+    '</div>' +
+
+    '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
+      '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
+      '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
+      '<div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="flex:1; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="white-space:nowrap; padding:8px 14px; font-size:0.84rem;">📋 Copy Webhook URL</button>' +
+      '</div>' +
+
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border);">' +
+        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
+          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+          '<span style="font-weight:600;">Automatically sync media server scrobbles to your Watch History list</span>' +
+        '</label>' +
+        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
+          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+          '<span style="font-weight:600;">Forward scrobbles to connected external accounts (Trakt, Simkl, MDBList)</span>' +
+        '</label>' +
+        '<div>' +
+          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:5px 12px; font-size:0.82rem;">Sync Current Watch History to Connected Accounts Now</button>' +
+        '</div>' +
+      '</div>' +
+
+      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:10px;">' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Plex Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. Open <strong>Plex Web &rarr; Settings &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Click <strong>Save Changes</strong>.</p>' +
+        '</details>' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Jellyfin Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. In Jellyfin <strong>Dashboard &rarr; Plugins</strong>, install the <strong>Webhook</strong> plugin.<br>2. Go to Webhook settings &rarr; <strong>Add Generic Destination</strong>.<br>3. Paste the URL and check <strong>Playback</strong> events.</p>' +
+        '</details>' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Emby Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. Open Emby Server <strong>Dashboard &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Check <strong>Playback</strong> / <strong>Scrobble</strong> events.</p>' +
+        '</details>' +
+      '</div>' +
+    '</div>' +
+
+    '<div id="trackPlaybackStatus" style="margin-top:8px;"></div>';
+
+  refreshTrackPlaybackStatus();
+}
+
+function copyScrobbleWebhookUrl() {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input || !input.value) return;
+  navigator.clipboard.writeText(input.value).then(() => {
+    alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
+  }).catch(() => {
+    prompt('Copy your Scrobble Webhook URL:', input.value);
+  });
+}
+
+function toggleMediaServerSync(enabled) {
+  try { localStorage.setItem('myListAddon:syncMediaServerHistory', enabled ? 'true' : 'false'); } catch (e) {}
+  if (typeof saveState === 'function') saveState();
+}
+
+function toggleForwardScrobbles(enabled) {
+  try { localStorage.setItem('myListAddon:forwardScrobbleToProviders', enabled ? 'true' : 'false'); } catch (e) {}
+  if (typeof saveState === 'function') saveState();
 }
 
 function onTrackPlaybackToggle(cb) {
@@ -395,9 +484,6 @@ function onTrackPlaybackToggle(cb) {
   if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
   if (cb.checked) {
     refreshTrackPlaybackStatus();
-  } else {
-    const statusBox = document.getElementById('trackPlaybackStatus');
-    if (statusBox) statusBox.innerHTML = '';
   }
 }
 
@@ -405,7 +491,7 @@ async function refreshTrackPlaybackStatus() {
   const statusBox = document.getElementById('trackPlaybackStatus');
   if (!statusBox || !activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  statusBox.innerHTML = '<small>Checking last ping\u2026</small>';
+  statusBox.innerHTML = '<small style="color:var(--muted);">Checking scrobble status\u2026</small>';
   try {
     const res = await fetch(ORIGIN + '/api/creator/track-status', {
       method: 'POST',
@@ -414,13 +500,23 @@ async function refreshTrackPlaybackStatus() {
     });
     const data = await res.json();
     if (!data.ok || !data.lastPingAt) {
-      statusBox.innerHTML = '<small>No ping received yet. If you\u2019ve played something in Stremio/wako since installing with this on and it still says that, the subtitle-request hook likely isn\u2019t firing for that app/platform \u2014 that would mean this approach doesn\u2019t work there, not that it\u2019s just slow.</small>';
+      statusBox.innerHTML = '<div style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:rgba(255,255,255,0.03); border-radius:6px; font-size:0.83rem; color:var(--muted);"><span style="color:var(--muted);">&#x25CB;</span> <span>Ready for playback / scrobble events from Stremio, Plex, Jellyfin, or Emby.</span></div>';
       return;
     }
     const when = new Date(data.lastPingAt).toLocaleString();
-    statusBox.innerHTML = '<small>Last ping: ' + escapeHtml(when) + ' \u2014 id: <code>' + escapeHtml(data.lastPingId || '') + '</code>, matched: ' + escapeHtml(data.matched || 'unknown') + '</small>';
+    const serverLabel = data.lastServer ? '<strong>' + escapeHtml(data.lastServer) + '</strong>' : '<strong>In-App Streaming Player</strong>';
+    statusBox.innerHTML =
+      '<div style="padding:10px 12px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.25); border-radius:8px; font-size:0.84rem;">' +
+        '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+          '<span style="color:var(--accent); font-weight:700;">\u2713 Last Scrobble Activity</span>' +
+          '<span style="color:var(--muted); font-size:0.78rem;">' + escapeHtml(when) + '</span>' +
+        '</div>' +
+        '<div style="color:var(--text);">' +
+          'Source: ' + serverLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(data.matched || data.lastPingId || 'OK') + '</code>' +
+        '</div>' +
+      '</div>';
   } catch (e) {
-    statusBox.innerHTML = '<small>Could not check status right now.</small>';
+    statusBox.innerHTML = '<small style="color:var(--muted);">Could not check status right now.</small>';
   }
 }
 
@@ -442,6 +538,7 @@ function switchCreatorProfile() {
   localStorage.removeItem('myListAddon:creatorKey');
   renderCreatorProfileBar();
   renderAccountKeySection();
+  renderWatchlistPreferencesSection();
   renderTrackPlaybackSection();
   renderCreatorDashboard();
 }
@@ -487,6 +584,7 @@ async function submitRestoreProfile() {
     closeModal();
     renderCreatorProfileBar();
     renderAccountKeySection();
+    renderWatchlistPreferencesSection();
     renderTrackPlaybackSection();
     renderCreatorDashboard();
     loadCreatorSync();
@@ -513,6 +611,7 @@ async function tryAutoRestoreCreatorProfile() {
       activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
       renderCreatorProfileBar();
       renderAccountKeySection();
+      renderWatchlistPreferencesSection();
       renderTrackPlaybackSection();
       renderCreatorDashboard();
       loadCreatorSync();
@@ -626,7 +725,7 @@ let trackingSyncTimer = null;
 function scheduleTrackingSync() {
   if (!activeCreator) return;
   if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
-  trackingSyncTimer = setTimeout(pushTrackingSync, 1200);
+  trackingSyncTimer = setTimeout(pushTrackingSync, 300);
 }
 
 async function pushCreatorSync() {
@@ -667,6 +766,9 @@ async function pushTrackingSync() {
   if (!creatorKey) return;
   try {
     const localMap = loadLocalCustomLists();
+    const wl = localMap['watchlist'] || {};
+    const wlItems = Array.isArray(wl.items) ? wl.items : [];
+    const wlUpdatedAt = Number(wl.updatedAt) || Date.now();
     await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -679,8 +781,10 @@ async function pushTrackingSync() {
         // merging.
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
-        watchlist: (localMap['watchlist'] && localMap['watchlist'].items) || [],
+        watchlist: wlItems,
+        watchlistUpdatedAt: wlUpdatedAt,
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
+        removeWatchedFromWatchlist: localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0',
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
       }),
@@ -760,6 +864,10 @@ async function loadCreatorSync() {
       try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
       if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
     }
+    if (typeof synced.removeWatchedFromWatchlist === 'boolean') {
+      try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', synced.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+      if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+    }
     if (Array.isArray(synced.likedLists)) {
       try {
         localStorage.setItem('myListAddon:likedLists', JSON.stringify(synced.likedLists));
@@ -830,6 +938,15 @@ async function loadCreatorSync() {
           localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
           window.simklUsername = synced.keys.simklUsername;
         }
+        if (typeof synced.keys.syncTraktHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncTraktHistory', synced.keys.syncTraktHistory ? 'true' : 'false');
+        }
+        if (typeof synced.keys.syncMdblistHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncMdblistHistory', synced.keys.syncMdblistHistory ? 'true' : 'false');
+        }
+        if (typeof synced.keys.syncSimklHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncSimklHistory', synced.keys.syncSimklHistory ? 'true' : 'false');
+        }
         if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
         if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
         if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
@@ -895,15 +1012,29 @@ async function loadCreatorSync() {
       touchedTracking = true;
     }
     if (Array.isArray(synced.watchlist)) {
-      const localWL = loadLocalCustomLists()['watchlist'];
-      const localWLItems = (localWL && localWL.items) || [];
-      if (localWLItems.length > synced.watchlist.length) {
-        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+      const map = loadLocalCustomLists();
+      backfillAutoTrackedListSlugs(map);
+      // Only use the dedicated watchlistUpdatedAt from the tracking blob.
+      // Do NOT fall back to synced.updatedAt (the profile's overall last-
+      // modified time) -- that timestamp has nothing to do with the
+      // watchlist and would cause the server to falsely "win" the
+      // comparison against a local change that hadn't synced up yet
+      // (e.g. the user added an item and refreshed before the push completed).
+      const localWL = map['watchlist'] || { items: [], updatedAt: 0 };
+      const localTime = Number(localWL.updatedAt) || 0;
+      const serverTime = Number(synced.watchlistUpdatedAt) || 0;
+
+      if (localTime >= serverTime) {
+        // Local is same age or newer — keep local and push it up so the
+        // server catches up (covers the case where push was interrupted
+        // by a page refresh before it completed).
+        if (localWL.items && localWL.items.length > 0 && typeof pushTrackingSync === 'function') {
+          pushTrackingSync();
+        }
       } else {
-        const map = loadLocalCustomLists();
-        backfillAutoTrackedListSlugs(map);
+        // Server is genuinely newer (e.g. another device added something).
         map['watchlist'].items = synced.watchlist;
-        map['watchlist'].updatedAt = Date.now();
+        map['watchlist'].updatedAt = serverTime;
         saveLocalCustomListsMap(map);
       }
       touchedTracking = true;
@@ -1034,6 +1165,7 @@ async function submitCreateProfile() {
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
+    renderWatchlistPreferencesSection();
     renderTrackPlaybackSection();
     showKeyRevealModal(data.displayName, data.creatorKey);
     loadCreatorSync();
@@ -1118,11 +1250,11 @@ function showSavedCustomListModal(listName, visibility, url) {
       '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">\u2713 List Saved</h2>' +
       '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
-        '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Creator Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
+        '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
       '</p>' +
       (isPrivate
         ? '<div style="padding:12px 14px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.2); border-radius:10px; margin-bottom:16px;">' +
-            '<p style="margin:0; font-size:0.84rem; color:var(--text);">&#x1F512; Only you can see this list from your profile when logged in.</p>' +
+            '<p style="margin:0; font-size:0.84rem; color:var(--text);">Only you can see this list from your profile when logged in.</p>' +
           '</div>'
         : '<div style="margin-bottom:16px;">' +
             '<p style="margin:0 0 8px; font-size:0.84rem; color:var(--muted);">Public share link:</p>' +
@@ -1332,8 +1464,20 @@ async function renderCreatorDashboard(options) {
       '</div>';
     }
 
+    const serverCustomLists = (data.lists || []).filter((l) => l && l.slug !== 'watchlist' && l.slug !== 'watch-history' && l.slug !== 'continue-watching');
+    const serverWatchlist = (data.lists || []).find((l) => l && (l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist')));
+    if (serverWatchlist) {
+      const localMap = loadLocalCustomLists();
+      if (localMap['watchlist']) {
+        if (serverWatchlist.visibility) localMap['watchlist'].visibility = serverWatchlist.visibility;
+        if (serverWatchlist.likes != null) localMap['watchlist'].likes = serverWatchlist.likes;
+        if (serverWatchlist.url) localMap['watchlist'].url = serverWatchlist.url;
+        saveLocalCustomListsMap(localMap);
+      }
+    }
+
     const allDashboardLists = [
-      ...(data.lists || []).map((l) => ({ isServer: true, list: l })),
+      ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
       ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
     ];
 
@@ -1379,12 +1523,23 @@ function formatWatchItemLabel(it) {
     const e = String(it.episodeNum).padStart(2, '0');
     return { title: it.showTitle + ' S' + s + 'E' + e, subtitle: it.name || it.title || '' };
   }
+  if (it.showTitle) {
+    return { title: it.showTitle, subtitle: it.name || it.title || '' };
+  }
   return { title: it.title || it.name || '', subtitle: '' };
 }
 
 function buildLocalListCardHtml(l) {
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
   const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist');
+  if (isWatchlist) {
+    const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
+    const liveWL = liveMap ? liveMap['watchlist'] : null;
+    if (liveWL && Array.isArray(liveWL.items)) {
+      l.items = liveWL.items;
+      if (liveWL.visibility) l.visibility = liveWL.visibility;
+    }
+  }
   const itemCount = (l.items || []).length;
   const allPosters = (l.items || []).slice(0, 9).filter((it) => (l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster)));
   const totalCount = itemCount || allPosters.length;
@@ -1410,9 +1565,17 @@ function buildLocalListCardHtml(l) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
     }
     const itemPoster = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
+    let dateBadge = '';
+    if (it.airDate && (it.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: it.airDate })))) {
+      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : it.airDate;
+      if (badgeText) {
+        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+      }
+    }
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+        dateBadge +
         removeBtn +
         overlays +
       '</div>' +
@@ -1423,6 +1586,13 @@ function buildLocalListCardHtml(l) {
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
   const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : '');
+  const isPublic = l.visibility === 'public';
+  const shareUrl = l.url || ((typeof activeCreator !== 'undefined' && activeCreator)
+    ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (l.slug || 'watchlist'))
+    : (location.origin + '/lists/' + (l.slug === 'watchlist' ? 'watchlist' : ('custom/' + l.slug))));
+  const shareBtn = isPublic
+    ? '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(shareUrl) + '">Share</button>'
+    : '';
 
   let isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
   if (!isAdded && isAutoTracked) {
@@ -1440,6 +1610,7 @@ function buildLocalListCardHtml(l) {
       }
     }
   }
+
   const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary localListAddToConfigBtn is-added' : 'primary localListAddToConfigBtn') + '" ' +
     (isAdded ? 'style="color:var(--danger);"' : '') +
     ' data-slug="' + escapeAttr(l.slug) + '">' +
@@ -1458,10 +1629,11 @@ function buildLocalListCardHtml(l) {
           escapeHtml(l.name) +
         '</div>' +
         '<div class="list-card-meta">' +
+          (!isAutoTracked ? ('<span>' + (isPublic ? 'Public' : 'Private') + '</span><span class="list-card-meta-sep">&middot;</span>') : '') +
           '<span>' + typeLabel + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span>' +
           '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
-          '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
+          (!isAutoTracked && l.slug !== 'watchlist' ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
         '</div>' +
       '</div>' +
       (isAutoTracked
@@ -1472,6 +1644,7 @@ function buildLocalListCardHtml(l) {
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
             deleteBtnHtml +
+            shareBtn +
             addBtnHtml +
           '</div>') +
     '</div>' +
@@ -1580,13 +1753,18 @@ if (_creatorDashEl) {
         subtitle: label.subtitle,
         poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
         year: it.year,
+        airDate: it.airDate,
+        isUnaired: it.isUnaired,
         removeShowId: isCw ? (it.showId || it.id) : null,
         removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
         removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
         removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? list.slug : null,
       };
     }) : [];
-    openListDetailsPage(viewBtn.dataset.name, viewBtn.dataset.type, '', { sample: sample, maybeMore: false });
+    const listSlug = (list && (list.slug || list.localSlug)) || (isCw ? 'continue-watching' : (isHistory ? 'watch-history' : (isWatchlist ? 'watchlist' : '')));
+    const listUrl = listSlug ? ('custom:' + listSlug) : '';
+    const listType = (viewBtn.dataset.type && viewBtn.dataset.type !== 'undefined') ? viewBtn.dataset.type : ((list && list.type) || (isCw ? 'series' : (isWatchlist ? 'mixed' : 'movie')));
+    openListDetailsPage(viewBtn.dataset.name, listType, listUrl, { sample: sample, maybeMore: false });
     return;
   }
   const shareBtn = e.target.closest('.creatorListShareBtn');
@@ -1888,6 +2066,8 @@ function editLocalCustomList(slug) {
   const stEl2 = document.getElementById('customListSearchType');
   if (stEl2) stEl2.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  if (visSelect) visSelect.value = (listMeta.visibility === 'public') ? 'public' : 'private';
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
   switchTab('lists');
@@ -2419,7 +2599,7 @@ function removeWatchHistoryItemDirect(id, btn) {
   const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   if (map['watch-history'] && Array.isArray(map['watch-history'].items)) {
     const initialLen = map['watch-history'].items.length;
-    map['watch-history'].items = map['watch-history'].items.filter(it => String(it.id || it.imdbId) !== targetId);
+    map['watch-history'].items = map['watch-history'].items.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
     if (map['watch-history'].items.length !== initialLen) {
       if (window._watchedItemIds) window._watchedItemIds.delete(targetId);
       map['watch-history'].updatedAt = Date.now();
@@ -2427,6 +2607,12 @@ function removeWatchHistoryItemDirect(id, btn) {
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
       if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
+    }
+  }
+  if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
+    window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+    if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
     }
   }
 }

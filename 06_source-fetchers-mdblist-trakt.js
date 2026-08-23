@@ -105,7 +105,15 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
 
   const res = await fetch(src, {
     headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
-    cf: { cacheTtl: 300, cacheEverything: true },
+    // Raised from 300s (5min) to 600s (10min) -- this is the default/
+    // fallback list source (detectSource's own catch-all), and it always
+    // carries an apikey -- the shared MDBLIST_API_KEY whenever a visitor
+    // hasn't pasted in their own -- so it draws against MDBList's shared
+    // 1,000-requests-per-day budget (a flat daily cap, no rolling window
+    // the way Trakt's works) every time it's a cache miss. Same tradeoff
+    // as the Trakt TTL bump above: a public list's own update takes up to
+    // 10min longer to show up for someone else browsing it.
+    cf: { cacheTtl: 600, cacheEverything: true },
   });
 
   if (!res.ok) {
@@ -120,7 +128,10 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
 
   const data = await res.json();
   const metas = mapMdblistItems(data, entry.type);
-  return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+  const total = metas.length;
+  const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+  enriched.totalItems = total;
+  return enriched;
 }
 
 // Pulls the user's watchlist from MDBList
@@ -305,13 +316,27 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
-    freshTtlSec: accessToken ? 60 : 300,
+    // Public/unauthenticated fetches (the ones that fall back to the
+    // shared TRAKT_CLIENT_ID and so draw against Trakt's shared
+    // 1,000-calls-per-5-minutes app-level limit -- see this function's
+    // own header comment) get a longer fresh window than a personal,
+    // per-user-token fetch: 600s (10min) here, 1200s (20min) on the raw
+    // fetch()'s own cf.cacheTtl below. Since 600 < 1200, the in-memory
+    // layer here will actually re-run more often than the edge cache
+    // beneath it changes -- real protection against hitting Trakt's
+    // origin again is bounded by the 1200s edge figure, not this one;
+    // this number mainly buys a fresher response for whoever's waiting
+    // on it, not fewer real Trakt calls. Personal-token fetches keep
+    // their short 60s window (unrelated to the shared-quota concern this
+    // is protecting against -- authed calls draw from Trakt's separate,
+    // per-user limit instead).
+    freshTtlSec: accessToken ? 60 : 600,
     staleTtlSec: 1800,
     providerLabel: "Trakt List",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
         headers,
-        cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 900, cacheEverything: true },
+        cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 1200, cacheEverything: true },
       });
       if (!res.ok) {
         const hint =

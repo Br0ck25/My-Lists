@@ -92,11 +92,11 @@
   <div class="channels-subpanel" id="channelsSubImport" style="display:none;">
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:8px;">
-        <h2 class="shelf-title">Import Channel from a Link</h2>
+        <h2 class="shelf-title">Import channel from a link</h2>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste any show list URL (MDBList or Trakt) to automatically generate a TV channel catalog.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste any MDBList, Trakt, or TMDB show list URL to import directly as a TV channel catalog.</p>
       <div class="row" style="margin-bottom:8px;">
-        <input type="text" id="channelImportUrlInput" placeholder="Show list URL (mdblist.com or trakt.tv)">
+        <input type="text" id="channelImportUrlInput" placeholder="mdblist.com, trakt.tv, or themoviedb.org show list URL">
       </div>
       <div class="row">
         <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
@@ -109,7 +109,7 @@
   <div class="channels-subpanel" id="channelsSubBuild" style="display:none;">
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
-        <h2 class="shelf-title" id="channelEditorTitle">Edit TV Channel <span class="badge" id="channelDraftCountBadge"></span></h2>
+        <h2 class="shelf-title" id="channelEditorTitle">Build Custom Channel</h2>
       </div>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search any TV show or movie to add episodes to your channel, and reorder or remove picks:</p>
       <div class="row">
@@ -123,7 +123,7 @@
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
         <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
-        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Clear All</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
         <input type="checkbox" id="channelRandomizeCheck">

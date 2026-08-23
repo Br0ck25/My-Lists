@@ -1,133 +1,235 @@
 # My Lists Addon
 
-A self-hosted Stremio/wako add-on that turns your **MDBList**, **Trakt**, and **TMDB** lists into catalog rows on your home screen — plus a built-in Watch History, Continue Watching, and Custom List builder, all running entirely on your own free Cloudflare account.
+A powerful, self-hosted [Stremio](https://stremio.com) and [wako](https://wako.app) add-on that transforms your **MDBList**, **Trakt**, **TMDB**, and **Simkl** lists into dynamic catalog rows on your home screen — featuring a full **Custom List Builder**, **Letterboxd CSV Import**, **Virtual TV Channels**, **Continue Watching & Watch History Sync**, **Creator Profiles**, and an **Admin Analytics Dashboard**, all running on a single free [Cloudflare Workers](https://workers.cloudflare.com) deployment.
 
-There's no database, no server to maintain, and no third-party service involved besides Cloudflare and the list providers themselves. Your configuration lives either in your install link or in your own Cloudflare KV storage — never on anyone else's server.
-
-## Features
-
-- Turn any public MDBList, Trakt, or TMDB list URL into a home-screen catalog
-- Popular Lists browser, Curated picks, and a list search box to find new lists without leaving the app
-- A full Custom List builder — search for titles and build your own lists from scratch, or import an existing list from a link
-- Watch History and Continue Watching, tracked automatically as you mark things watched, with a "next unwatched episode" indicator per show, and an optional background job to catch newly-aired episodes on shows you're caught up on
-- Optional free account system ("Creator Profiles") to save and sync your lists, presets, and watch history across devices
-- Trakt account connection for private list and watch-history import
-- Quick Add charts for popular streaming services, and Quick Add for live TV channels
-- Everything runs from a single Cloudflare Worker file — no backend server, no ongoing hosting cost
-
-## What you'll need
-
-- A free [Cloudflare](https://dash.cloudflare.com/sign-up) account
-- 5–10 minutes
-- Optionally, free API keys from MDBList, Trakt, TMDB, and/or Simkl (see below) — the add-on works without them, but each one unlocks a specific feature
-
-Nothing else. No command line, no Node.js, no billing information required (this runs entirely on Cloudflare's free tier for any normal amount of personal use).
+There are no servers to manage, no external databases required, and no subscription fees. Your configuration is encoded directly into your install link or securely synchronized via your own private Cloudflare KV storage.
 
 ---
 
-## Installation
+## 🌟 Key Features
 
-### Step 1 — Create the Worker
+### 📺 Multi-Provider Catalog Engine
+- **MDBList**: Turn public or private MDBList URLs and personal watchlists into catalog rows. Includes one-click browsing of MDBList Toplists and popular charts.
+- **Trakt**: Full support for public lists, personal lists, liked lists, watchlists, collections, recommendations, and trending/popular charts. Includes OAuth login and TV/console Device Code authentication (`/api/trakt/device/code`).
+- **TheMovieDB (TMDB)**: Support for TMDB v3/v4 lists, user lists, keyword/genre/network/company charts, search, and automated TMDB-to-IMDb external ID resolution.
+- **Simkl**: Trending charts across Movies, TV Shows, and Anime (Daily, Weekly, Monthly), plus OAuth account linking for personal list and history import.
 
-1. Log into the [Cloudflare dashboard](https://dash.cloudflare.com).
-2. In the left sidebar, go to **Workers & Pages**.
-3. Click **Create**, then **Create Worker**.
-4. Give it a name (e.g. `my-lists`) — this becomes part of your add-on's URL (`your-name.your-subdomain.workers.dev`). Click **Deploy** to create it with the default "Hello World" placeholder code; you'll replace that next.
+### ⚡ Discover & Quick Add Shelves
+- One-click catalog shortcuts for major streaming platforms (Netflix, Disney+, Prime Video, Apple TV+, Max, Hulu, Paramount+, Peacock, Anime, etc.).
+- Curated collections, award winners, box office hits, and trending lists built right into the configuration UI.
 
-### Step 2 — Paste in the add-on code
+### 🛠️ Custom List Builder & Letterboxd Import
+- **Build from scratch**: Search movies and shows across TMDB to create custom catalogs.
+- **Letterboxd CSV Import**: Upload your Letterboxd export CSVs and automatically batch-resolve titles and release years into IMDb/TMDB IDs (`/api/bulk-resolve`).
+- **List Sharing & Directory**: Publish your custom lists to the community directory, clone public lists, and like community catalogs.
 
-1. From your new Worker's page, click **Edit code** (this opens the Cloudflare "Quick Edit" browser-based code editor).
-2. Select all the placeholder code and delete it.
-3. Open `worker_entry_combined.js` from this project and copy its entire contents.
-4. Paste it into the editor.
-5. Click **Deploy** (or **Save and deploy**) in the top right.
+### 📡 Virtual TV Channel Builder
+- Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
+- Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
 
-That's it — your add-on is now live at `https://your-worker-name.your-subdomain.workers.dev`. Everything below this point is optional, and each piece can be added later at any time without breaking anything already working.
+### ⏱️ Continue Watching & Background Watch Sync
+- Automatically tracks watch progress and next unwatched episode per show.
+- Mark titles as watched/unwatched directly from the UI or scrobble integrations.
+- **Scheduled Cron Worker**: Automatically queries TMDB every 6 hours via Cloudflare Cron Triggers (`0 */6 * * *`) to find newly-aired episodes for caught-up shows and push them to Continue Watching.
 
-### Step 3 — (Optional) Enable accounts, saved lists, and stats
+### 👤 Creator Profiles & Cloud Sync
+- Free, passwordless account system secured by salted SHA-256 Creator Keys (`CRTR-...`).
+- Synchronize your catalogs, custom lists, channels, presets, likes, and watch history across all your browsers and devices.
 
-Creator Profiles (free accounts that let you save Custom Lists to the cloud and sync Watch History across devices), the admin stats dashboard, and short install links all need a place to store data. Without this step, the add-on still works fully for building and installing catalogs — this step only unlocks those extras.
+### 📊 Admin Dashboard (`/admin`)
+- Password-protected stats and management dashboard with session authentication (`ADMIN_KEY`).
+- Real-time telemetry: page views, installs, and live API usage counters for TMDB, Trakt, MDBList, and Simkl.
+- Catalog leaderboards and community feedback/issue tracking inbox (open/in-progress/closed).
+- Streaming provider lookup and Netflix catalog preview inspector.
 
-1. In the Cloudflare dashboard, go to **Storage & Databases → KV**.
-2. Click **Create a namespace**. Name it anything (e.g. `my-lists-configs`).
-3. Go back to your Worker → **Settings → Variables and Bindings**.
-4. Click **Add binding → KV Namespace**.
-   - **Variable name:** `CONFIGS` (must be exactly this — the code looks for it by name)
-   - **KV namespace:** select the one you just created
-5. Save.
+### 📱 Progressive Web App (PWA)
+- Installable PWA with offline caching (`/sw.js`), modern web app manifest (`/app.webmanifest`), dark mode UI, clipboard shortcuts, and QR code sharing.
+- Stremio & wako protocol compliance (Manifest v3, catalog pagination, stream/subtitle routing, shelf/item shuffling).
 
-### Step 4 — (Optional) Add API keys for list providers
+---
 
-The add-on works with **zero keys** for anything using public mdblist.com URLs. Each key below unlocks one additional provider or feature. Add only the ones you want — skipping any of these just means that specific feature shows a clear "not configured" message instead of breaking anything else.
+## 📋 Requirements
 
-Go to your Worker → **Settings → Variables and Bindings → Add → Secret** (use **Secret**, not plain **Text**, so the value stays encrypted and hidden even from you after saving) for each one you want:
+- A free [Cloudflare](https://dash.cloudflare.com/sign-up) account.
+- **Optional**: Free API keys/OAuth apps from TMDB, Trakt, Simkl, or MDBList to unlock specific list providers.
+- **Zero build dependencies**: The entire add-on runs from `worker_entry_combined.js`.
 
-| Variable name | Unlocks | Get a free key at |
+---
+
+## 🚀 Installation & Deployment
+
+### Step 1 — Create the Cloudflare Worker
+
+1. Log into your [Cloudflare Dashboard](https://dash.cloudflare.com).
+2. In the sidebar, navigate to **Workers & Pages**.
+3. Click **Create** &rarr; **Create Worker**.
+4. Name your worker (e.g. `my-lists`) and click **Deploy**.
+
+### Step 2 — Deploy the Add-on Code
+
+1. On your Worker's overview page, click **Edit code** (Quick Edit).
+2. Delete the default template code.
+3. Copy the entire contents of [`worker_entry_combined.js`](file:///c:/Users/James/Downloads/My%20Lists%20Addon/My%20Lists%20Addon%20Beta/worker_entry_combined.js) and paste it into the editor.
+4. Click **Deploy** (or **Save and Deploy**).
+
+> **Note**: Your add-on is now immediately operational at `https://your-worker-name.your-subdomain.workers.dev`!
+
+---
+
+### Step 3 — (Recommended) Enable Cloudflare KV Storage
+
+KV storage is required for Creator Profiles (cloud sync), short install links, Custom Lists, Channels, Admin analytics, and Feedback storage:
+
+1. In Cloudflare Dashboard, go to **Storage & Databases** &rarr; **KV**.
+2. Click **Create namespace** and name it (e.g., `my-lists-kv`).
+3. Return to your Worker &rarr; **Settings** &rarr; **Variables and Bindings**.
+4. Under **KV Namespace Bindings**, click **Add binding**:
+   - **Variable name**: `CONFIGS` *(must match exactly)*
+   - **KV namespace**: Select the namespace created in step 2.
+5. Click **Save and deploy**.
+
+---
+
+### Step 4 — (Optional) Add API Keys & OAuth Credentials
+
+The add-on works out-of-the-box with public MDBList and TMDB links. Adding API keys unlocks external accounts, private lists, and richer metadata.
+
+Add these under **Settings** &rarr; **Variables and Bindings** &rarr; **Add** &rarr; **Secret** (or Text):
+
+| Variable / Secret | Description & Feature Unlocked | Source / Where to obtain |
 |---|---|---|
-| `TMDB_API_KEY` | themoviedb.org lists, episode/season data, trailers, artwork | [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api) — use the **API Key** field, not "API Read Access Token" |
-| `TRAKT_CLIENT_ID` | trakt.tv public lists and charts | [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications) — create an app, copy the **Client ID** |
-| `TRAKT_CLIENT_SECRET` | "Connect Trakt account" (private lists, watch history import) | Same Trakt app as above — copy the **Client Secret** too |
-| `SIMKL_CLIENT_ID` | Simkl trending charts | [simkl.com/settings/developer](https://simkl.com/settings/developer/) |
-| `MDBLIST_API_KEY` | Private MDBList lists, "My Watchlist" quick-add (fallback if a visitor hasn't pasted their own) | [mdblist.com/preferences](https://mdblist.com/preferences) |
-| `MDBLIST_POPULAR_KEY` | The "Popular Lists" browse box specifically | Same place as `MDBLIST_API_KEY` above — can be the same key or a separate one |
+| `TMDB_API_KEY` | TMDB lists, episode/season data, search, recommendations, artwork, bulk movie resolution | [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api) (*API Key (v3 auth)*) |
+| `TRAKT_CLIENT_ID` | Trakt public lists, search, trending/popular charts, recommendations | [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications) |
+| `TRAKT_CLIENT_SECRET` | Trakt OAuth account login, Device Code authentication, private lists & watch history export | Same Trakt app as above |
+| `SIMKL_CLIENT_ID` | Simkl trending charts (Movies, TV, Anime) and OAuth login | [simkl.com/settings/developer](https://simkl.com/settings/developer/) |
+| `SIMKL_CLIENT_SECRET` | Simkl OAuth token exchange for private lists and history sync | Same Simkl app as above |
+| `MDBLIST_API_KEY` | Private MDBList lists, Watchlist quick-add fallback, history sync | [mdblist.com/preferences](https://mdblist.com/preferences) |
+| `MDBLIST_POPULAR_KEY` | Dedicated key for MDBList Toplists / Popular Lists browser | Same MDBList preferences as above |
+| `MDBLIST_CLIENT_ID` | MDBList OAuth client ID | [mdblist.com/preferences](https://mdblist.com/preferences) |
 
-For the Trakt Client ID/Secret, when creating the app on Trakt's site, set the **Redirect URI** to:
-```
-https://your-worker-name.your-subdomain.workers.dev/api/trakt/oauth/callback
-```
-(only needed if you're setting up `TRAKT_CLIENT_SECRET` for account connection — public Trakt lists work with just the Client ID.)
-
-### Step 5 — (Optional) Enable the admin dashboard
-
-If you set up the KV namespace in Step 3, you can also unlock `/admin` — a stats page showing installs and page views for your deployment.
-
-1. Add one more **Secret**: `ADMIN_KEY`, set to any long random string of your choosing (this is your admin password — keep it private).
-2. Visit `https://your-worker-name.your-subdomain.workers.dev/admin` and log in with that value.
-
-### Step 6 — (Optional) Enable the Continue Watching cron
-
-If you've got the KV namespace (Step 3) and a `TMDB_API_KEY` (Step 4) set up, you can also turn on a background job that checks every 6 hours for newly-aired episodes of shows people have fully caught up on, and adds them straight to Continue Watching automatically — without this, that only ever happens when someone manually reopens a show. It only does anything for people using a Creator Profile account (Step 3), since that's the only place watch data exists outside a single browser for a server-side job to reach.
-
-This one step can't be done from a pasted-in file — it's Worker configuration, not code:
-
-1. Go to your Worker in the Cloudflare dashboard → **Triggers**.
-2. Under **Cron Triggers**, click **Add Cron Trigger**.
-3. Set the schedule to `0 */6 * * *` (every 6 hours).
-4. Save.
-
-That's it — no code change needed, the Worker already has the handler for it.
-
-### Step 7 — Install the add-on
-
-1. Open `https://your-worker-name.your-subdomain.workers.dev` in a browser.
-2. Build your catalog: add lists, connect Trakt, set up Quick Add charts — whatever you'd like on your home screen.
-3. Click the install/configure button to get your personal install link.
-4. Open that link on your phone or in Stremio/wako, and confirm the install.
-
-Your configuration is encoded directly into that install link, so it keeps working even without the optional KV setup above — KV just adds the ability to save things server-side instead of only in the link itself.
+#### OAuth Redirect URIs
+If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set the OAuth callback URLs in their respective developer portals to:
+- **Trakt**: `https://your-worker-name.your-subdomain.workers.dev/api/trakt/oauth/callback`
+- **Simkl**: `https://your-worker-name.your-subdomain.workers.dev/api/simkl/oauth/callback`
+- **MDBList**: `https://your-worker-name.your-subdomain.workers.dev/api/mdblist/oauth/callback`
+- **TMDB**: `https://your-worker-name.your-subdomain.workers.dev/api/tmdb/oauth/callback`
 
 ---
 
-## Updating to a new version later
+### Step 5 — (Optional) Configure Admin Dashboard
 
-Cloudflare's Quick Edit editor doesn't track history the way `git` does, so to update:
+To access the `/admin` telemetry and management console:
+1. Under Worker **Settings** &rarr; **Variables and Bindings** &rarr; **Add** &rarr; **Secret**, create:
+   - **Variable name**: `ADMIN_KEY`
+   - **Value**: A secure password/passphrase of your choice.
+2. Visit `https://your-worker-name.your-subdomain.workers.dev/admin` to log in.
 
-1. Copy the new `worker_entry_combined.js` contents.
-2. Go back to your Worker → **Edit code**.
-3. Select all, delete, paste the new version in, and **Deploy** again.
+---
 
-Your KV data (saved lists, accounts, stats) and your environment variables/secrets are untouched by this — they live separately from the code itself.
+### Step 6 — (Optional) Set Up Continue Watching Cron Trigger
 
-## Troubleshooting
+To automatically check for newly-aired episodes every 6 hours for users with a Creator Profile:
+1. In your Worker dashboard, navigate to **Triggers** &rarr; **Cron Triggers**.
+2. Click **Add Cron Trigger**.
+3. Set the cron expression to: `0 */6 * * *` (every 6 hours).
+4. Click **Save**.
 
-- **"Popular Lists isn't configured on this add-on yet"** — set `MDBLIST_POPULAR_KEY` (Step 4).
-- **"Trakt lists aren't configured on this add-on yet"** — set `TRAKT_CLIENT_ID` (Step 4).
-- **"TMDB lists aren't configured on this add-on yet"** — set `TMDB_API_KEY` (Step 4).
-- **Can't create a Creator Profile / lists won't save** — make sure the `CONFIGS` KV binding is set up exactly as described in Step 3 (the variable name must be `CONFIGS`).
-- **`/admin` says incorrect key** — double check the `ADMIN_KEY` secret was saved, and that KV is bound (the admin dashboard needs both).
-- **Continue Watching never picks up new episodes on its own** — confirm the Cron Trigger was added in the Cloudflare dashboard (Step 6 above isn't set from code), and that `TMDB_API_KEY` and KV are both configured. This also only works for signed-in Creator Profile accounts — it has no way to reach data stored only in someone's browser.
-- Public mdblist.com lists, TMDB list/episode browsing without lookups, and everything about installing the add-on itself work with **no keys and no KV at all** — if something in that category isn't working, it's not a missing-key issue.
+---
 
-## A note on API keys
+### Step 7 — Install in Stremio or wako
 
-Every key above is a personal credential tied to a free developer account on that service. This add-on never ships with anyone's key baked in — you're always using your own. None of these services charge for the tier this add-on needs for personal use.
+1. Open your deployed worker URL in a browser: `https://your-worker-name.your-subdomain.workers.dev`
+2. Add your favorite lists, connect accounts, customize channels, or configure streaming quick-add shelves.
+3. Click **Install Addon** to copy your personal manifest URL or install directly into Stremio/wako.
+4. If you reconfigure later via wako or the configure page, your catalogs update instantly.
+
+---
+
+## 📂 Project Structure & Build Pipeline
+
+The codebase is organized into modular ES modules that compile into a single `worker_entry_combined.js` file:
+
+```
+.
+├── 00_constants.js                     # Versioning, addon constants, and API key globals
+├── 01_icon-asset.js                     # Embedded Base64 addon icon
+├── 02_http-and-creator-utils.js         # CORS, JSON helpers, crypto, creator auth & hashing
+├── 03_admin.js                          # Admin counters, telemetry, and API usage stats
+├── 04_config-resolution.js              # Config decoding (Base64 URL & KV short links)
+├── 05_catalog-core.js                   # Stremio/wako manifest generation & catalog logic
+├── 06_source-fetchers-mdblist-trakt.js  # MDBList & Trakt API data fetching & pagination
+├── 07_source-fetchers-tmdb-simkl.js     # TMDB & Simkl API fetching, episode cron checker
+├── 08_quickadd-chart-data.js            # Preconfigured streaming service & chart metadata
+├── 09_page-shell.js                     # Web app HTML shell, header, PWA meta tags & CSS
+├── 10_tab-search-add.js                 # Catalogs tab HTML
+├── 11_tab-quick-add.js                  # Discover & Quick Add tab HTML
+├── 12_tab-custom-lists.js               # Custom Lists builder tab HTML
+├── 13_tab-channels.js                   # Virtual TV Channels tab HTML
+├── 14_tab-presets-backup.js             # Presets & Backup tab HTML
+├── 15_tab-settings-html.js              # Account, API keys, sync, and preferences UI
+├── 16_client-row-core.js                # Core client runtime, router, state & DOM helpers
+├── 17_client-my-lists-and-trakt-oauth.js# Trakt & MDBList account integration & OAuth UI
+├── 18_client-copy-and-trakt-export.js   # List cloning, deep-linking, and Trakt export
+├── 19_client-search-and-likes.js        # Discover search, filters, and community likes
+├── 20_client-channel-builder.js         # Client-side Virtual Channel creator & preview
+├── 21_client-custom-list-builder.js     # Client-side Custom List builder & Letterboxd import
+├── 22_client-creator-profile.js         # Client-side Creator Profile management & sync
+├── 23_client-list-management.js         # Catalog reordering, toggles, and deletion
+├── 24_client-backup-restore-presets.js  # JSON backup/restore, short link & QR code logic
+├── 25_api-catalog-routes.js             # HTTP router: manifests, catalogs, search & OAuth
+├── 26_api-creator-and-admin-routes.js   # HTTP router: creator sync, admin API & worker export
+├── build.ps1                            # PowerShell script to bundle modules into worker_entry_combined.js
+├── worker_entry_combined.js             # Standalone production Cloudflare Worker bundle
+├── Changes.md                           # Development modification log
+└── README.md                            # Project documentation
+```
+
+### Building the Combined Worker
+
+When editing any individual split file (`00_` through `26_`), run the PowerShell build script to rebuild `worker_entry_combined.js`:
+
+```powershell
+.\build.ps1
+```
+
+---
+
+## 🛠️ API & Endpoint Reference
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | `GET` | Main configuration web app & PWA builder |
+| `/:config/configure` | `GET` | Builder interface pre-populated with existing configuration |
+| `/:config/manifest.json` | `GET` | Stremio / wako Addon Manifest (redirects to `/configure` in browser) |
+| `/:config/catalog/:type/:id.json`| `GET` | Catalog item feed with pagination (`skip=`) support |
+| `/api/title-search` | `GET` | Search movies and TV shows via TMDB |
+| `/api/bulk-resolve` | `POST` | Batch resolve movie title/year pairs to IMDb IDs (Letterboxd import) |
+| `/api/show-seasons` | `GET` | Fetch season lists for a TV show |
+| `/api/show-episodes` | `GET` | Fetch episode lists for a specific season |
+| `/api/toplists` | `GET` | Fetch popular MDBList toplists |
+| `/api/trakt-popular-lists` | `GET` | Fetch trending and popular Trakt lists |
+| `/api/recommendations` | `POST` | Fetch TMDB recommendations for selected titles |
+| `/api/trakt/device/code` | `POST` | Generate Trakt TV / Device Code login flow |
+| `/api/trakt/device/token` | `POST` | Poll Trakt device token status |
+| `/api/creator/*` | `POST` | Creator Profile authentication, list management, and cloud sync |
+| `/admin` | `GET` | Admin analytics dashboard UI |
+| `/admin/api/*` | `GET/POST` | Admin analytics, API usage counters, leaderboard & feedback API |
+| `/sw.js` | `GET` | Service worker for offline PWA support |
+| `/app.webmanifest` | `GET` | Web App Manifest for mobile/desktop PWA installation |
+
+---
+
+## ❓ Troubleshooting
+
+- **"MDBList Toplists / Popular Lists not configured"**: Set the `MDBLIST_POPULAR_KEY` or `MDBLIST_API_KEY` secret.
+- **"Trakt lists not configured"**: Set the `TRAKT_CLIENT_ID` environment secret.
+- **"TMDB lookup / episode browsing not working"**: Set the `TMDB_API_KEY` environment secret.
+- **"Cannot save lists / Creator Profiles not working"**: Ensure the KV Namespace binding is named exactly `CONFIGS`.
+- **"Admin dashboard authentication failed"**: Ensure `ADMIN_KEY` is configured as a Secret and KV storage is bound.
+- **"Continue Watching not updating with new episodes"**: Verify that the Cron Trigger (`0 */6 * * *`) is configured under Worker Triggers and `TMDB_API_KEY` is set. Note that cron updates apply to users with Creator Profiles.
+
+---
+
+## 📄 License
+
+MIT License. Designed for personal, self-hosted use.

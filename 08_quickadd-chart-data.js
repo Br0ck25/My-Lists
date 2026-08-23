@@ -140,6 +140,7 @@ function getProviderIconBadge(name, group) {
   if (n.includes('trakt')) return '<span class="provider-chip-icon" style="background:#ed1c24;color:#fff;">T</span>';
   if (n.includes('simkl')) return '<span class="provider-chip-icon" style="background:#000;border:1px solid #333;color:#fff;">S</span>';
   if (group === 'Kids') return '<span class="provider-chip-icon" style="background:#FF9900;color:#fff;">K</span>';
+  if (group === 'Genres') return '<span class="provider-chip-icon" style="background:#5856D6;color:#fff;">G</span>';
   return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
 }
 
@@ -362,12 +363,7 @@ function jsStringArrayLiteral(arr) {
 
 function buildCombinedChartsHtml() {
   const rows = COMBINED_CHART_LISTS.map((p) => {
-    // Same newline-joined multi-source url convention the "Streaming (All
-    // Services)" starter preset already uses (09_page-shell.js) --
-    // fetchMergedCatalog fans this out to every source in the list, so
-    // openListDetailsPage's normal single-url pagination works here too
-    // without needing its own special case for a "combined" list.
-    const seeAllUrl = JSON.stringify(p.movieUrls.join("\n"));
+    const movieUrlsJoined = p.movieUrls.join("\\n");
     return `
     <div class="discover-chart-card">
       <div class="discover-chart-header">
@@ -375,7 +371,7 @@ function buildCombinedChartsHtml() {
           <div class="discover-chart-title">${p.name}</div>
           <div class="discover-chart-sub">Blended Multi-Source Catalog</div>
         </div>
-        <a href="javascript:void(0)" class="discover-chart-seeall" onclick='openListDetailsPage(${JSON.stringify(p.name)}, "movie", ${seeAllUrl})'>See All &rsaquo;</a>
+        <a href="javascript:void(0)" class="discover-chart-seeall" onclick="openListDetailsPage('${p.name}', 'movie', '${movieUrlsJoined}')">See All &rsaquo;</a>
       </div>
       <div class="discover-chart-btns">
         <button type="button" class="lc-btn secondary" onclick="addCombinedRow('${p.name}', ${jsStringArrayLiteral(p.movieUrls)}, 'movie', 'Combined Charts')">+ Movies</button>
@@ -470,6 +466,23 @@ function buildHolidaysHtml() {
   return buildStreamingRowsHtml(HOLIDAY_LISTS, "", "Holidays");
 }
 
+const GENRE_LISTS = [
+  { name: "Family", movieUrl: "tmdb:genre:family", showUrl: "tmdb:genre:family" },
+  { name: "Fantasy", movieUrl: "tmdb:genre:fantasy", showUrl: "tmdb:genre:fantasy" },
+  { name: "History", movieUrl: "tmdb:genre:history", showUrl: "tmdb:genre:history" },
+  { name: "Horror", movieUrl: "tmdb:genre:horror", showUrl: "tmdb:genre:horror" },
+  { name: "Mystery", movieUrl: "tmdb:genre:mystery", showUrl: "tmdb:genre:mystery" },
+  { name: "Romance", movieUrl: "tmdb:genre:romance", showUrl: "tmdb:genre:romance" },
+  { name: "Science Fiction", movieUrl: "tmdb:genre:science-fiction", showUrl: "tmdb:genre:science-fiction" },
+  { name: "Stream Releases", movieUrl: "tmdb:genre:stream-releases", showUrl: "tmdb:genre:stream-releases" },
+  { name: "Thriller", movieUrl: "tmdb:genre:thriller", showUrl: "tmdb:genre:thriller" },
+  { name: "War", movieUrl: "tmdb:genre:war", showUrl: "tmdb:genre:war" },
+  { name: "Western", movieUrl: "tmdb:genre:western", showUrl: "tmdb:genre:western" },
+];
+function buildGenresHtml() {
+  return buildStreamingRowsHtml(GENRE_LISTS, "", "Genres");
+}
+
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
 //
 // "TMDB Trending" -> "TMDB-Trending" -- title case preserved, everything
@@ -512,6 +525,7 @@ const CHART_SLUG_ENTRIES = (() => {
     ...HIDDEN_GEMS_LIST,
     ...KIDS_LISTS,
     ...HOLIDAY_LISTS,
+    ...GENRE_LISTS,
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));

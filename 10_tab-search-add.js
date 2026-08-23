@@ -12,7 +12,7 @@
     <div class="shelf-header" style="margin-bottom:12px;">
       <h2 class="shelf-title">Live Preview &amp; Editor</h2>
       <div class="actions" style="flex-direction:row; flex-wrap:wrap; align-items:center; gap:6px;">
-        <button type="button" class="primary lc-btn" onclick="openAddShelfModal()">+ Catalog</button>
+        <button type="button" class="primary lc-btn" onclick="openAddShelfModal()">+ New Catalog</button>
         <button type="button" class="secondary lc-btn" id="livePreviewEditBtn" onclick="toggleLivePreviewEdit()">Edit</button>
         <button type="button" class="secondary lc-btn" onclick="renderLivePreview()">Refresh Preview</button>
       </div>
@@ -155,6 +155,15 @@
         <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="holidays">+ Add all</button>
       </div>
       ${holidaysHtml}
+    </div>
+
+    <!-- Genres Shelf -->
+    <div class="shelf-section discover-shelf" data-shelf-type="all">
+      <div class="shelf-header">
+        <h2 class="shelf-title">Genres</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="genres">+ Add all</button>
+      </div>
+      ${genresHtml}
     </div>
   </div>
   </div>

@@ -119,6 +119,7 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
     else if (source === "tmdb-holiday") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHoliday(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:holiday:".length)); }
+    else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length)); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
@@ -134,7 +135,9 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
   }
 
   if (keys.shuffleItems && Array.isArray(result) && result.length > 1) {
+    const tot = result.totalItems;
     result = deterministicDailyShuffle(result, `items:${entry.id || entry.name}:${keys.configParam || ''}`);
+    result.totalItems = tot;
   }
   return result || [];
 }
@@ -159,14 +162,18 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
   );
   const seen = new Set();
   const merged = [];
+  let totalSum = 0;
   for (const list of perSource) {
+    if (typeof list.totalItems === 'number') totalSum += list.totalItems;
     for (const m of list) {
       if (!m || seen.has(m.id)) continue;
       seen.add(m.id);
       merged.push(m);
     }
   }
-  return merged.slice(0, PAGE_SIZE);
+  const sliced = merged.slice(0, PAGE_SIZE);
+  sliced.totalItems = totalSum > 0 ? totalSum : null;
+  return sliced;
 }
 
 // --- Channels (synthetic series stitched from hand-picked episodes/movies) -
@@ -200,29 +207,357 @@ function parseChannelPayload(rawUrl) {
   }
 }
 
+function escapeXml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function wrapSvgText(text, maxCharsPerLine = 15, maxLines = 3) {
+  const words = String(text || "").trim().split(/\s+/);
+  const lines = [];
+  let currentLine = "";
+
+  for (const word of words) {
+    if (!currentLine) {
+      currentLine = word;
+    } else if ((currentLine + " " + word).length <= maxCharsPerLine) {
+      currentLine += " " + word;
+    } else {
+      lines.push(currentLine);
+      currentLine = word;
+      if (lines.length === maxLines - 1) break;
+    }
+  }
+  if (currentLine && lines.length < maxLines) {
+    lines.push(currentLine);
+  }
+  return lines.length ? lines : ["TV Channel"];
+}
+
+function generateChannelPosterSvg(name, backdropUrl = "") {
+  const cleanName = (name || "TV Channel").trim();
+  const lines = wrapSvgText(cleanName, 10, 3);
+  
+  const maxLen = Math.max(...lines.map((l) => l.length));
+  let fontSize = 54;
+  if (maxLen > 6 || lines.length >= 2) fontSize = 42;
+  if (maxLen > 9 || lines.length >= 3) fontSize = 34;
+  if (maxLen > 13) fontSize = 28;
+  const lineHeight = fontSize * 1.18;
+
+  // TV Screen Center is (0, 0) inside <g transform="translate(300, 440)">
+  const startY = -((lines.length - 1) * lineHeight) / 2 + (fontSize * 0.35);
+
+  const bgImageSvg = backdropUrl && backdropUrl.startsWith("http")
+    ? `<image href="${escapeXml(backdropUrl)}" width="600" height="900" preserveAspectRatio="xMidYMid slice" opacity="0.25" filter="url(#blur)" />`
+    : "";
+
+  const textSpans = lines.map((line, idx) => {
+    return `<tspan x="0" y="${startY + (idx * lineHeight)}">${escapeXml(line.toUpperCase())}</tspan>`;
+  }).join("");
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 900" width="600" height="900">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0d14" />
+      <stop offset="50%" stop-color="#131726" />
+      <stop offset="100%" stop-color="#06070a" />
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#007AFF" />
+      <stop offset="50%" stop-color="#5856D6" />
+      <stop offset="100%" stop-color="#AF52DE" />
+    </linearGradient>
+    <linearGradient id="tvBezel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1f2438" />
+      <stop offset="100%" stop-color="#0d0f17" />
+    </linearGradient>
+    <linearGradient id="tvScreen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141829" />
+      <stop offset="50%" stop-color="#0e111d" />
+      <stop offset="100%" stop-color="#080a11" />
+    </linearGradient>
+    <linearGradient id="overlayGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#06070a" stop-opacity="0.85" />
+      <stop offset="50%" stop-color="#06070a" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#06070a" stop-opacity="0.9" />
+    </linearGradient>
+    <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" />
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="1" />
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="600" height="900" fill="url(#bgGrad)" />
+  ${bgImageSvg}
+  <rect width="600" height="900" fill="url(#overlayGrad)" />
+
+  <!-- Outer Poster Border -->
+  <rect x="20" y="20" width="560" height="860" rx="32" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3" />
+
+  <!-- Centered Retro-Modern TV Set with Channel Name INSIDE the Screen -->
+  <g transform="translate(300, 440)">
+    <!-- Antenna -->
+    <path d="M-60,-240 L0,-185 L60,-240" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="-60" cy="-240" r="8" fill="#007AFF" filter="url(#glow)" />
+    <circle cx="60" cy="-240" r="8" fill="#AF52DE" filter="url(#glow)" />
+
+    <!-- Ambient Glow Behind Bezel -->
+    <rect x="-240" y="-185" width="480" height="370" rx="32" fill="url(#accentGrad)" opacity="0.3" filter="url(#glow)" />
+
+    <!-- TV Outer Cabinet Bezel -->
+    <rect x="-230" y="-175" width="460" height="350" rx="28" fill="url(#tvBezel)" stroke="rgba(255,255,255,0.3)" stroke-width="3.5" />
+
+    <!-- TV Inner Screen Glass -->
+    <rect x="-205" y="-150" width="410" height="300" rx="20" fill="url(#tvScreen)" stroke="rgba(0,122,255,0.5)" stroke-width="2.5" />
+
+    <!-- Screen Broadcast Waves inside TV -->
+    <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
+
+    <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
+    <g filter="url(#shadow)">
+      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
+        ${textSpans}
+      </text>
+    </g>
+
+    <!-- TV Control Knobs / Accent Dots -->
+    <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
+    <circle cx="148" cy="115" r="6" fill="#AF52DE" opacity="0.8" />
+  </g>
+
+  <!-- Bottom TV Channel Pill Badge -->
+  <g transform="translate(300, 780)">
+    <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
+    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+  </g>
+</svg>`;
+}
+
+// Landscape 16:9 Backdrop / Banner (600 x 338) - 25% smaller TV set & no LIVE TV badge
+function generateChannelBackdropSvg(name, backdropUrl = "") {
+  const cleanName = (name || "TV Channel").trim();
+  const lines = wrapSvgText(cleanName, 12, 2);
+  
+  const maxLen = Math.max(...lines.map((l) => l.length));
+  let fontSize = 21;
+  if (maxLen > 7 || lines.length >= 2) fontSize = 16;
+  if (maxLen > 11) fontSize = 13;
+  const lineHeight = fontSize * 1.18;
+
+  // TV Screen Center is (0, 0) inside <g transform="translate(300, 169)">
+  const startY = -((lines.length - 1) * lineHeight) / 2 + (fontSize * 0.35);
+
+  const bgImageSvg = backdropUrl && backdropUrl.startsWith("http")
+    ? `<image href="${escapeXml(backdropUrl)}" width="600" height="338" preserveAspectRatio="xMidYMid slice" opacity="0.25" filter="url(#blur)" />`
+    : "";
+
+  const textSpans = lines.map((line, idx) => {
+    return `<tspan x="0" y="${startY + (idx * lineHeight)}">${escapeXml(line.toUpperCase())}</tspan>`;
+  }).join("");
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 338" width="600" height="338">
+  <defs>
+    <linearGradient id="bgGradL" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0d14" />
+      <stop offset="50%" stop-color="#131726" />
+      <stop offset="100%" stop-color="#06070a" />
+    </linearGradient>
+    <linearGradient id="accentGradL" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#007AFF" />
+      <stop offset="50%" stop-color="#5856D6" />
+      <stop offset="100%" stop-color="#AF52DE" />
+    </linearGradient>
+    <linearGradient id="tvBezelL" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1f2438" />
+      <stop offset="100%" stop-color="#0d0f17" />
+    </linearGradient>
+    <linearGradient id="tvScreenL" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141829" />
+      <stop offset="50%" stop-color="#0e111d" />
+      <stop offset="100%" stop-color="#080a11" />
+    </linearGradient>
+    <linearGradient id="overlayGradL" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#06070a" stop-opacity="0.85" />
+      <stop offset="50%" stop-color="#06070a" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#06070a" stop-opacity="0.9" />
+    </linearGradient>
+    <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" />
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="1" />
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="600" height="338" fill="url(#bgGradL)" />
+  ${bgImageSvg}
+  <rect width="600" height="338" fill="url(#overlayGradL)" />
+
+  <!-- Outer Frame Border -->
+  <rect x="12" y="12" width="576" height="314" rx="20" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2" />
+
+  <!-- Centered TV Set (25% smaller, with Channel Name INSIDE) -->
+  <g transform="translate(300, 169)">
+    <!-- Antenna -->
+    <path d="M-20,-72 L0,-54 L20,-72" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="-20" cy="-72" r="2.8" fill="#007AFF" filter="url(#glow)" />
+    <circle cx="20" cy="-72" r="2.8" fill="#AF52DE" filter="url(#glow)" />
+
+    <!-- Ambient Glow -->
+    <rect x="-118.5" y="-48" width="237" height="96" rx="12" fill="url(#accentGradL)" opacity="0.25" filter="url(#glow)" />
+
+    <!-- TV Bezel -->
+    <rect x="-112.5" y="-45" width="225" height="90" rx="11" fill="url(#tvBezelL)" stroke="rgba(255,255,255,0.3)" stroke-width="1.8" />
+
+    <!-- TV Screen Glass -->
+    <rect x="-101" y="-37" width="202" height="74" rx="8" fill="url(#tvScreenL)" stroke="rgba(0,122,255,0.5)" stroke-width="1.2" />
+
+    <!-- Broadcast Wave inside TV -->
+    <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
+
+    <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
+    <g filter="url(#shadow)">
+      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
+        ${textSpans}
+      </text>
+    </g>
+
+    <!-- TV Control Knobs / Accent Dots -->
+    <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
+    <circle cx="76" cy="25" r="2.5" fill="#AF52DE" opacity="0.8" />
+  </g>
+</svg>`;
+}
+
 function getPaddedChannelLogo(rawPoster, origin) {
   if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
   return rawPoster;
 }
 
+function getChannelBackdropUrl(payload) {
+  if (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) {
+    return payload.backdrop;
+  }
+  if (payload.items && payload.items.length) {
+    for (const it of payload.items) {
+      if (it.backdrop && it.backdrop.startsWith("http") && !it.backdrop.includes("/api/channel-")) return it.backdrop;
+      if (it.showBackdrop && it.showBackdrop.startsWith("http") && !it.showBackdrop.includes("/api/channel-")) return it.showBackdrop;
+      if (it.thumbnail && it.thumbnail.startsWith("http") && !it.thumbnail.includes("/api/channel-")) return it.thumbnail;
+    }
+  }
+  return "";
+}
+
+function getChannelPoster(payload, origin) {
+  const name = payload.name || "TV Channel";
+  const backdrop = getChannelBackdropUrl(payload);
+  const params = new URLSearchParams();
+  params.set("name", name);
+  params.set("v", "6");
+  if (backdrop) params.set("bg", backdrop);
+  if (origin) {
+    return `${origin}/api/channel-poster?${params.toString()}`;
+  }
+  return `/api/channel-poster?${params.toString()}`;
+}
+
+function getChannelBackdrop(payload, origin) {
+  const name = payload.name || "TV Channel";
+  const backdrop = getChannelBackdropUrl(payload);
+  const params = new URLSearchParams();
+  params.set("name", name);
+  params.set("format", "landscape");
+  params.set("v", "6");
+  if (backdrop) params.set("bg", backdrop);
+  if (origin) {
+    return `${origin}/api/channel-poster?${params.toString()}`;
+  }
+  return `/api/channel-poster?${params.toString()}`;
+}
+
+function extractLogoPath(rawPoster) {
+  if (!rawPoster) return "";
+  const s = String(rawPoster).trim();
+  if (s.includes("path=")) {
+    try {
+      const u = new URL(s, "http://localhost");
+      return u.searchParams.get("path") || "";
+    } catch (e) {
+      const match = s.match(/path=([^&]+)/);
+      return match ? decodeURIComponent(match[1]) : "";
+    }
+  }
+  if (s.includes("image.tmdb.org/t/p/")) {
+    const parts = s.split("image.tmdb.org/t/p/");
+    if (parts[1]) {
+      return parts[1].replace(/^[^/]+/, "");
+    }
+  }
+  if (s.startsWith("/")) return s;
+  return "";
+}
+
+function getPremadeChannelLogo(payload, origin, isLandscape = false) {
+  const logoPath = extractLogoPath(payload.poster || payload.logo || "");
+  if (!logoPath) {
+    return isLandscape ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin);
+  }
+  const params = new URLSearchParams();
+  params.set("path", logoPath);
+  params.set("v", "7");
+  if (isLandscape) params.set("format", "landscape");
+  if (origin) return `${origin}/api/channel-logo?${params.toString()}`;
+  return `/api/channel-logo?${params.toString()}`;
+}
+
 function fetchChannelCatalog(entry, origin) {
-  const payload = parseChannelPayload(entry.url);
-  if (!payload || !payload.items.length) return [];
-  const channelId = payload.channelId || entry.id;
-  const name = payload.name || entry.name;
-  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
-  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
-  return [
-    {
+  const rawUrls = String(entry.url || "").split(/[\r\n]+/).map((u) => u.trim()).filter(Boolean);
+  const metas = [];
+  const isLandscapeShelf = entry.posterShape === "landscape";
+  for (const rawUrl of rawUrls) {
+    const payload = parseChannelPayload(rawUrl);
+    if (!payload || !payload.items || !payload.items.length) continue;
+    const channelId = payload.channelId || entry.id;
+    const name = payload.name || entry.name;
+    
+    const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+    
+    const channelPoster = isPremadeLogo
+      ? getPremadeChannelLogo(payload, origin, isLandscapeShelf)
+      : (isLandscapeShelf ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin));
+
+    const channelBackdrop = isPremadeLogo
+      ? getPremadeChannelLogo(payload, origin, true)
+      : getChannelBackdrop(payload, origin);
+
+    metas.push({
       id: "channel_" + channelId,
       type: "series",
       name: name,
-      poster: getPaddedChannelLogo(channelPoster, origin),
-      background: getPaddedChannelLogo(channelBackdrop, origin),
-      thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
-      logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
-    },
-  ];
+      poster: channelPoster,
+      posterShape: isLandscapeShelf ? "landscape" : "poster",
+      background: channelBackdrop,
+      thumbnail: channelBackdrop,
+    });
+  }
+  return metas;
 }
 
 // --- Custom Lists --------------------------------------------------------------
@@ -440,7 +775,23 @@ async function fetchAutoTrackedCatalog(entry, env) {
   
   try {
     let items;
-    const trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    let trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    if (!trackingRaw) {
+      // Same one-time creatorsync -> creatorsynctracking migration the
+      // other three tracking-data write paths already trigger defensively
+      // (client save-tracking, the Continue Watching cron, the Auto-Track
+      // Playback subtitle ping -- see ensureTrackingMigrated's own
+      // comment). Without this, an account that hasn't hit any of those
+      // three writes yet would never get migrated just by opening an
+      // autotrack shelf -- it'd keep silently reading the legacy
+      // creatorsync: blob below indefinitely instead. Only called on a
+      // miss above (not unconditionally on every request) so the common
+      // case -- an already-migrated account -- doesn't pay for a second,
+      // redundant read of the same key ensureTrackingMigrated checks
+      // internally before deciding whether there's anything to do.
+      await ensureTrackingMigrated(env, username);
+      trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    }
     if (trackingRaw) {
       const trackingBlob = JSON.parse(trackingRaw);
       items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (trackingBlob.watchlist || []));
@@ -472,7 +823,9 @@ async function fetchAutoTrackedCatalog(entry, env) {
         type: targetType,
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
         poster: showPoster,
-        releaseInfo: it.year || undefined
+        releaseInfo: it.year || undefined,
+        airDate: it.airDate || undefined,
+        isUnaired: it.isUnaired ? true : undefined,
       };
       
       if (!mapped.id) return;
@@ -504,35 +857,30 @@ async function fetchPublishedListCatalog(entry, env) {
   const parsed = parsePublishedListUrl(entry.url);
   if (!parsed) return [];
 
-  // Same lookup order and private-list handling as the public GET route
-  // above: a Creator-owned list that's private is treated exactly like it
-  // doesn't exist (not just "can't be added") -- someone pointing another
-  // config at a guessed/leaked private-list URL gets nothing, the same
-  // outcome as any other broken/nonexistent source.
   let payload = null;
-  const creatorRaw = await env.CONFIGS.get(`creatorlist:${parsed.username}:${parsed.listName}`);
-  if (creatorRaw) {
-    try {
-      const data = JSON.parse(creatorRaw);
-      if (data.visibility !== "private") payload = data;
-    } catch {
-      // fall through to anonymous lookup below
-    }
-  }
-  if (!payload) {
-    const anonRaw = await env.CONFIGS.get(`publishedlist:${parsed.username}:${parsed.listName}`);
-    if (anonRaw) {
+  const keysToTry = [
+    `creatorlist:${parsed.username}:${parsed.listName}`,
+    `creatorlist:${parsed.rawUsername}:${parsed.rawListName}`,
+    `publishedlist:${parsed.username}:${parsed.listName}`,
+    `publishedlist:${parsed.rawUsername}:${parsed.rawListName}`,
+  ];
+
+  for (const k of keysToTry) {
+    if (payload) break;
+    const raw = await env.CONFIGS.get(k);
+    if (raw) {
       try {
-        payload = JSON.parse(anonRaw);
-      } catch {
-        return [];
-      }
+        const data = JSON.parse(raw);
+        if (data && data.visibility !== "private") payload = data;
+      } catch {}
     }
   }
+
   if (!payload || !Array.isArray(payload.items)) return [];
   return payload.items
     .filter((it) => {
-      if (!it || !it.imdbId) return false;
+      const itId = it && (it.imdbId || it.id || it.tmdbId);
+      if (!itId) return false;
       const itType = it.kind || it.type;
       if (entry.type === 'movie') {
         if (itType === 'series' || itType === 'tv') return false;
@@ -541,13 +889,21 @@ async function fetchPublishedListCatalog(entry, env) {
       }
       return true;
     })
-    .map((it) => ({
-      id: it.imdbId,
-      type: entry.type || (it.kind === 'series' || it.type === 'series' || it.type === 'tv' ? 'series' : 'movie'),
-      name: it.title,
-      poster: it.poster || undefined,
-      releaseInfo: it.year || undefined,
-    }));
+    .map((it) => {
+      const itId = it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : (it.id ? `tt${it.id}` : ''));
+      const itName = it.title || it.name || it.showTitle || '';
+      let poster = it.poster || it.showPoster || undefined;
+      if (!poster && itId && itId.startsWith('tt')) {
+        poster = `https://images.metahub.space/poster/medium/${itId}/img`;
+      }
+      return {
+        id: itId || String(it.id || ''),
+        type: entry.type || (it.kind === 'series' || it.type === 'series' || it.type === 'tv' ? 'series' : 'movie'),
+        name: itName,
+        poster: poster,
+        releaseInfo: it.year || it.releaseInfo || undefined,
+      };
+    });
 }
 
 // NOTE: mixing movies into a channel is a known soft spot -- when someone
@@ -676,16 +1032,20 @@ function buildChannelMeta(entry, origin) {
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });
-  const channelPoster = payload.poster || (payload.items[0] && (payload.items[0].poster || payload.items[0].thumbnail));
-  const channelBackdrop = payload.backdrop || (payload.items[0] && (payload.items[0].thumbnail || payload.items[0].backdrop || payload.items[0].poster)) || channelPoster;
+  // Premade network channels with an official logo
+  const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+  const channelBackdrop = isPremadeLogo
+    ? getPremadeChannelLogo(payload, origin, true)
+    : getChannelBackdrop(payload, origin);
+
   return {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: getPaddedChannelLogo(channelPoster, origin),
-    background: getPaddedChannelLogo(channelBackdrop, origin),
-    thumbnail: getPaddedChannelLogo(channelBackdrop, origin),
-    logo: payload.logo || (payload.poster && payload.poster.endsWith(".png") ? payload.poster : undefined),
+    poster: channelBackdrop,
+    background: channelBackdrop,
+    thumbnail: channelBackdrop,
+    posterShape: "landscape",
     videos,
   };
 }

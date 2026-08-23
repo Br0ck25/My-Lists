@@ -4,7 +4,7 @@
     <button type="button" class="subnav-pill active" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
     <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('external', this)">External Accounts &amp; API Keys</button>
     <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">&#x1F4BE; Presets &amp; Backup</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">&#x1F4AC; Feedback</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">&#x1F4AC; Feedback and Support</button>
   </div>
 
   <!-- Submenu 2: Presets & Backup -->
@@ -16,7 +16,7 @@
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Save your current setup as a named preset to reuse or download as a file.</p>
       <div class="row">
         <input type="text" id="presetNameInput" placeholder="Preset name (e.g. Home Cinema)">
-        <button type="button" class="secondary" onclick="saveCurrentAsPreset()">Save preset</button>
+        <button type="button" class="secondary lc-btn" onclick="saveCurrentAsPreset()">Save preset</button>
       </div>
       <div class="actions" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('presetFileInput').click()">Upload preset file</button>
@@ -29,7 +29,7 @@
       <h2 class="panel-title">Backup &amp; Restore</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Export your complete setup as JSON or import an existing configuration.</p>
       <textarea id="configJsonBox" rows="5" style="width:100%;font-family:monospace;font-size:14px;" placeholder="Paste config JSON here to restore..."></textarea>
-      <div class="actions" style="margin-top:8px;">
+      <div class="backup-actions-grid" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="exportConfigJson()">Export current</button>
         <button type="button" class="secondary lc-btn" onclick="importConfigJson()">Import JSON</button>
         <button type="button" class="secondary lc-btn" onclick="downloadConfigJson()">Download file</button>
@@ -41,7 +41,38 @@
         <p style="margin:0 0 6px; font-weight:700; font-size:0.88rem;">Import from Install / Configure Link:</p>
         <div class="row">
           <input type="text" id="importLinkInput" placeholder="Paste an install or configure link here">
-          <button type="button" class="secondary" onclick="importFromLink()">Import link</button>
+          <button type="button" class="secondary lc-btn" onclick="importFromLink()">Import link</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export Lists & History (Universal CSV / Trakt / Letterboxd / MDBList / Simkl) -->
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Export Lists &amp; History</h2>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Export your Watch History, Continue Watching, and Custom Lists in standard CSV or JSON format for easy import into Trakt, Letterboxd, MDBList, Simkl, or IMDb.</p>
+      
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:12px 14px; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:10px;">
+          <div>
+            <div style="font-weight:700; font-size:0.92rem; color:var(--text);">Watch History</div>
+            <div style="font-size:0.8rem; color:var(--muted);">All watched movies, shows, and episodes with timestamps</div>
+          </div>
+          <div class="export-actions-grid">
+            <button type="button" class="secondary lc-btn" onclick="exportDataToCsv('watch-history', 'trakt')">CSV (Trakt / Simkl)</button>
+            <button type="button" class="secondary lc-btn" onclick="exportDataToCsv('watch-history', 'letterboxd')">CSV (Letterboxd)</button>
+            <button type="button" class="secondary lc-btn" onclick="exportDataToCsv('watch-history', 'standard')">Universal CSV</button>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:12px 14px; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:10px;">
+          <div>
+            <div style="font-weight:700; font-size:0.92rem; color:var(--text);">All Custom Lists &amp; Watchlist</div>
+            <div style="font-size:0.8rem; color:var(--muted);">Export all created lists, watchlist, and continue watching items</div>
+          </div>
+          <div class="export-actions-grid">
+            <button type="button" class="secondary lc-btn" onclick="exportDataToCsv('all-custom-lists', 'standard')">Export All (CSV)</button>
+            <button type="button" class="secondary lc-btn" onclick="exportDataToJson('full-library')">Full Library (JSON)</button>
+          </div>
         </div>
       </div>
     </div>

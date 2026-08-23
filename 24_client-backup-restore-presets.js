@@ -308,14 +308,17 @@ function renderPresetsList() {
   }
   container.innerHTML = names.map((n) => {
     const count = (map[n].entries || []).length;
-    return '<div class="row quick-row" data-preset="' + escapeAttr(n) + '">' +
-      '<strong>' + escapeHtml(n) + '</strong> <small style="color:var(--muted);">(' + count + ' list(s))</small>' +
-      '<span class="actions" style="gap:6px;">' +
-      '<button type="button" class="secondary preset-load-btn">Load</button>' +
-      '<button type="button" class="secondary preset-share-btn">Share</button>' +
-      '<button type="button" class="secondary preset-download-btn">Download</button>' +
-      '<button type="button" class="secondary preset-delete-btn">Delete</button>' +
-      '</span></div>';
+    return '<div class="preset-card" data-preset="' + escapeAttr(n) + '">' +
+      '<div class="preset-card-header">' +
+        '<strong class="preset-card-title">' + escapeHtml(n) + '</strong> <small style="color:var(--muted);">(' + count + ' list' + (count === 1 ? '' : 's') + ')</small>' +
+      '</div>' +
+      '<div class="preset-actions-grid">' +
+        '<button type="button" class="secondary lc-btn preset-load-btn">Load</button>' +
+        '<button type="button" class="secondary lc-btn preset-share-btn">Share</button>' +
+        '<button type="button" class="secondary lc-btn preset-download-btn">Download</button>' +
+        '<button type="button" class="secondary lc-btn preset-delete-btn">Delete</button>' +
+      '</div>' +
+    '</div>';
   }).join('');
 }
 
@@ -469,6 +472,185 @@ function uploadPresetFile(input) {
     renderPresetsList();
     schedulePresetsSync();
   });
+}
+
+// --- Universal & Platform Export (CSV / JSON) -------------------------------
+function downloadCsvFile(filename, csvString) {
+  const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function escapeCsvCell(val) {
+  if (val === null || val === undefined) return '';
+  const str = String(val);
+  const lf = String.fromCharCode(10);
+  const cr = String.fromCharCode(13);
+  if (str.indexOf(',') !== -1 || str.indexOf('"') !== -1 || str.indexOf(lf) !== -1 || str.indexOf(cr) !== -1) {
+    return '"' + str.split('"').join('""') + '"';
+  }
+  return str;
+}
+
+function extractItemMetadata(it) {
+  const title = it.title || it.name || it.showTitle || '';
+  const year = it.year || '';
+  let type = it.type || (it.seasonNum != null ? 'episode' : (it.showId ? 'series' : 'movie'));
+  
+  let imdbId = '';
+  if (it.imdbId) imdbId = it.imdbId;
+  else if (it.imdb_id) imdbId = it.imdb_id;
+  else if (typeof it.id === 'string' && it.id.startsWith('tt')) imdbId = it.id;
+  else if (typeof it.showId === 'string' && it.showId.startsWith('tt')) imdbId = it.showId;
+
+  let tmdbId = '';
+  if (it.tmdbId) tmdbId = String(it.tmdbId);
+  else if (it.tmdb_id) tmdbId = String(it.tmdb_id);
+  else if (typeof it.id === 'string' && it.id.startsWith('tmdb:')) tmdbId = it.id.slice(5);
+  else if (typeof it.id === 'number' || (typeof it.id === 'string' && new RegExp('^[0-9]+$').test(it.id))) tmdbId = String(it.id);
+  else if (typeof it.showId === 'string' && it.showId.startsWith('tmdb:')) tmdbId = it.showId.slice(5);
+
+  const season = (it.seasonNum != null) ? it.seasonNum : ((it.season != null) ? it.season : '');
+  const episode = (it.episodeNum != null) ? it.episodeNum : ((it.episode != null) ? it.episode : ((it.epNum != null) ? it.epNum : ''));
+
+  let watchedAtIso = '';
+  let watchedDateOnly = '';
+  if (it.watchedAt || it.watched_at || it.date) {
+    const rawDate = it.watchedAt || it.watched_at || it.date;
+    try {
+      const d = new Date(typeof rawDate === 'number' ? rawDate : rawDate);
+      if (!isNaN(d.getTime())) {
+        watchedAtIso = d.toISOString();
+        watchedDateOnly = watchedAtIso.split('T')[0];
+      }
+    } catch (e) {}
+  }
+
+  return { title, year, type, imdbId, tmdbId, season, episode, watchedAtIso, watchedDateOnly };
+}
+
+function exportDataToCsv(target, format) {
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  let rows = [];
+  let filename = 'export.csv';
+
+  if (target === 'watch-history') {
+    const historyList = map['watch-history'];
+    const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
+    if (!items.length) {
+      alert('Your Watch History is currently empty.');
+      return;
+    }
+
+    if (format === 'letterboxd') {
+      filename = 'watch_history_letterboxd.csv';
+      rows.push(['Title', 'Year', 'WatchedDate', 'imdbID', 'tmdbID'].join(','));
+      items.forEach((it) => {
+        const meta = extractItemMetadata(it);
+        const exportTitle = it.showTitle || meta.title;
+        rows.push([
+          escapeCsvCell(exportTitle),
+          escapeCsvCell(meta.year),
+          escapeCsvCell(meta.watchedDateOnly || meta.watchedAtIso),
+          escapeCsvCell(meta.imdbId),
+          escapeCsvCell(meta.tmdbId)
+        ].join(','));
+      });
+    } else if (format === 'trakt') {
+      filename = 'watch_history_trakt.csv';
+      rows.push(['Title', 'Year', 'Type', 'IMDb ID', 'TMDB ID', 'Season', 'Episode', 'Watched At'].join(','));
+      items.forEach((it) => {
+        const meta = extractItemMetadata(it);
+        const exportTitle = it.showTitle ? (it.showTitle + (meta.title ? ' — ' + meta.title : '')) : meta.title;
+        rows.push([
+          escapeCsvCell(exportTitle),
+          escapeCsvCell(meta.year),
+          escapeCsvCell(meta.type),
+          escapeCsvCell(meta.imdbId),
+          escapeCsvCell(meta.tmdbId),
+          escapeCsvCell(meta.season),
+          escapeCsvCell(meta.episode),
+          escapeCsvCell(meta.watchedAtIso)
+        ].join(','));
+      });
+    } else {
+      filename = 'watch_history_universal.csv';
+      rows.push(['List Name', 'Title', 'Year', 'Type', 'IMDb ID', 'TMDB ID', 'Season', 'Episode', 'Watched At'].join(','));
+      items.forEach((it) => {
+        const meta = extractItemMetadata(it);
+        rows.push([
+          escapeCsvCell('Watch History'),
+          escapeCsvCell(meta.title),
+          escapeCsvCell(meta.year),
+          escapeCsvCell(meta.type),
+          escapeCsvCell(meta.imdbId),
+          escapeCsvCell(meta.tmdbId),
+          escapeCsvCell(meta.season),
+          escapeCsvCell(meta.episode),
+          escapeCsvCell(meta.watchedAtIso)
+        ].join(','));
+      });
+    }
+  } else if (target === 'all-custom-lists') {
+    filename = 'all_lists_universal.csv';
+    rows.push(['List Name', 'Title', 'Year', 'Type', 'IMDb ID', 'TMDB ID', 'Season', 'Episode', 'Watched At'].join(','));
+    let totalItems = 0;
+    Object.keys(map).forEach((k) => {
+      const list = map[k];
+      if (list && Array.isArray(list.items) && list.items.length) {
+        const listName = list.name || list.slug || k;
+        list.items.forEach((it) => {
+          totalItems++;
+          const meta = extractItemMetadata(it);
+          rows.push([
+            escapeCsvCell(listName),
+            escapeCsvCell(meta.title),
+            escapeCsvCell(meta.year),
+            escapeCsvCell(meta.type),
+            escapeCsvCell(meta.imdbId),
+            escapeCsvCell(meta.tmdbId),
+            escapeCsvCell(meta.season),
+            escapeCsvCell(meta.episode),
+            escapeCsvCell(meta.watchedAtIso)
+          ].join(','));
+        });
+      }
+    });
+    if (totalItems === 0) {
+      alert('You do not have any saved list items to export.');
+      return;
+    }
+  }
+
+  downloadCsvFile(filename, rows.join(String.fromCharCode(10)));
+}
+
+function exportDataToJson(target) {
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  const entries = (typeof collectEntries === 'function') ? collectEntries() : [];
+  const keys = (typeof collectKeys === 'function') ? collectKeys() : {};
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    addonVersion: 'My Lists Addon Beta',
+    configuredCatalogs: entries,
+    apiKeys: {
+      tmdbKey: keys.tmdbKey || null,
+      traktUsername: keys.traktUsername || null,
+      simklUsername: keys.simklUsername || null
+    },
+    watchHistory: map['watch-history'] ? (map['watch-history'].items || []) : [],
+    continueWatching: map['continue-watching'] ? (map['continue-watching'].items || []) : [],
+    customLists: Object.keys(map)
+      .filter((k) => k !== 'watch-history' && k !== 'continue-watching')
+      .map((k) => map[k])
+  };
+
+  downloadJsonFile('my-lists-full-library.json', payload);
 }
 
 // --- browser-storage persistence -------------------------------------------
@@ -690,6 +872,7 @@ scheduleMyMdblistListsRefresh();
 scheduleMyTraktListsRefresh();
 renderCreatorProfileBar();
 renderAccountKeySection();
+if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
@@ -728,11 +911,31 @@ tryAutoRestoreCreatorProfile();
     openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
     return;
   }
+  if (path.toLowerCase() === '/lists/mdblist/watchlist') {
+    openListDetailsPage('MDBList Watchlist', 'movie', 'mdblist:watchlist', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/mdblist/history') {
+    openListDetailsPage('MDBList Watch History', 'movie', 'mdblist:history', null, { skipPushState: true });
+    return;
+  }
   const traktMatch = path.match(new RegExp('^/lists/trakt/([^/]+)/([^/]+)', 'i'));
   if (traktMatch) {
     const listUrl = 'https://trakt.tv/users/' + traktMatch[1] + '/lists/' + traktMatch[2];
     const name = typeof deslugify === 'function' ? deslugify(traktMatch[2]) : traktMatch[2];
     openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/trakt/watchlist') {
+    openListDetailsPage('Trakt Watchlist', 'movie', 'trakt:watchlist', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/trakt/history') {
+    openListDetailsPage('Trakt Watch History', 'movie', 'trakt:history', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/trakt/collection') {
+    openListDetailsPage('Trakt Collection', 'movie', 'trakt:collection', null, { skipPushState: true });
     return;
   }
   const curatedMatch = path.match(new RegExp('^/lists/curated/([^/]+)', 'i'));
@@ -756,6 +959,14 @@ tryAutoRestoreCreatorProfile();
     openListDetailsPage('Watchlist', 'mixed', 'autotrack:watchlist', null, { skipPushState: true });
     return;
   }
+  if (path.toLowerCase() === '/lists/tmdb/watchlist') {
+    openListDetailsPage('TMDB Watchlist', 'movie', 'tmdb:watchlist', null, { skipPushState: true });
+    return;
+  }
+  if (path.toLowerCase() === '/lists/tmdb/favorites') {
+    openListDetailsPage('TMDB Favorites', 'movie', 'tmdb:favorites', null, { skipPushState: true });
+    return;
+  }
   if (path.toLowerCase() === '/lists/new-movies') {
     openListDetailsPage('New Movies', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
     return;
@@ -776,6 +987,80 @@ tryAutoRestoreCreatorProfile();
     const listUrl = 'https://www.themoviedb.org/list/' + tmdbMatch[1];
     const name = tmdbMatch[2] ? (typeof deslugify === 'function' ? deslugify(tmdbMatch[2]) : tmdbMatch[2]) : ('TMDB List ' + tmdbMatch[1]);
     openListDetailsPage(name, 'movie', listUrl, null, { skipPushState: true });
+    return;
+  }
+
+  // Simkl lists deep linking
+  const simklMatch = path.match(new RegExp('^/lists/simkl/([a-z0-9_-]+)', 'i'));
+  if (simklMatch) {
+    const subSlug = simklMatch[1].toLowerCase();
+    if (subSlug === 'completed-movies') openListDetailsPage('Simkl Completed (Movies)', 'movie', 'simkl:completed:movies', null, { skipPushState: true });
+    else if (subSlug === 'completed-shows') openListDetailsPage('Simkl Completed (Shows)', 'series', 'simkl:completed:shows', null, { skipPushState: true });
+    else if (subSlug === 'watching-movies') openListDetailsPage('Simkl Watching (Movies)', 'movie', 'simkl:watching:movies', null, { skipPushState: true });
+    else if (subSlug === 'watching-shows') openListDetailsPage('Simkl Watching (Shows)', 'series', 'simkl:watching:shows', null, { skipPushState: true });
+    else if (subSlug === 'plantowatch-movies') openListDetailsPage('Simkl Plan to Watch (Movies)', 'movie', 'simkl:plantowatch:movies', null, { skipPushState: true });
+    else if (subSlug === 'plantowatch-shows') openListDetailsPage('Simkl Plan to Watch (Shows)', 'series', 'simkl:plantowatch:shows', null, { skipPushState: true });
+    else if (subSlug === 'hold-movies') openListDetailsPage('Simkl On Hold (Movies)', 'movie', 'simkl:hold:movies', null, { skipPushState: true });
+    else if (subSlug === 'hold-shows') openListDetailsPage('Simkl On Hold (Shows)', 'series', 'simkl:hold:shows', null, { skipPushState: true });
+    else if (subSlug === 'dropped-movies') openListDetailsPage('Simkl Not Interesting (Movies)', 'movie', 'simkl:dropped:movies', null, { skipPushState: true });
+    else if (subSlug === 'dropped-shows') openListDetailsPage('Simkl Not Interesting (Shows)', 'series', 'simkl:dropped:shows', null, { skipPushState: true });
+    else {
+      const numMatch = subSlug.match(/^([0-9]+)(?:-([a-z0-9_-]+))?/);
+      const listId = numMatch ? numMatch[1] : subSlug;
+      const listName = (numMatch && numMatch[2]) ? (typeof deslugify === 'function' ? deslugify(numMatch[2]) : numMatch[2]) : ('Simkl List ' + listId);
+      openListDetailsPage(listName, 'movie', 'simkl:custom:' + listId, null, { skipPushState: true });
+    }
+    return;
+  }
+
+  // Custom lists deep linking
+  const customMatch = path.match(new RegExp('^/lists/custom/([a-z0-9_-]+)', 'i'));
+  if (customMatch) {
+    const slug = customMatch[1].toLowerCase();
+    const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+    const list = map[slug] || null;
+    const name = list ? (list.name || (typeof deslugify === 'function' ? deslugify(slug) : slug)) : (typeof deslugify === 'function' ? deslugify(slug) : slug);
+    const type = (list && list.type) ? list.type : 'movie';
+    openListDetailsPage(name, type, 'custom:' + slug, list ? { sample: list.items, maybeMore: false } : null, { skipPushState: true });
+    return;
+  }
+
+  // Channel deep linking (e.g. /channels/tlc)
+  const channelMatch = path.match(new RegExp('^/channels/([a-z0-9_-]+)', 'i'));
+  if (channelMatch) {
+    const slug = channelMatch[1].toLowerCase();
+    const map = (typeof loadLocalChannels === 'function') ? (typeof ensureAllChannelsSyncedFromRows === 'function' ? ensureAllChannelsSyncedFromRows(loadLocalChannels()) : loadLocalChannels()) : {};
+    let foundChannel = null;
+    for (const key in map) {
+      const ch = map[key];
+      if (!ch) continue;
+      const chSlug = (ch.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+      if (chSlug === slug || key.toLowerCase() === slug || (ch.channelId && ch.channelId.toLowerCase() === slug) || slug.startsWith(key.toLowerCase()) || slug.includes(chSlug)) {
+        foundChannel = ch;
+        break;
+      }
+    }
+    const chName = foundChannel ? (foundChannel.name || (typeof deslugify === 'function' ? deslugify(slug) : slug)) : (typeof deslugify === 'function' ? deslugify(slug) : slug);
+    const chUrl = foundChannel ? (foundChannel.channelId ? ('channel:id:' + foundChannel.channelId) : ('channel:v1:' + (foundChannel.name || 'channel'))) : ('channel:v1:' + slug);
+    let sample = null;
+    if (foundChannel && Array.isArray(foundChannel.items)) {
+      sample = foundChannel.items.map((it) => {
+        let showName = it.showName || '';
+        let epName = it.epName || '';
+        let seasonEp = '';
+        if (it.season != null && it.episode != null) seasonEp = 'S' + it.season + 'E' + it.episode;
+        if (!showName && it.title) showName = it.title;
+        return {
+          id: it.id || (it.imdbId ? ('tt' + it.imdbId) : null),
+          name: showName,
+          subtitle: (seasonEp && epName) ? (seasonEp + ' \u2014 ' + epName) : (seasonEp || epName || ''),
+          poster: it.poster || it.showPoster || '',
+          year: it.year,
+          removeChannelItemIndex: it.removeChannelItemIndex != null ? it.removeChannelItemIndex : null
+        };
+      });
+    }
+    openListDetailsPage(chName, 'series', chUrl, sample ? { sample: sample, count: sample.length, maybeMore: false } : null, { skipPushState: true });
     return;
   }
 
@@ -821,12 +1106,16 @@ window.addEventListener('popstate', (e) => {
     const itemType = (state && state.type) || (new URLSearchParams(hash.slice('#/item?'.length)).get('type')) || 'movie';
     openItemDetailsModal(itemId, itemType, { skipPushState: true });
   } else {
-    const targetTab = window._originTab || window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
+    const targetTab = (state && (state.fromTab || (state.view === 'tab' && state.tab))) || window._originTab || window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
     const cleanTab = (targetTab === 'list-details' || targetTab === 'item-details') ? 'discover' : targetTab;
     if (location.pathname.startsWith('/lists/')) {
       history.replaceState({ view: 'tab', tab: cleanTab }, '', '/');
     }
     switchTab(cleanTab);
+    if (cleanTab === 'catalogs') {
+      const targetSubmenu = (state && state.fromCatalogsSubmenu) || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+      if (typeof switchCatalogsSubmenu === 'function') switchCatalogsSubmenu(targetSubmenu);
+    }
 
     if (typeof window._previousScrollY === 'number') {
       const scrollPos = window._previousScrollY;
