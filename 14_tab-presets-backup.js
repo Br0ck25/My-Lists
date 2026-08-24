@@ -3,8 +3,8 @@
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
     <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('external', this)">External Accounts &amp; API Keys</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">&#x1F4BE; Presets &amp; Backup</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">&#x1F4AC; Feedback and Support</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">Presets &amp; Backup</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">Feedback and Support</button>
   </div>
 
   <!-- Submenu 2: Presets & Backup -->

@@ -24,6 +24,49 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
+  // Precomputed here (same pattern as the *Html fragments above) rather
+  // than built inline inside the giant HTML template literal below --
+  // this file's template literal has bitten past changes before with
+  // subtle escaping issues (see e.g. the doubled-backslash regex gotcha
+  // elsewhere in renderBuilder), so anything with its own quotes/braces/
+  // JSON gets built as a plain variable first and just substituted in as
+  // one clean ${seoHeadHtml}.
+  //
+  // The two modes render different things: the plain / install page
+  // (isConfigureMode false) is the only URL meant to be publicly
+  // discoverable, so it gets the real title/description/OG/JSON-LD.
+  // /:config/configure pages carry a personal base64 config (and any
+  // personal API keys the user pasted in) baked straight into the URL
+  // path -- there's no reason for a search engine to crawl, index, or
+  // cache one of those, so those get a plain noindex instead of any of
+  // the SEO metadata below.
+  const seoHeadHtml = isConfigureMode
+    ? `<title>${ADDON_NAME} — Configure</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="canonical" href="${origin}/">`
+    : `<title>${ADDON_NAME} — Self-Hosted Stremio Catalogs from MDBList, Trakt, TMDB &amp; Simkl</title>
+<meta name="description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account -- no third-party server, no cost, your data stays yours. Includes Watch History, Continue Watching, and a full Custom List builder.">
+<link rel="canonical" href="${origin}/">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="website">
+<meta property="og:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
+<meta property="og:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account -- your data stays yours.">
+<meta property="og:url" content="${origin}/">
+<meta property="og:image" content="${origin}/icon.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
+<meta name="twitter:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account.">
+<script type="application/ld+json">${JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        name: ADDON_NAME,
+        applicationCategory: "MultimediaApplication",
+        operatingSystem: "Any",
+        description:
+          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own free Cloudflare Worker.",
+        offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+        url: origin + "/",
+      })}</script>`;
   const hasInitial = initialEntries.length > 0;
   const initialEntriesJson = JSON.stringify(
     hasInitial
@@ -58,7 +101,7 @@ function renderBuilder(
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#F2F2F7">
 <link rel="manifest" href="${origin}/app.webmanifest">
-<title>${ADDON_NAME}</title>
+${seoHeadHtml}
 <link rel="icon" type="image/png" href="${origin}/icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -840,6 +883,64 @@ function renderBuilder(
     white-space: nowrap;
   }
 
+  /* --- Settings Subpanels & Key Display Mobile Responsiveness ------------- */
+  .settings-subpanel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    overflow-x: hidden;
+  }
+  .creator-key-display {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    user-select: all;
+    -webkit-user-select: all;
+    max-width: 100%;
+    box-sizing: border-box;
+    letter-spacing: 0.5px;
+    margin: 4px 0 10px;
+  }
+  .webhook-input-group {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .webhook-input-group input {
+    flex: 1 1 200px;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .webhook-input-group button {
+    flex: none;
+    white-space: nowrap;
+  }
+  @media (max-width: 640px) {
+    .webhook-input-group {
+      flex-direction: column;
+    }
+    .webhook-input-group input,
+    .webhook-input-group button {
+      width: 100% !important;
+      flex: 1 1 100% !important;
+    }
+  }
+
   /* 9-Poster Preview Strip in List Cards (Desktop) / 3-Poster (Mobile) */
   .list-card-posters, .list-card-5posters {
     display: grid;
@@ -1273,6 +1374,252 @@ function renderBuilder(
     width: 36px; height: 54px; object-fit: cover; border-radius: 4px; flex: none; cursor: pointer;
   }
   .custom-list-pick-poster.empty-poster { background: transparent; }
+  .channel-poster-choice {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    border-radius: 8px;
+    padding: 6px;
+    cursor: pointer;
+    background: var(--surface);
+    border: 2px solid transparent;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+    user-select: none;
+  }
+  .channel-poster-choice:hover {
+    border-color: rgba(0, 122, 255, 0.4);
+  }
+  .channel-poster-choice.selected {
+    border-color: var(--accent);
+    background: rgba(0, 122, 255, 0.08);
+  }
+  .channel-poster-choice .channel-poster-thumb-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .channel-poster-choice .channel-poster-thumb-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .channel-poster-choice .channel-poster-check {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    z-index: 2;
+  }
+  .channel-poster-choice.selected .channel-poster-check {
+    display: flex;
+  }
+  .channel-poster-choice .channel-poster-title {
+    width: 100%;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 5px;
+  }
+  .channel-poster-choice .channel-poster-meta {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  .channel-crossover-banner {
+    position: relative;
+    background: linear-gradient(135deg, rgba(0, 122, 255, 0.12) 0%, rgba(88, 86, 214, 0.12) 100%);
+    border: 1px solid rgba(0, 122, 255, 0.35);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .channel-crossover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .channel-crossover-title {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .channel-crossover-badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .channel-crossover-desc {
+    font-size: 0.8rem;
+    color: var(--muted);
+    line-height: 1.35;
+    margin: 0;
+  }
+  .channel-crossover-parts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 4px 0 2px;
+  }
+  .channel-crossover-chip {
+    font-size: 0.72rem;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .channel-crossover-chip.present {
+    background: rgba(52, 199, 89, 0.15);
+    border-color: rgba(52, 199, 89, 0.4);
+    color: #34C759;
+  }
+  .channel-crossover-chip.missing {
+    background: rgba(255, 149, 0, 0.15);
+    border-color: rgba(255, 149, 0, 0.4);
+    color: #FF9500;
+  }
+  .channel-crossover-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    flex-wrap: wrap;
+  }
+  /* Support & Feedback Chat */
+  .support-chat-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  .support-threads-bar {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .support-thread-pill {
+    padding: 6px 12px;
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text);
+  }
+  .support-thread-pill.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .support-messages-stream {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 380px;
+    min-height: 180px;
+    overflow-y: auto;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+  }
+  .support-bubble {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+  .support-bubble.user {
+    align-self: flex-end;
+    background: var(--accent);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .support-bubble.admin {
+    align-self: flex-start;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-bottom-left-radius: 4px;
+  }
+  .support-bubble-sender {
+    font-size: 0.72rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    opacity: 0.85;
+  }
+  .support-bubble-time {
+    font-size: 0.68rem;
+    opacity: 0.65;
+    margin-top: 4px;
+    text-align: right;
+  }
+  .support-reply-composer {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+  }
+  .support-reply-composer textarea {
+    flex: 1;
+    min-height: 44px;
+    max-height: 120px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.88rem;
+    resize: vertical;
+  }
   .row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 10px; width: 100%; }
   .field-row { display: grid; grid-template-columns: 1fr; gap: 10px; width: 100%; }
   button, .actions a {
@@ -1311,6 +1658,189 @@ function renderBuilder(
   .btn-nuvio   { background: linear-gradient(135deg, #FF5E3A, #FF2A68); color: #fff; }
   .btn-wako    { background: linear-gradient(135deg, #007AFF, #34AADC); color: #fff; }
   .actions { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+
+  /* --- Install Result Card & Manifest Link Display ------------------------ */
+  #result {
+    margin-top: 16px;
+  }
+  .install-result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    animation: resultSlideIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes resultSlideIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .install-result-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .install-result-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: var(--radius-pill);
+    background: rgba(52, 199, 89, 0.12);
+    color: #34C759;
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.01em;
+  }
+  .install-result-badge svg {
+    stroke: currentColor;
+  }
+  .install-result-sub {
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .install-url-container {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    border: 1.5px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 12px 14px;
+    gap: 10px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    min-width: 0;
+  }
+  .install-url-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .install-url-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    font-size: 0.82rem;
+    color: var(--text-2);
+  }
+  .install-url-label svg {
+    color: var(--accent);
+  }
+  .install-url-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    border: 1.5px solid var(--border-strong);
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: var(--shadow-sm);
+    min-height: unset;
+    font-family: inherit;
+  }
+  .install-url-copy-btn:hover {
+    background: var(--panel-strong);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .install-url-box {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.84rem;
+    font-weight: 500;
+    color: var(--text);
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    user-select: all;
+    -webkit-user-select: all;
+    line-height: 1.5;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+  .install-hint-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: rgba(0, 122, 255, 0.05);
+    border: 1px solid rgba(0, 122, 255, 0.13);
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  .install-hint-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+    color: var(--text);
+    font-size: 0.82rem;
+  }
+
+  .trakt-connect-actions {
+    display: flex;
+    flex-direction: row;
+    width: auto;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  @media (max-width: 640px) {
+    .trakt-connect-actions {
+      display: flex !important;
+      flex-direction: row !important;
+      width: 100% !important;
+      gap: 8px !important;
+      flex-wrap: wrap !important;
+    }
+    .trakt-connect-actions #traktConnectBtn,
+    .trakt-connect-actions #traktDeviceBtn {
+      flex: 1 1 calc(50% - 4px) !important;
+      min-width: 0 !important;
+      padding: 8px 4px !important;
+      font-size: 0.8rem !important;
+      white-space: nowrap !important;
+      text-overflow: ellipsis !important;
+      overflow: hidden !important;
+    }
+    .trakt-connect-actions #traktDisconnectBtn {
+      flex: 1 1 100% !important;
+      width: 100% !important;
+      padding: 8px 4px !important;
+      font-size: 0.8rem !important;
+    }
+  }
+  @media (min-width: 641px) {
+    .trakt-connect-actions {
+      display: flex !important;
+      flex-direction: row !important;
+      width: auto !important;
+      gap: 8px !important;
+      flex-wrap: wrap !important;
+    }
+    .trakt-connect-actions button {
+      flex: none !important;
+      width: auto !important;
+    }
+  }
+
+
 
   /* --- Catalog Shelves (#lists in My Catalogs Tab) ------------------------ */
   #lists { display: grid; gap: 10px; grid-template-columns: 1fr; width: 100%; max-width: 100%; }
@@ -1702,6 +2232,7 @@ function renderBuilder(
       </div>
     </div>
     <div class="app-header-actions">
+      <a href="${origin}/guide" style="color:var(--text-2); font-size:0.82rem; font-weight:600; text-decoration:none; padding:4px 8px; white-space:nowrap;" title="Guide: how to use this add-on">Guide</a>
       <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
       <div id="creatorProfileBar"></div>
     </div>
@@ -1781,7 +2312,7 @@ function renderBuilder(
       <p id="detailSubtitle" style="margin-top:4px;">Loading&hellip;</p>
     </div>
     <div id="detailFilterBar" class="detail-filter-bar" style="display:none;">
-      <div id="whFilterControls" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+      <div id="whFilterControls" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; width:100%;">
         <button type="button" class="subnav-pill active wh-filter-pill" data-wh-filter="all" onclick="setWatchHistoryFilter('all', this)">All</button>
         <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="movie" onclick="setWatchHistoryFilter('movie', this)">Movies</button>
         <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="series" onclick="setWatchHistoryFilter('series', this)">Shows</button>
@@ -1789,6 +2320,7 @@ function renderBuilder(
           <input type="checkbox" id="whGroupShowsCheckbox" onchange="toggleWatchHistoryGroupShows(this.checked)" style="accent-color:var(--accent); cursor:pointer;">
           <span>Shows instead of episodes</span>
         </label>
+        <button type="button" class="subnav-pill" id="whClearHistoryBtn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear History</button>
       </div>
       <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center;">
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>

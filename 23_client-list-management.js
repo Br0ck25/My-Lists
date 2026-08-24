@@ -346,7 +346,8 @@ async function testSourceRow(btn) {
 async function testAllSources() {
   const buttons = Array.from(document.querySelectorAll('#lists .btn-test'));
   if (!buttons.length) {
-    alert('No lists to test yet -- add some above first.');
+    if (typeof showAppAlert === 'function') showAppAlert('No Lists', 'No lists to test yet -- add some above first.', false);
+    else alert('No lists to test yet -- add some above first.');
     return;
   }
   const testAllBtn = document.getElementById('testAllBtn');
@@ -377,7 +378,12 @@ async function testAllSources() {
     testAllBtn.disabled = false;
     testAllBtn.textContent = 'Test all';
   }
-  alert('Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.');
+  const summaryMsg = 'Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.';
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(errCount > 0 ? 'Testing Complete (With Errors)' : 'Testing Complete', summaryMsg, errCount === 0);
+  } else {
+    alert(summaryMsg);
+  }
 }
 
 function buildConfig(entries, keys) {
@@ -471,64 +477,69 @@ function collectKeys() {
   let track = false;
   try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
 
+  const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+
   const tmdbKeyEl = document.getElementById('tmdbKeyInput');
   let tmdbKey = tmdbKeyEl ? tmdbKeyEl.value.trim() : '';
-  if (!tmdbKey) {
+  if (!tmdbKey && !tmdbDisc) {
     try { tmdbKey = localStorage.getItem('myListAddon:tmdbKey') || ''; } catch (e) {}
   }
   let tmdbSession = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || '';
-  if (!tmdbSession) {
+  if (!tmdbSession && !tmdbDisc) {
     try { tmdbSession = localStorage.getItem('myListAddon:tmdbSessionId') || ''; } catch (e) {}
   }
   let tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || '';
-  if (!tmdbAcc) {
+  if (!tmdbAcc && !tmdbDisc) {
     try { tmdbAcc = localStorage.getItem('myListAddon:tmdbAccountId') || ''; } catch (e) {}
   }
   let tmdbUser = (typeof tmdbUsername !== 'undefined' && tmdbUsername) || '';
-  if (!tmdbUser) {
+  if (!tmdbUser && !tmdbDisc) {
     try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
   }
 
   const mdblistKeyEl = document.getElementById('mdblistKeyInput');
   let mdblistKey = mdblistKeyEl ? mdblistKeyEl.value.trim() : '';
-  if (!mdblistKey) {
+  if (!mdblistKey && !mdblistDisc) {
     try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
   }
   let mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || '';
-  if (!mdblistToken) {
+  if (!mdblistToken && !mdblistDisc) {
     try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
   let mdblistUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || '';
-  if (!mdblistUser) {
+  if (!mdblistUser && !mdblistDisc) {
     try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
   }
 
   const traktKeyEl = document.getElementById('traktKeyInput');
   let traktKey = traktKeyEl ? traktKeyEl.value.trim() : '';
-  if (!traktKey) {
+  if (!traktKey && !traktDisc) {
     try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
   }
   const traktUserEl = document.getElementById('traktUsernameInput');
   let traktUser = traktUserEl ? traktUserEl.value.trim() : '';
-  if (!traktUser) {
+  if (!traktUser && !traktDisc) {
     try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
   }
   let traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || '';
-  if (!traktToken) {
+  if (!traktToken && !traktDisc) {
     try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
   }
 
   const simklKeyEl = document.getElementById('simklKeyInput');
   let simklKey = simklKeyEl ? simklKeyEl.value.trim() : '';
-  if (!simklKey) {
+  if (!simklKey && !simklDisc) {
     try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
   }
   let simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || '';
-  if (!simklToken) {
+  if (!simklToken && !simklDisc) {
     try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
   let simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || '';
-  if (!simklUser) {
+  if (!simklUser && !simklDisc) {
     try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
   }
 
@@ -988,10 +999,10 @@ window.switchListDetailsType = function(newType) {
     isDualTypeChart = true;
     if (newType === 'series') {
       targetUrl = 'tmdb:chart:new_shows';
-      targetName = 'New Shows';
+      targetName = 'New Releases';
     } else if (newType === 'movie') {
       targetUrl = 'tmdb:chart:new_movies';
-      targetName = 'New Movies';
+      targetName = 'New Releases';
     }
   } else if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
     const match = CHART_SLUG_ENTRIES.find((e) => e.name === p.name || e.movieUrl === p.listUrl || e.showUrl === p.listUrl);
@@ -1521,9 +1532,70 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         removeListFromConfig(null, type, listUrl);
       }
       updateDetailAddBtn();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + (name || 'List') + '" from your Catalogs.');
     } else {
-      if (listUrl && listUrl.startsWith('custom:curated:')) {
+      let slug = '';
+      if (listUrl) {
+        if (listUrl.startsWith('autotrack:')) slug = listUrl.split(':')[1] || '';
+        else if (listUrl.startsWith('custom:') && !listUrl.startsWith('custom:curated:')) slug = listUrl.slice('custom:'.length);
+      }
+      if (!slug && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
+        slug = name.toLowerCase().replace(' ', '-');
+      }
+
+      if (slug === 'continue-watching' || slug === 'watch-history' || slug === 'watchlist') {
+        const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const listMeta = localMap[slug] || (typeof lastLocalCustomListsData !== 'undefined' && (lastLocalCustomListsData || []).find((l) => l.slug === slug)) || { name: name || slug, slug: slug, type: type || 'series', items: [] };
+        const items = listMeta.items || [];
+        const isMovieType = type === 'movie';
+        const isSeriesType = type === 'series';
+
+        if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+          const movies = [];
+          const series = [];
+          items.forEach((it) => {
+            const isMovie = it.kind === 'movie' || it.type === 'movie';
+            const mapped = {
+              imdbId: isMovie ? (it.imdbId || it.id) : (it.showId || it.imdbId || it.id),
+              title: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
+              poster: isMovie ? it.poster : (it.showPoster || it.poster),
+              year: it.year,
+            };
+            if (isMovie) {
+              movies.push(mapped);
+            } else {
+              if (!series.some((s) => s.imdbId === mapped.imdbId)) {
+                series.push(mapped);
+              }
+            }
+          });
+
+          if (isMovieType || (!isSeriesType && movies.length > 0)) {
+            const url = (typeof activeCreator !== 'undefined' && activeCreator && (slug === 'watch-history' || slug === 'continue-watching'))
+              ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
+              : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'movie', items: movies, shuffle: false });
+            addRow(listMeta.name + ((!isMovieType && series.length > 0) ? ' (Movies)' : ''), url, 'movie', true, 'My Lists');
+          }
+          if (isSeriesType || (!isMovieType && (series.length > 0 || movies.length === 0))) {
+            const url = (typeof activeCreator !== 'undefined' && activeCreator && (slug === 'watch-history' || slug === 'continue-watching'))
+              ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
+              : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'series', items: series, shuffle: false });
+            addRow(listMeta.name + ((!isSeriesType && movies.length > 0) ? ' (Shows)' : ''), url, 'series', true, 'My Lists');
+          }
+        } else {
+          const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type || type || 'movie', items: items, shuffle: false };
+          addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'My Lists');
+        }
+      } else if (slug && (typeof loadLocalCustomLists === 'function') && loadLocalCustomLists()[slug]) {
+        const listMeta = loadLocalCustomLists()[slug];
+        const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type || type || 'movie', items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'My Lists');
+      } else if (slug && typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData) && lastCreatorListsData.find((l) => l.slug === slug)) {
+        const listMeta = lastCreatorListsData.find((l) => l.slug === slug);
+        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type || type || 'movie', items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'Custom Lists');
+      } else if (listUrl && listUrl.startsWith('custom:curated:')) {
         addRow(name || 'Curated List', listUrl, type, true, 'Curated');
       } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
         addRow(name || 'List', listUrl, type, true, 'New Releases');
@@ -1531,6 +1603,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         addRow(name || 'List', listUrl, type, true, 'Custom');
       }
       updateDetailAddBtn();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + (name || 'List') + '" to your Catalogs.');
     }
   };

@@ -169,7 +169,6 @@ async function handleFetch(request, env, ctx) {
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
-      const isShow = slug.includes("show") || slug.includes("tv") || slug.includes("series");
       const title = isShow ? "Recommended Shows" : "Recommended Movies";
       return new Response(
         renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } }),
@@ -186,8 +185,8 @@ async function handleFetch(request, env, ctx) {
         if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching" };
         if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history" };
         if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist" };
-        if (slugLower === "new-movies") chart = { name: "New Movies", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
-        if (slugLower === "new-shows") chart = { name: "New Shows", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
+        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
+        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
       }
       return new Response(
         renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: (chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie", url: chart.movieUrl } } : {}),
@@ -276,6 +275,66 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    if (path === "/robots.txt") {
+      // Only the plain / install page is meant to be publicly
+      // discoverable -- see seoHeadHtml's comment in 09_page-shell.js for
+      // why /:config/configure pages (personal base64 config, and any
+      // personal API keys the user pasted in, baked straight into the
+      // URL) get an explicit noindex there too, on top of being
+      // Disallow'd here. /admin is a password-protected dashboard with
+      // no business being crawled at all, and everything under /api/ and
+      // the manifest/catalog/subtitles endpoints are raw JSON data
+      // routes, not content.
+      const robots = `User-agent: *
+Allow: /$
+Disallow: /admin
+Disallow: /api/
+Disallow: /*/configure
+Disallow: /*/manifest.json
+Disallow: /*/catalog/
+Disallow: /*/subtitles/
+
+Sitemap: ${url.origin}/sitemap.xml`;
+      return new Response(robots, {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+      });
+    }
+
+    if (path === "/sitemap.xml") {
+      // The plain install page and /guide (see the route just below) are
+      // the only two URLs on this whole deployment meant to be indexed
+      // (see /robots.txt just above) -- everything else either needs a
+      // personal config in its own URL to mean anything, or is a raw
+      // JSON/API endpoint rather than a page.
+      const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${url.origin}/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>${url.origin}/guide</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+</urlset>`;
+      return new Response(sitemap, {
+        headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+      });
+    }
+
+    // Standalone SEO/content page, not the interactive builder -- see
+    // renderGuidePage's own comment (end of 24_client-backup-restore-
+    // presets.js, right after renderBuilder closes) for why it's a
+    // separate, lightweight template literal rather than reusing
+    // renderBuilder's app stylesheet.
+    if (path === "/guide") {
+      return new Response(renderGuidePage(url.origin), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=3600" }
+      });
+    }
+
     if (path === "/sw.js") {
       const sw = `
 self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
@@ -298,9 +357,12 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, trackCreatorName } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
+
+      const source = detectSource(entry.url);
+      const isAutoTrack = source === "autotrack";
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -309,17 +371,20 @@ self.addEventListener('fetch', e => {
       // before. Only active when a CONFIGS KV namespace is bound (optional,
       // same as the short-link feature) -- without one this behaves exactly
       // as it did previously.
-      const staleKey = env && env.CONFIGS ? `lastgood:${config}:${type}:${id}` : null;
+      const staleKey = env && env.CONFIGS && !isAutoTrack ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, trackCreatorName, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
           );
         }
-        return json({ metas });
+        if (isAutoTrack) {
+          return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+        }
+        return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
 
@@ -2166,8 +2231,25 @@ self.addEventListener('fetch', e => {
             });
           }
         }
+        let simklUsername = "";
+        try {
+          const uRes = await fetch("https://api.simkl.com/users/settings", {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "Accept": "application/json",
+            },
+          });
+          if (uRes.ok) {
+            const uData = await uRes.json();
+            if (uData && uData.user && (uData.user.username || uData.user.name)) {
+              simklUsername = uData.user.username || uData.user.name;
+            }
+          }
+        } catch {}
 
-        return json({ ok: true, lists });
+        return json({ ok: true, lists, username: simklUsername });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) }, 500);
       }
@@ -3329,13 +3411,17 @@ self.addEventListener('fetch', e => {
         }
         return u.toString();
       };
+      let tmdbUsername = "";
 
       // If we don't have accountId but have sessionId, query account details
-      if (!accountId && sessionId) {
+      if (sessionId) {
         try {
           const accRes = await fetch(makeUrl("/account"), { headers: makeHeaders() });
           const acc = await accRes.json();
-          if (acc && acc.id) accountId = String(acc.id);
+          if (acc && acc.id) {
+            accountId = String(acc.id);
+            if (acc.username) tmdbUsername = acc.username;
+          }
         } catch {}
       }
 
@@ -3351,51 +3437,55 @@ self.addEventListener('fetch', e => {
           const listsRes = await fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/lists`, { page: "1" }), {
             headers: makeHeaders()
           });
-          const listsData = await listsRes.json();
-          const rawLists = Array.isArray(listsData.results) ? listsData.results : [];
-          
-          const customListsWithItems = await Promise.all(
-            rawLists.map(async (l) => {
+          if (listsRes.ok) {
+            const listsData = await listsRes.json();
+            const rawLists = Array.isArray(listsData.results) ? listsData.results : [];
+            const fetched = await mapWithConcurrency(rawLists, 4, async (it) => {
+              const listId = it.id;
+              let itemCount = it.item_count || 0;
               let previewItems = [];
               try {
-                const listDetailRes = await fetch(makeUrl(`/list/${l.id}`), { headers: makeHeaders() });
-                const listDetail = await listDetailRes.json();
-                const rawItems = Array.isArray(listDetail.items) ? listDetail.items : (Array.isArray(listDetail.results) ? listDetail.results : []);
-                previewItems = rawItems.slice(0, 9).map((it) => ({
-                  id: it.id,
-                  title: it.title || it.name || "Untitled",
-                  year: (it.release_date || it.first_air_date || "").slice(0, 4),
-                  poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : (it.poster || ""),
-                  type: it.media_type || (it.title ? "movie" : "series"),
-                }));
+                const detailRes = await fetch(makeUrl(`/list/${encodeURIComponent(listId)}`), { headers: makeHeaders() });
+                if (detailRes.ok) {
+                  const listDetail = await detailRes.json();
+                  const rawItems = Array.isArray(listDetail.items) ? listDetail.items : (Array.isArray(listDetail.results) ? listDetail.results : []);
+                  itemCount = listDetail.item_count || rawItems.length || itemCount;
+                  previewItems = rawItems.slice(0, 9).map((item) => ({
+                    id: item.id,
+                    title: item.title || item.name || "Untitled",
+                    year: (item.release_date || item.first_air_date || "").slice(0, 4),
+                    poster: item.poster_path ? `https://image.tmdb.org/t/p/w300${item.poster_path}` : "",
+                    type: item.media_type === "tv" ? "series" : "movie",
+                  }));
+                }
               } catch {}
               return {
-                id: l.id,
-                name: l.name || "Untitled List",
-                url: `https://www.themoviedb.org/list/${l.id}`,
-                contentType: l.list_type || "mixed",
-                items: l.item_count || previewItems.length || 0,
-                likes: l.favorite_count || 0,
-                description: l.description || "",
-                private: false,
+                id: String(listId),
+                name: it.name || "Untitled List",
+                url: `https://www.themoviedb.org/list/${encodeURIComponent(listId)}`,
+                contentType: "mixed",
+                items: itemCount,
+                likes: it.favorite_count || 0,
+                description: it.description || "",
+                private: it.public === false,
                 previewItems: previewItems,
               };
-            })
-          );
-          lists.push(...customListsWithItems);
+            });
+            lists.push(...fetched);
+          }
         }
 
-        // 2. Fetch user's Watchlist (movies & tv) if session is available
-        if (accountId && sessionId) {
-          const [wlMoviesRes, wlTvRes, favMoviesRes, favTvRes] = await Promise.all([
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/movies`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/tv`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/movies`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/tv`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
+        // 2. Fetch user's Watchlist (Movies & TV Shows) and Favorites if accountId is available
+        if (accountId) {
+          const [wlMovRes, wlTvRes, favMovRes, favTvRes] = await Promise.all([
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/movies`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/tv`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/movies`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/tv`, { page: "1" }), { headers: makeHeaders() }),
           ]);
 
-          if (wlMoviesRes && wlMoviesRes.ok) {
-            const wlMovData = await wlMoviesRes.json();
+          if (wlMovRes && wlMovRes.ok) {
+            const wlMovData = await wlMovRes.json();
             const rawItems = Array.isArray(wlMovData.results) ? wlMovData.results : [];
             const total = wlMovData.total_results || rawItems.length;
             if (total > 0) {
@@ -3406,14 +3496,14 @@ self.addEventListener('fetch', e => {
                 poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : "",
                 type: "movie",
               }));
-              lists.unshift({
+              lists.push({
                 id: "watchlist_movies",
                 name: "TMDB Watchlist (Movies)",
                 url: `tmdb:account:watchlist:movies`,
                 contentType: "movie",
                 items: total,
                 likes: 0,
-                description: "Your TMDB Movie Watchlist",
+                description: "Your TMDB Watchlist Movies",
                 private: true,
                 previewItems: previewItems,
               });
@@ -3432,22 +3522,22 @@ self.addEventListener('fetch', e => {
                 poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : "",
                 type: "series",
               }));
-              lists.unshift({
+              lists.push({
                 id: "watchlist_tv",
                 name: "TMDB Watchlist (Shows)",
                 url: `tmdb:account:watchlist:tv`,
                 contentType: "series",
                 items: total,
                 likes: 0,
-                description: "Your TMDB TV Show Watchlist",
+                description: "Your TMDB Watchlist TV Shows",
                 private: true,
                 previewItems: previewItems,
               });
             }
           }
 
-          if (favMoviesRes && favMoviesRes.ok) {
-            const favMovData = await favMoviesRes.json();
+          if (favMovRes && favMovRes.ok) {
+            const favMovData = await favMovRes.json();
             const rawItems = Array.isArray(favMovData.results) ? favMovData.results : [];
             const total = favMovData.total_results || rawItems.length;
             if (total > 0) {
@@ -3499,7 +3589,7 @@ self.addEventListener('fetch', e => {
           }
         }
 
-        return json({ ok: true, lists });
+        return json({ ok: true, lists, username: tmdbUsername, accountId });
       } catch (err) {
         return json({ ok: false, error: "Failed to load TMDB lists: " + (err.message || String(err)) }, 500);
       }
@@ -3527,7 +3617,7 @@ self.addEventListener('fetch', e => {
         const userHash = safeUserHash(accessToken);
         const cacheKey = `user_cache:trakt:private_lists:${userHash}`;
 
-        const lists = await fetchWithPerUserCacheAndCircuitBreaker({
+        const result = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
           freshTtlSec: 60,
           staleTtlSec: 1800,
@@ -3630,12 +3720,16 @@ self.addEventListener('fetch', e => {
               contentType: "unknown",
             };
 
+            const meUsername = (me && me.username) || (meSlug !== "me" ? meSlug : "");
+
             ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4));
-            return [watchlistEntry, historyEntry, ...rawLists];
+            return { lists: [watchlistEntry, historyEntry, ...rawLists], username: meUsername };
           }
         });
 
-        return json({ ok: true, lists });
+        const lists = Array.isArray(result) ? result : (result && result.lists) || [];
+        const username = (result && result.username) || "";
+        return json({ ok: true, lists, username });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -3692,15 +3786,8 @@ self.addEventListener('fetch', e => {
       }
     }
 
-    // /api/feedback  (POST)  { category, message, contact?, creatorName? } -> { ok }
-    // Settings > Feedback. No auth required -- anyone should be able to
-    // report a bug or suggest something without needing a Creator Profile
-    // first; creatorName is attached only if the person happens to be
-    // signed in, purely so it's visible in the admin dashboard, not
-    // verified against anything. Stored under a key that sorts
-    // chronologically as a plain string (zero-padded millisecond epoch),
-    // so the admin dashboard can list newest-first without needing to
-    // parse and sort every value first.
+    // /api/feedback  (POST)  { category, message, contact?, creatorName?, threadId? } -> { ok, entry }
+    // Settings > Feedback & Support 2-way chat.
     if (path === "/api/feedback" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
@@ -3716,32 +3803,69 @@ self.addEventListener('fetch', e => {
       const category = allowedCategories.has(body.category) ? body.category : "other";
       const contact = String(body.contact || "").trim().slice(0, 200);
       const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+      const threadId = body.threadId ? String(body.threadId).trim() : null;
 
-      // Simple per-IP rate limit (5/hour) -- KV's read-then-write isn't
-      // atomic (see bumpStat's own comment on the same tradeoff elsewhere
-      // in this file), so this is a deterrent against casual spam/abuse,
-      // not a hard guarantee against a determined actor. Skipped entirely
-      // for the admin dashboard's own "Log something yourself" form (an
-      // authenticated admin, not an anonymous IP, submitting it) -- the
-      // admin session cookie already rides along on that fetch() call
-      // since it's same-origin, so isAdminRequest can tell the two apart
-      // without any extra plumbing on the client side.
       const isAdmin = await isAdminRequest(request, env);
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
       const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (!isAdmin && rateCount >= 5) {
-        return json({ ok: false, error: "You've sent a few of these already today -- try again tomorrow, or reach out another way if it's urgent." });
+      if (!isAdmin && rateCount >= 20) {
+        return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
       }
 
+      // If replying to an existing thread
+      if (threadId) {
+        try {
+          const raw = await env.CONFIGS.get(`feedback:${threadId}`);
+          if (raw) {
+            const entry = JSON.parse(raw);
+            if (!Array.isArray(entry.messages) || !entry.messages.length) {
+              entry.messages = [{
+                id: `msg_init`,
+                sender: "user",
+                senderName: entry.creatorName || "User",
+                text: entry.message || "(Initial message)",
+                timestamp: entry.createdAt || Date.now()
+              }];
+            }
+            const newMsg = {
+              id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              sender: isAdmin ? "admin" : "user",
+              senderName: isAdmin ? "Developer" : (creatorName || entry.creatorName || "User"),
+              text: message,
+              timestamp: Date.now()
+            };
+            entry.messages.push(newMsg);
+            entry.updatedAt = Date.now();
+            entry.status = isAdmin ? "replied" : "open";
+            entry.completed = false;
+            if (contact && !entry.contact) entry.contact = contact;
+            if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
+            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+            return json({ ok: true, entry });
+          }
+        } catch (e) {}
+      }
+
+      // New Thread
       const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
       const entry = {
         id, category, message, contact: contact || null, creatorName,
         createdAt: Date.now(),
+        updatedAt: Date.now(),
         completed: false,
-        // Recorded for basic spam triage in the admin dashboard, not
-        // shown to anyone else and never used for anything beyond that.
+        status: "open",
+        messages: [
+          {
+            id: `msg_${Date.now()}_1`,
+            sender: isAdmin ? "admin" : "user",
+            senderName: isAdmin ? "Developer" : (creatorName || "User"),
+            text: message,
+            timestamp: Date.now()
+          }
+        ],
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
@@ -3750,12 +3874,91 @@ self.addEventListener('fetch', e => {
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
       }
-      // entry is echoed back so the admin dashboard's "Log something
-      // yourself" form can show the new card instantly (optimistic, using
-      // its own locally-built entry) and then swap in the server's real
-      // id/createdAt once this resolves -- needed because a later Mark
-      // Completed click has to send an id the server actually recognizes.
       return json({ ok: true, entry });
+    }
+
+    // /api/feedback/threads (POST) { creatorName?, threadIds? } -> { ok, threads }
+    // Loads active support chat threads for a user/device
+    if (path === "/api/feedback/threads" && (request.method === "POST" || request.method === "GET")) {
+      if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
+      let threadIds = [];
+      let creatorName = null;
+      if (request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (Array.isArray(body.threadIds)) threadIds = body.threadIds.map((t) => String(t).trim()).filter(Boolean);
+          if (body.creatorName) creatorName = String(body.creatorName).trim().toLowerCase();
+        } catch {}
+      } else {
+        const pIds = url.searchParams.get("threadIds");
+        if (pIds) threadIds = pIds.split(",").map((s) => s.trim()).filter(Boolean);
+        const pCreator = url.searchParams.get("creatorName");
+        if (pCreator) creatorName = pCreator.trim().toLowerCase();
+      }
+
+      const threadsMap = new Map();
+
+      // 1. Fetch explicitly listed thread IDs
+      if (threadIds.length) {
+        const lookups = threadIds.slice(0, 20).map(async (tid) => {
+          try {
+            const raw = await env.CONFIGS.get(`feedback:${tid}`);
+            if (raw) {
+              const entry = JSON.parse(raw);
+              if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                entry.messages = [{
+                  id: `msg_init`,
+                  sender: "user",
+                  senderName: entry.creatorName || "User",
+                  text: entry.message || "(Initial message)",
+                  timestamp: entry.createdAt || Date.now()
+                }];
+              }
+              threadsMap.set(entry.id, entry);
+            }
+          } catch {}
+        });
+        await Promise.all(lookups);
+      }
+
+      // 2. If creatorName is given, also scan recent feedback keys for this creator
+      if (creatorName) {
+        try {
+          const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 200 });
+          const scanKeys = (listRes.keys || []).map((k) => k.name);
+          const scanLookups = scanKeys.map(async (kName) => {
+            const tid = kName.replace(/^feedback:/, "");
+            if (threadsMap.has(tid)) return;
+            try {
+              const raw = await env.CONFIGS.get(kName);
+              if (raw) {
+                const entry = JSON.parse(raw);
+                if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                  if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                    entry.messages = [{
+                      id: `msg_init`,
+                      sender: "user",
+                      senderName: entry.creatorName || "User",
+                      text: entry.message || "(Initial message)",
+                      timestamp: entry.createdAt || Date.now()
+                    }];
+                  }
+                  threadsMap.set(entry.id, entry);
+                }
+              }
+            } catch {}
+          });
+          await Promise.all(scanLookups);
+        } catch {}
+      }
+
+      const threads = Array.from(threadsMap.values()).sort((a, b) => {
+        const timeA = a.updatedAt || a.createdAt || 0;
+        const timeB = b.updatedAt || b.createdAt || 0;
+        return timeB - timeA;
+      });
+
+      return json({ ok: true, threads }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/track-search  (POST)  { query } -> { ok }
@@ -3818,13 +4021,12 @@ self.addEventListener('fetch', e => {
       const accessToken = (url.searchParams.get("accessToken") || "").trim();
       if (!apikey && !accessToken) return json({ ok: false, error: "Missing apikey or accessToken." }, 400);
       try {
+        const token = accessToken || apikey;
         const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}` };
-        let targetUrl = `https://api.mdblist.com/lists/user`;
         if (accessToken) {
           headers["Authorization"] = `Bearer ${accessToken}`;
-        } else {
-          targetUrl += `?apikey=${encodeURIComponent(apikey)}`;
         }
+        const targetUrl = `https://api.mdblist.com/lists/user?apikey=${encodeURIComponent(token)}`;
         const res = await fetch(targetUrl, {
           headers,
           cf: { cacheTtl: 60, cacheEverything: false },
@@ -3834,22 +4036,48 @@ self.addEventListener('fetch', e => {
         }
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
-        const lists = rawLists
-          .filter((l) => l && (l.slug || l.id) && l.user_name)
-          .map((l) => ({
-            id: l.id != null ? String(l.id) : (l.slug || ""),
-            name: l.name || l.slug,
-            slug: l.slug,
-            dynamic: !!l.dynamic,
-            mediatype: l.mediatype || "",
-            contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
-            items: l.items || 0,
-            likes: l.likes || 0,
-            private: l.public === false || l.private === true,
-            url: `https://mdblist.com/lists/${encodeURIComponent(l.user_name)}/${encodeURIComponent(l.slug)}`,
-          }));
 
-        const username = (rawLists.find((l) => l && l.user_name) || {}).user_name || "";
+        let username = "";
+        for (const l of rawLists) {
+          if (l && (l.user_name || l.username || l.user)) {
+            username = l.user_name || l.username || l.user;
+            break;
+          }
+        }
+
+        if (!username) {
+          try {
+            const uRes = await fetch(`https://api.mdblist.com/user?apikey=${encodeURIComponent(token)}`, {
+              headers,
+              cf: { cacheTtl: 300, cacheEverything: false },
+            });
+            if (uRes.ok) {
+              const uData = await uRes.json();
+              if (uData) {
+                username = uData.user || uData.username || uData.user_name || uData.name || "";
+              }
+            }
+          } catch {}
+        }
+
+        const lists = rawLists
+          .filter((l) => l && (l.slug || l.id))
+          .map((l) => {
+            const itemUser = l.user_name || l.username || l.user || username || "";
+            return {
+              id: l.id != null ? String(l.id) : (l.slug || ""),
+              name: l.name || l.slug,
+              slug: l.slug,
+              dynamic: !!l.dynamic,
+              mediatype: l.mediatype || "",
+              contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
+              items: l.items || 0,
+              likes: l.likes || 0,
+              private: l.public === false || l.private === true,
+              url: itemUser ? `https://mdblist.com/lists/${encodeURIComponent(itemUser)}/${encodeURIComponent(l.slug)}` : `https://mdblist.com/lists/${encodeURIComponent(l.slug)}`,
+            };
+          });
+
         const watchlistCard = {
           name: "My Watchlist",
           slug: "watchlist",
@@ -3870,7 +4098,7 @@ self.addEventListener('fetch', e => {
           contentType: "unknown",
         };
 
-        return json({ ok: true, lists: [watchlistCard, historyCard, ...lists] });
+        return json({ ok: true, lists: [watchlistCard, historyCard, ...lists], username });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }

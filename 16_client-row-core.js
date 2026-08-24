@@ -179,17 +179,43 @@ function getListCleanPath(listUrl, name) {
 }
 
 function isListAddedToConfig(url, type, slug) {
+  let targetSlug = slug || '';
+  if (!targetSlug && url) {
+    if (url.startsWith('autotrack:')) {
+      targetSlug = url.split(':')[1] || '';
+    } else if (url.startsWith('custom:') && !url.startsWith('custom:curated:')) {
+      targetSlug = url.slice('custom:'.length);
+    } else if (url.startsWith('customlist:v1:')) {
+      const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
+      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+    }
+  }
+
   const entries = document.querySelectorAll('#lists .entry');
   for (const entry of entries) {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
-    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    if (type && t && t !== type && t !== 'both' && type !== 'both' && type !== 'mixed' && t !== 'mixed') {
+      if (targetSlug !== 'continue-watching' && targetSlug !== 'watch-history' && targetSlug !== 'watchlist') {
+        continue;
+      }
+    }
     const urlInputs = entry.querySelectorAll('.url');
     for (const el of urlInputs) {
       const u = el.value.trim();
-      if (url && u === url.trim()) return true;
-      if (slug) {
-        const payload = parseCustomListPayloadClient(u);
-        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) return true;
+      if (url && (u === url.trim() || (u.startsWith('autotrack:') && url.startsWith('autotrack:') && u.split(':')[1] === url.split(':')[1]))) return true;
+      if (targetSlug) {
+        if (u === 'custom:' + targetSlug || u === 'autotrack:' + targetSlug) return true;
+        if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) return true;
+        if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) return true;
+        const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) return true;
+      }
+    }
+    if (targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
+      const nameInput = entry.querySelector('.name');
+      const cleanName = targetSlug.replace('-', ' ');
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+        return true;
       }
     }
   }
@@ -197,33 +223,127 @@ function isListAddedToConfig(url, type, slug) {
 }
 
 function removeListFromConfig(url, type, slug) {
+  let targetSlug = slug || '';
+  if (!targetSlug && url) {
+    if (url.startsWith('autotrack:')) {
+      targetSlug = url.split(':')[1] || '';
+    } else if (url.startsWith('custom:') && !url.startsWith('custom:curated:')) {
+      targetSlug = url.slice('custom:'.length);
+    } else if (url.startsWith('customlist:v1:')) {
+      const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
+      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+    }
+  }
+
   const entries = document.querySelectorAll('#lists .entry');
   let removed = false;
   for (const entry of entries) {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
-    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    if (type && t && t !== type && t !== 'both' && type !== 'both' && type !== 'mixed' && t !== 'mixed') {
+      if (targetSlug !== 'continue-watching' && targetSlug !== 'watch-history' && targetSlug !== 'watchlist') {
+        continue;
+      }
+    }
     const urlInputs = entry.querySelectorAll('.url');
+    let match = false;
     for (const el of urlInputs) {
       const u = el.value.trim();
-      let match = false;
-      if (url && u === url.trim()) match = true;
-      if (slug) {
-        const payload = parseCustomListPayloadClient(u);
-        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) match = true;
+      if (url && (u === url.trim() || (u.startsWith('autotrack:') && url.startsWith('autotrack:') && u.split(':')[1] === url.split(':')[1]))) { match = true; break; }
+      if (targetSlug) {
+        if (u === 'custom:' + targetSlug || u === 'autotrack:' + targetSlug) { match = true; break; }
+        if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) { match = true; break; }
+        if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) { match = true; break; }
+        const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
       }
-      if (match) {
-        entry.remove();
-        removed = true;
-        break;
+    }
+    if (!match && targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
+      const nameInput = entry.querySelector('.name');
+      const cleanName = targetSlug.replace('-', ' ');
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+        match = true;
       }
+    }
+    if (match) {
+      entry.remove();
+      removed = true;
     }
   }
   if (removed) {
-    renumber();
-    saveState();
+    if (typeof renumber === 'function') renumber();
+    if (typeof saveState === 'function') saveState();
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
   }
   return removed;
 }
+
+function updateAllListAddButtons() {
+  // 1. Local list cards in My Lists
+  document.querySelectorAll('.localListAddToConfigBtn').forEach((btn) => {
+    const slug = btn.dataset.slug;
+    if (!slug) return;
+    const card = btn.closest('.list-card');
+    const type = card ? card.dataset.listType : null;
+    const isAdded = isListAddedToConfig(null, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 2. Creator Profile server list cards
+  document.querySelectorAll('.creatorListAddToConfigBtn').forEach((btn) => {
+    const slug = btn.dataset.slug;
+    if (!slug) return;
+    const card = btn.closest('.list-card');
+    const type = card ? card.dataset.listType : null;
+    const isAdded = isListAddedToConfig(null, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 3. See All / List Details page add button
+  const detailAddBtn = document.getElementById('detailAddBtn');
+  if (detailAddBtn && window._currentListDetailsParams) {
+    const { listUrl, type } = window._currentListDetailsParams;
+    const isAdded = isListAddedToConfig(listUrl, type);
+    detailAddBtn.classList.toggle('is-added', isAdded);
+    detailAddBtn.classList.toggle('secondary', isAdded);
+    detailAddBtn.classList.toggle('primary', !isAdded);
+    detailAddBtn.textContent = isAdded ? 'Remove' : '+ Add';
+    detailAddBtn.style.color = isAdded ? 'var(--danger)' : '';
+  }
+
+  // 4. Curated list add buttons
+  document.querySelectorAll('.curated-add-btn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const slug = btn.dataset.slug;
+    const isAdded = isListAddedToConfig(url, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 5. Search result list add buttons
+  document.querySelectorAll('.list-search-add-btn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const isAdded = isListAddedToConfig(url, type);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+}
+
 
 function navigateBackFromDetail() {
   const currentTab = document.querySelector('.tab-panel:not([hidden])')?.dataset?.tabPanel;
@@ -580,7 +700,8 @@ function switchListsSubmenu(name, btn) {
       runMyMdblistLists();
     }
     const traktBox = document.getElementById('myTraktListsResult');
-    const hasTraktContent = traktBox && traktBox.children.length > 0;
+    const privateTraktBox = document.getElementById('myPrivateTraktListsResult');
+    const hasTraktContent = (traktBox && traktBox.children.length > 0) || (privateTraktBox && privateTraktBox.children.length > 0);
     if (!hasTraktContent && typeof runMyTraktLists === 'function') {
       runMyTraktLists();
     }
@@ -634,13 +755,204 @@ function switchSettingsSubmenu(name, btn) {
   if (name === 'external' && typeof populateImportTargetLists === 'function') {
     populateImportTargetLists();
   }
+  if (name === 'feedback' && typeof loadUserFeedbackThreads === 'function') {
+    loadUserFeedbackThreads();
+  }
 }
 
-// Sends a Settings > Feedback submission to the server -- deliberately
-// works with or without a Creator Profile (attaches the username if
-// signed in, purely informational, not required) since anyone should be
-// able to report a bug or suggest something without needing an account
-// first.
+// --- Two-Way Support & Feedback Chat Controller ------------------------------
+let userFeedbackThreads = [];
+let activeFeedbackThreadId = null;
+let isComposingNewFeedback = false;
+
+function getUserFeedbackThreadIds() {
+  try {
+    const raw = localStorage.getItem('myListAddon:feedbackThreadIds');
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveUserFeedbackThreadId(threadId) {
+  if (!threadId) return;
+  try {
+    const ids = getUserFeedbackThreadIds();
+    if (!ids.includes(threadId)) {
+      ids.unshift(threadId);
+      localStorage.setItem('myListAddon:feedbackThreadIds', JSON.stringify(ids.slice(0, 30)));
+    }
+  } catch (e) {}
+}
+
+async function loadUserFeedbackThreads() {
+  const threadIds = getUserFeedbackThreadIds();
+  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback/threads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadIds: threadIds,
+        creatorName: creatorName,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && Array.isArray(data.threads)) {
+      userFeedbackThreads = data.threads;
+      data.threads.forEach((t) => saveUserFeedbackThreadId(t.id));
+      if (!activeFeedbackThreadId && userFeedbackThreads.length) {
+        activeFeedbackThreadId = userFeedbackThreads[0].id;
+      }
+    }
+  } catch (e) {}
+
+  renderUserFeedbackThreadsUI();
+}
+
+function refreshUserFeedbackThreads() {
+  const statusEl = document.getElementById('supportChatStatus');
+  if (statusEl) statusEl.textContent = 'Refreshing\u2026';
+  loadUserFeedbackThreads().then(() => {
+    if (statusEl) {
+      statusEl.textContent = 'Up to date';
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
+    }
+  });
+}
+
+function toggleNewFeedbackForm(showNew) {
+  isComposingNewFeedback = !!showNew;
+  renderUserFeedbackThreadsUI();
+  if (showNew) {
+    const msgInput = document.getElementById('feedbackMessageInput');
+    if (msgInput) { msgInput.focus(); }
+  }
+}
+
+function selectFeedbackThread(threadId) {
+  activeFeedbackThreadId = threadId;
+  isComposingNewFeedback = false;
+  renderUserFeedbackThreadsUI();
+}
+
+function renderUserFeedbackThreadsUI() {
+  const bar = document.getElementById('supportThreadsBar');
+  const chatView = document.getElementById('supportChatView');
+  const formWrap = document.getElementById('newFeedbackFormWrap');
+  const cancelBtn = document.getElementById('feedbackCancelNewBtn');
+  const newTicketBtn = document.getElementById('btnNewFeedbackTicket');
+
+  if (!userFeedbackThreads.length) {
+    if (bar) bar.style.display = 'none';
+    if (chatView) chatView.style.display = 'none';
+    if (formWrap) formWrap.style.display = 'block';
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (newTicketBtn) newTicketBtn.style.display = 'none';
+    return;
+  }
+
+  if (newTicketBtn) newTicketBtn.style.display = 'inline-flex';
+
+  if (bar) {
+    bar.style.display = 'flex';
+    bar.innerHTML = userFeedbackThreads.map((t) => {
+      const isActive = t.id === activeFeedbackThreadId && !isComposingNewFeedback;
+      const catLabel = t.category ? (t.category.charAt(0).toUpperCase() + t.category.slice(1)) : 'Support';
+      const hasAdminReply = Array.isArray(t.messages) && t.messages.some((m) => m.sender === 'admin');
+      const badge = hasAdminReply ? ' \uD83D\uDCAC' : '';
+      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeAttr(t.id) + '&quot;)">' +
+        escapeHtml(catLabel) + badge +
+      '</button>';
+    }).join('');
+  }
+
+  if (isComposingNewFeedback) {
+    if (chatView) chatView.style.display = 'none';
+    if (formWrap) formWrap.style.display = 'block';
+    if (cancelBtn) cancelBtn.style.display = 'inline-flex';
+    return;
+  }
+
+  if (formWrap) formWrap.style.display = 'none';
+  if (chatView) chatView.style.display = 'block';
+
+  const activeThread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId) || userFeedbackThreads[0];
+  if (!activeThread) return;
+  activeFeedbackThreadId = activeThread.id;
+
+  const stream = document.getElementById('supportMessagesStream');
+  if (stream) {
+    const messages = Array.isArray(activeThread.messages) && activeThread.messages.length
+      ? activeThread.messages
+      : [{
+          id: 'msg_init',
+          sender: 'user',
+          senderName: activeThread.creatorName || 'You',
+          text: activeThread.message || '(Initial message)',
+          timestamp: activeThread.createdAt || Date.now(),
+        }];
+
+    stream.innerHTML = messages.map((m) => {
+      const isAdmin = m.sender === 'admin';
+      const senderLabel = isAdmin ? '\uD83D\uDC68\u200D\uD83D\uDCBB Developer' : (m.senderName || 'You');
+      const timeStr = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+      return '<div class="support-bubble ' + (isAdmin ? 'admin' : 'user') + '">' +
+        '<div class="support-bubble-sender">' + escapeHtml(senderLabel) + '</div>' +
+        '<div>' + escapeHtml(m.text || '') + '</div>' +
+        (timeStr ? '<div class="support-bubble-time">' + escapeHtml(timeStr) + '</div>' : '') +
+      '</div>';
+    }).join('');
+
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+async function sendUserFeedbackReply() {
+  if (!activeFeedbackThreadId) return;
+  const input = document.getElementById('supportReplyInput');
+  const btn = document.getElementById('supportReplySendBtn');
+  const statusEl = document.getElementById('supportChatStatus');
+  const text = (input ? input.value : '').trim();
+  if (!text) return;
+
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Sending reply\u2026';
+
+  const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
+  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId: activeFeedbackThreadId,
+        message: text,
+        creatorName: creatorName,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && data.entry) {
+      if (input) input.value = '';
+      if (statusEl) statusEl.textContent = '';
+      const idx = userFeedbackThreads.findIndex((t) => t.id === activeFeedbackThreadId);
+      if (idx !== -1) {
+        userFeedbackThreads[idx] = data.entry;
+      } else {
+        userFeedbackThreads.unshift(data.entry);
+      }
+      renderUserFeedbackThreadsUI();
+    } else {
+      if (statusEl) statusEl.textContent = (data && data.error) || 'Failed to send reply.';
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'Connection error.';
+  }
+  if (btn) btn.disabled = false;
+}
+
 async function submitFeedback() {
   const btn = document.getElementById('feedbackSubmitBtn');
   const statusEl = document.getElementById('feedbackStatus');
@@ -665,10 +977,18 @@ async function submitFeedback() {
       }),
     });
     const data = await res.json().catch(() => null);
-    if (data && data.ok) {
-      if (statusEl) { statusEl.textContent = 'Thanks \u2014 sent.'; statusEl.style.color = 'var(--accent)'; }
+    if (data && data.ok && data.entry) {
+      if (statusEl) { statusEl.textContent = 'Message sent! Connecting to chat\u2026'; statusEl.style.color = 'var(--accent)'; }
       document.getElementById('feedbackMessageInput').value = '';
       document.getElementById('feedbackContactInput').value = '';
+      saveUserFeedbackThreadId(data.entry.id);
+      userFeedbackThreads.unshift(data.entry);
+      activeFeedbackThreadId = data.entry.id;
+      isComposingNewFeedback = false;
+      setTimeout(() => {
+        if (statusEl) statusEl.textContent = '';
+        renderUserFeedbackThreadsUI();
+      }, 600);
     } else {
       if (statusEl) { statusEl.textContent = (data && data.error) || 'Could not send \u2014 try again in a moment.'; statusEl.style.color = 'var(--danger)'; }
     }
@@ -799,10 +1119,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
 
   if (type !== 'gems' && type !== 'kids' && type !== 'holidays' && type !== 'genres' && type !== 'curated') {
     if (type === 'movie' || type === 'all') {
-      pushSingle('New Movies', 'tmdb:chart:new_movies', 'movie', 'TMDB');
+      pushSingle('New Releases', 'tmdb:chart:new_movies', 'movie', 'TMDB');
     }
     if (type === 'series' || type === 'all') {
-      pushSingle('New Shows', 'tmdb:chart:new_shows', 'series', 'TMDB');
+      pushSingle('New Releases', 'tmdb:chart:new_shows', 'series', 'TMDB');
     }
     if (window._CHARTS_TMDB) {
       window._CHARTS_TMDB.forEach(function(p) {
@@ -1255,6 +1575,10 @@ function submitAddShelfModal() {
 
 function addRow(name, url, type, enabled, group, channelId) {
   if (enabled === undefined) enabled = true;
+  const isCuratedRec = String(url || '').startsWith('custom:curated:recommended');
+  if (isCuratedRec && (name === 'Recommended Movies' || name === 'Recommended Shows' || !name || name === 'Curated List')) {
+    name = 'Recommended';
+  }
   const container = document.getElementById('lists');
   const div = document.createElement('div');
   div.className = 'entry';

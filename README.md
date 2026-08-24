@@ -61,18 +61,19 @@ There are no servers to manage, no external databases required, and no subscript
 ### Step 1 — Create the Cloudflare Worker
 
 1. Log into your [Cloudflare Dashboard](https://dash.cloudflare.com).
-2. In the sidebar, navigate to **Workers & Pages**.
-3. Click **Create** &rarr; **Create Worker**.
-4. Name your worker (e.g. `my-lists`) and click **Deploy**.
+2. In the sidebar, navigate to **Compute** &rarr; **Workers & Pages**.
+3. Click **Create application**.
+4. Select **Start with Hello World!** and click **Deploy**. (This creates the worker instance).
+
+---
 
 ### Step 2 — Deploy the Add-on Code
 
-1. On your Worker's overview page, click **Edit code** (Quick Edit).
-2. Delete the default template code.
-3. Copy the entire contents of [`worker_entry_combined.js`](file:///c:/Users/James/Downloads/My%20Lists%20Addon/My%20Lists%20Addon%20Beta/worker_entry_combined.js) and paste it into the editor.
-4. Click **Deploy** (or **Save and Deploy**).
-
-> **Note**: Your add-on is now immediately operational at `https://your-worker-name.your-subdomain.workers.dev`!
+1. On your Worker's page, click **Edit code**.
+2. Erase any existing template code in the editor.
+3. Copy the entire contents of [`worker_entry_combined.js`] and paste it into the editor.
+4. Click **Deploy**.
+5. Your add-on is now immediately accessible at `https://your-worker-name.your-subdomain.workers.dev`!
 
 ---
 
@@ -80,13 +81,15 @@ There are no servers to manage, no external databases required, and no subscript
 
 KV storage is required for Creator Profiles (cloud sync), short install links, Custom Lists, Channels, Admin analytics, and Feedback storage:
 
-1. In Cloudflare Dashboard, go to **Storage & Databases** &rarr; **KV**.
-2. Click **Create namespace** and name it (e.g., `my-lists-kv`).
-3. Return to your Worker &rarr; **Settings** &rarr; **Variables and Bindings**.
-4. Under **KV Namespace Bindings**, click **Add binding**:
-   - **Variable name**: `CONFIGS` *(must match exactly)*
-   - **KV namespace**: Select the namespace created in step 2.
-5. Click **Save and deploy**.
+1. In Cloudflare Dashboard sidebar, go to **Storage & Databases** &rarr; **Workers KV**.
+2. Click **Create Instance** (or **Create Namespace**).
+3. Set **Namespace name** to: `my-lists-kv` and save.
+4. Return to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
+5. Navigate to **Bindings**  and click **+ Binding**.
+6. Choose **KV namespace** &rarr; click **Add Binding**:
+   - **Variable name**: `CONFIGS` *(must match exactly in all caps)*
+   - **KV namespace**: Select the `my-lists-kv` namespace created in step 2.
+7. Click **Save** / **Deploy**.
 
 ---
 
@@ -94,7 +97,8 @@ KV storage is required for Creator Profiles (cloud sync), short install links, C
 
 The add-on works out-of-the-box with public MDBList and TMDB links. Adding API keys unlocks external accounts, private lists, and richer metadata.
 
-Add these under **Settings** &rarr; **Variables and Bindings** &rarr; **Add** &rarr; **Secret** (or Text):
+1. In Cloudflare Dashboard, go to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
+2. Click **Settings** (Variables and Secrets) &rarr; click **+ Add variable** (or **Add Secret**).
 
 | Variable / Secret | Description & Feature Unlocked | Source / Where to obtain |
 |---|---|---|
@@ -119,7 +123,7 @@ If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set th
 ### Step 5 — (Optional) Configure Admin Dashboard
 
 To access the `/admin` telemetry and management console:
-1. Under Worker **Settings** &rarr; **Variables and Bindings** &rarr; **Add** &rarr; **Secret**, create:
+1. Go to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker &rarr; **Settings** &rarr; **+ Add variable**, create:
    - **Variable name**: `ADMIN_KEY`
    - **Value**: A secure password/passphrase of your choice.
 2. Visit `https://your-worker-name.your-subdomain.workers.dev/admin` to log in.
@@ -129,10 +133,11 @@ To access the `/admin` telemetry and management console:
 ### Step 6 — (Optional) Set Up Continue Watching Cron Trigger
 
 To automatically check for newly-aired episodes every 6 hours for users with a Creator Profile:
-1. In your Worker dashboard, navigate to **Triggers** &rarr; **Cron Triggers**.
-2. Click **Add Cron Trigger**.
-3. Set the cron expression to: `0 */6 * * *` (every 6 hours).
-4. Click **Save**.
+1. In Cloudflare Dashboard, go to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
+2. Go to **Settings**, scroll down to **Trigger events** (or **Triggers** &rarr; **Cron Triggers**).
+3. Click **Add Trigger** (or **Add Cron Trigger**).
+4. Set the cron expression to: `0 */6 * * *` (every 6 hours).
+5. Click **Save** / **Deploy**.
 
 ---
 
@@ -227,6 +232,17 @@ When editing any individual split file (`00_` through `26_`), run the PowerShell
 - **"Cannot save lists / Creator Profiles not working"**: Ensure the KV Namespace binding is named exactly `CONFIGS`.
 - **"Admin dashboard authentication failed"**: Ensure `ADMIN_KEY` is configured as a Secret and KV storage is bound.
 - **"Continue Watching not updating with new episodes"**: Verify that the Cron Trigger (`0 */6 * * *`) is configured under Worker Triggers and `TMDB_API_KEY` is set. Note that cron updates apply to users with Creator Profiles.
+
+---
+
+## ☕ Support This Project
+
+This add-on is free and always will be — you're running it entirely on your own Cloudflare account, so there's no subscription and never will be. If it's been useful to you and you'd like to support ongoing development, you can do so here:
+
+- **Buy Me A Coffee**: **[buymeacoffee.com/brock25](https://buymeacoffee.com/brock25)**
+- **TorBox Debrid (Referral)**: **[torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1](https://torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1)**
+
+Entirely optional — this doesn't unlock anything or change how the add-on works. It's just an option for anyone who wants to say thanks or use a recommended debrid provider.
 
 ---
 

@@ -8,7 +8,8 @@
 function exportConfigJson() {
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const keys = collectKeys();
@@ -30,14 +31,16 @@ function exportConfigJson() {
 function importConfigJson() {
   const raw = document.getElementById('configJsonBox').value.trim();
   if (!raw) {
-    alert('Paste a config JSON blob into the box first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Input Required', 'Paste a config JSON blob into the box first.', false);
+    else alert('Paste a config JSON blob into the box first.');
     return;
   }
   let data;
   try {
     data = JSON.parse(raw);
   } catch (e) {
-    alert('That is not valid JSON.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid JSON', 'That is not valid JSON.', false);
+    else alert('That is not valid JSON.');
     return;
   }
   applyImportedConfig(data);
@@ -48,7 +51,8 @@ function importConfigJson() {
 // for the raw JSON.
 function applyImportedConfig(data) {
   if (!data || !Array.isArray(data.entries)) {
-    alert('That JSON does not look like a My Lists config -- expected an "entries" array.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid Config', 'That JSON does not look like a My Lists config -- expected an "entries" array.', false);
+    else alert('That JSON does not look like a My Lists config -- expected an "entries" array.');
     return;
   }
   document.getElementById('lists').innerHTML = '';
@@ -96,7 +100,8 @@ function applyImportedConfig(data) {
   scheduleMyMdblistListsRefresh();
   scheduleMyTraktListsRefresh();
   if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
-  alert('Imported ' + data.entries.length + ' list(s).');
+  if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s).', true);
+  else alert('Imported ' + data.entries.length + ' list(s).');
 }
 
 // --- import from an existing link -------------------------------------------
@@ -112,7 +117,8 @@ function applyImportedConfig(data) {
 async function importFromLink() {
   const raw = document.getElementById('importLinkInput').value.trim();
   if (!raw) {
-    alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Link Required', 'Paste an install link, configure link, or stremio:// / wako:// link first.', false);
+    else alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
     return;
   }
   const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
@@ -124,14 +130,16 @@ async function importFromLink() {
     config = cleaned; // looks like a bare config id/token, pasted on its own
   }
   if (!config) {
-    alert('Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid Link', 'Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.', false);
+    else alert('Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.');
     return;
   }
   try {
     const res = await fetch(ORIGIN + '/api/resolve?config=' + encodeURIComponent(config));
     const data = await res.json();
     if (!data.ok) {
-      alert('Could not load that link: ' + (data.error || 'unknown error'));
+      if (typeof showAppAlert === 'function') showAppAlert('Link Error', 'Could not load that link: ' + (data.error || 'unknown error'), false);
+      else alert('Could not load that link: ' + (data.error || 'unknown error'));
       return;
     }
     data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
@@ -151,9 +159,11 @@ async function importFromLink() {
     saveState();
     renderChannelMergeList();
     document.getElementById('importLinkInput').value = '';
-    alert('Imported ' + data.entries.length + ' list(s) from that link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s) from that link.', true);
+    else alert('Imported ' + data.entries.length + ' list(s) from that link.');
   } catch (e) {
-    alert('Network error while resolving that link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Network Error', 'Network error while resolving that link.', false);
+    else alert('Network error while resolving that link.');
   }
 }
 
@@ -258,12 +268,14 @@ async function saveCurrentAsPreset() {
   const nameInput = document.getElementById('presetNameInput');
   const name = nameInput.value.trim();
   if (!name) {
-    alert('Name this preset first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Preset Name Required', 'Name this preset first.', false);
+    else alert('Name this preset first.');
     return;
   }
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const map = loadPresetsMap();
@@ -280,13 +292,16 @@ async function saveCurrentAsPreset() {
     // that limit (see the size guard on /api/creator/sync/save-presets).
     const pushResult = activeCreator ? await pushPresetsDirectly(map) : { ok: false, error: null };
     if (!pushResult.ok) {
-      alert(
-        activeCreator
-          ? (pushResult.error
-              ? 'Could not save this preset to your account: ' + pushResult.error
-              : 'Could not save this preset to your account either \u2014 check your connection and try again. If this keeps happening, check the browser console (F12) for more detail.')
-          : 'Could not save this preset \u2014 your browser\\'s local storage is full. This usually happens when a TV Channel with a lot of episodes is included, since each preset stores a full copy of everything in it. Try removing a large Channel from this preset, deleting an older preset you no longer need, using Backup/Restore\\'s "Download as file" option instead (which isn\\'t limited the same way), or creating a free account so this can be saved there instead of just this browser.'
-      );
+      const errMsg = activeCreator
+        ? (pushResult.error
+            ? "Could not save this preset to your account: " + pushResult.error
+            : "Could not save this preset to your account either — check your connection and try again. If this keeps happening, check the browser console (F12) for more detail.")
+        : "Could not save this preset — your browser's local storage is full. This usually happens when a TV Channel with a lot of episodes is included, since each preset stores a full copy of everything in it. Try removing a large Channel from this preset, deleting an older preset you no longer need, using Backup/Restore's 'Download as file' option instead (which isn't limited the same way), or creating a free account so this can be saved there instead of just this browser.";
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Preset Save Error', errMsg, false);
+      } else {
+        alert(errMsg);
+      }
       return;
     }
   }
@@ -350,9 +365,13 @@ function sharePreset(name) {
   if (!preset) return;
   const jsonStr = JSON.stringify({ entries: preset.entries }, null, 2);
   navigator.clipboard.writeText(jsonStr).then(() => {
-    alert('"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Preset Copied', '"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.', true);
+    } else {
+      alert('"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.');
+    }
   }).catch(() => {
-    prompt('Copy this preset\\'s JSON:', jsonStr);
+    prompt("Copy this preset's JSON:", jsonStr);
   });
 }
 
@@ -410,7 +429,8 @@ function readJsonFile(input, onParsed) {
     try {
       data = JSON.parse(reader.result);
     } catch (e) {
-      alert('That file is not valid JSON.');
+      if (typeof showAppAlert === 'function') showAppAlert('Invalid File', 'That file is not valid JSON.', false);
+      else alert('That file is not valid JSON.');
       input.value = '';
       return;
     }
@@ -418,7 +438,8 @@ function readJsonFile(input, onParsed) {
     input.value = '';
   };
   reader.onerror = () => {
-    alert('Could not read that file.');
+    if (typeof showAppAlert === 'function') showAppAlert('Read Error', 'Could not read that file.', false);
+    else alert('Could not read that file.');
     input.value = '';
   };
   reader.readAsText(file);
@@ -427,7 +448,8 @@ function readJsonFile(input, onParsed) {
 function downloadConfigJson() {
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const keys = collectKeys();
@@ -460,7 +482,8 @@ function downloadPreset(name) {
 function uploadPresetFile(input) {
   readJsonFile(input, (data, file) => {
     if (!data || !Array.isArray(data.entries)) {
-      alert('That file does not look like a preset -- expected an "entries" array.');
+      if (typeof showAppAlert === 'function') showAppAlert('Invalid Preset', 'That file does not look like a preset -- expected an "entries" array.', false);
+      else alert('That file does not look like a preset -- expected an "entries" array.');
       return;
     }
     const suggested = (file.name || 'Preset').replace(/\.json$/i, '');
@@ -542,7 +565,8 @@ function exportDataToCsv(target, format) {
     const historyList = map['watch-history'];
     const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
     if (!items.length) {
-      alert('Your Watch History is currently empty.');
+      if (typeof showAppAlert === 'function') showAppAlert('Empty Watch History', 'Your Watch History is currently empty.', false);
+      else alert('Your Watch History is currently empty.');
       return;
     }
 
@@ -621,7 +645,8 @@ function exportDataToCsv(target, format) {
       }
     });
     if (totalItems === 0) {
-      alert('You do not have any saved list items to export.');
+      if (typeof showAppAlert === 'function') showAppAlert('No Saved Lists', 'You do not have any saved list items to export.', false);
+      else alert('You do not have any saved list items to export.');
       return;
     }
   }
@@ -672,6 +697,7 @@ function saveState() {
     // localStorage unavailable (private browsing, disabled, etc.) — fine,
     // just means refreshes won't be remembered.
   }
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
   scheduleCreatorSyncSave();
 }
 
@@ -694,9 +720,31 @@ function loadSavedState() {
 
 function copyLink(url) {
   navigator.clipboard.writeText(url).then(() => {
-    const btn = document.getElementById('copyBtn');
-    if (btn) { const old = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = old, 1500); }
-  }).catch(() => alert(url));
+    const urlBtn = document.getElementById('copyUrlBtn');
+    if (urlBtn) {
+      const oldUrlHtml = urlBtn.innerHTML;
+      urlBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span>Copied!</span>';
+      urlBtn.style.background = 'var(--success)';
+      urlBtn.style.color = '#ffffff';
+      urlBtn.style.borderColor = 'var(--success)';
+      setTimeout(() => {
+        urlBtn.innerHTML = oldUrlHtml;
+        urlBtn.style.background = '';
+        urlBtn.style.color = '';
+        urlBtn.style.borderColor = '';
+      }, 1800);
+    }
+  }).catch(() => {
+    const display = document.getElementById('manifestLinkDisplay');
+    if (window.getSelection && display) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(display);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    alert('Manifest URL: ' + url);
+  });
 }
 
 function openInNuvio(installUrl, e) {
@@ -712,7 +760,7 @@ async function generate() {
 
   const box = document.getElementById('result');
   box.style.display = 'block';
-  box.innerHTML = '<p><small>Generating link\u2026</small></p>';
+  box.innerHTML = '<div class="install-result-card" style="align-items:center; justify-content:center; padding:24px; color:var(--muted);"><span class="spinner" style="display:inline-block; width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; margin-right:8px; vertical-align:middle;"></span> Generating install link\u2026</div>';
 
   // Prefer a short, KV-backed id (see /api/save) so the install URL stays a
   // fixed short length no matter how many lists are configured. If this
@@ -743,13 +791,11 @@ async function generate() {
     // episodes can make the encoded config huge even with just one or two
     // rows total, so this checks the actual encoded length instead.
     if (config.length > 4000) {
-      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
     }
   }
 
   const installUrl = ORIGIN + '/' + config + '/manifest.json';
-  const stremioUrl = 'stremio://' + installUrl.replace(/^https?:\\/\\//, '');
-  const nuvioUrl = 'nuvio://' + installUrl.replace(/^https?:\\/\\//, '');
   // A group breakdown alongside the plain install-count beacon -- each
   // row's own .group ("MDBList Charts", "Custom Lists", "Channels", etc.)
   // is already a meaningful "what kind of source is this" label, no need
@@ -770,14 +816,43 @@ async function generate() {
   }).catch(() => {});
 
   box.innerHTML = \`
-    \${sizeWarning}
-    <a class="installlink" href="\${installUrl}" id="manifestLink">\${installUrl}</a>
-    <div class="actions">
-      <button class="btn-copy secondary" id="copyBtn" onclick="copyLink('\${installUrl}')">Copy link</button>
-      <a class="btn-stremio" href="\${stremioUrl}">Open in Stremio</a>
-      <a class="btn-nuvio" href="\${nuvioUrl}" onclick="openInNuvio('\${installUrl}', event)">Open in Nuvio</a>
-    </div>
-    <p class="hint"><small>If "Open in Nuvio" doesn't automatically open on your device, the manifest link was copied &mdash; paste it in Nuvio &rarr; Settings &gt; Content & Discovery &gt; Addons.</small></p>\`;
+    <div class="install-result-card">
+      <div class="install-result-header">
+        <div class="install-result-badge">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          <span>Add-on Ready to Install</span>
+        </div>
+        <span class="install-result-sub">\${entries.length} catalog\${entries.length === 1 ? '' : 's'} configured</span>
+      </div>
+
+      \${sizeWarning}
+
+      <div class="install-url-container">
+        <div class="install-url-header">
+          <div class="install-url-label">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+            <span>Manifest Link</span>
+          </div>
+          <button type="button" class="install-url-copy-btn" id="copyUrlBtn" onclick="copyLink('\${installUrl}')" title="Copy manifest link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <span>Copy Link</span>
+          </button>
+        </div>
+        <div class="install-url-box" id="manifestLinkDisplay" onclick="copyLink('\${installUrl}')" title="Click to copy">\${installUrl}</div>
+      </div>
+
+      <div class="install-hint-box">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0; margin-top:2px;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+        <div>
+          <span>To install this add-on, copy the manifest link above and paste it into:</span>
+          <div class="install-hint-steps">
+            <span>&bull; <strong>Stremio</strong> &rarr; Addons &rarr; Community &rarr; Paste URL</span>
+            <span>&bull; <strong>Nuvio</strong> &rarr; Settings &rarr; Content &amp; Discovery &rarr; Addons</span>
+            <span>&bull; <strong>Wako</strong> &rarr; Settings &rarr; Add-ons &rarr; Install from URL</span>
+          </div>
+        </div>
+      </div>
+    </div>\`;
   // The mobile sticky CTA bar can be tapped from anywhere on a long page of
   // rows, so bring the result into view rather than leaving it rendered
   // off-screen above the fold the person's currently scrolled past.
@@ -811,36 +886,46 @@ if (serverEntries.length) {
   if (saved && document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
   }
-  if (saved && saved.keys && saved.keys.mdblistKey) {
+  const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+
+  if (!mdblistDisc && saved && saved.keys && saved.keys.mdblistKey) {
     const el = document.getElementById('mdblistKeyInput');
     if (el) el.value = saved.keys.mdblistKey;
   }
-  if (saved && saved.keys && saved.keys.mdblistAccessToken) {
+  if (!mdblistDisc && saved && saved.keys && saved.keys.mdblistAccessToken) {
     mdblistAccessToken = saved.keys.mdblistAccessToken;
   }
-  if (saved && saved.keys && saved.keys.traktKey) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktKey) {
     const el = document.getElementById('traktKeyInput');
     if (el) el.value = saved.keys.traktKey;
   }
-  if (saved && saved.keys && saved.keys.traktUsername) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktUsername) {
     const el = document.getElementById('traktUsernameInput');
     if (el) el.value = saved.keys.traktUsername;
   }
-  if (saved && saved.keys && saved.keys.traktAccessToken) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktAccessToken) {
     traktAccessToken = saved.keys.traktAccessToken;
   }
-  if (saved && saved.keys && saved.keys.simklKey) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklKey) {
     const el = document.getElementById('simklKeyInput');
     if (el) el.value = saved.keys.simklKey;
   }
-  if (saved && saved.keys && saved.keys.simklAccessToken) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklAccessToken) {
     simklAccessToken = saved.keys.simklAccessToken;
   }
-  if (saved && saved.keys && saved.keys.simklUsername) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklUsername) {
     simklUsername = saved.keys.simklUsername;
   }
 }
-if (!mdblistAccessToken) {
+if (localStorage.getItem('myListAddon:mdblistDisconnected') === 'true') {
+  mdblistAccessToken = '';
+  try { window.mdblistAccessToken = ''; } catch (e) {}
+  const el = document.getElementById('mdblistKeyInput');
+  if (el) el.value = '';
+} else if (!mdblistAccessToken) {
   const savedForMdblist = loadSavedState();
   if (savedForMdblist && savedForMdblist.keys && savedForMdblist.keys.mdblistAccessToken) {
     mdblistAccessToken = savedForMdblist.keys.mdblistAccessToken;
@@ -848,7 +933,16 @@ if (!mdblistAccessToken) {
     try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
 }
-if (!traktAccessToken) {
+
+if (localStorage.getItem('myListAddon:traktDisconnected') === 'true') {
+  traktAccessToken = '';
+  try { window.traktAccessToken = ''; } catch (e) {}
+  if (typeof activeTraktToken !== 'undefined') activeTraktToken = null;
+  const tk = document.getElementById('traktKeyInput');
+  if (tk) tk.value = '';
+  const tu = document.getElementById('traktUsernameInput');
+  if (tu) tu.value = '';
+} else if (!traktAccessToken) {
   const savedForTrakt = loadSavedState();
   if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
     traktAccessToken = savedForTrakt.keys.traktAccessToken;
@@ -856,13 +950,32 @@ if (!traktAccessToken) {
     try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
   }
 }
-if (!simklAccessToken) {
+
+if (localStorage.getItem('myListAddon:simklDisconnected') === 'true') {
+  simklAccessToken = '';
+  try { window.simklAccessToken = ''; } catch (e) {}
+  simklUsername = '';
+  try { window.simklUsername = ''; } catch (e) {}
+  const sk = document.getElementById('simklKeyInput');
+  if (sk) sk.value = '';
+} else if (!simklAccessToken) {
   const savedForSimkl = loadSavedState();
   if (savedForSimkl && savedForSimkl.keys && savedForSimkl.keys.simklAccessToken) {
     simklAccessToken = savedForSimkl.keys.simklAccessToken;
   } else {
     try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
+}
+
+if (localStorage.getItem('myListAddon:tmdbDisconnected') === 'true') {
+  tmdbSessionId = '';
+  try { window.tmdbSessionId = ''; } catch (e) {}
+  tmdbAccountId = '';
+  try { window.tmdbAccountId = ''; } catch (e) {}
+  tmdbUsername = '';
+  try { window.tmdbUsername = ''; } catch (e) {}
+  const tmk = document.getElementById('tmdbKeyInput');
+  if (tmk) tmk.value = '';
 }
 suppressSave = false;
 renumber();
@@ -968,11 +1081,11 @@ tryAutoRestoreCreatorProfile();
     return;
   }
   if (path.toLowerCase() === '/lists/new-movies') {
-    openListDetailsPage('New Movies', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
+    openListDetailsPage('New Releases', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
     return;
   }
   if (path.toLowerCase() === '/lists/new-shows') {
-    openListDetailsPage('New Shows', 'series', 'tmdb:chart:new_shows', null, { skipPushState: true });
+    openListDetailsPage('New Releases', 'series', 'tmdb:chart:new_shows', null, { skipPushState: true });
     return;
   }
   const tmdbCollMatch = path.match(new RegExp('^/lists/tmdb/collection/([0-9]+)(?:-([a-z0-9_-]+))?', 'i'));
@@ -1131,6 +1244,245 @@ window.addEventListener('popstate', (e) => {
 });
 </script>
 
+</body>
+</html>`;
+}
+
+// --- /guide -----------------------------------------------------------------
+//
+// A standalone content page, not the interactive builder -- see the GET
+// /guide route in 25_api-catalog-routes.js. Deliberately its own small,
+// self-contained template literal (own <head>, own lightweight stylesheet)
+// rather than reusing renderBuilder's ~2000-line app stylesheet, since
+// almost none of that (tab bars, drag-and-drop entry cards, live preview
+// grids...) applies to a static article page -- pulling it in would just
+// be dead weight on every /guide page load.
+//
+// Content-wise this exists to be the answer to the searches this add-on's
+// own users already had to go find third-party guide sites for --
+// "how do I turn an MDBList/Trakt/TMDB list into a Stremio catalog" --
+// written by the people who actually built the tool, plus the "why
+// self-host instead of a hosted list addon" pitch and a provider
+// comparison/FAQ. See seoHeadHtml's own comment in 09_page-shell.js for
+// why /:config/configure pages are the ones that get noindex'd, not this
+// one -- this page has no per-user config in its URL at all, so it's
+// exactly the kind of URL meant to be crawled and indexed.
+function renderGuidePage(origin) {
+  const title = `${ADDON_NAME} — How to Turn MDBList, Trakt, TMDB & Simkl Lists Into Stremio Catalogs`;
+  const description =
+    "Step-by-step guide to turning any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row -- plus why self-hosting on your own free Cloudflare account beats a hosted list addon, a provider comparison, and answers to common questions.";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F2F2F7">
+<title>${title}</title>
+<meta name="description" content="${description}">
+<link rel="canonical" href="${origin}/guide">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${description}">
+<meta property="og:url" content="${origin}/guide">
+<meta property="og:image" content="${origin}/icon.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${description}">
+<link rel="icon" type="image/png" href="${origin}/icon.png">
+<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: [
+      {
+        "@type": "Question",
+        name: "Is this add-on free?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier -- optional support is available via Buy Me a Coffee, but nothing is gated behind it.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Do I need to create an account to use it?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Do I need API keys from MDBList, Trakt, TMDB, or Simkl?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "Not for public lists. Public mdblist.com list URLs work with no key at all. Trakt and TMDB require a key on every request even for public data, but the deployment already includes a shared key for that. You only need your own personal key for private lists, personal watchlists, or higher usage.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "What's the difference between self-hosting this and using a hosted list addon?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "A hosted addon runs on someone else's server, under someone else's account, subject to someone else's uptime and rate limits. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, nothing runs unless you deployed it, and there's no third party in the middle of your Stremio catalog.",
+        },
+      },
+    ],
+  })}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F2F2F7; --surface: #FFFFFF; --text: #1C1C1E; --text-2: #3A3A3C;
+    --muted: #8E8E93; --accent: #007AFF; --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.13); --radius: 14px; --radius-sm: 10px;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
+  a { color: var(--accent); }
+  .top-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  .top-nav .brand { font-weight: 800; font-size: 1.1rem; color: var(--text); text-decoration: none; }
+  .top-nav .back-link { font-size: 0.9rem; font-weight: 600; text-decoration: none; }
+  h1 {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-size: 2rem; font-weight: 700; letter-spacing: -0.02em;
+    margin: 0 0 10px; line-height: 1.2;
+  }
+  .lede { color: var(--text-2); font-size: 1.05rem; margin: 0 0 28px; }
+  h2 {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-size: 1.35rem; font-weight: 700; margin: 40px 0 12px; letter-spacing: -0.01em;
+  }
+  h3 { font-size: 1.05rem; font-weight: 700; margin: 22px 0 6px; }
+  p { color: var(--text-2); margin: 0 0 14px; }
+  code {
+    background: rgba(0,0,0,0.05); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; font-size: 0.88em;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px; margin: 14px 0;
+    box-shadow: var(--shadow-sm);
+  }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  ol, ul { color: var(--text-2); padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 32px; }
+  .toc a {
+    font-size: 0.85rem; font-weight: 600; text-decoration: none;
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 999px; padding: 6px 13px; color: var(--text-2);
+  }
+  .cta {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 14px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 22px; margin: 36px 0 8px;
+  }
+  .cta-btn {
+    background: var(--accent); color: #fff; text-decoration: none;
+    font-weight: 700; font-size: 0.95rem; padding: 11px 22px;
+    border-radius: 999px; white-space: nowrap;
+  }
+  .faq-q { font-weight: 700; margin: 18px 0 4px; }
+  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
+  :root.dark-theme, .dark-theme {
+    --bg: #000; --surface: #1C1C1E; --text: #FFF; --text-2: #EBEBF5;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+  }
+</style>
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
+</head>
+<body>
+<div class="wrap">
+  <div class="top-nav">
+    <a class="brand" href="${origin}/">${ADDON_NAME}</a>
+    <a class="back-link" href="${origin}/">&larr; Back to the builder</a>
+  </div>
+
+  <h1>How to Turn MDBList, Trakt, TMDB &amp; Simkl Lists Into Stremio Catalogs</h1>
+  <p class="lede">A self-hosted way to get any list — public or your own — onto your Stremio or wako home screen as a real catalog row, running entirely on your own free Cloudflare account.</p>
+
+  <div class="toc">
+    <a href="#mdblist">MDBList</a>
+    <a href="#trakt">Trakt</a>
+    <a href="#tmdb">TMDB</a>
+    <a href="#simkl">Simkl</a>
+    <a href="#self-hosted">Why self-host</a>
+    <a href="#comparison">Which provider?</a>
+    <a href="#faq">FAQ</a>
+  </div>
+
+  <p>All four steps below start the same way: open <a href="${origin}/">${origin.replace("https://", "").replace("http://", "")}</a>, paste a list URL into the builder, and click install. What changes is where you get the URL from and what it unlocks.</p>
+
+  <h2 id="mdblist">MDBList lists</h2>
+  <p>Works with no API key at all for public lists. Go to <a href="https://mdblist.com" target="_blank" rel="noopener">mdblist.com</a>, open any public list (your own or someone else's), and copy its URL — it looks like <code>mdblist.com/lists/username/list-name</code>. Paste that straight into the builder and it becomes a catalog row.</p>
+  <p>Private MDBList lists and the "My Watchlist" quick-add need your own free MDBList API key, pasted into Settings once.</p>
+
+  <h2 id="trakt">Trakt lists</h2>
+  <p>Public Trakt lists work out of the box — no account needed. Copy a list URL in the form <code>trakt.tv/users/username/lists/list-slug</code> and paste it in. Trakt's own trending and popular charts are available as one-tap Quick Add shelves too.</p>
+  <p>To pull in your own private lists, liked lists, watchlist, or watch history, connect your Trakt account from Settings — this uses Trakt's own OAuth login, so your credentials never pass through anything but Trakt itself.</p>
+
+  <h2 id="tmdb">TMDB lists</h2>
+  <p>Paste any public <code>themoviedb.org/list/12345</code> URL to add it as a catalog. TMDB also powers this add-on's genre, network, streaming-provider, and keyword charts, plus episode/season data for Continue Watching.</p>
+
+  <h2 id="simkl">Simkl charts</h2>
+  <p>Simkl's trending charts (daily, weekly, monthly, across movies, TV, and anime) are available as one-tap Quick Add shelves. Connecting a Simkl account additionally unlocks importing your own lists and watch history.</p>
+
+  <h2 id="self-hosted">Why self-host instead of a hosted list addon?</h2>
+  <p>Most Stremio catalog add-ons in this space run as a hosted service — you're pointing your Stremio app at someone else's server, using someone else's account, subject to someone else's uptime, rate limits, and whatever happens to that service down the road.</p>
+  <p>This add-on is different: you deploy it to your own free Cloudflare Workers account in about five minutes, and from then on it's entirely yours. Your configuration lives in your install link or your own Cloudflare storage — never on a third party's server. Nothing runs unless you deployed it. There's no subscription because there's nothing to subscribe to; Cloudflare's free tier comfortably covers normal personal use.</p>
+  <p>The tradeoff is honest: self-hosting takes those five minutes of setup a hosted service skips. In exchange you get a catalog that's actually yours.</p>
+
+  <h2 id="comparison">MDBList vs. Trakt vs. TMDB vs. Simkl — which should I use?</h2>
+  <table>
+    <tr><th>Provider</th><th>Best for</th><th>Needs a key?</th></tr>
+    <tr><td><strong>MDBList</strong></td><td>Curated public lists, community charts, the simplest path with zero setup</td><td>No, for public lists</td></tr>
+    <tr><td><strong>Trakt</strong></td><td>Your own watch history, watchlist, and lists if you already use Trakt to track what you watch</td><td>Only for private/personal data</td></tr>
+    <tr><td><strong>TMDB</strong></td><td>Genre/network/streaming-provider charts, episode &amp; season metadata</td><td>No, for public lists and charts</td></tr>
+    <tr><td><strong>Simkl</strong></td><td>Trending charts, especially for anime</td><td>Only for personal data</td></tr>
+  </table>
+  <p>None of these are exclusive — most people mix all four on one home screen, since they're just different sources feeding into the same catalog builder.</p>
+
+  <h2 id="faq">Frequently asked questions</h2>
+  <div class="faq-q">Is this add-on free?</div>
+  <p>Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier.</p>
+  <div class="faq-q">Do I need to create an account to use it?</div>
+  <p>No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.</p>
+  <div class="faq-q">Do I need API keys from MDBList, Trakt, TMDB, or Simkl?</div>
+  <p>Not for public lists. You only need your own personal key for private lists, personal watchlists, or if you're doing enough browsing that you want your own dedicated rate limit instead of the shared one.</p>
+  <div class="faq-q">What's the difference between self-hosting this and using a hosted list addon?</div>
+  <p>A hosted addon runs on someone else's server under someone else's account. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, and there's no third party in the middle of your Stremio catalog.</p>
+
+  <div class="cta">
+    <div>
+      <strong>Ready to build your own catalog?</strong>
+      <div style="color:var(--muted); font-size:0.88rem; margin-top:2px;">Takes about five minutes, no account required.</div>
+    </div>
+    <a class="cta-btn" href="${origin}/">Open the builder &rarr;</a>
+  </div>
+
+  <footer>
+    ${ADDON_NAME} is free and open, self-hosted on Cloudflare Workers. <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener">Support the project</a>.
+  </footer>
+</div>
 </body>
 </html>`;
 }

@@ -138,7 +138,7 @@ function detectSource(input) {
   if (s.startsWith("simkl:user:")) return "simkl-user";
   if (s.startsWith("channel:v1:")) return "channel";
   if (s.startsWith("customlist:v1:")) return "custom-list";
-  if (s.startsWith("autotrack:")) return "autotrack";
+  if (s.startsWith("autotrack:") || s === "custom:watch-history" || s === "custom:continue-watching" || s === "custom:watchlist" || s.startsWith("custom:watch-history:") || s.startsWith("custom:continue-watching:")) return "autotrack";
   if (s.startsWith("custom:curated:") || s.startsWith("curated:")) return "curated";
   if (s.startsWith("tmdb:collection:") || /^https?:\/\/(?:www\.)?themoviedb\.org\/collection\//i.test(s)) return "tmdb-collection";
   if (parsePublishedListUrl(s)) return "published-list";

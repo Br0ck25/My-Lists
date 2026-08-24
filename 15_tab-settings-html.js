@@ -12,6 +12,14 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Watch History</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History.</p>
+      <div id="watchHistorySettingsSection">
+        <button type="button" class="secondary lc-btn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Watch History</button>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Auto-Track &amp; Media Server Scrobbling</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically scrobble and track watched movies and TV episodes across your streaming apps (Stremio, Nuvio, Wako, etc.) and home media servers (Plex, Jellyfin, Emby) into your personal Watch History and Continue Watching.</p>
       <div id="trackPlaybackSection"></div>
@@ -36,7 +44,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom TMDB API Key / Token</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free TMDB API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent-2);">themoviedb.org/settings/api</a>.</small></p>
           </div>
         </details>
@@ -46,10 +54,10 @@
       <div id="traktSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Trakt</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Trakt account to import your personal lists, watchlist, and collection, or use a custom Client ID.</p>
-        <div class="actions trakt-connect-actions" style="display:flex; flex-direction:row; width:100%; gap:8px; flex-wrap:nowrap; margin-bottom:10px;">
-          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect Trakt Account</button>
-          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect with PIN / Code</button>
-          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none; flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem;" onclick="disconnectTrakt()">Disconnect</button>
+        <div class="actions trakt-connect-actions">
+          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()">Connect Trakt Account</button>
+          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()">Connect with PIN / Code</button>
+          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none;" onclick="disconnectTrakt()">Disconnect</button>
         </div>
         <p id="traktConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
         <div id="traktSyncHistoryWrap" style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid var(--border);">
@@ -66,10 +74,10 @@
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
             <div class="row">
-              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <div class="row" style="margin-top:8px;">
-              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <p style="margin-top:4px;"><small>Create a free Trakt Client ID at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--accent-2);">trakt.tv/oauth/applications</a>.</small></p>
           </div>
@@ -98,7 +106,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
           </div>
         </details>
@@ -126,7 +134,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
@@ -191,34 +199,64 @@
   <!-- Submenu 3: Feedback & Support -->
   <div class="settings-subpanel" id="settingsSubFeedback" style="display:none;">
     <div class="panel">
-      <h2 class="panel-title">Send Feedback &amp; Support</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Found a bug, have an idea, or want to see something improved? This goes straight to the developer.</p>
-      <div class="row">
-        <select id="feedbackCategorySelect">
-          <option value="bug">Bug</option>
-          <option value="improvement">Improvement</option>
-          <option value="idea">Idea</option>
-          <option value="other">Other</option>
-        </select>
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+        <div>
+          <h2 class="panel-title" style="margin:0;">Support &amp; Developer Chat</h2>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.85rem;">Have a question, found a bug, or have a suggestion? Chat directly with the developer.</p>
+        </div>
+        <button type="button" class="secondary lc-btn" id="btnNewFeedbackTicket" onclick="toggleNewFeedbackForm(true)" style="padding:6px 14px; font-size:0.85rem;">+ New Message</button>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <textarea id="feedbackMessageInput" rows="5" style="width:100%;" placeholder="What's on your mind?"></textarea>
+
+      <!-- Active Threads Selector -->
+      <div id="supportThreadsBar" class="support-threads-bar" style="display:none; margin-bottom:12px;"></div>
+
+      <!-- Chat View -->
+      <div id="supportChatView" style="display:none;">
+        <div id="supportMessagesStream" class="support-messages-stream"></div>
+        <div class="support-reply-composer" style="margin-top:10px;">
+          <textarea id="supportReplyInput" placeholder="Type a reply to the developer..." onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendUserFeedbackReply();}"></textarea>
+          <button type="button" class="primary lc-btn" id="supportReplySendBtn" onclick="sendUserFeedbackReply()" style="min-height:44px; padding:0 20px;">Send</button>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+          <span id="supportChatStatus" style="font-size:0.8rem; color:var(--muted);"></span>
+          <button type="button" class="secondary lc-btn" onclick="refreshUserFeedbackThreads()" style="padding:2px 8px; font-size:0.75rem; border:none; background:none; color:var(--muted); cursor:pointer;">&#x21BB; Refresh</button>
+        </div>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" id="feedbackContactInput" placeholder="Contact info (optional) — email, Discord, etc., if you want a reply">
+
+      <!-- New Message / Initial Form -->
+      <div id="newFeedbackFormWrap">
+        <div class="row">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Category</label>
+          <select id="feedbackCategorySelect">
+            <option value="bug">Bug Report</option>
+            <option value="improvement">Improvement / Feature Request</option>
+            <option value="idea">Idea / Suggestion</option>
+            <option value="other">General Question / Other</option>
+          </select>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Message</label>
+          <textarea id="feedbackMessageInput" rows="4" style="width:100%;" placeholder="What would you like help with or what did you find?"></textarea>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Contact Info (optional)</label>
+          <input type="text" id="feedbackContactInput" placeholder="Email, Discord username, etc. (optional)">
+        </div>
+        <div class="actions" style="margin-top:10px; gap:8px; justify-content:flex-start;">
+          <button type="button" class="primary lc-btn" id="feedbackSubmitBtn" onclick="submitFeedback()">Send Message</button>
+          <button type="button" class="secondary lc-btn" id="feedbackCancelNewBtn" style="display:none;" onclick="toggleNewFeedbackForm(false)">Cancel</button>
+        </div>
+        <p id="feedbackStatus" style="margin-top:8px; font-size:0.85rem;"></p>
       </div>
-      <div class="actions" style="margin-top:10px;">
-        <button type="button" class="primary" id="feedbackSubmitBtn" onclick="submitFeedback()">Send feedback</button>
-      </div>
-      <p id="feedbackStatus" style="margin-top:8px;"></p>
     </div>
 
-    <!-- Buy Me a Coffee Support Section -->
+    <!-- Support & Recommended Debrid Section -->
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Support</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon.</p>
-      <div class="actions" style="flex-direction:row; width:auto;">
-        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">&#x2615; Buy me a coffee</a>
+      <h2 class="panel-title">Support &amp; Recommended Debrid</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon, or sign up for TorBox debrid using our referral link.</p>
+      <div class="actions" style="flex-direction:row; width:auto; gap:10px; flex-wrap:wrap;">
+        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Buy me a coffee</a>
+        <a href="https://torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1" target="_blank" rel="noopener" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill); border-color:rgba(0,122,255,0.4); color:#ffffff;">Try TorBox Debrid (Referral)</a>
       </div>
     </div>
   </div>

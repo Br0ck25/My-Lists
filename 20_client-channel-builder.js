@@ -165,6 +165,8 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, show
             thumbnail: ep.thumbnail || showBackdrop || showPoster,
             poster: showPoster || ep.thumbnail || showBackdrop || '',
             showPoster: showPoster || '',
+            backdrop: showBackdrop || '',
+            showBackdrop: showBackdrop || '',
           });
         });
       });
@@ -261,6 +263,8 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
       thumbnail: ep.thumbnail || showBackdrop || showPoster,
       poster: showPoster || ep.thumbnail || showBackdrop || '',
       showPoster: showPoster || '',
+      backdrop: showBackdrop || '',
+      showBackdrop: showBackdrop || '',
     });
   });
   if (!channelDraftBackdrop && showBackdrop) channelDraftBackdrop = showBackdrop;
@@ -488,6 +492,8 @@ function renderChannelDraftList() {
   if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
   if (!channelDraftItems.length) {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p>';
+    renderChannelPosterPicker();
+    renderChannelCrossoverSuggestions();
     return;
   }
   const cardsHtml = channelDraftItems.map((it, i) => {
@@ -547,6 +553,690 @@ function renderChannelDraftList() {
   
   box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
   initChannelHoldDrag();
+  renderChannelPosterPicker();
+  renderChannelCrossoverSuggestions();
+}
+
+function renderChannelPosterPicker() {
+  const section = document.getElementById('channelPosterPickerSection');
+  const grid = document.getElementById('channelPosterChoicesGrid');
+  if (!section || !grid) return;
+
+  if (!channelDraftItems.length) {
+    section.style.display = 'none';
+    grid.innerHTML = '';
+    return;
+  }
+
+  section.style.display = 'block';
+
+  // Group shows from channelDraftItems and count episodes
+  const showsMap = new Map();
+  channelDraftItems.forEach((it) => {
+    let showName = it.showName || '';
+    let showPoster = it.showPoster || '';
+    let showBackdrop = it.backdrop || it.showBackdrop || it.thumbnail || '';
+    if (!showPoster && it.poster && it.poster.startsWith('http') && !it.poster.includes('/api/channel-')) {
+      showPoster = it.poster;
+    }
+    if (it.kind === 'movie') {
+      showName = it.title ? (it.title + (it.year && !it.title.includes(String(it.year)) ? ' (' + it.year + ')' : '')) : 'Movie';
+      showPoster = it.poster || it.thumbnail || '';
+      showBackdrop = it.backdrop || it.thumbnail || it.poster || '';
+    } else if (!showName && it.title) {
+      if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+        showName = it.title.slice(0, it.title.indexOf(' S')).trim();
+      } else if (it.title.indexOf(' \u2014 ') !== -1) {
+        showName = it.title.split(' \u2014 ')[0].trim();
+      } else if (it.title.indexOf(' - ') !== -1) {
+        showName = it.title.split(' - ')[0].trim();
+      } else {
+        showName = it.title.trim();
+      }
+    }
+    if (!showName) showName = 'Show';
+
+    if (!showsMap.has(showName)) {
+      showsMap.set(showName, {
+        name: showName,
+        poster: showPoster,
+        backdrop: showBackdrop,
+        count: 0
+      });
+    }
+    const entry = showsMap.get(showName);
+    entry.count++;
+    if (!entry.poster && showPoster) {
+      entry.poster = showPoster;
+    }
+    if (!entry.backdrop && showBackdrop) {
+      entry.backdrop = showBackdrop;
+    }
+  });
+
+  const shows = [...showsMap.values()].filter((s) => s.poster && s.poster.startsWith('http'));
+  // Sort show posters in descending order by episode count
+  shows.sort((a, b) => b.count - a.count);
+
+  if (channelDraftPoster === undefined || channelDraftPoster === null) {
+    channelDraftPoster = shows.length ? shows[0].poster : 'custom';
+    channelDraftBackdrop = (shows.length && shows[0].backdrop) ? shows[0].backdrop : null;
+  }
+
+  const isCustomSelected = (channelDraftPoster === 'custom' || !channelDraftPoster || channelDraftPoster.includes('/api/channel-poster'));
+
+  // 1. Custom Channel Poster Option
+  let html = '<div class="channel-poster-choice' + (isCustomSelected ? ' selected' : '') + '" data-poster="custom" data-backdrop="" onclick="selectChannelPoster(&quot;custom&quot;, &quot;&quot;)">' +
+    '<div class="channel-poster-thumb-wrap custom-preview" style="background:linear-gradient(135deg,#0b0d14 0%,#131726 50%,#06070a 100%); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; padding:6px; border:1px solid rgba(0,122,255,0.3);">' +
+      '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#007AFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>' +
+        '<polyline points="17 2 12 7 7 2"></polyline>' +
+      '</svg>' +
+      '<span style="font-size:0.62rem; font-weight:700; color:#fff; text-transform:uppercase; letter-spacing:0.5px; text-align:center;">Custom</span>' +
+    '</div>' +
+    '<div class="channel-poster-check">\u2713</div>' +
+    '<div class="channel-poster-title" title="Custom Channel Poster">Custom Poster</div>' +
+    '<div class="channel-poster-meta">Provided</div>' +
+  '</div>';
+
+  // 2. Show Posters ordered by episode count descending
+  shows.forEach((s) => {
+    const isSelected = !isCustomSelected && (channelDraftPoster === s.poster);
+    const countLabel = s.count + ' ep' + (s.count === 1 ? '' : 's');
+    html += '<div class="channel-poster-choice' + (isSelected ? ' selected' : '') + '" data-poster="' + escapeAttr(s.poster) + '" data-backdrop="' + escapeAttr(s.backdrop || '') + '" onclick="selectChannelPoster(this.dataset.poster, this.dataset.backdrop)">' +
+      '<div class="channel-poster-thumb-wrap">' +
+        '<img src="' + escapeAttr(s.poster) + '" alt="' + escapeAttr(s.name) + '" loading="lazy">' +
+      '</div>' +
+      '<div class="channel-poster-check">\u2713</div>' +
+      '<div class="channel-poster-title" title="' + escapeAttr(s.name) + '">' + escapeHtml(s.name) + '</div>' +
+      '<div class="channel-poster-meta">' + escapeHtml(countLabel) + '</div>' +
+    '</div>';
+  });
+
+  grid.innerHTML = html;
+}
+
+function selectChannelPoster(posterUrl, backdropUrl) {
+  channelDraftPoster = (posterUrl === 'custom' || !posterUrl) ? 'custom' : posterUrl;
+  channelDraftBackdrop = (posterUrl === 'custom' || !posterUrl) ? null : (backdropUrl || null);
+  const cards = document.querySelectorAll('#channelPosterChoicesGrid .channel-poster-choice');
+  cards.forEach((card) => {
+    const cardPoster = card.dataset.poster;
+    if (channelDraftPoster === 'custom' && cardPoster === 'custom') {
+      card.classList.add('selected');
+    } else if (channelDraftPoster !== 'custom' && cardPoster === channelDraftPoster) {
+      card.classList.add('selected');
+    } else {
+      card.classList.remove('selected');
+    }
+  });
+}
+
+// --- TV Crossover Events Registry & Story Splicer ---------------------------
+const TV_CROSSOVER_EVENTS = [
+  // --- Arrowverse ---
+  {
+    id: "arrowverse_flash_vs_arrow",
+    name: "Flash vs. Arrow",
+    franchise: "Arrowverse",
+    description: "The classic two-night crossover event between The Flash and Arrow.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 1, episode: 8, part: 1, title: "Flash vs. Arrow" },
+      { showName: "Arrow", tmdbId: 1412, season: 3, episode: 8, part: 2, title: "The Brave and the Bold" }
+    ]
+  },
+  {
+    id: "arrowverse_heroes_join_forces",
+    name: "Heroes Join Forces",
+    franchise: "Arrowverse",
+    description: "The two-part crossover setting up the Legends of Tomorrow against Vandal Savage.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 8, part: 1, title: "Legends of Today" },
+      { showName: "Arrow", tmdbId: 1412, season: 4, episode: 8, part: 2, title: "Legends of Yesterday" }
+    ]
+  },
+  {
+    id: "arrowverse_worlds_finest",
+    name: "Worlds Finest",
+    franchise: "Arrowverse",
+    description: "Barry Allen crosses universes and teams up with Kara Zor-El in National City.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 18, part: 1, title: "Versus Zoom" },
+      { showName: "Supergirl", tmdbId: 62688, season: 1, episode: 18, part: 2, title: "Worlds Finest" }
+    ]
+  },
+  {
+    id: "arrowverse_invasion",
+    name: "Invasion!",
+    franchise: "Arrowverse",
+    description: "The 3-part event uniting Flash, Arrow, Supergirl, and the Legends against the Dominators.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 8, part: 1, title: "Invasion! (Part 1)" },
+      { showName: "Arrow", tmdbId: 1412, season: 5, episode: 8, part: 2, title: "Invasion! (Part 2)" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 2, episode: 7, part: 3, title: "Invasion! (Part 3)" }
+    ]
+  },
+  {
+    id: "arrowverse_duet",
+    name: "Duet (Musical Crossover)",
+    franchise: "Arrowverse",
+    description: "The Music Meister traps Supergirl and The Flash in an alternate reality musical.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 2, episode: 16, part: 1, title: "Star-Crossed" },
+      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 17, part: 2, title: "Duet" }
+    ]
+  },
+  {
+    id: "arrowverse_crisis_on_earth_x",
+    name: "Crisis on Earth-X",
+    franchise: "Arrowverse",
+    description: "The 4-part event uniting heroes when dark doppelgängers crash Barry and Iris's wedding.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 3, episode: 8, part: 1, title: "Crisis on Earth-X, Part 1" },
+      { showName: "Arrow", tmdbId: 1412, season: 6, episode: 8, part: 2, title: "Crisis on Earth-X, Part 2" },
+      { showName: "The Flash", tmdbId: 60735, season: 4, episode: 8, part: 3, title: "Crisis on Earth-X, Part 3" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 3, episode: 8, part: 4, title: "Crisis on Earth-X, Part 4" }
+    ]
+  },
+  {
+    id: "arrowverse_elseworlds",
+    name: "Elseworlds",
+    franchise: "Arrowverse",
+    description: "The 3-part event introducing Gotham City and Batwoman when Oliver and Barry swap lives.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 5, episode: 9, part: 1, title: "Elseworlds, Part 1" },
+      { showName: "Arrow", tmdbId: 1412, season: 7, episode: 9, part: 2, title: "Elseworlds, Part 2" },
+      { showName: "Supergirl", tmdbId: 62688, season: 4, episode: 9, part: 3, title: "Elseworlds, Part 3" }
+    ]
+  },
+  {
+    id: "arrowverse_crisis_on_infinite_earths",
+    name: "Crisis on Infinite Earths",
+    franchise: "Arrowverse",
+    description: "The epic 5-part multiverse crossover event to save existence from the Anti-Monitor.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 5, episode: 9, part: 1, title: "Crisis on Infinite Earths: Part One" },
+      { showName: "Batwoman", tmdbId: 89247, season: 1, episode: 9, part: 2, title: "Crisis on Infinite Earths: Part Two" },
+      { showName: "The Flash", tmdbId: 60735, season: 6, episode: 9, part: 3, title: "Crisis on Infinite Earths: Part Three" },
+      { showName: "Arrow", tmdbId: 1412, season: 8, episode: 8, part: 4, title: "Crisis on Infinite Earths: Part Four" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 5, episode: 1, part: 5, title: "Crisis on Infinite Earths: Part Five" }
+    ]
+  },
+
+  // --- One Chicago ---
+  {
+    id: "chicago_a_dark_day",
+    name: "A Dark Day",
+    franchise: "One Chicago",
+    description: "The hospital explosion crossover event between Chicago Fire and Chicago P.D.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 2, episode: 20, part: 1, title: "A Dark Day" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 1, episode: 12, part: 2, title: "8:30 PM" }
+    ]
+  },
+  {
+    id: "chicago_nobody_touches_anything",
+    name: "Chicago Crossover (Child Pornography Ring)",
+    franchise: "One Chicago",
+    description: "The 3-part crossover uniting Firehouse 51, Intelligence, and the SVU squad.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 7, part: 1, title: "Nobody Touches Anything" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 7, part: 2, title: "Chicago Crossover" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 7, part: 3, title: "They'll Have to Go Through Me" }
+    ]
+  },
+  {
+    id: "chicago_three_bells",
+    name: "Shay Arson Investigation",
+    franchise: "One Chicago",
+    description: "The two-part crossover hunting the arsonist responsible for Leslie Shay's death.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 13, part: 1, title: "Three Bells" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 13, part: 2, title: "A Little Devil Complex" }
+    ]
+  },
+  {
+    id: "chicago_jellybean_yates",
+    name: "Greg Yates Serial Killer Crossover",
+    franchise: "One Chicago",
+    description: "The multi-part chase for serial killer Gregory Yates between Fire, P.D. and SVU.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 21, part: 1, title: "We Called Her Jellybean" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 20, part: 2, title: "The Number of Rats" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 20, part: 3, title: "Daydream Believer" }
+    ]
+  },
+  {
+    id: "chicago_beating_heart",
+    name: "The Beating Heart (Chemo Overdose Crossover)",
+    franchise: "One Chicago",
+    description: "The 3-part event connecting Christopher Herrmann's stabbing to a rogue doctor giving fatal chemo doses.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 4, episode: 10, part: 1, title: "The Beating Heart" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 1, episode: 5, part: 2, title: "Malignant" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 3, episode: 10, part: 3, title: "Now I'm God" }
+    ]
+  },
+  {
+    id: "chicago_deathtrap",
+    name: "Deathtrap / Warehouse Fire",
+    franchise: "One Chicago",
+    description: "The 3-part event spanning Chicago Fire, Chicago P.D. and Chicago Justice after a fatal warehouse fire.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 5, episode: 15, part: 1, title: "Deathtrap" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 4, episode: 16, part: 2, title: "Emotional Proximity" },
+      { showName: "Chicago Justice", tmdbId: 66986, season: 1, episode: 1, part: 3, title: "Fake" }
+    ]
+  },
+  {
+    id: "chicago_going_to_war",
+    name: "High-Rise Apartment Fire",
+    franchise: "One Chicago",
+    description: "The 3-part crossover event starting with a catastrophic 25-story high-rise apartment fire.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 7, episode: 2, part: 1, title: "Going to War" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 4, episode: 2, part: 2, title: "When to Let Go" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 6, episode: 2, part: 3, title: "Endings" }
+    ]
+  },
+  {
+    id: "chicago_infection",
+    name: "Infection (Bioterrorism Outbreak)",
+    franchise: "One Chicago",
+    description: "The 3-part crossover where a deadly flesh-eating bacterial epidemic strikes Chicago.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 4, part: 1, title: "Infection, Part I" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 5, episode: 4, part: 2, title: "Infection, Part II" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 4, part: 3, title: "Infection, Part III" }
+    ]
+  },
+  {
+    id: "chicago_off_the_grid",
+    name: "Sean Roman / Opioid Crisis Crossover",
+    franchise: "One Chicago",
+    description: "The 2-part event bringing former Officer Sean Roman back to Chicago to find his missing sister.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 15, part: 1, title: "Off the Grid" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 15, part: 2, title: "Burden of Truth" }
+    ]
+  },
+
+  // --- Law & Order Universe ---
+  {
+    id: "law_order_gimme_shelter",
+    name: "Gimme Shelter (Historic 3-Way Crossover)",
+    franchise: "Law & Order",
+    description: "The premiere 3-show crossover uniting Organized Crime, SVU, and the original Law & Order team.",
+    episodes: [
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 1, part: 1, title: "Gimme Shelter - Part One" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 1, part: 2, title: "Gimme Shelter - Part Two" },
+      { showName: "Law & Order", tmdbId: 549, season: 22, episode: 1, part: 3, title: "Gimme Shelter - Part Three" }
+    ]
+  },
+  {
+    id: "law_order_return_of_the_prodigal_son",
+    name: "Elliot Stabler's Return",
+    franchise: "Law & Order",
+    description: "Elliot Stabler reunites with Olivia Benson following a car bombing targeting his family.",
+    episodes: [
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 22, episode: 9, part: 1, title: "Return of the Prodigal Son" },
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 1, episode: 1, part: 2, title: "What Happens in Puglia" }
+    ]
+  },
+  {
+    id: "law_order_shadow_svu_oc_finale",
+    name: "Bad Things / All Pain Is One Malady",
+    franchise: "Law & Order",
+    description: "The tense season finale crossover taking down a murder-for-hire site targeting Benson and Stabler.",
+    episodes: [
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 22, part: 1, title: "All Pain Is One Malady" },
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 22, part: 2, title: "With Many Names" }
+    ]
+  },
+
+  // --- FBI Universe ---
+  {
+    id: "fbi_american_dreams",
+    name: "American Dreams / Emotional Rescue",
+    franchise: "FBI",
+    description: "The crossover investigation where Jubal brings in Jess LaCroix to rescue kidnapped schoolchildren.",
+    episodes: [
+      { showName: "FBI", tmdbId: 80748, season: 2, episode: 19, part: 1, title: "American Dreams" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 1, episode: 9, part: 2, title: "Emotional Rescue" }
+    ]
+  },
+  {
+    id: "fbi_all_that_glitters",
+    name: "All That Glitters / Exposed / Lovesick",
+    franchise: "FBI",
+    description: "The 3-part franchise premiere launching FBI: International across New York and Budapest.",
+    episodes: [
+      { showName: "FBI", tmdbId: 80748, season: 4, episode: 1, part: 1, title: "All That Glitters" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 3, episode: 1, part: 2, title: "Exposed" },
+      { showName: "FBI: International", tmdbId: 125988, season: 1, episode: 1, part: 3, title: "Pilot" }
+    ]
+  },
+  {
+    id: "fbi_imminent_threat",
+    name: "Imminent Threat (Global Terror Crossover)",
+    franchise: "FBI",
+    description: "The 3-part global event racing to stop a catastrophic terror attack planned in New York City.",
+    episodes: [
+      { showName: "FBI: International", tmdbId: 125988, season: 2, episode: 16, part: 1, title: "Imminent Threat - Part One" },
+      { showName: "FBI", tmdbId: 80748, season: 5, episode: 17, part: 2, title: "Imminent Threat - Part Two" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 4, episode: 16, part: 3, title: "Imminent Threat - Part Three" }
+    ]
+  },
+
+  // --- NCIS Universe ---
+  {
+    id: "ncis_sister_city",
+    name: "Sister City",
+    franchise: "NCIS",
+    description: "The 2-part murder investigation linking Gibbs's team with Pride's New Orleans squad.",
+    episodes: [
+      { showName: "NCIS", tmdbId: 4614, season: 13, episode: 12, part: 1, title: "Sister City (Part I)" },
+      { showName: "NCIS: New Orleans", tmdbId: 61387, season: 2, episode: 12, part: 2, title: "Sister City (Part II)" }
+    ]
+  },
+  {
+    id: "ncis_too_many_cooks",
+    name: "Too Many Cooks / A Long Time Coming",
+    franchise: "NCIS",
+    description: "The first-ever 3-way crossover event spanning NCIS, NCIS: Hawai'i, and NCIS: Los Angeles.",
+    episodes: [
+      { showName: "NCIS", tmdbId: 4614, season: 20, episode: 10, part: 1, title: "Too Many Cooks" },
+      { showName: "NCIS: Hawai'i", tmdbId: 124364, season: 2, episode: 10, part: 2, title: "Deep Fake" },
+      { showName: "NCIS: Los Angeles", tmdbId: 17610, season: 14, episode: 10, part: 3, title: "A Long Time Coming" }
+    ]
+  },
+
+  // --- Grey's Anatomy Universe ---
+  {
+    id: "greys_what_i_did_for_love",
+    name: "Lucas Ripley Hospital Emergency",
+    franchise: "Grey's Anatomy Universe",
+    description: "The tragic two-part medical emergency crossover involving Fire Chief Lucas Ripley.",
+    episodes: [
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 15, episode: 23, part: 1, title: "What I Did for Love" },
+      { showName: "Station 19", tmdbId: 76773, season: 2, episode: 15, part: 2, title: "Always Ready" }
+    ]
+  },
+  {
+    id: "greys_i_like_quick_and_dark",
+    name: "Joe's Bar Crash",
+    franchise: "Grey's Anatomy Universe",
+    description: "The crossover rescue when a car crashes through the roof of Joe's Bar.",
+    episodes: [
+      { showName: "Station 19", tmdbId: 76773, season: 3, episode: 1, part: 1, title: "I Know This Bar" },
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 16, episode: 10, part: 2, title: "Help Me Through the Night" }
+    ]
+  },
+  {
+    id: "greys_things_we_lost_in_the_fire",
+    name: "Gas Line Explosion",
+    franchise: "Grey's Anatomy Universe",
+    description: "The neighborhood gas pipeline disaster uniting Station 19 and Grey Sloan Memorial.",
+    episodes: [
+      { showName: "Station 19", tmdbId: 76773, season: 5, episode: 5, part: 1, title: "Things We Lost in the Fire" },
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 18, episode: 5, part: 2, title: "Bottle Up and Explode!" }
+    ]
+  },
+
+  // --- Hawaii Five-0 / Magnum P.I. / MacGyver ---
+  {
+    id: "hawaii_magnum_crossover",
+    name: "Desperate Measures",
+    franchise: "Hawaii Universe",
+    description: "Five-0 recruits private investigators Thomas Magnum and Juliet Higgins to extract a captured agent.",
+    episodes: [
+      { showName: "Hawaii Five-0", tmdbId: 32798, season: 10, episode: 12, part: 1, title: "Ihea 'oe i ka wa a ka ua e loku ana?" },
+      { showName: "Magnum P.I.", tmdbId: 79593, season: 2, episode: 12, part: 2, title: "Desperate Measures" }
+    ]
+  },
+  {
+    id: "macgyver_flashlight",
+    name: "Flashlight",
+    franchise: "Hawaii Universe",
+    description: "MacGyver and the Phoenix team travel to Hawaii to assist Five-0 after a severe earthquake.",
+    episodes: [
+      { showName: "MacGyver", tmdbId: 67178, season: 1, episode: 18, part: 1, title: "Flashlight" },
+      { showName: "Hawaii Five-0", tmdbId: 32798, season: 7, episode: 19, part: 2, title: "Exodus" }
+    ]
+  },
+
+  // --- Buffyverse ---
+  {
+    id: "buffyverse_i_will_remember_you",
+    name: "I Will Remember You",
+    franchise: "Buffyverse",
+    description: "Buffy visits Los Angeles after finding out Angel was in Sunnydale, leading to a fateful day of mortality.",
+    episodes: [
+      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 8, part: 1, title: "Pangs" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 8, part: 2, title: "I Will Remember You" }
+    ]
+  },
+  {
+    id: "buffyverse_five_by_five",
+    name: "Faith's Rogue Redemption",
+    franchise: "Buffyverse",
+    description: "Faith flees Sunnydale to Los Angeles where Wolfram & Hart hire her to assassinate Angel.",
+    episodes: [
+      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 20, part: 1, title: "The Yoko Factor" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 18, part: 2, title: "Five by Five" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 19, part: 3, title: "Sanctuary" }
+    ]
+  },
+
+  // --- The Vampire Diaries / The Originals ---
+  {
+    id: "vampire_diaries_moonlight_on_bayou",
+    name: "Moonlight on the Bayou",
+    franchise: "Vampire Diaries Universe",
+    description: "Stefan Salvatore travels to New Orleans to escape Rayna Cruz and seeks refuge with Klaus Mikaelson.",
+    episodes: [
+      { showName: "The Vampire Diaries", tmdbId: 18165, season: 7, episode: 14, part: 1, title: "Moonlight on the Bayou" },
+      { showName: "The Originals", tmdbId: 48866, season: 3, episode: 14, part: 2, title: "A Streetcar Named Desire" }
+    ]
+  },
+
+  // --- Bones / Sleepy Hollow ---
+  {
+    id: "bones_sleepy_hollow",
+    name: "The Resurrection in the Remains",
+    franchise: "Bones & Sleepy Hollow",
+    description: "Brennan & Booth team up with Ichabod Crane & Abbie Mills on Halloween over 200-year-old remains.",
+    episodes: [
+      { showName: "Bones", tmdbId: 1911, season: 11, episode: 5, part: 1, title: "The Resurrection in the Remains" },
+      { showName: "Sleepy Hollow", tmdbId: 46896, season: 3, episode: 5, part: 2, title: "Dead Men Tell No Tales" }
+    ]
+  }
+];
+
+function isCrossoverEpisodeMatch(item, epTarget) {
+  if (!item || item.kind === 'movie') return false;
+  const sNum = (item.seasonNum != null) ? Number(item.seasonNum) : Number(item.season);
+  const eNum = (item.episodeNum != null) ? Number(item.episodeNum) : Number(item.episode);
+  if (sNum !== epTarget.season || eNum !== epTarget.episode) return false;
+
+  const targetName = epTarget.showName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const itemShowName = String(item.showName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const itemTitle = String(item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  return itemShowName.includes(targetName) || targetName.includes(itemShowName) || itemTitle.includes(targetName);
+}
+
+function renderChannelCrossoverSuggestions() {
+  const container = document.getElementById('channelCrossoverSuggestions');
+  if (!container) return;
+
+  if (!channelDraftItems.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  const suggestions = [];
+
+  TV_CROSSOVER_EVENTS.forEach((event) => {
+    const presentParts = [];
+    const missingParts = [];
+
+    event.episodes.forEach((ep) => {
+      const match = channelDraftItems.find((it) => isCrossoverEpisodeMatch(it, ep));
+      if (match) {
+        presentParts.push({ ...ep, draftItem: match });
+      } else {
+        missingParts.push(ep);
+      }
+    });
+
+    if (presentParts.length > 0 && missingParts.length > 0) {
+      suggestions.push({
+        event,
+        presentParts,
+        missingParts
+      });
+    }
+  });
+
+  if (!suggestions.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  container.style.display = 'block';
+
+  const bannersHtml = suggestions.map(({ event, presentParts, missingParts }) => {
+    const chipsHtml = event.episodes.map((ep) => {
+      const isPresent = presentParts.some((p) => p.part === ep.part);
+      if (isPresent) {
+        return '<span class="channel-crossover-chip present" title="Already in channel draft">' +
+          '\u2713 Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+        '</span>';
+      }
+      return '<span class="channel-crossover-chip missing" title="Missing from channel draft">' +
+        '+ Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+      '</span>';
+    }).join('');
+
+    const missingCount = missingParts.length;
+    const btnLabel = '+ Add ' + missingCount + ' Missing Crossover Episode' + (missingCount === 1 ? '' : 's') + ' in Story Order';
+
+    return '<div class="channel-crossover-banner" data-event-id="' + escapeAttr(event.id) + '">' +
+      '<div class="channel-crossover-header">' +
+        '<div class="channel-crossover-title">' +
+          '<span>\uD83D\uDCA1 Crossover Event Detected: <strong>' + escapeHtml(event.name) + '</strong></span>' +
+          '<span class="channel-crossover-badge">' + escapeHtml(event.franchise) + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<p class="channel-crossover-desc">' + escapeHtml(event.description) + '</p>' +
+      '<div class="channel-crossover-parts">' + chipsHtml + '</div>' +
+      '<div class="channel-crossover-actions">' +
+        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  container.innerHTML = bannersHtml;
+}
+
+async function spliceCrossoverEvent(eventId, btn) {
+  const event = TV_CROSSOVER_EVENTS.find((e) => e.id === eventId);
+  if (!event) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Fetching crossover episodes\u2026';
+  }
+
+  try {
+    let firstIdx = -1;
+    for (let i = 0; i < channelDraftItems.length; i++) {
+      if (event.episodes.some((ep) => isCrossoverEpisodeMatch(channelDraftItems[i], ep))) {
+        firstIdx = i;
+        break;
+      }
+    }
+    if (firstIdx === -1) firstIdx = channelDraftItems.length;
+
+    const fullOrderedItems = [];
+    for (const ep of event.episodes) {
+      const existingMatch = channelDraftItems.find((it) => isCrossoverEpisodeMatch(it, ep));
+      if (existingMatch) {
+        fullOrderedItems.push(existingMatch);
+      } else {
+        const res = await fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(ep.tmdbId) + '&season=' + encodeURIComponent(ep.season), { cache: 'no-store' });
+        const data = await res.json();
+        let epData = null;
+        if (data.ok && Array.isArray(data.episodes)) {
+          epData = data.episodes.find((e) => e.episode === ep.episode) || data.episodes[ep.episode - 1] || null;
+        }
+
+        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
+        let showPoster = '';
+        let showBackdrop = '';
+        if (showDetailsRes) {
+          const sData = await showDetailsRes.json().catch(() => null);
+          if (sData && sData.ok && sData.results && sData.results.length) {
+            const found = sData.results.find((r) => String(r.tmdbId) === String(ep.tmdbId)) || sData.results[0];
+            if (found) {
+              showPoster = found.poster || '';
+              showBackdrop = found.backdrop || '';
+            }
+          }
+        }
+
+        const epTitle = (epData && epData.name) ? epData.name : ep.title;
+        const epRelease = (epData && epData.released) ? epData.released : undefined;
+        const epThumbnail = (epData && epData.thumbnail) ? epData.thumbnail : (showBackdrop || showPoster);
+
+        const newItem = {
+          kind: 'episode',
+          imdbId: (epData && epData.imdbId) || String(ep.tmdbId),
+          season: ep.season,
+          episode: ep.episode,
+          showName: ep.showName,
+          epName: epTitle,
+          title: ep.showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + epTitle,
+          released: epRelease,
+          thumbnail: epThumbnail,
+          poster: showPoster || epThumbnail || '',
+          showPoster: showPoster || '',
+          backdrop: showBackdrop || '',
+          showBackdrop: showBackdrop || '',
+          seasonNum: ep.season,
+          episodeNum: ep.episode,
+        };
+        fullOrderedItems.push(newItem);
+      }
+    }
+
+    channelDraftItems = channelDraftItems.filter((it) => !event.episodes.some((ep) => isCrossoverEpisodeMatch(it, ep)));
+
+    const insertPos = Math.min(firstIdx, channelDraftItems.length);
+    channelDraftItems.splice(insertPos, 0, ...fullOrderedItems);
+
+    if (channelDraftItems.length > CHANNEL_MAX_TOTAL_ITEMS) {
+      channelDraftItems = channelDraftItems.slice(0, CHANNEL_MAX_TOTAL_ITEMS);
+    }
+
+    renderChannelDraftList();
+    if (typeof showAddedToast === 'function') {
+      showAddedToast('Added crossover episodes for "' + event.name + '" in story order!');
+    }
+  } catch (err) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Crossover Splicer', 'Failed to fetch some crossover episodes. Please check your connection and try again.');
+    } else {
+      alert('Failed to fetch crossover episodes.');
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '+ Add Missing Crossover Episodes in Story Order';
+    }
+  }
 }
 
 function reverseChannelDraft() {
@@ -803,8 +1493,12 @@ function saveChannel() {
     }
     return;
   }
-  const verticalPoster = channelDraftPoster || null;
-  const horizontalBackdrop = channelDraftBackdrop || (channelDraftItems[0] && (channelDraftItems[0].thumbnail || channelDraftItems[0].backdrop)) || null;
+  const verticalPoster = (channelDraftPoster && channelDraftPoster !== 'custom' && !channelDraftPoster.includes('/api/channel-poster')) ? channelDraftPoster : null;
+  let horizontalBackdrop = null;
+  if (verticalPoster) {
+    const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
+    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || null;
+  }
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 
   const map = loadLocalChannels();

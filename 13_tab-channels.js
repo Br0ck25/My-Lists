@@ -119,6 +119,8 @@
       <div id="channelSearchResult"></div>
       <div id="channelEpisodePicker"></div>
 
+      <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
+
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
@@ -130,7 +132,14 @@
         <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
       </label>
 
-      <div class="row" style="margin-top:10px;">
+      <!-- Channel Poster Selection Section -->
+      <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
+        <p style="margin:0 0 4px; font-weight:600; font-size:0.85rem;">Channel Poster:</p>
+        <p style="margin:0 0 10px; color:var(--muted); font-size:0.8rem;">Choose a show poster (ranked by most episodes) or choose our custom channel poster.</p>
+        <div id="channelPosterChoicesGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:10px;"></div>
+      </div>
+
+      <div class="row" style="margin-top:12px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>

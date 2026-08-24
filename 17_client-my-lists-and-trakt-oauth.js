@@ -19,23 +19,34 @@ function scheduleMyTraktListsRefresh() {
 async function runMyMdblistLists() {
   const box = document.getElementById('myMdblistListsResult');
   if (!box) return;
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
   const keyInput = document.getElementById('mdblistKeyInput');
   const manualKey = keyInput ? keyInput.value.trim() : '';
-  const key = manualKey || mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const token = isDisc ? '' : (mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  const key = isDisc ? '' : (manualKey || token || localStorage.getItem('myListAddon:mdblistKey') || '');
   if (!key) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your MDBList account in Settings or click <strong>Connect MDBList</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
   box.innerHTML = '<p style="margin-top:10px;"><small>Loading your MDBList lists\u2026</small></p>';
   try {
-    const url = mdblistAccessToken
-      ? ORIGIN + '/api/mdblist-my-lists?accessToken=' + encodeURIComponent(mdblistAccessToken)
-      : ORIGIN + '/api/mdblist-my-lists?apikey=' + encodeURIComponent(manualKey);
+    const url = token
+      ? ORIGIN + '/api/mdblist-my-lists?accessToken=' + encodeURIComponent(token)
+      : ORIGIN + '/api/mdblist-my-lists?apikey=' + encodeURIComponent(manualKey || key);
     const res = await fetch(url, { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your MDBList lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      mdblistUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:mdblistUsername', mdblistUsername);
+        localStorage.removeItem('myListAddon:mdblistDisconnected');
+      } catch (e) {}
+      renderMdblistConnectStatus();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
     }
     renderMyMdblistLists(data.lists);
   } catch (e) {
@@ -135,10 +146,18 @@ document.getElementById('myMdblistListsResult').addEventListener('click', (e) =>
 async function runMyTraktLists() {
   const box = document.getElementById('myTraktListsResult');
   if (!box) return;
-  const username = document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '';
-  const traktKey = document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '';
-  const token = traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (!username && !token) {
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : (traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  const username = isDisc ? '' : ((document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '');
+  const traktKey = isDisc ? '' : ((document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '');
+
+  if (token) {
+    if (box) box.innerHTML = '';
+    scheduleMyPrivateTraktListsRefresh();
+    return;
+  }
+
+  if (!username) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Trakt account in Settings or click <strong>Connect Trakt</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
@@ -238,6 +257,7 @@ document.getElementById('myTraktListsResult').addEventListener('click', (e) => {
 
 // --- MDBList OAuth (Connect MDBList) --------------------------------------
 function startMdblistConnect() {
+  try { localStorage.removeItem('myListAddon:mdblistDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/mdblist/oauth/start';
 }
 
@@ -245,18 +265,23 @@ function disconnectMdblist() {
   const input = document.getElementById('mdblistKeyInput');
   if (input) input.value = '';
   mdblistAccessToken = '';
+  try { window.mdblistAccessToken = ''; } catch (e) {}
   try {
     localStorage.removeItem('myListAddon:mdblistAccessToken');
     localStorage.removeItem('myListAddon:mdblistUsername');
     localStorage.removeItem('myListAddon:mdblistKey');
+    localStorage.setItem('myListAddon:mdblistDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderMdblistConnectStatus();
   scheduleMyMdblistListsRefresh();
 }
 
 function toggleListsMdblistConnection() {
-  if (mdblistAccessToken) {
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken');
+  if (token && !isDisc) {
     disconnectMdblist();
   } else {
     startMdblistConnect();
@@ -269,37 +294,47 @@ function renderMdblistConnectStatus() {
   const connectBtn = document.getElementById('mdblistConnectBtn');
   const disconnectBtn = document.getElementById('mdblistDisconnectBtn');
   const listsBtn = document.getElementById('listsMdblistConnectBtn');
-  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
-  if (token) mdblistAccessToken = token;
-  const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
-  const connected = !!(token || key);
-  
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  if (!isDisc && token) mdblistAccessToken = token;
+  const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
+
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect MDBList';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect MDBList';
   }
-  
+
   if (statusEl) {
     if (token && user) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to MDBList</span>';
-    } else if (key) {
-      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom MDBList API Key configured</span>';
+      if (!window._mdblistResolvingUser) {
+        window._mdblistResolvingUser = true;
+        setTimeout(() => {
+          window._mdblistResolvingUser = false;
+          if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
+        }, 100);
+      }
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom MDBList API Key configured</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect MDBList' : (key ? 'Update Key' : 'Connect MDBList Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncMdblistHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
   const syncWrap = document.getElementById('mdblistSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
-  if (connected) {
-    scheduleMyMdblistListsRefresh();
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myMdblistListsResult');
+    if (box) box.innerHTML = '';
   }
 }
 
@@ -308,6 +343,9 @@ function pickUpMdblistTokenFromUrl() {
   const match = /(?:^|[#&])mdblist_token=([^&]+)/.exec(hash);
   if (match) {
     mdblistAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.removeItem('myListAddon:mdblistDisconnected');
+    } catch (e) {}
     const userMatch = /(?:^|[#&])mdblist_username=([^&]+)/.exec(hash);
     if (userMatch) {
       mdblistUsername = decodeURIComponent(userMatch[1]);
@@ -319,6 +357,7 @@ function pickUpMdblistTokenFromUrl() {
       localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessToken);
     } catch (e) {}
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('MDBList Connected', 'Connected to MDBList.', true);
@@ -326,6 +365,7 @@ function pickUpMdblistTokenFromUrl() {
       alert('Connected to MDBList.');
     }
     renderMdblistConnectStatus();
+    scheduleMyMdblistListsRefresh();
   }
   const params = new URLSearchParams(window.location.search);
   const err = params.get('mdblist_error');
@@ -361,6 +401,7 @@ function pickUpMdblistTokenFromUrl() {
 // redirects back here with the resulting token in the URL fragment; see
 // pickUpTraktTokenFromUrl below, called once from this page's own init.
 function startTraktConnect() {
+  try { localStorage.removeItem('myListAddon:traktDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/trakt/oauth/start';
 }
 
@@ -370,15 +411,29 @@ function disconnectTrakt() {
   const userInput = document.getElementById('traktUsernameInput');
   if (userInput) userInput.value = '';
   traktAccessToken = '';
+  try { window.traktAccessToken = ''; } catch (e) {}
+  if (typeof activeTraktToken !== 'undefined') activeTraktToken = null;
   try {
     localStorage.removeItem('myListAddon:traktAccessToken');
     localStorage.removeItem('myListAddon:traktUsername');
     localStorage.removeItem('myListAddon:traktKey');
+    localStorage.setItem('myListAddon:traktDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderTraktConnectStatus();
   const box = document.getElementById('myPrivateTraktListsResult');
   if (box) box.innerHTML = '';
+}
+
+function toggleListsTraktConnection() {
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken');
+  if (token && !isDisc) {
+    disconnectTrakt();
+  } else {
+    startTraktConnect();
+  }
 }
 
 function renderTraktConnectStatus() {
@@ -388,14 +443,16 @@ function renderTraktConnectStatus() {
   const connectBtn = document.getElementById('traktConnectBtn');
   const disconnectBtn = document.getElementById('traktDisconnectBtn');
   const listsBtn = document.getElementById('listsTraktConnectBtn');
-  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (token) traktAccessToken = token;
-  const user = (userInput ? userInput.value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '';
-  const key = (keyInput ? keyInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
-  const connected = !!(token || key || user);
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  if (!isDisc && token) traktAccessToken = token;
+  const user = (userInput ? userInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktUsername') || ''));
+  const key = (keyInput ? keyInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!(key || user);
   
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Trakt';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Trakt';
   }
   
   if (statusEl) {
@@ -403,25 +460,25 @@ function renderTraktConnectStatus() {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Trakt</span>';
-    } else if (key || user) {
+    } else if (hasKey) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Trakt Client ID configured' + (user ? ' (@' + escapeHtml(user) + ')' : '') + '</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Trakt' : (key ? 'Update Client ID' : 'Connect Trakt Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncTraktHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
   const syncWrap = document.getElementById('traktSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const box = document.getElementById('myPrivateTraktListsResult');
-  if (connected) {
-    scheduleMyPrivateTraktListsRefresh();
-  } else if (box) {
-    box.innerHTML = '';
+  const pubBox = document.getElementById('myTraktListsResult');
+  if (!isAccountConnected && !hasKey) {
+    if (box) box.innerHTML = '';
+    if (pubBox) pubBox.innerHTML = '';
   }
 }
 
@@ -437,6 +494,10 @@ function pickUpTraktTokenFromUrl() {
   const match = /(?:^|[#&])trakt_token=([^&]+)/.exec(hash);
   if (match) {
     traktAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+      localStorage.removeItem('myListAddon:traktDisconnected');
+    } catch (e) {}
     const userMatch = /(?:^|[#&])trakt_username=([^&]+)/.exec(hash);
     if (userMatch) {
       const user = decodeURIComponent(userMatch[1]);
@@ -447,6 +508,7 @@ function pickUpTraktTokenFromUrl() {
       if (uInput) uInput.value = user;
     }
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('Trakt Connected', 'Connected to Trakt.', true);
@@ -454,6 +516,7 @@ function pickUpTraktTokenFromUrl() {
       alert('Connected to Trakt.');
     }
     renderTraktConnectStatus();
+    scheduleMyTraktListsRefresh();
   }
   const params = new URLSearchParams(window.location.search);
   const err = params.get('trakt_error');
@@ -570,11 +633,13 @@ async function startTraktDeviceLogin() {
             if (uInput) uInput.value = pollData.username;
           }
           saveState();
+          if (typeof pushCreatorSync === 'function') pushCreatorSync();
           closeTraktDeviceModal();
           if (typeof showAppAlert === 'function') {
             showAppAlert('Trakt Connected', 'Successfully connected to Trakt' + (pollData.username ? ' as @' + pollData.username : '') + '.', true);
           }
           renderTraktConnectStatus();
+          scheduleMyTraktListsRefresh();
         } else if (pollData.pending) {
           // Still waiting for user confirmation
         } else if (pollData.slowDown) {
@@ -618,6 +683,16 @@ async function runMyPrivateTraktLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Trakt lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      traktUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:traktUsername', traktUsername);
+        localStorage.removeItem('myListAddon:traktDisconnected');
+      } catch (e) {}
+      const uInput = document.getElementById('traktUsernameInput');
+      if (uInput && !uInput.value) uInput.value = traktUsername;
+      renderTraktConnectStatus();
     }
     renderMyPrivateTraktLists(data.lists);
   } catch (e) {
@@ -716,34 +791,10 @@ document.getElementById('myPrivateTraktListsResult').addEventListener('click', (
   }
 });
 
-// Pulls every item from a list URL (paginated via /api/preview, the same
-// Fetches every item for one list+type via /api/preview (paginated, same
-// mechanism Live Preview's "See All" uses), mapped into the shape a
-// Custom List's items expect.
-function toggleListsTraktConnection() {
-  if (traktAccessToken) {
-    disconnectTrakt();
-  } else {
-    startTraktConnect();
-  }
-}
-
 // --- TMDB Account / API Key Connection -----------------------------------
 let tmdbSessionId = '';
 let tmdbAccountId = '';
 let tmdbUsername = '';
-
-function startTmdbConnect() {
-  window.location.href = ORIGIN + '/api/tmdb/oauth/start';
-}
-
-function toggleListsTmdbConnection() {
-  if (tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId')) {
-    disconnectTmdb();
-  } else {
-    startTmdbConnect();
-  }
-}
 
 function onTmdbKeyInputChanged() {
   const input = document.getElementById('tmdbKeyInput');
@@ -783,17 +834,39 @@ async function testTmdbConnection() {
   }
 }
 
+function startTmdbConnect() {
+  try { localStorage.removeItem('myListAddon:tmdbDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/tmdb/oauth/start';
+}
+
+function toggleListsTmdbConnection() {
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId');
+  if (sess && !isDisc) {
+    disconnectTmdb();
+  } else {
+    startTmdbConnect();
+  }
+}
+
 function disconnectTmdb() {
   const input = document.getElementById('tmdbKeyInput');
   if (input) input.value = '';
   tmdbSessionId = '';
+  try { window.tmdbSessionId = ''; } catch (e) {}
   tmdbAccountId = '';
+  try { window.tmdbAccountId = ''; } catch (e) {}
   tmdbUsername = '';
-  localStorage.removeItem('myListAddon:tmdbKey');
-  localStorage.removeItem('myListAddon:tmdbSessionId');
-  localStorage.removeItem('myListAddon:tmdbAccountId');
-  localStorage.removeItem('myListAddon:tmdbUsername');
+  try { window.tmdbUsername = ''; } catch (e) {}
+  try {
+    localStorage.removeItem('myListAddon:tmdbKey');
+    localStorage.removeItem('myListAddon:tmdbSessionId');
+    localStorage.removeItem('myListAddon:tmdbAccountId');
+    localStorage.removeItem('myListAddon:tmdbUsername');
+    localStorage.setItem('myListAddon:tmdbDisconnected', 'true');
+  } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderTmdbConnectStatus();
   scheduleMyTmdbListsRefresh();
 }
@@ -809,10 +882,14 @@ function pickUpTmdbTokenFromUrl() {
       tmdbSessionId = sess;
       tmdbAccountId = acc || '';
       tmdbUsername = user || '';
-      localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionId);
-      if (tmdbAccountId) localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
-      if (tmdbUsername) localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+      try {
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+        localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionId);
+        if (tmdbAccountId) localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        if (tmdbUsername) localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+      } catch (e) {}
       saveState();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
       params.delete('tmdb_session');
       params.delete('tmdb_account');
       params.delete('tmdb_user');
@@ -847,17 +924,19 @@ function renderTmdbConnectStatus() {
   const disconnectBtn = document.getElementById('tmdbDisconnectBtn');
   const listsConnectBtn = document.getElementById('listsTmdbConnectBtn');
 
-  const sess = tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '';
-  const user = tmdbUsername || localStorage.getItem('myListAddon:tmdbUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  const connected = !!(sess || key);
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = isDisc ? '' : (tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '');
+  const user = isDisc ? '' : (tmdbUsername || localStorage.getItem('myListAddon:tmdbUsername') || '');
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:tmdbKey') || ''));
+  const isAccountConnected = !isDisc && !!sess;
+  const hasKey = !isDisc && !!key;
 
   if (statusEl) {
     if (sess && user) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (sess) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB Account Connected</span>';
-    } else if (key) {
+    } else if (hasKey) {
       statusEl.innerHTML = '<span style="color:#7ce7b6;">\u2713 Custom TMDB Key configured</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected</span>';
@@ -865,8 +944,13 @@ function renderTmdbConnectStatus() {
   }
 
   if (connectBtn) connectBtn.textContent = sess ? 'Re-connect TMDB' : (key ? 'Update Key' : 'Connect TMDB Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
-  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect' : 'Connect TMDB';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+  if (listsConnectBtn) listsConnectBtn.textContent = isAccountConnected ? 'Disconnect' : 'Connect TMDB';
+
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myTmdbListsResult');
+    if (box) box.innerHTML = '';
+  }
 }
 
 let myTmdbListsTimer = null;
@@ -905,6 +989,18 @@ async function runMyTmdbLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your TMDB lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      tmdbUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+        if (data.accountId) {
+          tmdbAccountId = String(data.accountId);
+          localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        }
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+      } catch (e) {}
+      renderTmdbConnectStatus();
     }
     renderMyTmdbLists(data.lists);
   } catch (e) {
@@ -1027,9 +1123,9 @@ document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
     return;
   }
 });
-
 // --- Simkl OAuth & Personal Lists -----------------------------------------
 function startSimklConnect() {
+  try { localStorage.removeItem('myListAddon:simklDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/simkl/oauth/start';
 }
 
@@ -1037,19 +1133,25 @@ function disconnectSimkl() {
   const input = document.getElementById('simklKeyInput');
   if (input) input.value = '';
   simklAccessToken = '';
+  try { window.simklAccessToken = ''; } catch (e) {}
   simklUsername = '';
+  try { window.simklUsername = ''; } catch (e) {}
   try {
     localStorage.removeItem('myListAddon:simklAccessToken');
     localStorage.removeItem('myListAddon:simklUsername');
     localStorage.removeItem('myListAddon:simklKey');
+    localStorage.setItem('myListAddon:simklDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderSimklConnectStatus();
   scheduleMySimklListsRefresh();
 }
 
 function toggleListsSimklConnection() {
-  if (simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken')) {
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken');
+  if (token && !isDisc) {
     disconnectSimkl();
   } else {
     startSimklConnect();
@@ -1062,6 +1164,7 @@ function pickUpSimklTokenFromUrl() {
   if (match) {
     simklAccessToken = decodeURIComponent(match[1]);
     try {
+      localStorage.removeItem('myListAddon:simklDisconnected');
       localStorage.setItem('myListAddon:simklAccessToken', simklAccessToken);
     } catch (e) {}
     const userMatch = /(?:^|[#&])simkl_username=([^&]+)/.exec(hash);
@@ -1072,6 +1175,7 @@ function pickUpSimklTokenFromUrl() {
       } catch (e) {}
     }
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('Simkl Connected', 'Your Simkl account was successfully connected.', true);
@@ -1114,14 +1218,16 @@ function renderSimklConnectStatus() {
   const disconnectBtn = document.getElementById('simklDisconnectBtn');
   const listsBtn = document.getElementById('listsSimklConnectBtn');
 
-  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
-  if (token) simklAccessToken = token;
-  const user = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
-  const connected = !!(token || key);
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '');
+  if (!isDisc && token) simklAccessToken = token;
+  const user = (typeof simklUsername !== 'undefined' && simklUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:simklUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:simklKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
 
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Simkl';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Simkl';
   }
 
   if (statusEl) {
@@ -1129,23 +1235,24 @@ function renderSimklConnectStatus() {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Simkl</span>';
-    } else if (key) {
-      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Simkl Client ID configured</span>';
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom Simkl Client ID configured</span> <small style="color:var(--muted);">(Account not connected)</small>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
 
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncSimklHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
   const syncWrap = document.getElementById('simklSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
-  if (connected) {
-    scheduleMySimklListsRefresh();
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('mySimklListsResult');
+    if (box) box.innerHTML = '';
   }
 }
 
@@ -1178,6 +1285,14 @@ async function runMySimklLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Simkl lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      simklUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+        localStorage.removeItem('myListAddon:simklDisconnected');
+      } catch (e) {}
+      renderSimklConnectStatus();
     }
     renderMySimklLists(data.lists);
   } catch (e) {
@@ -1316,7 +1431,7 @@ async function syncWatchHistoryToProviderNow(provider, btn) {
   const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
   
   if (!items.length) {
-    if (typeof showToast === 'function') showToast('Your Watch History is currently empty.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Watch History', 'Your Watch History is currently empty.', false);
     else alert('Your Watch History is currently empty.');
     return;
   }
@@ -1355,20 +1470,21 @@ async function syncWatchHistoryToProviderNow(provider, btn) {
       btn.textContent = origText;
     }
     if (!res.ok || !data.ok) {
-      if (typeof showToast === 'function') showToast('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
-      else alert('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
+      const err = data.error || 'Unknown error';
+      if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Failed to sync to ' + cap + ': ' + err, false);
+      else alert('Failed to sync to ' + cap + ': ' + err);
       return;
     }
     const count = data.syncedCount != null ? data.syncedCount : items.length;
-    const msg = '\u2713 Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
-    if (typeof showToast === 'function') showToast(msg);
+    const msg = 'Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Complete', msg, true);
     else alert(msg);
   } catch (err) {
     if (btn) {
       btn.disabled = false;
       btn.textContent = origText;
     }
-    if (typeof showToast === 'function') showToast('Network error syncing to ' + cap + '.');
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Network error syncing to ' + cap + '.', false);
     else alert('Network error syncing to ' + cap + '.');
   }
 }
@@ -1384,8 +1500,9 @@ async function syncAllConnectedAccountsNow(btn) {
   if (simklToken) connectedProviders.push('simkl');
 
   if (!connectedProviders.length) {
-    if (typeof showToast === 'function') showToast('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
-    else alert('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
+    const msg = 'No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them under Settings \u2192 External Accounts & API Keys.';
+    if (typeof showAppAlert === 'function') showAppAlert('No Accounts Connected', msg, false);
+    else alert(msg);
     return;
   }
 

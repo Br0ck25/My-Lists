@@ -1742,19 +1742,17 @@ async function renderAdminDashboard(env) {
     // trip back to the server.
     function renderFeedbackList() {
       const box = document.getElementById('feedbackList');
+      if (!box) return;
       if (!feedbackEntries.length) {
         box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
         return;
       }
-      // Open (not completed) first, newest within each group -- the
-      // fetch itself already comes back newest-first, and new entries are
-      // unshifted onto the front locally, so this only needs to separate
-      // the two groups without disturbing that order.
       const open = feedbackEntries.filter((f) => !f.completed);
       const done = feedbackEntries.filter((f) => f.completed);
       box.innerHTML = open.map(feedbackCardHtml).join('') +
         (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
         (feedbackTruncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+      initFeedbackListEvents();
     }
 
     function feedbackCardHtml(f) {
@@ -1763,21 +1761,128 @@ async function renderAdminDashboard(env) {
       const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
+      const statusLabel = f.status === 'replied' ? '<span class="admin-badge improvement" style="margin-left:6px;">Replied</span>' : (completed ? '<span class="admin-badge other" style="margin-left:6px;">Resolved</span>' : '<span class="admin-badge bug" style="margin-left:6px;">Open</span>');
+
+      const messages = Array.isArray(f.messages) && f.messages.length
+        ? f.messages
+        : [{
+            id: 'msg_init',
+            sender: 'user',
+            senderName: f.creatorName || 'User',
+            text: f.message || '',
+            timestamp: f.createdAt || Date.now()
+          }];
+
+      const messagesHtml = messages.map((m) => {
+        const isAdmin = m.sender === 'admin';
+        const sender = isAdmin ? '\uD83D\uDC68\u200D\uD83D\uDCBB Developer (Admin)' : (m.senderName || who);
+        const mTime = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        const bg = isAdmin ? 'rgba(0,122,255,0.08)' : 'rgba(255,255,255,0.04)';
+        const border = isAdmin ? 'rgba(0,122,255,0.25)' : 'var(--border)';
+        return '<div style="margin-top:6px; padding:8px 12px; border-radius:8px; background:' + bg + '; border:1px solid ' + border + ';">' +
+          '<div style="display:flex; justify-content:space-between; font-size:0.75rem; font-weight:700; color:' + (isAdmin ? 'var(--accent)' : 'var(--text)') + ';">' +
+            '<span>' + escapeHtmlAdmin(sender) + '</span>' +
+            '<span style="color:var(--muted); font-weight:normal;">' + escapeHtmlAdmin(mTime) + '</span>' +
+          '</div>' +
+          '<div style="margin-top:4px; font-size:0.88rem; white-space:pre-wrap; word-break:break-word; color:var(--text);">' + escapeHtmlAdmin(m.text || '') + '</div>' +
+        '</div>';
+      }).join('');
+
       return '<div class="feedback-card' + (completed ? ' completed' : '') + '" id="feedbackCard_' + escapeHtmlAdmin(f.id) + '">' +
         '<div class="feedback-card-header">' +
-          '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+          '<div>' +
+            '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+            statusLabel +
+          '</div>' +
           '<div class="feedback-actions">' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="copyFeedbackMessage(this, ' + escapeHtmlAdmin(JSON.stringify(f.message || '')) + ')">&#x2398; Copy</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="openEditFeedbackModal(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x270E; Edit</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ')">' +
+            '<button type="button" class="admin-select fb-copy-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x2398; Copy</button>' +
+            '<button type="button" class="admin-select fb-edit-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x270E; Edit</button>' +
+            '<button type="button" class="admin-select fb-status-btn" data-id="' + escapeHtmlAdmin(f.id) + '" data-completed="' + (!completed) + '" style="margin:0; cursor:pointer;">' +
               (completed ? '\u21a9 Reopen' : '\u2713 Mark done') +
             '</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);" onclick="deleteFeedbackEntry(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x2715; Delete</button>' +
+            '<button type="button" class="admin-select fb-delete-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);">&#x2715; Delete</button>' +
           '</div>' +
         '</div>' +
-        '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
-        '<div class="feedback-meta">' + when + ' \u2014 ' + who + contact + '</div>' +
-        '</div>';
+        '<div style="margin-top:10px;">' + messagesHtml + '</div>' +
+        '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
+        '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
+          '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply...">' +
+          '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function initFeedbackListEvents() {
+      const listEl = document.getElementById('feedbackList');
+      if (!listEl || listEl._eventsBound) return;
+      listEl._eventsBound = true;
+
+      listEl.addEventListener('click', (e) => {
+        const replyBtn = e.target.closest('.fb-reply-btn');
+        if (replyBtn) {
+          sendAdminFeedbackReply(replyBtn.dataset.id);
+          return;
+        }
+        const copyBtn = e.target.closest('.fb-copy-btn');
+        if (copyBtn) {
+          copyFeedbackMessage(copyBtn, copyBtn.dataset.id);
+          return;
+        }
+        const editBtn = e.target.closest('.fb-edit-btn');
+        if (editBtn) {
+          openEditFeedbackModal(editBtn.dataset.id);
+          return;
+        }
+        const statusBtn = e.target.closest('.fb-status-btn');
+        if (statusBtn) {
+          toggleFeedbackStatus(statusBtn.dataset.id, statusBtn.dataset.completed === 'true');
+          return;
+        }
+        const deleteBtn = e.target.closest('.fb-delete-btn');
+        if (deleteBtn) {
+          deleteFeedbackEntry(deleteBtn.dataset.id);
+          return;
+        }
+      });
+
+      listEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const input = e.target.closest('.fb-reply-input');
+          if (input) {
+            e.preventDefault();
+            sendAdminFeedbackReply(input.dataset.id);
+          }
+        }
+      });
+    }
+
+    async function sendAdminFeedbackReply(id) {
+      const input = document.getElementById('adminReplyInput_' + id);
+      const text = (input ? input.value : '').trim();
+      if (!text) return;
+      input.disabled = true;
+
+      try {
+        const res = await fetch('/admin/api/feedback/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, message: text }),
+        });
+        const data = await res.json().catch(() => null);
+        if (data && data.ok && data.entry) {
+          const idx = feedbackEntries.findIndex((f) => f.id === id);
+          if (idx !== -1) {
+            feedbackEntries[idx] = data.entry;
+          }
+          renderFeedbackList();
+        } else {
+          showAdminAlert('Reply Failed', (data && data.error) || 'Could not send reply.', false);
+          if (input) input.disabled = false;
+        }
+      } catch (e) {
+        showAdminAlert('Connection Error', 'Could not send reply -- check your connection.', false);
+        if (input) input.disabled = false;
+      }
     }
 
     // Lets the admin log an issue directly from the dashboard, without
@@ -1999,9 +2104,18 @@ async function renderAdminDashboard(env) {
       }
     }
 
-    async function copyFeedbackMessage(btn, message) {
+    async function copyFeedbackMessage(btn, id) {
+      const entry = feedbackEntries.find((f) => f.id === id);
+      let text = '';
+      if (entry) {
+        if (Array.isArray(entry.messages) && entry.messages.length) {
+          text = entry.messages.map((m) => (m.sender === 'admin' ? '[Developer] ' : '[User] ') + m.text).join('\\n\\n');
+        } else {
+          text = entry.message || '';
+        }
+      }
       try {
-        await navigator.clipboard.writeText(message);
+        await navigator.clipboard.writeText(text);
         const prevText = btn.innerHTML;
         btn.innerHTML = '&#x2713; Copied!';
         btn.style.color = '#34C759';

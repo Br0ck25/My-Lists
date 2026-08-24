@@ -283,16 +283,8 @@ async function handleDeleteAccount() {
       if (btn) btn.disabled = false;
       return;
     }
-    localStorage.removeItem('myListAddon:creatorName');
-    localStorage.removeItem('myListAddon:creatorKey');
-    localStorage.removeItem('myListAddon:creatorDisplayName');
-    localStorage.removeItem('myListAddon:dashboardListOrder');
-    activeCreator = null;
+    clearLocalAccountData();
     closeModal();
-    renderCreatorProfileBar();
-    renderAccountKeySection();
-    renderCreatorDashboard();
-    renderLocalCustomListsDashboard();
     showAddedToast('Your account and all data have been permanently deleted.');
   } catch (err) {
     if (status) status.innerHTML = '<p class="testresult err">&#x2717; Network error deleting account.</p>';
@@ -418,26 +410,26 @@ function renderTrackPlaybackSection() {
     '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
       '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
       '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
-      '<div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">' +
-        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="flex:1; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
-        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="white-space:nowrap; padding:8px 14px; font-size:0.84rem;">📋 Copy Webhook URL</button>' +
+      '<div class="webhook-input-group">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
       '</div>' +
 
-      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border);">' +
-        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
-          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
+          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
           '<span style="font-weight:600;">Automatically sync media server scrobbles to your Watch History list</span>' +
         '</label>' +
-        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
-          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
+          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
           '<span style="font-weight:600;">Forward scrobbles to connected external accounts (Trakt, Simkl, MDBList)</span>' +
         '</label>' +
         '<div>' +
-          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:5px 12px; font-size:0.82rem;">Sync Current Watch History to Connected Accounts Now</button>' +
+          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:8px 14px; font-size:0.82rem; white-space:normal; line-height:1.35; text-align:center; max-width:100%; width:100%; box-sizing:border-box;">Sync Current Watch History to Connected Accounts Now</button>' +
         '</div>' +
       '</div>' +
 
-      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:10px;">' +
+      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap:8px; margin-top:10px; width:100%; max-width:100%; box-sizing:border-box;">' +
         '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
           '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Plex Webhook Setup</summary>' +
           '<p style="margin:6px 0 4px; color:var(--muted);">1. Open <strong>Plex Web &rarr; Settings &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Click <strong>Save Changes</strong>.</p>' +
@@ -462,7 +454,9 @@ function copyScrobbleWebhookUrl() {
   const input = document.getElementById('scrobbleWebhookInput');
   if (!input || !input.value) return;
   navigator.clipboard.writeText(input.value).then(() => {
-    alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
+    if (typeof showAddedToast === 'function') showAddedToast('Webhook URL copied to clipboard! \u2713');
+    else if (typeof showAppAlert === 'function') showAppAlert('Copied', 'Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.', true);
+    else alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
   }).catch(() => {
     prompt('Copy your Scrobble Webhook URL:', input.value);
   });
@@ -524,23 +518,131 @@ function copyAccountKey() {
   const key = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!key) return;
   navigator.clipboard.writeText(key).then(() => {
-    alert('Key copied to your clipboard.');
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard! \u2713');
+    else alert('Key copied to your clipboard.');
   }).catch(() => {
     prompt('Copy your Key:', key);
   });
 }
 
-function switchCreatorProfile() {
+function clearLocalAccountData() {
   activeCreator = null;
   editingCreatorListSlug = null;
   lastCreatorListsData = null;
-  localStorage.removeItem('myListAddon:creatorName');
-  localStorage.removeItem('myListAddon:creatorKey');
-  renderCreatorProfileBar();
-  renderAccountKeySection();
-  renderWatchlistPreferencesSection();
-  renderTrackPlaybackSection();
-  renderCreatorDashboard();
+
+  // Clear in-memory tokens and credentials
+  traktAccessToken = '';
+  if (typeof traktUsername !== 'undefined') traktUsername = '';
+  mdblistAccessToken = '';
+  if (typeof mdblistUsername !== 'undefined') mdblistUsername = '';
+  simklAccessToken = '';
+  if (typeof simklUsername !== 'undefined') simklUsername = '';
+  tmdbSessionId = '';
+  tmdbAccountId = '';
+  tmdbUsername = '';
+
+  // Clear personal list arrays & tracking sets
+  window._myTraktLists = [];
+  window._myPrivateTraktLists = [];
+  window._myTmdbLists = [];
+  window._mySimklLists = [];
+  window._myMdblistLists = [];
+  window._dismissedContinueWatching = new Set();
+  window._fullyWatchedShowIds = new Set();
+  if (typeof channelDraftItems !== 'undefined') channelDraftItems = [];
+  if (typeof channelDraftPoster !== 'undefined') channelDraftPoster = null;
+  if (typeof channelDraftBackdrop !== 'undefined') channelDraftBackdrop = null;
+  if (typeof editingChannelId !== 'undefined') editingChannelId = null;
+  if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
+
+  // Clear all localStorage keys for account data, credentials, and custom lists
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) {
+        if (
+          k.startsWith('myListAddon:') ||
+          k === 'localCustomLists' ||
+          k === 'localChannels' ||
+          k === 'localMergedChannels' ||
+          k === 'presets'
+        ) {
+          // Preserve persistent UI tab navigation if desired, wipe everything else
+          if (
+            k !== 'myListAddon:activeTab' &&
+            k !== 'myListAddon:settingsSubmenu' &&
+            k !== 'myListAddon:catalogsSubmenu' &&
+            k !== 'myListAddon:discoverSubmenu' &&
+            k !== 'myListAddon:channelsSubmenu' &&
+            k !== 'myListAddon:listsSubmenu'
+          ) {
+            keysToRemove.push(k);
+          }
+        }
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch (e) {}
+
+  // Clear form inputs
+  const inputIds = [
+    'tmdbKeyInput', 'mdblistKeyInput', 'traktKeyInput', 'traktUsernameInput', 'simklKeyInput',
+    'presetNameInput', 'channelNameInput', 'customListNameInput', 'bulkPasteBox', 'importLinkInput',
+    'configJsonBox', 'customListSearchInput', 'channelSearchInput'
+  ];
+  inputIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+
+  // Clear checkboxes
+  const checkboxIds = [
+    'syncTraktHistoryCheckbox', 'syncMdblistHistoryCheckbox', 'syncSimklHistoryCheckbox',
+    'syncMediaServerHistoryCheckbox', 'forwardScrobblesCheckbox', 'trackPlaybackCheck',
+    'removeWatchedFromWatchlistCheck', 'shuffleShelvesCheckbox', 'shuffleItemsCheckbox'
+  ];
+  checkboxIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = false;
+  });
+
+  // Clear rows and list containers
+  const listsEl = document.getElementById('lists');
+  if (listsEl) listsEl.innerHTML = '';
+
+  const resultContainerIds = [
+    'myTraktListsResult', 'myPrivateTraktListsResult', 'myTmdbListsResult',
+    'mySimklListsResult', 'myMdblistListsResult', 'channelDraftList', 'customListDraftList'
+  ];
+  resultContainerIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  });
+
+  // Re-render UI components into logged-out/empty state
+  if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+  if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+  if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+  if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+  if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+  if (typeof renderChannelsList === 'function') renderChannelsList();
+  if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+  if (typeof renderPresetsList === 'function') renderPresetsList();
+  if (typeof renumber === 'function') renumber();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+}
+
+function switchCreatorProfile() {
+  clearLocalAccountData();
+  if (typeof showAddedToast === 'function') {
+    showAddedToast('Signed out \u2713');
+  }
 }
 
 function openRestoreModal() {
@@ -578,6 +680,8 @@ async function submitRestoreProfile() {
         escapeHtml(data.error === 'no-kv' ? 'This Worker has no CONFIGS KV namespace bound.' : (data.error || 'Could not restore.')) + '</p>';
       return;
     }
+    // Clean any prior account state before loading restored account
+    clearLocalAccountData();
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
@@ -587,7 +691,7 @@ async function submitRestoreProfile() {
     renderWatchlistPreferencesSection();
     renderTrackPlaybackSection();
     renderCreatorDashboard();
-    loadCreatorSync();
+    await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
   }
@@ -878,66 +982,170 @@ async function loadCreatorSync() {
 
     if (synced.keys && typeof synced.keys === 'object') {
       try {
-        if (synced.keys.tmdbKey) {
+        const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+        const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+        const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+        const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+        let needPushSync = false;
+
+        if (synced.keys.tmdbKey && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbKey', synced.keys.tmdbKey);
           const el = document.getElementById('tmdbKeyInput');
           if (el) el.value = synced.keys.tmdbKey;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbKey');
+          const el = document.getElementById('tmdbKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:tmdbKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbSessionId) {
+
+        if (synced.keys.tmdbSessionId && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbSessionId', synced.keys.tmdbSessionId);
           window.tmdbSessionId = synced.keys.tmdbSessionId;
+          tmdbSessionId = synced.keys.tmdbSessionId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbSessionId');
+          window.tmdbSessionId = '';
+          tmdbSessionId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbSessionId')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbAccountId) {
+
+        if (synced.keys.tmdbAccountId && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbAccountId', synced.keys.tmdbAccountId);
           window.tmdbAccountId = synced.keys.tmdbAccountId;
+          tmdbAccountId = synced.keys.tmdbAccountId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbAccountId');
+          window.tmdbAccountId = '';
+          tmdbAccountId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbAccountId')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbUsername) {
+
+        if (synced.keys.tmdbUsername && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbUsername', synced.keys.tmdbUsername);
           window.tmdbUsername = synced.keys.tmdbUsername;
+          tmdbUsername = synced.keys.tmdbUsername;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbUsername');
+          window.tmdbUsername = '';
+          tmdbUsername = '';
+        } else if (localStorage.getItem('myListAddon:tmdbUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistKey) {
+
+        if (synced.keys.mdblistKey && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistKey', synced.keys.mdblistKey);
           const el = document.getElementById('mdblistKeyInput');
           if (el) el.value = synced.keys.mdblistKey;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistKey');
+          const el = document.getElementById('mdblistKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:mdblistKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistAccessToken) {
+
+        if (synced.keys.mdblistAccessToken && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
           window.mdblistAccessToken = synced.keys.mdblistAccessToken;
           mdblistAccessToken = synced.keys.mdblistAccessToken;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistAccessToken');
+          window.mdblistAccessToken = '';
+          mdblistAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:mdblistAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistUsername) {
+
+        if (synced.keys.mdblistUsername && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistUsername', synced.keys.mdblistUsername);
           window.mdblistUsername = synced.keys.mdblistUsername;
+          mdblistUsername = synced.keys.mdblistUsername;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistUsername');
+          window.mdblistUsername = '';
+          mdblistUsername = '';
+        } else if (localStorage.getItem('myListAddon:mdblistUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktKey) {
+
+        if (synced.keys.traktKey && !traktDisc) {
           localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
           const el = document.getElementById('traktKeyInput');
           if (el) el.value = synced.keys.traktKey;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktKey');
+          const el = document.getElementById('traktKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:traktKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktUsername) {
+
+        if (synced.keys.traktUsername && !traktDisc) {
           localStorage.setItem('myListAddon:traktUsername', synced.keys.traktUsername);
           const el = document.getElementById('traktUsernameInput');
           if (el) el.value = synced.keys.traktUsername;
+          traktUsername = synced.keys.traktUsername;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktUsername');
+          const el = document.getElementById('traktUsernameInput');
+          if (el) el.value = '';
+          traktUsername = '';
+        } else if (localStorage.getItem('myListAddon:traktUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktAccessToken) {
+
+        if (synced.keys.traktAccessToken && !traktDisc) {
           localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
           window.traktAccessToken = synced.keys.traktAccessToken;
           traktAccessToken = synced.keys.traktAccessToken;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktAccessToken');
+          window.traktAccessToken = '';
+          traktAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:traktAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklKey) {
+
+        if (synced.keys.simklKey && !simklDisc) {
           localStorage.setItem('myListAddon:simklKey', synced.keys.simklKey);
           const el = document.getElementById('simklKeyInput');
           if (el) el.value = synced.keys.simklKey;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklKey');
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:simklKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklAccessToken) {
+
+        if (synced.keys.simklAccessToken && !simklDisc) {
           localStorage.setItem('myListAddon:simklAccessToken', synced.keys.simklAccessToken);
           window.simklAccessToken = synced.keys.simklAccessToken;
           simklAccessToken = synced.keys.simklAccessToken;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklAccessToken');
+          window.simklAccessToken = '';
+          simklAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:simklAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklUsername) {
+
+        if (synced.keys.simklUsername && !simklDisc) {
           localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
           window.simklUsername = synced.keys.simklUsername;
+          simklUsername = synced.keys.simklUsername;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklUsername');
+          window.simklUsername = '';
+          simklUsername = '';
+        } else if (localStorage.getItem('myListAddon:simklUsername')) {
+          needPushSync = true;
         }
+
         if (typeof synced.keys.syncTraktHistory === 'boolean') {
           localStorage.setItem('myListAddon:syncTraktHistory', synced.keys.syncTraktHistory ? 'true' : 'false');
         }
@@ -948,10 +1156,15 @@ async function loadCreatorSync() {
           localStorage.setItem('myListAddon:syncSimklHistory', synced.keys.syncSimklHistory ? 'true' : 'false');
         }
         if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+        if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+        if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+        if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+        if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
         if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
         if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
         if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
         if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
+        if (needPushSync && typeof pushCreatorSync === 'function') pushCreatorSync();
       } catch (e) {}
     }
 
@@ -1844,6 +2057,7 @@ if (_creatorDashEl) {
       addToConfigBtn.classList.add('primary');
       addToConfigBtn.textContent = '+ Add';
       addToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
     } else {
       if (listMeta.type === 'mixed') {
@@ -1866,6 +2080,7 @@ if (_creatorDashEl) {
       addToConfigBtn.classList.remove('primary');
       addToConfigBtn.textContent = 'Remove';
       addToConfigBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
     }
     return;
@@ -1936,6 +2151,11 @@ if (_creatorDashEl) {
     }
 
     if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listMeta.type, slug);
+        removeListFromConfig(null, 'movie', slug);
+        removeListFromConfig(null, 'series', slug);
+      }
       document.querySelectorAll('#lists .url').forEach((urlInput) => {
         const rowPayload = parseCustomListPayloadClient(urlInput.value);
         if (rowPayload && rowPayload.localSlug === slug) {
@@ -1960,6 +2180,7 @@ if (_creatorDashEl) {
       localAddToConfigBtn.classList.add('primary');
       localAddToConfigBtn.textContent = '+ Add';
       localAddToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
       return;
     }
@@ -2010,6 +2231,7 @@ if (_creatorDashEl) {
     localAddToConfigBtn.classList.remove('primary');
     localAddToConfigBtn.textContent = 'Remove';
     localAddToConfigBtn.style.color = 'var(--danger)';
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
     showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
   }
 });
@@ -2645,4 +2867,48 @@ function removeCustomListItemDirect(id, slug, btn) {
   }
 }
 
+function clearWatchHistoryAll() {
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Clear Watch History',
+    'Are you sure you want to remove all items from your Watch History? This will reset your watched history and cannot be undone.',
+    'Clear All',
+    () => {
+      const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      if (map['watch-history']) {
+        map['watch-history'].items = [];
+        map['watch-history'].updatedAt = Date.now();
+        if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      }
+      window._watchedItemIds = new Set();
+      window._rawWatchHistoryItems = [];
+      window._fullyWatchedShowIds = new Set();
+      try {
+        localStorage.removeItem('myListAddon:fullyWatchedShows');
+      } catch (e) {}
 
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+
+      // Refresh list details view if currently visible
+      if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+        const params = window._currentListDetailsParams;
+        if (params && (params.name.toLowerCase().includes('watch history') || params.listUrl === 'autotrack:watch-history' || params.listUrl === 'custom:watch-history')) {
+          if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+          if (typeof _updateListDetailsItemCount === 'function') _updateListDetailsItemCount(0);
+        }
+      }
+
+      // Refresh dashboard if visible
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderLocalCustomListsDashboard === 'function') {
+        const box = document.getElementById('localCustomListsDashboard');
+        if (box) renderLocalCustomListsDashboard(box, true);
+      }
+
+      if (typeof showAddedToast === 'function') showAddedToast('Watch History cleared \u2713');
+    },
+    true
+  );
+}
+window.clearWatchHistoryAll = clearWatchHistoryAll;

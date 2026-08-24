@@ -73,7 +73,8 @@ async function bulkAddLists(btn) {
   const box = document.getElementById('bulkPasteBox');
   const lines = box.value.split('\\n').map((s) => s.trim()).filter(Boolean);
   if (!lines.length) {
-    alert('Paste at least one list URL first, one per line.');
+    if (typeof showAppAlert === 'function') showAppAlert('URL Required', 'Paste at least one list URL first, one per line.', false);
+    else alert('Paste at least one list URL first, one per line.');
     return;
   }
   const mdblistKey = document.getElementById('mdblistKeyInput').value.trim();

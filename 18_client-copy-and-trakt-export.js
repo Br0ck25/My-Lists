@@ -870,7 +870,11 @@ async function runTraktExportImport() {
   // someone can mark History as watched without also wanting a redundant
   // "Trakt Watch History" Custom List cluttering their Custom Lists tab.
   const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
-  if (!relevantCats.length) { alert('Pick at least one category first.'); return; }
+  if (!relevantCats.length) {
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Pick at least one category first.', false);
+    else alert('Pick at least one category first.');
+    return;
+  }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
 
   const created = [];
@@ -959,7 +963,11 @@ async function runTraktExportImport() {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
   }
   if (!msg) msg = 'Nothing to import in the selected categories.';
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(failed.length ? 'Import Finished with Warnings' : 'Import Complete', msg, !failed.length);
+  } else {
+    alert(msg);
+  }
 }
 
 // Turns a pasted list URL's last path segment into a readable starter name
@@ -1110,7 +1118,8 @@ window.runLetterboxdExportImport = async function() {
   // "mark as watched" checkbox is on, not only when both are.
   const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
   if (!relevantCats.length) {
-    alert('Please select at least one category to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Please select at least one category to import.', false);
+    else alert('Please select at least one category to import.');
     return;
   }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
@@ -1200,7 +1209,11 @@ window.runLetterboxdExportImport = async function() {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
   }
   if (!msg) msg = 'Nothing to import in the selected categories.';
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(failed.length ? 'Letterboxd Import Finished' : 'Letterboxd Import Complete', msg, !failed.length);
+  } else {
+    alert(msg);
+  }
 };
 
 // --- Unified Multi-Format List Importer -----------------------------------
@@ -1686,13 +1699,15 @@ async function runUnifiedListImport() {
   const globalAlsoMarkWatched = globalMarkWatchedCheck ? globalMarkWatchedCheck.checked : false;
 
   if (!discoveredImportCategories.length) {
-    alert('Please select at least one file to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('File Required', 'Please select at least one file to import.', false);
+    else alert('Please select at least one file to import.');
     return;
   }
 
   const checkedCatCards = Array.from(document.querySelectorAll('.importCatCheck:checked'));
   if (!checkedCatCards.length) {
-    alert('Please select at least one category/list to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Please select at least one category/list to import.', false);
+    else alert('Please select at least one category/list to import.');
     return;
   }
 

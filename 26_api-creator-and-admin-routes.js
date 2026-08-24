@@ -110,8 +110,41 @@
       // needed here -- see trackSharedApiUse in 05_catalog-core.js for
       // the same pattern elsewhere.
       if (!tmdbKey) bumpStat(env, "apiuse:tmdb");
-      const parts = id.split(":");
-      const imdbId = parts[0];
+      let cleanId = String(id || "").trim();
+      let imdbId = "";
+      let season = null;
+      let episode = null;
+
+      if (cleanId.startsWith("tmdb:")) {
+        const rest = cleanId.slice("tmdb:".length);
+        const tmdbParts = rest.split(":");
+        imdbId = "tmdb:" + tmdbParts[0];
+        if (tmdbParts.length >= 3) {
+          season = Number(tmdbParts[1]);
+          episode = Number(tmdbParts[2]);
+        } else if (tmdbParts.length === 2) {
+          season = Number(tmdbParts[0]);
+          episode = Number(tmdbParts[1]);
+        }
+      } else if (cleanId.startsWith("kitsu:")) {
+        const rest = cleanId.slice("kitsu:".length);
+        const kParts = rest.split(":");
+        imdbId = "kitsu:" + kParts[0];
+        if (kParts.length >= 2) {
+          season = 1;
+          episode = Number(kParts[1]);
+        }
+      } else {
+        const parts = cleanId.split(":");
+        imdbId = parts[0];
+        if (parts.length >= 3) {
+          season = Number(parts[1]);
+          episode = Number(parts[2]);
+        } else if (parts.length === 2) {
+          season = 1;
+          episode = Number(parts[1]);
+        }
+      }
       let matched = "no";
 
       try {
@@ -134,14 +167,15 @@
         blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
         blob.dismissedContinueWatching = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === "object" ? blob.dismissedContinueWatching : {};
 
-        if (stremioType === "series" && parts.length >= 3) {
-          const season = Number(parts[1]);
-          const episode = Number(parts[2]);
-          if (!Number.isFinite(season) || !Number.isFinite(episode)) {
+        if (stremioType === "series" || (season != null && episode != null)) {
+          if (season == null || episode == null || !Number.isFinite(season) || !Number.isFinite(episode)) {
             matched = "no (unrecognized episode id format)";
           } else {
             const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey);
-            const ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
+            let ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
+            if (!ep && seasonData && Array.isArray(seasonData.episodes) && seasonData.episodes.length > 0) {
+              ep = seasonData.episodes[episode - 1] || seasonData.episodes[0];
+            }
             if (!ep) {
               matched = "no (could not look up this episode on TMDB)";
             } else {
@@ -152,12 +186,13 @@
               if (showDetails && showDetails.title) {
                 ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, showDetails.title, "series"));
               }
-              const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === String(ep.id));
+              const epIdStr = String(ep.id || `${imdbId}:${season}:${episode}`);
+              const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
               if (!alreadyWatched) {
                 blob.watchHistory.unshift({
-                  id: String(ep.id),
+                  id: epIdStr,
                   type: "episode",
-                  name: ep.name,
+                  name: ep.name || ("Episode " + episode),
                   poster: ep.still_path || (showDetails && showDetails.poster) || "",
                   showId: imdbId,
                   showTitle: (showDetails && showDetails.title) || "",
@@ -1802,13 +1837,81 @@
         keys.map(async (k) => {
           try {
             const raw = await env.CONFIGS.get(k.name);
-            return raw ? JSON.parse(raw) : null;
+            if (!raw) return null;
+            const entry = JSON.parse(raw);
+            if (!Array.isArray(entry.messages) || !entry.messages.length) {
+              entry.messages = [{
+                id: `msg_init`,
+                sender: "user",
+                senderName: entry.creatorName || "User",
+                text: entry.message || "(Initial message)",
+                timestamp: entry.createdAt || Date.now()
+              }];
+            }
+            return entry;
           } catch {
             return null;
           }
         })
       );
       return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
+    // Allows admin to send a threaded reply back to the user.
+    if (path === "/admin/api/feedback/reply" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      const message = String(body.message || "").trim();
+      if (!id) return json({ ok: false, error: "Missing thread id." }, 400);
+      if (!message) return json({ ok: false, error: "Reply message can't be empty." }, 400);
+
+      const key = `feedback:${id}`;
+      const raw = await env.CONFIGS.get(key);
+      if (!raw) return json({ ok: false, error: "Feedback thread not found." }, 404);
+      let entry;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not parse feedback thread." }, 500);
+      }
+
+      if (!Array.isArray(entry.messages) || !entry.messages.length) {
+        entry.messages = [{
+          id: `msg_init`,
+          sender: "user",
+          senderName: entry.creatorName || "User",
+          text: entry.message || "(Initial message)",
+          timestamp: entry.createdAt || Date.now()
+        }];
+      }
+
+      const replyMsg = {
+        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        sender: "admin",
+        senderName: "Developer",
+        text: message,
+        timestamp: Date.now()
+      };
+      entry.messages.push(replyMsg);
+      entry.updatedAt = Date.now();
+      entry.status = "replied";
+      entry.completed = false;
+
+      try {
+        await env.CONFIGS.put(key, JSON.stringify(entry));
+      } catch (e) {
+        return json({ ok: false, error: "Could not save reply." }, 500);
+      }
+      return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }

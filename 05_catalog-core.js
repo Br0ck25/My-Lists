@@ -19,7 +19,7 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
   // Settings, since otherwise every video played anywhere would ping this
   // addon for no reason.
   if (track) {
-    resources.push({ name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt"] });
+    resources.push({ name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt", "tmdb", "kitsu"] });
   }
   return {
     id: ADDON_ID,
@@ -125,7 +125,7 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
-    else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env);
+    else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env, keys);
     else if (source === "curated") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchCuratedCatalog(entry, skip, keys); }
     else if (source === "published-list") result = await fetchPublishedListCatalog(entry, keys.env);
     else {
@@ -538,14 +538,25 @@ function fetchChannelCatalog(entry, origin) {
     const name = payload.name || entry.name;
     
     const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+    const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
     
+    let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
+    if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
+      const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+      if (match) {
+        matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
+      }
+    }
+
     const channelPoster = isPremadeLogo
       ? getPremadeChannelLogo(payload, origin, isLandscapeShelf)
-      : (isLandscapeShelf ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin));
+      : isShowPoster
+        ? (isLandscapeShelf ? (matchedBackdrop || payload.poster) : payload.poster)
+        : (isLandscapeShelf ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin));
 
     const channelBackdrop = isPremadeLogo
       ? getPremadeChannelLogo(payload, origin, true)
-      : getChannelBackdrop(payload, origin);
+      : (matchedBackdrop || getChannelBackdrop(payload, origin));
 
     metas.push({
       id: "channel_" + channelId,
@@ -582,7 +593,7 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   if (!payload || !payload.items || !payload.items.length) {
     if (payload && (
       (payload.listSlug && (payload.listSlug.startsWith('custom:curated:') || payload.listSlug.startsWith('curated:'))) ||
-      (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows')))
+      (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows') || payload.name.toLowerCase().trim() === 'recommended'))
     )) {
       return fetchCuratedCatalog({ url: payload.listSlug || (entry.type === 'series' ? 'custom:curated:recommended-shows' : 'custom:curated:recommended-movies'), type: entry.type }, skip, keys);
     }
@@ -761,17 +772,31 @@ async function ensureTrackingMigrated(env, username) {
   }
 }
 
-async function fetchAutoTrackedCatalog(entry, env) {
+async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   if (!env || !env.CONFIGS) return [];
   
-  // url format: autotrack:[slug]:[type]:[username]
+  // url format: autotrack:[slug]:[type]:[username] or autotrack:[slug] or custom:[slug]
   // e.g. autotrack:watch-history:movie:brock25
-  const parts = String(entry.url || "").split(":");
-  if (parts.length < 4) return [];
-  
-  const slug = parts[1]; // watch-history, continue-watching, or watchlist
-  const targetType = parts[2]; // movie or series
-  const username = parts[3];
+  const rawUrl = String(entry.url || "").trim();
+  const parts = rawUrl.split(":");
+  let slug = parts[1] || "";
+  let targetType = parts[2] || entry.type || "movie";
+  let username = parts[3] || (keys && (keys.trackCreatorName || keys.username || keys.creatorName)) || "";
+
+  if (rawUrl.startsWith("custom:")) {
+    slug = rawUrl.slice(7);
+  } else if (!slug) {
+    slug = (entry.id || "watch-history").toLowerCase().replace(/_/g, "-");
+  }
+
+  if (!username && keys && keys.configParam) {
+    try {
+      const resolved = await resolveConfig(keys.configParam, env);
+      if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
+    } catch {}
+  }
+
+  if (!username) return [];
   
   try {
     let items;
@@ -1034,18 +1059,33 @@ function buildChannelMeta(entry, origin) {
   });
   // Premade network channels with an official logo
   const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+  const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
+
+  let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
+  if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
+    const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+    if (match) {
+      matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
+    }
+  }
+
+  const channelPoster = isPremadeLogo
+    ? getPremadeChannelLogo(payload, origin, false)
+    : isShowPoster
+      ? payload.poster
+      : getChannelPoster(payload, origin);
   const channelBackdrop = isPremadeLogo
     ? getPremadeChannelLogo(payload, origin, true)
-    : getChannelBackdrop(payload, origin);
+    : (matchedBackdrop || getChannelBackdrop(payload, origin));
 
   return {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: channelBackdrop,
+    poster: channelPoster,
     background: channelBackdrop,
     thumbnail: channelBackdrop,
-    posterShape: "landscape",
+    posterShape: isShowPoster ? "poster" : "landscape",
     videos,
   };
 }

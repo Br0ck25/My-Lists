@@ -15,13 +15,13 @@
  *    lists work fine with no key at all.
  *  - Public trakt.tv lists (https://trakt.tv/users/USER/lists/LIST-SLUG)
  *    are supported too. Trakt requires a Client ID (their term for an API
- *    key) on every request, even for public lists — this Worker uses a
+ *    key) on every request, even for public lists â€” this Worker uses a
  *    single fixed TRAKT_CLIENT_ID (below) for all users; there's no
  *    per-user override in the builder page.
  *  - Public themoviedb.org lists (https://www.themoviedb.org/list/LIST_ID)
  *    are supported too, the same fixed-key way as Trakt (TMDB_API_KEY
  *    below). TMDB list items only carry a TMDB id, so each item needs an
- *    extra external_ids lookup to resolve its IMDB id — those lookups are
+ *    extra external_ids lookup to resolve its IMDB id â€” those lookups are
  *    throttled and cached hard at Cloudflare's edge to stay well under
  *    TMDB's soft per-IP connection limit.
  *  - GET /                            -> builder page (fresh install, external browser)
@@ -42,7 +42,6 @@
  * Deploy with `wrangler deploy` or paste directly into the Cloudflare dashboard.
  * No environment variables or bindings required.
  */
-
 const ADDON_ID = "app.my-list";
 const ADDON_VERSION = "1.4.0";
 const ADDON_NAME = "My Lists";
@@ -3699,19 +3698,17 @@ async function renderAdminDashboard(env) {
     // trip back to the server.
     function renderFeedbackList() {
       const box = document.getElementById('feedbackList');
+      if (!box) return;
       if (!feedbackEntries.length) {
         box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
         return;
       }
-      // Open (not completed) first, newest within each group -- the
-      // fetch itself already comes back newest-first, and new entries are
-      // unshifted onto the front locally, so this only needs to separate
-      // the two groups without disturbing that order.
       const open = feedbackEntries.filter((f) => !f.completed);
       const done = feedbackEntries.filter((f) => f.completed);
       box.innerHTML = open.map(feedbackCardHtml).join('') +
         (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
         (feedbackTruncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+      initFeedbackListEvents();
     }
 
     function feedbackCardHtml(f) {
@@ -3720,21 +3717,128 @@ async function renderAdminDashboard(env) {
       const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
+      const statusLabel = f.status === 'replied' ? '<span class="admin-badge improvement" style="margin-left:6px;">Replied</span>' : (completed ? '<span class="admin-badge other" style="margin-left:6px;">Resolved</span>' : '<span class="admin-badge bug" style="margin-left:6px;">Open</span>');
+
+      const messages = Array.isArray(f.messages) && f.messages.length
+        ? f.messages
+        : [{
+            id: 'msg_init',
+            sender: 'user',
+            senderName: f.creatorName || 'User',
+            text: f.message || '',
+            timestamp: f.createdAt || Date.now()
+          }];
+
+      const messagesHtml = messages.map((m) => {
+        const isAdmin = m.sender === 'admin';
+        const sender = isAdmin ? '\uD83D\uDC68\u200D\uD83D\uDCBB Developer (Admin)' : (m.senderName || who);
+        const mTime = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        const bg = isAdmin ? 'rgba(0,122,255,0.08)' : 'rgba(255,255,255,0.04)';
+        const border = isAdmin ? 'rgba(0,122,255,0.25)' : 'var(--border)';
+        return '<div style="margin-top:6px; padding:8px 12px; border-radius:8px; background:' + bg + '; border:1px solid ' + border + ';">' +
+          '<div style="display:flex; justify-content:space-between; font-size:0.75rem; font-weight:700; color:' + (isAdmin ? 'var(--accent)' : 'var(--text)') + ';">' +
+            '<span>' + escapeHtmlAdmin(sender) + '</span>' +
+            '<span style="color:var(--muted); font-weight:normal;">' + escapeHtmlAdmin(mTime) + '</span>' +
+          '</div>' +
+          '<div style="margin-top:4px; font-size:0.88rem; white-space:pre-wrap; word-break:break-word; color:var(--text);">' + escapeHtmlAdmin(m.text || '') + '</div>' +
+        '</div>';
+      }).join('');
+
       return '<div class="feedback-card' + (completed ? ' completed' : '') + '" id="feedbackCard_' + escapeHtmlAdmin(f.id) + '">' +
         '<div class="feedback-card-header">' +
-          '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+          '<div>' +
+            '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+            statusLabel +
+          '</div>' +
           '<div class="feedback-actions">' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="copyFeedbackMessage(this, ' + escapeHtmlAdmin(JSON.stringify(f.message || '')) + ')">&#x2398; Copy</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="openEditFeedbackModal(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x270E; Edit</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer;" onclick="toggleFeedbackStatus(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ', ' + !completed + ')">' +
+            '<button type="button" class="admin-select fb-copy-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x2398; Copy</button>' +
+            '<button type="button" class="admin-select fb-edit-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x270E; Edit</button>' +
+            '<button type="button" class="admin-select fb-status-btn" data-id="' + escapeHtmlAdmin(f.id) + '" data-completed="' + (!completed) + '" style="margin:0; cursor:pointer;">' +
               (completed ? '\u21a9 Reopen' : '\u2713 Mark done') +
             '</button>' +
-            '<button type="button" class="admin-select" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);" onclick="deleteFeedbackEntry(' + escapeHtmlAdmin(JSON.stringify(f.id)) + ')">&#x2715; Delete</button>' +
+            '<button type="button" class="admin-select fb-delete-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);">&#x2715; Delete</button>' +
           '</div>' +
         '</div>' +
-        '<div class="feedback-message">' + escapeHtmlAdmin(f.message) + '</div>' +
-        '<div class="feedback-meta">' + when + ' \u2014 ' + who + contact + '</div>' +
-        '</div>';
+        '<div style="margin-top:10px;">' + messagesHtml + '</div>' +
+        '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
+        '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
+          '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply...">' +
+          '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function initFeedbackListEvents() {
+      const listEl = document.getElementById('feedbackList');
+      if (!listEl || listEl._eventsBound) return;
+      listEl._eventsBound = true;
+
+      listEl.addEventListener('click', (e) => {
+        const replyBtn = e.target.closest('.fb-reply-btn');
+        if (replyBtn) {
+          sendAdminFeedbackReply(replyBtn.dataset.id);
+          return;
+        }
+        const copyBtn = e.target.closest('.fb-copy-btn');
+        if (copyBtn) {
+          copyFeedbackMessage(copyBtn, copyBtn.dataset.id);
+          return;
+        }
+        const editBtn = e.target.closest('.fb-edit-btn');
+        if (editBtn) {
+          openEditFeedbackModal(editBtn.dataset.id);
+          return;
+        }
+        const statusBtn = e.target.closest('.fb-status-btn');
+        if (statusBtn) {
+          toggleFeedbackStatus(statusBtn.dataset.id, statusBtn.dataset.completed === 'true');
+          return;
+        }
+        const deleteBtn = e.target.closest('.fb-delete-btn');
+        if (deleteBtn) {
+          deleteFeedbackEntry(deleteBtn.dataset.id);
+          return;
+        }
+      });
+
+      listEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const input = e.target.closest('.fb-reply-input');
+          if (input) {
+            e.preventDefault();
+            sendAdminFeedbackReply(input.dataset.id);
+          }
+        }
+      });
+    }
+
+    async function sendAdminFeedbackReply(id) {
+      const input = document.getElementById('adminReplyInput_' + id);
+      const text = (input ? input.value : '').trim();
+      if (!text) return;
+      input.disabled = true;
+
+      try {
+        const res = await fetch('/admin/api/feedback/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, message: text }),
+        });
+        const data = await res.json().catch(() => null);
+        if (data && data.ok && data.entry) {
+          const idx = feedbackEntries.findIndex((f) => f.id === id);
+          if (idx !== -1) {
+            feedbackEntries[idx] = data.entry;
+          }
+          renderFeedbackList();
+        } else {
+          showAdminAlert('Reply Failed', (data && data.error) || 'Could not send reply.', false);
+          if (input) input.disabled = false;
+        }
+      } catch (e) {
+        showAdminAlert('Connection Error', 'Could not send reply -- check your connection.', false);
+        if (input) input.disabled = false;
+      }
     }
 
     // Lets the admin log an issue directly from the dashboard, without
@@ -3956,9 +4060,18 @@ async function renderAdminDashboard(env) {
       }
     }
 
-    async function copyFeedbackMessage(btn, message) {
+    async function copyFeedbackMessage(btn, id) {
+      const entry = feedbackEntries.find((f) => f.id === id);
+      let text = '';
+      if (entry) {
+        if (Array.isArray(entry.messages) && entry.messages.length) {
+          text = entry.messages.map((m) => (m.sender === 'admin' ? '[Developer] ' : '[User] ') + m.text).join('\\n\\n');
+        } else {
+          text = entry.message || '';
+        }
+      }
       try {
-        await navigator.clipboard.writeText(message);
+        await navigator.clipboard.writeText(text);
         const prevText = btn.innerHTML;
         btn.innerHTML = '&#x2713; Copied!';
         btn.style.color = '#34C759';
@@ -4147,7 +4260,7 @@ function detectSource(input) {
   if (s.startsWith("simkl:user:")) return "simkl-user";
   if (s.startsWith("channel:v1:")) return "channel";
   if (s.startsWith("customlist:v1:")) return "custom-list";
-  if (s.startsWith("autotrack:")) return "autotrack";
+  if (s.startsWith("autotrack:") || s === "custom:watch-history" || s === "custom:continue-watching" || s === "custom:watchlist" || s.startsWith("custom:watch-history:") || s.startsWith("custom:continue-watching:")) return "autotrack";
   if (s.startsWith("custom:curated:") || s.startsWith("curated:")) return "curated";
   if (s.startsWith("tmdb:collection:") || /^https?:\/\/(?:www\.)?themoviedb\.org\/collection\//i.test(s)) return "tmdb-collection";
   if (parsePublishedListUrl(s)) return "published-list";
@@ -4348,7 +4461,7 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
   // Settings, since otherwise every video played anywhere would ping this
   // addon for no reason.
   if (track) {
-    resources.push({ name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt"] });
+    resources.push({ name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt", "tmdb", "kitsu"] });
   }
   return {
     id: ADDON_ID,
@@ -4454,7 +4567,7 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
-    else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env);
+    else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env, keys);
     else if (source === "curated") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchCuratedCatalog(entry, skip, keys); }
     else if (source === "published-list") result = await fetchPublishedListCatalog(entry, keys.env);
     else {
@@ -4867,14 +4980,25 @@ function fetchChannelCatalog(entry, origin) {
     const name = payload.name || entry.name;
     
     const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+    const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
     
+    let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
+    if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
+      const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+      if (match) {
+        matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
+      }
+    }
+
     const channelPoster = isPremadeLogo
       ? getPremadeChannelLogo(payload, origin, isLandscapeShelf)
-      : (isLandscapeShelf ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin));
+      : isShowPoster
+        ? (isLandscapeShelf ? (matchedBackdrop || payload.poster) : payload.poster)
+        : (isLandscapeShelf ? getChannelBackdrop(payload, origin) : getChannelPoster(payload, origin));
 
     const channelBackdrop = isPremadeLogo
       ? getPremadeChannelLogo(payload, origin, true)
-      : getChannelBackdrop(payload, origin);
+      : (matchedBackdrop || getChannelBackdrop(payload, origin));
 
     metas.push({
       id: "channel_" + channelId,
@@ -4911,7 +5035,7 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   if (!payload || !payload.items || !payload.items.length) {
     if (payload && (
       (payload.listSlug && (payload.listSlug.startsWith('custom:curated:') || payload.listSlug.startsWith('curated:'))) ||
-      (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows')))
+      (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows') || payload.name.toLowerCase().trim() === 'recommended'))
     )) {
       return fetchCuratedCatalog({ url: payload.listSlug || (entry.type === 'series' ? 'custom:curated:recommended-shows' : 'custom:curated:recommended-movies'), type: entry.type }, skip, keys);
     }
@@ -5090,17 +5214,31 @@ async function ensureTrackingMigrated(env, username) {
   }
 }
 
-async function fetchAutoTrackedCatalog(entry, env) {
+async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   if (!env || !env.CONFIGS) return [];
   
-  // url format: autotrack:[slug]:[type]:[username]
+  // url format: autotrack:[slug]:[type]:[username] or autotrack:[slug] or custom:[slug]
   // e.g. autotrack:watch-history:movie:brock25
-  const parts = String(entry.url || "").split(":");
-  if (parts.length < 4) return [];
-  
-  const slug = parts[1]; // watch-history, continue-watching, or watchlist
-  const targetType = parts[2]; // movie or series
-  const username = parts[3];
+  const rawUrl = String(entry.url || "").trim();
+  const parts = rawUrl.split(":");
+  let slug = parts[1] || "";
+  let targetType = parts[2] || entry.type || "movie";
+  let username = parts[3] || (keys && (keys.trackCreatorName || keys.username || keys.creatorName)) || "";
+
+  if (rawUrl.startsWith("custom:")) {
+    slug = rawUrl.slice(7);
+  } else if (!slug) {
+    slug = (entry.id || "watch-history").toLowerCase().replace(/_/g, "-");
+  }
+
+  if (!username && keys && keys.configParam) {
+    try {
+      const resolved = await resolveConfig(keys.configParam, env);
+      if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
+    } catch {}
+  }
+
+  if (!username) return [];
   
   try {
     let items;
@@ -5363,18 +5501,33 @@ function buildChannelMeta(entry, origin) {
   });
   // Premade network channels with an official logo
   const isPremadeLogo = Boolean(payload.poster && (payload.poster.includes("/api/channel-logo") || payload.isPreset || payload.networkId));
+  const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
+
+  let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
+  if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
+    const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+    if (match) {
+      matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
+    }
+  }
+
+  const channelPoster = isPremadeLogo
+    ? getPremadeChannelLogo(payload, origin, false)
+    : isShowPoster
+      ? payload.poster
+      : getChannelPoster(payload, origin);
   const channelBackdrop = isPremadeLogo
     ? getPremadeChannelLogo(payload, origin, true)
-    : getChannelBackdrop(payload, origin);
+    : (matchedBackdrop || getChannelBackdrop(payload, origin));
 
   return {
     id: "channel_" + channelId,
     type: "series",
     name: name,
-    poster: channelBackdrop,
+    poster: channelPoster,
     background: channelBackdrop,
     thumbnail: channelBackdrop,
-    posterShape: "landscape",
+    posterShape: isShowPoster ? "poster" : "landscape",
     videos,
   };
 }
@@ -7889,6 +8042,49 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
+  // Precomputed here (same pattern as the *Html fragments above) rather
+  // than built inline inside the giant HTML template literal below --
+  // this file's template literal has bitten past changes before with
+  // subtle escaping issues (see e.g. the doubled-backslash regex gotcha
+  // elsewhere in renderBuilder), so anything with its own quotes/braces/
+  // JSON gets built as a plain variable first and just substituted in as
+  // one clean ${seoHeadHtml}.
+  //
+  // The two modes render different things: the plain / install page
+  // (isConfigureMode false) is the only URL meant to be publicly
+  // discoverable, so it gets the real title/description/OG/JSON-LD.
+  // /:config/configure pages carry a personal base64 config (and any
+  // personal API keys the user pasted in) baked straight into the URL
+  // path -- there's no reason for a search engine to crawl, index, or
+  // cache one of those, so those get a plain noindex instead of any of
+  // the SEO metadata below.
+  const seoHeadHtml = isConfigureMode
+    ? `<title>${ADDON_NAME} — Configure</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="canonical" href="${origin}/">`
+    : `<title>${ADDON_NAME} — Self-Hosted Stremio Catalogs from MDBList, Trakt, TMDB &amp; Simkl</title>
+<meta name="description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account -- no third-party server, no cost, your data stays yours. Includes Watch History, Continue Watching, and a full Custom List builder.">
+<link rel="canonical" href="${origin}/">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="website">
+<meta property="og:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
+<meta property="og:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account -- your data stays yours.">
+<meta property="og:url" content="${origin}/">
+<meta property="og:image" content="${origin}/icon.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
+<meta name="twitter:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account.">
+<script type="application/ld+json">${JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        name: ADDON_NAME,
+        applicationCategory: "MultimediaApplication",
+        operatingSystem: "Any",
+        description:
+          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own free Cloudflare Worker.",
+        offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+        url: origin + "/",
+      })}</script>`;
   const hasInitial = initialEntries.length > 0;
   const initialEntriesJson = JSON.stringify(
     hasInitial
@@ -7923,7 +8119,7 @@ function renderBuilder(
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#F2F2F7">
 <link rel="manifest" href="${origin}/app.webmanifest">
-<title>${ADDON_NAME}</title>
+${seoHeadHtml}
 <link rel="icon" type="image/png" href="${origin}/icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -8705,6 +8901,64 @@ function renderBuilder(
     white-space: nowrap;
   }
 
+  /* --- Settings Subpanels & Key Display Mobile Responsiveness ------------- */
+  .settings-subpanel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    overflow-x: hidden;
+  }
+  .creator-key-display {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    user-select: all;
+    -webkit-user-select: all;
+    max-width: 100%;
+    box-sizing: border-box;
+    letter-spacing: 0.5px;
+    margin: 4px 0 10px;
+  }
+  .webhook-input-group {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .webhook-input-group input {
+    flex: 1 1 200px;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .webhook-input-group button {
+    flex: none;
+    white-space: nowrap;
+  }
+  @media (max-width: 640px) {
+    .webhook-input-group {
+      flex-direction: column;
+    }
+    .webhook-input-group input,
+    .webhook-input-group button {
+      width: 100% !important;
+      flex: 1 1 100% !important;
+    }
+  }
+
   /* 9-Poster Preview Strip in List Cards (Desktop) / 3-Poster (Mobile) */
   .list-card-posters, .list-card-5posters {
     display: grid;
@@ -9138,6 +9392,252 @@ function renderBuilder(
     width: 36px; height: 54px; object-fit: cover; border-radius: 4px; flex: none; cursor: pointer;
   }
   .custom-list-pick-poster.empty-poster { background: transparent; }
+  .channel-poster-choice {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    border-radius: 8px;
+    padding: 6px;
+    cursor: pointer;
+    background: var(--surface);
+    border: 2px solid transparent;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+    user-select: none;
+  }
+  .channel-poster-choice:hover {
+    border-color: rgba(0, 122, 255, 0.4);
+  }
+  .channel-poster-choice.selected {
+    border-color: var(--accent);
+    background: rgba(0, 122, 255, 0.08);
+  }
+  .channel-poster-choice .channel-poster-thumb-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .channel-poster-choice .channel-poster-thumb-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .channel-poster-choice .channel-poster-check {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    z-index: 2;
+  }
+  .channel-poster-choice.selected .channel-poster-check {
+    display: flex;
+  }
+  .channel-poster-choice .channel-poster-title {
+    width: 100%;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 5px;
+  }
+  .channel-poster-choice .channel-poster-meta {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  .channel-crossover-banner {
+    position: relative;
+    background: linear-gradient(135deg, rgba(0, 122, 255, 0.12) 0%, rgba(88, 86, 214, 0.12) 100%);
+    border: 1px solid rgba(0, 122, 255, 0.35);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .channel-crossover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .channel-crossover-title {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .channel-crossover-badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .channel-crossover-desc {
+    font-size: 0.8rem;
+    color: var(--muted);
+    line-height: 1.35;
+    margin: 0;
+  }
+  .channel-crossover-parts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 4px 0 2px;
+  }
+  .channel-crossover-chip {
+    font-size: 0.72rem;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .channel-crossover-chip.present {
+    background: rgba(52, 199, 89, 0.15);
+    border-color: rgba(52, 199, 89, 0.4);
+    color: #34C759;
+  }
+  .channel-crossover-chip.missing {
+    background: rgba(255, 149, 0, 0.15);
+    border-color: rgba(255, 149, 0, 0.4);
+    color: #FF9500;
+  }
+  .channel-crossover-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    flex-wrap: wrap;
+  }
+  /* Support & Feedback Chat */
+  .support-chat-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  .support-threads-bar {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .support-thread-pill {
+    padding: 6px 12px;
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text);
+  }
+  .support-thread-pill.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .support-messages-stream {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 380px;
+    min-height: 180px;
+    overflow-y: auto;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+  }
+  .support-bubble {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+  .support-bubble.user {
+    align-self: flex-end;
+    background: var(--accent);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .support-bubble.admin {
+    align-self: flex-start;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-bottom-left-radius: 4px;
+  }
+  .support-bubble-sender {
+    font-size: 0.72rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    opacity: 0.85;
+  }
+  .support-bubble-time {
+    font-size: 0.68rem;
+    opacity: 0.65;
+    margin-top: 4px;
+    text-align: right;
+  }
+  .support-reply-composer {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+  }
+  .support-reply-composer textarea {
+    flex: 1;
+    min-height: 44px;
+    max-height: 120px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.88rem;
+    resize: vertical;
+  }
   .row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 10px; width: 100%; }
   .field-row { display: grid; grid-template-columns: 1fr; gap: 10px; width: 100%; }
   button, .actions a {
@@ -9176,6 +9676,189 @@ function renderBuilder(
   .btn-nuvio   { background: linear-gradient(135deg, #FF5E3A, #FF2A68); color: #fff; }
   .btn-wako    { background: linear-gradient(135deg, #007AFF, #34AADC); color: #fff; }
   .actions { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+
+  /* --- Install Result Card & Manifest Link Display ------------------------ */
+  #result {
+    margin-top: 16px;
+  }
+  .install-result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    animation: resultSlideIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes resultSlideIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .install-result-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .install-result-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: var(--radius-pill);
+    background: rgba(52, 199, 89, 0.12);
+    color: #34C759;
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.01em;
+  }
+  .install-result-badge svg {
+    stroke: currentColor;
+  }
+  .install-result-sub {
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .install-url-container {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    border: 1.5px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 12px 14px;
+    gap: 10px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    min-width: 0;
+  }
+  .install-url-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .install-url-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    font-size: 0.82rem;
+    color: var(--text-2);
+  }
+  .install-url-label svg {
+    color: var(--accent);
+  }
+  .install-url-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    border: 1.5px solid var(--border-strong);
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: var(--shadow-sm);
+    min-height: unset;
+    font-family: inherit;
+  }
+  .install-url-copy-btn:hover {
+    background: var(--panel-strong);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .install-url-box {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.84rem;
+    font-weight: 500;
+    color: var(--text);
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    user-select: all;
+    -webkit-user-select: all;
+    line-height: 1.5;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+  .install-hint-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: rgba(0, 122, 255, 0.05);
+    border: 1px solid rgba(0, 122, 255, 0.13);
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  .install-hint-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+    color: var(--text);
+    font-size: 0.82rem;
+  }
+
+  .trakt-connect-actions {
+    display: flex;
+    flex-direction: row;
+    width: auto;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  @media (max-width: 640px) {
+    .trakt-connect-actions {
+      display: flex !important;
+      flex-direction: row !important;
+      width: 100% !important;
+      gap: 8px !important;
+      flex-wrap: wrap !important;
+    }
+    .trakt-connect-actions #traktConnectBtn,
+    .trakt-connect-actions #traktDeviceBtn {
+      flex: 1 1 calc(50% - 4px) !important;
+      min-width: 0 !important;
+      padding: 8px 4px !important;
+      font-size: 0.8rem !important;
+      white-space: nowrap !important;
+      text-overflow: ellipsis !important;
+      overflow: hidden !important;
+    }
+    .trakt-connect-actions #traktDisconnectBtn {
+      flex: 1 1 100% !important;
+      width: 100% !important;
+      padding: 8px 4px !important;
+      font-size: 0.8rem !important;
+    }
+  }
+  @media (min-width: 641px) {
+    .trakt-connect-actions {
+      display: flex !important;
+      flex-direction: row !important;
+      width: auto !important;
+      gap: 8px !important;
+      flex-wrap: wrap !important;
+    }
+    .trakt-connect-actions button {
+      flex: none !important;
+      width: auto !important;
+    }
+  }
+
+
 
   /* --- Catalog Shelves (#lists in My Catalogs Tab) ------------------------ */
   #lists { display: grid; gap: 10px; grid-template-columns: 1fr; width: 100%; max-width: 100%; }
@@ -9567,6 +10250,7 @@ function renderBuilder(
       </div>
     </div>
     <div class="app-header-actions">
+      <a href="${origin}/guide" style="color:var(--text-2); font-size:0.82rem; font-weight:600; text-decoration:none; padding:4px 8px; white-space:nowrap;" title="Guide: how to use this add-on">Guide</a>
       <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
       <div id="creatorProfileBar"></div>
     </div>
@@ -9646,7 +10330,7 @@ function renderBuilder(
       <p id="detailSubtitle" style="margin-top:4px;">Loading&hellip;</p>
     </div>
     <div id="detailFilterBar" class="detail-filter-bar" style="display:none;">
-      <div id="whFilterControls" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+      <div id="whFilterControls" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; width:100%;">
         <button type="button" class="subnav-pill active wh-filter-pill" data-wh-filter="all" onclick="setWatchHistoryFilter('all', this)">All</button>
         <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="movie" onclick="setWatchHistoryFilter('movie', this)">Movies</button>
         <button type="button" class="subnav-pill wh-filter-pill" data-wh-filter="series" onclick="setWatchHistoryFilter('series', this)">Shows</button>
@@ -9654,6 +10338,7 @@ function renderBuilder(
           <input type="checkbox" id="whGroupShowsCheckbox" onchange="toggleWatchHistoryGroupShows(this.checked)" style="accent-color:var(--accent); cursor:pointer;">
           <span>Shows instead of episodes</span>
         </label>
+        <button type="button" class="subnav-pill" id="whClearHistoryBtn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear History</button>
       </div>
       <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center;">
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
@@ -10349,6 +11034,8 @@ if ('serviceWorker' in navigator) {
       <div id="channelSearchResult"></div>
       <div id="channelEpisodePicker"></div>
 
+      <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
+
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
@@ -10360,7 +11047,14 @@ if ('serviceWorker' in navigator) {
         <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
       </label>
 
-      <div class="row" style="margin-top:10px;">
+      <!-- Channel Poster Selection Section -->
+      <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
+        <p style="margin:0 0 4px; font-weight:600; font-size:0.85rem;">Channel Poster:</p>
+        <p style="margin:0 0 10px; color:var(--muted); font-size:0.8rem;">Choose a show poster (ranked by most episodes) or choose our custom channel poster.</p>
+        <div id="channelPosterChoicesGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:10px;"></div>
+      </div>
+
+      <div class="row" style="margin-top:12px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>
@@ -10395,8 +11089,8 @@ if ('serviceWorker' in navigator) {
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
     <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('external', this)">External Accounts &amp; API Keys</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">&#x1F4BE; Presets &amp; Backup</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">&#x1F4AC; Feedback and Support</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">Presets &amp; Backup</button>
+    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">Feedback and Support</button>
   </div>
 
   <!-- Submenu 2: Presets & Backup -->
@@ -10483,6 +11177,14 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Watch History</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History.</p>
+      <div id="watchHistorySettingsSection">
+        <button type="button" class="secondary lc-btn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Watch History</button>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Auto-Track &amp; Media Server Scrobbling</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Automatically scrobble and track watched movies and TV episodes across your streaming apps (Stremio, Nuvio, Wako, etc.) and home media servers (Plex, Jellyfin, Emby) into your personal Watch History and Continue Watching.</p>
       <div id="trackPlaybackSection"></div>
@@ -10507,7 +11209,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom TMDB API Key / Token</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free TMDB API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent-2);">themoviedb.org/settings/api</a>.</small></p>
           </div>
         </details>
@@ -10517,10 +11219,10 @@ if ('serviceWorker' in navigator) {
       <div id="traktSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Trakt</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.83rem;">Connect your Trakt account to import your personal lists, watchlist, and collection, or use a custom Client ID.</p>
-        <div class="actions trakt-connect-actions" style="display:flex; flex-direction:row; width:100%; gap:8px; flex-wrap:nowrap; margin-bottom:10px;">
-          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect Trakt Account</button>
-          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()" style="flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">Connect with PIN / Code</button>
-          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none; flex:1 1 0; min-width:0; padding:8px 4px; font-size:0.8rem;" onclick="disconnectTrakt()">Disconnect</button>
+        <div class="actions trakt-connect-actions">
+          <button type="button" class="secondary" id="traktConnectBtn" onclick="startTraktConnect()">Connect Trakt Account</button>
+          <button type="button" class="secondary" id="traktDeviceBtn" onclick="startTraktDeviceLogin()">Connect with PIN / Code</button>
+          <button type="button" class="secondary" id="traktDisconnectBtn" style="display:none;" onclick="disconnectTrakt()">Disconnect</button>
         </div>
         <p id="traktConnectStatus" style="margin:0 0 10px; font-size:0.85rem;"></p>
         <div id="traktSyncHistoryWrap" style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid var(--border);">
@@ -10537,10 +11239,10 @@ if ('serviceWorker' in navigator) {
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
             <div class="row">
-              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <div class="row" style="margin-top:8px;">
-              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <p style="margin-top:4px;"><small>Create a free Trakt Client ID at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--accent-2);">trakt.tv/oauth/applications</a>.</small></p>
           </div>
@@ -10569,7 +11271,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
           </div>
         </details>
@@ -10597,7 +11299,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
@@ -10662,34 +11364,64 @@ if ('serviceWorker' in navigator) {
   <!-- Submenu 3: Feedback & Support -->
   <div class="settings-subpanel" id="settingsSubFeedback" style="display:none;">
     <div class="panel">
-      <h2 class="panel-title">Send Feedback &amp; Support</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Found a bug, have an idea, or want to see something improved? This goes straight to the developer.</p>
-      <div class="row">
-        <select id="feedbackCategorySelect">
-          <option value="bug">Bug</option>
-          <option value="improvement">Improvement</option>
-          <option value="idea">Idea</option>
-          <option value="other">Other</option>
-        </select>
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+        <div>
+          <h2 class="panel-title" style="margin:0;">Support &amp; Developer Chat</h2>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.85rem;">Have a question, found a bug, or have a suggestion? Chat directly with the developer.</p>
+        </div>
+        <button type="button" class="secondary lc-btn" id="btnNewFeedbackTicket" onclick="toggleNewFeedbackForm(true)" style="padding:6px 14px; font-size:0.85rem;">+ New Message</button>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <textarea id="feedbackMessageInput" rows="5" style="width:100%;" placeholder="What's on your mind?"></textarea>
+
+      <!-- Active Threads Selector -->
+      <div id="supportThreadsBar" class="support-threads-bar" style="display:none; margin-bottom:12px;"></div>
+
+      <!-- Chat View -->
+      <div id="supportChatView" style="display:none;">
+        <div id="supportMessagesStream" class="support-messages-stream"></div>
+        <div class="support-reply-composer" style="margin-top:10px;">
+          <textarea id="supportReplyInput" placeholder="Type a reply to the developer..." onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendUserFeedbackReply();}"></textarea>
+          <button type="button" class="primary lc-btn" id="supportReplySendBtn" onclick="sendUserFeedbackReply()" style="min-height:44px; padding:0 20px;">Send</button>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+          <span id="supportChatStatus" style="font-size:0.8rem; color:var(--muted);"></span>
+          <button type="button" class="secondary lc-btn" onclick="refreshUserFeedbackThreads()" style="padding:2px 8px; font-size:0.75rem; border:none; background:none; color:var(--muted); cursor:pointer;">&#x21BB; Refresh</button>
+        </div>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" id="feedbackContactInput" placeholder="Contact info (optional) — email, Discord, etc., if you want a reply">
+
+      <!-- New Message / Initial Form -->
+      <div id="newFeedbackFormWrap">
+        <div class="row">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Category</label>
+          <select id="feedbackCategorySelect">
+            <option value="bug">Bug Report</option>
+            <option value="improvement">Improvement / Feature Request</option>
+            <option value="idea">Idea / Suggestion</option>
+            <option value="other">General Question / Other</option>
+          </select>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Message</label>
+          <textarea id="feedbackMessageInput" rows="4" style="width:100%;" placeholder="What would you like help with or what did you find?"></textarea>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Contact Info (optional)</label>
+          <input type="text" id="feedbackContactInput" placeholder="Email, Discord username, etc. (optional)">
+        </div>
+        <div class="actions" style="margin-top:10px; gap:8px; justify-content:flex-start;">
+          <button type="button" class="primary lc-btn" id="feedbackSubmitBtn" onclick="submitFeedback()">Send Message</button>
+          <button type="button" class="secondary lc-btn" id="feedbackCancelNewBtn" style="display:none;" onclick="toggleNewFeedbackForm(false)">Cancel</button>
+        </div>
+        <p id="feedbackStatus" style="margin-top:8px; font-size:0.85rem;"></p>
       </div>
-      <div class="actions" style="margin-top:10px;">
-        <button type="button" class="primary" id="feedbackSubmitBtn" onclick="submitFeedback()">Send feedback</button>
-      </div>
-      <p id="feedbackStatus" style="margin-top:8px;"></p>
     </div>
 
-    <!-- Buy Me a Coffee Support Section -->
+    <!-- Support & Recommended Debrid Section -->
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Support</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon.</p>
-      <div class="actions" style="flex-direction:row; width:auto;">
-        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">&#x2615; Buy me a coffee</a>
+      <h2 class="panel-title">Support &amp; Recommended Debrid</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon, or sign up for TorBox debrid using our referral link.</p>
+      <div class="actions" style="flex-direction:row; width:auto; gap:10px; flex-wrap:wrap;">
+        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Buy me a coffee</a>
+        <a href="https://torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1" target="_blank" rel="noopener" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill); border-color:rgba(0,122,255,0.4); color:#ffffff;">Try TorBox Debrid (Referral)</a>
       </div>
     </div>
   </div>
@@ -10878,17 +11610,43 @@ function getListCleanPath(listUrl, name) {
 }
 
 function isListAddedToConfig(url, type, slug) {
+  let targetSlug = slug || '';
+  if (!targetSlug && url) {
+    if (url.startsWith('autotrack:')) {
+      targetSlug = url.split(':')[1] || '';
+    } else if (url.startsWith('custom:') && !url.startsWith('custom:curated:')) {
+      targetSlug = url.slice('custom:'.length);
+    } else if (url.startsWith('customlist:v1:')) {
+      const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
+      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+    }
+  }
+
   const entries = document.querySelectorAll('#lists .entry');
   for (const entry of entries) {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
-    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    if (type && t && t !== type && t !== 'both' && type !== 'both' && type !== 'mixed' && t !== 'mixed') {
+      if (targetSlug !== 'continue-watching' && targetSlug !== 'watch-history' && targetSlug !== 'watchlist') {
+        continue;
+      }
+    }
     const urlInputs = entry.querySelectorAll('.url');
     for (const el of urlInputs) {
       const u = el.value.trim();
-      if (url && u === url.trim()) return true;
-      if (slug) {
-        const payload = parseCustomListPayloadClient(u);
-        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) return true;
+      if (url && (u === url.trim() || (u.startsWith('autotrack:') && url.startsWith('autotrack:') && u.split(':')[1] === url.split(':')[1]))) return true;
+      if (targetSlug) {
+        if (u === 'custom:' + targetSlug || u === 'autotrack:' + targetSlug) return true;
+        if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) return true;
+        if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) return true;
+        const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) return true;
+      }
+    }
+    if (targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
+      const nameInput = entry.querySelector('.name');
+      const cleanName = targetSlug.replace('-', ' ');
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+        return true;
       }
     }
   }
@@ -10896,33 +11654,127 @@ function isListAddedToConfig(url, type, slug) {
 }
 
 function removeListFromConfig(url, type, slug) {
+  let targetSlug = slug || '';
+  if (!targetSlug && url) {
+    if (url.startsWith('autotrack:')) {
+      targetSlug = url.split(':')[1] || '';
+    } else if (url.startsWith('custom:') && !url.startsWith('custom:curated:')) {
+      targetSlug = url.slice('custom:'.length);
+    } else if (url.startsWith('customlist:v1:')) {
+      const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
+      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+    }
+  }
+
   const entries = document.querySelectorAll('#lists .entry');
   let removed = false;
   for (const entry of entries) {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
-    if (type && t && t !== type && t !== 'both' && type !== 'both') continue;
+    if (type && t && t !== type && t !== 'both' && type !== 'both' && type !== 'mixed' && t !== 'mixed') {
+      if (targetSlug !== 'continue-watching' && targetSlug !== 'watch-history' && targetSlug !== 'watchlist') {
+        continue;
+      }
+    }
     const urlInputs = entry.querySelectorAll('.url');
+    let match = false;
     for (const el of urlInputs) {
       const u = el.value.trim();
-      let match = false;
-      if (url && u === url.trim()) match = true;
-      if (slug) {
-        const payload = parseCustomListPayloadClient(u);
-        if (payload && (payload.localSlug === slug || payload.listSlug === slug || payload.slug === slug)) match = true;
+      if (url && (u === url.trim() || (u.startsWith('autotrack:') && url.startsWith('autotrack:') && u.split(':')[1] === url.split(':')[1]))) { match = true; break; }
+      if (targetSlug) {
+        if (u === 'custom:' + targetSlug || u === 'autotrack:' + targetSlug) { match = true; break; }
+        if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) { match = true; break; }
+        if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) { match = true; break; }
+        const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
       }
-      if (match) {
-        entry.remove();
-        removed = true;
-        break;
+    }
+    if (!match && targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
+      const nameInput = entry.querySelector('.name');
+      const cleanName = targetSlug.replace('-', ' ');
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+        match = true;
       }
+    }
+    if (match) {
+      entry.remove();
+      removed = true;
     }
   }
   if (removed) {
-    renumber();
-    saveState();
+    if (typeof renumber === 'function') renumber();
+    if (typeof saveState === 'function') saveState();
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
   }
   return removed;
 }
+
+function updateAllListAddButtons() {
+  // 1. Local list cards in My Lists
+  document.querySelectorAll('.localListAddToConfigBtn').forEach((btn) => {
+    const slug = btn.dataset.slug;
+    if (!slug) return;
+    const card = btn.closest('.list-card');
+    const type = card ? card.dataset.listType : null;
+    const isAdded = isListAddedToConfig(null, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 2. Creator Profile server list cards
+  document.querySelectorAll('.creatorListAddToConfigBtn').forEach((btn) => {
+    const slug = btn.dataset.slug;
+    if (!slug) return;
+    const card = btn.closest('.list-card');
+    const type = card ? card.dataset.listType : null;
+    const isAdded = isListAddedToConfig(null, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 3. See All / List Details page add button
+  const detailAddBtn = document.getElementById('detailAddBtn');
+  if (detailAddBtn && window._currentListDetailsParams) {
+    const { listUrl, type } = window._currentListDetailsParams;
+    const isAdded = isListAddedToConfig(listUrl, type);
+    detailAddBtn.classList.toggle('is-added', isAdded);
+    detailAddBtn.classList.toggle('secondary', isAdded);
+    detailAddBtn.classList.toggle('primary', !isAdded);
+    detailAddBtn.textContent = isAdded ? 'Remove' : '+ Add';
+    detailAddBtn.style.color = isAdded ? 'var(--danger)' : '';
+  }
+
+  // 4. Curated list add buttons
+  document.querySelectorAll('.curated-add-btn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const slug = btn.dataset.slug;
+    const isAdded = isListAddedToConfig(url, type, slug);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+
+  // 5. Search result list add buttons
+  document.querySelectorAll('.list-search-add-btn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const isAdded = isListAddedToConfig(url, type);
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+  });
+}
+
 
 function navigateBackFromDetail() {
   const currentTab = document.querySelector('.tab-panel:not([hidden])')?.dataset?.tabPanel;
@@ -11279,7 +12131,8 @@ function switchListsSubmenu(name, btn) {
       runMyMdblistLists();
     }
     const traktBox = document.getElementById('myTraktListsResult');
-    const hasTraktContent = traktBox && traktBox.children.length > 0;
+    const privateTraktBox = document.getElementById('myPrivateTraktListsResult');
+    const hasTraktContent = (traktBox && traktBox.children.length > 0) || (privateTraktBox && privateTraktBox.children.length > 0);
     if (!hasTraktContent && typeof runMyTraktLists === 'function') {
       runMyTraktLists();
     }
@@ -11333,13 +12186,204 @@ function switchSettingsSubmenu(name, btn) {
   if (name === 'external' && typeof populateImportTargetLists === 'function') {
     populateImportTargetLists();
   }
+  if (name === 'feedback' && typeof loadUserFeedbackThreads === 'function') {
+    loadUserFeedbackThreads();
+  }
 }
 
-// Sends a Settings > Feedback submission to the server -- deliberately
-// works with or without a Creator Profile (attaches the username if
-// signed in, purely informational, not required) since anyone should be
-// able to report a bug or suggest something without needing an account
-// first.
+// --- Two-Way Support & Feedback Chat Controller ------------------------------
+let userFeedbackThreads = [];
+let activeFeedbackThreadId = null;
+let isComposingNewFeedback = false;
+
+function getUserFeedbackThreadIds() {
+  try {
+    const raw = localStorage.getItem('myListAddon:feedbackThreadIds');
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveUserFeedbackThreadId(threadId) {
+  if (!threadId) return;
+  try {
+    const ids = getUserFeedbackThreadIds();
+    if (!ids.includes(threadId)) {
+      ids.unshift(threadId);
+      localStorage.setItem('myListAddon:feedbackThreadIds', JSON.stringify(ids.slice(0, 30)));
+    }
+  } catch (e) {}
+}
+
+async function loadUserFeedbackThreads() {
+  const threadIds = getUserFeedbackThreadIds();
+  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback/threads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadIds: threadIds,
+        creatorName: creatorName,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && Array.isArray(data.threads)) {
+      userFeedbackThreads = data.threads;
+      data.threads.forEach((t) => saveUserFeedbackThreadId(t.id));
+      if (!activeFeedbackThreadId && userFeedbackThreads.length) {
+        activeFeedbackThreadId = userFeedbackThreads[0].id;
+      }
+    }
+  } catch (e) {}
+
+  renderUserFeedbackThreadsUI();
+}
+
+function refreshUserFeedbackThreads() {
+  const statusEl = document.getElementById('supportChatStatus');
+  if (statusEl) statusEl.textContent = 'Refreshing\u2026';
+  loadUserFeedbackThreads().then(() => {
+    if (statusEl) {
+      statusEl.textContent = 'Up to date';
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
+    }
+  });
+}
+
+function toggleNewFeedbackForm(showNew) {
+  isComposingNewFeedback = !!showNew;
+  renderUserFeedbackThreadsUI();
+  if (showNew) {
+    const msgInput = document.getElementById('feedbackMessageInput');
+    if (msgInput) { msgInput.focus(); }
+  }
+}
+
+function selectFeedbackThread(threadId) {
+  activeFeedbackThreadId = threadId;
+  isComposingNewFeedback = false;
+  renderUserFeedbackThreadsUI();
+}
+
+function renderUserFeedbackThreadsUI() {
+  const bar = document.getElementById('supportThreadsBar');
+  const chatView = document.getElementById('supportChatView');
+  const formWrap = document.getElementById('newFeedbackFormWrap');
+  const cancelBtn = document.getElementById('feedbackCancelNewBtn');
+  const newTicketBtn = document.getElementById('btnNewFeedbackTicket');
+
+  if (!userFeedbackThreads.length) {
+    if (bar) bar.style.display = 'none';
+    if (chatView) chatView.style.display = 'none';
+    if (formWrap) formWrap.style.display = 'block';
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (newTicketBtn) newTicketBtn.style.display = 'none';
+    return;
+  }
+
+  if (newTicketBtn) newTicketBtn.style.display = 'inline-flex';
+
+  if (bar) {
+    bar.style.display = 'flex';
+    bar.innerHTML = userFeedbackThreads.map((t) => {
+      const isActive = t.id === activeFeedbackThreadId && !isComposingNewFeedback;
+      const catLabel = t.category ? (t.category.charAt(0).toUpperCase() + t.category.slice(1)) : 'Support';
+      const hasAdminReply = Array.isArray(t.messages) && t.messages.some((m) => m.sender === 'admin');
+      const badge = hasAdminReply ? ' \uD83D\uDCAC' : '';
+      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeAttr(t.id) + '&quot;)">' +
+        escapeHtml(catLabel) + badge +
+      '</button>';
+    }).join('');
+  }
+
+  if (isComposingNewFeedback) {
+    if (chatView) chatView.style.display = 'none';
+    if (formWrap) formWrap.style.display = 'block';
+    if (cancelBtn) cancelBtn.style.display = 'inline-flex';
+    return;
+  }
+
+  if (formWrap) formWrap.style.display = 'none';
+  if (chatView) chatView.style.display = 'block';
+
+  const activeThread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId) || userFeedbackThreads[0];
+  if (!activeThread) return;
+  activeFeedbackThreadId = activeThread.id;
+
+  const stream = document.getElementById('supportMessagesStream');
+  if (stream) {
+    const messages = Array.isArray(activeThread.messages) && activeThread.messages.length
+      ? activeThread.messages
+      : [{
+          id: 'msg_init',
+          sender: 'user',
+          senderName: activeThread.creatorName || 'You',
+          text: activeThread.message || '(Initial message)',
+          timestamp: activeThread.createdAt || Date.now(),
+        }];
+
+    stream.innerHTML = messages.map((m) => {
+      const isAdmin = m.sender === 'admin';
+      const senderLabel = isAdmin ? '\uD83D\uDC68\u200D\uD83D\uDCBB Developer' : (m.senderName || 'You');
+      const timeStr = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+      return '<div class="support-bubble ' + (isAdmin ? 'admin' : 'user') + '">' +
+        '<div class="support-bubble-sender">' + escapeHtml(senderLabel) + '</div>' +
+        '<div>' + escapeHtml(m.text || '') + '</div>' +
+        (timeStr ? '<div class="support-bubble-time">' + escapeHtml(timeStr) + '</div>' : '') +
+      '</div>';
+    }).join('');
+
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+async function sendUserFeedbackReply() {
+  if (!activeFeedbackThreadId) return;
+  const input = document.getElementById('supportReplyInput');
+  const btn = document.getElementById('supportReplySendBtn');
+  const statusEl = document.getElementById('supportChatStatus');
+  const text = (input ? input.value : '').trim();
+  if (!text) return;
+
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Sending reply\u2026';
+
+  const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
+  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId: activeFeedbackThreadId,
+        message: text,
+        creatorName: creatorName,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && data.entry) {
+      if (input) input.value = '';
+      if (statusEl) statusEl.textContent = '';
+      const idx = userFeedbackThreads.findIndex((t) => t.id === activeFeedbackThreadId);
+      if (idx !== -1) {
+        userFeedbackThreads[idx] = data.entry;
+      } else {
+        userFeedbackThreads.unshift(data.entry);
+      }
+      renderUserFeedbackThreadsUI();
+    } else {
+      if (statusEl) statusEl.textContent = (data && data.error) || 'Failed to send reply.';
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'Connection error.';
+  }
+  if (btn) btn.disabled = false;
+}
+
 async function submitFeedback() {
   const btn = document.getElementById('feedbackSubmitBtn');
   const statusEl = document.getElementById('feedbackStatus');
@@ -11364,10 +12408,18 @@ async function submitFeedback() {
       }),
     });
     const data = await res.json().catch(() => null);
-    if (data && data.ok) {
-      if (statusEl) { statusEl.textContent = 'Thanks \u2014 sent.'; statusEl.style.color = 'var(--accent)'; }
+    if (data && data.ok && data.entry) {
+      if (statusEl) { statusEl.textContent = 'Message sent! Connecting to chat\u2026'; statusEl.style.color = 'var(--accent)'; }
       document.getElementById('feedbackMessageInput').value = '';
       document.getElementById('feedbackContactInput').value = '';
+      saveUserFeedbackThreadId(data.entry.id);
+      userFeedbackThreads.unshift(data.entry);
+      activeFeedbackThreadId = data.entry.id;
+      isComposingNewFeedback = false;
+      setTimeout(() => {
+        if (statusEl) statusEl.textContent = '';
+        renderUserFeedbackThreadsUI();
+      }, 600);
     } else {
       if (statusEl) { statusEl.textContent = (data && data.error) || 'Could not send \u2014 try again in a moment.'; statusEl.style.color = 'var(--danger)'; }
     }
@@ -11498,10 +12550,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
 
   if (type !== 'gems' && type !== 'kids' && type !== 'holidays' && type !== 'genres' && type !== 'curated') {
     if (type === 'movie' || type === 'all') {
-      pushSingle('New Movies', 'tmdb:chart:new_movies', 'movie', 'TMDB');
+      pushSingle('New Releases', 'tmdb:chart:new_movies', 'movie', 'TMDB');
     }
     if (type === 'series' || type === 'all') {
-      pushSingle('New Shows', 'tmdb:chart:new_shows', 'series', 'TMDB');
+      pushSingle('New Releases', 'tmdb:chart:new_shows', 'series', 'TMDB');
     }
     if (window._CHARTS_TMDB) {
       window._CHARTS_TMDB.forEach(function(p) {
@@ -11954,6 +13006,10 @@ function submitAddShelfModal() {
 
 function addRow(name, url, type, enabled, group, channelId) {
   if (enabled === undefined) enabled = true;
+  const isCuratedRec = String(url || '').startsWith('custom:curated:recommended');
+  if (isCuratedRec && (name === 'Recommended Movies' || name === 'Recommended Shows' || !name || name === 'Curated List')) {
+    name = 'Recommended';
+  }
   const container = document.getElementById('lists');
   const div = document.createElement('div');
   div.className = 'entry';
@@ -12254,23 +13310,34 @@ function scheduleMyTraktListsRefresh() {
 async function runMyMdblistLists() {
   const box = document.getElementById('myMdblistListsResult');
   if (!box) return;
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
   const keyInput = document.getElementById('mdblistKeyInput');
   const manualKey = keyInput ? keyInput.value.trim() : '';
-  const key = manualKey || mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const token = isDisc ? '' : (mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  const key = isDisc ? '' : (manualKey || token || localStorage.getItem('myListAddon:mdblistKey') || '');
   if (!key) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your MDBList account in Settings or click <strong>Connect MDBList</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
   box.innerHTML = '<p style="margin-top:10px;"><small>Loading your MDBList lists\u2026</small></p>';
   try {
-    const url = mdblistAccessToken
-      ? ORIGIN + '/api/mdblist-my-lists?accessToken=' + encodeURIComponent(mdblistAccessToken)
-      : ORIGIN + '/api/mdblist-my-lists?apikey=' + encodeURIComponent(manualKey);
+    const url = token
+      ? ORIGIN + '/api/mdblist-my-lists?accessToken=' + encodeURIComponent(token)
+      : ORIGIN + '/api/mdblist-my-lists?apikey=' + encodeURIComponent(manualKey || key);
     const res = await fetch(url, { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your MDBList lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      mdblistUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:mdblistUsername', mdblistUsername);
+        localStorage.removeItem('myListAddon:mdblistDisconnected');
+      } catch (e) {}
+      renderMdblistConnectStatus();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
     }
     renderMyMdblistLists(data.lists);
   } catch (e) {
@@ -12370,10 +13437,18 @@ document.getElementById('myMdblistListsResult').addEventListener('click', (e) =>
 async function runMyTraktLists() {
   const box = document.getElementById('myTraktListsResult');
   if (!box) return;
-  const username = document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '';
-  const traktKey = document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '';
-  const token = traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (!username && !token) {
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : (traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  const username = isDisc ? '' : ((document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '');
+  const traktKey = isDisc ? '' : ((document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '');
+
+  if (token) {
+    if (box) box.innerHTML = '';
+    scheduleMyPrivateTraktListsRefresh();
+    return;
+  }
+
+  if (!username) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Trakt account in Settings or click <strong>Connect Trakt</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
     return;
   }
@@ -12473,6 +13548,7 @@ document.getElementById('myTraktListsResult').addEventListener('click', (e) => {
 
 // --- MDBList OAuth (Connect MDBList) --------------------------------------
 function startMdblistConnect() {
+  try { localStorage.removeItem('myListAddon:mdblistDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/mdblist/oauth/start';
 }
 
@@ -12480,18 +13556,23 @@ function disconnectMdblist() {
   const input = document.getElementById('mdblistKeyInput');
   if (input) input.value = '';
   mdblistAccessToken = '';
+  try { window.mdblistAccessToken = ''; } catch (e) {}
   try {
     localStorage.removeItem('myListAddon:mdblistAccessToken');
     localStorage.removeItem('myListAddon:mdblistUsername');
     localStorage.removeItem('myListAddon:mdblistKey');
+    localStorage.setItem('myListAddon:mdblistDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderMdblistConnectStatus();
   scheduleMyMdblistListsRefresh();
 }
 
 function toggleListsMdblistConnection() {
-  if (mdblistAccessToken) {
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken');
+  if (token && !isDisc) {
     disconnectMdblist();
   } else {
     startMdblistConnect();
@@ -12504,37 +13585,47 @@ function renderMdblistConnectStatus() {
   const connectBtn = document.getElementById('mdblistConnectBtn');
   const disconnectBtn = document.getElementById('mdblistDisconnectBtn');
   const listsBtn = document.getElementById('listsMdblistConnectBtn');
-  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
-  if (token) mdblistAccessToken = token;
-  const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
-  const connected = !!(token || key);
-  
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  if (!isDisc && token) mdblistAccessToken = token;
+  const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
+
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect MDBList';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect MDBList';
   }
-  
+
   if (statusEl) {
     if (token && user) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to MDBList</span>';
-    } else if (key) {
-      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom MDBList API Key configured</span>';
+      if (!window._mdblistResolvingUser) {
+        window._mdblistResolvingUser = true;
+        setTimeout(() => {
+          window._mdblistResolvingUser = false;
+          if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
+        }, 100);
+      }
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom MDBList API Key configured</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect MDBList' : (key ? 'Update Key' : 'Connect MDBList Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncMdblistHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
   const syncWrap = document.getElementById('mdblistSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
-  if (connected) {
-    scheduleMyMdblistListsRefresh();
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myMdblistListsResult');
+    if (box) box.innerHTML = '';
   }
 }
 
@@ -12543,6 +13634,9 @@ function pickUpMdblistTokenFromUrl() {
   const match = /(?:^|[#&])mdblist_token=([^&]+)/.exec(hash);
   if (match) {
     mdblistAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.removeItem('myListAddon:mdblistDisconnected');
+    } catch (e) {}
     const userMatch = /(?:^|[#&])mdblist_username=([^&]+)/.exec(hash);
     if (userMatch) {
       mdblistUsername = decodeURIComponent(userMatch[1]);
@@ -12554,6 +13648,7 @@ function pickUpMdblistTokenFromUrl() {
       localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessToken);
     } catch (e) {}
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('MDBList Connected', 'Connected to MDBList.', true);
@@ -12561,6 +13656,7 @@ function pickUpMdblistTokenFromUrl() {
       alert('Connected to MDBList.');
     }
     renderMdblistConnectStatus();
+    scheduleMyMdblistListsRefresh();
   }
   const params = new URLSearchParams(window.location.search);
   const err = params.get('mdblist_error');
@@ -12596,6 +13692,7 @@ function pickUpMdblistTokenFromUrl() {
 // redirects back here with the resulting token in the URL fragment; see
 // pickUpTraktTokenFromUrl below, called once from this page's own init.
 function startTraktConnect() {
+  try { localStorage.removeItem('myListAddon:traktDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/trakt/oauth/start';
 }
 
@@ -12605,15 +13702,29 @@ function disconnectTrakt() {
   const userInput = document.getElementById('traktUsernameInput');
   if (userInput) userInput.value = '';
   traktAccessToken = '';
+  try { window.traktAccessToken = ''; } catch (e) {}
+  if (typeof activeTraktToken !== 'undefined') activeTraktToken = null;
   try {
     localStorage.removeItem('myListAddon:traktAccessToken');
     localStorage.removeItem('myListAddon:traktUsername');
     localStorage.removeItem('myListAddon:traktKey');
+    localStorage.setItem('myListAddon:traktDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderTraktConnectStatus();
   const box = document.getElementById('myPrivateTraktListsResult');
   if (box) box.innerHTML = '';
+}
+
+function toggleListsTraktConnection() {
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken');
+  if (token && !isDisc) {
+    disconnectTrakt();
+  } else {
+    startTraktConnect();
+  }
 }
 
 function renderTraktConnectStatus() {
@@ -12623,14 +13734,16 @@ function renderTraktConnectStatus() {
   const connectBtn = document.getElementById('traktConnectBtn');
   const disconnectBtn = document.getElementById('traktDisconnectBtn');
   const listsBtn = document.getElementById('listsTraktConnectBtn');
-  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (token) traktAccessToken = token;
-  const user = (userInput ? userInput.value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '';
-  const key = (keyInput ? keyInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
-  const connected = !!(token || key || user);
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  if (!isDisc && token) traktAccessToken = token;
+  const user = (userInput ? userInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktUsername') || ''));
+  const key = (keyInput ? keyInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!(key || user);
   
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Trakt';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Trakt';
   }
   
   if (statusEl) {
@@ -12638,25 +13751,25 @@ function renderTraktConnectStatus() {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Trakt</span>';
-    } else if (key || user) {
+    } else if (hasKey) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Trakt Client ID configured' + (user ? ' (@' + escapeHtml(user) + ')' : '') + '</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Trakt' : (key ? 'Update Client ID' : 'Connect Trakt Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncTraktHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
   const syncWrap = document.getElementById('traktSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const box = document.getElementById('myPrivateTraktListsResult');
-  if (connected) {
-    scheduleMyPrivateTraktListsRefresh();
-  } else if (box) {
-    box.innerHTML = '';
+  const pubBox = document.getElementById('myTraktListsResult');
+  if (!isAccountConnected && !hasKey) {
+    if (box) box.innerHTML = '';
+    if (pubBox) pubBox.innerHTML = '';
   }
 }
 
@@ -12672,6 +13785,10 @@ function pickUpTraktTokenFromUrl() {
   const match = /(?:^|[#&])trakt_token=([^&]+)/.exec(hash);
   if (match) {
     traktAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+      localStorage.removeItem('myListAddon:traktDisconnected');
+    } catch (e) {}
     const userMatch = /(?:^|[#&])trakt_username=([^&]+)/.exec(hash);
     if (userMatch) {
       const user = decodeURIComponent(userMatch[1]);
@@ -12682,6 +13799,7 @@ function pickUpTraktTokenFromUrl() {
       if (uInput) uInput.value = user;
     }
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('Trakt Connected', 'Connected to Trakt.', true);
@@ -12689,6 +13807,7 @@ function pickUpTraktTokenFromUrl() {
       alert('Connected to Trakt.');
     }
     renderTraktConnectStatus();
+    scheduleMyTraktListsRefresh();
   }
   const params = new URLSearchParams(window.location.search);
   const err = params.get('trakt_error');
@@ -12805,11 +13924,13 @@ async function startTraktDeviceLogin() {
             if (uInput) uInput.value = pollData.username;
           }
           saveState();
+          if (typeof pushCreatorSync === 'function') pushCreatorSync();
           closeTraktDeviceModal();
           if (typeof showAppAlert === 'function') {
             showAppAlert('Trakt Connected', 'Successfully connected to Trakt' + (pollData.username ? ' as @' + pollData.username : '') + '.', true);
           }
           renderTraktConnectStatus();
+          scheduleMyTraktListsRefresh();
         } else if (pollData.pending) {
           // Still waiting for user confirmation
         } else if (pollData.slowDown) {
@@ -12853,6 +13974,16 @@ async function runMyPrivateTraktLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Trakt lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      traktUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:traktUsername', traktUsername);
+        localStorage.removeItem('myListAddon:traktDisconnected');
+      } catch (e) {}
+      const uInput = document.getElementById('traktUsernameInput');
+      if (uInput && !uInput.value) uInput.value = traktUsername;
+      renderTraktConnectStatus();
     }
     renderMyPrivateTraktLists(data.lists);
   } catch (e) {
@@ -12951,34 +14082,10 @@ document.getElementById('myPrivateTraktListsResult').addEventListener('click', (
   }
 });
 
-// Pulls every item from a list URL (paginated via /api/preview, the same
-// Fetches every item for one list+type via /api/preview (paginated, same
-// mechanism Live Preview's "See All" uses), mapped into the shape a
-// Custom List's items expect.
-function toggleListsTraktConnection() {
-  if (traktAccessToken) {
-    disconnectTrakt();
-  } else {
-    startTraktConnect();
-  }
-}
-
 // --- TMDB Account / API Key Connection -----------------------------------
 let tmdbSessionId = '';
 let tmdbAccountId = '';
 let tmdbUsername = '';
-
-function startTmdbConnect() {
-  window.location.href = ORIGIN + '/api/tmdb/oauth/start';
-}
-
-function toggleListsTmdbConnection() {
-  if (tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId')) {
-    disconnectTmdb();
-  } else {
-    startTmdbConnect();
-  }
-}
 
 function onTmdbKeyInputChanged() {
   const input = document.getElementById('tmdbKeyInput');
@@ -13018,17 +14125,39 @@ async function testTmdbConnection() {
   }
 }
 
+function startTmdbConnect() {
+  try { localStorage.removeItem('myListAddon:tmdbDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/tmdb/oauth/start';
+}
+
+function toggleListsTmdbConnection() {
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId');
+  if (sess && !isDisc) {
+    disconnectTmdb();
+  } else {
+    startTmdbConnect();
+  }
+}
+
 function disconnectTmdb() {
   const input = document.getElementById('tmdbKeyInput');
   if (input) input.value = '';
   tmdbSessionId = '';
+  try { window.tmdbSessionId = ''; } catch (e) {}
   tmdbAccountId = '';
+  try { window.tmdbAccountId = ''; } catch (e) {}
   tmdbUsername = '';
-  localStorage.removeItem('myListAddon:tmdbKey');
-  localStorage.removeItem('myListAddon:tmdbSessionId');
-  localStorage.removeItem('myListAddon:tmdbAccountId');
-  localStorage.removeItem('myListAddon:tmdbUsername');
+  try { window.tmdbUsername = ''; } catch (e) {}
+  try {
+    localStorage.removeItem('myListAddon:tmdbKey');
+    localStorage.removeItem('myListAddon:tmdbSessionId');
+    localStorage.removeItem('myListAddon:tmdbAccountId');
+    localStorage.removeItem('myListAddon:tmdbUsername');
+    localStorage.setItem('myListAddon:tmdbDisconnected', 'true');
+  } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderTmdbConnectStatus();
   scheduleMyTmdbListsRefresh();
 }
@@ -13044,10 +14173,14 @@ function pickUpTmdbTokenFromUrl() {
       tmdbSessionId = sess;
       tmdbAccountId = acc || '';
       tmdbUsername = user || '';
-      localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionId);
-      if (tmdbAccountId) localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
-      if (tmdbUsername) localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+      try {
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+        localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionId);
+        if (tmdbAccountId) localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        if (tmdbUsername) localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+      } catch (e) {}
       saveState();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
       params.delete('tmdb_session');
       params.delete('tmdb_account');
       params.delete('tmdb_user');
@@ -13082,17 +14215,19 @@ function renderTmdbConnectStatus() {
   const disconnectBtn = document.getElementById('tmdbDisconnectBtn');
   const listsConnectBtn = document.getElementById('listsTmdbConnectBtn');
 
-  const sess = tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '';
-  const user = tmdbUsername || localStorage.getItem('myListAddon:tmdbUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  const connected = !!(sess || key);
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = isDisc ? '' : (tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '');
+  const user = isDisc ? '' : (tmdbUsername || localStorage.getItem('myListAddon:tmdbUsername') || '');
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:tmdbKey') || ''));
+  const isAccountConnected = !isDisc && !!sess;
+  const hasKey = !isDisc && !!key;
 
   if (statusEl) {
     if (sess && user) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (sess) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB Account Connected</span>';
-    } else if (key) {
+    } else if (hasKey) {
       statusEl.innerHTML = '<span style="color:#7ce7b6;">\u2713 Custom TMDB Key configured</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected</span>';
@@ -13100,8 +14235,13 @@ function renderTmdbConnectStatus() {
   }
 
   if (connectBtn) connectBtn.textContent = sess ? 'Re-connect TMDB' : (key ? 'Update Key' : 'Connect TMDB Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
-  if (listsConnectBtn) listsConnectBtn.textContent = connected ? 'Disconnect' : 'Connect TMDB';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+  if (listsConnectBtn) listsConnectBtn.textContent = isAccountConnected ? 'Disconnect' : 'Connect TMDB';
+
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myTmdbListsResult');
+    if (box) box.innerHTML = '';
+  }
 }
 
 let myTmdbListsTimer = null;
@@ -13140,6 +14280,18 @@ async function runMyTmdbLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your TMDB lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      tmdbUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+        if (data.accountId) {
+          tmdbAccountId = String(data.accountId);
+          localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        }
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+      } catch (e) {}
+      renderTmdbConnectStatus();
     }
     renderMyTmdbLists(data.lists);
   } catch (e) {
@@ -13262,9 +14414,9 @@ document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
     return;
   }
 });
-
 // --- Simkl OAuth & Personal Lists -----------------------------------------
 function startSimklConnect() {
+  try { localStorage.removeItem('myListAddon:simklDisconnected'); } catch (e) {}
   window.location.href = ORIGIN + '/api/simkl/oauth/start';
 }
 
@@ -13272,19 +14424,25 @@ function disconnectSimkl() {
   const input = document.getElementById('simklKeyInput');
   if (input) input.value = '';
   simklAccessToken = '';
+  try { window.simklAccessToken = ''; } catch (e) {}
   simklUsername = '';
+  try { window.simklUsername = ''; } catch (e) {}
   try {
     localStorage.removeItem('myListAddon:simklAccessToken');
     localStorage.removeItem('myListAddon:simklUsername');
     localStorage.removeItem('myListAddon:simklKey');
+    localStorage.setItem('myListAddon:simklDisconnected', 'true');
   } catch (e) {}
   saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
   renderSimklConnectStatus();
   scheduleMySimklListsRefresh();
 }
 
 function toggleListsSimklConnection() {
-  if (simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken')) {
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken');
+  if (token && !isDisc) {
     disconnectSimkl();
   } else {
     startSimklConnect();
@@ -13297,6 +14455,7 @@ function pickUpSimklTokenFromUrl() {
   if (match) {
     simklAccessToken = decodeURIComponent(match[1]);
     try {
+      localStorage.removeItem('myListAddon:simklDisconnected');
       localStorage.setItem('myListAddon:simklAccessToken', simklAccessToken);
     } catch (e) {}
     const userMatch = /(?:^|[#&])simkl_username=([^&]+)/.exec(hash);
@@ -13307,6 +14466,7 @@ function pickUpSimklTokenFromUrl() {
       } catch (e) {}
     }
     saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
     history.replaceState(null, '', window.location.pathname + window.location.search);
     if (typeof showAppAlert === 'function') {
       showAppAlert('Simkl Connected', 'Your Simkl account was successfully connected.', true);
@@ -13349,14 +14509,16 @@ function renderSimklConnectStatus() {
   const disconnectBtn = document.getElementById('simklDisconnectBtn');
   const listsBtn = document.getElementById('listsSimklConnectBtn');
 
-  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
-  if (token) simklAccessToken = token;
-  const user = (typeof simklUsername !== 'undefined' && simklUsername) || localStorage.getItem('myListAddon:simklUsername') || '';
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
-  const connected = !!(token || key);
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '');
+  if (!isDisc && token) simklAccessToken = token;
+  const user = (typeof simklUsername !== 'undefined' && simklUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:simklUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:simklKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
 
   if (listsBtn) {
-    listsBtn.innerText = connected ? 'Disconnect' : 'Connect Simkl';
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Simkl';
   }
 
   if (statusEl) {
@@ -13364,23 +14526,24 @@ function renderSimklConnectStatus() {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
     } else if (token) {
       statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Simkl</span>';
-    } else if (key) {
-      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Simkl Client ID configured</span>';
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom Simkl Client ID configured</span> <small style="color:var(--muted);">(Account not connected)</small>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
     }
   }
 
   if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
-  if (disconnectBtn) disconnectBtn.style.display = connected ? '' : 'none';
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
   const syncCb = document.getElementById('syncSimklHistoryCheckbox');
   if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
   const syncWrap = document.getElementById('simklSyncHistoryWrap');
-  if (syncWrap) syncWrap.style.display = connected ? '' : 'none';
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
 
-  if (connected) {
-    scheduleMySimklListsRefresh();
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('mySimklListsResult');
+    if (box) box.innerHTML = '';
   }
 }
 
@@ -13413,6 +14576,14 @@ async function runMySimklLists() {
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Simkl lists.') + '</p>';
       return;
+    }
+    if (data.username) {
+      simklUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+        localStorage.removeItem('myListAddon:simklDisconnected');
+      } catch (e) {}
+      renderSimklConnectStatus();
     }
     renderMySimklLists(data.lists);
   } catch (e) {
@@ -13551,7 +14722,7 @@ async function syncWatchHistoryToProviderNow(provider, btn) {
   const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
   
   if (!items.length) {
-    if (typeof showToast === 'function') showToast('Your Watch History is currently empty.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Watch History', 'Your Watch History is currently empty.', false);
     else alert('Your Watch History is currently empty.');
     return;
   }
@@ -13590,20 +14761,21 @@ async function syncWatchHistoryToProviderNow(provider, btn) {
       btn.textContent = origText;
     }
     if (!res.ok || !data.ok) {
-      if (typeof showToast === 'function') showToast('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
-      else alert('Failed to sync to ' + cap + ': ' + (data.error || 'Unknown error'));
+      const err = data.error || 'Unknown error';
+      if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Failed to sync to ' + cap + ': ' + err, false);
+      else alert('Failed to sync to ' + cap + ': ' + err);
       return;
     }
     const count = data.syncedCount != null ? data.syncedCount : items.length;
-    const msg = '\u2713 Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
-    if (typeof showToast === 'function') showToast(msg);
+    const msg = 'Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Complete', msg, true);
     else alert(msg);
   } catch (err) {
     if (btn) {
       btn.disabled = false;
       btn.textContent = origText;
     }
-    if (typeof showToast === 'function') showToast('Network error syncing to ' + cap + '.');
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Network error syncing to ' + cap + '.', false);
     else alert('Network error syncing to ' + cap + '.');
   }
 }
@@ -13619,8 +14791,9 @@ async function syncAllConnectedAccountsNow(btn) {
   if (simklToken) connectedProviders.push('simkl');
 
   if (!connectedProviders.length) {
-    if (typeof showToast === 'function') showToast('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
-    else alert('No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them in External Accounts & API Keys.');
+    const msg = 'No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them under Settings \u2192 External Accounts & API Keys.';
+    if (typeof showAppAlert === 'function') showAppAlert('No Accounts Connected', msg, false);
+    else alert(msg);
     return;
   }
 
@@ -14604,7 +15777,11 @@ async function runTraktExportImport() {
   // someone can mark History as watched without also wanting a redundant
   // "Trakt Watch History" Custom List cluttering their Custom Lists tab.
   const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
-  if (!relevantCats.length) { alert('Pick at least one category first.'); return; }
+  if (!relevantCats.length) {
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Pick at least one category first.', false);
+    else alert('Pick at least one category first.');
+    return;
+  }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
 
   const created = [];
@@ -14693,7 +15870,11 @@ async function runTraktExportImport() {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
   }
   if (!msg) msg = 'Nothing to import in the selected categories.';
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(failed.length ? 'Import Finished with Warnings' : 'Import Complete', msg, !failed.length);
+  } else {
+    alert(msg);
+  }
 }
 
 // Turns a pasted list URL's last path segment into a readable starter name
@@ -14844,7 +16025,8 @@ window.runLetterboxdExportImport = async function() {
   // "mark as watched" checkbox is on, not only when both are.
   const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
   if (!relevantCats.length) {
-    alert('Please select at least one category to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Please select at least one category to import.', false);
+    else alert('Please select at least one category to import.');
     return;
   }
   if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
@@ -14934,7 +16116,11 @@ window.runLetterboxdExportImport = async function() {
     msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
   }
   if (!msg) msg = 'Nothing to import in the selected categories.';
-  alert(msg);
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(failed.length ? 'Letterboxd Import Finished' : 'Letterboxd Import Complete', msg, !failed.length);
+  } else {
+    alert(msg);
+  }
 };
 
 // --- Unified Multi-Format List Importer -----------------------------------
@@ -15420,13 +16606,15 @@ async function runUnifiedListImport() {
   const globalAlsoMarkWatched = globalMarkWatchedCheck ? globalMarkWatchedCheck.checked : false;
 
   if (!discoveredImportCategories.length) {
-    alert('Please select at least one file to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('File Required', 'Please select at least one file to import.', false);
+    else alert('Please select at least one file to import.');
     return;
   }
 
   const checkedCatCards = Array.from(document.querySelectorAll('.importCatCheck:checked'));
   if (!checkedCatCards.length) {
-    alert('Please select at least one category/list to import.');
+    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Please select at least one category/list to import.', false);
+    else alert('Please select at least one category/list to import.');
     return;
   }
 
@@ -15675,7 +16863,8 @@ async function bulkAddLists(btn) {
   const box = document.getElementById('bulkPasteBox');
   const lines = box.value.split('\\n').map((s) => s.trim()).filter(Boolean);
   if (!lines.length) {
-    alert('Paste at least one list URL first, one per line.');
+    if (typeof showAppAlert === 'function') showAppAlert('URL Required', 'Paste at least one list URL first, one per line.', false);
+    else alert('Paste at least one list URL first, one per line.');
     return;
   }
   const mdblistKey = document.getElementById('mdblistKeyInput').value.trim();
@@ -18438,6 +19627,8 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, show
             thumbnail: ep.thumbnail || showBackdrop || showPoster,
             poster: showPoster || ep.thumbnail || showBackdrop || '',
             showPoster: showPoster || '',
+            backdrop: showBackdrop || '',
+            showBackdrop: showBackdrop || '',
           });
         });
       });
@@ -18534,6 +19725,8 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
       thumbnail: ep.thumbnail || showBackdrop || showPoster,
       poster: showPoster || ep.thumbnail || showBackdrop || '',
       showPoster: showPoster || '',
+      backdrop: showBackdrop || '',
+      showBackdrop: showBackdrop || '',
     });
   });
   if (!channelDraftBackdrop && showBackdrop) channelDraftBackdrop = showBackdrop;
@@ -18761,6 +19954,8 @@ function renderChannelDraftList() {
   if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
   if (!channelDraftItems.length) {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p>';
+    renderChannelPosterPicker();
+    renderChannelCrossoverSuggestions();
     return;
   }
   const cardsHtml = channelDraftItems.map((it, i) => {
@@ -18820,6 +20015,690 @@ function renderChannelDraftList() {
   
   box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
   initChannelHoldDrag();
+  renderChannelPosterPicker();
+  renderChannelCrossoverSuggestions();
+}
+
+function renderChannelPosterPicker() {
+  const section = document.getElementById('channelPosterPickerSection');
+  const grid = document.getElementById('channelPosterChoicesGrid');
+  if (!section || !grid) return;
+
+  if (!channelDraftItems.length) {
+    section.style.display = 'none';
+    grid.innerHTML = '';
+    return;
+  }
+
+  section.style.display = 'block';
+
+  // Group shows from channelDraftItems and count episodes
+  const showsMap = new Map();
+  channelDraftItems.forEach((it) => {
+    let showName = it.showName || '';
+    let showPoster = it.showPoster || '';
+    let showBackdrop = it.backdrop || it.showBackdrop || it.thumbnail || '';
+    if (!showPoster && it.poster && it.poster.startsWith('http') && !it.poster.includes('/api/channel-')) {
+      showPoster = it.poster;
+    }
+    if (it.kind === 'movie') {
+      showName = it.title ? (it.title + (it.year && !it.title.includes(String(it.year)) ? ' (' + it.year + ')' : '')) : 'Movie';
+      showPoster = it.poster || it.thumbnail || '';
+      showBackdrop = it.backdrop || it.thumbnail || it.poster || '';
+    } else if (!showName && it.title) {
+      if (it.title.indexOf(' S') !== -1 && it.title.indexOf('E') !== -1) {
+        showName = it.title.slice(0, it.title.indexOf(' S')).trim();
+      } else if (it.title.indexOf(' \u2014 ') !== -1) {
+        showName = it.title.split(' \u2014 ')[0].trim();
+      } else if (it.title.indexOf(' - ') !== -1) {
+        showName = it.title.split(' - ')[0].trim();
+      } else {
+        showName = it.title.trim();
+      }
+    }
+    if (!showName) showName = 'Show';
+
+    if (!showsMap.has(showName)) {
+      showsMap.set(showName, {
+        name: showName,
+        poster: showPoster,
+        backdrop: showBackdrop,
+        count: 0
+      });
+    }
+    const entry = showsMap.get(showName);
+    entry.count++;
+    if (!entry.poster && showPoster) {
+      entry.poster = showPoster;
+    }
+    if (!entry.backdrop && showBackdrop) {
+      entry.backdrop = showBackdrop;
+    }
+  });
+
+  const shows = [...showsMap.values()].filter((s) => s.poster && s.poster.startsWith('http'));
+  // Sort show posters in descending order by episode count
+  shows.sort((a, b) => b.count - a.count);
+
+  if (channelDraftPoster === undefined || channelDraftPoster === null) {
+    channelDraftPoster = shows.length ? shows[0].poster : 'custom';
+    channelDraftBackdrop = (shows.length && shows[0].backdrop) ? shows[0].backdrop : null;
+  }
+
+  const isCustomSelected = (channelDraftPoster === 'custom' || !channelDraftPoster || channelDraftPoster.includes('/api/channel-poster'));
+
+  // 1. Custom Channel Poster Option
+  let html = '<div class="channel-poster-choice' + (isCustomSelected ? ' selected' : '') + '" data-poster="custom" data-backdrop="" onclick="selectChannelPoster(&quot;custom&quot;, &quot;&quot;)">' +
+    '<div class="channel-poster-thumb-wrap custom-preview" style="background:linear-gradient(135deg,#0b0d14 0%,#131726 50%,#06070a 100%); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; padding:6px; border:1px solid rgba(0,122,255,0.3);">' +
+      '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#007AFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>' +
+        '<polyline points="17 2 12 7 7 2"></polyline>' +
+      '</svg>' +
+      '<span style="font-size:0.62rem; font-weight:700; color:#fff; text-transform:uppercase; letter-spacing:0.5px; text-align:center;">Custom</span>' +
+    '</div>' +
+    '<div class="channel-poster-check">\u2713</div>' +
+    '<div class="channel-poster-title" title="Custom Channel Poster">Custom Poster</div>' +
+    '<div class="channel-poster-meta">Provided</div>' +
+  '</div>';
+
+  // 2. Show Posters ordered by episode count descending
+  shows.forEach((s) => {
+    const isSelected = !isCustomSelected && (channelDraftPoster === s.poster);
+    const countLabel = s.count + ' ep' + (s.count === 1 ? '' : 's');
+    html += '<div class="channel-poster-choice' + (isSelected ? ' selected' : '') + '" data-poster="' + escapeAttr(s.poster) + '" data-backdrop="' + escapeAttr(s.backdrop || '') + '" onclick="selectChannelPoster(this.dataset.poster, this.dataset.backdrop)">' +
+      '<div class="channel-poster-thumb-wrap">' +
+        '<img src="' + escapeAttr(s.poster) + '" alt="' + escapeAttr(s.name) + '" loading="lazy">' +
+      '</div>' +
+      '<div class="channel-poster-check">\u2713</div>' +
+      '<div class="channel-poster-title" title="' + escapeAttr(s.name) + '">' + escapeHtml(s.name) + '</div>' +
+      '<div class="channel-poster-meta">' + escapeHtml(countLabel) + '</div>' +
+    '</div>';
+  });
+
+  grid.innerHTML = html;
+}
+
+function selectChannelPoster(posterUrl, backdropUrl) {
+  channelDraftPoster = (posterUrl === 'custom' || !posterUrl) ? 'custom' : posterUrl;
+  channelDraftBackdrop = (posterUrl === 'custom' || !posterUrl) ? null : (backdropUrl || null);
+  const cards = document.querySelectorAll('#channelPosterChoicesGrid .channel-poster-choice');
+  cards.forEach((card) => {
+    const cardPoster = card.dataset.poster;
+    if (channelDraftPoster === 'custom' && cardPoster === 'custom') {
+      card.classList.add('selected');
+    } else if (channelDraftPoster !== 'custom' && cardPoster === channelDraftPoster) {
+      card.classList.add('selected');
+    } else {
+      card.classList.remove('selected');
+    }
+  });
+}
+
+// --- TV Crossover Events Registry & Story Splicer ---------------------------
+const TV_CROSSOVER_EVENTS = [
+  // --- Arrowverse ---
+  {
+    id: "arrowverse_flash_vs_arrow",
+    name: "Flash vs. Arrow",
+    franchise: "Arrowverse",
+    description: "The classic two-night crossover event between The Flash and Arrow.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 1, episode: 8, part: 1, title: "Flash vs. Arrow" },
+      { showName: "Arrow", tmdbId: 1412, season: 3, episode: 8, part: 2, title: "The Brave and the Bold" }
+    ]
+  },
+  {
+    id: "arrowverse_heroes_join_forces",
+    name: "Heroes Join Forces",
+    franchise: "Arrowverse",
+    description: "The two-part crossover setting up the Legends of Tomorrow against Vandal Savage.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 8, part: 1, title: "Legends of Today" },
+      { showName: "Arrow", tmdbId: 1412, season: 4, episode: 8, part: 2, title: "Legends of Yesterday" }
+    ]
+  },
+  {
+    id: "arrowverse_worlds_finest",
+    name: "Worlds Finest",
+    franchise: "Arrowverse",
+    description: "Barry Allen crosses universes and teams up with Kara Zor-El in National City.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 18, part: 1, title: "Versus Zoom" },
+      { showName: "Supergirl", tmdbId: 62688, season: 1, episode: 18, part: 2, title: "Worlds Finest" }
+    ]
+  },
+  {
+    id: "arrowverse_invasion",
+    name: "Invasion!",
+    franchise: "Arrowverse",
+    description: "The 3-part event uniting Flash, Arrow, Supergirl, and the Legends against the Dominators.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 8, part: 1, title: "Invasion! (Part 1)" },
+      { showName: "Arrow", tmdbId: 1412, season: 5, episode: 8, part: 2, title: "Invasion! (Part 2)" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 2, episode: 7, part: 3, title: "Invasion! (Part 3)" }
+    ]
+  },
+  {
+    id: "arrowverse_duet",
+    name: "Duet (Musical Crossover)",
+    franchise: "Arrowverse",
+    description: "The Music Meister traps Supergirl and The Flash in an alternate reality musical.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 2, episode: 16, part: 1, title: "Star-Crossed" },
+      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 17, part: 2, title: "Duet" }
+    ]
+  },
+  {
+    id: "arrowverse_crisis_on_earth_x",
+    name: "Crisis on Earth-X",
+    franchise: "Arrowverse",
+    description: "The 4-part event uniting heroes when dark doppelgängers crash Barry and Iris's wedding.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 3, episode: 8, part: 1, title: "Crisis on Earth-X, Part 1" },
+      { showName: "Arrow", tmdbId: 1412, season: 6, episode: 8, part: 2, title: "Crisis on Earth-X, Part 2" },
+      { showName: "The Flash", tmdbId: 60735, season: 4, episode: 8, part: 3, title: "Crisis on Earth-X, Part 3" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 3, episode: 8, part: 4, title: "Crisis on Earth-X, Part 4" }
+    ]
+  },
+  {
+    id: "arrowverse_elseworlds",
+    name: "Elseworlds",
+    franchise: "Arrowverse",
+    description: "The 3-part event introducing Gotham City and Batwoman when Oliver and Barry swap lives.",
+    episodes: [
+      { showName: "The Flash", tmdbId: 60735, season: 5, episode: 9, part: 1, title: "Elseworlds, Part 1" },
+      { showName: "Arrow", tmdbId: 1412, season: 7, episode: 9, part: 2, title: "Elseworlds, Part 2" },
+      { showName: "Supergirl", tmdbId: 62688, season: 4, episode: 9, part: 3, title: "Elseworlds, Part 3" }
+    ]
+  },
+  {
+    id: "arrowverse_crisis_on_infinite_earths",
+    name: "Crisis on Infinite Earths",
+    franchise: "Arrowverse",
+    description: "The epic 5-part multiverse crossover event to save existence from the Anti-Monitor.",
+    episodes: [
+      { showName: "Supergirl", tmdbId: 62688, season: 5, episode: 9, part: 1, title: "Crisis on Infinite Earths: Part One" },
+      { showName: "Batwoman", tmdbId: 89247, season: 1, episode: 9, part: 2, title: "Crisis on Infinite Earths: Part Two" },
+      { showName: "The Flash", tmdbId: 60735, season: 6, episode: 9, part: 3, title: "Crisis on Infinite Earths: Part Three" },
+      { showName: "Arrow", tmdbId: 1412, season: 8, episode: 8, part: 4, title: "Crisis on Infinite Earths: Part Four" },
+      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 5, episode: 1, part: 5, title: "Crisis on Infinite Earths: Part Five" }
+    ]
+  },
+
+  // --- One Chicago ---
+  {
+    id: "chicago_a_dark_day",
+    name: "A Dark Day",
+    franchise: "One Chicago",
+    description: "The hospital explosion crossover event between Chicago Fire and Chicago P.D.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 2, episode: 20, part: 1, title: "A Dark Day" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 1, episode: 12, part: 2, title: "8:30 PM" }
+    ]
+  },
+  {
+    id: "chicago_nobody_touches_anything",
+    name: "Chicago Crossover (Child Pornography Ring)",
+    franchise: "One Chicago",
+    description: "The 3-part crossover uniting Firehouse 51, Intelligence, and the SVU squad.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 7, part: 1, title: "Nobody Touches Anything" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 7, part: 2, title: "Chicago Crossover" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 7, part: 3, title: "They'll Have to Go Through Me" }
+    ]
+  },
+  {
+    id: "chicago_three_bells",
+    name: "Shay Arson Investigation",
+    franchise: "One Chicago",
+    description: "The two-part crossover hunting the arsonist responsible for Leslie Shay's death.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 13, part: 1, title: "Three Bells" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 13, part: 2, title: "A Little Devil Complex" }
+    ]
+  },
+  {
+    id: "chicago_jellybean_yates",
+    name: "Greg Yates Serial Killer Crossover",
+    franchise: "One Chicago",
+    description: "The multi-part chase for serial killer Gregory Yates between Fire, P.D. and SVU.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 21, part: 1, title: "We Called Her Jellybean" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 20, part: 2, title: "The Number of Rats" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 20, part: 3, title: "Daydream Believer" }
+    ]
+  },
+  {
+    id: "chicago_beating_heart",
+    name: "The Beating Heart (Chemo Overdose Crossover)",
+    franchise: "One Chicago",
+    description: "The 3-part event connecting Christopher Herrmann's stabbing to a rogue doctor giving fatal chemo doses.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 4, episode: 10, part: 1, title: "The Beating Heart" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 1, episode: 5, part: 2, title: "Malignant" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 3, episode: 10, part: 3, title: "Now I'm God" }
+    ]
+  },
+  {
+    id: "chicago_deathtrap",
+    name: "Deathtrap / Warehouse Fire",
+    franchise: "One Chicago",
+    description: "The 3-part event spanning Chicago Fire, Chicago P.D. and Chicago Justice after a fatal warehouse fire.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 5, episode: 15, part: 1, title: "Deathtrap" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 4, episode: 16, part: 2, title: "Emotional Proximity" },
+      { showName: "Chicago Justice", tmdbId: 66986, season: 1, episode: 1, part: 3, title: "Fake" }
+    ]
+  },
+  {
+    id: "chicago_going_to_war",
+    name: "High-Rise Apartment Fire",
+    franchise: "One Chicago",
+    description: "The 3-part crossover event starting with a catastrophic 25-story high-rise apartment fire.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 7, episode: 2, part: 1, title: "Going to War" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 4, episode: 2, part: 2, title: "When to Let Go" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 6, episode: 2, part: 3, title: "Endings" }
+    ]
+  },
+  {
+    id: "chicago_infection",
+    name: "Infection (Bioterrorism Outbreak)",
+    franchise: "One Chicago",
+    description: "The 3-part crossover where a deadly flesh-eating bacterial epidemic strikes Chicago.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 4, part: 1, title: "Infection, Part I" },
+      { showName: "Chicago Med", tmdbId: 62650, season: 5, episode: 4, part: 2, title: "Infection, Part II" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 4, part: 3, title: "Infection, Part III" }
+    ]
+  },
+  {
+    id: "chicago_off_the_grid",
+    name: "Sean Roman / Opioid Crisis Crossover",
+    franchise: "One Chicago",
+    description: "The 2-part event bringing former Officer Sean Roman back to Chicago to find his missing sister.",
+    episodes: [
+      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 15, part: 1, title: "Off the Grid" },
+      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 15, part: 2, title: "Burden of Truth" }
+    ]
+  },
+
+  // --- Law & Order Universe ---
+  {
+    id: "law_order_gimme_shelter",
+    name: "Gimme Shelter (Historic 3-Way Crossover)",
+    franchise: "Law & Order",
+    description: "The premiere 3-show crossover uniting Organized Crime, SVU, and the original Law & Order team.",
+    episodes: [
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 1, part: 1, title: "Gimme Shelter - Part One" },
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 1, part: 2, title: "Gimme Shelter - Part Two" },
+      { showName: "Law & Order", tmdbId: 549, season: 22, episode: 1, part: 3, title: "Gimme Shelter - Part Three" }
+    ]
+  },
+  {
+    id: "law_order_return_of_the_prodigal_son",
+    name: "Elliot Stabler's Return",
+    franchise: "Law & Order",
+    description: "Elliot Stabler reunites with Olivia Benson following a car bombing targeting his family.",
+    episodes: [
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 22, episode: 9, part: 1, title: "Return of the Prodigal Son" },
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 1, episode: 1, part: 2, title: "What Happens in Puglia" }
+    ]
+  },
+  {
+    id: "law_order_shadow_svu_oc_finale",
+    name: "Bad Things / All Pain Is One Malady",
+    franchise: "Law & Order",
+    description: "The tense season finale crossover taking down a murder-for-hire site targeting Benson and Stabler.",
+    episodes: [
+      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 22, part: 1, title: "All Pain Is One Malady" },
+      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 22, part: 2, title: "With Many Names" }
+    ]
+  },
+
+  // --- FBI Universe ---
+  {
+    id: "fbi_american_dreams",
+    name: "American Dreams / Emotional Rescue",
+    franchise: "FBI",
+    description: "The crossover investigation where Jubal brings in Jess LaCroix to rescue kidnapped schoolchildren.",
+    episodes: [
+      { showName: "FBI", tmdbId: 80748, season: 2, episode: 19, part: 1, title: "American Dreams" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 1, episode: 9, part: 2, title: "Emotional Rescue" }
+    ]
+  },
+  {
+    id: "fbi_all_that_glitters",
+    name: "All That Glitters / Exposed / Lovesick",
+    franchise: "FBI",
+    description: "The 3-part franchise premiere launching FBI: International across New York and Budapest.",
+    episodes: [
+      { showName: "FBI", tmdbId: 80748, season: 4, episode: 1, part: 1, title: "All That Glitters" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 3, episode: 1, part: 2, title: "Exposed" },
+      { showName: "FBI: International", tmdbId: 125988, season: 1, episode: 1, part: 3, title: "Pilot" }
+    ]
+  },
+  {
+    id: "fbi_imminent_threat",
+    name: "Imminent Threat (Global Terror Crossover)",
+    franchise: "FBI",
+    description: "The 3-part global event racing to stop a catastrophic terror attack planned in New York City.",
+    episodes: [
+      { showName: "FBI: International", tmdbId: 125988, season: 2, episode: 16, part: 1, title: "Imminent Threat - Part One" },
+      { showName: "FBI", tmdbId: 80748, season: 5, episode: 17, part: 2, title: "Imminent Threat - Part Two" },
+      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 4, episode: 16, part: 3, title: "Imminent Threat - Part Three" }
+    ]
+  },
+
+  // --- NCIS Universe ---
+  {
+    id: "ncis_sister_city",
+    name: "Sister City",
+    franchise: "NCIS",
+    description: "The 2-part murder investigation linking Gibbs's team with Pride's New Orleans squad.",
+    episodes: [
+      { showName: "NCIS", tmdbId: 4614, season: 13, episode: 12, part: 1, title: "Sister City (Part I)" },
+      { showName: "NCIS: New Orleans", tmdbId: 61387, season: 2, episode: 12, part: 2, title: "Sister City (Part II)" }
+    ]
+  },
+  {
+    id: "ncis_too_many_cooks",
+    name: "Too Many Cooks / A Long Time Coming",
+    franchise: "NCIS",
+    description: "The first-ever 3-way crossover event spanning NCIS, NCIS: Hawai'i, and NCIS: Los Angeles.",
+    episodes: [
+      { showName: "NCIS", tmdbId: 4614, season: 20, episode: 10, part: 1, title: "Too Many Cooks" },
+      { showName: "NCIS: Hawai'i", tmdbId: 124364, season: 2, episode: 10, part: 2, title: "Deep Fake" },
+      { showName: "NCIS: Los Angeles", tmdbId: 17610, season: 14, episode: 10, part: 3, title: "A Long Time Coming" }
+    ]
+  },
+
+  // --- Grey's Anatomy Universe ---
+  {
+    id: "greys_what_i_did_for_love",
+    name: "Lucas Ripley Hospital Emergency",
+    franchise: "Grey's Anatomy Universe",
+    description: "The tragic two-part medical emergency crossover involving Fire Chief Lucas Ripley.",
+    episodes: [
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 15, episode: 23, part: 1, title: "What I Did for Love" },
+      { showName: "Station 19", tmdbId: 76773, season: 2, episode: 15, part: 2, title: "Always Ready" }
+    ]
+  },
+  {
+    id: "greys_i_like_quick_and_dark",
+    name: "Joe's Bar Crash",
+    franchise: "Grey's Anatomy Universe",
+    description: "The crossover rescue when a car crashes through the roof of Joe's Bar.",
+    episodes: [
+      { showName: "Station 19", tmdbId: 76773, season: 3, episode: 1, part: 1, title: "I Know This Bar" },
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 16, episode: 10, part: 2, title: "Help Me Through the Night" }
+    ]
+  },
+  {
+    id: "greys_things_we_lost_in_the_fire",
+    name: "Gas Line Explosion",
+    franchise: "Grey's Anatomy Universe",
+    description: "The neighborhood gas pipeline disaster uniting Station 19 and Grey Sloan Memorial.",
+    episodes: [
+      { showName: "Station 19", tmdbId: 76773, season: 5, episode: 5, part: 1, title: "Things We Lost in the Fire" },
+      { showName: "Grey's Anatomy", tmdbId: 1416, season: 18, episode: 5, part: 2, title: "Bottle Up and Explode!" }
+    ]
+  },
+
+  // --- Hawaii Five-0 / Magnum P.I. / MacGyver ---
+  {
+    id: "hawaii_magnum_crossover",
+    name: "Desperate Measures",
+    franchise: "Hawaii Universe",
+    description: "Five-0 recruits private investigators Thomas Magnum and Juliet Higgins to extract a captured agent.",
+    episodes: [
+      { showName: "Hawaii Five-0", tmdbId: 32798, season: 10, episode: 12, part: 1, title: "Ihea 'oe i ka wa a ka ua e loku ana?" },
+      { showName: "Magnum P.I.", tmdbId: 79593, season: 2, episode: 12, part: 2, title: "Desperate Measures" }
+    ]
+  },
+  {
+    id: "macgyver_flashlight",
+    name: "Flashlight",
+    franchise: "Hawaii Universe",
+    description: "MacGyver and the Phoenix team travel to Hawaii to assist Five-0 after a severe earthquake.",
+    episodes: [
+      { showName: "MacGyver", tmdbId: 67178, season: 1, episode: 18, part: 1, title: "Flashlight" },
+      { showName: "Hawaii Five-0", tmdbId: 32798, season: 7, episode: 19, part: 2, title: "Exodus" }
+    ]
+  },
+
+  // --- Buffyverse ---
+  {
+    id: "buffyverse_i_will_remember_you",
+    name: "I Will Remember You",
+    franchise: "Buffyverse",
+    description: "Buffy visits Los Angeles after finding out Angel was in Sunnydale, leading to a fateful day of mortality.",
+    episodes: [
+      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 8, part: 1, title: "Pangs" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 8, part: 2, title: "I Will Remember You" }
+    ]
+  },
+  {
+    id: "buffyverse_five_by_five",
+    name: "Faith's Rogue Redemption",
+    franchise: "Buffyverse",
+    description: "Faith flees Sunnydale to Los Angeles where Wolfram & Hart hire her to assassinate Angel.",
+    episodes: [
+      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 20, part: 1, title: "The Yoko Factor" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 18, part: 2, title: "Five by Five" },
+      { showName: "Angel", tmdbId: 2426, season: 1, episode: 19, part: 3, title: "Sanctuary" }
+    ]
+  },
+
+  // --- The Vampire Diaries / The Originals ---
+  {
+    id: "vampire_diaries_moonlight_on_bayou",
+    name: "Moonlight on the Bayou",
+    franchise: "Vampire Diaries Universe",
+    description: "Stefan Salvatore travels to New Orleans to escape Rayna Cruz and seeks refuge with Klaus Mikaelson.",
+    episodes: [
+      { showName: "The Vampire Diaries", tmdbId: 18165, season: 7, episode: 14, part: 1, title: "Moonlight on the Bayou" },
+      { showName: "The Originals", tmdbId: 48866, season: 3, episode: 14, part: 2, title: "A Streetcar Named Desire" }
+    ]
+  },
+
+  // --- Bones / Sleepy Hollow ---
+  {
+    id: "bones_sleepy_hollow",
+    name: "The Resurrection in the Remains",
+    franchise: "Bones & Sleepy Hollow",
+    description: "Brennan & Booth team up with Ichabod Crane & Abbie Mills on Halloween over 200-year-old remains.",
+    episodes: [
+      { showName: "Bones", tmdbId: 1911, season: 11, episode: 5, part: 1, title: "The Resurrection in the Remains" },
+      { showName: "Sleepy Hollow", tmdbId: 46896, season: 3, episode: 5, part: 2, title: "Dead Men Tell No Tales" }
+    ]
+  }
+];
+
+function isCrossoverEpisodeMatch(item, epTarget) {
+  if (!item || item.kind === 'movie') return false;
+  const sNum = (item.seasonNum != null) ? Number(item.seasonNum) : Number(item.season);
+  const eNum = (item.episodeNum != null) ? Number(item.episodeNum) : Number(item.episode);
+  if (sNum !== epTarget.season || eNum !== epTarget.episode) return false;
+
+  const targetName = epTarget.showName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const itemShowName = String(item.showName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const itemTitle = String(item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  return itemShowName.includes(targetName) || targetName.includes(itemShowName) || itemTitle.includes(targetName);
+}
+
+function renderChannelCrossoverSuggestions() {
+  const container = document.getElementById('channelCrossoverSuggestions');
+  if (!container) return;
+
+  if (!channelDraftItems.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  const suggestions = [];
+
+  TV_CROSSOVER_EVENTS.forEach((event) => {
+    const presentParts = [];
+    const missingParts = [];
+
+    event.episodes.forEach((ep) => {
+      const match = channelDraftItems.find((it) => isCrossoverEpisodeMatch(it, ep));
+      if (match) {
+        presentParts.push({ ...ep, draftItem: match });
+      } else {
+        missingParts.push(ep);
+      }
+    });
+
+    if (presentParts.length > 0 && missingParts.length > 0) {
+      suggestions.push({
+        event,
+        presentParts,
+        missingParts
+      });
+    }
+  });
+
+  if (!suggestions.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  container.style.display = 'block';
+
+  const bannersHtml = suggestions.map(({ event, presentParts, missingParts }) => {
+    const chipsHtml = event.episodes.map((ep) => {
+      const isPresent = presentParts.some((p) => p.part === ep.part);
+      if (isPresent) {
+        return '<span class="channel-crossover-chip present" title="Already in channel draft">' +
+          '\u2713 Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+        '</span>';
+      }
+      return '<span class="channel-crossover-chip missing" title="Missing from channel draft">' +
+        '+ Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+      '</span>';
+    }).join('');
+
+    const missingCount = missingParts.length;
+    const btnLabel = '+ Add ' + missingCount + ' Missing Crossover Episode' + (missingCount === 1 ? '' : 's') + ' in Story Order';
+
+    return '<div class="channel-crossover-banner" data-event-id="' + escapeAttr(event.id) + '">' +
+      '<div class="channel-crossover-header">' +
+        '<div class="channel-crossover-title">' +
+          '<span>\uD83D\uDCA1 Crossover Event Detected: <strong>' + escapeHtml(event.name) + '</strong></span>' +
+          '<span class="channel-crossover-badge">' + escapeHtml(event.franchise) + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<p class="channel-crossover-desc">' + escapeHtml(event.description) + '</p>' +
+      '<div class="channel-crossover-parts">' + chipsHtml + '</div>' +
+      '<div class="channel-crossover-actions">' +
+        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  container.innerHTML = bannersHtml;
+}
+
+async function spliceCrossoverEvent(eventId, btn) {
+  const event = TV_CROSSOVER_EVENTS.find((e) => e.id === eventId);
+  if (!event) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Fetching crossover episodes\u2026';
+  }
+
+  try {
+    let firstIdx = -1;
+    for (let i = 0; i < channelDraftItems.length; i++) {
+      if (event.episodes.some((ep) => isCrossoverEpisodeMatch(channelDraftItems[i], ep))) {
+        firstIdx = i;
+        break;
+      }
+    }
+    if (firstIdx === -1) firstIdx = channelDraftItems.length;
+
+    const fullOrderedItems = [];
+    for (const ep of event.episodes) {
+      const existingMatch = channelDraftItems.find((it) => isCrossoverEpisodeMatch(it, ep));
+      if (existingMatch) {
+        fullOrderedItems.push(existingMatch);
+      } else {
+        const res = await fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(ep.tmdbId) + '&season=' + encodeURIComponent(ep.season), { cache: 'no-store' });
+        const data = await res.json();
+        let epData = null;
+        if (data.ok && Array.isArray(data.episodes)) {
+          epData = data.episodes.find((e) => e.episode === ep.episode) || data.episodes[ep.episode - 1] || null;
+        }
+
+        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
+        let showPoster = '';
+        let showBackdrop = '';
+        if (showDetailsRes) {
+          const sData = await showDetailsRes.json().catch(() => null);
+          if (sData && sData.ok && sData.results && sData.results.length) {
+            const found = sData.results.find((r) => String(r.tmdbId) === String(ep.tmdbId)) || sData.results[0];
+            if (found) {
+              showPoster = found.poster || '';
+              showBackdrop = found.backdrop || '';
+            }
+          }
+        }
+
+        const epTitle = (epData && epData.name) ? epData.name : ep.title;
+        const epRelease = (epData && epData.released) ? epData.released : undefined;
+        const epThumbnail = (epData && epData.thumbnail) ? epData.thumbnail : (showBackdrop || showPoster);
+
+        const newItem = {
+          kind: 'episode',
+          imdbId: (epData && epData.imdbId) || String(ep.tmdbId),
+          season: ep.season,
+          episode: ep.episode,
+          showName: ep.showName,
+          epName: epTitle,
+          title: ep.showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + epTitle,
+          released: epRelease,
+          thumbnail: epThumbnail,
+          poster: showPoster || epThumbnail || '',
+          showPoster: showPoster || '',
+          backdrop: showBackdrop || '',
+          showBackdrop: showBackdrop || '',
+          seasonNum: ep.season,
+          episodeNum: ep.episode,
+        };
+        fullOrderedItems.push(newItem);
+      }
+    }
+
+    channelDraftItems = channelDraftItems.filter((it) => !event.episodes.some((ep) => isCrossoverEpisodeMatch(it, ep)));
+
+    const insertPos = Math.min(firstIdx, channelDraftItems.length);
+    channelDraftItems.splice(insertPos, 0, ...fullOrderedItems);
+
+    if (channelDraftItems.length > CHANNEL_MAX_TOTAL_ITEMS) {
+      channelDraftItems = channelDraftItems.slice(0, CHANNEL_MAX_TOTAL_ITEMS);
+    }
+
+    renderChannelDraftList();
+    if (typeof showAddedToast === 'function') {
+      showAddedToast('Added crossover episodes for "' + event.name + '" in story order!');
+    }
+  } catch (err) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Crossover Splicer', 'Failed to fetch some crossover episodes. Please check your connection and try again.');
+    } else {
+      alert('Failed to fetch crossover episodes.');
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '+ Add Missing Crossover Episodes in Story Order';
+    }
+  }
 }
 
 function reverseChannelDraft() {
@@ -19076,8 +20955,12 @@ function saveChannel() {
     }
     return;
   }
-  const verticalPoster = channelDraftPoster || null;
-  const horizontalBackdrop = channelDraftBackdrop || (channelDraftItems[0] && (channelDraftItems[0].thumbnail || channelDraftItems[0].backdrop)) || null;
+  const verticalPoster = (channelDraftPoster && channelDraftPoster !== 'custom' && !channelDraftPoster.includes('/api/channel-poster')) ? channelDraftPoster : null;
+  let horizontalBackdrop = null;
+  if (verticalPoster) {
+    const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
+    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || null;
+  }
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 
   const map = loadLocalChannels();
@@ -22267,16 +24150,8 @@ async function handleDeleteAccount() {
       if (btn) btn.disabled = false;
       return;
     }
-    localStorage.removeItem('myListAddon:creatorName');
-    localStorage.removeItem('myListAddon:creatorKey');
-    localStorage.removeItem('myListAddon:creatorDisplayName');
-    localStorage.removeItem('myListAddon:dashboardListOrder');
-    activeCreator = null;
+    clearLocalAccountData();
     closeModal();
-    renderCreatorProfileBar();
-    renderAccountKeySection();
-    renderCreatorDashboard();
-    renderLocalCustomListsDashboard();
     showAddedToast('Your account and all data have been permanently deleted.');
   } catch (err) {
     if (status) status.innerHTML = '<p class="testresult err">&#x2717; Network error deleting account.</p>';
@@ -22402,26 +24277,26 @@ function renderTrackPlaybackSection() {
     '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
       '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
       '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
-      '<div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">' +
-        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="flex:1; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
-        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="white-space:nowrap; padding:8px 14px; font-size:0.84rem;">📋 Copy Webhook URL</button>' +
+      '<div class="webhook-input-group">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
       '</div>' +
 
-      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border);">' +
-        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
-          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
+          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
           '<span style="font-weight:600;">Automatically sync media server scrobbles to your Watch History list</span>' +
         '</label>' +
-        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
-          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; cursor:pointer;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
+          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
           '<span style="font-weight:600;">Forward scrobbles to connected external accounts (Trakt, Simkl, MDBList)</span>' +
         '</label>' +
         '<div>' +
-          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:5px 12px; font-size:0.82rem;">Sync Current Watch History to Connected Accounts Now</button>' +
+          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:8px 14px; font-size:0.82rem; white-space:normal; line-height:1.35; text-align:center; max-width:100%; width:100%; box-sizing:border-box;">Sync Current Watch History to Connected Accounts Now</button>' +
         '</div>' +
       '</div>' +
 
-      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:10px;">' +
+      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap:8px; margin-top:10px; width:100%; max-width:100%; box-sizing:border-box;">' +
         '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
           '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Plex Webhook Setup</summary>' +
           '<p style="margin:6px 0 4px; color:var(--muted);">1. Open <strong>Plex Web &rarr; Settings &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Click <strong>Save Changes</strong>.</p>' +
@@ -22446,7 +24321,9 @@ function copyScrobbleWebhookUrl() {
   const input = document.getElementById('scrobbleWebhookInput');
   if (!input || !input.value) return;
   navigator.clipboard.writeText(input.value).then(() => {
-    alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
+    if (typeof showAddedToast === 'function') showAddedToast('Webhook URL copied to clipboard! \u2713');
+    else if (typeof showAppAlert === 'function') showAppAlert('Copied', 'Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.', true);
+    else alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
   }).catch(() => {
     prompt('Copy your Scrobble Webhook URL:', input.value);
   });
@@ -22508,23 +24385,131 @@ function copyAccountKey() {
   const key = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!key) return;
   navigator.clipboard.writeText(key).then(() => {
-    alert('Key copied to your clipboard.');
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard! \u2713');
+    else alert('Key copied to your clipboard.');
   }).catch(() => {
     prompt('Copy your Key:', key);
   });
 }
 
-function switchCreatorProfile() {
+function clearLocalAccountData() {
   activeCreator = null;
   editingCreatorListSlug = null;
   lastCreatorListsData = null;
-  localStorage.removeItem('myListAddon:creatorName');
-  localStorage.removeItem('myListAddon:creatorKey');
-  renderCreatorProfileBar();
-  renderAccountKeySection();
-  renderWatchlistPreferencesSection();
-  renderTrackPlaybackSection();
-  renderCreatorDashboard();
+
+  // Clear in-memory tokens and credentials
+  traktAccessToken = '';
+  if (typeof traktUsername !== 'undefined') traktUsername = '';
+  mdblistAccessToken = '';
+  if (typeof mdblistUsername !== 'undefined') mdblistUsername = '';
+  simklAccessToken = '';
+  if (typeof simklUsername !== 'undefined') simklUsername = '';
+  tmdbSessionId = '';
+  tmdbAccountId = '';
+  tmdbUsername = '';
+
+  // Clear personal list arrays & tracking sets
+  window._myTraktLists = [];
+  window._myPrivateTraktLists = [];
+  window._myTmdbLists = [];
+  window._mySimklLists = [];
+  window._myMdblistLists = [];
+  window._dismissedContinueWatching = new Set();
+  window._fullyWatchedShowIds = new Set();
+  if (typeof channelDraftItems !== 'undefined') channelDraftItems = [];
+  if (typeof channelDraftPoster !== 'undefined') channelDraftPoster = null;
+  if (typeof channelDraftBackdrop !== 'undefined') channelDraftBackdrop = null;
+  if (typeof editingChannelId !== 'undefined') editingChannelId = null;
+  if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
+
+  // Clear all localStorage keys for account data, credentials, and custom lists
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) {
+        if (
+          k.startsWith('myListAddon:') ||
+          k === 'localCustomLists' ||
+          k === 'localChannels' ||
+          k === 'localMergedChannels' ||
+          k === 'presets'
+        ) {
+          // Preserve persistent UI tab navigation if desired, wipe everything else
+          if (
+            k !== 'myListAddon:activeTab' &&
+            k !== 'myListAddon:settingsSubmenu' &&
+            k !== 'myListAddon:catalogsSubmenu' &&
+            k !== 'myListAddon:discoverSubmenu' &&
+            k !== 'myListAddon:channelsSubmenu' &&
+            k !== 'myListAddon:listsSubmenu'
+          ) {
+            keysToRemove.push(k);
+          }
+        }
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch (e) {}
+
+  // Clear form inputs
+  const inputIds = [
+    'tmdbKeyInput', 'mdblistKeyInput', 'traktKeyInput', 'traktUsernameInput', 'simklKeyInput',
+    'presetNameInput', 'channelNameInput', 'customListNameInput', 'bulkPasteBox', 'importLinkInput',
+    'configJsonBox', 'customListSearchInput', 'channelSearchInput'
+  ];
+  inputIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+
+  // Clear checkboxes
+  const checkboxIds = [
+    'syncTraktHistoryCheckbox', 'syncMdblistHistoryCheckbox', 'syncSimklHistoryCheckbox',
+    'syncMediaServerHistoryCheckbox', 'forwardScrobblesCheckbox', 'trackPlaybackCheck',
+    'removeWatchedFromWatchlistCheck', 'shuffleShelvesCheckbox', 'shuffleItemsCheckbox'
+  ];
+  checkboxIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = false;
+  });
+
+  // Clear rows and list containers
+  const listsEl = document.getElementById('lists');
+  if (listsEl) listsEl.innerHTML = '';
+
+  const resultContainerIds = [
+    'myTraktListsResult', 'myPrivateTraktListsResult', 'myTmdbListsResult',
+    'mySimklListsResult', 'myMdblistListsResult', 'channelDraftList', 'customListDraftList'
+  ];
+  resultContainerIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  });
+
+  // Re-render UI components into logged-out/empty state
+  if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+  if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+  if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+  if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+  if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+  if (typeof renderChannelsList === 'function') renderChannelsList();
+  if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+  if (typeof renderPresetsList === 'function') renderPresetsList();
+  if (typeof renumber === 'function') renumber();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+}
+
+function switchCreatorProfile() {
+  clearLocalAccountData();
+  if (typeof showAddedToast === 'function') {
+    showAddedToast('Signed out \u2713');
+  }
 }
 
 function openRestoreModal() {
@@ -22562,6 +24547,8 @@ async function submitRestoreProfile() {
         escapeHtml(data.error === 'no-kv' ? 'This Worker has no CONFIGS KV namespace bound.' : (data.error || 'Could not restore.')) + '</p>';
       return;
     }
+    // Clean any prior account state before loading restored account
+    clearLocalAccountData();
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
@@ -22571,7 +24558,7 @@ async function submitRestoreProfile() {
     renderWatchlistPreferencesSection();
     renderTrackPlaybackSection();
     renderCreatorDashboard();
-    loadCreatorSync();
+    await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
   }
@@ -22862,66 +24849,170 @@ async function loadCreatorSync() {
 
     if (synced.keys && typeof synced.keys === 'object') {
       try {
-        if (synced.keys.tmdbKey) {
+        const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+        const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+        const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+        const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+        let needPushSync = false;
+
+        if (synced.keys.tmdbKey && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbKey', synced.keys.tmdbKey);
           const el = document.getElementById('tmdbKeyInput');
           if (el) el.value = synced.keys.tmdbKey;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbKey');
+          const el = document.getElementById('tmdbKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:tmdbKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbSessionId) {
+
+        if (synced.keys.tmdbSessionId && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbSessionId', synced.keys.tmdbSessionId);
           window.tmdbSessionId = synced.keys.tmdbSessionId;
+          tmdbSessionId = synced.keys.tmdbSessionId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbSessionId');
+          window.tmdbSessionId = '';
+          tmdbSessionId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbSessionId')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbAccountId) {
+
+        if (synced.keys.tmdbAccountId && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbAccountId', synced.keys.tmdbAccountId);
           window.tmdbAccountId = synced.keys.tmdbAccountId;
+          tmdbAccountId = synced.keys.tmdbAccountId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbAccountId');
+          window.tmdbAccountId = '';
+          tmdbAccountId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbAccountId')) {
+          needPushSync = true;
         }
-        if (synced.keys.tmdbUsername) {
+
+        if (synced.keys.tmdbUsername && !tmdbDisc) {
           localStorage.setItem('myListAddon:tmdbUsername', synced.keys.tmdbUsername);
           window.tmdbUsername = synced.keys.tmdbUsername;
+          tmdbUsername = synced.keys.tmdbUsername;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbUsername');
+          window.tmdbUsername = '';
+          tmdbUsername = '';
+        } else if (localStorage.getItem('myListAddon:tmdbUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistKey) {
+
+        if (synced.keys.mdblistKey && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistKey', synced.keys.mdblistKey);
           const el = document.getElementById('mdblistKeyInput');
           if (el) el.value = synced.keys.mdblistKey;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistKey');
+          const el = document.getElementById('mdblistKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:mdblistKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistAccessToken) {
+
+        if (synced.keys.mdblistAccessToken && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
           window.mdblistAccessToken = synced.keys.mdblistAccessToken;
           mdblistAccessToken = synced.keys.mdblistAccessToken;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistAccessToken');
+          window.mdblistAccessToken = '';
+          mdblistAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:mdblistAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.mdblistUsername) {
+
+        if (synced.keys.mdblistUsername && !mdblistDisc) {
           localStorage.setItem('myListAddon:mdblistUsername', synced.keys.mdblistUsername);
           window.mdblistUsername = synced.keys.mdblistUsername;
+          mdblistUsername = synced.keys.mdblistUsername;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistUsername');
+          window.mdblistUsername = '';
+          mdblistUsername = '';
+        } else if (localStorage.getItem('myListAddon:mdblistUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktKey) {
+
+        if (synced.keys.traktKey && !traktDisc) {
           localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
           const el = document.getElementById('traktKeyInput');
           if (el) el.value = synced.keys.traktKey;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktKey');
+          const el = document.getElementById('traktKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:traktKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktUsername) {
+
+        if (synced.keys.traktUsername && !traktDisc) {
           localStorage.setItem('myListAddon:traktUsername', synced.keys.traktUsername);
           const el = document.getElementById('traktUsernameInput');
           if (el) el.value = synced.keys.traktUsername;
+          traktUsername = synced.keys.traktUsername;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktUsername');
+          const el = document.getElementById('traktUsernameInput');
+          if (el) el.value = '';
+          traktUsername = '';
+        } else if (localStorage.getItem('myListAddon:traktUsername')) {
+          needPushSync = true;
         }
-        if (synced.keys.traktAccessToken) {
+
+        if (synced.keys.traktAccessToken && !traktDisc) {
           localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
           window.traktAccessToken = synced.keys.traktAccessToken;
           traktAccessToken = synced.keys.traktAccessToken;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktAccessToken');
+          window.traktAccessToken = '';
+          traktAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:traktAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklKey) {
+
+        if (synced.keys.simklKey && !simklDisc) {
           localStorage.setItem('myListAddon:simklKey', synced.keys.simklKey);
           const el = document.getElementById('simklKeyInput');
           if (el) el.value = synced.keys.simklKey;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklKey');
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:simklKey')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklAccessToken) {
+
+        if (synced.keys.simklAccessToken && !simklDisc) {
           localStorage.setItem('myListAddon:simklAccessToken', synced.keys.simklAccessToken);
           window.simklAccessToken = synced.keys.simklAccessToken;
           simklAccessToken = synced.keys.simklAccessToken;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklAccessToken');
+          window.simklAccessToken = '';
+          simklAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:simklAccessToken')) {
+          needPushSync = true;
         }
-        if (synced.keys.simklUsername) {
+
+        if (synced.keys.simklUsername && !simklDisc) {
           localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
           window.simklUsername = synced.keys.simklUsername;
+          simklUsername = synced.keys.simklUsername;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklUsername');
+          window.simklUsername = '';
+          simklUsername = '';
+        } else if (localStorage.getItem('myListAddon:simklUsername')) {
+          needPushSync = true;
         }
+
         if (typeof synced.keys.syncTraktHistory === 'boolean') {
           localStorage.setItem('myListAddon:syncTraktHistory', synced.keys.syncTraktHistory ? 'true' : 'false');
         }
@@ -22932,10 +25023,15 @@ async function loadCreatorSync() {
           localStorage.setItem('myListAddon:syncSimklHistory', synced.keys.syncSimklHistory ? 'true' : 'false');
         }
         if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+        if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+        if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+        if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+        if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
         if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
         if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
         if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
         if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
+        if (needPushSync && typeof pushCreatorSync === 'function') pushCreatorSync();
       } catch (e) {}
     }
 
@@ -23828,6 +25924,7 @@ if (_creatorDashEl) {
       addToConfigBtn.classList.add('primary');
       addToConfigBtn.textContent = '+ Add';
       addToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
     } else {
       if (listMeta.type === 'mixed') {
@@ -23850,6 +25947,7 @@ if (_creatorDashEl) {
       addToConfigBtn.classList.remove('primary');
       addToConfigBtn.textContent = 'Remove';
       addToConfigBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
     }
     return;
@@ -23920,6 +26018,11 @@ if (_creatorDashEl) {
     }
 
     if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listMeta.type, slug);
+        removeListFromConfig(null, 'movie', slug);
+        removeListFromConfig(null, 'series', slug);
+      }
       document.querySelectorAll('#lists .url').forEach((urlInput) => {
         const rowPayload = parseCustomListPayloadClient(urlInput.value);
         if (rowPayload && rowPayload.localSlug === slug) {
@@ -23944,6 +26047,7 @@ if (_creatorDashEl) {
       localAddToConfigBtn.classList.add('primary');
       localAddToConfigBtn.textContent = '+ Add';
       localAddToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
       return;
     }
@@ -23994,6 +26098,7 @@ if (_creatorDashEl) {
     localAddToConfigBtn.classList.remove('primary');
     localAddToConfigBtn.textContent = 'Remove';
     localAddToConfigBtn.style.color = 'var(--danger)';
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
     showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
   }
 });
@@ -24629,7 +26734,51 @@ function removeCustomListItemDirect(id, slug, btn) {
   }
 }
 
+function clearWatchHistoryAll() {
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Clear Watch History',
+    'Are you sure you want to remove all items from your Watch History? This will reset your watched history and cannot be undone.',
+    'Clear All',
+    () => {
+      const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      if (map['watch-history']) {
+        map['watch-history'].items = [];
+        map['watch-history'].updatedAt = Date.now();
+        if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      }
+      window._watchedItemIds = new Set();
+      window._rawWatchHistoryItems = [];
+      window._fullyWatchedShowIds = new Set();
+      try {
+        localStorage.removeItem('myListAddon:fullyWatchedShows');
+      } catch (e) {}
 
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+
+      // Refresh list details view if currently visible
+      if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+        const params = window._currentListDetailsParams;
+        if (params && (params.name.toLowerCase().includes('watch history') || params.listUrl === 'autotrack:watch-history' || params.listUrl === 'custom:watch-history')) {
+          if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+          if (typeof _updateListDetailsItemCount === 'function') _updateListDetailsItemCount(0);
+        }
+      }
+
+      // Refresh dashboard if visible
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderLocalCustomListsDashboard === 'function') {
+        const box = document.getElementById('localCustomListsDashboard');
+        if (box) renderLocalCustomListsDashboard(box, true);
+      }
+
+      if (typeof showAddedToast === 'function') showAddedToast('Watch History cleared \u2713');
+    },
+    true
+  );
+}
+window.clearWatchHistoryAll = clearWatchHistoryAll;
 // Reordering & position management
 function moveRow(btn, dir) {
   const entry = btn.closest('.entry');
@@ -24978,7 +27127,8 @@ async function testSourceRow(btn) {
 async function testAllSources() {
   const buttons = Array.from(document.querySelectorAll('#lists .btn-test'));
   if (!buttons.length) {
-    alert('No lists to test yet -- add some above first.');
+    if (typeof showAppAlert === 'function') showAppAlert('No Lists', 'No lists to test yet -- add some above first.', false);
+    else alert('No lists to test yet -- add some above first.');
     return;
   }
   const testAllBtn = document.getElementById('testAllBtn');
@@ -25009,7 +27159,12 @@ async function testAllSources() {
     testAllBtn.disabled = false;
     testAllBtn.textContent = 'Test all';
   }
-  alert('Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.');
+  const summaryMsg = 'Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.';
+  if (typeof showAppAlert === 'function') {
+    showAppAlert(errCount > 0 ? 'Testing Complete (With Errors)' : 'Testing Complete', summaryMsg, errCount === 0);
+  } else {
+    alert(summaryMsg);
+  }
 }
 
 function buildConfig(entries, keys) {
@@ -25103,64 +27258,69 @@ function collectKeys() {
   let track = false;
   try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
 
+  const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+
   const tmdbKeyEl = document.getElementById('tmdbKeyInput');
   let tmdbKey = tmdbKeyEl ? tmdbKeyEl.value.trim() : '';
-  if (!tmdbKey) {
+  if (!tmdbKey && !tmdbDisc) {
     try { tmdbKey = localStorage.getItem('myListAddon:tmdbKey') || ''; } catch (e) {}
   }
   let tmdbSession = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || '';
-  if (!tmdbSession) {
+  if (!tmdbSession && !tmdbDisc) {
     try { tmdbSession = localStorage.getItem('myListAddon:tmdbSessionId') || ''; } catch (e) {}
   }
   let tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || '';
-  if (!tmdbAcc) {
+  if (!tmdbAcc && !tmdbDisc) {
     try { tmdbAcc = localStorage.getItem('myListAddon:tmdbAccountId') || ''; } catch (e) {}
   }
   let tmdbUser = (typeof tmdbUsername !== 'undefined' && tmdbUsername) || '';
-  if (!tmdbUser) {
+  if (!tmdbUser && !tmdbDisc) {
     try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
   }
 
   const mdblistKeyEl = document.getElementById('mdblistKeyInput');
   let mdblistKey = mdblistKeyEl ? mdblistKeyEl.value.trim() : '';
-  if (!mdblistKey) {
+  if (!mdblistKey && !mdblistDisc) {
     try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
   }
   let mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || '';
-  if (!mdblistToken) {
+  if (!mdblistToken && !mdblistDisc) {
     try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
   let mdblistUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || '';
-  if (!mdblistUser) {
+  if (!mdblistUser && !mdblistDisc) {
     try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
   }
 
   const traktKeyEl = document.getElementById('traktKeyInput');
   let traktKey = traktKeyEl ? traktKeyEl.value.trim() : '';
-  if (!traktKey) {
+  if (!traktKey && !traktDisc) {
     try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
   }
   const traktUserEl = document.getElementById('traktUsernameInput');
   let traktUser = traktUserEl ? traktUserEl.value.trim() : '';
-  if (!traktUser) {
+  if (!traktUser && !traktDisc) {
     try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
   }
   let traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || '';
-  if (!traktToken) {
+  if (!traktToken && !traktDisc) {
     try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
   }
 
   const simklKeyEl = document.getElementById('simklKeyInput');
   let simklKey = simklKeyEl ? simklKeyEl.value.trim() : '';
-  if (!simklKey) {
+  if (!simklKey && !simklDisc) {
     try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
   }
   let simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || '';
-  if (!simklToken) {
+  if (!simklToken && !simklDisc) {
     try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
   let simklUser = (typeof simklUsername !== 'undefined' && simklUsername) || '';
-  if (!simklUser) {
+  if (!simklUser && !simklDisc) {
     try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
   }
 
@@ -25620,10 +27780,10 @@ window.switchListDetailsType = function(newType) {
     isDualTypeChart = true;
     if (newType === 'series') {
       targetUrl = 'tmdb:chart:new_shows';
-      targetName = 'New Shows';
+      targetName = 'New Releases';
     } else if (newType === 'movie') {
       targetUrl = 'tmdb:chart:new_movies';
-      targetName = 'New Movies';
+      targetName = 'New Releases';
     }
   } else if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
     const match = CHART_SLUG_ENTRIES.find((e) => e.name === p.name || e.movieUrl === p.listUrl || e.showUrl === p.listUrl);
@@ -26153,9 +28313,70 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         removeListFromConfig(null, type, listUrl);
       }
       updateDetailAddBtn();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + (name || 'List') + '" from your Catalogs.');
     } else {
-      if (listUrl && listUrl.startsWith('custom:curated:')) {
+      let slug = '';
+      if (listUrl) {
+        if (listUrl.startsWith('autotrack:')) slug = listUrl.split(':')[1] || '';
+        else if (listUrl.startsWith('custom:') && !listUrl.startsWith('custom:curated:')) slug = listUrl.slice('custom:'.length);
+      }
+      if (!slug && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
+        slug = name.toLowerCase().replace(' ', '-');
+      }
+
+      if (slug === 'continue-watching' || slug === 'watch-history' || slug === 'watchlist') {
+        const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const listMeta = localMap[slug] || (typeof lastLocalCustomListsData !== 'undefined' && (lastLocalCustomListsData || []).find((l) => l.slug === slug)) || { name: name || slug, slug: slug, type: type || 'series', items: [] };
+        const items = listMeta.items || [];
+        const isMovieType = type === 'movie';
+        const isSeriesType = type === 'series';
+
+        if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+          const movies = [];
+          const series = [];
+          items.forEach((it) => {
+            const isMovie = it.kind === 'movie' || it.type === 'movie';
+            const mapped = {
+              imdbId: isMovie ? (it.imdbId || it.id) : (it.showId || it.imdbId || it.id),
+              title: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
+              poster: isMovie ? it.poster : (it.showPoster || it.poster),
+              year: it.year,
+            };
+            if (isMovie) {
+              movies.push(mapped);
+            } else {
+              if (!series.some((s) => s.imdbId === mapped.imdbId)) {
+                series.push(mapped);
+              }
+            }
+          });
+
+          if (isMovieType || (!isSeriesType && movies.length > 0)) {
+            const url = (typeof activeCreator !== 'undefined' && activeCreator && (slug === 'watch-history' || slug === 'continue-watching'))
+              ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
+              : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'movie', items: movies, shuffle: false });
+            addRow(listMeta.name + ((!isMovieType && series.length > 0) ? ' (Movies)' : ''), url, 'movie', true, 'My Lists');
+          }
+          if (isSeriesType || (!isMovieType && (series.length > 0 || movies.length === 0))) {
+            const url = (typeof activeCreator !== 'undefined' && activeCreator && (slug === 'watch-history' || slug === 'continue-watching'))
+              ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
+              : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'series', items: series, shuffle: false });
+            addRow(listMeta.name + ((!isSeriesType && movies.length > 0) ? ' (Shows)' : ''), url, 'series', true, 'My Lists');
+          }
+        } else {
+          const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type || type || 'movie', items: items, shuffle: false };
+          addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'My Lists');
+        }
+      } else if (slug && (typeof loadLocalCustomLists === 'function') && loadLocalCustomLists()[slug]) {
+        const listMeta = loadLocalCustomLists()[slug];
+        const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type || type || 'movie', items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'My Lists');
+      } else if (slug && typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData) && lastCreatorListsData.find((l) => l.slug === slug)) {
+        const listMeta = lastCreatorListsData.find((l) => l.slug === slug);
+        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type || type || 'movie', items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'Custom Lists');
+      } else if (listUrl && listUrl.startsWith('custom:curated:')) {
         addRow(name || 'Curated List', listUrl, type, true, 'Curated');
       } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
         addRow(name || 'List', listUrl, type, true, 'New Releases');
@@ -26163,6 +28384,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         addRow(name || 'List', listUrl, type, true, 'Custom');
       }
       updateDetailAddBtn();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + (name || 'List') + '" to your Catalogs.');
     }
   };
@@ -26404,7 +28626,8 @@ function openLivePreviewSeeAll(i) {
 function exportConfigJson() {
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const keys = collectKeys();
@@ -26426,14 +28649,16 @@ function exportConfigJson() {
 function importConfigJson() {
   const raw = document.getElementById('configJsonBox').value.trim();
   if (!raw) {
-    alert('Paste a config JSON blob into the box first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Input Required', 'Paste a config JSON blob into the box first.', false);
+    else alert('Paste a config JSON blob into the box first.');
     return;
   }
   let data;
   try {
     data = JSON.parse(raw);
   } catch (e) {
-    alert('That is not valid JSON.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid JSON', 'That is not valid JSON.', false);
+    else alert('That is not valid JSON.');
     return;
   }
   applyImportedConfig(data);
@@ -26444,7 +28669,8 @@ function importConfigJson() {
 // for the raw JSON.
 function applyImportedConfig(data) {
   if (!data || !Array.isArray(data.entries)) {
-    alert('That JSON does not look like a My Lists config -- expected an "entries" array.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid Config', 'That JSON does not look like a My Lists config -- expected an "entries" array.', false);
+    else alert('That JSON does not look like a My Lists config -- expected an "entries" array.');
     return;
   }
   document.getElementById('lists').innerHTML = '';
@@ -26492,7 +28718,8 @@ function applyImportedConfig(data) {
   scheduleMyMdblistListsRefresh();
   scheduleMyTraktListsRefresh();
   if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
-  alert('Imported ' + data.entries.length + ' list(s).');
+  if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s).', true);
+  else alert('Imported ' + data.entries.length + ' list(s).');
 }
 
 // --- import from an existing link -------------------------------------------
@@ -26508,7 +28735,8 @@ function applyImportedConfig(data) {
 async function importFromLink() {
   const raw = document.getElementById('importLinkInput').value.trim();
   if (!raw) {
-    alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Link Required', 'Paste an install link, configure link, or stremio:// / wako:// link first.', false);
+    else alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
     return;
   }
   const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
@@ -26520,14 +28748,16 @@ async function importFromLink() {
     config = cleaned; // looks like a bare config id/token, pasted on its own
   }
   if (!config) {
-    alert('Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid Link', 'Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.', false);
+    else alert('Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.');
     return;
   }
   try {
     const res = await fetch(ORIGIN + '/api/resolve?config=' + encodeURIComponent(config));
     const data = await res.json();
     if (!data.ok) {
-      alert('Could not load that link: ' + (data.error || 'unknown error'));
+      if (typeof showAppAlert === 'function') showAppAlert('Link Error', 'Could not load that link: ' + (data.error || 'unknown error'), false);
+      else alert('Could not load that link: ' + (data.error || 'unknown error'));
       return;
     }
     data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
@@ -26547,9 +28777,11 @@ async function importFromLink() {
     saveState();
     renderChannelMergeList();
     document.getElementById('importLinkInput').value = '';
-    alert('Imported ' + data.entries.length + ' list(s) from that link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s) from that link.', true);
+    else alert('Imported ' + data.entries.length + ' list(s) from that link.');
   } catch (e) {
-    alert('Network error while resolving that link.');
+    if (typeof showAppAlert === 'function') showAppAlert('Network Error', 'Network error while resolving that link.', false);
+    else alert('Network error while resolving that link.');
   }
 }
 
@@ -26654,12 +28886,14 @@ async function saveCurrentAsPreset() {
   const nameInput = document.getElementById('presetNameInput');
   const name = nameInput.value.trim();
   if (!name) {
-    alert('Name this preset first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Preset Name Required', 'Name this preset first.', false);
+    else alert('Name this preset first.');
     return;
   }
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const map = loadPresetsMap();
@@ -26676,13 +28910,16 @@ async function saveCurrentAsPreset() {
     // that limit (see the size guard on /api/creator/sync/save-presets).
     const pushResult = activeCreator ? await pushPresetsDirectly(map) : { ok: false, error: null };
     if (!pushResult.ok) {
-      alert(
-        activeCreator
-          ? (pushResult.error
-              ? 'Could not save this preset to your account: ' + pushResult.error
-              : 'Could not save this preset to your account either \u2014 check your connection and try again. If this keeps happening, check the browser console (F12) for more detail.')
-          : 'Could not save this preset \u2014 your browser\\'s local storage is full. This usually happens when a TV Channel with a lot of episodes is included, since each preset stores a full copy of everything in it. Try removing a large Channel from this preset, deleting an older preset you no longer need, using Backup/Restore\\'s "Download as file" option instead (which isn\\'t limited the same way), or creating a free account so this can be saved there instead of just this browser.'
-      );
+      const errMsg = activeCreator
+        ? (pushResult.error
+            ? "Could not save this preset to your account: " + pushResult.error
+            : "Could not save this preset to your account either — check your connection and try again. If this keeps happening, check the browser console (F12) for more detail.")
+        : "Could not save this preset — your browser's local storage is full. This usually happens when a TV Channel with a lot of episodes is included, since each preset stores a full copy of everything in it. Try removing a large Channel from this preset, deleting an older preset you no longer need, using Backup/Restore's 'Download as file' option instead (which isn't limited the same way), or creating a free account so this can be saved there instead of just this browser.";
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Preset Save Error', errMsg, false);
+      } else {
+        alert(errMsg);
+      }
       return;
     }
   }
@@ -26746,9 +28983,13 @@ function sharePreset(name) {
   if (!preset) return;
   const jsonStr = JSON.stringify({ entries: preset.entries }, null, 2);
   navigator.clipboard.writeText(jsonStr).then(() => {
-    alert('"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Preset Copied', '"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.', true);
+    } else {
+      alert('"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.');
+    }
   }).catch(() => {
-    prompt('Copy this preset\\'s JSON:', jsonStr);
+    prompt("Copy this preset's JSON:", jsonStr);
   });
 }
 
@@ -26806,7 +29047,8 @@ function readJsonFile(input, onParsed) {
     try {
       data = JSON.parse(reader.result);
     } catch (e) {
-      alert('That file is not valid JSON.');
+      if (typeof showAppAlert === 'function') showAppAlert('Invalid File', 'That file is not valid JSON.', false);
+      else alert('That file is not valid JSON.');
       input.value = '';
       return;
     }
@@ -26814,7 +29056,8 @@ function readJsonFile(input, onParsed) {
     input.value = '';
   };
   reader.onerror = () => {
-    alert('Could not read that file.');
+    if (typeof showAppAlert === 'function') showAppAlert('Read Error', 'Could not read that file.', false);
+    else alert('Could not read that file.');
     input.value = '';
   };
   reader.readAsText(file);
@@ -26823,7 +29066,8 @@ function readJsonFile(input, onParsed) {
 function downloadConfigJson() {
   const entries = collectEntries();
   if (!entries.length) {
-    alert('Add at least one list first.');
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
+    else alert('Add at least one list first.');
     return;
   }
   const keys = collectKeys();
@@ -26856,7 +29100,8 @@ function downloadPreset(name) {
 function uploadPresetFile(input) {
   readJsonFile(input, (data, file) => {
     if (!data || !Array.isArray(data.entries)) {
-      alert('That file does not look like a preset -- expected an "entries" array.');
+      if (typeof showAppAlert === 'function') showAppAlert('Invalid Preset', 'That file does not look like a preset -- expected an "entries" array.', false);
+      else alert('That file does not look like a preset -- expected an "entries" array.');
       return;
     }
     const suggested = (file.name || 'Preset').replace(/\.json$/i, '');
@@ -26938,7 +29183,8 @@ function exportDataToCsv(target, format) {
     const historyList = map['watch-history'];
     const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
     if (!items.length) {
-      alert('Your Watch History is currently empty.');
+      if (typeof showAppAlert === 'function') showAppAlert('Empty Watch History', 'Your Watch History is currently empty.', false);
+      else alert('Your Watch History is currently empty.');
       return;
     }
 
@@ -27017,7 +29263,8 @@ function exportDataToCsv(target, format) {
       }
     });
     if (totalItems === 0) {
-      alert('You do not have any saved list items to export.');
+      if (typeof showAppAlert === 'function') showAppAlert('No Saved Lists', 'You do not have any saved list items to export.', false);
+      else alert('You do not have any saved list items to export.');
       return;
     }
   }
@@ -27068,6 +29315,7 @@ function saveState() {
     // localStorage unavailable (private browsing, disabled, etc.) — fine,
     // just means refreshes won't be remembered.
   }
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
   scheduleCreatorSyncSave();
 }
 
@@ -27090,9 +29338,31 @@ function loadSavedState() {
 
 function copyLink(url) {
   navigator.clipboard.writeText(url).then(() => {
-    const btn = document.getElementById('copyBtn');
-    if (btn) { const old = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = old, 1500); }
-  }).catch(() => alert(url));
+    const urlBtn = document.getElementById('copyUrlBtn');
+    if (urlBtn) {
+      const oldUrlHtml = urlBtn.innerHTML;
+      urlBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span>Copied!</span>';
+      urlBtn.style.background = 'var(--success)';
+      urlBtn.style.color = '#ffffff';
+      urlBtn.style.borderColor = 'var(--success)';
+      setTimeout(() => {
+        urlBtn.innerHTML = oldUrlHtml;
+        urlBtn.style.background = '';
+        urlBtn.style.color = '';
+        urlBtn.style.borderColor = '';
+      }, 1800);
+    }
+  }).catch(() => {
+    const display = document.getElementById('manifestLinkDisplay');
+    if (window.getSelection && display) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(display);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    alert('Manifest URL: ' + url);
+  });
 }
 
 function openInNuvio(installUrl, e) {
@@ -27108,7 +29378,7 @@ async function generate() {
 
   const box = document.getElementById('result');
   box.style.display = 'block';
-  box.innerHTML = '<p><small>Generating link\u2026</small></p>';
+  box.innerHTML = '<div class="install-result-card" style="align-items:center; justify-content:center; padding:24px; color:var(--muted);"><span class="spinner" style="display:inline-block; width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; margin-right:8px; vertical-align:middle;"></span> Generating install link\u2026</div>';
 
   // Prefer a short, KV-backed id (see /api/save) so the install URL stays a
   // fixed short length no matter how many lists are configured. If this
@@ -27139,13 +29409,11 @@ async function generate() {
     // episodes can make the encoded config huge even with just one or two
     // rows total, so this checks the actual encoded length instead.
     if (config.length > 4000) {
-      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
     }
   }
 
   const installUrl = ORIGIN + '/' + config + '/manifest.json';
-  const stremioUrl = 'stremio://' + installUrl.replace(/^https?:\\/\\//, '');
-  const nuvioUrl = 'nuvio://' + installUrl.replace(/^https?:\\/\\//, '');
   // A group breakdown alongside the plain install-count beacon -- each
   // row's own .group ("MDBList Charts", "Custom Lists", "Channels", etc.)
   // is already a meaningful "what kind of source is this" label, no need
@@ -27166,14 +29434,43 @@ async function generate() {
   }).catch(() => {});
 
   box.innerHTML = \`
-    \${sizeWarning}
-    <a class="installlink" href="\${installUrl}" id="manifestLink">\${installUrl}</a>
-    <div class="actions">
-      <button class="btn-copy secondary" id="copyBtn" onclick="copyLink('\${installUrl}')">Copy link</button>
-      <a class="btn-stremio" href="\${stremioUrl}">Open in Stremio</a>
-      <a class="btn-nuvio" href="\${nuvioUrl}" onclick="openInNuvio('\${installUrl}', event)">Open in Nuvio</a>
-    </div>
-    <p class="hint"><small>If "Open in Nuvio" doesn't automatically open on your device, the manifest link was copied &mdash; paste it in Nuvio &rarr; Settings &gt; Content & Discovery &gt; Addons.</small></p>\`;
+    <div class="install-result-card">
+      <div class="install-result-header">
+        <div class="install-result-badge">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          <span>Add-on Ready to Install</span>
+        </div>
+        <span class="install-result-sub">\${entries.length} catalog\${entries.length === 1 ? '' : 's'} configured</span>
+      </div>
+
+      \${sizeWarning}
+
+      <div class="install-url-container">
+        <div class="install-url-header">
+          <div class="install-url-label">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+            <span>Manifest Link</span>
+          </div>
+          <button type="button" class="install-url-copy-btn" id="copyUrlBtn" onclick="copyLink('\${installUrl}')" title="Copy manifest link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <span>Copy Link</span>
+          </button>
+        </div>
+        <div class="install-url-box" id="manifestLinkDisplay" onclick="copyLink('\${installUrl}')" title="Click to copy">\${installUrl}</div>
+      </div>
+
+      <div class="install-hint-box">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0; margin-top:2px;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+        <div>
+          <span>To install this add-on, copy the manifest link above and paste it into:</span>
+          <div class="install-hint-steps">
+            <span>&bull; <strong>Stremio</strong> &rarr; Addons &rarr; Community &rarr; Paste URL</span>
+            <span>&bull; <strong>Nuvio</strong> &rarr; Settings &rarr; Content &amp; Discovery &rarr; Addons</span>
+            <span>&bull; <strong>Wako</strong> &rarr; Settings &rarr; Add-ons &rarr; Install from URL</span>
+          </div>
+        </div>
+      </div>
+    </div>\`;
   // The mobile sticky CTA bar can be tapped from anywhere on a long page of
   // rows, so bring the result into view rather than leaving it rendered
   // off-screen above the fold the person's currently scrolled past.
@@ -27207,36 +29504,46 @@ if (serverEntries.length) {
   if (saved && document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
   }
-  if (saved && saved.keys && saved.keys.mdblistKey) {
+  const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+
+  if (!mdblistDisc && saved && saved.keys && saved.keys.mdblistKey) {
     const el = document.getElementById('mdblistKeyInput');
     if (el) el.value = saved.keys.mdblistKey;
   }
-  if (saved && saved.keys && saved.keys.mdblistAccessToken) {
+  if (!mdblistDisc && saved && saved.keys && saved.keys.mdblistAccessToken) {
     mdblistAccessToken = saved.keys.mdblistAccessToken;
   }
-  if (saved && saved.keys && saved.keys.traktKey) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktKey) {
     const el = document.getElementById('traktKeyInput');
     if (el) el.value = saved.keys.traktKey;
   }
-  if (saved && saved.keys && saved.keys.traktUsername) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktUsername) {
     const el = document.getElementById('traktUsernameInput');
     if (el) el.value = saved.keys.traktUsername;
   }
-  if (saved && saved.keys && saved.keys.traktAccessToken) {
+  if (!traktDisc && saved && saved.keys && saved.keys.traktAccessToken) {
     traktAccessToken = saved.keys.traktAccessToken;
   }
-  if (saved && saved.keys && saved.keys.simklKey) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklKey) {
     const el = document.getElementById('simklKeyInput');
     if (el) el.value = saved.keys.simklKey;
   }
-  if (saved && saved.keys && saved.keys.simklAccessToken) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklAccessToken) {
     simklAccessToken = saved.keys.simklAccessToken;
   }
-  if (saved && saved.keys && saved.keys.simklUsername) {
+  if (!simklDisc && saved && saved.keys && saved.keys.simklUsername) {
     simklUsername = saved.keys.simklUsername;
   }
 }
-if (!mdblistAccessToken) {
+if (localStorage.getItem('myListAddon:mdblistDisconnected') === 'true') {
+  mdblistAccessToken = '';
+  try { window.mdblistAccessToken = ''; } catch (e) {}
+  const el = document.getElementById('mdblistKeyInput');
+  if (el) el.value = '';
+} else if (!mdblistAccessToken) {
   const savedForMdblist = loadSavedState();
   if (savedForMdblist && savedForMdblist.keys && savedForMdblist.keys.mdblistAccessToken) {
     mdblistAccessToken = savedForMdblist.keys.mdblistAccessToken;
@@ -27244,7 +29551,16 @@ if (!mdblistAccessToken) {
     try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
   }
 }
-if (!traktAccessToken) {
+
+if (localStorage.getItem('myListAddon:traktDisconnected') === 'true') {
+  traktAccessToken = '';
+  try { window.traktAccessToken = ''; } catch (e) {}
+  if (typeof activeTraktToken !== 'undefined') activeTraktToken = null;
+  const tk = document.getElementById('traktKeyInput');
+  if (tk) tk.value = '';
+  const tu = document.getElementById('traktUsernameInput');
+  if (tu) tu.value = '';
+} else if (!traktAccessToken) {
   const savedForTrakt = loadSavedState();
   if (savedForTrakt && savedForTrakt.keys && savedForTrakt.keys.traktAccessToken) {
     traktAccessToken = savedForTrakt.keys.traktAccessToken;
@@ -27252,13 +29568,32 @@ if (!traktAccessToken) {
     try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
   }
 }
-if (!simklAccessToken) {
+
+if (localStorage.getItem('myListAddon:simklDisconnected') === 'true') {
+  simklAccessToken = '';
+  try { window.simklAccessToken = ''; } catch (e) {}
+  simklUsername = '';
+  try { window.simklUsername = ''; } catch (e) {}
+  const sk = document.getElementById('simklKeyInput');
+  if (sk) sk.value = '';
+} else if (!simklAccessToken) {
   const savedForSimkl = loadSavedState();
   if (savedForSimkl && savedForSimkl.keys && savedForSimkl.keys.simklAccessToken) {
     simklAccessToken = savedForSimkl.keys.simklAccessToken;
   } else {
     try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
   }
+}
+
+if (localStorage.getItem('myListAddon:tmdbDisconnected') === 'true') {
+  tmdbSessionId = '';
+  try { window.tmdbSessionId = ''; } catch (e) {}
+  tmdbAccountId = '';
+  try { window.tmdbAccountId = ''; } catch (e) {}
+  tmdbUsername = '';
+  try { window.tmdbUsername = ''; } catch (e) {}
+  const tmk = document.getElementById('tmdbKeyInput');
+  if (tmk) tmk.value = '';
 }
 suppressSave = false;
 renumber();
@@ -27364,11 +29699,11 @@ tryAutoRestoreCreatorProfile();
     return;
   }
   if (path.toLowerCase() === '/lists/new-movies') {
-    openListDetailsPage('New Movies', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
+    openListDetailsPage('New Releases', 'movie', 'tmdb:chart:new_movies', null, { skipPushState: true });
     return;
   }
   if (path.toLowerCase() === '/lists/new-shows') {
-    openListDetailsPage('New Shows', 'series', 'tmdb:chart:new_shows', null, { skipPushState: true });
+    openListDetailsPage('New Releases', 'series', 'tmdb:chart:new_shows', null, { skipPushState: true });
     return;
   }
   const tmdbCollMatch = path.match(new RegExp('^/lists/tmdb/collection/([0-9]+)(?:-([a-z0-9_-]+))?', 'i'));
@@ -27527,6 +29862,245 @@ window.addEventListener('popstate', (e) => {
 });
 </script>
 
+</body>
+</html>`;
+}
+
+// --- /guide -----------------------------------------------------------------
+//
+// A standalone content page, not the interactive builder -- see the GET
+// /guide route in 25_api-catalog-routes.js. Deliberately its own small,
+// self-contained template literal (own <head>, own lightweight stylesheet)
+// rather than reusing renderBuilder's ~2000-line app stylesheet, since
+// almost none of that (tab bars, drag-and-drop entry cards, live preview
+// grids...) applies to a static article page -- pulling it in would just
+// be dead weight on every /guide page load.
+//
+// Content-wise this exists to be the answer to the searches this add-on's
+// own users already had to go find third-party guide sites for --
+// "how do I turn an MDBList/Trakt/TMDB list into a Stremio catalog" --
+// written by the people who actually built the tool, plus the "why
+// self-host instead of a hosted list addon" pitch and a provider
+// comparison/FAQ. See seoHeadHtml's own comment in 09_page-shell.js for
+// why /:config/configure pages are the ones that get noindex'd, not this
+// one -- this page has no per-user config in its URL at all, so it's
+// exactly the kind of URL meant to be crawled and indexed.
+function renderGuidePage(origin) {
+  const title = `${ADDON_NAME} — How to Turn MDBList, Trakt, TMDB & Simkl Lists Into Stremio Catalogs`;
+  const description =
+    "Step-by-step guide to turning any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row -- plus why self-hosting on your own free Cloudflare account beats a hosted list addon, a provider comparison, and answers to common questions.";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F2F2F7">
+<title>${title}</title>
+<meta name="description" content="${description}">
+<link rel="canonical" href="${origin}/guide">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${description}">
+<meta property="og:url" content="${origin}/guide">
+<meta property="og:image" content="${origin}/icon.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${description}">
+<link rel="icon" type="image/png" href="${origin}/icon.png">
+<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: [
+      {
+        "@type": "Question",
+        name: "Is this add-on free?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier -- optional support is available via Buy Me a Coffee, but nothing is gated behind it.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Do I need to create an account to use it?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Do I need API keys from MDBList, Trakt, TMDB, or Simkl?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "Not for public lists. Public mdblist.com list URLs work with no key at all. Trakt and TMDB require a key on every request even for public data, but the deployment already includes a shared key for that. You only need your own personal key for private lists, personal watchlists, or higher usage.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "What's the difference between self-hosting this and using a hosted list addon?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text:
+            "A hosted addon runs on someone else's server, under someone else's account, subject to someone else's uptime and rate limits. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, nothing runs unless you deployed it, and there's no third party in the middle of your Stremio catalog.",
+        },
+      },
+    ],
+  })}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F2F2F7; --surface: #FFFFFF; --text: #1C1C1E; --text-2: #3A3A3C;
+    --muted: #8E8E93; --accent: #007AFF; --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.13); --radius: 14px; --radius-sm: 10px;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
+  a { color: var(--accent); }
+  .top-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  .top-nav .brand { font-weight: 800; font-size: 1.1rem; color: var(--text); text-decoration: none; }
+  .top-nav .back-link { font-size: 0.9rem; font-weight: 600; text-decoration: none; }
+  h1 {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-size: 2rem; font-weight: 700; letter-spacing: -0.02em;
+    margin: 0 0 10px; line-height: 1.2;
+  }
+  .lede { color: var(--text-2); font-size: 1.05rem; margin: 0 0 28px; }
+  h2 {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-size: 1.35rem; font-weight: 700; margin: 40px 0 12px; letter-spacing: -0.01em;
+  }
+  h3 { font-size: 1.05rem; font-weight: 700; margin: 22px 0 6px; }
+  p { color: var(--text-2); margin: 0 0 14px; }
+  code {
+    background: rgba(0,0,0,0.05); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; font-size: 0.88em;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px; margin: 14px 0;
+    box-shadow: var(--shadow-sm);
+  }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  ol, ul { color: var(--text-2); padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 32px; }
+  .toc a {
+    font-size: 0.85rem; font-weight: 600; text-decoration: none;
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 999px; padding: 6px 13px; color: var(--text-2);
+  }
+  .cta {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 14px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 22px; margin: 36px 0 8px;
+  }
+  .cta-btn {
+    background: var(--accent); color: #fff; text-decoration: none;
+    font-weight: 700; font-size: 0.95rem; padding: 11px 22px;
+    border-radius: 999px; white-space: nowrap;
+  }
+  .faq-q { font-weight: 700; margin: 18px 0 4px; }
+  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
+  :root.dark-theme, .dark-theme {
+    --bg: #000; --surface: #1C1C1E; --text: #FFF; --text-2: #EBEBF5;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+  }
+</style>
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
+</head>
+<body>
+<div class="wrap">
+  <div class="top-nav">
+    <a class="brand" href="${origin}/">${ADDON_NAME}</a>
+    <a class="back-link" href="${origin}/">&larr; Back to the builder</a>
+  </div>
+
+  <h1>How to Turn MDBList, Trakt, TMDB &amp; Simkl Lists Into Stremio Catalogs</h1>
+  <p class="lede">A self-hosted way to get any list — public or your own — onto your Stremio or wako home screen as a real catalog row, running entirely on your own free Cloudflare account.</p>
+
+  <div class="toc">
+    <a href="#mdblist">MDBList</a>
+    <a href="#trakt">Trakt</a>
+    <a href="#tmdb">TMDB</a>
+    <a href="#simkl">Simkl</a>
+    <a href="#self-hosted">Why self-host</a>
+    <a href="#comparison">Which provider?</a>
+    <a href="#faq">FAQ</a>
+  </div>
+
+  <p>All four steps below start the same way: open <a href="${origin}/">${origin.replace("https://", "").replace("http://", "")}</a>, paste a list URL into the builder, and click install. What changes is where you get the URL from and what it unlocks.</p>
+
+  <h2 id="mdblist">MDBList lists</h2>
+  <p>Works with no API key at all for public lists. Go to <a href="https://mdblist.com" target="_blank" rel="noopener">mdblist.com</a>, open any public list (your own or someone else's), and copy its URL — it looks like <code>mdblist.com/lists/username/list-name</code>. Paste that straight into the builder and it becomes a catalog row.</p>
+  <p>Private MDBList lists and the "My Watchlist" quick-add need your own free MDBList API key, pasted into Settings once.</p>
+
+  <h2 id="trakt">Trakt lists</h2>
+  <p>Public Trakt lists work out of the box — no account needed. Copy a list URL in the form <code>trakt.tv/users/username/lists/list-slug</code> and paste it in. Trakt's own trending and popular charts are available as one-tap Quick Add shelves too.</p>
+  <p>To pull in your own private lists, liked lists, watchlist, or watch history, connect your Trakt account from Settings — this uses Trakt's own OAuth login, so your credentials never pass through anything but Trakt itself.</p>
+
+  <h2 id="tmdb">TMDB lists</h2>
+  <p>Paste any public <code>themoviedb.org/list/12345</code> URL to add it as a catalog. TMDB also powers this add-on's genre, network, streaming-provider, and keyword charts, plus episode/season data for Continue Watching.</p>
+
+  <h2 id="simkl">Simkl charts</h2>
+  <p>Simkl's trending charts (daily, weekly, monthly, across movies, TV, and anime) are available as one-tap Quick Add shelves. Connecting a Simkl account additionally unlocks importing your own lists and watch history.</p>
+
+  <h2 id="self-hosted">Why self-host instead of a hosted list addon?</h2>
+  <p>Most Stremio catalog add-ons in this space run as a hosted service — you're pointing your Stremio app at someone else's server, using someone else's account, subject to someone else's uptime, rate limits, and whatever happens to that service down the road.</p>
+  <p>This add-on is different: you deploy it to your own free Cloudflare Workers account in about five minutes, and from then on it's entirely yours. Your configuration lives in your install link or your own Cloudflare storage — never on a third party's server. Nothing runs unless you deployed it. There's no subscription because there's nothing to subscribe to; Cloudflare's free tier comfortably covers normal personal use.</p>
+  <p>The tradeoff is honest: self-hosting takes those five minutes of setup a hosted service skips. In exchange you get a catalog that's actually yours.</p>
+
+  <h2 id="comparison">MDBList vs. Trakt vs. TMDB vs. Simkl — which should I use?</h2>
+  <table>
+    <tr><th>Provider</th><th>Best for</th><th>Needs a key?</th></tr>
+    <tr><td><strong>MDBList</strong></td><td>Curated public lists, community charts, the simplest path with zero setup</td><td>No, for public lists</td></tr>
+    <tr><td><strong>Trakt</strong></td><td>Your own watch history, watchlist, and lists if you already use Trakt to track what you watch</td><td>Only for private/personal data</td></tr>
+    <tr><td><strong>TMDB</strong></td><td>Genre/network/streaming-provider charts, episode &amp; season metadata</td><td>No, for public lists and charts</td></tr>
+    <tr><td><strong>Simkl</strong></td><td>Trending charts, especially for anime</td><td>Only for personal data</td></tr>
+  </table>
+  <p>None of these are exclusive — most people mix all four on one home screen, since they're just different sources feeding into the same catalog builder.</p>
+
+  <h2 id="faq">Frequently asked questions</h2>
+  <div class="faq-q">Is this add-on free?</div>
+  <p>Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier.</p>
+  <div class="faq-q">Do I need to create an account to use it?</div>
+  <p>No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.</p>
+  <div class="faq-q">Do I need API keys from MDBList, Trakt, TMDB, or Simkl?</div>
+  <p>Not for public lists. You only need your own personal key for private lists, personal watchlists, or if you're doing enough browsing that you want your own dedicated rate limit instead of the shared one.</p>
+  <div class="faq-q">What's the difference between self-hosting this and using a hosted list addon?</div>
+  <p>A hosted addon runs on someone else's server under someone else's account. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, and there's no third party in the middle of your Stremio catalog.</p>
+
+  <div class="cta">
+    <div>
+      <strong>Ready to build your own catalog?</strong>
+      <div style="color:var(--muted); font-size:0.88rem; margin-top:2px;">Takes about five minutes, no account required.</div>
+    </div>
+    <a class="cta-btn" href="${origin}/">Open the builder &rarr;</a>
+  </div>
+
+  <footer>
+    ${ADDON_NAME} is free and open, self-hosted on Cloudflare Workers. <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener">Support the project</a>.
+  </footer>
+</div>
 </body>
 </html>`;
 }
@@ -27702,7 +30276,6 @@ async function handleFetch(request, env, ctx) {
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
-      const isShow = slug.includes("show") || slug.includes("tv") || slug.includes("series");
       const title = isShow ? "Recommended Shows" : "Recommended Movies";
       return new Response(
         renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } }),
@@ -27719,8 +30292,8 @@ async function handleFetch(request, env, ctx) {
         if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching" };
         if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history" };
         if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist" };
-        if (slugLower === "new-movies") chart = { name: "New Movies", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
-        if (slugLower === "new-shows") chart = { name: "New Shows", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
+        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
+        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
       }
       return new Response(
         renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: (chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie", url: chart.movieUrl } } : {}),
@@ -27809,6 +30382,66 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    if (path === "/robots.txt") {
+      // Only the plain / install page is meant to be publicly
+      // discoverable -- see seoHeadHtml's comment in 09_page-shell.js for
+      // why /:config/configure pages (personal base64 config, and any
+      // personal API keys the user pasted in, baked straight into the
+      // URL) get an explicit noindex there too, on top of being
+      // Disallow'd here. /admin is a password-protected dashboard with
+      // no business being crawled at all, and everything under /api/ and
+      // the manifest/catalog/subtitles endpoints are raw JSON data
+      // routes, not content.
+      const robots = `User-agent: *
+Allow: /$
+Disallow: /admin
+Disallow: /api/
+Disallow: /*/configure
+Disallow: /*/manifest.json
+Disallow: /*/catalog/
+Disallow: /*/subtitles/
+
+Sitemap: ${url.origin}/sitemap.xml`;
+      return new Response(robots, {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+      });
+    }
+
+    if (path === "/sitemap.xml") {
+      // The plain install page and /guide (see the route just below) are
+      // the only two URLs on this whole deployment meant to be indexed
+      // (see /robots.txt just above) -- everything else either needs a
+      // personal config in its own URL to mean anything, or is a raw
+      // JSON/API endpoint rather than a page.
+      const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${url.origin}/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>${url.origin}/guide</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+</urlset>`;
+      return new Response(sitemap, {
+        headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+      });
+    }
+
+    // Standalone SEO/content page, not the interactive builder -- see
+    // renderGuidePage's own comment (end of 24_client-backup-restore-
+    // presets.js, right after renderBuilder closes) for why it's a
+    // separate, lightweight template literal rather than reusing
+    // renderBuilder's app stylesheet.
+    if (path === "/guide") {
+      return new Response(renderGuidePage(url.origin), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=3600" }
+      });
+    }
+
     if (path === "/sw.js") {
       const sw = `
 self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
@@ -27831,9 +30464,12 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, trackCreatorName } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
+
+      const source = detectSource(entry.url);
+      const isAutoTrack = source === "autotrack";
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -27842,17 +30478,20 @@ self.addEventListener('fetch', e => {
       // before. Only active when a CONFIGS KV namespace is bound (optional,
       // same as the short-link feature) -- without one this behaves exactly
       // as it did previously.
-      const staleKey = env && env.CONFIGS ? `lastgood:${config}:${type}:${id}` : null;
+      const staleKey = env && env.CONFIGS && !isAutoTrack ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, trackCreatorName, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
           );
         }
-        return json({ metas });
+        if (isAutoTrack) {
+          return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+        }
+        return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
 
@@ -29699,8 +32338,25 @@ self.addEventListener('fetch', e => {
             });
           }
         }
+        let simklUsername = "";
+        try {
+          const uRes = await fetch("https://api.simkl.com/users/settings", {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "simkl-api-key": clientId,
+              "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+              "Accept": "application/json",
+            },
+          });
+          if (uRes.ok) {
+            const uData = await uRes.json();
+            if (uData && uData.user && (uData.user.username || uData.user.name)) {
+              simklUsername = uData.user.username || uData.user.name;
+            }
+          }
+        } catch {}
 
-        return json({ ok: true, lists });
+        return json({ ok: true, lists, username: simklUsername });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) }, 500);
       }
@@ -30862,13 +33518,17 @@ self.addEventListener('fetch', e => {
         }
         return u.toString();
       };
+      let tmdbUsername = "";
 
       // If we don't have accountId but have sessionId, query account details
-      if (!accountId && sessionId) {
+      if (sessionId) {
         try {
           const accRes = await fetch(makeUrl("/account"), { headers: makeHeaders() });
           const acc = await accRes.json();
-          if (acc && acc.id) accountId = String(acc.id);
+          if (acc && acc.id) {
+            accountId = String(acc.id);
+            if (acc.username) tmdbUsername = acc.username;
+          }
         } catch {}
       }
 
@@ -30884,51 +33544,55 @@ self.addEventListener('fetch', e => {
           const listsRes = await fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/lists`, { page: "1" }), {
             headers: makeHeaders()
           });
-          const listsData = await listsRes.json();
-          const rawLists = Array.isArray(listsData.results) ? listsData.results : [];
-          
-          const customListsWithItems = await Promise.all(
-            rawLists.map(async (l) => {
+          if (listsRes.ok) {
+            const listsData = await listsRes.json();
+            const rawLists = Array.isArray(listsData.results) ? listsData.results : [];
+            const fetched = await mapWithConcurrency(rawLists, 4, async (it) => {
+              const listId = it.id;
+              let itemCount = it.item_count || 0;
               let previewItems = [];
               try {
-                const listDetailRes = await fetch(makeUrl(`/list/${l.id}`), { headers: makeHeaders() });
-                const listDetail = await listDetailRes.json();
-                const rawItems = Array.isArray(listDetail.items) ? listDetail.items : (Array.isArray(listDetail.results) ? listDetail.results : []);
-                previewItems = rawItems.slice(0, 9).map((it) => ({
-                  id: it.id,
-                  title: it.title || it.name || "Untitled",
-                  year: (it.release_date || it.first_air_date || "").slice(0, 4),
-                  poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : (it.poster || ""),
-                  type: it.media_type || (it.title ? "movie" : "series"),
-                }));
+                const detailRes = await fetch(makeUrl(`/list/${encodeURIComponent(listId)}`), { headers: makeHeaders() });
+                if (detailRes.ok) {
+                  const listDetail = await detailRes.json();
+                  const rawItems = Array.isArray(listDetail.items) ? listDetail.items : (Array.isArray(listDetail.results) ? listDetail.results : []);
+                  itemCount = listDetail.item_count || rawItems.length || itemCount;
+                  previewItems = rawItems.slice(0, 9).map((item) => ({
+                    id: item.id,
+                    title: item.title || item.name || "Untitled",
+                    year: (item.release_date || item.first_air_date || "").slice(0, 4),
+                    poster: item.poster_path ? `https://image.tmdb.org/t/p/w300${item.poster_path}` : "",
+                    type: item.media_type === "tv" ? "series" : "movie",
+                  }));
+                }
               } catch {}
               return {
-                id: l.id,
-                name: l.name || "Untitled List",
-                url: `https://www.themoviedb.org/list/${l.id}`,
-                contentType: l.list_type || "mixed",
-                items: l.item_count || previewItems.length || 0,
-                likes: l.favorite_count || 0,
-                description: l.description || "",
-                private: false,
+                id: String(listId),
+                name: it.name || "Untitled List",
+                url: `https://www.themoviedb.org/list/${encodeURIComponent(listId)}`,
+                contentType: "mixed",
+                items: itemCount,
+                likes: it.favorite_count || 0,
+                description: it.description || "",
+                private: it.public === false,
                 previewItems: previewItems,
               };
-            })
-          );
-          lists.push(...customListsWithItems);
+            });
+            lists.push(...fetched);
+          }
         }
 
-        // 2. Fetch user's Watchlist (movies & tv) if session is available
-        if (accountId && sessionId) {
-          const [wlMoviesRes, wlTvRes, favMoviesRes, favTvRes] = await Promise.all([
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/movies`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/tv`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/movies`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
-            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/tv`, { page: "1" }), { headers: makeHeaders() }).catch(() => null),
+        // 2. Fetch user's Watchlist (Movies & TV Shows) and Favorites if accountId is available
+        if (accountId) {
+          const [wlMovRes, wlTvRes, favMovRes, favTvRes] = await Promise.all([
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/movies`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/watchlist/tv`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/movies`, { page: "1" }), { headers: makeHeaders() }),
+            fetch(makeUrl(`/account/${encodeURIComponent(accountId)}/favorite/tv`, { page: "1" }), { headers: makeHeaders() }),
           ]);
 
-          if (wlMoviesRes && wlMoviesRes.ok) {
-            const wlMovData = await wlMoviesRes.json();
+          if (wlMovRes && wlMovRes.ok) {
+            const wlMovData = await wlMovRes.json();
             const rawItems = Array.isArray(wlMovData.results) ? wlMovData.results : [];
             const total = wlMovData.total_results || rawItems.length;
             if (total > 0) {
@@ -30939,14 +33603,14 @@ self.addEventListener('fetch', e => {
                 poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : "",
                 type: "movie",
               }));
-              lists.unshift({
+              lists.push({
                 id: "watchlist_movies",
                 name: "TMDB Watchlist (Movies)",
                 url: `tmdb:account:watchlist:movies`,
                 contentType: "movie",
                 items: total,
                 likes: 0,
-                description: "Your TMDB Movie Watchlist",
+                description: "Your TMDB Watchlist Movies",
                 private: true,
                 previewItems: previewItems,
               });
@@ -30965,22 +33629,22 @@ self.addEventListener('fetch', e => {
                 poster: it.poster_path ? `https://image.tmdb.org/t/p/w300${it.poster_path}` : "",
                 type: "series",
               }));
-              lists.unshift({
+              lists.push({
                 id: "watchlist_tv",
                 name: "TMDB Watchlist (Shows)",
                 url: `tmdb:account:watchlist:tv`,
                 contentType: "series",
                 items: total,
                 likes: 0,
-                description: "Your TMDB TV Show Watchlist",
+                description: "Your TMDB Watchlist TV Shows",
                 private: true,
                 previewItems: previewItems,
               });
             }
           }
 
-          if (favMoviesRes && favMoviesRes.ok) {
-            const favMovData = await favMoviesRes.json();
+          if (favMovRes && favMovRes.ok) {
+            const favMovData = await favMovRes.json();
             const rawItems = Array.isArray(favMovData.results) ? favMovData.results : [];
             const total = favMovData.total_results || rawItems.length;
             if (total > 0) {
@@ -31032,7 +33696,7 @@ self.addEventListener('fetch', e => {
           }
         }
 
-        return json({ ok: true, lists });
+        return json({ ok: true, lists, username: tmdbUsername, accountId });
       } catch (err) {
         return json({ ok: false, error: "Failed to load TMDB lists: " + (err.message || String(err)) }, 500);
       }
@@ -31060,7 +33724,7 @@ self.addEventListener('fetch', e => {
         const userHash = safeUserHash(accessToken);
         const cacheKey = `user_cache:trakt:private_lists:${userHash}`;
 
-        const lists = await fetchWithPerUserCacheAndCircuitBreaker({
+        const result = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
           freshTtlSec: 60,
           staleTtlSec: 1800,
@@ -31163,12 +33827,16 @@ self.addEventListener('fetch', e => {
               contentType: "unknown",
             };
 
+            const meUsername = (me && me.username) || (meSlug !== "me" ? meSlug : "");
+
             ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4));
-            return [watchlistEntry, historyEntry, ...rawLists];
+            return { lists: [watchlistEntry, historyEntry, ...rawLists], username: meUsername };
           }
         });
 
-        return json({ ok: true, lists });
+        const lists = Array.isArray(result) ? result : (result && result.lists) || [];
+        const username = (result && result.username) || "";
+        return json({ ok: true, lists, username });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -31225,15 +33893,8 @@ self.addEventListener('fetch', e => {
       }
     }
 
-    // /api/feedback  (POST)  { category, message, contact?, creatorName? } -> { ok }
-    // Settings > Feedback. No auth required -- anyone should be able to
-    // report a bug or suggest something without needing a Creator Profile
-    // first; creatorName is attached only if the person happens to be
-    // signed in, purely so it's visible in the admin dashboard, not
-    // verified against anything. Stored under a key that sorts
-    // chronologically as a plain string (zero-padded millisecond epoch),
-    // so the admin dashboard can list newest-first without needing to
-    // parse and sort every value first.
+    // /api/feedback  (POST)  { category, message, contact?, creatorName?, threadId? } -> { ok, entry }
+    // Settings > Feedback & Support 2-way chat.
     if (path === "/api/feedback" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
@@ -31249,32 +33910,69 @@ self.addEventListener('fetch', e => {
       const category = allowedCategories.has(body.category) ? body.category : "other";
       const contact = String(body.contact || "").trim().slice(0, 200);
       const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+      const threadId = body.threadId ? String(body.threadId).trim() : null;
 
-      // Simple per-IP rate limit (5/hour) -- KV's read-then-write isn't
-      // atomic (see bumpStat's own comment on the same tradeoff elsewhere
-      // in this file), so this is a deterrent against casual spam/abuse,
-      // not a hard guarantee against a determined actor. Skipped entirely
-      // for the admin dashboard's own "Log something yourself" form (an
-      // authenticated admin, not an anonymous IP, submitting it) -- the
-      // admin session cookie already rides along on that fetch() call
-      // since it's same-origin, so isAdminRequest can tell the two apart
-      // without any extra plumbing on the client side.
       const isAdmin = await isAdminRequest(request, env);
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
       const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (!isAdmin && rateCount >= 5) {
-        return json({ ok: false, error: "You've sent a few of these already today -- try again tomorrow, or reach out another way if it's urgent." });
+      if (!isAdmin && rateCount >= 20) {
+        return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
       }
 
+      // If replying to an existing thread
+      if (threadId) {
+        try {
+          const raw = await env.CONFIGS.get(`feedback:${threadId}`);
+          if (raw) {
+            const entry = JSON.parse(raw);
+            if (!Array.isArray(entry.messages) || !entry.messages.length) {
+              entry.messages = [{
+                id: `msg_init`,
+                sender: "user",
+                senderName: entry.creatorName || "User",
+                text: entry.message || "(Initial message)",
+                timestamp: entry.createdAt || Date.now()
+              }];
+            }
+            const newMsg = {
+              id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              sender: isAdmin ? "admin" : "user",
+              senderName: isAdmin ? "Developer" : (creatorName || entry.creatorName || "User"),
+              text: message,
+              timestamp: Date.now()
+            };
+            entry.messages.push(newMsg);
+            entry.updatedAt = Date.now();
+            entry.status = isAdmin ? "replied" : "open";
+            entry.completed = false;
+            if (contact && !entry.contact) entry.contact = contact;
+            if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
+            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+            return json({ ok: true, entry });
+          }
+        } catch (e) {}
+      }
+
+      // New Thread
       const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
       const entry = {
         id, category, message, contact: contact || null, creatorName,
         createdAt: Date.now(),
+        updatedAt: Date.now(),
         completed: false,
-        // Recorded for basic spam triage in the admin dashboard, not
-        // shown to anyone else and never used for anything beyond that.
+        status: "open",
+        messages: [
+          {
+            id: `msg_${Date.now()}_1`,
+            sender: isAdmin ? "admin" : "user",
+            senderName: isAdmin ? "Developer" : (creatorName || "User"),
+            text: message,
+            timestamp: Date.now()
+          }
+        ],
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
@@ -31283,12 +33981,91 @@ self.addEventListener('fetch', e => {
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
       }
-      // entry is echoed back so the admin dashboard's "Log something
-      // yourself" form can show the new card instantly (optimistic, using
-      // its own locally-built entry) and then swap in the server's real
-      // id/createdAt once this resolves -- needed because a later Mark
-      // Completed click has to send an id the server actually recognizes.
       return json({ ok: true, entry });
+    }
+
+    // /api/feedback/threads (POST) { creatorName?, threadIds? } -> { ok, threads }
+    // Loads active support chat threads for a user/device
+    if (path === "/api/feedback/threads" && (request.method === "POST" || request.method === "GET")) {
+      if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
+      let threadIds = [];
+      let creatorName = null;
+      if (request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (Array.isArray(body.threadIds)) threadIds = body.threadIds.map((t) => String(t).trim()).filter(Boolean);
+          if (body.creatorName) creatorName = String(body.creatorName).trim().toLowerCase();
+        } catch {}
+      } else {
+        const pIds = url.searchParams.get("threadIds");
+        if (pIds) threadIds = pIds.split(",").map((s) => s.trim()).filter(Boolean);
+        const pCreator = url.searchParams.get("creatorName");
+        if (pCreator) creatorName = pCreator.trim().toLowerCase();
+      }
+
+      const threadsMap = new Map();
+
+      // 1. Fetch explicitly listed thread IDs
+      if (threadIds.length) {
+        const lookups = threadIds.slice(0, 20).map(async (tid) => {
+          try {
+            const raw = await env.CONFIGS.get(`feedback:${tid}`);
+            if (raw) {
+              const entry = JSON.parse(raw);
+              if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                entry.messages = [{
+                  id: `msg_init`,
+                  sender: "user",
+                  senderName: entry.creatorName || "User",
+                  text: entry.message || "(Initial message)",
+                  timestamp: entry.createdAt || Date.now()
+                }];
+              }
+              threadsMap.set(entry.id, entry);
+            }
+          } catch {}
+        });
+        await Promise.all(lookups);
+      }
+
+      // 2. If creatorName is given, also scan recent feedback keys for this creator
+      if (creatorName) {
+        try {
+          const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 200 });
+          const scanKeys = (listRes.keys || []).map((k) => k.name);
+          const scanLookups = scanKeys.map(async (kName) => {
+            const tid = kName.replace(/^feedback:/, "");
+            if (threadsMap.has(tid)) return;
+            try {
+              const raw = await env.CONFIGS.get(kName);
+              if (raw) {
+                const entry = JSON.parse(raw);
+                if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                  if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                    entry.messages = [{
+                      id: `msg_init`,
+                      sender: "user",
+                      senderName: entry.creatorName || "User",
+                      text: entry.message || "(Initial message)",
+                      timestamp: entry.createdAt || Date.now()
+                    }];
+                  }
+                  threadsMap.set(entry.id, entry);
+                }
+              }
+            } catch {}
+          });
+          await Promise.all(scanLookups);
+        } catch {}
+      }
+
+      const threads = Array.from(threadsMap.values()).sort((a, b) => {
+        const timeA = a.updatedAt || a.createdAt || 0;
+        const timeB = b.updatedAt || b.createdAt || 0;
+        return timeB - timeA;
+      });
+
+      return json({ ok: true, threads }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/track-search  (POST)  { query } -> { ok }
@@ -31351,13 +34128,12 @@ self.addEventListener('fetch', e => {
       const accessToken = (url.searchParams.get("accessToken") || "").trim();
       if (!apikey && !accessToken) return json({ ok: false, error: "Missing apikey or accessToken." }, 400);
       try {
+        const token = accessToken || apikey;
         const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}` };
-        let targetUrl = `https://api.mdblist.com/lists/user`;
         if (accessToken) {
           headers["Authorization"] = `Bearer ${accessToken}`;
-        } else {
-          targetUrl += `?apikey=${encodeURIComponent(apikey)}`;
         }
+        const targetUrl = `https://api.mdblist.com/lists/user?apikey=${encodeURIComponent(token)}`;
         const res = await fetch(targetUrl, {
           headers,
           cf: { cacheTtl: 60, cacheEverything: false },
@@ -31367,22 +34143,48 @@ self.addEventListener('fetch', e => {
         }
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
-        const lists = rawLists
-          .filter((l) => l && (l.slug || l.id) && l.user_name)
-          .map((l) => ({
-            id: l.id != null ? String(l.id) : (l.slug || ""),
-            name: l.name || l.slug,
-            slug: l.slug,
-            dynamic: !!l.dynamic,
-            mediatype: l.mediatype || "",
-            contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
-            items: l.items || 0,
-            likes: l.likes || 0,
-            private: l.public === false || l.private === true,
-            url: `https://mdblist.com/lists/${encodeURIComponent(l.user_name)}/${encodeURIComponent(l.slug)}`,
-          }));
 
-        const username = (rawLists.find((l) => l && l.user_name) || {}).user_name || "";
+        let username = "";
+        for (const l of rawLists) {
+          if (l && (l.user_name || l.username || l.user)) {
+            username = l.user_name || l.username || l.user;
+            break;
+          }
+        }
+
+        if (!username) {
+          try {
+            const uRes = await fetch(`https://api.mdblist.com/user?apikey=${encodeURIComponent(token)}`, {
+              headers,
+              cf: { cacheTtl: 300, cacheEverything: false },
+            });
+            if (uRes.ok) {
+              const uData = await uRes.json();
+              if (uData) {
+                username = uData.user || uData.username || uData.user_name || uData.name || "";
+              }
+            }
+          } catch {}
+        }
+
+        const lists = rawLists
+          .filter((l) => l && (l.slug || l.id))
+          .map((l) => {
+            const itemUser = l.user_name || l.username || l.user || username || "";
+            return {
+              id: l.id != null ? String(l.id) : (l.slug || ""),
+              name: l.name || l.slug,
+              slug: l.slug,
+              dynamic: !!l.dynamic,
+              mediatype: l.mediatype || "",
+              contentType: l.mediatype === "show" ? "series" : (l.mediatype === "movie" ? "movie" : "unknown"),
+              items: l.items || 0,
+              likes: l.likes || 0,
+              private: l.public === false || l.private === true,
+              url: itemUser ? `https://mdblist.com/lists/${encodeURIComponent(itemUser)}/${encodeURIComponent(l.slug)}` : `https://mdblist.com/lists/${encodeURIComponent(l.slug)}`,
+            };
+          });
+
         const watchlistCard = {
           name: "My Watchlist",
           slug: "watchlist",
@@ -31403,7 +34205,7 @@ self.addEventListener('fetch', e => {
           contentType: "unknown",
         };
 
-        return json({ ok: true, lists: [watchlistCard, historyCard, ...lists] });
+        return json({ ok: true, lists: [watchlistCard, historyCard, ...lists], username });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -31826,8 +34628,41 @@ self.addEventListener('fetch', e => {
       // needed here -- see trackSharedApiUse in 05_catalog-core.js for
       // the same pattern elsewhere.
       if (!tmdbKey) bumpStat(env, "apiuse:tmdb");
-      const parts = id.split(":");
-      const imdbId = parts[0];
+      let cleanId = String(id || "").trim();
+      let imdbId = "";
+      let season = null;
+      let episode = null;
+
+      if (cleanId.startsWith("tmdb:")) {
+        const rest = cleanId.slice("tmdb:".length);
+        const tmdbParts = rest.split(":");
+        imdbId = "tmdb:" + tmdbParts[0];
+        if (tmdbParts.length >= 3) {
+          season = Number(tmdbParts[1]);
+          episode = Number(tmdbParts[2]);
+        } else if (tmdbParts.length === 2) {
+          season = Number(tmdbParts[0]);
+          episode = Number(tmdbParts[1]);
+        }
+      } else if (cleanId.startsWith("kitsu:")) {
+        const rest = cleanId.slice("kitsu:".length);
+        const kParts = rest.split(":");
+        imdbId = "kitsu:" + kParts[0];
+        if (kParts.length >= 2) {
+          season = 1;
+          episode = Number(kParts[1]);
+        }
+      } else {
+        const parts = cleanId.split(":");
+        imdbId = parts[0];
+        if (parts.length >= 3) {
+          season = Number(parts[1]);
+          episode = Number(parts[2]);
+        } else if (parts.length === 2) {
+          season = 1;
+          episode = Number(parts[1]);
+        }
+      }
       let matched = "no";
 
       try {
@@ -31850,14 +34685,15 @@ self.addEventListener('fetch', e => {
         blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
         blob.dismissedContinueWatching = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === "object" ? blob.dismissedContinueWatching : {};
 
-        if (stremioType === "series" && parts.length >= 3) {
-          const season = Number(parts[1]);
-          const episode = Number(parts[2]);
-          if (!Number.isFinite(season) || !Number.isFinite(episode)) {
+        if (stremioType === "series" || (season != null && episode != null)) {
+          if (season == null || episode == null || !Number.isFinite(season) || !Number.isFinite(episode)) {
             matched = "no (unrecognized episode id format)";
           } else {
             const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey);
-            const ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
+            let ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
+            if (!ep && seasonData && Array.isArray(seasonData.episodes) && seasonData.episodes.length > 0) {
+              ep = seasonData.episodes[episode - 1] || seasonData.episodes[0];
+            }
             if (!ep) {
               matched = "no (could not look up this episode on TMDB)";
             } else {
@@ -31868,12 +34704,13 @@ self.addEventListener('fetch', e => {
               if (showDetails && showDetails.title) {
                 ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, showDetails.title, "series"));
               }
-              const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === String(ep.id));
+              const epIdStr = String(ep.id || `${imdbId}:${season}:${episode}`);
+              const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
               if (!alreadyWatched) {
                 blob.watchHistory.unshift({
-                  id: String(ep.id),
+                  id: epIdStr,
                   type: "episode",
-                  name: ep.name,
+                  name: ep.name || ("Episode " + episode),
                   poster: ep.still_path || (showDetails && showDetails.poster) || "",
                   showId: imdbId,
                   showTitle: (showDetails && showDetails.title) || "",
@@ -33518,13 +36355,81 @@ self.addEventListener('fetch', e => {
         keys.map(async (k) => {
           try {
             const raw = await env.CONFIGS.get(k.name);
-            return raw ? JSON.parse(raw) : null;
+            if (!raw) return null;
+            const entry = JSON.parse(raw);
+            if (!Array.isArray(entry.messages) || !entry.messages.length) {
+              entry.messages = [{
+                id: `msg_init`,
+                sender: "user",
+                senderName: entry.creatorName || "User",
+                text: entry.message || "(Initial message)",
+                timestamp: entry.createdAt || Date.now()
+              }];
+            }
+            return entry;
           } catch {
             return null;
           }
         })
       );
       return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
+    // Allows admin to send a threaded reply back to the user.
+    if (path === "/admin/api/feedback/reply" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const id = String(body.id || "").trim();
+      const message = String(body.message || "").trim();
+      if (!id) return json({ ok: false, error: "Missing thread id." }, 400);
+      if (!message) return json({ ok: false, error: "Reply message can't be empty." }, 400);
+
+      const key = `feedback:${id}`;
+      const raw = await env.CONFIGS.get(key);
+      if (!raw) return json({ ok: false, error: "Feedback thread not found." }, 404);
+      let entry;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not parse feedback thread." }, 500);
+      }
+
+      if (!Array.isArray(entry.messages) || !entry.messages.length) {
+        entry.messages = [{
+          id: `msg_init`,
+          sender: "user",
+          senderName: entry.creatorName || "User",
+          text: entry.message || "(Initial message)",
+          timestamp: entry.createdAt || Date.now()
+        }];
+      }
+
+      const replyMsg = {
+        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        sender: "admin",
+        senderName: "Developer",
+        text: message,
+        timestamp: Date.now()
+      };
+      entry.messages.push(replyMsg);
+      entry.updatedAt = Date.now();
+      entry.status = "replied";
+      entry.completed = false;
+
+      try {
+        await env.CONFIGS.put(key, JSON.stringify(entry));
+      } catch (e) {
+        return json({ ok: false, error: "Could not save reply." }, 500);
+      }
+      return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
