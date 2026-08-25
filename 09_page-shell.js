@@ -2263,7 +2263,6 @@ ${seoHeadHtml}
       </div>
     </div>
     <div class="app-header-actions">
-      <a href="${origin}/guide" style="color:var(--text-2); font-size:0.82rem; font-weight:600; text-decoration:none; padding:4px 8px; white-space:nowrap;" title="Guide: how to use this add-on">Guide</a>
       <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
       <div id="creatorProfileBar"></div>
     </div>

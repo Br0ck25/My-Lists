@@ -15,13 +15,13 @@
  *    lists work fine with no key at all.
  *  - Public trakt.tv lists (https://trakt.tv/users/USER/lists/LIST-SLUG)
  *    are supported too. Trakt requires a Client ID (their term for an API
- *    key) on every request, even for public lists â€” this Worker uses a
+ *    key) on every request, even for public lists — this Worker uses a
  *    single fixed TRAKT_CLIENT_ID (below) for all users; there's no
  *    per-user override in the builder page.
  *  - Public themoviedb.org lists (https://www.themoviedb.org/list/LIST_ID)
  *    are supported too, the same fixed-key way as Trakt (TMDB_API_KEY
  *    below). TMDB list items only carry a TMDB id, so each item needs an
- *    extra external_ids lookup to resolve its IMDB id â€” those lookups are
+ *    extra external_ids lookup to resolve its IMDB id — those lookups are
  *    throttled and cached hard at Cloudflare's edge to stay well under
  *    TMDB's soft per-IP connection limit.
  *  - GET /                            -> builder page (fresh install, external browser)
@@ -10286,7 +10286,6 @@ ${seoHeadHtml}
       </div>
     </div>
     <div class="app-header-actions">
-      <a href="${origin}/guide" style="color:var(--text-2); font-size:0.82rem; font-weight:600; text-decoration:none; padding:4px 8px; white-space:nowrap;" title="Guide: how to use this add-on">Guide</a>
       <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
       <div id="creatorProfileBar"></div>
     </div>
