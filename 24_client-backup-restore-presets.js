@@ -1228,17 +1228,19 @@ window.addEventListener('popstate', (e) => {
     if (cleanTab === 'catalogs') {
       const targetSubmenu = (state && state.fromCatalogsSubmenu) || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
       if (typeof switchCatalogsSubmenu === 'function') switchCatalogsSubmenu(targetSubmenu);
+    } else if (cleanTab === 'channels') {
+      const targetSubmenu = (state && state.fromChannelsSubmenu) || window._previousChannelsSubmenu || localStorage.getItem('myListAddon:channelsSubmenu') || 'storylines';
+      if (typeof switchChannelsSubmenu === 'function') switchChannelsSubmenu(targetSubmenu);
     }
 
-    if (typeof window._previousScrollY === 'number') {
-      const scrollPos = window._previousScrollY;
-      window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      requestAnimationFrame(() => {
-        window.scrollTo({ top: scrollPos, behavior: 'instant' });
-        setTimeout(() => {
-          window.scrollTo({ top: scrollPos, behavior: 'instant' });
-        }, 50);
-      });
+    const scrollPos = (state && typeof state.previousScrollY === 'number') ? state.previousScrollY : (typeof window._previousScrollY === 'number' ? window._previousScrollY : null);
+    if (typeof scrollPos === 'number' && scrollPos > 0) {
+      const restoreFn = () => window.scrollTo({ top: scrollPos, behavior: 'instant' });
+      restoreFn();
+      requestAnimationFrame(restoreFn);
+      setTimeout(restoreFn, 50);
+      setTimeout(restoreFn, 150);
+      setTimeout(restoreFn, 300);
     }
   }
 });

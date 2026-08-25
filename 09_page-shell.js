@@ -1016,6 +1016,31 @@ ${seoHeadHtml}
     position: relative;
     width: 100%;
   }
+  .storyline-posters-scroll {
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 12px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch !important;
+    touch-action: pan-x !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+    padding: 8px 2px 10px !important;
+    scrollbar-width: thin !important;
+  }
+  .storyline-poster-item {
+    display: flex !important;
+    flex-direction: column !important;
+    flex: 0 0 105px !important;
+    width: 105px !important;
+    max-width: 105px !important;
+    min-width: 105px !important;
+    box-sizing: border-box !important;
+    text-align: center !important;
+  }
   .cw-remove-btn {
     position: absolute;
     top: 6px;

@@ -1,5 +1,5 @@
 const ADDON_ID = "app.my-list";
-const ADDON_VERSION = "1.4.0";
+const ADDON_VERSION = "1.4.1";
 const ADDON_NAME = "My Lists";
 
 // --- Env-backed API keys ----------------------------------------------------

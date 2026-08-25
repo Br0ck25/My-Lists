@@ -1061,11 +1061,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   opts = opts || {};
   const currentActiveTab = window._originTab || localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
   const currentSubmenu = window._currentCatalogsSubmenu || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+  const currentChannelsSubmenu = window._currentChannelsSubmenu || localStorage.getItem('myListAddon:channelsSubmenu') || 'storylines';
   
   if (!opts.preserveScroll) {
     if (currentActiveTab !== 'list-details' && currentActiveTab !== 'item-details') {
       window._previousTab = currentActiveTab;
       window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+      window._previousChannelsSubmenu = currentChannelsSubmenu;
     }
     switchTab('list-details');
     if (typeof opts.restoreScrollY === 'number') {
@@ -1083,17 +1085,17 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const currentLoc = window.location.pathname + window.location.search + window.location.hash;
       if (window.location.hash !== targetUrl && currentLoc !== targetUrl) {
         if (cleanPath) {
-          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '', cleanPath);
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', cleanPath);
         } else {
           const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
-          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '', '/#/list?' + params.toString());
+          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
         }
       }
     } catch (e) {}
   } else if (opts.preserveScroll) {
     try {
       const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
-      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu }, '');
+      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '');
     } catch (e) {}
   }
 

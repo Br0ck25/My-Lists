@@ -1758,17 +1758,20 @@ async function renderAdminDashboard(env) {
     function feedbackCardHtml(f) {
       const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
       const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
-      const who = f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous';
+      const isSelfLogged = f.creatorName === 'admin';
+      const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
-      const statusLabel = f.status === 'replied' ? '<span class="admin-badge improvement" style="margin-left:6px;">Replied</span>' : (completed ? '<span class="admin-badge other" style="margin-left:6px;">Resolved</span>' : '<span class="admin-badge bug" style="margin-left:6px;">Open</span>');
+      const statusLabel = (!isSelfLogged && f.status === 'replied')
+        ? '<span class="admin-badge improvement" style="margin-left:6px;">Replied</span>'
+        : (completed ? '<span class="admin-badge other" style="margin-left:6px;">Resolved</span>' : '<span class="admin-badge bug" style="margin-left:6px;">Open</span>');
 
       const messages = Array.isArray(f.messages) && f.messages.length
         ? f.messages
         : [{
             id: 'msg_init',
-            sender: 'user',
-            senderName: f.creatorName || 'User',
+            sender: isSelfLogged ? 'admin' : 'user',
+            senderName: isSelfLogged ? 'Admin' : (f.creatorName || 'User'),
             text: f.message || '',
             timestamp: f.createdAt || Date.now()
           }];
@@ -1805,10 +1808,12 @@ async function renderAdminDashboard(env) {
         '</div>' +
         '<div style="margin-top:10px;">' + messagesHtml + '</div>' +
         '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
-        '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
-          '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply...">' +
-          '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
-        '</div>' +
+        (!isSelfLogged ?
+          '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + escapeHtmlAdmin(who) + '...">' +
+            '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
+          '</div>' : ''
+        ) +
       '</div>';
     }
 
@@ -2109,7 +2114,7 @@ async function renderAdminDashboard(env) {
       let text = '';
       if (entry) {
         if (Array.isArray(entry.messages) && entry.messages.length) {
-          text = entry.messages.map((m) => (m.sender === 'admin' ? '[Developer] ' : '[User] ') + m.text).join('\\n\\n');
+          text = entry.messages.map((m) => m.text).join('\\n\\n');
         } else {
           text = entry.message || '';
         }

@@ -10,6 +10,36 @@
 let channelDraftItems = [];
 let channelDraftPoster = null;
 let channelDraftBackdrop = null;
+let channelSearchType = 'tv';
+
+function setChannelSearchType(type, btn) {
+  channelSearchType = type === 'movie' ? 'movie' : 'tv';
+  const bar = document.getElementById('channelSearchTypeChips');
+  if (bar) {
+    bar.querySelectorAll('.subnav-pill').forEach((p) => {
+      p.classList.remove('active');
+      const c = p.querySelector('.check-icon');
+      if (c) c.remove();
+    });
+  }
+  if (btn) {
+    btn.classList.add('active');
+    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+  }
+  const input = document.getElementById('channelSearchInput');
+  if (input) {
+    input.placeholder = channelSearchType === 'movie' ? 'Search a movie by name...' : 'Search a show by name...';
+  }
+  const box = document.getElementById('channelSearchResult');
+  const epBox = document.getElementById('channelEpisodePicker');
+  if (epBox) epBox.innerHTML = '';
+  const q = input ? input.value.trim() : '';
+  if (q) {
+    runChannelTitleSearch();
+  } else if (box) {
+    box.innerHTML = '';
+  }
+}
 
 async function runChannelTitleSearch() {
   const q = document.getElementById('channelSearchInput').value.trim();
@@ -21,47 +51,127 @@ async function runChannelTitleSearch() {
   }
   box.innerHTML = '<p><small>Searching\u2026</small></p>';
   try {
-    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=tv', { cache: 'no-store' });
+    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=' + encodeURIComponent(channelSearchType), { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Search failed.') + '</p>';
       return;
     }
-    renderChannelTitleResults(data.results);
+    renderChannelTitleResults(data.results, channelSearchType);
   } catch (e) {
     box.innerHTML = '<p class="testresult err">\u2717 Network error while searching.</p>';
   }
 }
 
-function renderChannelTitleResults(results) {
+function renderChannelTitleResults(results, searchType = 'tv') {
   const box = document.getElementById('channelSearchResult');
   if (!results.length) {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
     return;
   }
+  const isMovie = searchType === 'movie';
   const cardsHtml = results.map((r) => {
     const posterImg = r.poster
       ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No poster</div>';
-    return '<div class="custom-list-search-item channelTitleCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">' +
+    const btnLabel = isMovie ? '+ Add Movie' : '+ Browse';
+    const cardClass = isMovie ? 'channelMovieCard' : 'channelTitleCard';
+    const btnClass = isMovie ? 'channelAddMovieBtn' : 'channelTitleBtn';
+    return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' +
+      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">' +
       posterImg +
       '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
         escapeHtml(r.title) +
       '</div>' +
       (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
-      '<button type="button" class="lc-btn secondary channelTitleBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">+ Browse</button>' +
+      '<button type="button" class="lc-btn secondary ' + btnClass + '" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
+      ' data-tmdbid="' + r.tmdbId + '" data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '" data-poster="' + escapeAttr(r.poster || '') + '" data-backdrop="' + escapeAttr(r.backdrop || '') + '">' + btnLabel + '</button>' +
       '</div>';
   }).join('');
   box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
 }
 
 document.getElementById('channelSearchResult').addEventListener('click', (e) => {
-  const target = e.target.closest('.channelTitleCard, .channelTitleBtn');
-  if (!target) return;
-  browseChannelShow(target.dataset.tmdbid, target.dataset.title, target.dataset.poster, target.dataset.backdrop);
+  const showTarget = e.target.closest('.channelTitleCard, .channelTitleBtn');
+  if (showTarget) {
+    browseChannelShow(showTarget.dataset.tmdbid, showTarget.dataset.title, showTarget.dataset.poster, showTarget.dataset.backdrop);
+    return;
+  }
+  const movieTarget = e.target.closest('.channelMovieCard, .channelAddMovieBtn');
+  if (movieTarget) {
+    addMovieToChannelDraft(
+      movieTarget.dataset.tmdbid,
+      movieTarget.dataset.title,
+      movieTarget.dataset.year,
+      movieTarget.dataset.poster,
+      movieTarget.dataset.backdrop,
+      movieTarget.querySelector('.channelAddMovieBtn') || movieTarget
+    );
+  }
 });
+
+async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn) {
+  if (channelDraftItems.length >= CHANNEL_MAX_TOTAL_ITEMS) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Channel Limit', 'This channel has reached the maximum of ' + CHANNEL_MAX_TOTAL_ITEMS + ' items.');
+    }
+    return;
+  }
+  const originalText = btn ? btn.textContent : '+ Add Movie';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding\u2026';
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok || !data.imdbId) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Movie Resolution', (data && data.error) || 'Could not resolve IMDb ID for this movie.');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+      return;
+    }
+    channelDraftItems.push({
+      kind: 'movie',
+      imdbId: data.imdbId,
+      tmdbId: tmdbId,
+      title: title,
+      year: year || '',
+      showName: title,
+      epName: 'Movie',
+      released: year ? (year + '-01-01') : '',
+      thumbnail: backdrop || poster || '',
+      poster: poster || '',
+      showPoster: poster || '',
+      backdrop: backdrop || '',
+      showBackdrop: backdrop || '',
+    });
+    if (!channelDraftBackdrop && backdrop) channelDraftBackdrop = backdrop;
+    if (!channelDraftPoster && poster) channelDraftPoster = poster;
+    renderChannelDraftList();
+    if (btn) {
+      btn.textContent = 'Added \u2713';
+      setTimeout(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '+ Add Movie';
+        }
+      }, 1200);
+    }
+  } catch (e) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Network Error', 'Could not add movie -- check connection.');
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+}
 
 async function browseChannelShow(tmdbId, showName, showPoster, showBackdrop) {
   const box = document.getElementById('channelEpisodePicker');
@@ -407,6 +517,43 @@ function saveLocalChannel(payload) {
   return map[channelId];
 }
 
+function pruneChannelFromAllMerges(channelId) {
+  const map = loadLocalMergedChannels();
+  const channelsMap = loadLocalChannels();
+  let changed = false;
+  Object.keys(map).forEach((mergedId) => {
+    const merged = map[mergedId];
+    if (!merged || !Array.isArray(merged.channelIds) || !merged.channelIds.includes(channelId)) return;
+    changed = true;
+    merged.channelIds = merged.channelIds.filter((id) => id !== channelId);
+    merged.updatedAt = Date.now();
+
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    if (merged.channelIds.length === 0) {
+      delete map[mergedId];
+      rows.forEach((row) => {
+        if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
+          row.remove();
+        }
+      });
+    } else {
+      map[mergedId] = merged;
+      rows.forEach((row) => {
+        if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
+          const urls = merged.channelIds.map((id) => {
+            const ch = channelsMap[id];
+            return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+          }).filter(Boolean);
+          const urlInput = row.querySelector('.url');
+          if (urlInput) urlInput.value = urls.join('\\n');
+        }
+      });
+    }
+  });
+  if (changed) saveLocalMergedChannelsMap(map);
+  return changed;
+}
+
 function deleteLocalChannel(channelId, fallbackName) {
   const map = loadLocalChannels();
   const channel = map[channelId];
@@ -425,6 +572,7 @@ function deleteLocalChannel(channelId, fallbackName) {
   const performDelete = () => {
     delete map[channelId];
     saveLocalChannelsMap(map);
+    pruneChannelFromAllMerges(channelId);
     
     const rows = [...document.querySelectorAll('#lists .entry')];
     rows.forEach((row) => {
@@ -672,398 +820,2635 @@ function selectChannelPoster(posterUrl, backdropUrl) {
   });
 }
 
-// --- TV Crossover Events Registry & Story Splicer ---------------------------
+// --- // --- Sagas, Universes & Movie Franchises Registry ---------------------------
 const TV_CROSSOVER_EVENTS = [
-  // --- Arrowverse ---
   {
-    id: "arrowverse_flash_vs_arrow",
-    name: "Flash vs. Arrow",
-    franchise: "Arrowverse",
-    description: "The classic two-night crossover event between The Flash and Arrow.",
-    episodes: [
-      { showName: "The Flash", tmdbId: 60735, season: 1, episode: 8, part: 1, title: "Flash vs. Arrow" },
-      { showName: "Arrow", tmdbId: 1412, season: 3, episode: 8, part: 2, title: "The Brave and the Bold" }
+    "id": "movie_mcu_infinity_saga",
+    "name": "Marvel Cinematic Universe: The Infinity Saga",
+    "franchise": "Marvel",
+    "category": "moviesagas",
+    "description": "The complete 12-movie core Infinity Saga in chronological storyline order, from Steve Rogers in WWII through the culmination of Endgame.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Captain America: The First Avenger",
+        "year": 2011,
+        "tmdbId": 1771,
+        "imdbId": "tt0458339",
+        "poster": "https://images.metahub.space/poster/medium/tt0458339/img",
+        "part": 1
+      },
+      {
+        "type": "movie",
+        "title": "Captain Marvel",
+        "year": 2019,
+        "tmdbId": 299537,
+        "imdbId": "tt4154664",
+        "poster": "https://images.metahub.space/poster/medium/tt4154664/img",
+        "part": 2
+      },
+      {
+        "type": "movie",
+        "title": "Iron Man",
+        "year": 2008,
+        "tmdbId": 1726,
+        "imdbId": "tt0371746",
+        "poster": "https://images.metahub.space/poster/medium/tt0371746/img",
+        "part": 3
+      },
+      {
+        "type": "movie",
+        "title": "Iron Man 2",
+        "year": 2010,
+        "tmdbId": 10138,
+        "imdbId": "tt1228705",
+        "poster": "https://images.metahub.space/poster/medium/tt1228705/img",
+        "part": 4
+      },
+      {
+        "type": "movie",
+        "title": "Thor",
+        "year": 2011,
+        "tmdbId": 10195,
+        "imdbId": "tt0800369",
+        "poster": "https://images.metahub.space/poster/medium/tt0800369/img",
+        "part": 5
+      },
+      {
+        "type": "movie",
+        "title": "The Avengers",
+        "year": 2012,
+        "tmdbId": 24428,
+        "imdbId": "tt0848228",
+        "poster": "https://images.metahub.space/poster/medium/tt0848228/img",
+        "part": 6
+      },
+      {
+        "type": "movie",
+        "title": "Captain America: The Winter Soldier",
+        "year": 2014,
+        "tmdbId": 100402,
+        "imdbId": "tt1843866",
+        "poster": "https://images.metahub.space/poster/medium/tt1843866/img",
+        "part": 7
+      },
+      {
+        "type": "movie",
+        "title": "Guardians of the Galaxy",
+        "year": 2014,
+        "tmdbId": 118340,
+        "imdbId": "tt2015381",
+        "poster": "https://images.metahub.space/poster/medium/tt2015381/img",
+        "part": 8
+      },
+      {
+        "type": "movie",
+        "title": "Avengers: Age of Ultron",
+        "year": 2015,
+        "tmdbId": 99861,
+        "imdbId": "tt2395427",
+        "poster": "https://images.metahub.space/poster/medium/tt2395427/img",
+        "part": 9
+      },
+      {
+        "type": "movie",
+        "title": "Captain America: Civil War",
+        "year": 2016,
+        "tmdbId": 271110,
+        "imdbId": "tt3498820",
+        "poster": "https://images.metahub.space/poster/medium/tt3498820/img",
+        "part": 10
+      },
+      {
+        "type": "movie",
+        "title": "Avengers: Infinity War",
+        "year": 2018,
+        "tmdbId": 299536,
+        "imdbId": "tt4154756",
+        "poster": "https://images.metahub.space/poster/medium/tt4154756/img",
+        "part": 11
+      },
+      {
+        "type": "movie",
+        "title": "Avengers: Endgame",
+        "year": 2019,
+        "tmdbId": 299534,
+        "imdbId": "tt4154796",
+        "poster": "https://images.metahub.space/poster/medium/tt4154796/img",
+        "part": 12
+      }
     ]
   },
   {
-    id: "arrowverse_heroes_join_forces",
-    name: "Heroes Join Forces",
-    franchise: "Arrowverse",
-    description: "The two-part crossover setting up the Legends of Tomorrow against Vandal Savage.",
-    episodes: [
-      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 8, part: 1, title: "Legends of Today" },
-      { showName: "Arrow", tmdbId: 1412, season: 4, episode: 8, part: 2, title: "Legends of Yesterday" }
+    "id": "movie_star_wars_skywalker_saga",
+    "name": "Star Wars: The Complete Skywalker Saga & Stories",
+    "franchise": "Star Wars",
+    "category": "moviesagas",
+    "description": "The complete 11-film saga in chronological in-universe order: Episodes I-III, Solo, Rogue One, the Original Trilogy (IV-VI), and the Sequel Trilogy (VII-IX).",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode I - The Phantom Menace",
+        "year": 1999,
+        "tmdbId": 1893,
+        "imdbId": "tt0120915",
+        "poster": "https://images.metahub.space/poster/medium/tt0120915/img",
+        "part": 1
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode II - Attack of the Clones",
+        "year": 2002,
+        "tmdbId": 1894,
+        "imdbId": "tt0121765",
+        "poster": "https://images.metahub.space/poster/medium/tt0121765/img",
+        "part": 2
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode III - Revenge of the Sith",
+        "year": 2005,
+        "tmdbId": 1895,
+        "imdbId": "tt0121766",
+        "poster": "https://images.metahub.space/poster/medium/tt0121766/img",
+        "part": 3
+      },
+      {
+        "type": "movie",
+        "title": "Solo: A Star Wars Story",
+        "year": 2018,
+        "tmdbId": 348350,
+        "imdbId": "tt3778644",
+        "poster": "https://images.metahub.space/poster/medium/tt3778644/img",
+        "part": 4
+      },
+      {
+        "type": "movie",
+        "title": "Rogue One: A Star Wars Story",
+        "year": 2016,
+        "tmdbId": 330459,
+        "imdbId": "tt3748528",
+        "poster": "https://images.metahub.space/poster/medium/tt3748528/img",
+        "part": 5
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode IV - A New Hope",
+        "year": 1977,
+        "tmdbId": 11,
+        "imdbId": "tt0076759",
+        "poster": "https://images.metahub.space/poster/medium/tt0076759/img",
+        "part": 6
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode V - The Empire Strikes Back",
+        "year": 1980,
+        "tmdbId": 1891,
+        "imdbId": "tt0080684",
+        "poster": "https://images.metahub.space/poster/medium/tt0080684/img",
+        "part": 7
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode VI - Return of the Jedi",
+        "year": 1983,
+        "tmdbId": 1892,
+        "imdbId": "tt0086190",
+        "poster": "https://images.metahub.space/poster/medium/tt0086190/img",
+        "part": 8
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode VII - The Force Awakens",
+        "year": 2015,
+        "tmdbId": 140607,
+        "imdbId": "tt2488496",
+        "poster": "https://images.metahub.space/poster/medium/tt2488496/img",
+        "part": 9
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode VIII - The Last Jedi",
+        "year": 2017,
+        "tmdbId": 181808,
+        "imdbId": "tt2527336",
+        "poster": "https://images.metahub.space/poster/medium/tt2527336/img",
+        "part": 10
+      },
+      {
+        "type": "movie",
+        "title": "Star Wars: Episode IX - The Rise of Skywalker",
+        "year": 2019,
+        "tmdbId": 181812,
+        "imdbId": "tt2527338",
+        "poster": "https://images.metahub.space/poster/medium/tt2527338/img",
+        "part": 11
+      }
     ]
   },
   {
-    id: "arrowverse_worlds_finest",
-    name: "Worlds Finest",
-    franchise: "Arrowverse",
-    description: "Barry Allen crosses universes and teams up with Kara Zor-El in National City.",
-    episodes: [
-      { showName: "The Flash", tmdbId: 60735, season: 2, episode: 18, part: 1, title: "Versus Zoom" },
-      { showName: "Supergirl", tmdbId: 62688, season: 1, episode: 18, part: 2, title: "Worlds Finest" }
+    "id": "movie_middle_earth_saga",
+    "name": "Middle-earth: The Hobbit & The Lord of the Rings",
+    "franchise": "The Lord of the Rings",
+    "category": "moviesagas",
+    "description": "Peter Jackson's epic 6-film saga in chronological watch order: The Hobbit trilogy followed by The Lord of the Rings trilogy.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Hobbit: An Unexpected Journey",
+        "year": 2012,
+        "tmdbId": 49051,
+        "imdbId": "tt0903624",
+        "poster": "https://images.metahub.space/poster/medium/tt0903624/img",
+        "part": 1
+      },
+      {
+        "type": "movie",
+        "title": "The Hobbit: The Desolation of Smaug",
+        "year": 2013,
+        "tmdbId": 57158,
+        "imdbId": "tt1170358",
+        "poster": "https://images.metahub.space/poster/medium/tt1170358/img",
+        "part": 2
+      },
+      {
+        "type": "movie",
+        "title": "The Hobbit: The Battle of the Five Armies",
+        "year": 2014,
+        "tmdbId": 122917,
+        "imdbId": "tt2310332",
+        "poster": "https://images.metahub.space/poster/medium/tt2310332/img",
+        "part": 3
+      },
+      {
+        "type": "movie",
+        "title": "The Lord of the Rings: The Fellowship of the Ring",
+        "year": 2001,
+        "tmdbId": 120,
+        "imdbId": "tt0120737",
+        "poster": "https://images.metahub.space/poster/medium/tt0120737/img",
+        "part": 4
+      },
+      {
+        "type": "movie",
+        "title": "The Lord of the Rings: The Two Towers",
+        "year": 2002,
+        "tmdbId": 121,
+        "imdbId": "tt0167261",
+        "poster": "https://images.metahub.space/poster/medium/tt0167261/img",
+        "part": 5
+      },
+      {
+        "type": "movie",
+        "title": "The Lord of the Rings: The Return of the King",
+        "year": 2003,
+        "tmdbId": 122,
+        "imdbId": "tt0167260",
+        "poster": "https://images.metahub.space/poster/medium/tt0167260/img",
+        "part": 6
+      }
     ]
   },
   {
-    id: "arrowverse_invasion",
-    name: "Invasion!",
-    franchise: "Arrowverse",
-    description: "The 3-part event uniting Flash, Arrow, Supergirl, and the Legends against the Dominators.",
-    episodes: [
-      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 8, part: 1, title: "Invasion! (Part 1)" },
-      { showName: "Arrow", tmdbId: 1412, season: 5, episode: 8, part: 2, title: "Invasion! (Part 2)" },
-      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 2, episode: 7, part: 3, title: "Invasion! (Part 3)" }
+    "id": "movie_batman_dark_knight_trilogy",
+    "name": "Batman: The Dark Knight Trilogy",
+    "franchise": "Batman",
+    "category": "moviesagas",
+    "description": "Christopher Nolan's definitive Batman trilogy from Bruce Wayne's origins to the fall and rise of Gotham's protector.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Batman Begins",
+        "year": 2005,
+        "tmdbId": 272,
+        "imdbId": "tt0372784",
+        "poster": "https://images.metahub.space/poster/medium/tt0372784/img",
+        "part": 1
+      },
+      {
+        "type": "movie",
+        "title": "The Dark Knight",
+        "year": 2008,
+        "tmdbId": 155,
+        "imdbId": "tt0468569",
+        "poster": "https://images.metahub.space/poster/medium/tt0468569/img",
+        "part": 2
+      },
+      {
+        "type": "movie",
+        "title": "The Dark Knight Rises",
+        "year": 2012,
+        "tmdbId": 49026,
+        "imdbId": "tt1345836",
+        "poster": "https://images.metahub.space/poster/medium/tt1345836/img",
+        "part": 3
+      }
     ]
   },
   {
-    id: "arrowverse_duet",
-    name: "Duet (Musical Crossover)",
-    franchise: "Arrowverse",
-    description: "The Music Meister traps Supergirl and The Flash in an alternate reality musical.",
-    episodes: [
-      { showName: "Supergirl", tmdbId: 62688, season: 2, episode: 16, part: 1, title: "Star-Crossed" },
-      { showName: "The Flash", tmdbId: 60735, season: 3, episode: 17, part: 2, title: "Duet" }
+    "id": "movie_harry_potter_wizarding_world",
+    "name": "Harry Potter & The Wizarding World",
+    "franchise": "Harry Potter",
+    "category": "moviesagas",
+    "description": "The complete 11-film Wizarding World in chronological watch order: Fantastic Beasts (1-3) followed by Harry Potter (1-8).",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Fantastic Beasts and Where to Find Them",
+        "year": 2016,
+        "tmdbId": 259316,
+        "imdbId": "tt3183660",
+        "poster": "https://images.metahub.space/poster/medium/tt3183660/img",
+        "part": 1
+      },
+      {
+        "type": "movie",
+        "title": "Fantastic Beasts: The Crimes of Grindelwald",
+        "year": 2018,
+        "tmdbId": 338952,
+        "imdbId": "tt4123430",
+        "poster": "https://images.metahub.space/poster/medium/tt4123430/img",
+        "part": 2
+      },
+      {
+        "type": "movie",
+        "title": "Fantastic Beasts: The Secrets of Dumbledore",
+        "year": 2022,
+        "tmdbId": 338953,
+        "imdbId": "tt4123432",
+        "poster": "https://images.metahub.space/poster/medium/tt4123432/img",
+        "part": 3
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Sorcerer's Stone",
+        "year": 2001,
+        "tmdbId": 671,
+        "imdbId": "tt0241527",
+        "poster": "https://images.metahub.space/poster/medium/tt0241527/img",
+        "part": 4
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Chamber of Secrets",
+        "year": 2002,
+        "tmdbId": 672,
+        "imdbId": "tt0295297",
+        "poster": "https://images.metahub.space/poster/medium/tt0295297/img",
+        "part": 5
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Prisoner of Azkaban",
+        "year": 2004,
+        "tmdbId": 673,
+        "imdbId": "tt0304141",
+        "poster": "https://images.metahub.space/poster/medium/tt0304141/img",
+        "part": 6
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Goblet of Fire",
+        "year": 2005,
+        "tmdbId": 674,
+        "imdbId": "tt0330373",
+        "poster": "https://images.metahub.space/poster/medium/tt0330373/img",
+        "part": 7
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Order of the Phoenix",
+        "year": 2007,
+        "tmdbId": 675,
+        "imdbId": "tt0373889",
+        "poster": "https://images.metahub.space/poster/medium/tt0373889/img",
+        "part": 8
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Half-Blood Prince",
+        "year": 2009,
+        "tmdbId": 767,
+        "imdbId": "tt0417741",
+        "poster": "https://images.metahub.space/poster/medium/tt0417741/img",
+        "part": 9
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Deathly Hallows: Part 1",
+        "year": 2010,
+        "tmdbId": 12444,
+        "imdbId": "tt0926084",
+        "poster": "https://images.metahub.space/poster/medium/tt0926084/img",
+        "part": 10
+      },
+      {
+        "type": "movie",
+        "title": "Harry Potter and the Deathly Hallows: Part 2",
+        "year": 2011,
+        "tmdbId": 12445,
+        "imdbId": "tt1201607",
+        "poster": "https://images.metahub.space/poster/medium/tt1201607/img",
+        "part": 11
+      }
     ]
   },
   {
-    id: "arrowverse_crisis_on_earth_x",
-    name: "Crisis on Earth-X",
-    franchise: "Arrowverse",
-    description: "The 4-part event uniting heroes when dark doppelgängers crash Barry and Iris's wedding.",
-    episodes: [
-      { showName: "Supergirl", tmdbId: 62688, season: 3, episode: 8, part: 1, title: "Crisis on Earth-X, Part 1" },
-      { showName: "Arrow", tmdbId: 1412, season: 6, episode: 8, part: 2, title: "Crisis on Earth-X, Part 2" },
-      { showName: "The Flash", tmdbId: 60735, season: 4, episode: 8, part: 3, title: "Crisis on Earth-X, Part 3" },
-      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 3, episode: 8, part: 4, title: "Crisis on Earth-X, Part 4" }
+    "id": "movie_fast_and_furious_saga",
+    "name": "The Fast and the Furious: Complete Saga",
+    "franchise": "Fast & Furious",
+    "category": "moviesagas",
+    "description": "The complete 11-film high-octane saga in chronological narrative order (with Tokyo Drift placed correctly before Furious 7).",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Fast and the Furious",
+        "year": 2001,
+        "tmdbId": 9799,
+        "imdbId": "tt0232500",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0232500/img"
+      },
+      {
+        "type": "movie",
+        "title": "2 Fast 2 Furious",
+        "year": 2003,
+        "tmdbId": 584,
+        "imdbId": "tt0322259",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0322259/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fast & Furious",
+        "year": 2009,
+        "tmdbId": 13804,
+        "imdbId": "tt1013752",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1013752/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fast Five",
+        "year": 2011,
+        "tmdbId": 51497,
+        "imdbId": "tt1596343",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1596343/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fast & Furious 6",
+        "year": 2013,
+        "tmdbId": 82992,
+        "imdbId": "tt1905041",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1905041/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Fast and the Furious: Tokyo Drift",
+        "year": 2006,
+        "tmdbId": 9615,
+        "imdbId": "tt0463985",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt0463985/img"
+      },
+      {
+        "type": "movie",
+        "title": "Furious 7",
+        "year": 2015,
+        "tmdbId": 168259,
+        "imdbId": "tt2820852",
+        "part": 7,
+        "poster": "https://images.metahub.space/poster/medium/tt2820852/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Fate of the Furious",
+        "year": 2017,
+        "tmdbId": 337339,
+        "imdbId": "tt4630562",
+        "part": 8,
+        "poster": "https://images.metahub.space/poster/medium/tt4630562/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fast & Furious Presents: Hobbs & Shaw",
+        "year": 2019,
+        "tmdbId": 384018,
+        "imdbId": "tt6806448",
+        "part": 9,
+        "poster": "https://images.metahub.space/poster/medium/tt6806448/img"
+      },
+      {
+        "type": "movie",
+        "title": "F9",
+        "year": 2021,
+        "tmdbId": 385128,
+        "imdbId": "tt5433138",
+        "part": 10,
+        "poster": "https://images.metahub.space/poster/medium/tt5433138/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fast X",
+        "year": 2023,
+        "tmdbId": 385687,
+        "imdbId": "tt5433140",
+        "part": 11,
+        "poster": "https://images.metahub.space/poster/medium/tt5433140/img"
+      }
     ]
   },
   {
-    id: "arrowverse_elseworlds",
-    name: "Elseworlds",
-    franchise: "Arrowverse",
-    description: "The 3-part event introducing Gotham City and Batwoman when Oliver and Barry swap lives.",
-    episodes: [
-      { showName: "The Flash", tmdbId: 60735, season: 5, episode: 9, part: 1, title: "Elseworlds, Part 1" },
-      { showName: "Arrow", tmdbId: 1412, season: 7, episode: 9, part: 2, title: "Elseworlds, Part 2" },
-      { showName: "Supergirl", tmdbId: 62688, season: 4, episode: 9, part: 3, title: "Elseworlds, Part 3" }
+    "id": "movie_alien_predator_timeline",
+    "name": "Alien & Predator: Complete Universe Timeline",
+    "franchise": "Alien",
+    "category": "moviesagas",
+    "description": "The complete xenomorph and yautja chronology: from Prey (1719) and Prometheus through Alien: Romulus (2024) and Resurrection.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Prey",
+        "year": 2022,
+        "tmdbId": 766507,
+        "imdbId": "tt11866324",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt11866324/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien vs. Predator",
+        "year": 2004,
+        "tmdbId": 395,
+        "imdbId": "tt0370263",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0370263/img"
+      },
+      {
+        "type": "movie",
+        "title": "Aliens vs. Predator: Requiem",
+        "year": 2007,
+        "tmdbId": 440,
+        "imdbId": "tt0758730",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0758730/img"
+      },
+      {
+        "type": "movie",
+        "title": "Prometheus",
+        "year": 2012,
+        "tmdbId": 70981,
+        "imdbId": "tt1446714",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1446714/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien: Covenant",
+        "year": 2017,
+        "tmdbId": 342473,
+        "imdbId": "tt2316204",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt2316204/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "imdbId": "tt0078748",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt0078748/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien: Romulus",
+        "year": 2024,
+        "tmdbId": 945961,
+        "imdbId": "tt18412256",
+        "part": 7,
+        "poster": "https://images.metahub.space/poster/medium/tt18412256/img"
+      },
+      {
+        "type": "movie",
+        "title": "Aliens",
+        "year": 1986,
+        "tmdbId": 679,
+        "imdbId": "tt0090605",
+        "part": 8,
+        "poster": "https://images.metahub.space/poster/medium/tt0090605/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien 3",
+        "year": 1992,
+        "tmdbId": 8077,
+        "imdbId": "tt0103644",
+        "part": 9,
+        "poster": "https://images.metahub.space/poster/medium/tt0103644/img"
+      },
+      {
+        "type": "movie",
+        "title": "Alien: Resurrection",
+        "year": 1997,
+        "tmdbId": 8078,
+        "imdbId": "tt0118583",
+        "part": 10,
+        "poster": "https://images.metahub.space/poster/medium/tt0118583/img"
+      }
     ]
   },
   {
-    id: "arrowverse_crisis_on_infinite_earths",
-    name: "Crisis on Infinite Earths",
-    franchise: "Arrowverse",
-    description: "The epic 5-part multiverse crossover event to save existence from the Anti-Monitor.",
-    episodes: [
-      { showName: "Supergirl", tmdbId: 62688, season: 5, episode: 9, part: 1, title: "Crisis on Infinite Earths: Part One" },
-      { showName: "Batwoman", tmdbId: 89247, season: 1, episode: 9, part: 2, title: "Crisis on Infinite Earths: Part Two" },
-      { showName: "The Flash", tmdbId: 60735, season: 6, episode: 9, part: 3, title: "Crisis on Infinite Earths: Part Three" },
-      { showName: "Arrow", tmdbId: 1412, season: 8, episode: 8, part: 4, title: "Crisis on Infinite Earths: Part Four" },
-      { showName: "DC's Legends of Tomorrow", tmdbId: 62643, season: 5, episode: 1, part: 5, title: "Crisis on Infinite Earths: Part Five" }
-    ]
-  },
-
-  // --- One Chicago ---
-  {
-    id: "chicago_a_dark_day",
-    name: "A Dark Day",
-    franchise: "One Chicago",
-    description: "The hospital explosion crossover event between Chicago Fire and Chicago P.D.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 2, episode: 20, part: 1, title: "A Dark Day" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 1, episode: 12, part: 2, title: "8:30 PM" }
-    ]
-  },
-  {
-    id: "chicago_nobody_touches_anything",
-    name: "Chicago Crossover (Child Pornography Ring)",
-    franchise: "One Chicago",
-    description: "The 3-part crossover uniting Firehouse 51, Intelligence, and the SVU squad.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 7, part: 1, title: "Nobody Touches Anything" },
-      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 7, part: 2, title: "Chicago Crossover" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 7, part: 3, title: "They'll Have to Go Through Me" }
-    ]
-  },
-  {
-    id: "chicago_three_bells",
-    name: "Shay Arson Investigation",
-    franchise: "One Chicago",
-    description: "The two-part crossover hunting the arsonist responsible for Leslie Shay's death.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 13, part: 1, title: "Three Bells" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 13, part: 2, title: "A Little Devil Complex" }
-    ]
-  },
-  {
-    id: "chicago_jellybean_yates",
-    name: "Greg Yates Serial Killer Crossover",
-    franchise: "One Chicago",
-    description: "The multi-part chase for serial killer Gregory Yates between Fire, P.D. and SVU.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 3, episode: 21, part: 1, title: "We Called Her Jellybean" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 2, episode: 20, part: 2, title: "The Number of Rats" },
-      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 16, episode: 20, part: 3, title: "Daydream Believer" }
+    "id": "movie_planet_of_the_apes_reboot",
+    "name": "Planet of the Apes: Modern Reboot Saga",
+    "franchise": "Planet of the Apes",
+    "category": "moviesagas",
+    "description": "The critically acclaimed modern saga following Caesar's rise, the war for Earth, and the new kingdom generations later.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Rise of the Planet of the Apes",
+        "year": 2011,
+        "tmdbId": 61791,
+        "imdbId": "tt1318514",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1318514/img"
+      },
+      {
+        "type": "movie",
+        "title": "Dawn of the Planet of the Apes",
+        "year": 2014,
+        "tmdbId": 119450,
+        "imdbId": "tt2103281",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2103281/img"
+      },
+      {
+        "type": "movie",
+        "title": "War for the Planet of the Apes",
+        "year": 2017,
+        "tmdbId": 281338,
+        "imdbId": "tt3450958",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt3450958/img"
+      },
+      {
+        "type": "movie",
+        "title": "Kingdom of the Planet of the Apes",
+        "year": 2024,
+        "tmdbId": 653346,
+        "imdbId": "tt11389872",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt11389872/img"
+      }
     ]
   },
   {
-    id: "chicago_beating_heart",
-    name: "The Beating Heart (Chemo Overdose Crossover)",
-    franchise: "One Chicago",
-    description: "The 3-part event connecting Christopher Herrmann's stabbing to a rogue doctor giving fatal chemo doses.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 4, episode: 10, part: 1, title: "The Beating Heart" },
-      { showName: "Chicago Med", tmdbId: 62650, season: 1, episode: 5, part: 2, title: "Malignant" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 3, episode: 10, part: 3, title: "Now I'm God" }
+    "id": "movie_mission_impossible_saga",
+    "name": "Mission: Impossible Complete Chronology",
+    "franchise": "Mission: Impossible",
+    "category": "moviesagas",
+    "description": "All 7 globe-trotting espionage thrillers starring Tom Cruise as IMF agent Ethan Hunt.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Mission: Impossible",
+        "year": 1996,
+        "tmdbId": 954,
+        "imdbId": "tt0117060",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0117060/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible II",
+        "year": 2000,
+        "tmdbId": 955,
+        "imdbId": "tt0120755",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0120755/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible III",
+        "year": 2006,
+        "tmdbId": 956,
+        "imdbId": "tt0317919",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0317919/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible - Ghost Protocol",
+        "year": 2011,
+        "tmdbId": 56292,
+        "imdbId": "tt1229238",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1229238/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible - Rogue Nation",
+        "year": 2015,
+        "tmdbId": 177677,
+        "imdbId": "tt2381249",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt2381249/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible - Fallout",
+        "year": 2018,
+        "tmdbId": 353081,
+        "imdbId": "tt4912910",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt4912910/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mission: Impossible - Dead Reckoning Part One",
+        "year": 2023,
+        "tmdbId": 575264,
+        "imdbId": "tt9603212",
+        "part": 7,
+        "poster": "https://images.metahub.space/poster/medium/tt9603212/img"
+      }
     ]
   },
   {
-    id: "chicago_deathtrap",
-    name: "Deathtrap / Warehouse Fire",
-    franchise: "One Chicago",
-    description: "The 3-part event spanning Chicago Fire, Chicago P.D. and Chicago Justice after a fatal warehouse fire.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 5, episode: 15, part: 1, title: "Deathtrap" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 4, episode: 16, part: 2, title: "Emotional Proximity" },
-      { showName: "Chicago Justice", tmdbId: 66986, season: 1, episode: 1, part: 3, title: "Fake" }
+    "id": "movie_james_bond_craig_era",
+    "name": "James Bond: The Daniel Craig 007 Era",
+    "franchise": "James Bond",
+    "category": "moviesagas",
+    "description": "The complete 5-film serialized story arc of 007 from his first Double-O assignment to his final mission.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Casino Royale",
+        "year": 2006,
+        "tmdbId": 36557,
+        "imdbId": "tt0381061",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0381061/img"
+      },
+      {
+        "type": "movie",
+        "title": "Quantum of Solace",
+        "year": 2008,
+        "tmdbId": 10764,
+        "imdbId": "tt0830515",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0830515/img"
+      },
+      {
+        "type": "movie",
+        "title": "Skyfall",
+        "year": 2012,
+        "tmdbId": 37724,
+        "imdbId": "tt1074638",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1074638/img"
+      },
+      {
+        "type": "movie",
+        "title": "Spectre",
+        "year": 2015,
+        "tmdbId": 206647,
+        "imdbId": "tt2379713",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt2379713/img"
+      },
+      {
+        "type": "movie",
+        "title": "No Time to Die",
+        "year": 2021,
+        "tmdbId": 370172,
+        "imdbId": "tt2382320",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt2382320/img"
+      }
     ]
   },
   {
-    id: "chicago_going_to_war",
-    name: "High-Rise Apartment Fire",
-    franchise: "One Chicago",
-    description: "The 3-part crossover event starting with a catastrophic 25-story high-rise apartment fire.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 7, episode: 2, part: 1, title: "Going to War" },
-      { showName: "Chicago Med", tmdbId: 62650, season: 4, episode: 2, part: 2, title: "When to Let Go" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 6, episode: 2, part: 3, title: "Endings" }
+    "id": "movie_john_wick_universe",
+    "name": "John Wick: Complete Universe",
+    "franchise": "John Wick",
+    "category": "moviesagas",
+    "description": "The relentless 4-chapter saga of the legendary Baba Yaga fighting his way through the High Table.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "John Wick",
+        "year": 2014,
+        "tmdbId": 245891,
+        "imdbId": "tt2911666",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2911666/img"
+      },
+      {
+        "type": "movie",
+        "title": "John Wick: Chapter 2",
+        "year": 2017,
+        "tmdbId": 324552,
+        "imdbId": "tt4425200",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4425200/img"
+      },
+      {
+        "type": "movie",
+        "title": "John Wick: Chapter 3 - Parabellum",
+        "year": 2019,
+        "tmdbId": 458156,
+        "imdbId": "tt6146586",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt6146586/img"
+      },
+      {
+        "type": "movie",
+        "title": "John Wick: Chapter 4",
+        "year": 2023,
+        "tmdbId": 603692,
+        "imdbId": "tt10366206",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt10366206/img"
+      }
     ]
   },
   {
-    id: "chicago_infection",
-    name: "Infection (Bioterrorism Outbreak)",
-    franchise: "One Chicago",
-    description: "The 3-part crossover where a deadly flesh-eating bacterial epidemic strikes Chicago.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 4, part: 1, title: "Infection, Part I" },
-      { showName: "Chicago Med", tmdbId: 62650, season: 5, episode: 4, part: 2, title: "Infection, Part II" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 4, part: 3, title: "Infection, Part III" }
+    "id": "movie_matrix_complete_saga",
+    "name": "The Matrix: Complete Quadrilogy",
+    "franchise": "The Matrix",
+    "category": "moviesagas",
+    "description": "The Wachowskis' groundbreaking cyberpunk saga from Neo's awakening to the battle of Zion and Resurrections.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Matrix",
+        "year": 1999,
+        "tmdbId": 603,
+        "imdbId": "tt0133093",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0133093/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Matrix Reloaded",
+        "year": 2003,
+        "tmdbId": 604,
+        "imdbId": "tt0234215",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0234215/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Matrix Revolutions",
+        "year": 2003,
+        "tmdbId": 605,
+        "imdbId": "tt0242653",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0242653/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Matrix Resurrections",
+        "year": 2021,
+        "tmdbId": 624860,
+        "imdbId": "tt10838180",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt10838180/img"
+      }
     ]
   },
   {
-    id: "chicago_off_the_grid",
-    name: "Sean Roman / Opioid Crisis Crossover",
-    franchise: "One Chicago",
-    description: "The 2-part event bringing former Officer Sean Roman back to Chicago to find his missing sister.",
-    episodes: [
-      { showName: "Chicago Fire", tmdbId: 44006, season: 8, episode: 15, part: 1, title: "Off the Grid" },
-      { showName: "Chicago P.D.", tmdbId: 58841, season: 7, episode: 15, part: 2, title: "Burden of Truth" }
-    ]
-  },
-
-  // --- Law & Order Universe ---
-  {
-    id: "law_order_gimme_shelter",
-    name: "Gimme Shelter (Historic 3-Way Crossover)",
-    franchise: "Law & Order",
-    description: "The premiere 3-show crossover uniting Organized Crime, SVU, and the original Law & Order team.",
-    episodes: [
-      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 1, part: 1, title: "Gimme Shelter - Part One" },
-      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 1, part: 2, title: "Gimme Shelter - Part Two" },
-      { showName: "Law & Order", tmdbId: 549, season: 22, episode: 1, part: 3, title: "Gimme Shelter - Part Three" }
-    ]
-  },
-  {
-    id: "law_order_return_of_the_prodigal_son",
-    name: "Elliot Stabler's Return",
-    franchise: "Law & Order",
-    description: "Elliot Stabler reunites with Olivia Benson following a car bombing targeting his family.",
-    episodes: [
-      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 22, episode: 9, part: 1, title: "Return of the Prodigal Son" },
-      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 1, episode: 1, part: 2, title: "What Happens in Puglia" }
-    ]
-  },
-  {
-    id: "law_order_shadow_svu_oc_finale",
-    name: "Bad Things / All Pain Is One Malady",
-    franchise: "Law & Order",
-    description: "The tense season finale crossover taking down a murder-for-hire site targeting Benson and Stabler.",
-    episodes: [
-      { showName: "Law & Order: Special Victims Unit", tmdbId: 2734, season: 24, episode: 22, part: 1, title: "All Pain Is One Malady" },
-      { showName: "Law & Order: Organized Crime", tmdbId: 111831, season: 3, episode: 22, part: 2, title: "With Many Names" }
-    ]
-  },
-
-  // --- FBI Universe ---
-  {
-    id: "fbi_american_dreams",
-    name: "American Dreams / Emotional Rescue",
-    franchise: "FBI",
-    description: "The crossover investigation where Jubal brings in Jess LaCroix to rescue kidnapped schoolchildren.",
-    episodes: [
-      { showName: "FBI", tmdbId: 80748, season: 2, episode: 19, part: 1, title: "American Dreams" },
-      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 1, episode: 9, part: 2, title: "Emotional Rescue" }
-    ]
-  },
-  {
-    id: "fbi_all_that_glitters",
-    name: "All That Glitters / Exposed / Lovesick",
-    franchise: "FBI",
-    description: "The 3-part franchise premiere launching FBI: International across New York and Budapest.",
-    episodes: [
-      { showName: "FBI", tmdbId: 80748, season: 4, episode: 1, part: 1, title: "All That Glitters" },
-      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 3, episode: 1, part: 2, title: "Exposed" },
-      { showName: "FBI: International", tmdbId: 125988, season: 1, episode: 1, part: 3, title: "Pilot" }
+    "id": "movie_hunger_games_chronology",
+    "name": "The Hunger Games: Complete Chronology",
+    "franchise": "The Hunger Games",
+    "category": "moviesagas",
+    "description": "Panem's saga in timeline order: The Ballad of Songbirds & Snakes (2023) followed by Katniss Everdeen's revolution.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Hunger Games: The Ballad of Songbirds & Snakes",
+        "year": 2023,
+        "tmdbId": 695721,
+        "imdbId": "tt10545296",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt10545296/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Hunger Games",
+        "year": 2012,
+        "tmdbId": 70160,
+        "imdbId": "tt1392170",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1392170/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Hunger Games: Catching Fire",
+        "year": 2013,
+        "tmdbId": 101299,
+        "imdbId": "tt1951264",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1951264/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Hunger Games: Mockingjay - Part 1",
+        "year": 2014,
+        "tmdbId": 131631,
+        "imdbId": "tt1951265",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1951265/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Hunger Games: Mockingjay - Part 2",
+        "year": 2015,
+        "tmdbId": 131634,
+        "imdbId": "tt1951266",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1951266/img"
+      }
     ]
   },
   {
-    id: "fbi_imminent_threat",
-    name: "Imminent Threat (Global Terror Crossover)",
-    franchise: "FBI",
-    description: "The 3-part global event racing to stop a catastrophic terror attack planned in New York City.",
-    episodes: [
-      { showName: "FBI: International", tmdbId: 125988, season: 2, episode: 16, part: 1, title: "Imminent Threat - Part One" },
-      { showName: "FBI", tmdbId: 80748, season: 5, episode: 17, part: 2, title: "Imminent Threat - Part Two" },
-      { showName: "FBI: Most Wanted", tmdbId: 94372, season: 4, episode: 16, part: 3, title: "Imminent Threat - Part Three" }
-    ]
-  },
-
-  // --- NCIS Universe ---
-  {
-    id: "ncis_sister_city",
-    name: "Sister City",
-    franchise: "NCIS",
-    description: "The 2-part murder investigation linking Gibbs's team with Pride's New Orleans squad.",
-    episodes: [
-      { showName: "NCIS", tmdbId: 4614, season: 13, episode: 12, part: 1, title: "Sister City (Part I)" },
-      { showName: "NCIS: New Orleans", tmdbId: 61387, season: 2, episode: 12, part: 2, title: "Sister City (Part II)" }
-    ]
-  },
-  {
-    id: "ncis_too_many_cooks",
-    name: "Too Many Cooks / A Long Time Coming",
-    franchise: "NCIS",
-    description: "The first-ever 3-way crossover event spanning NCIS, NCIS: Hawai'i, and NCIS: Los Angeles.",
-    episodes: [
-      { showName: "NCIS", tmdbId: 4614, season: 20, episode: 10, part: 1, title: "Too Many Cooks" },
-      { showName: "NCIS: Hawai'i", tmdbId: 124364, season: 2, episode: 10, part: 2, title: "Deep Fake" },
-      { showName: "NCIS: Los Angeles", tmdbId: 17610, season: 14, episode: 10, part: 3, title: "A Long Time Coming" }
-    ]
-  },
-
-  // --- Grey's Anatomy Universe ---
-  {
-    id: "greys_what_i_did_for_love",
-    name: "Lucas Ripley Hospital Emergency",
-    franchise: "Grey's Anatomy Universe",
-    description: "The tragic two-part medical emergency crossover involving Fire Chief Lucas Ripley.",
-    episodes: [
-      { showName: "Grey's Anatomy", tmdbId: 1416, season: 15, episode: 23, part: 1, title: "What I Did for Love" },
-      { showName: "Station 19", tmdbId: 76773, season: 2, episode: 15, part: 2, title: "Always Ready" }
-    ]
-  },
-  {
-    id: "greys_i_like_quick_and_dark",
-    name: "Joe's Bar Crash",
-    franchise: "Grey's Anatomy Universe",
-    description: "The crossover rescue when a car crashes through the roof of Joe's Bar.",
-    episodes: [
-      { showName: "Station 19", tmdbId: 76773, season: 3, episode: 1, part: 1, title: "I Know This Bar" },
-      { showName: "Grey's Anatomy", tmdbId: 1416, season: 16, episode: 10, part: 2, title: "Help Me Through the Night" }
-    ]
-  },
-  {
-    id: "greys_things_we_lost_in_the_fire",
-    name: "Gas Line Explosion",
-    franchise: "Grey's Anatomy Universe",
-    description: "The neighborhood gas pipeline disaster uniting Station 19 and Grey Sloan Memorial.",
-    episodes: [
-      { showName: "Station 19", tmdbId: 76773, season: 5, episode: 5, part: 1, title: "Things We Lost in the Fire" },
-      { showName: "Grey's Anatomy", tmdbId: 1416, season: 18, episode: 5, part: 2, title: "Bottle Up and Explode!" }
-    ]
-  },
-
-  // --- Hawaii Five-0 / Magnum P.I. / MacGyver ---
-  {
-    id: "hawaii_magnum_crossover",
-    name: "Desperate Measures",
-    franchise: "Hawaii Universe",
-    description: "Five-0 recruits private investigators Thomas Magnum and Juliet Higgins to extract a captured agent.",
-    episodes: [
-      { showName: "Hawaii Five-0", tmdbId: 32798, season: 10, episode: 12, part: 1, title: "Ihea 'oe i ka wa a ka ua e loku ana?" },
-      { showName: "Magnum P.I.", tmdbId: 79593, season: 2, episode: 12, part: 2, title: "Desperate Measures" }
+    "id": "movie_jurassic_park_world_saga",
+    "name": "Jurassic Park & Jurassic World Saga",
+    "franchise": "Jurassic Park",
+    "category": "moviesagas",
+    "description": "The complete 6-movie dinosaur adventure saga from Isla Nublar to global coexistence in Dominion.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Jurassic Park",
+        "year": 1993,
+        "tmdbId": 329,
+        "imdbId": "tt0107290",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0107290/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Lost World: Jurassic Park",
+        "year": 1997,
+        "tmdbId": 330,
+        "imdbId": "tt0119567",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0119567/img"
+      },
+      {
+        "type": "movie",
+        "title": "Jurassic Park III",
+        "year": 2001,
+        "tmdbId": 331,
+        "imdbId": "tt0163025",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0163025/img"
+      },
+      {
+        "type": "movie",
+        "title": "Jurassic World",
+        "year": 2015,
+        "tmdbId": 135397,
+        "imdbId": "tt0369610",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0369610/img"
+      },
+      {
+        "type": "movie",
+        "title": "Jurassic World: Fallen Kingdom",
+        "year": 2018,
+        "tmdbId": 351286,
+        "imdbId": "tt4881806",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt4881806/img"
+      },
+      {
+        "type": "movie",
+        "title": "Jurassic World Dominion",
+        "year": 2022,
+        "tmdbId": 507086,
+        "imdbId": "tt8041270",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt8041270/img"
+      }
     ]
   },
   {
-    id: "macgyver_flashlight",
-    name: "Flashlight",
-    franchise: "Hawaii Universe",
-    description: "MacGyver and the Phoenix team travel to Hawaii to assist Five-0 after a severe earthquake.",
-    episodes: [
-      { showName: "MacGyver", tmdbId: 67178, season: 1, episode: 18, part: 1, title: "Flashlight" },
-      { showName: "Hawaii Five-0", tmdbId: 32798, season: 7, episode: 19, part: 2, title: "Exodus" }
+    "id": "movie_indiana_jones_adventures",
+    "name": "Indiana Jones: The Complete Adventures",
+    "franchise": "Indiana Jones",
+    "category": "moviesagas",
+    "description": "All 5 globetrotting archeological adventures starring Harrison Ford from Raiders of the Lost Ark to Dial of Destiny.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Indiana Jones and the Raiders of the Lost Ark",
+        "year": 1981,
+        "tmdbId": 85,
+        "imdbId": "tt0082971",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0082971/img"
+      },
+      {
+        "type": "movie",
+        "title": "Indiana Jones and the Temple of Doom",
+        "year": 1984,
+        "tmdbId": 87,
+        "imdbId": "tt0087469",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0087469/img"
+      },
+      {
+        "type": "movie",
+        "title": "Indiana Jones and the Last Crusade",
+        "year": 1989,
+        "tmdbId": 89,
+        "imdbId": "tt0097576",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0097576/img"
+      },
+      {
+        "type": "movie",
+        "title": "Indiana Jones and the Kingdom of the Crystal Skull",
+        "year": 2008,
+        "tmdbId": 217,
+        "imdbId": "tt0367882",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0367882/img"
+      },
+      {
+        "type": "movie",
+        "title": "Indiana Jones and the Dial of Destiny",
+        "year": 2023,
+        "tmdbId": 335977,
+        "imdbId": "tt1462764",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1462764/img"
+      }
     ]
   },
-
-  // --- Buffyverse ---
   {
-    id: "buffyverse_i_will_remember_you",
-    name: "I Will Remember You",
-    franchise: "Buffyverse",
-    description: "Buffy visits Los Angeles after finding out Angel was in Sunnydale, leading to a fateful day of mortality.",
-    episodes: [
-      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 8, part: 1, title: "Pangs" },
-      { showName: "Angel", tmdbId: 2426, season: 1, episode: 8, part: 2, title: "I Will Remember You" }
+    "id": "movie_mad_max_universe",
+    "name": "Mad Max: Complete Wasteland Saga",
+    "franchise": "Mad Max",
+    "category": "moviesagas",
+    "description": "George Miller's post-apocalyptic vehicular action masterpieces in chronological timeline order.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Mad Max",
+        "year": 1979,
+        "tmdbId": 764,
+        "imdbId": "tt0079501",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0079501/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mad Max 2: The Road Warrior",
+        "year": 1981,
+        "tmdbId": 885,
+        "imdbId": "tt0082694",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0082694/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mad Max Beyond Thunderdome",
+        "year": 1985,
+        "tmdbId": 9355,
+        "imdbId": "tt0089530",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0089530/img"
+      },
+      {
+        "type": "movie",
+        "title": "Furiosa: A Mad Max Saga",
+        "year": 2024,
+        "tmdbId": 786892,
+        "imdbId": "tt12037194",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt12037194/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mad Max: Fury Road",
+        "year": 2015,
+        "tmdbId": 76341,
+        "imdbId": "tt1392190",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1392190/img"
+      }
     ]
   },
   {
-    id: "buffyverse_five_by_five",
-    name: "Faith's Rogue Redemption",
-    franchise: "Buffyverse",
-    description: "Faith flees Sunnydale to Los Angeles where Wolfram & Hart hire her to assassinate Angel.",
-    episodes: [
-      { showName: "Buffy the Vampire Slayer", tmdbId: 95, season: 4, episode: 20, part: 1, title: "The Yoko Factor" },
-      { showName: "Angel", tmdbId: 2426, season: 1, episode: 18, part: 2, title: "Five by Five" },
-      { showName: "Angel", tmdbId: 2426, season: 1, episode: 19, part: 3, title: "Sanctuary" }
+    "id": "movie_pirates_caribbean_saga",
+    "name": "Pirates of the Caribbean: Complete Saga",
+    "franchise": "Pirates of the Caribbean",
+    "category": "moviesagas",
+    "description": "All 5 swashbuckling Disney adventures following Captain Jack Sparrow across the Seven Seas.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Pirates of the Caribbean: The Curse of the Black Pearl",
+        "year": 2003,
+        "tmdbId": 22,
+        "imdbId": "tt0325980",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0325980/img"
+      },
+      {
+        "type": "movie",
+        "title": "Pirates of the Caribbean: Dead Man's Chest",
+        "year": 2006,
+        "tmdbId": 58,
+        "imdbId": "tt0383574",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0383574/img"
+      },
+      {
+        "type": "movie",
+        "title": "Pirates of the Caribbean: At World's End",
+        "year": 2007,
+        "tmdbId": 285,
+        "imdbId": "tt0449088",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0449088/img"
+      },
+      {
+        "type": "movie",
+        "title": "Pirates of the Caribbean: On Stranger Tides",
+        "year": 2011,
+        "tmdbId": 1865,
+        "imdbId": "tt1298650",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1298650/img"
+      },
+      {
+        "type": "movie",
+        "title": "Pirates of the Caribbean: Dead Men Tell No Tales",
+        "year": 2017,
+        "tmdbId": 166426,
+        "imdbId": "tt1790809",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1790809/img"
+      }
     ]
   },
-
-  // --- The Vampire Diaries / The Originals ---
   {
-    id: "vampire_diaries_moonlight_on_bayou",
-    name: "Moonlight on the Bayou",
-    franchise: "Vampire Diaries Universe",
-    description: "Stefan Salvatore travels to New Orleans to escape Rayna Cruz and seeks refuge with Klaus Mikaelson.",
-    episodes: [
-      { showName: "The Vampire Diaries", tmdbId: 18165, season: 7, episode: 14, part: 1, title: "Moonlight on the Bayou" },
-      { showName: "The Originals", tmdbId: 48866, season: 3, episode: 14, part: 2, title: "A Streetcar Named Desire" }
+    "id": "movie_toy_story_quadrilogy",
+    "name": "Toy Story: Complete Quadrilogy",
+    "franchise": "Toy Story",
+    "category": "moviesagas",
+    "description": "Pixar's beloved 4-movie animated masterpiece tracking Woody, Buzz, and the gang through Andy and Bonnie's childhoods.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Toy Story",
+        "year": 1995,
+        "tmdbId": 862,
+        "imdbId": "tt0114709",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0114709/img"
+      },
+      {
+        "type": "movie",
+        "title": "Toy Story 2",
+        "year": 1999,
+        "tmdbId": 863,
+        "imdbId": "tt0120363",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0120363/img"
+      },
+      {
+        "type": "movie",
+        "title": "Toy Story 3",
+        "year": 2010,
+        "tmdbId": 10193,
+        "imdbId": "tt0435761",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0435761/img"
+      },
+      {
+        "type": "movie",
+        "title": "Toy Story 4",
+        "year": 2019,
+        "tmdbId": 301528,
+        "imdbId": "tt1979376",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1979376/img"
+      }
     ]
   },
-
-  // --- Bones / Sleepy Hollow ---
   {
-    id: "bones_sleepy_hollow",
-    name: "The Resurrection in the Remains",
-    franchise: "Bones & Sleepy Hollow",
-    description: "Brennan & Booth team up with Ichabod Crane & Abbie Mills on Halloween over 200-year-old remains.",
-    episodes: [
-      { showName: "Bones", tmdbId: 1911, season: 11, episode: 5, part: 1, title: "The Resurrection in the Remains" },
-      { showName: "Sleepy Hollow", tmdbId: 46896, season: 3, episode: 5, part: 2, title: "Dead Men Tell No Tales" }
+    "id": "movie_shrek_universe",
+    "name": "Shrek & Puss in Boots Universe",
+    "franchise": "Shrek",
+    "category": "moviesagas",
+    "description": "The complete 6-film fairytale comedy franchise in chronological narrative order.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Puss in Boots",
+        "year": 2011,
+        "tmdbId": 417859,
+        "imdbId": "tt0448694",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0448694/img"
+      },
+      {
+        "type": "movie",
+        "title": "Shrek",
+        "year": 2001,
+        "tmdbId": 808,
+        "imdbId": "tt0126029",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0126029/img"
+      },
+      {
+        "type": "movie",
+        "title": "Shrek 2",
+        "year": 2004,
+        "tmdbId": 809,
+        "imdbId": "tt0298148",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0298148/img"
+      },
+      {
+        "type": "movie",
+        "title": "Shrek the Third",
+        "year": 2007,
+        "tmdbId": 810,
+        "imdbId": "tt0413267",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0413267/img"
+      },
+      {
+        "type": "movie",
+        "title": "Shrek Forever After",
+        "year": 2010,
+        "tmdbId": 10192,
+        "imdbId": "tt0892791",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt0892791/img"
+      },
+      {
+        "type": "movie",
+        "title": "Puss in Boots: The Last Wish",
+        "year": 2022,
+        "tmdbId": 315162,
+        "imdbId": "tt3915174",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt3915174/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_breaking_bad_el_camino",
+    "name": "Breaking Bad Complete Universe",
+    "franchise": "Breaking Bad",
+    "category": "tvuniverses",
+    "description": "The complete chronological universe: Breaking Bad (Seasons 1-5), followed by El Camino: A Breaking Bad Movie, followed by Better Call Saul (Seasons 1-6).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Breaking Bad",
+        "tmdbId": 1396,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Breaking Bad (Seasons 1-5)",
+        "part": 1,
+        "imdbId": "tt0903747",
+        "poster": "https://images.metahub.space/poster/medium/tt0903747/img"
+      },
+      {
+        "type": "movie",
+        "title": "El Camino: A Breaking Bad Movie",
+        "tmdbId": 559969,
+        "imdbId": "tt9243946",
+        "year": 2019,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt9243946/img"
+      },
+      {
+        "type": "show",
+        "showName": "Better Call Saul",
+        "tmdbId": 60059,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "Better Call Saul (Seasons 1-6)",
+        "part": 3,
+        "imdbId": "tt3032476",
+        "poster": "https://images.metahub.space/poster/medium/tt3032476/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_complete_timeline",
+    "name": "The Complete Arrowverse Timeline",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "The complete shared DC universe in air date order: Arrow (Seasons 1-8), The Flash (Seasons 1-9), Supergirl (Seasons 1-6), and DC's Legends of Tomorrow (Seasons 1-7).",
+    "episodes": [
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 1,
+        "title": "Arrow (Season 1)",
+        "part": 1,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 2,
+        "title": "Arrow (Season 2)",
+        "part": 2,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 1,
+        "title": "The Flash (Season 1)",
+        "part": 3,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 3,
+        "title": "Arrow (Season 3)",
+        "part": 4,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 1,
+        "title": "Supergirl (Season 1)",
+        "part": 5,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 2,
+        "title": "The Flash (Season 2)",
+        "part": 6,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 4,
+        "title": "Arrow (Season 4)",
+        "part": 7,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 1,
+        "title": "Legends of Tomorrow (Season 1)",
+        "part": 8,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 2,
+        "title": "Supergirl (Season 2)",
+        "part": 9,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 3,
+        "title": "The Flash (Season 3)",
+        "part": 10,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 5,
+        "title": "Arrow (Season 5)",
+        "part": 11,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 2,
+        "title": "Legends of Tomorrow (Season 2)",
+        "part": 12,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 3,
+        "title": "Supergirl (Season 3)",
+        "part": 13,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 6,
+        "title": "Arrow (Season 6)",
+        "part": 14,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 4,
+        "title": "The Flash (Season 4)",
+        "part": 15,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 3,
+        "title": "Legends of Tomorrow (Season 3)",
+        "part": 16,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 5,
+        "title": "The Flash (Season 5)",
+        "part": 17,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 7,
+        "title": "Arrow (Season 7)",
+        "part": 18,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 4,
+        "title": "Supergirl (Season 4)",
+        "part": 19,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 4,
+        "title": "Legends of Tomorrow (Season 4)",
+        "part": 20,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 5,
+        "title": "Supergirl (Season 5)",
+        "part": 21,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 6,
+        "title": "The Flash (Season 6)",
+        "part": 22,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Arrow",
+        "tmdbId": 1412,
+        "season": 8,
+        "title": "Arrow (Season 8)",
+        "part": 23,
+        "imdbId": "tt2193021",
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 5,
+        "title": "Legends of Tomorrow (Season 5)",
+        "part": 24,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 7,
+        "title": "The Flash (Season 7)",
+        "part": 25,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "Supergirl",
+        "tmdbId": 62688,
+        "season": 6,
+        "title": "Supergirl (Season 6)",
+        "part": 26,
+        "imdbId": "tt4016454",
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 6,
+        "title": "Legends of Tomorrow (Season 6)",
+        "part": 27,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "DC's Legends of Tomorrow",
+        "tmdbId": 62643,
+        "season": 7,
+        "title": "Legends of Tomorrow (Season 7)",
+        "part": 28,
+        "imdbId": "tt4532368",
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 8,
+        "title": "The Flash (Season 8)",
+        "part": 29,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "season",
+        "showName": "The Flash",
+        "tmdbId": 60735,
+        "season": 9,
+        "title": "The Flash (Season 9)",
+        "part": 30,
+        "imdbId": "tt3107288",
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_xfiles_complete_chronology",
+    "name": "The X-Files: Complete Canon Chronology",
+    "franchise": "The X-Files",
+    "category": "tvuniverses",
+    "description": "The entire X-Files saga in chronological order: Seasons 1-5, Fight the Future (1998), Seasons 6-9, I Want to Believe (2008), and Seasons 10-11.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The X-Files",
+        "tmdbId": 4087,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "The X-Files (Seasons 1-5)",
+        "part": 1,
+        "imdbId": "tt0106179",
+        "poster": "https://images.metahub.space/poster/medium/tt0106179/img"
+      },
+      {
+        "type": "movie",
+        "title": "The X-Files: Fight the Future",
+        "tmdbId": 8870,
+        "imdbId": "tt0120902",
+        "year": 1998,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0120902/img"
+      },
+      {
+        "type": "show",
+        "showName": "The X-Files",
+        "tmdbId": 4087,
+        "seasons": [
+          6,
+          7,
+          8,
+          9
+        ],
+        "title": "The X-Files (Seasons 6-9)",
+        "part": 3,
+        "imdbId": "tt0106179",
+        "poster": "https://images.metahub.space/poster/medium/tt0106179/img"
+      },
+      {
+        "type": "movie",
+        "title": "The X-Files: I Want to Believe",
+        "tmdbId": 10534,
+        "imdbId": "tt0443701",
+        "year": 2008,
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0443701/img"
+      },
+      {
+        "type": "show",
+        "showName": "The X-Files",
+        "tmdbId": 4087,
+        "seasons": [
+          10,
+          11
+        ],
+        "title": "The X-Files (Seasons 10-11)",
+        "part": 5,
+        "imdbId": "tt0106179",
+        "poster": "https://images.metahub.space/poster/medium/tt0106179/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_star_trek_tng_films",
+    "name": "Star Trek: The Next Generation Chronology",
+    "franchise": "Star Trek",
+    "category": "tvuniverses",
+    "description": "Star Trek: The Next Generation (Seasons 1-7), followed by Generations (1994), First Contact (1996), Insurrection (1998), and Nemesis (2002).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Star Trek: The Next Generation",
+        "tmdbId": 655,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Star Trek: TNG (Seasons 1-7)",
+        "part": 1,
+        "imdbId": "tt0092455",
+        "poster": "https://images.metahub.space/poster/medium/tt0092455/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek: Generations",
+        "tmdbId": 193,
+        "imdbId": "tt0111282",
+        "year": 1994,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0111282/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek: First Contact",
+        "tmdbId": 199,
+        "imdbId": "tt0117731",
+        "year": 1996,
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0117731/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek: Insurrection",
+        "tmdbId": 200,
+        "imdbId": "tt0120844",
+        "year": 1998,
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0120844/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek: Nemesis",
+        "tmdbId": 201,
+        "imdbId": "tt0253754",
+        "year": 2002,
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt0253754/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_star_trek_tos_movies",
+    "name": "Star Trek: The Original Series & Feature Films (I-VI)",
+    "franchise": "Star Trek",
+    "category": "tvuniverses",
+    "description": "The classic 3-season TOS television series, followed by movies I through VI.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Star Trek",
+        "tmdbId": 253,
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Star Trek: TOS (Seasons 1-3)",
+        "part": 1,
+        "imdbId": "tt0060028",
+        "poster": "https://images.metahub.space/poster/medium/tt0060028/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek: The Motion Picture",
+        "year": 1979,
+        "tmdbId": 152,
+        "imdbId": "tt0079945",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0079945/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek II: The Wrath of Khan",
+        "year": 1982,
+        "tmdbId": 154,
+        "imdbId": "tt0084726",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0084726/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek III: The Search for Spock",
+        "year": 1984,
+        "tmdbId": 157,
+        "imdbId": "tt0088170",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0088170/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek IV: The Voyage Home",
+        "year": 1986,
+        "tmdbId": 168,
+        "imdbId": "tt0092007",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt0092007/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek V: The Final Frontier",
+        "year": 1989,
+        "tmdbId": 172,
+        "imdbId": "tt0098382",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt0098382/img"
+      },
+      {
+        "type": "movie",
+        "title": "Star Trek VI: The Undiscovered Country",
+        "year": 1991,
+        "tmdbId": 174,
+        "imdbId": "tt0102975",
+        "part": 7,
+        "poster": "https://images.metahub.space/poster/medium/tt0102975/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_demon_slayer_mugen_train",
+    "name": "Demon Slayer: Complete Canon Order",
+    "franchise": "Demon Slayer",
+    "category": "tvuniverses",
+    "description": "Season 1 (Unwavering Resolve), followed by the Mugen Train canon film, followed by Seasons 2, 3, and 4 in broadcast order.",
+    "episodes": [
+      {
+        "type": "season",
+        "showName": "Demon Slayer: Kimetsu no Yaiba",
+        "tmdbId": 85937,
+        "season": 1,
+        "title": "Season 1: Unwavering Resolve",
+        "part": 1,
+        "imdbId": "tt9335498",
+        "poster": "https://images.metahub.space/poster/medium/tt9335498/img"
+      },
+      {
+        "type": "movie",
+        "title": "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train",
+        "tmdbId": 635302,
+        "imdbId": "tt11032374",
+        "year": 2020,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt11032374/img"
+      },
+      {
+        "type": "show",
+        "showName": "Demon Slayer: Kimetsu no Yaiba",
+        "tmdbId": 85937,
+        "seasons": [
+          2,
+          3,
+          4
+        ],
+        "title": "Seasons 2-4",
+        "part": 3,
+        "imdbId": "tt9335498",
+        "poster": "https://images.metahub.space/poster/medium/tt9335498/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_jujutsu_kaisen_0",
+    "name": "Jujutsu Kaisen: Complete Timeline",
+    "franchise": "Jujutsu Kaisen",
+    "category": "tvuniverses",
+    "description": "Jujutsu Kaisen 0 (prequel movie), followed by Season 1 and Season 2 (Hidden Inventory & Shibuya Incident).",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Jujutsu Kaisen 0",
+        "year": 2021,
+        "tmdbId": 810693,
+        "imdbId": "tt14331144",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt14331144/img"
+      },
+      {
+        "type": "show",
+        "showName": "Jujutsu Kaisen",
+        "tmdbId": 95479,
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Jujutsu Kaisen (Seasons 1-2)",
+        "part": 2,
+        "imdbId": "tt12343534",
+        "poster": "https://images.metahub.space/poster/medium/tt12343534/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_firefly_serenity",
+    "name": "Firefly: Complete Series & Serenity",
+    "franchise": "Firefly",
+    "category": "tvuniverses",
+    "description": "The complete Firefly experience: Season 1 (all 14 episodes), followed by the canon theatrical finale Serenity (2005).",
+    "episodes": [
+      {
+        "type": "season",
+        "showName": "Firefly",
+        "tmdbId": 1437,
+        "season": 1,
+        "title": "Firefly (Season 1)",
+        "part": 1,
+        "imdbId": "tt0303461",
+        "poster": "https://images.metahub.space/poster/medium/tt0303461/img"
+      },
+      {
+        "type": "movie",
+        "title": "Serenity",
+        "tmdbId": 163,
+        "imdbId": "tt0379786",
+        "year": 2005,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0379786/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_homestead_prequel",
+    "name": "Homestead: Complete Saga",
+    "franchise": "Homestead",
+    "category": "tvuniverses",
+    "description": "Homestead (2024 film) introduces the apocalyptic collapse, followed by Homestead: The Series (Season 1).",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Homestead",
+        "year": 2024,
+        "tmdbId": 1217690,
+        "imdbId": "tt29137778",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt29137778/img"
+      },
+      {
+        "type": "season",
+        "showName": "Homestead: The Series",
+        "tmdbId": 247070,
+        "season": 1,
+        "title": "Homestead: The Series (Season 1)",
+        "part": 2,
+        "imdbId": "tt33484648",
+        "poster": "https://images.metahub.space/poster/medium/tt33484648/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_last_kingdom_seven_kings",
+    "name": "The Last Kingdom: Complete Saga",
+    "franchise": "The Last Kingdom",
+    "category": "tvuniverses",
+    "description": "The complete 5-season saga of Uhtred of Bebbanburg, culminating in the Seven Kings Must Die (2023) finale film.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Last Kingdom",
+        "tmdbId": 63333,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "The Last Kingdom (Seasons 1-5)",
+        "part": 1,
+        "imdbId": "tt4495098",
+        "poster": "https://images.metahub.space/poster/medium/tt4495098/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Last Kingdom: Seven Kings Must Die",
+        "year": 2023,
+        "tmdbId": 948713,
+        "imdbId": "tt15767808",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt15767808/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_futurama_feature_films",
+    "name": "Futurama: Complete Saga & The 4 Feature Films",
+    "franchise": "Futurama",
+    "category": "tvuniverses",
+    "description": "Futurama classic seasons, followed by the four direct-to-video feature films, followed by the revival seasons.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Futurama",
+        "tmdbId": 615,
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Futurama (Classic Seasons 1-4)",
+        "part": 1,
+        "imdbId": "tt0149460",
+        "poster": "https://images.metahub.space/poster/medium/tt0149460/img"
+      },
+      {
+        "type": "movie",
+        "title": "Futurama: Bender's Big Score",
+        "year": 2007,
+        "tmdbId": 13348,
+        "imdbId": "tt0471711",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0471711/img"
+      },
+      {
+        "type": "movie",
+        "title": "Futurama: The Beast with a Billion Backs",
+        "year": 2008,
+        "tmdbId": 13349,
+        "imdbId": "tt1054485",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1054485/img"
+      },
+      {
+        "type": "movie",
+        "title": "Futurama: Bender's Game",
+        "year": 2008,
+        "tmdbId": 13350,
+        "imdbId": "tt1054486",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt1054486/img"
+      },
+      {
+        "type": "movie",
+        "title": "Futurama: Into the Wild Green Yonder",
+        "year": 2009,
+        "tmdbId": 13351,
+        "imdbId": "tt1054487",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt1054487/img"
+      },
+      {
+        "type": "show",
+        "showName": "Futurama",
+        "tmdbId": 615,
+        "seasons": [
+          6,
+          7,
+          8
+        ],
+        "title": "Futurama (Revival Seasons 6-8)",
+        "part": 6,
+        "imdbId": "tt0149460",
+        "poster": "https://images.metahub.space/poster/medium/tt0149460/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_24_redemption",
+    "name": "24: Complete Saga & Redemption",
+    "franchise": "24",
+    "category": "tvuniverses",
+    "description": "24 Seasons 1-6, followed by 24: Redemption (2008) in Africa, followed by Seasons 7-9.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "24",
+        "tmdbId": 197,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "24 (Seasons 1-6)",
+        "part": 1,
+        "imdbId": "tt0285331",
+        "poster": "https://images.metahub.space/poster/medium/tt0285331/img"
+      },
+      {
+        "type": "movie",
+        "title": "24: Redemption",
+        "year": 2008,
+        "tmdbId": 14781,
+        "imdbId": "tt0813980",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0813980/img"
+      },
+      {
+        "type": "show",
+        "showName": "24",
+        "tmdbId": 197,
+        "seasons": [
+          7,
+          8,
+          9
+        ],
+        "title": "24 (Seasons 7-9)",
+        "part": 3,
+        "imdbId": "tt0285331",
+        "poster": "https://images.metahub.space/poster/medium/tt0285331/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_prison_break_the_final_break",
+    "name": "Prison Break: Complete Saga & The Final Break",
+    "franchise": "Prison Break",
+    "category": "tvuniverses",
+    "description": "Prison Break Seasons 1-4, followed by The Final Break (2009), followed by Season 5.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Prison Break",
+        "tmdbId": 2288,
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Prison Break (Seasons 1-4)",
+        "part": 1,
+        "imdbId": "tt0455275",
+        "poster": "https://images.metahub.space/poster/medium/tt0455275/img"
+      },
+      {
+        "type": "movie",
+        "title": "Prison Break: The Final Break",
+        "year": 2009,
+        "tmdbId": 23684,
+        "imdbId": "tt1131748",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1131748/img"
+      },
+      {
+        "type": "season",
+        "showName": "Prison Break",
+        "tmdbId": 2288,
+        "season": 5,
+        "title": "Prison Break (Season 5)",
+        "part": 3,
+        "imdbId": "tt0455275",
+        "poster": "https://images.metahub.space/poster/medium/tt0455275/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_downton_abbey_continuation",
+    "name": "Downton Abbey: Complete Saga & Feature Films",
+    "franchise": "Downton Abbey",
+    "category": "tvuniverses",
+    "description": "Downton Abbey Seasons 1-6, followed by the theatrical feature films Downton Abbey (2019) and A New Era (2022).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Downton Abbey",
+        "tmdbId": 1405,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "Downton Abbey (Seasons 1-6)",
+        "part": 1,
+        "imdbId": "tt1606375",
+        "poster": "https://images.metahub.space/poster/medium/tt1606375/img"
+      },
+      {
+        "type": "movie",
+        "title": "Downton Abbey",
+        "tmdbId": 535544,
+        "imdbId": "tt6398184",
+        "year": 2019,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt6398184/img"
+      },
+      {
+        "type": "movie",
+        "title": "Downton Abbey: A New Era",
+        "tmdbId": 678580,
+        "imdbId": "tt11703710",
+        "year": 2022,
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt11703710/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_psych_the_movies",
+    "name": "Psych: Complete Saga & The Movies",
+    "franchise": "Psych",
+    "category": "tvuniverses",
+    "description": "Psych Seasons 1-8, followed by Psych: The Movie (2017), Psych 2: Lassie Come Home (2020), and Psych 3: This Is Gus (2021).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Psych",
+        "tmdbId": 1447,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "title": "Psych (Seasons 1-8)",
+        "part": 1,
+        "imdbId": "tt0491738",
+        "poster": "https://images.metahub.space/poster/medium/tt0491738/img"
+      },
+      {
+        "type": "movie",
+        "title": "Psych: The Movie",
+        "tmdbId": 473614,
+        "imdbId": "tt6868216",
+        "year": 2017,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt6868216/img"
+      },
+      {
+        "type": "movie",
+        "title": "Psych 2: Lassie Come Home",
+        "tmdbId": 604811,
+        "imdbId": "tt9792884",
+        "year": 2020,
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt9792884/img"
+      },
+      {
+        "type": "movie",
+        "title": "Psych 3: This Is Gus",
+        "tmdbId": 830784,
+        "imdbId": "tt14641648",
+        "year": 2021,
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt14641648/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_ray_donovan_the_movie",
+    "name": "Ray Donovan: Complete Saga",
+    "franchise": "Ray Donovan",
+    "category": "tvuniverses",
+    "description": "All 7 seasons of Ray Donovan, concluding with Ray Donovan: The Movie (2022).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Ray Donovan",
+        "tmdbId": 46702,
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Ray Donovan (Seasons 1-7)",
+        "part": 1,
+        "imdbId": "tt2249007",
+        "poster": "https://images.metahub.space/poster/medium/tt2249007/img"
+      },
+      {
+        "type": "movie",
+        "title": "Ray Donovan: The Movie",
+        "year": 2022,
+        "tmdbId": 871964,
+        "imdbId": "tt14124268",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14124268/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_deadwood_the_movie",
+    "name": "Deadwood: Complete Saga",
+    "franchise": "Deadwood",
+    "category": "tvuniverses",
+    "description": "All 3 seasons of Deadwood, concluding with Deadwood: The Movie (2019).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Deadwood",
+        "tmdbId": 1425,
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Deadwood (Seasons 1-3)",
+        "part": 1,
+        "imdbId": "tt0357373",
+        "poster": "https://images.metahub.space/poster/medium/tt0357373/img"
+      },
+      {
+        "type": "movie",
+        "title": "Deadwood: The Movie",
+        "tmdbId": 543788,
+        "imdbId": "tt4943998",
+        "year": 2019,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4943998/img"
+      }
+    ]
+  },
+  {
+    "id": "ncis_three_way_crossover_2023",
+    "name": "NCIS: The Three-Way Crossover (2023)",
+    "franchise": "NCIS Universe",
+    "category": "tvuniverses",
+    "description": "Historic 3-way crossover connecting NCIS, NCIS: Hawaiʻi, and NCIS: Los Angeles to track down a dangerous assassin.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "NCIS",
+        "season": 20,
+        "episode": 10,
+        "title": "Too Many Cooks",
+        "tmdbId": 4614,
+        "imdbId": "tt0364845",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0364845/img"
+      },
+      {
+        "type": "episode",
+        "showName": "NCIS: Hawai'i",
+        "season": 2,
+        "episode": 10,
+        "title": "Deep Fake",
+        "tmdbId": 124364,
+        "imdbId": "tt14218674",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14218674/img"
+      },
+      {
+        "type": "episode",
+        "showName": "NCIS: Los Angeles",
+        "season": 14,
+        "episode": 10,
+        "title": "A Long Time Coming",
+        "tmdbId": 17610,
+        "imdbId": "tt1378167",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1378167/img"
+      }
+    ]
+  },
+  {
+    "id": "hawaii_five_0_ncis_la_crossover",
+    "name": "Hawaii Five-0 & NCIS: Los Angeles Crossover (Touch of Death)",
+    "franchise": "NCIS Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting Hawaii Five-0 and NCIS: Los Angeles across Honolulu and LA.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Hawaii Five-0",
+        "season": 2,
+        "episode": 21,
+        "title": "Pa Make Loa",
+        "tmdbId": 32798,
+        "imdbId": "tt1600194",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1600194/img"
+      },
+      {
+        "type": "episode",
+        "showName": "NCIS: Los Angeles",
+        "season": 3,
+        "episode": 21,
+        "title": "Touch of Death",
+        "tmdbId": 17610,
+        "imdbId": "tt1378167",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1378167/img"
+      }
+    ]
+  },
+  {
+    "id": "ncis_new_orleans_sister_city_crossover",
+    "name": "NCIS & NCIS: New Orleans Crossover (Sister City)",
+    "franchise": "NCIS Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting NCIS and NCIS: New Orleans to investigate a poison attack.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "NCIS",
+        "season": 13,
+        "episode": 12,
+        "title": "Sister City (Part I)",
+        "tmdbId": 4614,
+        "imdbId": "tt0364845",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0364845/img"
+      },
+      {
+        "type": "episode",
+        "showName": "NCIS: New Orleans",
+        "season": 2,
+        "episode": 12,
+        "title": "Sister City (Part II)",
+        "tmdbId": 3560084,
+        "imdbId": "tt3560084",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3560084/img"
+      }
+    ]
+  },
+  {
+    "id": "ncis_hawaii_starting_over_crossover",
+    "name": "NCIS & NCIS: Hawai'i Crossover (Starting Over)",
+    "franchise": "NCIS Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting NCIS and NCIS: Hawai'i to track down a former Pentagon defense specialist.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "NCIS",
+        "season": 19,
+        "episode": 17,
+        "title": "Starting Over",
+        "tmdbId": 4614,
+        "imdbId": "tt0364845",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0364845/img"
+      },
+      {
+        "type": "episode",
+        "showName": "NCIS: Hawai'i",
+        "season": 1,
+        "episode": 18,
+        "title": "T'N'T",
+        "tmdbId": 124364,
+        "imdbId": "tt14218674",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14218674/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_in_the_trenches_2025",
+    "name": "One Chicago: In the Trenches (2025)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "3-part crossover event: a gas explosion and high-rise collapse unite Firehouse 51, Chicago Med, and Intelligence in a race to save dozens trapped underground.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 13,
+        "episode": 11,
+        "title": "In the Trenches: Part I",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Med",
+        "season": 10,
+        "episode": 11,
+        "title": "In the Trenches: Part II",
+        "tmdbId": 62650,
+        "imdbId": "tt4655480",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4655480/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 12,
+        "episode": 11,
+        "title": "In the Trenches: Part III",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "yellowstone_dutton_dynasty_saga",
+    "name": "Yellowstone: The Dutton Dynasty (Chronological Order)",
+    "franchise": "Yellowstone",
+    "category": "tvuniverses",
+    "description": "The complete Dutton family saga in chronological order: 1883 (the journey west), 1923 (Prohibition-era Montana), then Yellowstone (the modern-day ranch war).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "1883",
+        "tmdbId": 118357,
+        "seasons": [1],
+        "title": "1883 (Season 1)",
+        "part": 1,
+        "imdbId": "tt13991232",
+        "poster": "https://images.metahub.space/poster/medium/tt13991232/img"
+      },
+      {
+        "type": "show",
+        "showName": "1923",
+        "tmdbId": 157744,
+        "seasons": [1, 2],
+        "title": "1923 (Seasons 1-2)",
+        "part": 2,
+        "imdbId": "tt18335752",
+        "poster": "https://images.metahub.space/poster/medium/tt18335752/img"
+      },
+      {
+        "type": "show",
+        "showName": "Yellowstone",
+        "tmdbId": 73586,
+        "seasons": [1, 2, 3, 4, 5],
+        "title": "Yellowstone (Seasons 1-5)",
+        "part": 3,
+        "imdbId": "tt4236770",
+        "poster": "https://images.metahub.space/poster/medium/tt4236770/img"
+      }
     ]
   }
 ];
 
 function isCrossoverEpisodeMatch(item, epTarget) {
-  if (!item || item.kind === 'movie') return false;
+  if (!item || !epTarget) return false;
+  if (epTarget.type === 'movie') {
+    if (item.kind !== 'movie' && item.type !== 'movie') return false;
+    if (epTarget.imdbId && item.imdbId && epTarget.imdbId === item.imdbId) return true;
+    if (epTarget.tmdbId && item.tmdbId && String(epTarget.tmdbId) === String(item.tmdbId)) return true;
+    const targetTitle = String(epTarget.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const itemTitle = String(item.title || item.showName || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!targetTitle || !itemTitle) return false;
+    return targetTitle === itemTitle;
+  }
+
+  if (item.kind === 'movie' || item.type === 'movie') return false;
   const sNum = (item.seasonNum != null) ? Number(item.seasonNum) : Number(item.season);
   const eNum = (item.episodeNum != null) ? Number(item.episodeNum) : Number(item.episode);
-  if (sNum !== epTarget.season || eNum !== epTarget.episode) return false;
 
-  const targetName = epTarget.showName.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const itemShowName = String(item.showName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const itemTitle = String(item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (epTarget.tmdbId && item.tmdbId && String(epTarget.tmdbId) === String(item.tmdbId)) {
+    if (Array.isArray(epTarget.seasons)) {
+      return isNaN(sNum) || epTarget.seasons.includes(sNum);
+    }
+    if (epTarget.season != null && epTarget.episode != null && epTarget.episode !== 'all') {
+      return sNum === Number(epTarget.season) && eNum === Number(epTarget.episode);
+    }
+    if (epTarget.season != null && epTarget.season !== 'all') {
+      return isNaN(sNum) || sNum === Number(epTarget.season);
+    }
+    return true;
+  }
 
-  return itemShowName.includes(targetName) || targetName.includes(itemShowName) || itemTitle.includes(targetName);
+  if (epTarget.imdbId && item.imdbId && epTarget.imdbId === item.imdbId) {
+    if (Array.isArray(epTarget.seasons)) {
+      return isNaN(sNum) || epTarget.seasons.includes(sNum);
+    }
+    if (epTarget.season != null && epTarget.episode != null && epTarget.episode !== 'all') {
+      return sNum === Number(epTarget.season) && eNum === Number(epTarget.episode);
+    }
+    if (epTarget.season != null && epTarget.season !== 'all') {
+      return isNaN(sNum) || sNum === Number(epTarget.season);
+    }
+    return true;
+  }
+
+  const targetName = String(epTarget.showName || epTarget.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const itemShowName = String(item.showName || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!targetName || !itemShowName) return false;
+
+  const nameMatch = (itemShowName === targetName) ||
+    (targetName.length >= 5 && itemShowName.startsWith(targetName)) ||
+    (itemShowName.length >= 5 && targetName.startsWith(itemShowName));
+  if (!nameMatch) return false;
+
+  if (Array.isArray(epTarget.seasons)) {
+    return isNaN(sNum) || epTarget.seasons.includes(sNum);
+  }
+  return true;
 }
 
 function renderChannelCrossoverSuggestions() {
@@ -1111,23 +3496,44 @@ function renderChannelCrossoverSuggestions() {
   const bannersHtml = suggestions.map(({ event, presentParts, missingParts }) => {
     const chipsHtml = event.episodes.map((ep) => {
       const isPresent = presentParts.some((p) => p.part === ep.part);
+      const isMovie = ep.type === 'movie';
+      let label = '';
+      if (isMovie) {
+        label = 'Part ' + ep.part + ' (Movie): ' + ep.title + (ep.year ? ' (' + ep.year + ')' : '');
+      } else if (Array.isArray(ep.seasons)) {
+        label = 'Part ' + ep.part + ': ' + ep.showName + ' (Seasons ' + ep.seasons[0] + '-' + ep.seasons[ep.seasons.length - 1] + ')';
+      } else if (ep.season != null && ep.episode != null && ep.episode !== 'all') {
+        label = 'Part ' + ep.part + ': ' + ep.showName + ' S' + ep.season + 'E' + ep.episode;
+      } else if (ep.season != null && ep.season !== 'all') {
+        label = 'Part ' + ep.part + ': ' + ep.showName + ' Season ' + ep.season;
+      } else {
+        label = 'Part ' + ep.part + ': ' + (ep.showName || ep.title);
+      }
       if (isPresent) {
         return '<span class="channel-crossover-chip present" title="Already in channel draft">' +
-          '\u2713 Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+          '\u2713 ' + escapeHtml(label) +
         '</span>';
       }
       return '<span class="channel-crossover-chip missing" title="Missing from channel draft">' +
-        '+ Part ' + ep.part + ': ' + escapeHtml(ep.showName) + ' S' + ep.season + 'E' + ep.episode +
+        '+ ' + escapeHtml(label) +
       '</span>';
     }).join('');
 
     const missingCount = missingParts.length;
-    const btnLabel = '+ Add ' + missingCount + ' Missing Crossover Episode' + (missingCount === 1 ? '' : 's') + ' in Story Order';
+    const hasMovieMissing = missingParts.some((p) => p.type === 'movie');
+    const hasEpMissing = missingParts.some((p) => p.type !== 'movie');
+    let itemTypeLabel = 'Crossover Part' + (missingCount === 1 ? '' : 's');
+    if (hasMovieMissing && !hasEpMissing) itemTypeLabel = 'Movie Continuation' + (missingCount === 1 ? '' : 's');
+    else if (!hasMovieMissing && hasEpMissing) itemTypeLabel = 'Crossover Episode' + (missingCount === 1 ? '' : 's');
+    const btnLabel = '+ Add ' + missingCount + ' Missing ' + itemTypeLabel + ' in Story Order';
+
+    const isMovieEvent = event.id.startsWith('movie_');
+    const tagLabel = isMovieEvent ? 'Movie Continuation' : 'Crossover Event';
 
     return '<div class="channel-crossover-banner" data-event-id="' + escapeAttr(event.id) + '">' +
       '<div class="channel-crossover-header">' +
         '<div class="channel-crossover-title">' +
-          '<span>\uD83D\uDCA1 Crossover Event Detected: <strong>' + escapeHtml(event.name) + '</strong></span>' +
+          '<span>' + tagLabel + ' Detected: <strong>' + escapeHtml(event.name) + '</strong></span>' +
           '<span class="channel-crossover-badge">' + escapeHtml(event.franchise) + '</span>' +
         '</div>' +
       '</div>' +
@@ -1148,7 +3554,7 @@ async function spliceCrossoverEvent(eventId, btn) {
 
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Fetching crossover episodes\u2026';
+    btn.textContent = 'Fetching story items\u2026';
   }
 
   try {
@@ -1161,56 +3567,9 @@ async function spliceCrossoverEvent(eventId, btn) {
     }
     if (firstIdx === -1) firstIdx = channelDraftItems.length;
 
-    const fullOrderedItems = [];
-    for (const ep of event.episodes) {
-      const existingMatch = channelDraftItems.find((it) => isCrossoverEpisodeMatch(it, ep));
-      if (existingMatch) {
-        fullOrderedItems.push(existingMatch);
-      } else {
-        const res = await fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(ep.tmdbId) + '&season=' + encodeURIComponent(ep.season), { cache: 'no-store' });
-        const data = await res.json();
-        let epData = null;
-        if (data.ok && Array.isArray(data.episodes)) {
-          epData = data.episodes.find((e) => e.episode === ep.episode) || data.episodes[ep.episode - 1] || null;
-        }
-
-        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
-        let showPoster = '';
-        let showBackdrop = '';
-        if (showDetailsRes) {
-          const sData = await showDetailsRes.json().catch(() => null);
-          if (sData && sData.ok && sData.results && sData.results.length) {
-            const found = sData.results.find((r) => String(r.tmdbId) === String(ep.tmdbId)) || sData.results[0];
-            if (found) {
-              showPoster = found.poster || '';
-              showBackdrop = found.backdrop || '';
-            }
-          }
-        }
-
-        const epTitle = (epData && epData.name) ? epData.name : ep.title;
-        const epRelease = (epData && epData.released) ? epData.released : undefined;
-        const epThumbnail = (epData && epData.thumbnail) ? epData.thumbnail : (showBackdrop || showPoster);
-
-        const newItem = {
-          kind: 'episode',
-          imdbId: (epData && epData.imdbId) || String(ep.tmdbId),
-          season: ep.season,
-          episode: ep.episode,
-          showName: ep.showName,
-          epName: epTitle,
-          title: ep.showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + epTitle,
-          released: epRelease,
-          thumbnail: epThumbnail,
-          poster: showPoster || epThumbnail || '',
-          showPoster: showPoster || '',
-          backdrop: showBackdrop || '',
-          showBackdrop: showBackdrop || '',
-          seasonNum: ep.season,
-          episodeNum: ep.episode,
-        };
-        fullOrderedItems.push(newItem);
-      }
+    const { items: fullOrderedItems } = await fetchStorylineOrderedItems(eventId);
+    if (!fullOrderedItems || !fullOrderedItems.length) {
+      throw new Error('No items returned for this storyline.');
     }
 
     channelDraftItems = channelDraftItems.filter((it) => !event.episodes.some((ep) => isCrossoverEpisodeMatch(it, ep)));
@@ -1224,18 +3583,18 @@ async function spliceCrossoverEvent(eventId, btn) {
 
     renderChannelDraftList();
     if (typeof showAddedToast === 'function') {
-      showAddedToast('Added crossover episodes for "' + event.name + '" in story order!');
+      showAddedToast('Added items for "' + event.name + '" in story order!');
     }
   } catch (err) {
     if (typeof showAppAlert === 'function') {
-      showAppAlert('Crossover Splicer', 'Failed to fetch some crossover episodes. Please check your connection and try again.');
+      showAppAlert('Crossover Splicer', 'Could not add crossover items: ' + (err.message || err));
     } else {
-      alert('Failed to fetch crossover episodes.');
+      alert('Could not add crossover items: ' + (err.message || err));
     }
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = '+ Add Missing Crossover Episodes in Story Order';
-    }
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = '+ Add Missing in Story Order';
   }
 }
 
@@ -1563,6 +3922,571 @@ function saveChannel() {
   if (myChPanel) myChPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+let activeStorylineCategory = 'all';
+
+function getStorylineCategories(event) {
+  const cats = ['all'];
+  const franchise = String(event.franchise || '').toLowerCase();
+  const cat = String(event.category || '').toLowerCase();
+
+  if (cat === 'moviesagas' || event.episodes.every((e) => e.type === 'movie')) {
+    cats.push('moviesagas');
+  }
+  if (cat === 'tvuniverses' || event.episodes.some((e) => e.type === 'show' || e.type === 'season')) {
+    cats.push('tvuniverses');
+  }
+  if (
+    franchise.includes('star wars') || franchise.includes('marvel') || franchise.includes('lord of the rings') ||
+    franchise.includes('matrix') || franchise.includes('star trek') || franchise.includes('x-files') ||
+    franchise.includes('alien') || franchise.includes('planet of the apes') || franchise.includes('jurassic') ||
+    franchise.includes('firefly') || franchise.includes('transformers') || franchise.includes('homestead')
+  ) {
+    cats.push('scifi');
+  }
+  if (
+    franchise.includes('fast & furious') || franchise.includes('batman') || franchise.includes('mission: impossible') ||
+    franchise.includes('james bond') || franchise.includes('john wick') || franchise.includes('hunger games') ||
+    franchise.includes('indiana jones') || franchise.includes('mad max') || franchise.includes('pirates') ||
+    franchise.includes('breaking bad') || franchise.includes('24') || franchise.includes('arrowverse')
+  ) {
+    cats.push('action');
+  }
+  if (
+    franchise.includes('toy story') || franchise.includes('shrek') || franchise.includes('demon slayer') ||
+    franchise.includes('jujutsu') || franchise.includes('futurama') || franchise.includes('cowboy bebop') ||
+    franchise.includes('evangelion') || franchise.includes('simpsons') || franchise.includes('bobs') ||
+    franchise.includes('steven') || franchise.includes('hey arnold') || franchise.includes('invader') ||
+    franchise.includes('beavis')
+  ) {
+    cats.push('animation');
+  }
+  return cats;
+}
+
+function filterStorylinesCategory(cat, btn) {
+  activeStorylineCategory = cat;
+  const bar = document.getElementById('storylineCategoryFilterBar');
+  if (bar) {
+    bar.querySelectorAll('.subnav-pill').forEach((p) => {
+      p.classList.remove('active');
+      const c = p.querySelector('.check-icon');
+      if (c) c.remove();
+    });
+  }
+  if (btn) {
+    btn.classList.add('active');
+    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+  }
+  renderStorylinesUniverseList(cat);
+}
+
+function openStorylineDetails(eventId) {
+  const event = TV_CROSSOVER_EVENTS.find((e) => e.id === eventId);
+  if (!event) return;
+  const hasMovies = event.episodes.some((e) => e.type === 'movie');
+  const hasShows = event.episodes.some((e) => e.type !== 'movie');
+  let type = 'mixed';
+  if (hasMovies && !hasShows) type = 'movie';
+  else if (hasShows && !hasMovies) type = 'series';
+  else type = 'mixed';
+
+  const customUrl = 'custom:storyline:' + event.id;
+  window._previousScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+  window._previousTab = 'channels';
+  window._originTab = 'channels';
+  const items = event.episodes.map((ep) => ({
+    id: ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : ''),
+    type: (ep.type === 'movie') ? 'movie' : 'series',
+    name: ep.title || ep.showName,
+    title: ep.title || ep.showName,
+    year: ep.year || '',
+    poster: ep.poster || (ep.imdbId ? ('https://images.metahub.space/poster/medium/' + ep.imdbId + '/img') : ''),
+    season: ep.season,
+    episode: ep.episode
+  }));
+  if (typeof openListDetailsPage === 'function') {
+    openListDetailsPage(event.name, type, customUrl, { sample: items, count: items.length, maybeMore: false }, {
+      creatorName: event.franchise + ' \u2022 Storylines & Sagas',
+      itemCount: items.length,
+      likes: null
+    });
+  }
+}
+
+const storylinePosterFallbackAttempted = new WeakSet();
+
+async function handleStorylinePosterError(imgEl) {
+  if (!imgEl || storylinePosterFallbackAttempted.has(imgEl)) {
+    if (imgEl) imgEl.onerror = null;
+    return;
+  }
+  storylinePosterFallbackAttempted.add(imgEl);
+  imgEl.onerror = null;
+
+  const tmdbId = imgEl.dataset.tmdbId;
+  const kind = imgEl.dataset.posterKind;
+  const title = imgEl.dataset.posterTitle || '';
+  if (!tmdbId) return;
+
+  try {
+    let fallbackPoster = '';
+    if (kind === 'movie') {
+      const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(title) + '&type=movie', { cache: 'no-store' });
+      const data = await res.json().catch(() => null);
+      if (data && data.ok && Array.isArray(data.results)) {
+        const found = data.results.find((r) => String(r.tmdbId) === String(tmdbId)) || data.results[0];
+        if (found && found.poster) fallbackPoster = found.poster;
+      }
+    } else {
+      const res = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+      const data = await res.json().catch(() => null);
+      if (data && data.ok && data.poster) fallbackPoster = data.poster;
+    }
+    if (fallbackPoster) {
+      imgEl.src = fallbackPoster;
+    }
+  } catch (e) {
+    // No fallback available -- leave the broken-image placeholder; nothing more we can do client-side.
+  }
+}
+
+function renderStorylinesUniverseList(category = activeStorylineCategory) {
+  const container = document.getElementById('storylinesUniverseList');
+  if (!container) return;
+
+  const filtered = TV_CROSSOVER_EVENTS.filter((ev) => {
+    if (category === 'all') return true;
+    const cats = getStorylineCategories(ev);
+    return cats.includes(category);
+  });
+
+  if (!filtered.length) {
+    container.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No sagas found in this category.</small></p>';
+    return;
+  }
+
+  const channelsMap = (typeof loadLocalChannels === 'function') ? (loadLocalChannels() || {}) : {};
+
+  const cardsHtml = filtered.map((event) => {
+    const isMovieSaga = event.category === 'moviesagas' || event.episodes.every((e) => e.type === 'movie');
+    const typeBadge = isMovieSaga ? 'Movie Saga (3+ Films)' : 'TV Universe & Movie Bridges';
+    const movieCount = event.episodes.filter((e) => e.type === 'movie').length;
+    const showCount = event.episodes.filter((e) => e.type === 'show' || e.type === 'season').length;
+    
+    let countLabel = '';
+    if (isMovieSaga) {
+      countLabel = event.episodes.length + ' Movies';
+    } else if (movieCount > 0 && showCount > 0) {
+      countLabel = showCount + ' Show' + (showCount > 1 ? 's' : '') + ' & ' + movieCount + ' Movie' + (movieCount > 1 ? 's' : '');
+    } else {
+      countLabel = event.episodes.length + ' Segments';
+    }
+
+    const chId = 'channel-' + event.id;
+    const isAdded = !!channelsMap[chId] || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, null, chId));
+
+    const totalCount = event.episodes.length;
+    const previewPosters = event.episodes.slice(0, 9);
+
+    const postersHtml = previewPosters.map((ep, i) => {
+      const isMovie = ep.type === 'movie';
+      let itemTitle = ep.title || ep.showName || '';
+      let yearOrSeason = '';
+      if (isMovie) {
+        yearOrSeason = ep.year ? String(ep.year) : 'Movie';
+      } else if (ep.seasons) {
+        yearOrSeason = 'Seasons ' + ep.seasons[0] + '-' + ep.seasons[ep.seasons.length - 1];
+      } else if (ep.season) {
+        yearOrSeason = 'Season ' + ep.season;
+      } else {
+        yearOrSeason = 'Series';
+      }
+
+      let posterUrl = ep.poster || (ep.imdbId ? ('https://images.metahub.space/poster/medium/' + ep.imdbId + '/img') : '');
+
+      const isMobileEnd = (i === 2 && totalCount > 3);
+      const isDesktopEnd = (i === previewPosters.length - 1 && totalCount >= 4);
+      let overlays = '';
+      if (isMobileEnd) {
+        overlays += '<div class="list-card-count-overlay mobile-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+      }
+      if (isDesktopEnd) {
+        overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+      }
+
+      return '<div class="list-card-mini-poster-tile">' +
+        '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)">' +
+          '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          overlays +
+        '</div>' +
+        '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
+        '<div class="list-card-mini-poster-year">' + escapeHtml(yearOrSeason) + '</div>' +
+      '</div>';
+    }).join('');
+
+    return '<div class="list-card" data-universe-id="' + escapeAttr(event.id) + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + escapeHtml(event.name) + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + escapeHtml(event.franchise) + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span>' +
+            '<span>' + escapeHtml(typeBadge) + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span>' +
+            '<span>' + escapeHtml(countLabel) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          '<button type="button" class="lc-btn ' + (isAdded ? 'secondary is-added' : 'primary') + '" onclick="createInstantStorylineChannel(&quot;' + escapeAttr(event.id) + '&quot;, this)" ' + (isAdded ? 'style="color:var(--danger);"' : '') + '>' + (isAdded ? 'Remove' : '+ Add') + '</button>' +
+          '<button type="button" class="lc-btn secondary" onclick="loadStorylineToDraft(&quot;' + escapeAttr(event.id) + '&quot;, this)" title="Customize in Channel Builder">Customize</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="list-card-posters">' +
+        postersHtml +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  container.innerHTML = cardsHtml;
+}
+
+async function fetchStorylineOrderedItems(eventId) {
+  const event = TV_CROSSOVER_EVENTS.find((e) => e.id === eventId);
+
+  const fullOrderedItems = [];
+  for (const ep of event.episodes) {
+    if (ep.type === 'movie') {
+      let moviePoster = ep.poster || '';
+      let movieBackdrop = ep.backdrop || '';
+      let movieImdbId = ep.imdbId || '';
+      let movieYear = ep.year || '';
+      let movieRelease = ep.released || (ep.year ? (ep.year + '-01-01') : '');
+
+      if (!movieImdbId && ep.tmdbId) {
+        const res = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+        const data = res ? await res.json().catch(() => null) : null;
+        if (data && data.ok && data.imdbId) {
+          movieImdbId = data.imdbId;
+        }
+      }
+
+      if (!moviePoster) {
+        const searchRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.title) + '&type=movie', { cache: 'no-store' }).catch(() => null);
+        if (searchRes) {
+          const sData = await searchRes.json().catch(() => null);
+          if (sData && sData.ok && sData.results && sData.results.length) {
+            const found = (ep.tmdbId ? sData.results.find((r) => String(r.tmdbId) === String(ep.tmdbId)) : null) || sData.results[0];
+            if (found) {
+              if (!moviePoster) moviePoster = found.poster || '';
+              if (!movieBackdrop) movieBackdrop = found.backdrop || '';
+              if (!movieYear) movieYear = found.year || '';
+            }
+          }
+        }
+      }
+
+      fullOrderedItems.push({
+        kind: 'movie',
+        imdbId: movieImdbId || ('tt_movie_' + (ep.tmdbId || Math.random().toString(36).slice(2, 8))),
+        tmdbId: ep.tmdbId,
+        title: ep.title,
+        year: movieYear || '',
+        showName: ep.title,
+        epName: 'Movie',
+        released: movieRelease || (movieYear ? (movieYear + '-01-01') : ''),
+        thumbnail: movieBackdrop || moviePoster || '',
+        poster: moviePoster || '',
+        showPoster: moviePoster || '',
+        backdrop: movieBackdrop || '',
+        showBackdrop: movieBackdrop || '',
+      });
+    } else if (ep.type === 'show' || ep.type === 'season' || ep.seasons || ep.episode === 'all') {
+      let seasonNums = [];
+      if (Array.isArray(ep.seasons)) {
+        seasonNums = ep.seasons;
+      } else if (ep.season != null && ep.season !== 'all') {
+        seasonNums = [parseInt(ep.season, 10)];
+      } else {
+        const sRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+        const sData = sRes ? await sRes.json().catch(() => null) : null;
+        if (sData && sData.ok && Array.isArray(sData.seasons)) {
+          seasonNums = sData.seasons.map((s) => s.season).filter((n) => n > 0);
+        } else {
+          seasonNums = [1];
+        }
+      }
+
+      let showPoster = ep.poster || '';
+      let showBackdrop = ep.backdrop || '';
+      let showImdbId = ep.imdbId || '';
+      const seasonPostersMap = {};
+
+      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+      if (seasonsInfoRes) {
+        const siData = await seasonsInfoRes.json().catch(() => null);
+        if (siData && siData.ok) {
+          if (siData.imdbId) showImdbId = siData.imdbId;
+          if (siData.poster) showPoster = siData.poster;
+          if (siData.backdrop) showBackdrop = siData.backdrop;
+          if (Array.isArray(siData.seasons)) {
+            siData.seasons.forEach((s) => {
+              if (s.season != null && s.poster) {
+                seasonPostersMap[s.season] = s.poster;
+              }
+            });
+          }
+        }
+      }
+
+      if (!showPoster || !showBackdrop) {
+        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
+        if (showDetailsRes) {
+          const sData = await showDetailsRes.json().catch(() => null);
+          if (sData && sData.ok && sData.results && sData.results.length) {
+            const found = sData.results.find((r) => String(r.tmdbId) === String(ep.tmdbId)) || sData.results[0];
+            if (found) {
+              if (!showPoster) showPoster = found.poster || '';
+              if (!showBackdrop) showBackdrop = found.backdrop || '';
+            }
+          }
+        }
+      }
+
+      const seasonResults = await Promise.all(seasonNums.map((sNum) =>
+        fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(ep.tmdbId) + '&season=' + encodeURIComponent(sNum), { cache: 'no-store' })
+          .then((r) => r.json())
+          .then((d) => ({ season: sNum, episodes: (d && d.ok && Array.isArray(d.episodes)) ? d.episodes : [] }))
+          .catch(() => ({ season: sNum, episodes: [] }))
+      ));
+
+      seasonResults
+        .sort((a, b) => a.season - b.season)
+        .forEach(({ season: sNum, episodes }) => {
+          const seasonPoster = seasonPostersMap[sNum] || ep.poster || showPoster;
+          episodes.forEach((epItem) => {
+            const epTitle = epItem.name || ('Episode ' + epItem.episode);
+            const epRelease = epItem.released || undefined;
+            const epThumbnail = epItem.thumbnail || showBackdrop || seasonPoster || showPoster;
+
+            fullOrderedItems.push({
+              kind: 'episode',
+              imdbId: showImdbId || String(ep.tmdbId),
+              season: sNum,
+              episode: epItem.episode,
+              showName: ep.showName,
+              epName: epTitle,
+              title: ep.showName + ' S' + sNum + 'E' + epItem.episode + ' \u2014 ' + epTitle,
+              released: epRelease,
+              thumbnail: epThumbnail,
+              poster: seasonPoster || showPoster || epThumbnail || '',
+              showPoster: showPoster || '',
+              backdrop: showBackdrop || '',
+              showBackdrop: showBackdrop || '',
+              seasonNum: sNum,
+              episodeNum: epItem.episode,
+            });
+          });
+        });
+    } else {
+      const res = await fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(ep.tmdbId) + '&season=' + encodeURIComponent(ep.season), { cache: 'no-store' });
+      const data = await res.json();
+      let epData = null;
+      if (data.ok && Array.isArray(data.episodes)) {
+        epData = data.episodes.find((e) => e.episode === ep.episode) || data.episodes[ep.episode - 1] || null;
+      }
+
+      let showPoster = ep.poster || '';
+      let showBackdrop = ep.backdrop || '';
+      let showImdbId = ep.imdbId || '';
+      let seasonPoster = ep.poster || '';
+
+      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+      if (seasonsInfoRes) {
+        const siData = await seasonsInfoRes.json().catch(() => null);
+        if (siData && siData.ok) {
+          if (siData.imdbId) showImdbId = siData.imdbId;
+          if (siData.poster) showPoster = siData.poster;
+          if (siData.backdrop) showBackdrop = siData.backdrop;
+          if (Array.isArray(siData.seasons)) {
+            const matchSeason = siData.seasons.find((s) => s.season === ep.season);
+            if (matchSeason && matchSeason.poster) seasonPoster = matchSeason.poster;
+          }
+        }
+      }
+
+      const epTitle = (epData && epData.name) ? epData.name : ep.title;
+      const epRelease = (epData && epData.released) ? epData.released : undefined;
+      const epThumbnail = (epData && epData.thumbnail) ? epData.thumbnail : (showBackdrop || seasonPoster || showPoster);
+
+      fullOrderedItems.push({
+        kind: 'episode',
+        imdbId: showImdbId || (epData && epData.imdbId) || String(ep.tmdbId),
+        season: ep.season,
+        episode: ep.episode,
+        showName: ep.showName,
+        epName: epTitle,
+        title: ep.showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + epTitle,
+        released: epRelease,
+        thumbnail: epThumbnail,
+        poster: seasonPoster || showPoster || epThumbnail || '',
+        showPoster: showPoster || '',
+        backdrop: showBackdrop || '',
+        showBackdrop: showBackdrop || '',
+        seasonNum: ep.season,
+        episodeNum: ep.episode,
+      });
+    }
+  }
+  return { event, items: fullOrderedItems };
+}
+
+async function createInstantStorylineChannel(eventId, btn) {
+  const event = TV_CROSSOVER_EVENTS.find((e) => e.id === eventId);
+  if (!event) return;
+
+  const originalText = btn ? btn.textContent : '';
+  const chId = 'channel-' + event.id;
+  const map = (typeof loadLocalChannels === 'function') ? (loadLocalChannels() || {}) : {};
+  const isAlreadyAdded = !!map[chId] || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, null, chId));
+
+  if (isAlreadyAdded) {
+    delete map[chId];
+    if (typeof saveLocalChannelsMap === 'function') {
+      saveLocalChannelsMap(map);
+    }
+    if (typeof removeListFromConfig === 'function') {
+      removeListFromConfig(null, null, chId);
+    }
+    if (btn) {
+      btn.textContent = '+ Add';
+      btn.classList.remove('secondary', 'is-added');
+      btn.classList.add('primary');
+      btn.style.color = '';
+    }
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof showAddedToast === 'function') {
+      showAddedToast('Removed "' + event.name + '" from your Channels.');
+    }
+    return;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding\u2026';
+  }
+
+  try {
+    const { items } = await fetchStorylineOrderedItems(eventId);
+    if (!items || !items.length) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Storyline Builder', 'Could not resolve items for this saga.');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+      return;
+    }
+
+    const firstWithPoster = items.find((it) => it.poster || it.thumbnail);
+    const poster = firstWithPoster ? (firstWithPoster.poster || firstWithPoster.thumbnail) : null;
+    const firstWithBackdrop = items.find((it) => it.backdrop || it.showBackdrop);
+    const backdrop = firstWithBackdrop ? (firstWithBackdrop.backdrop || firstWithBackdrop.showBackdrop) : null;
+
+    const channelPayload = {
+      channelId: chId,
+      name: event.name,
+      poster: poster,
+      backdrop: backdrop,
+      items: items,
+      shuffle: false,
+      dailyRotate: false,
+    };
+
+    saveLocalChannel(channelPayload);
+
+    if (typeof addRow === 'function') {
+      addRow(event.name, 'channel:v1:' + JSON.stringify(channelPayload), 'series', true, 'Channels', chId);
+    }
+
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Remove';
+      btn.classList.remove('primary');
+      btn.classList.add('secondary', 'is-added');
+      btn.style.color = 'var(--danger)';
+    }
+
+    if (typeof showAddedToast === 'function') {
+      showAddedToast('Added "' + event.name + '" to your Channels & Catalogs!');
+    }
+  } catch (err) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Storyline Channel', 'Error adding channel: ' + (err.message || err));
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+}
+
+async function loadStorylineToDraft(eventId, btn) {
+  const originalText = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Loading items\u2026';
+  }
+  try {
+    const { event, items } = await fetchStorylineOrderedItems(eventId);
+    if (!event || !items.length) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Storyline Builder', 'Could not load items for this storyline.');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+      return;
+    }
+
+    editingChannelId = null;
+    editingChannelUrlInput = null;
+    channelDraftItems = items.slice();
+    const firstWithPoster = items.find((it) => it.poster || it.thumbnail);
+    channelDraftPoster = firstWithPoster ? (firstWithPoster.poster || firstWithPoster.thumbnail) : null;
+    const firstWithBackdrop = items.find((it) => it.backdrop || it.showBackdrop);
+    channelDraftBackdrop = firstWithBackdrop ? (firstWithBackdrop.backdrop || firstWithBackdrop.showBackdrop) : null;
+
+    const nameInput = document.getElementById('channelNameInput');
+    if (nameInput) nameInput.value = event.name;
+    const randCheck = document.getElementById('channelRandomizeCheck');
+    if (randCheck) randCheck.checked = false;
+
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    setChannelSearchType('tv', document.getElementById('channelSearchTypeShowsBtn'));
+
+    switchChannelsSubmenu('build', null);
+    const panel = document.getElementById('channelsSubBuild');
+    if (panel) {
+      panel.style.display = 'block';
+      panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  } catch (err) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Storyline Builder', 'Error loading storyline: ' + (err.message || err));
+    }
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
 function switchChannelsSubmenu(name, btn) {
   if (btn) {
     document.querySelectorAll('#channelsSubnavBar .subnav-pill').forEach((p) => {
@@ -1576,6 +4500,7 @@ function switchChannelsSubmenu(name, btn) {
 
   const panels = {
     'my-channels': document.getElementById('channelsSubMyChannels'),
+    'storylines': document.getElementById('channelsSubStorylines'),
     'quickadd': document.getElementById('channelsSubQuickAdd'),
     'import': document.getElementById('channelsSubImport'),
     'build': document.getElementById('channelsSubBuild')
@@ -1594,6 +4519,8 @@ function switchChannelsSubmenu(name, btn) {
   if (name === 'my-channels') {
     renderMyCreatedChannelsList();
     renderChannelMergeList();
+  } else if (name === 'storylines') {
+    renderStorylinesUniverseList();
   } else if (name === 'import') {
     renderChannelMergeList();
   }
@@ -1617,6 +4544,7 @@ function openBuildCustomChannel() {
   if (epPicker) epPicker.innerHTML = '';
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
+  setChannelSearchType('tv', document.getElementById('channelSearchTypeShowsBtn'));
   switchChannelsSubmenu('build', null);
   const panel = document.getElementById('channelsSubBuild');
   if (panel) {
@@ -1649,6 +4577,7 @@ function editChannelById(channelId) {
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
+  setChannelSearchType('tv', document.getElementById('channelSearchTypeShowsBtn'));
   
   switchTab('channels');
   switchChannelsSubmenu('build', null);

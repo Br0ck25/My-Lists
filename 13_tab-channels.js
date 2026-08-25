@@ -2,8 +2,33 @@
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
     <button type="button" class="subnav-pill active" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
+    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
     <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
     <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('import', this)">Import</button>
+  </div>
+
+  <!-- Submenu: Storylines & Universes (Canon Timelines, Sagas & Bridges) -->
+  <div class="channels-subpanel" id="channelsSubStorylines" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Storylines, Sagas &amp; Universes</h2>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">
+        Complete franchise timelines, movie trilogies &amp; sagas (3+ films), and TV-to-movie universes in canon chronological watch order. Add any saga directly to your Catalogs or launch it as a continuous 24/7 channel with 1-click.
+      </p>
+
+      <!-- Category Filter Tabs -->
+      <div class="subnav-pills-bar" id="storylineCategoryFilterBar" style="margin-bottom:16px; flex-wrap:wrap;">
+        <button type="button" class="subnav-pill active" onclick="filterStorylinesCategory('all', this)"><span class="check-icon">&#x2713;</span> All Sagas</button>
+        <button type="button" class="subnav-pill" onclick="filterStorylinesCategory('moviesagas', this)">Movie Sagas (3+ Films)</button>
+        <button type="button" class="subnav-pill" onclick="filterStorylinesCategory('tvuniverses', this)">TV Universes &amp; Bridges</button>
+        <button type="button" class="subnav-pill" onclick="filterStorylinesCategory('scifi', this)">Sci-Fi &amp; Fantasy</button>
+        <button type="button" class="subnav-pill" onclick="filterStorylinesCategory('action', this)">Action &amp; Crime</button>
+        <button type="button" class="subnav-pill" onclick="filterStorylinesCategory('animation', this)">Animation &amp; Anime</button>
+      </div>
+
+      <div id="storylinesUniverseList" style="display:flex; flex-direction:column; gap:16px;"></div>
+    </div>
   </div>
 
   <!-- Submenu 1: My Channels -->
@@ -111,7 +136,11 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title" id="channelEditorTitle">Build Custom Channel</h2>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search any TV show or movie to add episodes to your channel, and reorder or remove picks:</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search any TV show or movie to add to your channel, and reorder or remove picks:</p>
+      <div class="subnav-pills-bar" id="channelSearchTypeChips" style="margin-bottom:10px;">
+        <button type="button" class="subnav-pill active" id="channelSearchTypeShowsBtn" onclick="setChannelSearchType('tv', this)"><span class="check-icon">&#x2713;</span> Shows</button>
+        <button type="button" class="subnav-pill" id="channelSearchTypeMoviesBtn" onclick="setChannelSearchType('movie', this)">Movies</button>
+      </div>
       <div class="row">
         <input type="text" id="channelSearchInput" placeholder="Search a show by name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
         <button type="button" class="secondary" onclick="runChannelTitleSearch()">Search</button>
