@@ -1059,6 +1059,7 @@ window.switchListDetailsType = function(newType) {
 // history entry would just create a duplicate back-button step.
 async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   opts = opts || {};
+  const storylineEventId = (listUrl && listUrl.startsWith('custom:storyline:')) ? listUrl.slice('custom:storyline:'.length) : null;
   const currentActiveTab = window._originTab || localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
   const currentSubmenu = window._currentCatalogsSubmenu || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
   const currentChannelsSubmenu = window._currentChannelsSubmenu || localStorage.getItem('myListAddon:channelsSubmenu') || 'storylines';
@@ -1405,7 +1406,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       return;
     }
     addBtn.style.display = '';
-    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+    let isAdded;
+    if (storylineEventId) {
+      const chId = 'channel-' + storylineEventId;
+      isAdded = [...document.querySelectorAll('#lists .entry')].some((row) =>
+        [...row.querySelectorAll('.url')].some((u) => u.value.includes(chId))
+      );
+    } else {
+      isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+    }
     if (isAdded) {
       addBtn.textContent = 'Remove';
       addBtn.classList.remove('primary');
@@ -1527,6 +1536,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   addBtn.onclick = function() {
+    if (storylineEventId) {
+      if (typeof createInstantStorylineChannel === 'function') {
+        createInstantStorylineChannel(storylineEventId, addBtn);
+      }
+      return;
+    }
     const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
     if (isAdded) {
       if (typeof removeListFromConfig === 'function') {

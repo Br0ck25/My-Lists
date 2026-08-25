@@ -295,6 +295,12 @@ ${seoHeadHtml}
      above -- setting min-width:0 on the parent only protects the parent,
      not these children individually. */
   .lists-subpanel { min-width: 0; }
+  /* Same fix, same reason, for the Channels tab's subpanels (My Channels,
+     Storylines & Universes, Quick Add, Import) -- without this, wide
+     unwrapped content in any of them (e.g. the Storylines poster grid or
+     a crossover-detection banner) could force the whole tab wider than
+     the viewport on mobile instead of wrapping/scrolling within itself. */
+  .channels-subpanel { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
 
   /* --- Bottom Nav (Mobile Only - Persistent Glassmorphism) ---------------- */
   .bottom-nav { display: none; }

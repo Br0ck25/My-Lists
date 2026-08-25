@@ -8318,6 +8318,12 @@ ${seoHeadHtml}
      above -- setting min-width:0 on the parent only protects the parent,
      not these children individually. */
   .lists-subpanel { min-width: 0; }
+  /* Same fix, same reason, for the Channels tab's subpanels (My Channels,
+     Storylines & Universes, Quick Add, Import) -- without this, wide
+     unwrapped content in any of them (e.g. the Storylines poster grid or
+     a crossover-detection banner) could force the whole tab wider than
+     the viewport on mobile instead of wrapping/scrolling within itself. */
+  .channels-subpanel { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
 
   /* --- Bottom Nav (Mobile Only - Persistent Glassmorphism) ---------------- */
   .bottom-nav { display: none; }
@@ -22535,7 +22541,7 @@ const TV_CROSSOVER_EVENTS = [
     "name": "Downton Abbey: Complete Saga & Feature Films",
     "franchise": "Downton Abbey",
     "category": "tvuniverses",
-    "description": "Downton Abbey Seasons 1-6, followed by the theatrical feature films Downton Abbey (2019) and A New Era (2022).",
+    "description": "Downton Abbey Seasons 1-6, followed by the theatrical feature films Downton Abbey (2019), A New Era (2022), and The Grand Finale (2025).",
     "episodes": [
       {
         "type": "show",
@@ -22571,6 +22577,15 @@ const TV_CROSSOVER_EVENTS = [
         "year": 2022,
         "part": 3,
         "poster": "https://images.metahub.space/poster/medium/tt11703710/img"
+      },
+      {
+        "type": "movie",
+        "title": "Downton Abbey: The Grand Finale",
+        "tmdbId": 1289936,
+        "imdbId": "tt31888477",
+        "year": 2025,
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt31888477/img"
       }
     ]
   },
@@ -22880,6 +22895,7 @@ const TV_CROSSOVER_EVENTS = [
     "franchise": "Yellowstone",
     "category": "tvuniverses",
     "description": "The complete Dutton family saga in chronological order: 1883 (the journey west), 1923 (Prohibition-era Montana), then Yellowstone (the modern-day ranch war).",
+    "noCrossoverSuggestion": true,
     "episodes": [
       {
         "type": "show",
@@ -22910,6 +22926,1074 @@ const TV_CROSSOVER_EVENTS = [
         "part": 3,
         "imdbId": "tt4236770",
         "poster": "https://images.metahub.space/poster/medium/tt4236770/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_flash_vs_arrow_2014",
+    "name": "Flash vs. Arrow (2014)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "The inaugural Arrowverse crossover: Barry Allen and Oliver Queen team up across Central City and Starling City to stop a boomerang-wielding killer.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 1,
+        "episode": 8,
+        "title": "Flash vs. Arrow",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 3,
+        "episode": 8,
+        "title": "The Brave and the Bold",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_heroes_join_forces_2015",
+    "name": "Heroes Join Forces: Legends of Today/Yesterday (2015)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "Team Flash and Team Arrow join forces against the immortal Vandal Savage to protect Hawkman and Hawkgirl -- the backdoor pilot that launched DC's Legends of Tomorrow.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 2,
+        "episode": 8,
+        "title": "Legends of Today",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 4,
+        "episode": 8,
+        "title": "Legends of Yesterday",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_invasion_2016",
+    "name": "Invasion! (2016)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "The first 4-show Arrowverse crossover: Supergirl, The Flash, Arrow, and DC's Legends of Tomorrow unite to stop an alien invasion by the Dominators.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Supergirl",
+        "season": 2,
+        "episode": 8,
+        "title": "Medusa",
+        "tmdbId": 62688,
+        "imdbId": "tt4016454",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 3,
+        "episode": 8,
+        "title": "Invasion!",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 5,
+        "episode": 8,
+        "title": "Invasion!",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "episode",
+        "showName": "DC's Legends of Tomorrow",
+        "season": 2,
+        "episode": 7,
+        "title": "Invasion!",
+        "tmdbId": 62643,
+        "imdbId": "tt4532368",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_crisis_on_earth_x_2017",
+    "name": "Crisis on Earth-X (2017)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "Nazi invaders from the parallel world Earth-X attack Central City during Barry and Iris's wedding, forcing Supergirl, Arrow, The Flash, and the Legends into the Arrowverse's biggest crossover yet.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Supergirl",
+        "season": 3,
+        "episode": 8,
+        "title": "Crisis on Earth-X, Part 1",
+        "tmdbId": 62688,
+        "imdbId": "tt4016454",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 6,
+        "episode": 8,
+        "title": "Crisis on Earth-X, Part 2",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 4,
+        "episode": 8,
+        "title": "Crisis on Earth-X, Part 3",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "DC's Legends of Tomorrow",
+        "season": 3,
+        "episode": 8,
+        "title": "Crisis on Earth-X, Part 4",
+        "tmdbId": 62643,
+        "imdbId": "tt4532368",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_elseworlds_2018",
+    "name": "Elseworlds (2018)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "Barry Allen and Oliver Queen wake up having swapped bodies and lives, sending The Flash, Arrow, and Supergirl on a reality-bending adventure that sets up Crisis on Infinite Earths.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 5,
+        "episode": 9,
+        "title": "Elseworlds, Part 1",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 7,
+        "episode": 9,
+        "title": "Elseworlds, Part 2",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Supergirl",
+        "season": 4,
+        "episode": 9,
+        "title": "Elseworlds, Part 3",
+        "tmdbId": 62688,
+        "imdbId": "tt4016454",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      }
+    ]
+  },
+  {
+    "id": "arrowverse_crisis_on_infinite_earths_2019",
+    "name": "Crisis on Infinite Earths (2019-2020)",
+    "franchise": "Arrowverse",
+    "category": "tvuniverses",
+    "description": "The Arrowverse's biggest crossover event: Supergirl, Batwoman, The Flash, Arrow, and the Legends unite across five episodes to stop the Anti-Monitor from erasing the entire multiverse.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Supergirl",
+        "season": 5,
+        "episode": 9,
+        "title": "Crisis on Infinite Earths: Part One",
+        "tmdbId": 62688,
+        "imdbId": "tt4016454",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt4016454/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Batwoman",
+        "season": 1,
+        "episode": 9,
+        "title": "Crisis on Infinite Earths: Part Two",
+        "tmdbId": 89247,
+        "imdbId": "tt8712204",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt8712204/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Flash",
+        "season": 6,
+        "episode": 9,
+        "title": "Crisis on Infinite Earths: Part Three",
+        "tmdbId": 60735,
+        "imdbId": "tt3107288",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt3107288/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Arrow",
+        "season": 8,
+        "episode": 8,
+        "title": "Crisis on Infinite Earths: Part Four",
+        "tmdbId": 1412,
+        "imdbId": "tt2193021",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt2193021/img"
+      },
+      {
+        "type": "episode",
+        "showName": "DC's Legends of Tomorrow",
+        "season": 5,
+        "episode": 1,
+        "title": "Crisis on Infinite Earths: Part Five",
+        "tmdbId": 62643,
+        "imdbId": "tt4532368",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt4532368/img"
+      }
+    ]
+  },
+  {
+    "id": "greys_station19_november_2020_crossover",
+    "name": "Grey's Anatomy & Station 19: Season Premiere Crossover (2020)",
+    "franchise": "Grey's Anatomy Universe",
+    "category": "tvuniverses",
+    "description": "3-part crossover connecting Station 19 and Grey's Anatomy season premieres, following the rescue and treatment of children injured in a car accident.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Station 19",
+        "season": 4,
+        "episode": 1,
+        "title": "Nothing Seems the Same",
+        "tmdbId": 76773,
+        "imdbId": "tt7053188",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7053188/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Grey's Anatomy",
+        "season": 17,
+        "episode": 1,
+        "title": "All Tomorrow's Parties",
+        "tmdbId": 1416,
+        "imdbId": "tt0413573",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0413573/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Grey's Anatomy",
+        "season": 17,
+        "episode": 2,
+        "title": "The Center Won't Hold",
+        "tmdbId": 1416,
+        "imdbId": "tt0413573",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0413573/img"
+      }
+    ]
+  },
+  {
+    "id": "greys_station19_bottle_up_and_explode_2021",
+    "name": "Grey's Anatomy & Station 19: Bottle Up and Explode! (2021)",
+    "franchise": "Grey's Anatomy Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover: a Seattle pipeline explosion sends Station 19 racing into a chaotic rescue that overwhelms the Grey Sloan doctors in the aftermath.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Station 19",
+        "season": 5,
+        "episode": 5,
+        "title": "Things We Lost in the Fire",
+        "tmdbId": 76773,
+        "imdbId": "tt7053188",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7053188/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Grey's Anatomy",
+        "season": 18,
+        "episode": 5,
+        "title": "Bottle Up and Explode!",
+        "tmdbId": 1416,
+        "imdbId": "tt0413573",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0413573/img"
+      }
+    ]
+  },
+  {
+    "id": "law_and_order_return_of_the_prodigal_son_2021",
+    "name": "Law & Order: Return of the Prodigal Son (2021)",
+    "franchise": "Law & Order Universe",
+    "category": "tvuniverses",
+    "description": "The launch crossover for Law & Order: Organized Crime -- Elliot Stabler returns to New York after a decade away, only for tragedy to strike, kicking off the new spin-off series.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 22,
+        "episode": 9,
+        "title": "Return of the Prodigal Son",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Law & Order: Organized Crime",
+        "season": 1,
+        "episode": 1,
+        "title": "What Happens in Puglia",
+        "tmdbId": 106158,
+        "imdbId": "tt12677870",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt12677870/img"
+      }
+    ]
+  },
+  {
+    "id": "law_and_order_gimme_shelter_2022",
+    "name": "Law & Order: Gimme Shelter (2022)",
+    "franchise": "Law & Order Universe",
+    "category": "tvuniverses",
+    "description": "The first-ever 3-hour crossover across all three active Law & Order shows: a shooting investigation pulls in Organized Crime, SVU, and the original Law & Order squad and DAs.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Law & Order: Organized Crime",
+        "season": 3,
+        "episode": 1,
+        "title": "Gimme Shelter: Part One",
+        "tmdbId": 106158,
+        "imdbId": "tt12677870",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt12677870/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 24,
+        "episode": 1,
+        "title": "Gimme Shelter: Part Two",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Law & Order",
+        "season": 22,
+        "episode": 1,
+        "title": "Gimme Shelter: Part Three",
+        "tmdbId": 549,
+        "imdbId": "tt0098844",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0098844/img"
+      }
+    ]
+  },
+  {
+    "id": "fbi_and_most_wanted_crossover_2020",
+    "name": "FBI & FBI: Most Wanted Crossover (2020)",
+    "franchise": "FBI Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting FBI and FBI: Most Wanted as the two teams work a case together.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "FBI",
+        "season": 2,
+        "episode": 18,
+        "title": "American Dreams",
+        "tmdbId": 80748,
+        "imdbId": "tt7491982",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7491982/img"
+      },
+      {
+        "type": "episode",
+        "showName": "FBI: Most Wanted",
+        "season": 1,
+        "episode": 9,
+        "title": "Reveille",
+        "tmdbId": 94372,
+        "imdbId": "tt9742936",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt9742936/img"
+      }
+    ]
+  },
+  {
+    "id": "fbi_international_launch_crossover_2021",
+    "name": "FBI, Most Wanted & International: Series Launch Crossover (2021)",
+    "franchise": "FBI Universe",
+    "category": "tvuniverses",
+    "description": "3-part crossover premiere spanning the United States and Europe: a yacht party murder leads to a manhunt that concludes with the launch of FBI: International's Budapest-based Fly Team.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "FBI",
+        "season": 4,
+        "episode": 1,
+        "title": "All That Glitters",
+        "tmdbId": 80748,
+        "imdbId": "tt7491982",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7491982/img"
+      },
+      {
+        "type": "episode",
+        "showName": "FBI: Most Wanted",
+        "season": 3,
+        "episode": 1,
+        "title": "Exposed",
+        "tmdbId": 94372,
+        "imdbId": "tt9742936",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt9742936/img"
+      },
+      {
+        "type": "episode",
+        "showName": "FBI: International",
+        "season": 1,
+        "episode": 1,
+        "title": "Pilot",
+        "tmdbId": 121658,
+        "imdbId": "tt14449470",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt14449470/img"
+      }
+    ]
+  },
+  {
+    "id": "fbi_imminent_threat_crossover_2023",
+    "name": "FBI: Imminent Threat (2023)",
+    "franchise": "FBI Universe",
+    "category": "tvuniverses",
+    "description": "3-part global crossover: the abduction of an American citizen in Rome reveals an international plot to carry out a mass-casualty terror attack in New York City, uniting all three FBI teams.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "FBI: International",
+        "season": 2,
+        "episode": 16,
+        "title": "Imminent Threat, Part One",
+        "tmdbId": 121658,
+        "imdbId": "tt14449470",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt14449470/img"
+      },
+      {
+        "type": "episode",
+        "showName": "FBI",
+        "season": 5,
+        "episode": 17,
+        "title": "Imminent Threat, Part Two",
+        "tmdbId": 80748,
+        "imdbId": "tt7491982",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7491982/img"
+      },
+      {
+        "type": "episode",
+        "showName": "FBI: Most Wanted",
+        "season": 4,
+        "episode": 16,
+        "title": "Imminent Threat, Part Three",
+        "tmdbId": 94372,
+        "imdbId": "tt9742936",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt9742936/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_april_2014_crossover",
+    "name": "One Chicago: A Dark Day / 8:30 PM (2014)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "The very first One Chicago crossover, launching the shared universe between Chicago Fire and its new spin-off Chicago P.D.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 2,
+        "episode": 20,
+        "title": "A Dark Day",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 1,
+        "episode": 12,
+        "title": "8:30 PM",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_the_beating_heart_2015",
+    "name": "One Chicago: The Beating Heart (2015)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "The first official 3-show One Chicago crossover, and the backdoor pilot for Chicago Med: a stabbed Firehouse 51 member connects Fire, the new hospital, and a P.D. chemo-overdose investigation.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 4,
+        "episode": 10,
+        "title": "The Beating Heart",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Med",
+        "season": 1,
+        "episode": 5,
+        "title": "Malignant",
+        "tmdbId": 62650,
+        "imdbId": "tt4655480",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4655480/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 3,
+        "episode": 10,
+        "title": "Now I'm God",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_going_to_war_2018",
+    "name": "One Chicago: Going to War (2018)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "A high-rise fire endangers Stella Kidd and claims the life of Pat Halstead, father of both Med's Will Halstead and P.D.'s Jay Halstead, in this heart-breaking crossover.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 7,
+        "episode": 2,
+        "title": "Going to War",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Med",
+        "season": 4,
+        "episode": 2,
+        "title": "When to Let Go",
+        "tmdbId": 62650,
+        "imdbId": "tt4655480",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4655480/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 6,
+        "episode": 2,
+        "title": "Endings",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_infection_2019",
+    "name": "One Chicago: Infection (2019)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "A deadly, fast-spreading virus forces Firehouse 51, Chicago Med, and Intelligence to work alongside the CDC to contain a citywide outbreak.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 8,
+        "episode": 4,
+        "title": "Infection: Part I",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Med",
+        "season": 5,
+        "episode": 4,
+        "title": "Infection: Part II",
+        "tmdbId": 62650,
+        "imdbId": "tt4655480",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4655480/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 7,
+        "episode": 4,
+        "title": "Infection: Part III",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_off_the_grid_2020",
+    "name": "One Chicago: Off the Grid (2020)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "2-part crossover: a suspected opioid overdose call at a rescue scene leads Fire and Intelligence into the return of a former Chicago P.D. officer searching for his missing sister.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 8,
+        "episode": 15,
+        "title": "Off the Grid",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 7,
+        "episode": 15,
+        "title": "Burden of Truth",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_nobody_touches_anything_2014",
+    "name": "One Chicago: Nobody Touches Anything / Chicago Crossover (2014)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "3-part crossover: a Firehouse 51 fire investigation leads Chicago P.D.'s Erin Lindsay into a decades-old child pornography ring case, personal for her, that pulls in SVU's Olivia Benson.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 3,
+        "episode": 7,
+        "title": "Nobody Touches Anything",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 16,
+        "episode": 7,
+        "title": "Chicago Crossover",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 2,
+        "episode": 7,
+        "title": "They'll Have to Go Through Me",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_three_bells_2014",
+    "name": "One Chicago: Three Bells (2014)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting Chicago Fire and Chicago P.D.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 3,
+        "episode": 13,
+        "title": "Three Bells",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 2,
+        "episode": 13,
+        "title": "A Little Devil Complex",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_daydream_believer_2015",
+    "name": "One Chicago: We Called Her Jellybean / Daydream Believer (2015)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "3-part crossover: a rape/murder case eerily similar to one from a decade ago pulls Chicago Fire, Chicago P.D., and SVU's Olivia Benson into a manhunt for serial killer Gregory Yates that moves from Chicago to New York.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 3,
+        "episode": 21,
+        "title": "We Called Her Jellybean",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 2,
+        "episode": 20,
+        "title": "The Number of Rats",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 16,
+        "episode": 20,
+        "title": "Daydream Believer",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_nationwide_manhunt_2016",
+    "name": "One Chicago: Nationwide Manhunt (2016)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "SVU joins Chicago P.D.'s Intelligence Unit in a manhunt after serial killer Gregory Yates escapes a New York prison and heads for Chicago, targeting Erin Lindsay.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 17,
+        "episode": 14,
+        "title": "Nationwide Manhunt",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 3,
+        "episode": 14,
+        "title": "The Song of Gregory William Yates",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_deathtrap_2017",
+    "name": "One Chicago: Deathtrap / Fake (2017)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "3-part crossover and the launch of Chicago Justice: an intentionally set warehouse fire that kills dozens, including a colleague's daughter, leads from the fire scene through an Intelligence Unit manhunt to the courtroom trial of the arsonist.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 5,
+        "episode": 15,
+        "title": "Deathtrap",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 4,
+        "episode": 16,
+        "title": "Emotional Proximity",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Justice",
+        "season": 1,
+        "episode": 1,
+        "title": "Fake",
+        "tmdbId": 67993,
+        "imdbId": "tt5640060",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt5640060/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_some_make_it_2017",
+    "name": "One Chicago: Some Make It, Some Don't (2017)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting Chicago Fire and Chicago P.D.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 5,
+        "episode": 9,
+        "title": "Some Make It, Some Don't",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 4,
+        "episode": 9,
+        "title": "Don't Bury This Case",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_profiles_2018",
+    "name": "One Chicago: Profiles (2018)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "2-part crossover, starting on Chicago P.D. and continuing on Chicago Fire.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 5,
+        "episode": 16,
+        "title": "Profiles",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 6,
+        "episode": 13,
+        "title": "Hiding Not Seeking",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_what_i_saw_2019",
+    "name": "One Chicago: What I Saw / Good Men (2019)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "2-part crossover connecting Chicago Fire and Chicago P.D.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Chicago Fire",
+        "season": 7,
+        "episode": 15,
+        "title": "What I Saw",
+        "tmdbId": 44006,
+        "imdbId": "tt2261391",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2261391/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 6,
+        "episode": 15,
+        "title": "Good Men",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_karate_kid_cobra_kai_saga",
+    "name": "The Karate Kid: Complete Miyagi-Verse Saga",
+    "franchise": "The Karate Kid",
+    "category": "moviesagas",
+    "description": "The Karate Kid (1984), Part II (1986), Part III (1989), and The Next Karate Kid (1994), followed by Cobra Kai (Seasons 1-6), and concluding with Karate Kid: Legends (2025) -- the 'Miyagi-verse' continuity as defined by Cobra Kai's own creators.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Karate Kid",
+        "tmdbId": 1885,
+        "imdbId": "tt0087538",
+        "year": 1984,
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0087538/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Karate Kid Part II",
+        "tmdbId": 8856,
+        "imdbId": "tt0091326",
+        "year": 1986,
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0091326/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Karate Kid Part III",
+        "tmdbId": 10495,
+        "imdbId": "tt0097647",
+        "year": 1989,
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0097647/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Next Karate Kid",
+        "tmdbId": 11231,
+        "imdbId": "tt0110657",
+        "year": 1994,
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0110657/img"
+      },
+      {
+        "type": "show",
+        "showName": "Cobra Kai",
+        "tmdbId": 77169,
+        "seasons": [1, 2, 3, 4, 5, 6],
+        "title": "Cobra Kai (Seasons 1-6)",
+        "part": 5,
+        "imdbId": "tt7221388",
+        "poster": "https://images.metahub.space/poster/medium/tt7221388/img"
+      },
+      {
+        "type": "movie",
+        "title": "Karate Kid: Legends",
+        "tmdbId": 1011477,
+        "imdbId": "tt1674782",
+        "year": 2025,
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt1674782/img"
       }
     ]
   }
@@ -22985,6 +24069,7 @@ function renderChannelCrossoverSuggestions() {
   const suggestions = [];
 
   TV_CROSSOVER_EVENTS.forEach((event) => {
+    if (event.noCrossoverSuggestion) return;
     const presentParts = [];
     const missingParts = [];
 
@@ -30828,6 +31913,7 @@ window.switchListDetailsType = function(newType) {
 // history entry would just create a duplicate back-button step.
 async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   opts = opts || {};
+  const storylineEventId = (listUrl && listUrl.startsWith('custom:storyline:')) ? listUrl.slice('custom:storyline:'.length) : null;
   const currentActiveTab = window._originTab || localStorage.getItem('myListAddon:activeTab') || document.querySelector('.tab-btn.active, .bottom-nav-item.active')?.dataset.tab || 'discover';
   const currentSubmenu = window._currentCatalogsSubmenu || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
   const currentChannelsSubmenu = window._currentChannelsSubmenu || localStorage.getItem('myListAddon:channelsSubmenu') || 'storylines';
@@ -31174,7 +32260,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       return;
     }
     addBtn.style.display = '';
-    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+    let isAdded;
+    if (storylineEventId) {
+      const chId = 'channel-' + storylineEventId;
+      isAdded = [...document.querySelectorAll('#lists .entry')].some((row) =>
+        [...row.querySelectorAll('.url')].some((u) => u.value.includes(chId))
+      );
+    } else {
+      isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+    }
     if (isAdded) {
       addBtn.textContent = 'Remove';
       addBtn.classList.remove('primary');
@@ -31296,6 +32390,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   addBtn.onclick = function() {
+    if (storylineEventId) {
+      if (typeof createInstantStorylineChannel === 'function') {
+        createInstantStorylineChannel(storylineEventId, addBtn);
+      }
+      return;
+    }
     const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
     if (isAdded) {
       if (typeof removeListFromConfig === 'function') {
