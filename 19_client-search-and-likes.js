@@ -1557,9 +1557,11 @@ async function openItemDetailsModal(id, type, opts) {
   
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const regionEl = document.getElementById('regionSelect');
+  const region = (regionEl && regionEl.value) || localStorage.getItem('myListAddon:region') || 'US';
   
   try {
-    const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(id) + '&tmdbKey=' + encodeURIComponent(tmdbKey) + (type ? '&type=' + encodeURIComponent(type) : ''));
+    const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(id) + '&tmdbKey=' + encodeURIComponent(tmdbKey) + (type ? '&type=' + encodeURIComponent(type) : '') + '&region=' + encodeURIComponent(region));
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
       let parsed = null;

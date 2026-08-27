@@ -178,7 +178,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -210,6 +210,19 @@ function decodeConfig(config) {
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
       shuffleShelves: !!(!Array.isArray(parsed) && parsed.shuffleShelves),
       shuffleItems: !!(!Array.isArray(parsed) && parsed.shuffleItems),
+      // Two-letter watch_region for streaming-availability catalogs
+      // (provider charts, Stream Releases) and content ratings -- see
+      // 07_source-fetchers-tmdb-simkl.js's tmdbProviderChartPaths and
+      // fetchTmdbItemDetailsUncached for where this actually gets used.
+      // Defaults to US so every install predating this feature keeps
+      // behaving exactly as it always did.
+      region: (!Array.isArray(parsed) && parsed.region) || "US",
+      // Filters items with no known digital release (movie charts only,
+      // see fetchTmdbChart's own comment for why) out of TMDB Trending/
+      // Popular movie catalogs. Defaults to false so every install
+      // predating this feature keeps showing everything, same reasoning
+      // as region's own default above.
+      hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
     };
   } catch {
     return empty;

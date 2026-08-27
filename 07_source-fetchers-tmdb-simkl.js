@@ -62,11 +62,12 @@ async function fetchSimklChart(entry, skip, clientId, chartKey) {
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
-async function fetchSimklUserList(entry, skip, token, clientId, spec) {
+async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey) {
   if (!token) {
     throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
   }
   const cid = clientId || SIMKL_CLIENT_ID;
+  const tmdbApiKey = userTmdbKey || TMDB_API_KEY;
   const parts = (spec || "").split(":");
   const category = parts[0] || "movies"; // "movies", "shows", "anime"
   const status = parts[1] || "plantowatch"; // "plantowatch", "watching", "completed", "hold", "dropped"
@@ -95,6 +96,76 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec) {
       return await res.json();
     }
   });
+  if (status === "airing-next" || category === "airing-next") {
+    const rawShows = (category === "anime")
+      ? (Array.isArray(data.anime) ? data.anime : [])
+      : [
+          ...(Array.isArray(data.shows) ? data.shows : []),
+          ...(Array.isArray(data.anime) ? data.anime : []),
+        ];
+    const candidateShows = rawShows.filter((it) => (it.status === "watching" || it.status === "completed"));
+    candidateShows.sort((a, b) => {
+      const aTime = a.last_watched_at ? new Date(a.last_watched_at).getTime() : 0;
+      const bTime = b.last_watched_at ? new Date(b.last_watched_at).getTime() : 0;
+      if (a.status === "watching" && b.status !== "watching") return -1;
+      if (b.status === "watching" && a.status !== "watching") return 1;
+      return bTime - aTime;
+    });
+    const seen = new Set();
+    const candidateMetas = [];
+    candidateShows.forEach((it) => {
+      const mediaObj = it.show || it.anime || it.movie;
+      if (mediaObj && mediaObj.ids) {
+        const imdbId = mediaObj.ids.imdb || "";
+        const tmdbId = mediaObj.ids.tmdb || "";
+        const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "");
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          candidateMetas.push({
+            id,
+            imdbId,
+            tmdbId,
+            name: mediaObj.title || "",
+            poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+            year: mediaObj.year ? String(mediaObj.year) : undefined,
+          });
+        }
+      }
+    });
+
+    const airingMetas = [];
+    await mapWithConcurrency(candidateMetas.slice(0, 35), 6, async (item) => {
+      try {
+        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series");
+        if (details && details.nextEpisodeAirDate) {
+          const isPremiere = details.nextEpisodeNumber === 1;
+          const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
+          const eNum = details.nextEpisodeNumber ? `E${String(details.nextEpisodeNumber).padStart(2, "0")}` : "";
+          const epLabel = sNum && eNum ? `${sNum}${eNum}` : "";
+          const realId = (item.imdbId && item.imdbId.startsWith("tt")) ? item.imdbId : (details.imdbId && String(details.imdbId).startsWith("tt") ? details.imdbId : (item.id || item.imdbId));
+          airingMetas.push({
+            id: realId,
+            type: "series",
+            name: item.name || details.title || "",
+            poster: item.poster || details.poster || "",
+            background: details.background || undefined,
+            // No releaseInfo (year) here on purpose -- for an Airing Next
+            // row, the useful date is the upcoming episode's air date
+            // (already surfaced in description below), not the show's
+            // original release year, which is noise in this context.
+            airDate: details.nextEpisodeAirDate,
+            isSeasonPremiere: isPremiere,
+            description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+            trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
+          });
+        }
+      } catch {}
+    });
+
+    airingMetas.sort((a, b) => (a.airDate || "").localeCompare(b.airDate || ""));
+    return airingMetas.slice(skip, skip + PAGE_SIZE);
+  }
+
   const arr = Array.isArray(data[category]) ? data[category] : [];
   const filtered = arr.filter((it) => (it.status || "plantowatch") === status);
   const metas = [];
@@ -292,18 +363,38 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
+  // release_dates is appended alongside external_ids/videos at no extra
+  // request cost (same call, one more field) -- used by fetchTmdbChart
+  // below to support the "hide items with no digital release" setting
+  // without a second per-item fetch. Harmless for callers that don't need
+  // it (TMDB list imports, etc.) since it's simply unused there.
   const src = `https://api.themoviedb.org/3/${kind}/${cleanTmdbId}?api_key=${encodeURIComponent(
     apiKey
-  )}&append_to_response=external_ids,videos`;
+  )}&append_to_response=external_ids,videos,release_dates`;
   const res = await fetch(src, {
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return { imdbId: null, videos: null };
+  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
   const data = await res.json();
   const imdbId = (data.external_ids && data.external_ids.imdb_id) || data.imdb_id || null;
   const videos = (data.videos && data.videos.results) || null;
-  return { imdbId, videos };
+  // hasDigitalRelease stays null for TV (kind === "tv") -- TMDB's
+  // release_dates/release type concept (theatrical/digital/physical) is
+  // movie-only; there's no equivalent field on the /tv endpoint, so the
+  // "hide items with no digital release" setting only ever applies to
+  // movie charts (see fetchTmdbChart below), never TV ones.
+  let hasDigitalRelease = null;
+  if (kind === "movie" && data.release_dates && Array.isArray(data.release_dates.results)) {
+    // Type 4 = Digital, 5 = Physical (TMDB's own release_type enum) --
+    // physical is included too since a disc/rental release reliably
+    // implies digital availability exists somewhere even when TMDB's own
+    // digital entry for that title is missing or incomplete.
+    hasDigitalRelease = data.release_dates.results.some((r) =>
+      Array.isArray(r.release_dates) && r.release_dates.some((rd) => rd.type === 4 || rd.type === 5)
+    );
+  }
+  return { imdbId, videos, hasDigitalRelease };
 }
 
 // Pulls a public themoviedb.org list via TMDB's v4 List Details endpoint.
@@ -498,6 +589,20 @@ function tmdbProviderChartPaths(providerId) {
   return { movie: `discover/movie?${q}`, tv: `discover/tv?${q}` };
 }
 
+// Every provider/stream-releases path built above bakes in watch_region=US
+// as a placeholder -- substituteWatchRegion swaps it for the caller's
+// actual region at request time (see fetchTmdbChart/fetchTmdbProviderTop10/
+// fetchTmdbGenre below). Done this way, rather than rebuilding the whole
+// TMDB_CHART_PATHS/TMDB_GENRE_CONFIG maps to be region-aware from the
+// start, since only these few entries are watch_region-sensitive at all --
+// most chart/genre paths (trending, by-genre, etc.) have nothing to do
+// with regional availability and shouldn't need touching.
+function substituteWatchRegion(path, region) {
+  if (!path || !path.includes("watch_region=")) return path;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  return path.replace(/watch_region=[A-Z]{2}/, `watch_region=${effectiveRegion}`);
+}
+
 const TMDB_CHART_PATHS = {
   trending: { movie: "trending/movie/week", tv: "trending/tv/week" },
   popular: { movie: "movie/popular", tv: "tv/popular" },
@@ -577,7 +682,7 @@ function getTmdbNewReleasesChartPath(wantKind) {
 // fetches a specific user-curated list and has to walk pages defensively
 // since v3's /list/{id} pagination is flaky), these are standard, reliably-
 // paginated v3 endpoints -- see fetchTmdbPagedResults.
-async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
+async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigitalReleases) {
   if (!apiKey) {
     throw new Error(
       "TMDB charts aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
@@ -594,12 +699,27 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
   if (!chartPath) {
     throw new Error("This TMDB chart doesn't have a shows version.");
   }
+  chartPath = substituteWatchRegion(chartPath, region);
 
   const windowItems = await fetchTmdbPagedResults(chartPath, apiKey, skip);
 
+  // Only Trending/Popular movie charts support this filter -- TV has no
+  // digital-release concept on TMDB (see fetchTmdbDetails's own comment),
+  // and every other chartKey (Top Rated, Now Playing, Upcoming, provider
+  // charts, etc.) is either already release-gated by its own nature or
+  // isn't what the "hide items with no digital release" setting was aimed
+  // at (Trending/Popular specifically, per how it was requested).
+  const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
+
   const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
+    // hasDigitalRelease === null means the lookup itself failed or didn't
+    // apply (see fetchTmdbDetails) -- treat that as "keep it" rather than
+    // "no digital release", so a transient TMDB hiccup can't silently
+    // shrink the list; only an explicit false (checked and confirmed
+    // absent) is filtered out.
+    if (applyDigitalFilter && hasDigitalRelease === false) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
@@ -618,7 +738,7 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
 // them -- TOP_N below is the only thing controlling that, not something
 // TMDB itself expresses (their discover results are just popularity-
 // sorted, uncapped).
-async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
+async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey, region) {
   const TOP_N = 10;
   if (skip >= TOP_N) return []; // already gave everything -- tells the caller to stop paginating
   if (!apiKey) {
@@ -628,10 +748,11 @@ async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
   }
   const wantKind = entry.type === "series" ? "tv" : "movie";
   const pathMap = TMDB_CHART_PATHS[chartKey];
-  const chartPath = pathMap && pathMap[wantKind];
+  let chartPath = pathMap && pathMap[wantKind];
   if (!chartPath) {
     throw new Error("This TMDB chart doesn't have a shows version.");
   }
+  chartPath = substituteWatchRegion(chartPath, region);
   // A single direct page-1 request -- TOP_N=10 always fits inside TMDB's
   // own 20-per-page results, so this deliberately skips
   // fetchTmdbPagedResults's own windowing (built for pulling up to
@@ -874,7 +995,7 @@ const TMDB_GENRE_CONFIG = {
   },
 };
 
-async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
+async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
   if (!apiKey) {
     throw new Error(
       "Genre lists aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
@@ -883,7 +1004,7 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
   const wantKind = entry.type === "series" ? "tv" : "movie";
   const key = String(genreKey || "").toLowerCase().trim();
   const config = TMDB_GENRE_CONFIG[key] || { movie: "", tv: "" };
-  const queryPart = config[wantKind] || "";
+  const queryPart = substituteWatchRegion(config[wantKind] || "", region);
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
 
@@ -926,9 +1047,16 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
-  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}`;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  // effectiveRegion folded into the cache key (defaulting to "US" so every
+  // existing call site that doesn't pass one keeps sharing the exact same
+  // cache entries as before, zero regression) -- content ratings are
+  // region-specific (see fetchTmdbItemDetailsUncached below), so without
+  // this the first region to ever request a given title would silently
+  // poison the shared cache for every other region's users.
+  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
   return fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
     // Matches the 7-day cacheTtl already on each individual fetch() below
@@ -940,12 +1068,13 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
     // beats the modal failing to open at all.
     staleTtlSec: 2592000,
     providerLabel: "TMDB Item Details",
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
   });
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   let rawStr = String(imdbId).trim();
   let tmdbId = null;
   let type = (fallbackType === "series" || fallbackType === "tv") ? "tv" : (fallbackType === "movie" ? "movie" : null);
@@ -1018,16 +1147,21 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
   if (!match || !resolvedType) return null;
   type = resolvedType;
   
-  // Extract content rating (US fallback)
+  // Extract content rating -- prefer the requested region's own
+  // certification, falling back to US if that region has no entry for
+  // this title (common outside a handful of major markets; US almost
+  // always has one, and an approximate rating beats showing none at all).
   let contentRating = null;
   if (type === "movie" && match.release_dates && match.release_dates.results) {
-    const us = match.release_dates.results.find(r => r.iso_3166_1 === "US");
-    if (us && us.release_dates.length > 0) {
-      contentRating = us.release_dates.find(r => r.certification)?.certification;
+    const regional = match.release_dates.results.find(r => r.iso_3166_1 === effectiveRegion) ||
+                      match.release_dates.results.find(r => r.iso_3166_1 === "US");
+    if (regional && regional.release_dates.length > 0) {
+      contentRating = regional.release_dates.find(r => r.certification)?.certification;
     }
   } else if (type === "tv" && match.content_ratings && match.content_ratings.results) {
-    const us = match.content_ratings.results.find(r => r.iso_3166_1 === "US");
-    if (us) contentRating = us.rating;
+    const regional = match.content_ratings.results.find(r => r.iso_3166_1 === effectiveRegion) ||
+                      match.content_ratings.results.find(r => r.iso_3166_1 === "US");
+    if (regional) contentRating = regional.rating;
   }
   
   // Extract trailer
@@ -1114,7 +1248,48 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
     genres: genres,
     trailerKey: trailerKey,
     cast: cast,
-    director: director
+    director: director,
+    // Airing Next (client-side, 21_client-custom-list-builder.js) reads
+    // these straight off TMDB's own next_episode_to_air -- already present
+    // on this same /tv/{id} response fetched above, so this costs nothing
+    // extra. null on a movie, or a tv show with no scheduled next episode
+    // (ended/cancelled, or simply not yet renewed).
+    //
+    // Fallback: TMDB only populates next_episode_to_air once it has an
+    // actual episode row with a confirmed air date -- a renewed show whose
+    // next season has only a season-level premiere date announced (e.g.
+    // "Season 9 -- Jan 1, 2027") shows next_episode_to_air: null right up
+    // until TMDB adds that first episode's own row, even though the
+    // premiere date itself is already known. match.seasons (fetched as
+    // part of this same response, see seasonsData above) carries that
+    // season-level air_date, so fall back to the nearest not-yet-aired
+    // season in there rather than silently reporting "nothing scheduled".
+    ...(() => {
+      if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
+      if (match.next_episode_to_air) {
+        return {
+          nextEpisodeAirDate: match.next_episode_to_air.air_date || null,
+          nextEpisodeNumber: typeof match.next_episode_to_air.episode_number === "number" ? match.next_episode_to_air.episode_number : null,
+          nextEpisodeSeasonNumber: typeof match.next_episode_to_air.season_number === "number" ? match.next_episode_to_air.season_number : null,
+        };
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      const upcomingSeasons = Array.isArray(match.seasons)
+        ? match.seasons.filter((s) => s && s.season_number > 0 && s.air_date && s.air_date > today)
+        : [];
+      upcomingSeasons.sort((a, b) => a.air_date.localeCompare(b.air_date));
+      const nextSeason = upcomingSeasons[0];
+      if (nextSeason) {
+        return {
+          nextEpisodeAirDate: nextSeason.air_date,
+          nextEpisodeNumber: 1,
+          nextEpisodeSeasonNumber: nextSeason.season_number,
+        };
+      }
+      return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
+    })(),
+    lastEpisodeNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.episode_number === "number" ? match.last_episode_to_air.episode_number : null) : null,
+    lastEpisodeSeasonNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.season_number === "number" ? match.last_episode_to_air.season_number : null) : null,
   };
 }
 

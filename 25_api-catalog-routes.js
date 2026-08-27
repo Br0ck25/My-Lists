@@ -80,11 +80,11 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
       return new Response(
         renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
           isConfigureMode: true,
         }),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
@@ -357,12 +357,13 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, trackCreatorName } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
 
       const source = detectSource(entry.url);
       const isAutoTrack = source === "autotrack";
+      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -371,22 +372,26 @@ self.addEventListener('fetch', e => {
       // before. Only active when a CONFIGS KV namespace is bound (optional,
       // same as the short-link feature) -- without one this behaves exactly
       // as it did previously.
-      const staleKey = env && env.CONFIGS && !isAutoTrack ? `lastgood:${config}:${type}:${id}` : null;
+      const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, trackCreatorName, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
           );
         }
-        if (isAutoTrack) {
+        if (isUserPersonal) {
           return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
         return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
+        if (isUserPersonal) {
+          console.error("User personal catalog fetch error:", errMsg);
+          return json({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+        }
 
         if (skip === 0 && staleKey) {
           try {
@@ -477,7 +482,7 @@ self.addEventListener('fetch', e => {
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -495,6 +500,7 @@ self.addEventListener('fetch', e => {
         simklKey = reqBody.simklKey || "";
         simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
+        hideNonDigitalReleases = !!reqBody.hideNonDigitalReleases;
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
       } else {
@@ -508,12 +514,13 @@ self.addEventListener('fetch', e => {
         simklKey = url.searchParams.get("simklKey") || "";
         simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
+        hideNonDigitalReleases = url.searchParams.get("hideNonDigitalReleases") === "1";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
@@ -2162,7 +2169,15 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
       }
       try {
-        const res = await fetch("https://api.simkl.com/sync/all-items/", {
+        // extended=full is required to get watched_episodes_count/
+        // total_episodes_count/not_aired_episodes_count back on each item --
+        // without it Simkl's default (summary) shape omits or zeroes these,
+        // which breaks isCaughtUp's fallback check in
+        // enrichSimklAiringNextDates (17_client-my-lists-and-trakt-oauth.js)
+        // for any show whose completion isn't otherwise obvious from
+        // status alone. No date_from on purpose -- this always wants the
+        // full current watchlist, not a delta since a stored checkpoint.
+        const res = await fetch("https://api.simkl.com/sync/all-items/?extended=full", {
           headers: {
             "Authorization": `Bearer ${token}`,
             "simkl-api-key": clientId,
@@ -2230,6 +2245,59 @@ self.addEventListener('fetch', e => {
               url: `simkl:user:${cat.key}:${stKey}`,
             });
           }
+        }
+
+        const airingCandidateItems = [
+          ...(Array.isArray(data.shows) ? data.shows : []),
+          ...(Array.isArray(data.anime) ? data.anime : []),
+        ].filter((it) => (it.status === "watching" || it.status === "completed"));
+
+        airingCandidateItems.sort((a, b) => {
+          const aTime = a.last_watched_at ? new Date(a.last_watched_at).getTime() : 0;
+          const bTime = b.last_watched_at ? new Date(b.last_watched_at).getTime() : 0;
+          if (a.status === "watching" && b.status !== "watching") return -1;
+          if (b.status === "watching" && a.status !== "watching") return 1;
+          return bTime - aTime;
+        });
+
+        const seenAiringIds = new Set();
+        const dedupedAiring = [];
+        for (const item of airingCandidateItems) {
+          const mediaObj = item.show || item.anime;
+          if (mediaObj && mediaObj.ids) {
+            const imdbId = mediaObj.ids.imdb || "";
+            const tmdbId = mediaObj.ids.tmdb || "";
+            const simklId = mediaObj.ids.simkl || "";
+            const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : (simklId ? `simkl:${simklId}` : ""));
+            if (bestId && !seenAiringIds.has(bestId)) {
+              seenAiringIds.add(bestId);
+              dedupedAiring.push({
+                id: bestId,
+                imdbId: imdbId || null,
+                tmdbId: tmdbId || null,
+                name: mediaObj.title || "",
+                year: mediaObj.year || "",
+                poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+                type: "series",
+                status: item.status || "watching",
+                watchedCount: item.watched_episodes_count,
+                totalCount: item.total_episodes_count,
+                lastWatched: item.last_watched || null,
+              });
+            }
+          }
+        }
+
+        if (dedupedAiring.length > 0) {
+          lists.unshift({
+            name: "Simkl Airing Next",
+            type: "series",
+            itemCount: dedupedAiring.length,
+            statusKey: "airing-next",
+            categoryKey: "shows",
+            items: dedupedAiring,
+            url: "simkl:user:shows:airing-next",
+          });
         }
         let simklUsername = "";
         try {
@@ -3805,7 +3873,7 @@ self.addEventListener('fetch', e => {
       const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
-      const isAdmin = await isAdminRequest(request, env);
+      const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
       const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
@@ -4032,7 +4100,16 @@ self.addEventListener('fetch', e => {
           cf: { cacheTtl: 60, cacheEverything: false },
         });
         if (!res.ok) {
-          return json({ ok: false, error: `MDBList request failed (HTTP ${res.status}). Double check the API key or connection.` });
+          // 429 means MDBList's own rate limit was hit -- a bad/expired
+          // key would come back as 401/403, not 429, so don't tell the
+          // person to "double check the API key" for a rate limit; that
+          // sends them looking in the wrong place. See the matching hint
+          // logic in fetchMdblistList (06_source-fetchers-mdblist-trakt.js)
+          // for the same distinction on the other MDBList call site.
+          const hint = res.status === 429
+            ? " MDBList's rate limit was hit -- wait a bit and try again."
+            : (res.status === 401 || res.status === 403 ? " Double check the API key or connection." : "");
+          return json({ ok: false, error: `MDBList request failed (HTTP ${res.status}).${hint}` });
         }
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
@@ -4283,11 +4360,15 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "No lists provided." }, 400);
       }
       const payload = { entries };
+      if (body.tmdbKey) payload.tmdbKey = body.tmdbKey;
       if (body.mdblistKey) payload.mdblistKey = body.mdblistKey;
       if (body.mdblistAccessToken) payload.mdblistAccessToken = body.mdblistAccessToken;
       if (body.traktKey) payload.traktKey = body.traktKey;
       if (body.traktUsername) payload.traktUsername = body.traktUsername;
       if (body.traktAccessToken) payload.traktAccessToken = body.traktAccessToken;
+      if (body.simklKey) payload.simklKey = body.simklKey;
+      if (body.simklAccessToken) payload.simklAccessToken = body.simklAccessToken;
+      if (body.simklUsername) payload.simklUsername = body.simklUsername;
       if (body.track) {
         payload.track = true;
         payload.trackCreatorName = body.trackCreatorName || "";
@@ -4295,6 +4376,8 @@ self.addEventListener('fetch', e => {
       }
       if (body.shuffleShelves) payload.shuffleShelves = true;
       if (body.shuffleItems) payload.shuffleItems = true;
+      if (body.region && body.region !== "US") payload.region = body.region;
+      if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
 
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -4390,15 +4473,15 @@ self.addEventListener('fetch', e => {
         }
       } else {
         const q = url.searchParams;
-        reqBody = { imdbId: q.get("imdbId") || "", tmdbKey: q.get("tmdbKey") || "", type: q.get("type") || "" };
+        reqBody = { imdbId: q.get("imdbId") || q.get("id") || "", tmdbKey: q.get("tmdbKey") || "", type: q.get("type") || "", region: q.get("region") || "" };
       }
       
-      const imdbId = reqBody.imdbId;
+      const imdbId = reqBody.imdbId || reqBody.id;
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
       if (!imdbId) return json({ ok: false, error: "Missing imdbId" }, 400);
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       
-      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type);
+      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region);
       if (!details) return json({ ok: false, error: "Not found or TMDB error" }, 404);
       
       // Short max-age -- same reasoning as /api/season's own comment: this

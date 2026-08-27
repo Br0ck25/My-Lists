@@ -1,9 +1,9 @@
 <div class="tab-panel" data-tab-panel="catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
-    <button type="button" class="subnav-pill active" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
-    <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('quickadd', this)">Quick Add</button>
-    <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('bulk', this)">Bulk Add</button>
+    <button type="button" class="subnav-pill active" data-sub="all" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
+    <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchCatalogsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="bulk" onclick="switchCatalogsSubmenu('bulk', this)">Bulk Add</button>
   </div>
 
   <div class="lists-subpanel" id="catalogsSubShelves">

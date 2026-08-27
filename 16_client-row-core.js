@@ -16,6 +16,104 @@ const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
 
+(function earlySubmenuSync() {
+  try {
+    // 1. Catalogs submenu early sync
+    var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+    var catBar = document.getElementById('catalogsFilterBar');
+    if (catBar) {
+      catBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === catSub || (p.getAttribute('onclick') || '').indexOf("'" + catSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subShelves = document.getElementById('catalogsSubShelves');
+    var subQuickAdd = document.getElementById('catalogsSubQuickAdd');
+    var subBulk = document.getElementById('catalogsSubBulk');
+    if (subShelves) subShelves.style.display = (catSub === 'all' || catSub === 'shelves') ? 'block' : 'none';
+    if (subQuickAdd) subQuickAdd.style.display = (catSub === 'quickadd') ? 'block' : 'none';
+    if (subBulk) subBulk.style.display = (catSub === 'bulk') ? 'block' : 'none';
+
+    // 2. Lists submenu early sync
+    var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+    var listBar = document.getElementById('listsSubnavBar');
+    if (listBar) {
+      listBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === listSub || (p.getAttribute('onclick') || '').indexOf("'" + listSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subMyLists = document.getElementById('listsSubMyLists');
+    var subLiked = document.getElementById('listsSubLiked');
+    var subListImport = document.getElementById('listsSubImport');
+    var subListBulk = document.getElementById('listsSubBulk');
+    var subCreate = document.getElementById('listsSubCreateList');
+    if (subMyLists) subMyLists.style.display = (listSub === 'my-lists') ? 'block' : 'none';
+    if (subLiked) subLiked.style.display = (listSub === 'liked') ? 'block' : 'none';
+    if (subListImport) subListImport.style.display = (listSub === 'import') ? 'block' : 'none';
+    if (subListBulk) subListBulk.style.display = (listSub === 'bulk') ? 'block' : 'none';
+    if (subCreate) subCreate.style.display = (listSub === 'create-list') ? 'block' : 'none';
+
+    // 3. Channels submenu early sync
+    var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+    var chBar = document.getElementById('channelsSubnavBar');
+    if (chBar) {
+      chBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === chSub || (p.getAttribute('onclick') || '').indexOf("'" + chSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subMyChannels = document.getElementById('channelsSubMyChannels');
+    var subStorylines = document.getElementById('channelsSubStorylines');
+    var subChQuickAdd = document.getElementById('channelsSubQuickAdd');
+    var subChImport = document.getElementById('channelsSubImport');
+    var subBuild = document.getElementById('channelsSubBuild');
+    if (subMyChannels) subMyChannels.style.display = (chSub === 'my-channels') ? 'block' : 'none';
+    if (subStorylines) subStorylines.style.display = (chSub === 'storylines') ? 'block' : 'none';
+    if (subChQuickAdd) subChQuickAdd.style.display = (chSub === 'quickadd') ? 'block' : 'none';
+    if (subChImport) subChImport.style.display = (chSub === 'import') ? 'block' : 'none';
+    if (subBuild) subBuild.style.display = (chSub === 'build') ? 'block' : 'none';
+
+    // 4. Settings submenu early sync
+    var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
+    var setBar = document.getElementById('settingsSubnavBar');
+    if (setBar) {
+      setBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === setSub || (p.getAttribute('onclick') || '').indexOf("'" + setSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subAccount = document.getElementById('settingsSubAccount');
+    var subExternal = document.getElementById('settingsSubExternal');
+    var subBackup = document.getElementById('settingsSubBackup');
+    var subFeedback = document.getElementById('settingsSubFeedback');
+    if (subAccount) subAccount.style.display = (setSub === 'account' || setSub === 'keys') ? 'block' : 'none';
+    if (subExternal) subExternal.style.display = (setSub === 'external') ? 'block' : 'none';
+    if (subBackup) subBackup.style.display = (setSub === 'backup') ? 'block' : 'none';
+    if (subFeedback) subFeedback.style.display = (setSub === 'feedback') ? 'block' : 'none';
+
+    // 5. Discover submenu early sync
+    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    var discBar = document.getElementById('discoverSubnavBar');
+    if (discBar) {
+      discBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === discSub || (p.getAttribute('onclick') || '').indexOf("'" + discSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+  } catch (e) {}
+})();
+
 function deslugify(s) {
   return String(s || '')
     .split('-')
@@ -342,6 +440,19 @@ function updateAllListAddButtons() {
     btn.textContent = isAdded ? 'Remove' : '+ Add';
     btn.style.color = isAdded ? 'var(--danger)' : '';
   });
+
+  // 6. Provider My Lists add buttons (Simkl, Trakt, MDBList)
+  document.querySelectorAll('.myListAddBtn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(url, type) || isListAddedToConfig(null, type, url)) : false;
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+    btn.disabled = false;
+  });
 }
 
 
@@ -380,7 +491,15 @@ function navigateBackFromDetail() {
 
 // Global state variables
 var suppressSave = false;
-var activeCreator = null;
+var activeCreator = (function() {
+  try {
+    const name = localStorage.getItem('myListAddon:creatorName');
+    const key = localStorage.getItem('myListAddon:creatorKey');
+    const disp = localStorage.getItem('myListAddon:creatorDisplayName') || name;
+    if (name && key) return { creatorName: name, displayName: disp };
+  } catch (e) {}
+  return null;
+})();
 var livePreviewShelfData = [];
 // No dedicated text input for this one (unlike the other keys) -- it's set
 // via the Connect Trakt button/OAuth flow, not typed in, so it lives as
@@ -453,6 +572,10 @@ function switchTab(name) {
   if (titleEl) titleEl.textContent = t.title;
   if (subEl) subEl.textContent = t.sub;
 
+  try {
+    document.documentElement.removeAttribute('data-initial-tab');
+  } catch (e) {}
+
   document.querySelectorAll('.tab-panel').forEach(function(p) {
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
   });
@@ -488,6 +611,7 @@ function switchTab(name) {
   }
 
   if (name === 'lists') {
+    if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
     if (!window._listsInitializedOnce) {
       window._listsInitializedOnce = true;
       let savedSub = 'my-lists';
@@ -548,7 +672,34 @@ function switchTab(name) {
   if (name === 'catalogs') {
     if (!window._catalogsInitializedOnce) {
       window._catalogsInitializedOnce = true;
-      if (typeof renderLivePreview === 'function') renderLivePreview();
+      // Rows are added by the page's own init sequence (addRow calls in
+      // 24_client-backup-restore-presets.js, driven by either the install
+      // link's serverEntries or a restored localStorage save) earlier in
+      // the same script, and restoreActiveTab (which reaches this via
+      // switchTab) runs after that block finishes -- so #lists should
+      // already be populated by the time this fires. But this is the
+      // first tab-switch of the page's life, run from the very tail of a
+      // long synchronous init script, and depends on that whole prior
+      // sequence having actually completed rather than merely being
+      // *scheduled* -- if anything upstream ever ends up deferring its
+      // own addRow calls (e.g. a slow-loading dependency, a future
+      // refactor), calling renderLivePreview against an empty #lists here
+      // finds zero enabled shelves and silently no-ops (see its own early
+      // return), permanently leaving every row on its "Click Refresh
+      // Preview" placeholder with nothing left to ever retry it. Guarding
+      // on an actual entry existing (rather than trusting a fixed delay,
+      // which either races on a slow device or wastes time on a fast one)
+      // makes this immune to exactly how long that upstream sequence
+      // takes, including if it ever changes.
+      const triggerLivePreview = () => {
+        const hasRows = document.getElementById('lists') && document.getElementById('lists').querySelector('.entry');
+        if (hasRows) {
+          if (typeof renderLivePreview === 'function') renderLivePreview();
+        } else {
+          setTimeout(triggerLivePreview, 50);
+        }
+      };
+      triggerLivePreview();
     }
   }
   if (name === 'discover') {
@@ -662,6 +813,7 @@ function restoreActiveTab() {
 
 function switchListsSubmenu(name, btn) {
   try {
+    document.documentElement.removeAttribute('data-initial-lists-sub');
     localStorage.setItem('myListAddon:listsSubmenu', name);
   } catch (e) {}
   document.querySelectorAll('#listsSubnavBar .subnav-pill').forEach(function(p) {
@@ -727,6 +879,7 @@ function switchListsSubmenu(name, btn) {
 
 function switchSettingsSubmenu(name, btn) {
   try {
+    document.documentElement.removeAttribute('data-initial-settings-sub');
     localStorage.setItem('myListAddon:settingsSubmenu', name);
   } catch (e) {}
   if (btn) {
@@ -1026,6 +1179,9 @@ function trackEventsBatch(eventType, items) {
 }
 
 function filterDiscoverShelves(filter, btn) {
+  try {
+    document.documentElement.removeAttribute('data-initial-discover-sub');
+  } catch (e) {}
   window._currentDiscoverFilter = filter || 'all';
   try {
     localStorage.setItem('myListAddon:discoverSubmenu', filter || 'all');
@@ -1174,15 +1330,15 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
 
   if (type === 'gems' || type === 'all') {
-    pushSingle('Hidden Gems (Movies)', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
-    pushSingle('Hidden Gems (Shows)', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
+    pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
+    pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
   }
 
   if (type === 'kids' || type === 'all') {
     if (window._CHARTS_KIDS) {
       window._CHARTS_KIDS.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Kids');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Kids');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Kids');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Kids');
       });
     }
   }
@@ -1190,8 +1346,8 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'holidays' || type === 'all') {
     if (window._CHARTS_HOLIDAYS) {
       window._CHARTS_HOLIDAYS.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Holidays');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Holidays');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Holidays');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Holidays');
       });
     }
   }
@@ -1199,8 +1355,8 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'genres' || type === 'all') {
     if (window._CHARTS_GENRES) {
       window._CHARTS_GENRES.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Genres');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Genres');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Genres');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Genres');
       });
     }
   }
@@ -1223,6 +1379,9 @@ function switchCatalogsSubmenu(filter, btn) {
     switchTab('channels');
     return;
   }
+  try {
+    document.documentElement.removeAttribute('data-initial-catalogs-sub');
+  } catch (e) {}
   window._currentCatalogsSubmenu = filter || 'all';
   try {
     localStorage.setItem('myListAddon:catalogsSubmenu', filter || 'all');

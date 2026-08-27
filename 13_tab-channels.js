@@ -1,10 +1,10 @@
 <div class="tab-panel" data-tab-panel="channels" hidden>
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('import', this)">Import</button>
+    <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
+    <button type="button" class="subnav-pill" data-sub="storylines" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
+    <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="import" onclick="switchChannelsSubmenu('import', this)">Import</button>
   </div>
 
   <!-- Submenu: Storylines & Universes (Canon Timelines, Sagas & Bridges) -->

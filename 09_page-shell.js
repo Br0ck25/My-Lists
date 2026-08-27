@@ -13,6 +13,8 @@ function renderBuilder(
   const initialSimklUsername = initialKeys.simklUsername || "";
   const initialShuffleShelves = !!initialKeys.shuffleShelves;
   const initialShuffleItems = !!initialKeys.shuffleItems;
+  const initialRegion = initialKeys.region || "US";
+  const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -110,6 +112,34 @@ ${seoHeadHtml}
   if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
     document.documentElement.classList.add('dark-theme');
   }
+  (function() {
+    var p = location.pathname || '';
+    var h = location.hash || '';
+    var isDeep = (p.startsWith('/lists/') && p !== '/lists') || p.startsWith('/channels/') || h.startsWith('#/list?') || h.startsWith('#/item?');
+    var tab = 'discover';
+    if (isDeep) {
+      tab = h.startsWith('#/item?') ? 'item-details' : 'list-details';
+    } else {
+      try {
+        var s = localStorage.getItem('myListAddon:activeTab');
+        if (s && s !== 'list-details' && s !== 'item-details') tab = s;
+      } catch (e) {}
+    }
+    document.documentElement.setAttribute('data-initial-tab', tab);
+
+    try {
+      var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+      document.documentElement.setAttribute('data-initial-catalogs-sub', catSub);
+      var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+      document.documentElement.setAttribute('data-initial-lists-sub', listSub);
+      var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+      document.documentElement.setAttribute('data-initial-channels-sub', chSub);
+      var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
+      document.documentElement.setAttribute('data-initial-settings-sub', setSub);
+      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+      document.documentElement.setAttribute('data-initial-discover-sub', discSub);
+    } catch (e) {}
+  })();
 </script>
 <style>
   :root {
@@ -289,6 +319,241 @@ ${seoHeadHtml}
   .tab-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
   .tab-panel { display: grid; gap: 14px; width: 100%; max-width: 100%; min-width: 0; }
   .tab-panel[hidden] { display: none; }
+  /* Prevent FOUC: Show initial active tab and hide inactive ones before script execution */
+  html[data-initial-tab] .tab-panel {
+    display: none !important;
+  }
+  html[data-initial-tab="discover"] .tab-panel[data-tab-panel="discover"],
+  html[data-initial-tab="catalogs"] .tab-panel[data-tab-panel="catalogs"],
+  html[data-initial-tab="lists"] .tab-panel[data-tab-panel="lists"],
+  html[data-initial-tab="channels"] .tab-panel[data-tab-panel="channels"],
+  html[data-initial-tab="search"] .tab-panel[data-tab-panel="search"],
+  html[data-initial-tab="settings"] .tab-panel[data-tab-panel="settings"],
+  html[data-initial-tab="list-details"] .tab-panel[data-tab-panel="list-details"],
+  html[data-initial-tab="item-details"] .tab-panel[data-tab-panel="item-details"] {
+    display: grid !important;
+  }
+  html[data-initial-tab]:not([data-initial-tab="discover"]) .tab-btn[data-tab="discover"] {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: var(--shadow-sm) !important;
+  }
+  html[data-initial-tab]:not([data-initial-tab="discover"]) .bottom-nav-item[data-tab="discover"] {
+    color: var(--muted) !important;
+  }
+  html[data-initial-tab="catalogs"] .tab-btn[data-tab="catalogs"],
+  html[data-initial-tab="lists"] .tab-btn[data-tab="lists"],
+  html[data-initial-tab="channels"] .tab-btn[data-tab="channels"],
+  html[data-initial-tab="search"] .tab-btn[data-tab="search"],
+  html[data-initial-tab="settings"] .tab-btn[data-tab="settings"] {
+    background: var(--accent) !important;
+    color: #fff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 10px rgba(0,122,255,0.30) !important;
+  }
+  html[data-initial-tab="catalogs"] .bottom-nav-item[data-tab="catalogs"],
+  html[data-initial-tab="lists"] .bottom-nav-item[data-tab="lists"],
+  html[data-initial-tab="channels"] .bottom-nav-item[data-tab="channels"],
+  html[data-initial-tab="search"] .bottom-nav-item[data-tab="search"],
+  html[data-initial-tab="settings"] .bottom-nav-item[data-tab="settings"] {
+    color: var(--accent) !important;
+  }
+
+  /* --- Initial Subpanel & Subnav Styles (Zero FOUC on Refresh) --- */
+  /* Catalogs */
+  html[data-initial-catalogs-sub] #catalogsSubShelves,
+  html[data-initial-catalogs-sub] #catalogsSubQuickAdd,
+  html[data-initial-catalogs-sub] #catalogsSubBulk {
+    display: none !important;
+  }
+  html[data-initial-catalogs-sub="all"] #catalogsSubShelves,
+  html[data-initial-catalogs-sub="shelves"] #catalogsSubShelves {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub="quickadd"] #catalogsSubQuickAdd {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub="bulk"] #catalogsSubBulk {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub] #catalogsFilterBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-catalogs-sub] #catalogsFilterBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-catalogs-sub="all"] #catalogsFilterBar .subnav-pill[data-sub="all"],
+  html[data-initial-catalogs-sub="shelves"] #catalogsFilterBar .subnav-pill[data-sub="all"],
+  html[data-initial-catalogs-sub="quickadd"] #catalogsFilterBar .subnav-pill[data-sub="quickadd"],
+  html[data-initial-catalogs-sub="bulk"] #catalogsFilterBar .subnav-pill[data-sub="bulk"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Lists */
+  html[data-initial-lists-sub] #listsSubMyLists,
+  html[data-initial-lists-sub] #listsSubLiked,
+  html[data-initial-lists-sub] #listsSubImport,
+  html[data-initial-lists-sub] #listsSubBulk,
+  html[data-initial-lists-sub] #listsSubCreateList {
+    display: none !important;
+  }
+  html[data-initial-lists-sub="my-lists"] #listsSubMyLists {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="liked"] #listsSubLiked {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="import"] #listsSubImport {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="bulk"] #listsSubBulk {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="create-list"] #listsSubCreateList {
+    display: block !important;
+  }
+  html[data-initial-lists-sub] #listsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-lists-sub] #listsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-lists-sub="my-lists"] #listsSubnavBar .subnav-pill[data-sub="my-lists"],
+  html[data-initial-lists-sub="liked"] #listsSubnavBar .subnav-pill[data-sub="liked"],
+  html[data-initial-lists-sub="import"] #listsSubnavBar .subnav-pill[data-sub="import"],
+  html[data-initial-lists-sub="bulk"] #listsSubnavBar .subnav-pill[data-sub="bulk"],
+  html[data-initial-lists-sub="create-list"] #listsSubnavBar .subnav-pill[data-sub="create-list"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Channels */
+  html[data-initial-channels-sub] #channelsSubMyChannels,
+  html[data-initial-channels-sub] #channelsSubStorylines,
+  html[data-initial-channels-sub] #channelsSubQuickAdd,
+  html[data-initial-channels-sub] #channelsSubImport,
+  html[data-initial-channels-sub] #channelsSubBuild {
+    display: none !important;
+  }
+  html[data-initial-channels-sub="my-channels"] #channelsSubMyChannels {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="storylines"] #channelsSubStorylines {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="quickadd"] #channelsSubQuickAdd {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="import"] #channelsSubImport {
+    display: block !important;
+  }
+  html[data-initial-channels-sub] #channelsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-channels-sub] #channelsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-channels-sub="my-channels"] #channelsSubnavBar .subnav-pill[data-sub="my-channels"],
+  html[data-initial-channels-sub="storylines"] #channelsSubnavBar .subnav-pill[data-sub="storylines"],
+  html[data-initial-channels-sub="quickadd"] #channelsSubnavBar .subnav-pill[data-sub="quickadd"],
+  html[data-initial-channels-sub="import"] #channelsSubnavBar .subnav-pill[data-sub="import"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Settings */
+  html[data-initial-settings-sub] #settingsSubAccount,
+  html[data-initial-settings-sub] #settingsSubExternal,
+  html[data-initial-settings-sub] #settingsSubBackup,
+  html[data-initial-settings-sub] #settingsSubFeedback {
+    display: none !important;
+  }
+  html[data-initial-settings-sub="account"] #settingsSubAccount,
+  html[data-initial-settings-sub="keys"] #settingsSubAccount {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="external"] #settingsSubExternal {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="backup"] #settingsSubBackup {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="feedback"] #settingsSubFeedback {
+    display: block !important;
+  }
+  html[data-initial-settings-sub] #settingsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-settings-sub] #settingsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-settings-sub="account"] #settingsSubnavBar .subnav-pill[data-sub="account"],
+  html[data-initial-settings-sub="keys"] #settingsSubnavBar .subnav-pill[data-sub="account"],
+  html[data-initial-settings-sub="external"] #settingsSubnavBar .subnav-pill[data-sub="external"],
+  html[data-initial-settings-sub="backup"] #settingsSubnavBar .subnav-pill[data-sub="backup"],
+  html[data-initial-settings-sub="feedback"] #settingsSubnavBar .subnav-pill[data-sub="feedback"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Discover */
+  html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="popular"] #discoverListsFeed,
+  html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="curated"] #discoverListsFeed {
+    display: none !important;
+  }
+  html[data-initial-discover-sub="popular"] #discoverSubPopular {
+    display: block !important;
+  }
+  html[data-initial-discover-sub="curated"] #discoverSubCurated {
+    display: block !important;
+  }
+  html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-discover-sub="all"] #discoverSubnavBar .subnav-pill[data-sub="all"],
+  html[data-initial-discover-sub="movie"] #discoverSubnavBar .subnav-pill[data-sub="movie"],
+  html[data-initial-discover-sub="series"] #discoverSubnavBar .subnav-pill[data-sub="series"],
+  html[data-initial-discover-sub="popular"] #discoverSubnavBar .subnav-pill[data-sub="popular"],
+  html[data-initial-discover-sub="curated"] #discoverSubnavBar .subnav-pill[data-sub="curated"],
+  html[data-initial-discover-sub="gems"] #discoverSubnavBar .subnav-pill[data-sub="gems"],
+  html[data-initial-discover-sub="kids"] #discoverSubnavBar .subnav-pill[data-sub="kids"],
+  html[data-initial-discover-sub="holidays"] #discoverSubnavBar .subnav-pill[data-sub="holidays"],
+  html[data-initial-discover-sub="genres"] #discoverSubnavBar .subnav-pill[data-sub="genres"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
   /* Each direct child of .tab-panel (the subnav pill bar, each
      .lists-subpanel) is a grid item and inherits the same default
      min-width:auto issue .tab-panel itself was already guarded against
@@ -301,6 +566,13 @@ ${seoHeadHtml}
      a crossover-detection banner) could force the whole tab wider than
      the viewport on mobile instead of wrapping/scrolling within itself. */
   .channels-subpanel { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  /* Same fix, same reason, for the item-details page's direct content
+     wrapper -- it's a direct grid-item child of .tab-panel too, and
+     without its own min-width:0 override, wide unwrapped content inside
+     it (cast rows, provider/genre chip rows, etc.) could force the whole
+     page past the viewport width on mobile, same as the two subpanels
+     above. */
+  #itemDetailsBody { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
 
   /* --- Bottom Nav (Mobile Only - Persistent Glassmorphism) ---------------- */
   .bottom-nav { display: none; }
@@ -1100,6 +1372,32 @@ ${seoHeadHtml}
     white-space: nowrap;
     text-transform: uppercase;
   }
+  .cw-date-badge-premiere {
+    background: #2fa84f;
+    top: auto;
+    bottom: 4px;
+  }
+  .airing-next-filter-pills {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .airingNextFilterPill {
+    background: var(--panel-strong);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .airingNextFilterPill.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
   .list-card-mini-poster-img-wrap img {
     width: 100%;
     height: 100%;
@@ -1551,6 +1849,18 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 2px;
     flex-wrap: wrap;
+  }
+  /* .lc-btn's base white-space:nowrap (further up this stylesheet) is
+     correct for the short, fixed labels it's normally used with ("Copy
+     Key", "Reset Key", etc.), but the button here can carry a long,
+     dynamic label ("+ Add 15 Missing Crossover Episodes in Story Order")
+     -- nowrap forced it to render as one unbroken line wider than the
+     viewport on mobile instead of wrapping. Scoped to just this button so
+     every other .lc-btn usage keeps its normal nowrap behavior. */
+  .channel-crossover-actions .lc-btn {
+    white-space: normal;
+    text-align: center;
+    max-width: 100%;
   }
   /* Support & Feedback Chat */
   .support-chat-container {
@@ -2322,6 +2632,42 @@ ${seoHeadHtml}
       Settings
     </button>
   </nav>
+
+  <script>
+    (function() {
+      var initTab = document.documentElement.getAttribute('data-initial-tab');
+      if (initTab) {
+        var titles = {
+          discover: { title: 'Discover', sub: 'Explore Popular & Streaming' },
+          catalogs: { title: 'Catalogs', sub: 'Manage Configured Catalogs' },
+          lists: { title: 'Lists', sub: 'Custom, Connected & Liked Lists' },
+          channels: { title: 'Channels', sub: '24/7 Continuous TV Streaming' },
+          search: { title: 'Search', sub: 'Find Movies, Shows & Lists' },
+          settings: { title: 'Settings', sub: 'Accounts, API Keys & Tools' }
+        };
+        var t = titles[initTab];
+        if (t) {
+          var titleEl = document.getElementById('pageMainTitle');
+          var subEl = document.getElementById('pageSubtitle');
+          if (titleEl) titleEl.textContent = t.title;
+          if (subEl) subEl.textContent = t.sub;
+        }
+      }
+      try {
+        var cName = localStorage.getItem('myListAddon:creatorName');
+        var cKey = localStorage.getItem('myListAddon:creatorKey');
+        var cDisp = localStorage.getItem('myListAddon:creatorDisplayName') || cName;
+        var cBar = document.getElementById('creatorProfileBar');
+        if (cBar) {
+          if (cName && cKey) {
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + (cDisp || cName) + '</button></div>';
+          } else {
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:6px;"><button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button></div>';
+          }
+        }
+      } catch (e) {}
+    })();
+  </script>
 
   <!-- Action Notification Toast -->
   <div id="actionToast" class="action-toast"></div>

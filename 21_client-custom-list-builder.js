@@ -956,6 +956,11 @@ function setShowFullyWatched(showId, isFullyWatched) {
   if (isFullyWatched && typeof cleanWatchedFromWatchlists === 'function') {
     cleanWatchedFromWatchlists();
   }
+  // Keeps the already-computed Airing Next list in sync with a watched-
+  // state change the instant it happens (e.g. "Mark Whole Show Unwatched")
+  // instead of leaving a stale entry on screen until the next scheduled
+  // refresh -- see syncAiringNextWatchState's own comment further down.
+  if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
 }
 
 // Companion to setShowFullyWatched above -- marks a show as having an
@@ -973,6 +978,7 @@ function setShowInProgress(showId, isInProgress) {
     window._inProgressShowIds.delete(showId);
   }
   refreshWatchBadge(showId, 'series');
+  if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
 }
 
 // Automatically removes a watched item from any Custom List designated as the Watchlist.
@@ -1306,13 +1312,28 @@ window.toggleWatchStatus = function(id, type, name, poster) {
 
 // Batch-adds or batch-removes many items (episodes, mainly) to/from the
 // Watch History list in a single localStorage write.
-window.toggleBatchWatchStatus = function(items) {
+//
+// forceUnwatch (optional): overrides the auto-detected "are these all
+// already watched" check below with an explicit true/false from the
+// caller, instead of re-deriving it from window._watchedItemIds. Exists
+// for markShowWatched (below): that caller re-fetches every season fresh
+// from TMDB on every click, and if TMDB's episode ids for the aired-
+// episode set drift even slightly between the click that marked a show
+// watched and a later click meant to unwatch it (a metadata refresh, a
+// newly-aired episode changing which ids count as "aired", etc.), the
+// items.every(...) check below can come back false on what the person
+// sees as an "unwatch" click -- silently re-adding the (mostly already
+// watched) episodes instead of removing them, so the button visibly does
+// nothing and needs a second click once every id lines up. Passing the
+// button's own current state explicitly removes that class of mismatch
+// entirely for this caller.
+window.toggleBatchWatchStatus = function(items, forceUnwatch) {
   if (!items || !items.length) return { added: 0, removed: 0, nowWatched: false };
 
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
 
-  const allWatched = items.every(it => window._watchedItemIds.has(String(it.id)));
+  const allWatched = typeof forceUnwatch === 'boolean' ? forceUnwatch : items.every(it => window._watchedItemIds.has(String(it.id)));
   let added = 0;
   let removed = 0;
 
@@ -1388,6 +1409,12 @@ window.markShowWatched = async function(imdbId) {
   const seasons = d.seasonsData.filter(s => s.season_number !== 0);
   if (!seasons.length) return;
 
+  // Capture intent from the button's own state before it's disabled/
+  // relabeled below -- see toggleBatchWatchStatus's forceUnwatch comment
+  // for why this is passed through explicitly rather than re-derived from
+  // window._watchedItemIds after the fresh TMDB fetch below.
+  const wasFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
+
   if (btn) {
     btn.disabled = true;
     btn.innerHTML = 'Fetching episodes... (0/' + seasons.length + ')';
@@ -1456,7 +1483,7 @@ window.markShowWatched = async function(imdbId) {
     return;
   }
 
-  const result = window.toggleBatchWatchStatus(allEpisodes);
+  const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
   setShowFullyWatched(String(imdbId), nowWatched);
   if (nowWatched) {
@@ -1850,4 +1877,434 @@ function dismissContinueWatchingShow(showId, btn) {
   setShowFullyWatched(showId, true);
   if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
 }
+
+// --- Airing Next ------------------------------------------------------------
+//
+// A read-only, client-computed shelf listing every watched show's next
+// upcoming episode, soonest first. A show's next air date itself only
+// changes when TMDB's own schedule changes, so the item list is
+// recomputed against TMDB on a timer (refreshAiringNext below) rather
+// than on every watch event -- but WHICH shows are even eligible changes
+// the instant this browser's own watch state does (marking something
+// watched/unwatched, etc.), so syncAiringNextWatchState below re-derives
+// that part immediately, purely from already-local data, no network
+// involved. No Fully Watched/In Progress split -- every watched show with
+// a known upcoming episode is listed together.
+
+const AIRING_NEXT_REFRESH_MS = 6 * 3600 * 1000; // matches the server Continue Watching cron's own cadence
+const AIRING_NEXT_MAX_SHOWS_PER_RUN = 60; // bounds one refresh's /api/details calls for anyone with very large history
+const AIRING_NEXT_CONCURRENCY = 4;
+
+
+function getOrCreateAiringNextList() {
+  const map = loadLocalCustomLists();
+  if (!map['airing-next']) {
+    map['airing-next'] = {
+      slug: 'airing-next',
+      localSlug: 'airing-next',
+      name: 'Airing Next',
+      description: 'Upcoming episodes for shows you have watched, soonest first.',
+      type: 'series',
+      items: [],
+      updatedAt: 0, // 0 (not Date.now()) so a fresh install refreshes on first load instead of waiting a full cycle
+      createdAt: Date.now(),
+    };
+    saveLocalCustomListsMap(map);
+  } else if (!map['airing-next'].slug) {
+    map['airing-next'].slug = 'airing-next';
+    saveLocalCustomListsMap(map);
+  }
+  return map['airing-next'];
+}
+
+// Every distinct show with at least one watched episode is a candidate --
+// this list shows all of them with a known upcoming episode, no Fully
+// Watched/In Progress split (that distinction was removed; see this
+// function's git history for the old bucketing logic if it's ever needed
+// again).
+function collectAiringNextCandidateShowIds() {
+  const ids = new Set();
+  const map = loadLocalCustomLists();
+  const watchHistoryItems = (map['watch-history'] || {}).items || [];
+  watchHistoryItems.forEach((it) => {
+    if (it && it.type === 'episode' && it.showId) ids.add(it.showId);
+  });
+  // Belt-and-suspenders: also counts a show explicitly known as fully
+  // watched even if Watch History was cleared.
+  if (window._fullyWatchedShowIds) {
+    window._fullyWatchedShowIds.forEach((id) => ids.add(id));
+  }
+  return ids;
+}
+
+// Re-derives the already-computed Airing Next list's eligibility against
+// current local state -- no network involved, unlike refreshAiringNext
+// below (which is the only thing that ever fetches a new next-air-date
+// from TMDB). Called from setShowFullyWatched/setShowInProgress (this
+// file) and removeWatchHistoryItemDirect (22_client-creator-profile.js)
+// so a show with no watched episodes left (e.g. "Mark Whole Show
+// Unwatched", or the last Watch History row for it removed) drops out of
+// the list immediately instead of lingering until the next 6-hour
+// refresh. Deliberately never ADDS a show that isn't already in the
+// cached list -- a newly-eligible show still needs its actual
+// next-air-date fetched from TMDB, which only refreshAiringNext does.
+function syncAiringNextWatchState() {
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return;
+  const map = loadLocalCustomLists();
+  const list = map['airing-next'];
+
+  const candidates = collectAiringNextCandidateShowIds();
+
+  // If there are candidate shows that aren't in the cached list at all, those
+  // newly-watched shows need a TMDB lookup to get their next air date. Force a
+  // full refresh so they appear without waiting up to 6 hours.
+  const cachedShowIds = new Set((list && Array.isArray(list.items) ? list.items : []).map((it) => it && it.showId).filter(Boolean));
+  const hasNewCandidates = [...candidates].some((id) => !cachedShowIds.has(id));
+  if (hasNewCandidates) {
+    refreshAiringNext(true).catch(() => {});
+    return;
+  }
+
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+
+  let changed = false;
+  const filtered = list.items.filter((it) => {
+    const stillCandidate = it && it.showId && candidates.has(it.showId);
+    if (!stillCandidate) changed = true;
+    return stillCandidate;
+  });
+  if (!changed) return;
+
+  list.items = filtered;
+  map['airing-next'] = list;
+  saveLocalCustomListsMap(map);
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  // Keeps a signed-in account's live "autotrack:airing-next:..." Stremio
+  // catalog in sync too, not just this browser's own dashboard preview --
+  // no-ops if not signed in, same guard as scheduleTrackingSync's own.
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+}
+
+// Recomputes the Airing Next list against TMDB, throttled to
+// AIRING_NEXT_CONCURRENCY parallel /api/details calls at a time -- each
+// call is a single cheap edge-cached lookup (same endpoint the item
+// details modal already uses), but a large watch history could still mean
+// dozens of shows, so this fans out a few at a time rather than one giant
+// Promise.all. No-ops (returns the existing list untouched) if the last
+// refresh is still within AIRING_NEXT_REFRESH_MS, unless force is true.
+async function refreshAiringNext(force) {
+  const existing = getOrCreateAiringNextList();
+  if (!force && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+    return existing;
+  }
+
+  const candidates = [...collectAiringNextCandidateShowIds()].slice(0, AIRING_NEXT_MAX_SHOWS_PER_RUN);
+  if (!candidates.length) return existing;
+
+  // Best-known title/poster for each show, straight from Watch History --
+  // avoids depending on /api/details (TMDB-only) for display fields that
+  // might already be known from a richer source (e.g. an imported Trakt
+  // history entry).
+  const knownByShow = new Map();
+  ((loadLocalCustomLists()['watch-history'] || {}).items || []).forEach((it) => {
+    if (it && it.showId && it.showTitle && !knownByShow.has(it.showId)) {
+      knownByShow.set(it.showId, { title: it.showTitle, poster: it.showPoster });
+    }
+  });
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+
+  const results = [];
+  let cursor = 0;
+  async function worker() {
+    while (cursor < candidates.length) {
+      const showId = candidates[cursor++];
+      try {
+        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey));
+        const data = await res.json();
+        const d = data && data.ok ? data.details : null;
+        if (d && d.nextEpisodeAirDate) {
+          const known = knownByShow.get(showId);
+          results.push({
+            id: showId,
+            showId: showId,
+            showTitle: (known && known.title) || d.title || '',
+            showPoster: (known && known.poster) || d.poster || '',
+            airDate: d.nextEpisodeAirDate,
+            seasonNum: d.nextEpisodeSeasonNumber,
+            episodeNum: d.nextEpisodeNumber,
+            isSeasonPremiere: d.nextEpisodeNumber === 1,
+            isUnaired: true,
+          });
+        }
+      } catch (e) {
+        // Network hiccup or no TMDB key configured -- this show is simply
+        // retried on the next refresh (or a manual "force" one) rather
+        // than blocking the rest of the batch.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
+
+  // Deduplicate by showId -- a show can appear under multiple IDs if Watch
+  // History recorded both an imdb and a tmdb-prefixed form; keep the first
+  // (earliest-resolved) entry for each show.
+  const seenIds = new Set();
+  const deduped = results.filter((it) => {
+    if (seenIds.has(it.showId)) return false;
+    seenIds.add(it.showId);
+    return true;
+  });
+  deduped.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+
+  const map = loadLocalCustomLists();
+  const fresh = getOrCreateAiringNextList();
+  fresh.items = deduped;
+  fresh.updatedAt = Date.now();
+  map['airing-next'] = fresh;
+  saveLocalCustomListsMap(map);
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  // Pushes the freshly computed list to this account's server-side
+  // tracking record (no-ops if not signed in -- see scheduleTrackingSync's
+  // own guard) so the "autotrack:airing-next:series:<username>" Stremio
+  // catalog (fetchAutoTrackedCatalog, 05_catalog-core.js) reflects it too,
+  // not just this browser's own dashboard preview.
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  return fresh;
+}
+
+// Kicked off after Watch History/Continue Watching have had a chance to
+// populate (initWatchHistory itself fires at 500ms -- see 21's own
+// setTimeout above) rather than racing them for the same localStorage
+// reads.
+setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
+
+// Builds the "Airing Next" dashboard card -- deliberately not part of
+// buildLocalListCardHtml/renderAutoTrackedListsHtml (22_client-creator-
+// profile.js): unlike Continue Watching/Watch History it has no local
+// commit-lock/dismiss machinery of its own, just a filter state and an
+// "+Add to Config" toggle, so it's simpler to keep self-contained. Adding
+// it to the Stremio config generates "autotrack:airing-next:series:
+// <username>" for a signed-in Creator account (served live by
+// fetchAutoTrackedCatalog, 05_catalog-core.js, off the airingNext field
+// pushed by pushTrackingSync) or a "customlist:v1:" snapshot of the
+// current items for a local-only browser, same as Watch History does for
+// local-only users -- see the README's "Stale install links" note for why
+// that snapshot needs a manual Configure -> Update to refresh later.
+function buildAiringNextCardHtml() {
+  const list = getOrCreateAiringNextList();
+  const filtered = list.items || [];
+  const totalCount = filtered.length;
+  const shown = filtered.slice(0, 9);
+
+  const posterThumbs = shown.map((it, i) => {
+    const isMobileEnd = (i === 2 && shown.length > 3);
+    const isDesktopEnd = (i === shown.length - 1 && shown.length >= 4);
+    let overlays = '';
+    if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    const dateBadge = it.isSeasonPremiere ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>' : '';
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0') + (dateLabel ? ' \u00b7 ' + dateLabel : '');
+    return '<div class="list-card-mini-poster-tile">' +
+      '<div class="list-card-mini-poster-img-wrap">' +
+        '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
+        dateBadge +
+        overlays +
+      '</div>' +
+      '<div class="list-card-mini-poster-name">' + escapeHtml(it.showTitle || '') + '</div>' +
+      '<div class="list-card-mini-poster-subtitle">' + escapeHtml(seasonEp) + '</div>' +
+    '</div>';
+  }).join('');
+
+  const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, 'series', 'airing-next') : false;
+  const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary localListAddToConfigBtn airingNextAddToConfigBtn is-added' : 'primary localListAddToConfigBtn airingNextAddToConfigBtn') + '" ' +
+    (isAdded ? 'style="color:var(--danger);"' : '') +
+    ' data-slug="airing-next">' + (isAdded ? 'Remove' : '+ Add') + '</button>';
+
+  return '<div class="creator-list-row list-card" draggable="true" data-slug="airing-next" data-list-type="series">' +
+    '<div class="list-card-header">' +
+      '<div class="list-card-body">' +
+        '<div class="list-card-title">' +
+          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          'Airing Next' +
+        '</div>' +
+        '<div class="list-card-meta">' +
+          '<span>Shows</span><span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="list-card-actions">' +
+        '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap;">Auto-tracked</span>' +
+        addBtnHtml +
+      '</div>' +
+    '</div>' +
+    (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '<p><small>Nothing scheduled yet.</small></p>') +
+  '</div>';
+}
+
+// Opens the full Airing Next list through the same generic list-details
+// page Continue Watching/Watch History already use -- see
+// openListDetailsPage's preloaded-sample branch (23_client-list-
+// management.js), which renders straight from the sample array below
+// without needing a server-side catalog route.
+function openAiringNextDetailsPage() {
+  const list = getOrCreateAiringNextList();
+  const sample = (list.items || []).map((it) => {
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0');
+    return {
+      id: it.showId,
+      type: 'series',
+      name: it.showTitle,
+      subtitle: dateLabel ? (seasonEp + ' \u00b7 ' + dateLabel) : seasonEp,
+      poster: it.showPoster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: it.isSeasonPremiere,
+      // The date already sits next to S/E in the subtitle above -- suppress
+      // livePreviewPosterHtml's own plain-date badge (23_client-list-
+      // management.js) for a non-premiere item so it isn't shown twice.
+      // A premiere item still shows its badge (now pinned to the bottom of
+      // the poster, see .cw-date-badge-premiere, 09_page-shell.js).
+      hideDateBadge: !it.isSeasonPremiere,
+    };
+  });
+  openListDetailsPage('Airing Next', 'series', 'custom:airing-next', { sample: sample, count: sample.length, maybeMore: false });
+}
+
+// --- Hidden Lists (Settings toggle) ------------------------------------
+//
+// Lets the person hide specific lists -- by identifier, not by section --
+// from every place lists get rendered: My Lists (local Custom Lists and
+// each connected provider's personal lists), the Airing Next dashboard
+// card, and Simkl Airing Next. A hidden list still exists and is still
+// tracked/updated normally underneath; only its rendering is suppressed,
+// the same way a browser bookmark folder can be collapsed without
+// deleting what's in it. Persisted as a flat array of identifiers in
+// localStorage so it survives reloads without needing a server round
+// trip -- this is a display preference, not data, so it doesn't need to
+// live in Watch History/Continue Watching's synced blob.
+//
+// Identifiers: a local Custom List (including the synthetic
+// 'airing-next' slug used by getOrCreateAiringNextList) is keyed by its
+// slug; every provider-backed list (MDBList/Trakt/TMDB/Simkl, including
+// 'simkl:user:shows:airing-next') is keyed by its url. Both happen to
+// already be the unique identifier each render function keys its own
+// lists by, so no extra id scheme was needed.
+const HIDDEN_LISTS_KEY = 'myListAddon:hiddenLists';
+
+function getHiddenListIds() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_LISTS_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function isListHidden(id) {
+  if (!id) return false;
+  return getHiddenListIds().includes(String(id));
+}
+
+// Adds or removes a single identifier from the hidden set and re-renders
+// every place a hidden list could currently be showing, so the change is
+// visible immediately without a full page reload. Each re-render call is
+// individually guarded (typeof ... === 'function') since not every one of
+// these is necessarily defined yet depending on where in the page's own
+// load sequence this fires from.
+function setListHidden(id, hidden) {
+  if (!id) return;
+  const idStr = String(id);
+  const current = getHiddenListIds();
+  const has = current.includes(idStr);
+  if (hidden === has) return; // already in the requested state
+  const next = hidden ? [...current, idStr] : current.filter((x) => x !== idStr);
+  try {
+    localStorage.setItem(HIDDEN_LISTS_KEY, JSON.stringify(next));
+  } catch (e) {
+    // non-critical -- worst case the toggle doesn't persist across reloads
+  }
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderMySimklLists === 'function' && window._mySimklLists) renderMySimklLists(window._mySimklLists);
+  if (typeof renderMyMdblistLists === 'function' && window._myMdblistLists) renderMyMdblistLists(window._myMdblistLists);
+  if (typeof renderMyTraktLists === 'function' && window._myTraktLists) renderMyTraktLists(window._myTraktLists);
+  if (typeof renderMyTmdbLists === 'function' && window._myTmdbLists) renderMyTmdbLists(window._myTmdbLists);
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+// --- Hidden My Lists Sections --------------------------------------------
+//
+// A coarser companion to the per-list hiding above: hides an entire
+// provider's "Your X Lists" panel on the My Lists tab (My MDBList/Trakt/
+// TMDB/Simkl Lists) -- for someone who's connected a provider account but
+// doesn't want that whole block cluttering My Lists, without having to
+// hide every individual list inside it one at a time (and without having
+// to re-hide new lists that provider adds later). Deliberately a separate
+// key/mechanism from HIDDEN_LISTS_KEY above -- these are section
+// identifiers (a fixed small set: 'mdblist', 'trakt', 'tmdb', 'simkl'),
+// not list identifiers, and mixing the two would make it ambiguous
+// whether a given hidden id in one list meant "this specific list" or
+// "this whole section" when read back.
+const HIDDEN_SECTIONS_KEY = 'myListAddon:hiddenMyListsSections';
+const MY_LISTS_SECTION_PANEL_IDS = {
+  mdblist: 'myListsSectionPanel-mdblist',
+  trakt: 'myListsSectionPanel-trakt',
+  tmdb: 'myListsSectionPanel-tmdb',
+  simkl: 'myListsSectionPanel-simkl',
+};
+
+function getHiddenMyListsSections() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_SECTIONS_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function isMyListsSectionHidden(section) {
+  if (!section) return false;
+  return getHiddenMyListsSections().includes(String(section));
+}
+
+// Applies the current hidden-sections state directly to each panel's own
+// display style -- no re-render needed the way per-list hiding requires,
+// since the section panels themselves are static markup (12_tab-custom-
+// lists.js) that already exists in the DOM; hiding/showing one is just a
+// style toggle, not a re-render of provider data. Safe to call any time
+// (e.g. on tab switch) since it's idempotent.
+function applyHiddenMyListsSections() {
+  const hidden = new Set(getHiddenMyListsSections());
+  Object.keys(MY_LISTS_SECTION_PANEL_IDS).forEach((section) => {
+    const el = document.getElementById(MY_LISTS_SECTION_PANEL_IDS[section]);
+    if (el) el.style.display = hidden.has(section) ? 'none' : '';
+  });
+}
+
+function setMyListsSectionHidden(section, hidden) {
+  if (!section || !MY_LISTS_SECTION_PANEL_IDS[section]) return;
+  const current = getHiddenMyListsSections();
+  const has = current.includes(section);
+  if (hidden === has) return;
+  const next = hidden ? [...current, section] : current.filter((s) => s !== section);
+  try {
+    localStorage.setItem(HIDDEN_SECTIONS_KEY, JSON.stringify(next));
+  } catch (e) {
+    // non-critical -- worst case the toggle doesn't persist across reloads
+  }
+  applyHiddenMyListsSections();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+// Applied once on page load and once more each time the Lists tab is
+// switched to (see switchTab, 16_client-row-core.js) -- the My Lists
+// section panels only exist once that panel's markup is in the DOM, and
+// while it's always present (not conditionally rendered), applying this
+// on every Lists-tab visit rather than assuming a single page-load call
+// suffices costs nothing and removes any ordering dependency on exactly
+// when this script runs relative to the panel markup existing.
+setTimeout(() => { applyHiddenMyListsSections(); }, 0);
+
 

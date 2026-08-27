@@ -31,6 +31,7 @@ function renumber() {
   updateListGroupFilterOptions();
   filterLists();
   saveState();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
 }
 
 // Lets someone type a new position directly into a row's number box (e.g.
@@ -302,13 +303,17 @@ async function testSourceRow(btn) {
   resultEl.textContent = 'Testing\u2026';
 
   try {
+    const keys = typeof collectKeys === 'function' ? collectKeys() : {};
     const body = { url, type };
-    const mdblistKey = document.getElementById('mdblistKeyInput').value.trim();
-    if (mdblistKey) body.mdblistKey = mdblistKey;
-    const traktKey = document.getElementById('traktKeyInput').value.trim();
-    if (traktKey) body.traktKey = traktKey;
-    if (traktAccessToken) body.traktAccessToken = traktAccessToken;
-    const res = await fetch(\`\${ORIGIN}/api/preview\`, {
+    if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
+    if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+    if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
+    if (keys.traktKey) body.traktKey = keys.traktKey;
+    if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+    if (keys.simklKey) body.simklKey = keys.simklKey;
+    if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
+    if (keys.creatorName) body.creatorName = keys.creatorName;
+    const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -388,10 +393,15 @@ async function testAllSources() {
 
 function buildConfig(entries, keys) {
   const payload = { entries };
+  if (keys && keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
   if (keys && keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
+  if (keys && keys.mdblistAccessToken) payload.mdblistAccessToken = keys.mdblistAccessToken;
   if (keys && keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys && keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys && keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys && keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys && keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys && keys.simklUsername) payload.simklUsername = keys.simklUsername;
   if (keys && keys.track) {
     payload.track = true;
     payload.trackCreatorName = keys.trackCreatorName;
@@ -399,6 +409,8 @@ function buildConfig(entries, keys) {
   }
   if (keys && keys.shuffleShelves) payload.shuffleShelves = true;
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
+  if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
+  if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -559,6 +571,12 @@ function collectKeys() {
     simklUsername: simklUser,
     shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
     shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
+    region: (function() {
+      const el = document.getElementById('regionSelect');
+      if (el && el.value) return el.value;
+      try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
+    })(),
+    hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -653,9 +671,13 @@ async function renderLivePreview() {
         const body = { url: s.url, type: s.type, sample: 100 };
         if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
         if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+        if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
         if (keys.traktKey) body.traktKey = keys.traktKey;
         if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+        if (keys.simklKey) body.simklKey = keys.simklKey;
+        if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
+        if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
         const res = await fetch(ORIGIN + '/api/preview', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -718,12 +740,23 @@ function livePreviewPosterHtml(m) {
   }
 
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
-  const addOverlay = '<div class="poster-add-overlay" title="Add to Lists">+</div>';
   let dateBadge = '';
-  if (m.airDate && (m.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: m.airDate })))) {
-    const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : m.airDate;
+  // hideDateBadge: Airing Next sets this on non-premiere items once its
+  // own subtitle line already spells out the air date next to S/E (see
+  // openAiringNextDetailsPage, 21_client-custom-list-builder.js) -- avoids
+  // showing the same date twice. Continue Watching/Watch History never set
+  // it, so their own plain-date badge is untouched.
+  if (!m.hideDateBadge && m.airDate && (m.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: m.airDate })))) {
+    // Airing Next passes isSeasonPremiere for episode 1 of a season -- a
+    // distinct green pill (matching the badge style used elsewhere for
+    // "premiere" callouts), pinned to the bottom of the poster (see
+    // .cw-date-badge-premiere, 09_page-shell.js) rather than the plain
+    // accent-colored date badge's usual top-left spot, so premieres stand
+    // out from ordinary upcoming episodes at a glance.
+    const badgeText = m.isSeasonPremiere ? 'Season Premiere' : (typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : m.airDate);
     if (badgeText) {
-      dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+      const badgeClass = m.isSeasonPremiere ? 'cw-date-badge cw-date-badge-premiere' : 'cw-date-badge';
+      dateBadge = '<div class="' + badgeClass + '" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
     }
   }
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
@@ -731,7 +764,6 @@ function livePreviewPosterHtml(m) {
       posterEl +
       dateBadge +
       removeBtn +
-      addOverlay +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
     (m.subtitle ? '<div class="live-preview-poster-subtitle">' + escapeHtml(m.subtitle) + '</div>' : '') +
@@ -1355,10 +1387,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     nLower.includes('recommended shows') ||
     nLower.includes('continue watching') ||
     nLower.includes('watch history') ||
+    nLower.includes('airing next') ||
     urlLower.startsWith('custom:curated:') ||
     urlLower.startsWith('autotrack:') ||
+    urlLower.startsWith('simkl:user:') ||
     urlLower === 'custom:continue-watching' ||
-    urlLower === 'custom:watch-history';
+    urlLower === 'custom:watch-history' ||
+    urlLower === 'custom:airing-next';
 
   if (isNoLikesList) {
     likesCount = null;
@@ -1524,7 +1559,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   if (likeBtn) {
-    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:')) {
+    if (listUrl && !isNoLikesList && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;

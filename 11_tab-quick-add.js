@@ -1,15 +1,15 @@
 <div class="tab-panel" data-tab-panel="discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('movie', this)">Movies</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('series', this)">Shows</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('curated', this)">Curated</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('kids', this)">Kids</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('genres', this)">Genres</button>
+    <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
+    <button type="button" class="subnav-pill" data-sub="movie" onclick="filterDiscoverShelves('movie', this)">Movies</button>
+    <button type="button" class="subnav-pill" data-sub="series" onclick="filterDiscoverShelves('series', this)">Shows</button>
+    <button type="button" class="subnav-pill" data-sub="popular" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
+    <button type="button" class="subnav-pill" data-sub="curated" onclick="filterDiscoverShelves('curated', this)">Curated</button>
+    <button type="button" class="subnav-pill" data-sub="gems" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
+    <button type="button" class="subnav-pill" data-sub="kids" onclick="filterDiscoverShelves('kids', this)">Kids</button>
+    <button type="button" class="subnav-pill" data-sub="holidays" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
+    <button type="button" class="subnav-pill" data-sub="genres" onclick="filterDiscoverShelves('genres', this)">Genres</button>
   </div>
 
   <!-- Discover Shelves Feed -->

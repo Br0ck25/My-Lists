@@ -1,9 +1,9 @@
 <div class="tab-panel" data-tab-panel="lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('liked', this)">Liked</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('import', this)">Import</button>
+    <button type="button" class="subnav-pill active" data-sub="my-lists" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
+    <button type="button" class="subnav-pill" data-sub="liked" onclick="switchListsSubmenu('liked', this)">Liked</button>
+    <button type="button" class="subnav-pill" data-sub="import" onclick="switchListsSubmenu('import', this)">Import</button>
   </div>
 
   <!-- Submenu 1: User's Connected Account & Custom Lists -->
@@ -20,7 +20,7 @@
       <div id="creatorDashboard"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-mdblist">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your MDBList Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -32,7 +32,7 @@
       <div id="myMdblistListsResult"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-trakt">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Trakt Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -45,7 +45,7 @@
       <div id="myPrivateTraktListsResult" style="margin-top:10px;"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-tmdb">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your TMDB Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -57,7 +57,7 @@
       <div id="myTmdbListsResult"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-simkl">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Simkl Lists</h2>
         <div style="display:flex; gap:8px;">

@@ -670,14 +670,124 @@
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+      // Recovery answer is optional and, unlike the Creator Key itself,
+      // chosen by the person rather than generated -- normalized
+      // (trimmed + lowercased) before hashing so a small casing slip
+      // months later at reset time doesn't lock them out over nothing.
+      // Same PBKDF2 hash-only storage as the key: this value is never
+      // recoverable, only checkable, and it's never shown to an admin --
+      // self-service reset (/api/creator/reset-key) is the only thing
+      // that ever reads it.
+      const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
-        JSON.stringify({ displayName, keyHash, createdAt: Date.now() })
+        JSON.stringify({ displayName, keyHash, recoveryAnswerHash, createdAt: Date.now() })
       );
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
       return json({ ok: true, creatorName: v.normalized, displayName, creatorKey });
+    }
+
+    // /api/creator/reset-key  (POST)  { username, recoveryAnswer } -> { ok, creatorKey }
+    // Public, self-service. This is the reason recoveryAnswerHash exists
+    // at all: someone who's lost their Creator Key but still knows the
+    // recovery answer they set at signup can get a working key back
+    // without ever filing a Feedback ticket or needing an admin. Same
+    // reset-not-recovery shape as /admin/api/reset-creator-key -- a new
+    // key is generated and the old one stops working immediately -- the
+    // only difference is what proves the requester is allowed to do this
+    // (a matching recovery answer here, an authenticated admin there).
+    // The recovery answer itself is intentionally NOT rotated on a
+    // successful reset: unlike a single-use recovery code, this is a
+    // chosen, memorized answer meant to keep working for next time too,
+    // the same way a security question's answer would.
+    if (path === "/api/creator/reset-key" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const rateLimitKey = `resetkeyrate:${ip}:${statsToday()}`;
+      const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+      const rateCount = parseInt(rateCountRaw, 10) || 0;
+      if (rateCount >= 10) {
+        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." });
+      }
+      await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+
+      const v = validateCreatorUsername(body.username);
+      const answer = String(body.recoveryAnswer || "").trim();
+      // Generic error for every failure case below (unknown username, no
+      // recovery answer on file, wrong answer) -- distinguishing them
+      // would let this endpoint be used to enumerate which usernames
+      // exist and which have a recovery answer set at all.
+      const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
+      if (!v.ok || !answer) return json({ ok: false, error: genericError });
+      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      if (!raw) return json({ ok: false, error: genericError });
+      let profile;
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: genericError });
+      }
+      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+      const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
+      if (!matches) return json({ ok: false, error: genericError });
+
+      const creatorKey = generateCreatorKey();
+      const keyHash = await hashCreatorKey(creatorKey);
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
+      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
+    }
+
+    // /admin/api/reset-creator-key  (POST)  { username } -> { ok, creatorKey }
+    // Admin-only. There's no email or password on a Creator Profile (see
+    // authenticateCreator's own comment above), so a lost key can never be
+    // recovered -- only a hash of it is ever stored. This is a reset, not
+    // a recovery: it generates a brand-new key the same way signup does,
+    // overwrites the stored hash, and hands the plaintext key back exactly
+    // once, same as /api/creator/create does. The old key stops working
+    // the instant this runs -- anywhere it was in use (other devices,
+    // scrobble webhook URLs that embed it) breaks until updated with the
+    // new one. This endpoint has no way to confirm the requester actually
+    // is the creator in question; that verification is left entirely to
+    // the admin using it, out of band, before calling it.
+    if (path === "/admin/api/reset-creator-key" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Unknown creator." });
+      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      if (!raw) return json({ ok: false, error: "Unknown creator." });
+      let profile;
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not read that creator's profile." });
+      }
+      const creatorKey = generateCreatorKey();
+      const keyHash = await hashCreatorKey(creatorKey);
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
+      return json({ ok: true, creatorKey });
     }
 
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
@@ -967,6 +1077,8 @@
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
         collapsedPanels: body.collapsedPanels && typeof body.collapsedPanels === "object" ? body.collapsedPanels : {},
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
+        hiddenLists: Array.isArray(body.hiddenLists) ? body.hiddenLists.map(String) : [],
+        hiddenMyListsSections: Array.isArray(body.hiddenMyListsSections) ? body.hiddenMyListsSections.map(String) : [],
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -1024,6 +1136,14 @@
         continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
         watchlist: Array.isArray(body.watchlist) ? body.watchlist : [],
         watchlistUpdatedAt: watchlistUpdatedAt,
+        // Airing Next -- unlike watchHistory/continueWatching, this is
+        // purely derived (recomputed client-side against TMDB on a timer,
+        // see refreshAiringNext, 21_client-custom-list-builder.js), so
+        // there's nothing to migrate from an older creatorsync: blob the
+        // way ensureTrackingMigrated handles the other tracking fields --
+        // it just starts empty on an account that hasn't pushed one yet,
+        // same as a brand new field always would.
+        airingNext: Array.isArray(body.airingNext) ? body.airingNext : [],
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
@@ -1812,6 +1932,112 @@
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
     }
 
+    // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }
+    // One-time migration for the switch (see recordTrackedEvent's own
+    // comment) from one KV key per (eventType/query, id, day) to one JSON
+    // blob per (eventType/query, id) holding every day's count. Old
+    // per-day keys are still sitting in KV from before that switch --
+    // this reads them, folds each into the corresponding new blob (merging
+    // with whatever's already there from live tracking since the switch,
+    // never overwriting), and deletes the old key once it's safely folded
+    // in. Deleting as it goes is what makes this safe to run repeatedly:
+    // a second run finds nothing left to migrate and reports done
+    // immediately, the same idempotent shape backfill-trending above has.
+    // Same paginated-cursor pattern as that endpoint too, for the same
+    // reason -- covers three prefixes in sequence (evtcount:watched:,
+    // evtcount:list-add:, searchquery:), storing which prefix and how far
+    // into its key list this run has reached in migratedaycounts:state so
+    // repeated calls make forward progress without redoing work.
+    if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, done: true, keysMigratedThisCall: 0 });
+
+      const PREFIXES = ["evtcount:watched:", "evtcount:list-add:", "searchquery:"];
+      const BATCH_LIMIT = 100;
+
+      let state;
+      try {
+        const stateRaw = await env.CONFIGS.get("migratedaycounts:state");
+        state = stateRaw ? JSON.parse(stateRaw) : { prefixIndex: 0, cursor: null };
+      } catch {
+        state = { prefixIndex: 0, cursor: null };
+      }
+
+      if (state.prefixIndex >= PREFIXES.length) {
+        return json({ ok: true, done: true, keysMigratedThisCall: 0 });
+      }
+
+      const prefix = PREFIXES[state.prefixIndex];
+      const listOpts = { prefix, limit: BATCH_LIMIT };
+      if (state.cursor) listOpts.cursor = state.cursor;
+      const listResult = await env.CONFIGS.list(listOpts);
+
+      // Old per-day keys only -- the running total (:alltime) and the
+      // new blob format itself (:days) share this same prefix and would
+      // otherwise get misread as if "alltime" or "days" were date strings.
+      const dayKeyPattern = /^\d{4}-\d{2}-\d{2}$/;
+      const oldDayKeys = listResult.keys.filter((k) => {
+        const rest = k.name.slice(prefix.length);
+        const lastColon = rest.lastIndexOf(":");
+        if (lastColon === -1) return false;
+        return dayKeyPattern.test(rest.slice(lastColon + 1));
+      });
+
+      // Group by id first so a title/query with many old day-keys in this
+      // batch costs one blob read-modify-write, not one per day.
+      const byId = new Map(); // id -> { day: count, ... } (partial, this batch only)
+      oldDayKeys.forEach((k) => {
+        const rest = k.name.slice(prefix.length);
+        const lastColon = rest.lastIndexOf(":");
+        const id = rest.slice(0, lastColon);
+        const day = rest.slice(lastColon + 1);
+        if (!byId.has(id)) byId.set(id, {});
+        byId.get(id)[day] = k.name; // stash the real key name for the read pass below
+      });
+
+      let keysMigratedThisCall = 0;
+      await Promise.all(
+        [...byId.entries()].map(async ([id, dayKeyNames]) => {
+          const days = Object.keys(dayKeyNames);
+          const [oldValues, existingBlobRaw] = await Promise.all([
+            Promise.all(days.map((d) => env.CONFIGS.get(dayKeyNames[d]))),
+            env.CONFIGS.get(`${prefix}${id}:days`),
+          ]);
+          let blob;
+          try {
+            blob = existingBlobRaw ? JSON.parse(existingBlobRaw) : {};
+          } catch {
+            blob = {};
+          }
+          days.forEach((d, i) => {
+            const oldCount = parseInt(oldValues[i], 10) || 0;
+            if (oldCount <= 0) return;
+            // Additive, not overwrite -- if live tracking already wrote
+            // something for this exact id+day since the format switch,
+            // that count is just as real as the migrated one.
+            blob[d] = (blob[d] || 0) + oldCount;
+          });
+          const dayKeysSorted = Object.keys(blob).sort();
+          if (dayKeysSorted.length > 95) {
+            dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
+          }
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
+          keysMigratedThisCall += days.length;
+        })
+      );
+
+      const prefixDone = listResult.list_complete || !listResult.cursor;
+      const nextState = prefixDone
+        ? { prefixIndex: state.prefixIndex + 1, cursor: null }
+        : { prefixIndex: state.prefixIndex, cursor: listResult.cursor };
+      await env.CONFIGS.put("migratedaycounts:state", JSON.stringify(nextState));
+
+      const done = nextState.prefixIndex >= PREFIXES.length;
+      return json({ ok: true, done, keysMigratedThisCall, prefix, prefixDone });
+    }
+
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
     // newest first. Reads up to 300 entries; feedback keys already sort
     // chronologically as plain strings (see /api/feedback's own comment),
@@ -1885,10 +2111,16 @@
       }
 
       if (!Array.isArray(entry.messages) || !entry.messages.length) {
+        // sender here mirrors renderFeedbackList's own fallback logic
+        // (isSelfLogged ? 'admin' : 'user') -- this used to be hardcoded
+        // to "user" unconditionally, which meant a self-logged "Log
+        // something yourself" entry's original message would flip to
+        // showing as if a user had written it the moment it got its
+        // first reply, instead of staying attributed to the admin.
         entry.messages = [{
           id: `msg_init`,
-          sender: "user",
-          senderName: entry.creatorName || "User",
+          sender: entry.creatorName === "admin" ? "admin" : "user",
+          senderName: entry.creatorName === "admin" ? "Admin" : (entry.creatorName || "User"),
           text: entry.message || "(Initial message)",
           timestamp: entry.createdAt || Date.now()
         }];
@@ -1973,7 +2205,21 @@
         return json({ ok: false, error: "Could not read that feedback entry." }, 500);
       }
       if (typeof body.message === "string" && body.message.trim()) {
-        entry.message = body.message.trim().slice(0, 4000);
+        const trimmedMessage = body.message.trim().slice(0, 4000);
+        entry.message = trimmedMessage;
+        // Once a reply has landed on this entry (self-logged or not), the
+        // dashboard list renders from entry.messages[...] instead of the
+        // top-level entry.message that this edit form actually posts (see
+        // renderFeedbackList's own fallback: it only synthesizes a single
+        // message from entry.message when entry.messages is empty).
+        // Editing only entry.message left it invisible on any entry that
+        // already had a thread -- the save genuinely succeeded, nothing
+        // in the list ever reflected it. Keeping the first message in the
+        // thread (the original log/report) in sync fixes that regardless
+        // of which shape a given entry happens to be in.
+        if (Array.isArray(entry.messages) && entry.messages.length && entry.messages[0]) {
+          entry.messages[0].text = trimmedMessage;
+        }
       }
       if (typeof body.category === "string" && ["bug", "improvement", "idea", "other"].includes(body.category.trim())) {
         entry.category = body.category.trim();

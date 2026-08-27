@@ -221,17 +221,39 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
     const day = statsToday();
-    const dayKey = `evtcount:${eventType}:${id}:${day}`;
+    const daysKey = `evtcount:${eventType}:${id}:days`;
     const totalKey = `evtcount:${eventType}:${id}:alltime`;
     const metaKey = `evtmeta:${eventType}:${id}`;
     const indexKey = `evtdayindex:${eventType}:${day}`;
 
-    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
-      env.CONFIGS.get(dayKey),
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
       env.CONFIGS.get(totalKey),
       env.CONFIGS.get(indexKey),
     ]);
-    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    // One JSON blob per (eventType, id) holding every day's count, rather
+    // than one KV key per (eventType, id, day) -- summing a 90-day window
+    // used to mean 90 separate reads per candidate title (see
+    // computeLeaderboard below), which multiplied against even a modest
+    // candidate list blew past a safe per-invocation KV read budget and
+    // was quietly capping the leaderboard to far fewer than 100 entries
+    // for every window wider than a day or two. One read per candidate
+    // here, regardless of window width, fixes that at the root instead of
+    // just raising a cap number. Trimmed to the most recent 95 days on
+    // write (a few days' buffer past the widest window this dashboard
+    // ever queries, 90) so this blob can't grow without bound for a title
+    // that's been tracked for years.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
     const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
 
     let index = [];
@@ -243,7 +265,7 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     if (!index.includes(id)) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
       env.CONFIGS.put(totalKey, String(totalCount)),
       env.CONFIGS.put(indexKey, JSON.stringify(index)),
       // Overwritten every time rather than only on first sight -- keeps
@@ -342,12 +364,24 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
       // skip an unparseable day index rather than failing the whole window
     }
   });
-  const ids = [...idSet].slice(0, 500); // defensive cap, see the size-guard convention used elsewhere in this file
+  // Flat top-100 cap regardless of window width: each candidate now costs
+  // exactly 2 KV reads below (one evtcount days-blob, one evtmeta) since
+  // recordTrackedEvent stores every day's count for a title in a single
+  // JSON blob rather than one key per day -- summing a 90-day window no
+  // longer means 90 reads per candidate, just one. See
+  // recordTrackedEvent's own comment for why that changed.
+  const ids = [...idSet].slice(0, 100);
 
   const entries = await Promise.all(
     ids.map(async (id) => {
-      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtcount:${eventType}:${id}:${d}`)));
-      const count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
+      const daysRaw = await env.CONFIGS.get(`evtcount:${eventType}:${id}:days`);
+      let dayCounts = {};
+      try {
+        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+      } catch {
+        dayCounts = {};
+      }
+      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
       const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
       let title = id;
       let mediaType = "";
@@ -364,8 +398,19 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     })
   );
   const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
-  filtered.sort((a, b) => b.count - a.count);
-  const topEntries = filtered.slice(0, 100);
+  // count > 0 filter: without it, an id that's in today's/this window's
+  // day-index (written unconditionally on every tracked event, regardless
+  // of counter format) but has no data in the current evtcount:...:days
+  // blob -- e.g. an id only ever tracked before this blob-based format
+  // shipped, whose history lives solely under the old per-day-per-id keys
+  // this branch no longer reads -- would show up as a real-looking
+  // leaderboard row stuck at 0 forever. Matches the filter
+  // computeSearchLeaderboard's equivalent branch already has; the alltime
+  // branch above doesn't need one since it only ever lists ids that
+  // already have a nonzero running total by construction.
+  const nonZero = filtered.filter((e) => e.count > 0);
+  nonZero.sort((a, b) => b.count - a.count);
+  const topEntries = nonZero.slice(0, 100);
 
   // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
   await Promise.all(
@@ -427,16 +472,33 @@ async function recordSearchQuery(env, query) {
   if (q.length < 2) return;
   try {
     const day = statsToday();
-    const dayKey = `searchquery:${q}:${day}`;
+    const daysKey = `searchquery:${q}:days`;
     const totalKey = `searchquery:${q}:alltime`;
     const indexKey = `searchquerydayindex:${day}`;
 
-    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
-      env.CONFIGS.get(dayKey),
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
       env.CONFIGS.get(totalKey),
       env.CONFIGS.get(indexKey),
     ]);
-    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    // Same consolidated-blob shape as recordTrackedEvent above, and the
+    // same reason: one JSON blob per query holding every day's count,
+    // instead of one KV key per (query, day), so summing a wide window
+    // costs one read per candidate query instead of one read per
+    // candidate per day. See recordTrackedEvent's own comment for the
+    // full story -- this is the same fix applied to the same bug in the
+    // Search & Queries leaderboard.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
     const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
 
     let index = [];
@@ -448,7 +510,7 @@ async function recordSearchQuery(env, query) {
     if (!index.includes(q)) index.push(q);
 
     await Promise.all([
-      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
       env.CONFIGS.put(totalKey, String(totalCount)),
       env.CONFIGS.put(indexKey, JSON.stringify(index)),
     ]);
@@ -480,12 +542,17 @@ async function computeSearchLeaderboard(env, window) {
     dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
   }
 
-  // Check both searchquerydayindex and direct searchquery list prefix
-  const [indexResults, listResult] = await Promise.all([
-    Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`))),
-    env.CONFIGS.list({ prefix, limit: 1000 }),
-  ]);
-
+  // Union of every query that had any activity anywhere in this window,
+  // from the day-index only -- same pattern as computeLeaderboard above.
+  // This used to also list()-scan the entire "searchquery:" prefix (up to
+  // 1000 keys) unconditionally on every call, which pulled in every query
+  // ever recorded on any day, not just this window -- defeating the
+  // day-index's entire purpose and inflating the candidate set (and the
+  // KV reads below) regardless of how narrow a window was actually asked
+  // for. Removed rather than kept "just in case": the day-index is
+  // written every time recordSearchQuery runs, so there's nothing a raw
+  // prefix scan would catch that the index doesn't already have.
+  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`)));
   const querySet = new Set();
   indexResults.forEach((raw) => {
     if (!raw) return;
@@ -494,26 +561,21 @@ async function computeSearchLeaderboard(env, window) {
     } catch {}
   });
 
-  (listResult.keys || []).forEach((k) => {
-    const rest = k.name.slice(prefix.length);
-    const lastColon = rest.lastIndexOf(":");
-    if (lastColon !== -1) {
-      const q = rest.slice(0, lastColon);
-      const sfx = rest.slice(lastColon + 1);
-      if (sfx !== "alltime") querySet.add(q);
-    }
-  });
-
-  const queries = [...querySet].slice(0, 500);
+  // Flat top-100 cap regardless of window width -- see recordSearchQuery's
+  // own comment: summing a window now costs one read per candidate query
+  // (the days-blob), not one per candidate per day.
+  const queries = [...querySet].slice(0, 100);
 
   const entries = await Promise.all(
     queries.map(async (q) => {
-      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquery:${q}:${d}`)));
-      let count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
-      if (count === 0 && window === "today") {
-        const totalRaw = await env.CONFIGS.get(`searchquery:${q}:alltime`);
-        count = parseInt(totalRaw, 10) || 0;
+      const daysRaw = await env.CONFIGS.get(`searchquery:${q}:days`);
+      let dayCounts = {};
+      try {
+        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+      } catch {
+        dayCounts = {};
       }
+      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
       return { query: q, count };
     })
   );
@@ -963,7 +1025,18 @@ async function renderAdminDashboard(env) {
       (c) =>
         `<tr><td>${escapeHtmlServer(c.displayName)}</td><td>${escapeHtmlServer(c.username)}</td>` +
         `<td>${c.createdAt ? easternDateKey(new Date(c.createdAt)) : "\u2014"}</td>` +
-        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td></tr>`
+        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td>` +
+        // data-* attributes here rather than passing c.displayName inline into
+        // the onclick string -- displayName is arbitrary creator-chosen text
+        // (only .trim()'d server-side, not restricted to safe characters the
+        // way the normalized username is), so splicing it directly into an
+        // onclick="..." attribute would both break on a display name
+        // containing a quote and, worse, let a crafted display name inject
+        // script into this admin page. escapeHtmlServer handles the HTML-
+        // attribute escaping here the same way it already does for the two
+        // <td> values above; resetCreatorKey reads the values back off the
+        // element at click time instead of receiving them as literals.
+        `<td><button type="button" class="lc-btn secondary" style="padding:4px 10px; font-size:0.8rem;" data-username="${escapeHtmlServer(c.username)}" data-displayname="${escapeHtmlServer(c.displayName)}" onclick="resetCreatorKey(this)">Reset Key</button></td></tr>`
     )
     .join("");
   const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
@@ -1164,8 +1237,8 @@ async function renderAdminDashboard(env) {
     </div>
     <div class="table-wrap">
       <table>
-        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
-        ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
+        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th><th>Key</th></tr>
+        ${accountRows || '<tr><td colspan="5">No accounts yet.</td></tr>'}
       </table>
     </div>
   </div>
@@ -1203,6 +1276,11 @@ async function renderAdminDashboard(env) {
       <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
     <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
+    <div style="margin:0 0 12px;">
+      <button type="button" class="admin-select" style="cursor:pointer;" id="migrateDayCountsBtn" onclick="runMigrateDayCounts()">Migrate Historical Day Counts</button>
+      <span id="migrateDayCountsStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <p style="color:#8E8E93; margin:6px 0 0; font-size:0.8rem;">One-time migration for the switch from one KV key per day to one JSON blob per title -- reads every old per-day count still sitting in KV and folds it into the new format, so 7/30/90-day windows reflect activity from before that switch instead of only counting forward from it. Safe to run more than once (adds, never subtracts); old keys are deleted once folded in, so re-running just confirms there's nothing left. Also covers the Search &amp; Queries leaderboard.</p>
+    </div>
     <div class="table-wrap">
       <table>
         <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
@@ -1449,6 +1527,56 @@ async function renderAdminDashboard(env) {
 
     restoreAdminActiveTab();
 
+    // Resets a creator's login key server-side (see /admin/api/reset-creator-key
+    // -- it can only invalidate + replace, never recover the original,
+    // since only a salted hash of it is ever stored). Two-step confirm
+    // matching this dashboard's other destructive actions: a plain
+    // confirm() naming exactly what's about to happen and to whom, then
+    // the new key is shown once in a copyable box -- there is no second
+    // chance to see it, same as the reveal shown at signup.
+    async function resetCreatorKey(btn) {
+      const username = btn.dataset.username;
+      const displayName = btn.dataset.displayname;
+      const sure = confirm(
+        'Reset the login key for "' + displayName + '" (' + username + ')?\\n\\n' +
+        'Their current key will stop working immediately. You will need to ' +
+        'send them the new key yourself -- there is no email on file to send it to.'
+      );
+      if (!sure) return;
+      try {
+        const res = await fetch('/admin/api/reset-creator-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('Could not reset key: ' + (data.error || 'unknown error'));
+          return;
+        }
+        showResetKeyModal(displayName, data.creatorKey);
+      } catch (e) {
+        alert('Network error -- could not reset key. Try again.');
+      }
+    }
+
+    function showResetKeyModal(displayName, creatorKey) {
+      const overlay = document.createElement('div');
+      overlay.id = 'resetKeyOverlay';
+      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:9999;';
+      overlay.innerHTML =
+        '<div style="background:#fff; border-radius:12px; padding:24px; max-width:380px; width:90%;">' +
+          '<h3 style="margin-top:0;">New key for ' + escapeHtmlAdmin(displayName) + '</h3>' +
+          '<p style="color:#8E8E93; font-size:0.9rem;">This is shown once. Copy it now and send it to the creator yourself -- their old key no longer works.</p>' +
+          '<div id="resetKeyDisplay" style="font-family:monospace; font-size:1.1rem; background:#F2F2F7; border-radius:8px; padding:10px; text-align:center; margin:12px 0; user-select:all;">' + escapeHtmlAdmin(creatorKey) + '</div>' +
+          '<div style="display:flex; gap:8px;">' +
+            '<button type="button" class="lc-btn secondary" style="flex:1;" onclick="navigator.clipboard.writeText(\\'' + creatorKey + '\\'); this.textContent=\\'Copied!\\';">Copy Key</button>' +
+            '<button type="button" class="lc-btn" style="flex:1;" onclick="document.getElementById(\\'resetKeyOverlay\\').remove();">Done</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+    }
+
     async function loadSearchData() {
       const body = document.getElementById('searchTableBody');
       body.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
@@ -1602,6 +1730,39 @@ async function renderAdminDashboard(env) {
       }
       btn.disabled = false;
       loadTrendingData();
+    }
+
+    // Same shape as runBackfillTrending just above -- see
+    // /admin/api/migrate-day-counts's own comment for what this is
+    // actually migrating and why.
+    async function runMigrateDayCounts() {
+      const btn = document.getElementById('migrateDayCountsBtn');
+      const status = document.getElementById('migrateDayCountsStatus');
+      btn.disabled = true;
+      let keysMigrated = 0;
+      let safetyCounter = 0;
+      try {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-day-counts', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (migrated ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 migrated ' + keysMigrated + ' old day-count' + (keysMigrated === 1 ? '' : 's') + ' into the new format.';
+            break;
+          }
+          keysMigrated += data.keysMigratedThisCall || 0;
+          status.textContent = 'Working\u2026 ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ' migrated so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (migrated ' + keysMigrated + ' day-counts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+      if (typeof loadSearchData === 'function') loadSearchData();
     }
 
     async function loadApiUsage() {
@@ -1928,7 +2089,17 @@ async function renderAdminDashboard(env) {
         const res = await fetch('/api/feedback', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ category: category, message: message, creatorName: 'admin' }),
+          // fromAdminPanel: true is the deliberate signal that this
+          // request really is the admin dashboard's own "Log something
+          // yourself" feature, not just any page that happens to load in
+          // a browser that also has a valid admin cookie. /api/feedback
+          // is the same public endpoint the regular addon's Settings page
+          // posts to -- without this flag, isAdmin there was based on
+          // cookie presence alone, so testing the public feedback UI
+          // (e.g. under a different Creator Profile/persona) in the same
+          // browser as an active admin session got every message
+          // mislabeled as sent by "Developer" instead of that persona.
+          body: JSON.stringify({ category: category, message: message, creatorName: 'admin', fromAdminPanel: true }),
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {

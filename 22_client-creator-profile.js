@@ -383,6 +383,141 @@ function onRemoveWatchedFromWatchlistToggle(cb) {
   if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
 }
 
+// "Hidden Lists" panel on Settings -- lets the person hide specific lists
+// (by identifier -- see setListHidden's own comment, 21_client-custom-
+// list-builder.js) from My Lists, the Airing Next dashboard card, and
+// Simkl Airing Next, without deleting or unsyncing anything underneath.
+//
+// Enumerates every list this browser currently knows about across every
+// source that can produce one -- local Custom Lists (via
+// loadLocalCustomLists, same store getOrCreateAiringNextList uses, so
+// Airing Next's synthetic 'airing-next' entry shows up here too), a
+// signed-in Creator Profile's server-side lists (lastCreatorListsData,
+// already fetched by renderCreatorDashboard -- this panel doesn't re-fetch
+// on its own), and whichever of MDBList/Trakt/TMDB/Simkl the person has
+// connected (window._myMdblistLists/_myTraktLists/_myTmdbLists/
+// _mySimklLists -- each already populated by that provider's own "My
+// Lists" panel render, so this can be empty here until that panel has
+// loaded at least once). A list already hidden is included too (checkbox
+// unchecked) so it can be found and re-shown -- this panel is the only
+// place a hidden list is still visible at all.
+function renderHiddenListsSettingsSection() {
+  const box = document.getElementById('hiddenListsSettingsSection');
+  if (!box) return;
+
+  const rows = []; // { id, name, source }
+  const seenIds = new Set();
+  function addRow(id, name, source) {
+    if (!id || seenIds.has(id)) return;
+    seenIds.add(id);
+    rows.push({ id: id, name: name || id, source: source });
+  }
+
+  // Local Custom Lists (keyed by slug) -- includes the synthetic
+  // 'airing-next' entry once it has any items, matching how the dashboard
+  // itself only ever shows that card once it's eligible.
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    Object.keys(map).forEach((slug) => {
+      const l = map[slug];
+      if (!l || !l.slug) return;
+      if (l.slug === 'airing-next') {
+        addRow('airing-next', 'Airing Next', 'Dashboard');
+      } else {
+        addRow(l.slug, l.name || l.slug, 'My Lists');
+      }
+    });
+  } catch (e) {}
+  if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size) {
+    addRow('airing-next', 'Airing Next', 'Dashboard');
+  }
+
+  // A signed-in Creator Profile's server-side lists -- already fetched by
+  // renderCreatorDashboard into lastCreatorListsData; not re-fetched here.
+  if (Array.isArray(lastCreatorListsData)) {
+    lastCreatorListsData.forEach((l) => {
+      if (l && l.slug) addRow(l.slug, l.name || l.slug, 'My Lists');
+    });
+  }
+
+  // Connected providers -- each keyed by url, matching the filter applied
+  // in that provider's own render function (17_client-my-lists-and-trakt-
+  // oauth.js). Simkl's own 'simkl:user:shows:airing-next' entry naturally
+  // lands under its own "Simkl Airing Next" label via the url check below.
+  const providerLists = [
+    { arr: window._myMdblistLists, label: 'MDBList' },
+    { arr: window._myTraktLists, label: 'Trakt' },
+    { arr: window._myTmdbLists, label: 'TMDB' },
+    { arr: window._mySimklLists, label: 'Simkl' },
+  ];
+  providerLists.forEach(({ arr, label }) => {
+    if (!Array.isArray(arr)) return;
+    arr.forEach((l) => {
+      if (!l || !l.url) return;
+      const isSimklAiringNext = l.url.includes(':airing-next');
+      addRow(l.url, l.name || l.url, isSimklAiringNext ? 'Simkl Airing Next' : label);
+    });
+  });
+
+  if (!rows.length && Object.keys(MY_LISTS_SECTION_PANEL_IDS || {}).length === 0) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No lists found yet -- visit My Lists (and connect any providers you use) first, then come back here to manage what\u2019s shown.</small></p>';
+    return;
+  }
+
+  rows.sort((a, b) => a.source.localeCompare(b.source) || a.name.localeCompare(b.name));
+
+  const hiddenIds = new Set(typeof getHiddenListIds === 'function' ? getHiddenListIds() : []);
+  const hiddenSections = new Set(typeof getHiddenMyListsSections === 'function' ? getHiddenMyListsSections() : []);
+
+  // Whole-section toggles first -- coarser than the per-list rows below,
+  // for someone who wants an entire provider's "Your X Lists" panel gone
+  // from My Lists rather than hiding each list inside it one at a time.
+  // Always a fixed set of 4 (see MY_LISTS_SECTION_PANEL_IDS, 21_client-
+  // custom-list-builder.js) regardless of whether that provider is
+  // connected yet -- hiding ahead of connecting is harmless and saves a
+  // trip back here after connecting.
+  const sectionLabels = { mdblist: 'Your MDBList Lists', trakt: 'Your Trakt Lists', tmdb: 'Your TMDB Lists', simkl: 'Your Simkl Lists' };
+  const sectionsHtml = Object.keys(sectionLabels).map((section) => {
+    const checked = hiddenSections.has(section);
+    return '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-section-id="' + escapeAttr(section) + '" onchange="onHiddenSectionToggle(this)" style="cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<span style="font-weight:600;">' + escapeHtml(sectionLabels[section]) + '</span>' +
+    '</label>';
+  }).join('');
+
+  const rowsHtml = rows.length ? rows.map((r) => {
+    const checked = hiddenIds.has(String(r.id));
+    return '<label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-list-id="' + escapeAttr(r.id) + '" onchange="onHiddenListToggle(this)" style="margin-top:2px; cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<div style="min-width:0;">' +
+        '<span style="font-weight:600; overflow-wrap:anywhere;">' + escapeHtml(r.name) + '</span>' +
+        '<div style="color:var(--muted); font-size:0.78rem; margin-top:2px;">' + escapeHtml(r.source) + '</div>' +
+      '</div>' +
+    '</label>';
+  }).join('') : '<p style="color:var(--muted); font-size:0.85rem; margin-top:8px;"><small>No individual lists found yet -- visit My Lists (and connect any providers you use) first.</small></p>';
+
+  box.innerHTML =
+    '<p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Whole sections</p>' +
+    sectionsHtml +
+    '<p style="margin:14px 0 6px; font-weight:600; font-size:0.85rem;">Individual lists</p>' +
+    rowsHtml;
+}
+
+function onHiddenListToggle(cb) {
+  const id = cb && cb.dataset ? cb.dataset.listId : '';
+  if (!id) return;
+  // Checked = hidden, unchecked = visible -- matches the panel's own name
+  // ("Hidden Lists": check a box to hide that list).
+  if (typeof setListHidden === 'function') setListHidden(id, cb.checked);
+}
+
+function onHiddenSectionToggle(cb) {
+  const section = cb && cb.dataset ? cb.dataset.sectionId : '';
+  if (!section) return;
+  // Same checked = hidden convention as onHiddenListToggle above.
+  if (typeof setMyListsSectionHidden === 'function') setMyListsSectionHidden(section, cb.checked);
+}
+
 // that persists anywhere outside a single browser for that link to
 // point at in the first place.
 function renderTrackPlaybackSection() {
@@ -624,6 +759,7 @@ function clearLocalAccountData() {
   if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
   if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
   if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
@@ -656,7 +792,8 @@ function openRestoreModal() {
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
-    '</div>'
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
   );
 }
 
@@ -684,6 +821,7 @@ async function submitRestoreProfile() {
     clearLocalAccountData();
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
     renderCreatorProfileBar();
@@ -697,7 +835,66 @@ async function submitRestoreProfile() {
   }
 }
 
-// Silent on failure by design -- a browser with a stale/invalid stored key
+// Self-service key reset for anyone who set a recovery answer at signup
+// (see /api/creator/reset-key and its own comment). Reuses
+// showKeyRevealModal -- same one-time reveal UX as signup and the
+// admin-side reset -- and, once revealed, logs the new key straight in
+// the same way a successful restore would, since at that point the
+// person has fully proven who they are.
+function openForgotKeyModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<h2>Reset Your Key</h2>' +
+    '<p class="modal-sub">Enter your Username and the recovery answer you set when you created your account.</p>' +
+    '<div class="row"><input type="text" id="forgotKeyNameInput" placeholder="Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
+    '<div id="forgotKeyModalError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
+  );
+}
+
+async function submitForgotKey() {
+  const name = document.getElementById('forgotKeyNameInput').value.trim();
+  const answer = document.getElementById('forgotKeyAnswerInput').value.trim();
+  const errBox = document.getElementById('forgotKeyModalError');
+  if (!name || !answer) {
+    errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
+    return;
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/reset-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name, recoveryAnswer: answer }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' + escapeHtml(data.error || 'Could not reset your key.') + '</p>';
+      return;
+    }
+    clearLocalAccountData();
+    activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+    localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+    localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    closeModal();
+    showKeyRevealModal(data.displayName, data.creatorKey);
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderWatchlistPreferencesSection();
+    renderTrackPlaybackSection();
+    renderCreatorDashboard();
+    await loadCreatorSync();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  }
+}
+
+
 // (e.g. the profile was somehow deleted) just falls back to logged-out
 // rather than throwing an error at page load.
 async function tryAutoRestoreCreatorProfile() {
@@ -713,6 +910,7 @@ async function tryAutoRestoreCreatorProfile() {
     const data = await res.json();
     if (data.ok) {
       activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+      localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
       renderCreatorProfileBar();
       renderAccountKeySection();
       renderWatchlistPreferencesSection();
@@ -854,6 +1052,12 @@ async function pushCreatorSync() {
         // their own, only when they actually change.
         collapsedPanels: collectCollapsedPanelsState(),
         likedLists: [...getLikedListsSet()],
+        hiddenLists: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch (e) { return []; }
+        })(),
+        hiddenMyListsSections: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
+        })(),
       }),
     });
   } catch (e) {
@@ -885,6 +1089,7 @@ async function pushTrackingSync() {
         // merging.
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
+        airingNext: (localMap['airing-next'] && localMap['airing-next'].items) || [],
         watchlist: wlItems,
         watchlistUpdatedAt: wlUpdatedAt,
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
@@ -937,7 +1142,26 @@ async function loadCreatorSync() {
     }
     renumber();
     suppressSave = false;
-    
+
+    // Restore hidden lists state from sync so the selections survive
+    // cross-browser logins. Both keys live only in localStorage locally;
+    // the server blob now carries them so this browser can adopt them.
+    if (Array.isArray(synced.hiddenLists)) {
+      try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(synced.hiddenLists)); } catch (e) {}
+    }
+    if (Array.isArray(synced.hiddenMyListsSections)) {
+      try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
+      if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
+    }
+
+    // Re-trigger the live preview if the Catalogs tab has already been
+    // visited this page load -- loadCreatorSync wipes and rebuilds #lists
+    // which resets every row to its "Click Refresh Preview" placeholder,
+    // so the preview needs to run again after the rebuild completes.
+    if (window._catalogsInitializedOnce && typeof renderLivePreview === 'function') {
+      renderLivePreview();
+    }
+
     if (synced.channels && typeof synced.channels === 'object') {
       if (typeof saveLocalChannelsMap === 'function') {
         saveLocalChannelsMap(synced.channels);
@@ -1168,6 +1392,30 @@ async function loadCreatorSync() {
       } catch (e) {}
     }
 
+    // Restore UI settings from synced.keys -- these are sent by collectKeys()
+    // on every pushCreatorSync but were never applied back to the DOM on load,
+    // so signing in from a different browser left them at their defaults.
+    if (synced.keys && typeof synced.keys === 'object') {
+      if (typeof synced.keys.hideNonDigitalReleases === 'boolean') {
+        const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+        if (cb) cb.checked = synced.keys.hideNonDigitalReleases;
+        try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+      }
+      if (typeof synced.keys.shuffleShelves === 'boolean') {
+        const el = document.getElementById('shuffleShelvesCheckbox');
+        if (el) el.checked = synced.keys.shuffleShelves;
+      }
+      if (typeof synced.keys.shuffleItems === 'boolean') {
+        const el = document.getElementById('shuffleItemsCheckbox');
+        if (el) el.checked = synced.keys.shuffleItems;
+      }
+      if (synced.keys.region) {
+        const el = document.getElementById('regionSelect');
+        if (el) el.value = synced.keys.region;
+        try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
+      }
+    }
+
     // Watch History / Continue Watching -- same wholesale-replace as
     // everything else in this blob (see this function's own comment).
     // getOrCreateWatchHistoryList/getOrCreateContinueWatchingList are used
@@ -1346,6 +1594,8 @@ function openCreateProfileModal() {
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -1356,6 +1606,7 @@ function openCreateProfileModal() {
 
 async function submitCreateProfile() {
   const name = document.getElementById('createProfileNameInput').value.trim();
+  const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
@@ -1365,7 +1616,7 @@ async function submitCreateProfile() {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: name }),
+      body: JSON.stringify({ creatorName: name, recoveryAnswer: recoveryAnswer || undefined }),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -1375,6 +1626,7 @@ async function submitCreateProfile() {
     }
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -1693,6 +1945,17 @@ async function renderCreatorDashboard(options) {
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
       ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
     ];
+    // Airing Next is local-only (see its own comment, 21_client-custom-
+    // list-builder.js) -- folded into the same array (rather than its own
+    // separate card type) purely so it sorts and drags alongside every
+    // other card via the shared savedOrder/persistCreatorListOrderFromDom
+    // machinery below; buildAiringNextCardHtml (unlike buildServerListCardHtml/
+    // buildLocalListCardHtml) takes no arguments, so "list" here is just a
+    if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function') {
+      allDashboardLists.push({ isAiringNext: true, list: { slug: 'airing-next' } });
+    }
+
+    const visibleDashboardLists = (typeof isListHidden === 'function') ? allDashboardLists.filter((item) => !isListHidden(item.list && item.list.slug)) : allDashboardLists;
 
     let savedOrder = [];
     if (Array.isArray(data.order) && data.order.length) {
@@ -1707,21 +1970,22 @@ async function renderCreatorDashboard(options) {
     }
     if (savedOrder && savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
-      allDashboardLists.sort((a, b) => {
+      visibleDashboardLists.sort((a, b) => {
         const posA = orderMap.has(a.list.slug) ? orderMap.get(a.list.slug) : 9999;
         const posB = orderMap.has(b.list.slug) ? orderMap.get(b.list.slug) : 9999;
         return posA - posB;
       });
     }
 
-    const rowsHtml = allDashboardLists.length
-      ? allDashboardLists.map((item) => item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list)).join('')
+    const rowsHtml = visibleDashboardLists.length
+      ? visibleDashboardLists.map((item) => item.isAiringNext ? buildAiringNextCardHtml() : (item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list))).join('')
       : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
 
     const prevScrollTop = box.scrollTop;
     box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+    if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   } catch (e) {
     if (!hasExistingContent) {
       box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
@@ -1914,30 +2178,44 @@ function renderLocalCustomListsDashboard(box, silent) {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
 
-  const lists = Object.keys(map).map((k) => map[k]);
+  // Airing Next lives in this same map (getOrCreateAiringNextList uses the
+  // same store) but needs its own render path (buildAiringNextCardHtml,
+  // no args) rather than the generic buildLocalListCardHtml -- filtered
+  // out of the plain loop below and re-added as a stub so it still
+  // participates in the shared saved-order sort/drag exactly like every
+  // other card (see the matching comment in renderCreatorDashboard above).
+  const lists = Object.keys(map).map((k) => map[k]).filter((l) => l && l.slug !== 'airing-next');
+  const airingNextEligible = typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function';
+  if (airingNextEligible) {
+    lists.push({ slug: 'airing-next', isAiringNext: true, updatedAt: (map['airing-next'] && map['airing-next'].updatedAt) || Date.now() });
+  }
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
+
   let savedOrder = [];
   try {
     savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
   } catch (e) {}
   if (savedOrder && savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
-    lists.sort((a, b) => {
+    visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
       const posB = orderMap.has(b.slug) ? orderMap.get(b.slug) : 9999;
       if (posA !== posB) return posA - posB;
       return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
   } else {
-    lists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    visibleLists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
-  lastLocalCustomListsData = lists;
-  const rowsHtml = lists.length
-    ? lists.map(buildLocalListCardHtml).join('')
+  lastLocalCustomListsData = visibleLists;
+  const rowsHtml = visibleLists.length
+    ? visibleLists.map((l) => l.isAiringNext ? buildAiringNextCardHtml() : buildLocalListCardHtml(l)).join('')
     : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
   const prevScrollTop = box ? box.scrollTop : 0;
   box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
   if (prevScrollTop) box.scrollTop = prevScrollTop;
   document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 
@@ -1945,6 +2223,51 @@ const _creatorDashEl = document.getElementById('creatorDashboard');
 if (_creatorDashEl) {
   _creatorDashEl.addEventListener('click', async (e) => {
     if (e.target.closest('.clickable-poster')) return;
+    const airingViewBtn = e.target.closest('.airingNextViewBtn');
+    if (airingViewBtn) {
+      if (typeof openAiringNextDetailsPage === 'function') openAiringNextDetailsPage();
+      return;
+    }
+    const airingAddBtn = e.target.closest('.airingNextAddToConfigBtn');
+    if (airingAddBtn) {
+      const list = (typeof getOrCreateAiringNextList === 'function') ? getOrCreateAiringNextList() : { items: [] };
+      let isAdded = airingAddBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, 'series', 'airing-next'));
+      if (isAdded) {
+        if (typeof removeListFromConfig === 'function') removeListFromConfig(null, 'series', 'airing-next');
+        if (typeof renumber === 'function') renumber();
+        if (typeof saveState === 'function') saveState();
+        airingAddBtn.classList.remove('is-added', 'secondary');
+        airingAddBtn.classList.add('primary');
+        airingAddBtn.textContent = '+ Add';
+        airingAddBtn.style.color = '';
+        if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+        if (typeof showAddedToast === 'function') showAddedToast('Removed "Airing Next" from your Catalogs.');
+        return;
+      }
+      // Signed-in Creator account: a live catalog reading server-side
+      // tracking data (see fetchAutoTrackedCatalog, 05_catalog-core.js).
+      // Local-only browser: a snapshot of today's items, same as Watch
+      // History/Continue Watching fall back to for local-only users --
+      // it'll go stale as the schedule moves and needs a manual Configure
+      // -> Update to refresh (see this repo's README).
+      const url = (typeof activeCreator !== 'undefined' && activeCreator)
+        ? 'autotrack:airing-next:series:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({
+            listId: (typeof generateChannelId === 'function') ? generateChannelId() : String(Date.now()),
+            localSlug: 'airing-next',
+            type: 'series',
+            items: (list.items || []).map((it) => ({ imdbId: it.showId, title: it.showTitle, poster: it.showPoster })),
+            shuffle: false,
+          });
+      if (typeof addRow === 'function') addRow('Airing Next', url, 'series', true, 'My Lists');
+      airingAddBtn.classList.add('is-added', 'secondary');
+      airingAddBtn.classList.remove('primary');
+      airingAddBtn.textContent = 'Remove';
+      airingAddBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "Airing Next" to your Catalogs.');
+      return;
+    }
     const viewBtn = e.target.closest('.creatorListViewBtn, .localListViewBtn, .creatorListViewTrigger, .localListViewTrigger');
   if (viewBtn) {
     const slug = viewBtn.dataset.slug;
@@ -2829,6 +3152,10 @@ function removeWatchHistoryItemDirect(id, btn) {
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
       if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
+      // Removing the last watched episode of a show drops it from Airing
+      // Next's candidate set -- see syncAiringNextWatchState's own
+      // comment (21_client-custom-list-builder.js).
+      if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
     }
   }
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
@@ -2912,3 +3239,4 @@ function clearWatchHistoryAll() {
   );
 }
 window.clearWatchHistoryAll = clearWatchHistoryAll;
+// Reordering & position management

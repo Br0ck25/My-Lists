@@ -73,6 +73,43 @@ let TRAKT_CLIENT_ID = "";
 let SIMKL_CLIENT_ID = "";
 let SIMKL_CLIENT_SECRET = "";
 
+// Countries for the Settings > External Accounts & API Keys region picker
+// (streaming-availability catalogs and content ratings -- see
+// 07_source-fetchers-tmdb-simkl.js's tmdbProviderChartPaths/
+// fetchTmdbItemDetailsUncached). ISO 3166-1 alpha-2 codes, matching what
+// TMDB's own watch_region/certification data expects. Not every country
+// TMDB recognizes is listed here -- this covers the markets TMDB actually
+// has meaningful watch-provider coverage for, sorted by country name so
+// the dropdown reads naturally rather than needing anyone to already know
+// their own ISO code.
+const REGION_OPTIONS = [
+  ["AR", "Argentina"], ["AU", "Australia"], ["AT", "Austria"], ["BE", "Belgium"],
+  ["BO", "Bolivia"], ["BR", "Brazil"], ["CA", "Canada"], ["CL", "Chile"],
+  ["CO", "Colombia"], ["CR", "Costa Rica"], ["HR", "Croatia"], ["CZ", "Czech Republic"],
+  ["DK", "Denmark"], ["DO", "Dominican Republic"], ["EC", "Ecuador"], ["EG", "Egypt"],
+  ["FI", "Finland"], ["FR", "France"], ["DE", "Germany"], ["GR", "Greece"],
+  ["HK", "Hong Kong"], ["HU", "Hungary"], ["IN", "India"], ["ID", "Indonesia"],
+  ["IE", "Ireland"], ["IL", "Israel"], ["IT", "Italy"], ["JP", "Japan"],
+  ["MY", "Malaysia"], ["MX", "Mexico"], ["NL", "Netherlands"], ["NZ", "New Zealand"],
+  ["NO", "Norway"], ["PA", "Panama"], ["PE", "Peru"], ["PH", "Philippines"],
+  ["PL", "Poland"], ["PT", "Portugal"], ["RO", "Romania"], ["SA", "Saudi Arabia"],
+  ["SG", "Singapore"], ["ZA", "South Africa"], ["KR", "South Korea"], ["ES", "Spain"],
+  ["SE", "Sweden"], ["CH", "Switzerland"], ["TW", "Taiwan"], ["TH", "Thailand"],
+  ["TR", "Turkey"], ["AE", "United Arab Emirates"], ["GB", "United Kingdom"],
+  ["US", "United States"], ["UY", "Uruguay"], ["VE", "Venezuela"], ["VN", "Vietnam"],
+];
+
+// Renders REGION_OPTIONS as <option> tags for the Settings region <select>,
+// called at render time in 15_tab-settings-html.js with whatever region
+// this install's config already carries (or "US" for a fresh one).
+function buildRegionOptionsHtml(selectedRegion) {
+  const sel = (selectedRegion || "US").toUpperCase().slice(0, 2) || "US";
+  return REGION_OPTIONS.map(
+    ([code, name]) => `<option value="${code}"${code === sel ? " selected" : ""}>${name}</option>`
+  ).join("");
+}
+
+
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -1646,7 +1683,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -1678,6 +1715,19 @@ function decodeConfig(config) {
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
       shuffleShelves: !!(!Array.isArray(parsed) && parsed.shuffleShelves),
       shuffleItems: !!(!Array.isArray(parsed) && parsed.shuffleItems),
+      // Two-letter watch_region for streaming-availability catalogs
+      // (provider charts, Stream Releases) and content ratings -- see
+      // 07_source-fetchers-tmdb-simkl.js's tmdbProviderChartPaths and
+      // fetchTmdbItemDetailsUncached for where this actually gets used.
+      // Defaults to US so every install predating this feature keeps
+      // behaving exactly as it always did.
+      region: (!Array.isArray(parsed) && parsed.region) || "US",
+      // Filters items with no known digital release (movie charts only,
+      // see fetchTmdbChart's own comment for why) out of TMDB Trending/
+      // Popular movie catalogs. Defaults to false so every install
+      // predating this feature keeps showing everything, same reasoning
+      // as region's own default above.
+      hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
     };
   } catch {
     return empty;
@@ -2177,17 +2227,39 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
     const day = statsToday();
-    const dayKey = `evtcount:${eventType}:${id}:${day}`;
+    const daysKey = `evtcount:${eventType}:${id}:days`;
     const totalKey = `evtcount:${eventType}:${id}:alltime`;
     const metaKey = `evtmeta:${eventType}:${id}`;
     const indexKey = `evtdayindex:${eventType}:${day}`;
 
-    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
-      env.CONFIGS.get(dayKey),
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
       env.CONFIGS.get(totalKey),
       env.CONFIGS.get(indexKey),
     ]);
-    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    // One JSON blob per (eventType, id) holding every day's count, rather
+    // than one KV key per (eventType, id, day) -- summing a 90-day window
+    // used to mean 90 separate reads per candidate title (see
+    // computeLeaderboard below), which multiplied against even a modest
+    // candidate list blew past a safe per-invocation KV read budget and
+    // was quietly capping the leaderboard to far fewer than 100 entries
+    // for every window wider than a day or two. One read per candidate
+    // here, regardless of window width, fixes that at the root instead of
+    // just raising a cap number. Trimmed to the most recent 95 days on
+    // write (a few days' buffer past the widest window this dashboard
+    // ever queries, 90) so this blob can't grow without bound for a title
+    // that's been tracked for years.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
     const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
 
     let index = [];
@@ -2199,7 +2271,7 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     if (!index.includes(id)) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
       env.CONFIGS.put(totalKey, String(totalCount)),
       env.CONFIGS.put(indexKey, JSON.stringify(index)),
       // Overwritten every time rather than only on first sight -- keeps
@@ -2298,12 +2370,24 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
       // skip an unparseable day index rather than failing the whole window
     }
   });
-  const ids = [...idSet].slice(0, 500); // defensive cap, see the size-guard convention used elsewhere in this file
+  // Flat top-100 cap regardless of window width: each candidate now costs
+  // exactly 2 KV reads below (one evtcount days-blob, one evtmeta) since
+  // recordTrackedEvent stores every day's count for a title in a single
+  // JSON blob rather than one key per day -- summing a 90-day window no
+  // longer means 90 reads per candidate, just one. See
+  // recordTrackedEvent's own comment for why that changed.
+  const ids = [...idSet].slice(0, 100);
 
   const entries = await Promise.all(
     ids.map(async (id) => {
-      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtcount:${eventType}:${id}:${d}`)));
-      const count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
+      const daysRaw = await env.CONFIGS.get(`evtcount:${eventType}:${id}:days`);
+      let dayCounts = {};
+      try {
+        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+      } catch {
+        dayCounts = {};
+      }
+      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
       const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
       let title = id;
       let mediaType = "";
@@ -2320,8 +2404,19 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     })
   );
   const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
-  filtered.sort((a, b) => b.count - a.count);
-  const topEntries = filtered.slice(0, 100);
+  // count > 0 filter: without it, an id that's in today's/this window's
+  // day-index (written unconditionally on every tracked event, regardless
+  // of counter format) but has no data in the current evtcount:...:days
+  // blob -- e.g. an id only ever tracked before this blob-based format
+  // shipped, whose history lives solely under the old per-day-per-id keys
+  // this branch no longer reads -- would show up as a real-looking
+  // leaderboard row stuck at 0 forever. Matches the filter
+  // computeSearchLeaderboard's equivalent branch already has; the alltime
+  // branch above doesn't need one since it only ever lists ids that
+  // already have a nonzero running total by construction.
+  const nonZero = filtered.filter((e) => e.count > 0);
+  nonZero.sort((a, b) => b.count - a.count);
+  const topEntries = nonZero.slice(0, 100);
 
   // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
   await Promise.all(
@@ -2383,16 +2478,33 @@ async function recordSearchQuery(env, query) {
   if (q.length < 2) return;
   try {
     const day = statsToday();
-    const dayKey = `searchquery:${q}:${day}`;
+    const daysKey = `searchquery:${q}:days`;
     const totalKey = `searchquery:${q}:alltime`;
     const indexKey = `searchquerydayindex:${day}`;
 
-    const [dayRaw, totalRaw, indexRaw] = await Promise.all([
-      env.CONFIGS.get(dayKey),
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
       env.CONFIGS.get(totalKey),
       env.CONFIGS.get(indexKey),
     ]);
-    const dayCount = (parseInt(dayRaw, 10) || 0) + 1;
+    // Same consolidated-blob shape as recordTrackedEvent above, and the
+    // same reason: one JSON blob per query holding every day's count,
+    // instead of one KV key per (query, day), so summing a wide window
+    // costs one read per candidate query instead of one read per
+    // candidate per day. See recordTrackedEvent's own comment for the
+    // full story -- this is the same fix applied to the same bug in the
+    // Search & Queries leaderboard.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
     const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
 
     let index = [];
@@ -2404,7 +2516,7 @@ async function recordSearchQuery(env, query) {
     if (!index.includes(q)) index.push(q);
 
     await Promise.all([
-      env.CONFIGS.put(dayKey, String(dayCount)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
       env.CONFIGS.put(totalKey, String(totalCount)),
       env.CONFIGS.put(indexKey, JSON.stringify(index)),
     ]);
@@ -2436,12 +2548,17 @@ async function computeSearchLeaderboard(env, window) {
     dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
   }
 
-  // Check both searchquerydayindex and direct searchquery list prefix
-  const [indexResults, listResult] = await Promise.all([
-    Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`))),
-    env.CONFIGS.list({ prefix, limit: 1000 }),
-  ]);
-
+  // Union of every query that had any activity anywhere in this window,
+  // from the day-index only -- same pattern as computeLeaderboard above.
+  // This used to also list()-scan the entire "searchquery:" prefix (up to
+  // 1000 keys) unconditionally on every call, which pulled in every query
+  // ever recorded on any day, not just this window -- defeating the
+  // day-index's entire purpose and inflating the candidate set (and the
+  // KV reads below) regardless of how narrow a window was actually asked
+  // for. Removed rather than kept "just in case": the day-index is
+  // written every time recordSearchQuery runs, so there's nothing a raw
+  // prefix scan would catch that the index doesn't already have.
+  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`)));
   const querySet = new Set();
   indexResults.forEach((raw) => {
     if (!raw) return;
@@ -2450,26 +2567,21 @@ async function computeSearchLeaderboard(env, window) {
     } catch {}
   });
 
-  (listResult.keys || []).forEach((k) => {
-    const rest = k.name.slice(prefix.length);
-    const lastColon = rest.lastIndexOf(":");
-    if (lastColon !== -1) {
-      const q = rest.slice(0, lastColon);
-      const sfx = rest.slice(lastColon + 1);
-      if (sfx !== "alltime") querySet.add(q);
-    }
-  });
-
-  const queries = [...querySet].slice(0, 500);
+  // Flat top-100 cap regardless of window width -- see recordSearchQuery's
+  // own comment: summing a window now costs one read per candidate query
+  // (the days-blob), not one per candidate per day.
+  const queries = [...querySet].slice(0, 100);
 
   const entries = await Promise.all(
     queries.map(async (q) => {
-      const dayCounts = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquery:${q}:${d}`)));
-      let count = dayCounts.reduce((sum, v) => sum + (parseInt(v, 10) || 0), 0);
-      if (count === 0 && window === "today") {
-        const totalRaw = await env.CONFIGS.get(`searchquery:${q}:alltime`);
-        count = parseInt(totalRaw, 10) || 0;
+      const daysRaw = await env.CONFIGS.get(`searchquery:${q}:days`);
+      let dayCounts = {};
+      try {
+        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+      } catch {
+        dayCounts = {};
       }
+      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
       return { query: q, count };
     })
   );
@@ -2919,7 +3031,18 @@ async function renderAdminDashboard(env) {
       (c) =>
         `<tr><td>${escapeHtmlServer(c.displayName)}</td><td>${escapeHtmlServer(c.username)}</td>` +
         `<td>${c.createdAt ? easternDateKey(new Date(c.createdAt)) : "\u2014"}</td>` +
-        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td></tr>`
+        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td>` +
+        // data-* attributes here rather than passing c.displayName inline into
+        // the onclick string -- displayName is arbitrary creator-chosen text
+        // (only .trim()'d server-side, not restricted to safe characters the
+        // way the normalized username is), so splicing it directly into an
+        // onclick="..." attribute would both break on a display name
+        // containing a quote and, worse, let a crafted display name inject
+        // script into this admin page. escapeHtmlServer handles the HTML-
+        // attribute escaping here the same way it already does for the two
+        // <td> values above; resetCreatorKey reads the values back off the
+        // element at click time instead of receiving them as literals.
+        `<td><button type="button" class="lc-btn secondary" style="padding:4px 10px; font-size:0.8rem;" data-username="${escapeHtmlServer(c.username)}" data-displayname="${escapeHtmlServer(c.displayName)}" onclick="resetCreatorKey(this)">Reset Key</button></td></tr>`
     )
     .join("");
   const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
@@ -3120,8 +3243,8 @@ async function renderAdminDashboard(env) {
     </div>
     <div class="table-wrap">
       <table>
-        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th></tr>
-        ${accountRows || '<tr><td colspan="4">No accounts yet.</td></tr>'}
+        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th><th>Key</th></tr>
+        ${accountRows || '<tr><td colspan="5">No accounts yet.</td></tr>'}
       </table>
     </div>
   </div>
@@ -3159,6 +3282,11 @@ async function renderAdminDashboard(env) {
       <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
     <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
+    <div style="margin:0 0 12px;">
+      <button type="button" class="admin-select" style="cursor:pointer;" id="migrateDayCountsBtn" onclick="runMigrateDayCounts()">Migrate Historical Day Counts</button>
+      <span id="migrateDayCountsStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <p style="color:#8E8E93; margin:6px 0 0; font-size:0.8rem;">One-time migration for the switch from one KV key per day to one JSON blob per title -- reads every old per-day count still sitting in KV and folds it into the new format, so 7/30/90-day windows reflect activity from before that switch instead of only counting forward from it. Safe to run more than once (adds, never subtracts); old keys are deleted once folded in, so re-running just confirms there's nothing left. Also covers the Search &amp; Queries leaderboard.</p>
+    </div>
     <div class="table-wrap">
       <table>
         <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
@@ -3405,6 +3533,56 @@ async function renderAdminDashboard(env) {
 
     restoreAdminActiveTab();
 
+    // Resets a creator's login key server-side (see /admin/api/reset-creator-key
+    // -- it can only invalidate + replace, never recover the original,
+    // since only a salted hash of it is ever stored). Two-step confirm
+    // matching this dashboard's other destructive actions: a plain
+    // confirm() naming exactly what's about to happen and to whom, then
+    // the new key is shown once in a copyable box -- there is no second
+    // chance to see it, same as the reveal shown at signup.
+    async function resetCreatorKey(btn) {
+      const username = btn.dataset.username;
+      const displayName = btn.dataset.displayname;
+      const sure = confirm(
+        'Reset the login key for "' + displayName + '" (' + username + ')?\\n\\n' +
+        'Their current key will stop working immediately. You will need to ' +
+        'send them the new key yourself -- there is no email on file to send it to.'
+      );
+      if (!sure) return;
+      try {
+        const res = await fetch('/admin/api/reset-creator-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('Could not reset key: ' + (data.error || 'unknown error'));
+          return;
+        }
+        showResetKeyModal(displayName, data.creatorKey);
+      } catch (e) {
+        alert('Network error -- could not reset key. Try again.');
+      }
+    }
+
+    function showResetKeyModal(displayName, creatorKey) {
+      const overlay = document.createElement('div');
+      overlay.id = 'resetKeyOverlay';
+      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:9999;';
+      overlay.innerHTML =
+        '<div style="background:#fff; border-radius:12px; padding:24px; max-width:380px; width:90%;">' +
+          '<h3 style="margin-top:0;">New key for ' + escapeHtmlAdmin(displayName) + '</h3>' +
+          '<p style="color:#8E8E93; font-size:0.9rem;">This is shown once. Copy it now and send it to the creator yourself -- their old key no longer works.</p>' +
+          '<div id="resetKeyDisplay" style="font-family:monospace; font-size:1.1rem; background:#F2F2F7; border-radius:8px; padding:10px; text-align:center; margin:12px 0; user-select:all;">' + escapeHtmlAdmin(creatorKey) + '</div>' +
+          '<div style="display:flex; gap:8px;">' +
+            '<button type="button" class="lc-btn secondary" style="flex:1;" onclick="navigator.clipboard.writeText(\\'' + creatorKey + '\\'); this.textContent=\\'Copied!\\';">Copy Key</button>' +
+            '<button type="button" class="lc-btn" style="flex:1;" onclick="document.getElementById(\\'resetKeyOverlay\\').remove();">Done</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+    }
+
     async function loadSearchData() {
       const body = document.getElementById('searchTableBody');
       body.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
@@ -3558,6 +3736,39 @@ async function renderAdminDashboard(env) {
       }
       btn.disabled = false;
       loadTrendingData();
+    }
+
+    // Same shape as runBackfillTrending just above -- see
+    // /admin/api/migrate-day-counts's own comment for what this is
+    // actually migrating and why.
+    async function runMigrateDayCounts() {
+      const btn = document.getElementById('migrateDayCountsBtn');
+      const status = document.getElementById('migrateDayCountsStatus');
+      btn.disabled = true;
+      let keysMigrated = 0;
+      let safetyCounter = 0;
+      try {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-day-counts', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (migrated ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 migrated ' + keysMigrated + ' old day-count' + (keysMigrated === 1 ? '' : 's') + ' into the new format.';
+            break;
+          }
+          keysMigrated += data.keysMigratedThisCall || 0;
+          status.textContent = 'Working\u2026 ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ' migrated so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (migrated ' + keysMigrated + ' day-counts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+      if (typeof loadSearchData === 'function') loadSearchData();
     }
 
     async function loadApiUsage() {
@@ -3884,7 +4095,17 @@ async function renderAdminDashboard(env) {
         const res = await fetch('/api/feedback', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ category: category, message: message, creatorName: 'admin' }),
+          // fromAdminPanel: true is the deliberate signal that this
+          // request really is the admin dashboard's own "Log something
+          // yourself" feature, not just any page that happens to load in
+          // a browser that also has a valid admin cookie. /api/feedback
+          // is the same public endpoint the regular addon's Settings page
+          // posts to -- without this flag, isAdmin there was based on
+          // cookie presence alone, so testing the public feedback UI
+          // (e.g. under a different Creator Profile/persona) in the same
+          // browser as an active admin session got every message
+          // mislabeled as sent by "Developer" instead of that persona.
+          body: JSON.stringify({ category: category, message: message, creatorName: 'admin', fromAdminPanel: true }),
         });
         const data = await res.json().catch(() => null);
         if (!data || !data.ok) {
@@ -4148,6 +4369,8 @@ async function resolveConfig(configParam, env) {
           trackCreatorKey: parsed.trackCreatorKey || "",
           shuffleShelves: !!parsed.shuffleShelves,
           shuffleItems: !!parsed.shuffleItems,
+          region: parsed.region || "US",
+          hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
         };
       } catch {
         // fall through to legacy decode below
@@ -4559,17 +4782,17 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
       trackSharedApiUse(keys, true, "tmdb");
       const webChart = typeof parseTmdbWebChartUrl === "function" ? parseTmdbWebChartUrl(entry.url) : null;
       const chartKey = webChart ? webChart.chartKey : entry.url.trim().slice("tmdb:chart:".length);
-      result = await fetchTmdbChart(entry, skip, TMDB_API_KEY, chartKey);
+      result = await fetchTmdbChart(entry, skip, TMDB_API_KEY, chartKey, keys.region, keys.hideNonDigitalReleases);
     }
     else if (source === "tmdb-collection") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbCollection(entry, skip, TMDB_API_KEY); }
-    else if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length)); }
+    else if (source === "tmdb-top10") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbProviderTop10(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:top10:".length), keys.region); }
     else if (source === "tmdb-hidden-gems") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHiddenGems(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
     else if (source === "tmdb-holiday") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHoliday(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:holiday:".length)); }
-    else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length)); }
+    else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length), keys.region); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length)); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length)); }
-    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length)); }
+    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
     else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env, keys);
@@ -5266,12 +5489,12 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     }
     if (trackingRaw) {
       const trackingBlob = JSON.parse(trackingRaw);
-      items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (trackingBlob.watchlist || []));
+      items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
     } else {
       const blobStr = await env.CONFIGS.get('creatorsync:' + username);
       if (!blobStr) return [];
       const blob = JSON.parse(blobStr);
-      items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (blob.watchlist || []));
+      items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
     }
     if (!items || !items.length) return [];
     
@@ -5298,6 +5521,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         releaseInfo: it.year || undefined,
         airDate: it.airDate || undefined,
         isUnaired: it.isUnaired ? true : undefined,
+        isSeasonPremiere: it.isSeasonPremiere ? true : undefined,
       };
       
       if (!mapped.id) return;
@@ -6101,11 +6325,12 @@ async function fetchSimklChart(entry, skip, clientId, chartKey) {
   return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
 }
 
-async function fetchSimklUserList(entry, skip, token, clientId, spec) {
+async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey) {
   if (!token) {
     throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
   }
   const cid = clientId || SIMKL_CLIENT_ID;
+  const tmdbApiKey = userTmdbKey || TMDB_API_KEY;
   const parts = (spec || "").split(":");
   const category = parts[0] || "movies"; // "movies", "shows", "anime"
   const status = parts[1] || "plantowatch"; // "plantowatch", "watching", "completed", "hold", "dropped"
@@ -6134,6 +6359,76 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec) {
       return await res.json();
     }
   });
+  if (status === "airing-next" || category === "airing-next") {
+    const rawShows = (category === "anime")
+      ? (Array.isArray(data.anime) ? data.anime : [])
+      : [
+          ...(Array.isArray(data.shows) ? data.shows : []),
+          ...(Array.isArray(data.anime) ? data.anime : []),
+        ];
+    const candidateShows = rawShows.filter((it) => (it.status === "watching" || it.status === "completed"));
+    candidateShows.sort((a, b) => {
+      const aTime = a.last_watched_at ? new Date(a.last_watched_at).getTime() : 0;
+      const bTime = b.last_watched_at ? new Date(b.last_watched_at).getTime() : 0;
+      if (a.status === "watching" && b.status !== "watching") return -1;
+      if (b.status === "watching" && a.status !== "watching") return 1;
+      return bTime - aTime;
+    });
+    const seen = new Set();
+    const candidateMetas = [];
+    candidateShows.forEach((it) => {
+      const mediaObj = it.show || it.anime || it.movie;
+      if (mediaObj && mediaObj.ids) {
+        const imdbId = mediaObj.ids.imdb || "";
+        const tmdbId = mediaObj.ids.tmdb || "";
+        const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "");
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          candidateMetas.push({
+            id,
+            imdbId,
+            tmdbId,
+            name: mediaObj.title || "",
+            poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+            year: mediaObj.year ? String(mediaObj.year) : undefined,
+          });
+        }
+      }
+    });
+
+    const airingMetas = [];
+    await mapWithConcurrency(candidateMetas.slice(0, 35), 6, async (item) => {
+      try {
+        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series");
+        if (details && details.nextEpisodeAirDate) {
+          const isPremiere = details.nextEpisodeNumber === 1;
+          const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
+          const eNum = details.nextEpisodeNumber ? `E${String(details.nextEpisodeNumber).padStart(2, "0")}` : "";
+          const epLabel = sNum && eNum ? `${sNum}${eNum}` : "";
+          const realId = (item.imdbId && item.imdbId.startsWith("tt")) ? item.imdbId : (details.imdbId && String(details.imdbId).startsWith("tt") ? details.imdbId : (item.id || item.imdbId));
+          airingMetas.push({
+            id: realId,
+            type: "series",
+            name: item.name || details.title || "",
+            poster: item.poster || details.poster || "",
+            background: details.background || undefined,
+            // No releaseInfo (year) here on purpose -- for an Airing Next
+            // row, the useful date is the upcoming episode's air date
+            // (already surfaced in description below), not the show's
+            // original release year, which is noise in this context.
+            airDate: details.nextEpisodeAirDate,
+            isSeasonPremiere: isPremiere,
+            description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+            trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
+          });
+        }
+      } catch {}
+    });
+
+    airingMetas.sort((a, b) => (a.airDate || "").localeCompare(b.airDate || ""));
+    return airingMetas.slice(skip, skip + PAGE_SIZE);
+  }
+
   const arr = Array.isArray(data[category]) ? data[category] : [];
   const filtered = arr.filter((it) => (it.status || "plantowatch") === status);
   const metas = [];
@@ -6331,18 +6626,38 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
+  // release_dates is appended alongside external_ids/videos at no extra
+  // request cost (same call, one more field) -- used by fetchTmdbChart
+  // below to support the "hide items with no digital release" setting
+  // without a second per-item fetch. Harmless for callers that don't need
+  // it (TMDB list imports, etc.) since it's simply unused there.
   const src = `https://api.themoviedb.org/3/${kind}/${cleanTmdbId}?api_key=${encodeURIComponent(
     apiKey
-  )}&append_to_response=external_ids,videos`;
+  )}&append_to_response=external_ids,videos,release_dates`;
   const res = await fetch(src, {
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return { imdbId: null, videos: null };
+  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
   const data = await res.json();
   const imdbId = (data.external_ids && data.external_ids.imdb_id) || data.imdb_id || null;
   const videos = (data.videos && data.videos.results) || null;
-  return { imdbId, videos };
+  // hasDigitalRelease stays null for TV (kind === "tv") -- TMDB's
+  // release_dates/release type concept (theatrical/digital/physical) is
+  // movie-only; there's no equivalent field on the /tv endpoint, so the
+  // "hide items with no digital release" setting only ever applies to
+  // movie charts (see fetchTmdbChart below), never TV ones.
+  let hasDigitalRelease = null;
+  if (kind === "movie" && data.release_dates && Array.isArray(data.release_dates.results)) {
+    // Type 4 = Digital, 5 = Physical (TMDB's own release_type enum) --
+    // physical is included too since a disc/rental release reliably
+    // implies digital availability exists somewhere even when TMDB's own
+    // digital entry for that title is missing or incomplete.
+    hasDigitalRelease = data.release_dates.results.some((r) =>
+      Array.isArray(r.release_dates) && r.release_dates.some((rd) => rd.type === 4 || rd.type === 5)
+    );
+  }
+  return { imdbId, videos, hasDigitalRelease };
 }
 
 // Pulls a public themoviedb.org list via TMDB's v4 List Details endpoint.
@@ -6537,6 +6852,20 @@ function tmdbProviderChartPaths(providerId) {
   return { movie: `discover/movie?${q}`, tv: `discover/tv?${q}` };
 }
 
+// Every provider/stream-releases path built above bakes in watch_region=US
+// as a placeholder -- substituteWatchRegion swaps it for the caller's
+// actual region at request time (see fetchTmdbChart/fetchTmdbProviderTop10/
+// fetchTmdbGenre below). Done this way, rather than rebuilding the whole
+// TMDB_CHART_PATHS/TMDB_GENRE_CONFIG maps to be region-aware from the
+// start, since only these few entries are watch_region-sensitive at all --
+// most chart/genre paths (trending, by-genre, etc.) have nothing to do
+// with regional availability and shouldn't need touching.
+function substituteWatchRegion(path, region) {
+  if (!path || !path.includes("watch_region=")) return path;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  return path.replace(/watch_region=[A-Z]{2}/, `watch_region=${effectiveRegion}`);
+}
+
 const TMDB_CHART_PATHS = {
   trending: { movie: "trending/movie/week", tv: "trending/tv/week" },
   popular: { movie: "movie/popular", tv: "tv/popular" },
@@ -6616,7 +6945,7 @@ function getTmdbNewReleasesChartPath(wantKind) {
 // fetches a specific user-curated list and has to walk pages defensively
 // since v3's /list/{id} pagination is flaky), these are standard, reliably-
 // paginated v3 endpoints -- see fetchTmdbPagedResults.
-async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
+async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigitalReleases) {
   if (!apiKey) {
     throw new Error(
       "TMDB charts aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
@@ -6633,12 +6962,27 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
   if (!chartPath) {
     throw new Error("This TMDB chart doesn't have a shows version.");
   }
+  chartPath = substituteWatchRegion(chartPath, region);
 
   const windowItems = await fetchTmdbPagedResults(chartPath, apiKey, skip);
 
+  // Only Trending/Popular movie charts support this filter -- TV has no
+  // digital-release concept on TMDB (see fetchTmdbDetails's own comment),
+  // and every other chartKey (Top Rated, Now Playing, Upcoming, provider
+  // charts, etc.) is either already release-gated by its own nature or
+  // isn't what the "hide items with no digital release" setting was aimed
+  // at (Trending/Popular specifically, per how it was requested).
+  const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
+
   const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-    const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+    const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
     if (!imdbId) return null;
+    // hasDigitalRelease === null means the lookup itself failed or didn't
+    // apply (see fetchTmdbDetails) -- treat that as "keep it" rather than
+    // "no digital release", so a transient TMDB hiccup can't silently
+    // shrink the list; only an explicit false (checked and confirmed
+    // absent) is filtered out.
+    if (applyDigitalFilter && hasDigitalRelease === false) return null;
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
@@ -6657,7 +7001,7 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey) {
 // them -- TOP_N below is the only thing controlling that, not something
 // TMDB itself expresses (their discover results are just popularity-
 // sorted, uncapped).
-async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
+async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey, region) {
   const TOP_N = 10;
   if (skip >= TOP_N) return []; // already gave everything -- tells the caller to stop paginating
   if (!apiKey) {
@@ -6667,10 +7011,11 @@ async function fetchTmdbProviderTop10(entry, skip, apiKey, chartKey) {
   }
   const wantKind = entry.type === "series" ? "tv" : "movie";
   const pathMap = TMDB_CHART_PATHS[chartKey];
-  const chartPath = pathMap && pathMap[wantKind];
+  let chartPath = pathMap && pathMap[wantKind];
   if (!chartPath) {
     throw new Error("This TMDB chart doesn't have a shows version.");
   }
+  chartPath = substituteWatchRegion(chartPath, region);
   // A single direct page-1 request -- TOP_N=10 always fits inside TMDB's
   // own 20-per-page results, so this deliberately skips
   // fetchTmdbPagedResults's own windowing (built for pulling up to
@@ -6913,7 +7258,7 @@ const TMDB_GENRE_CONFIG = {
   },
 };
 
-async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
+async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
   if (!apiKey) {
     throw new Error(
       "Genre lists aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
@@ -6922,7 +7267,7 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
   const wantKind = entry.type === "series" ? "tv" : "movie";
   const key = String(genreKey || "").toLowerCase().trim();
   const config = TMDB_GENRE_CONFIG[key] || { movie: "", tv: "" };
-  const queryPart = config[wantKind] || "";
+  const queryPart = substituteWatchRegion(config[wantKind] || "", region);
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
 
@@ -6965,9 +7310,16 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
-  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}`;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  // effectiveRegion folded into the cache key (defaulting to "US" so every
+  // existing call site that doesn't pass one keeps sharing the exact same
+  // cache entries as before, zero regression) -- content ratings are
+  // region-specific (see fetchTmdbItemDetailsUncached below), so without
+  // this the first region to ever request a given title would silently
+  // poison the shared cache for every other region's users.
+  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
   return fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
     // Matches the 7-day cacheTtl already on each individual fetch() below
@@ -6979,12 +7331,13 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType) {
     // beats the modal failing to open at all.
     staleTtlSec: 2592000,
     providerLabel: "TMDB Item Details",
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
   });
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
+  const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   let rawStr = String(imdbId).trim();
   let tmdbId = null;
   let type = (fallbackType === "series" || fallbackType === "tv") ? "tv" : (fallbackType === "movie" ? "movie" : null);
@@ -7057,16 +7410,21 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
   if (!match || !resolvedType) return null;
   type = resolvedType;
   
-  // Extract content rating (US fallback)
+  // Extract content rating -- prefer the requested region's own
+  // certification, falling back to US if that region has no entry for
+  // this title (common outside a handful of major markets; US almost
+  // always has one, and an approximate rating beats showing none at all).
   let contentRating = null;
   if (type === "movie" && match.release_dates && match.release_dates.results) {
-    const us = match.release_dates.results.find(r => r.iso_3166_1 === "US");
-    if (us && us.release_dates.length > 0) {
-      contentRating = us.release_dates.find(r => r.certification)?.certification;
+    const regional = match.release_dates.results.find(r => r.iso_3166_1 === effectiveRegion) ||
+                      match.release_dates.results.find(r => r.iso_3166_1 === "US");
+    if (regional && regional.release_dates.length > 0) {
+      contentRating = regional.release_dates.find(r => r.certification)?.certification;
     }
   } else if (type === "tv" && match.content_ratings && match.content_ratings.results) {
-    const us = match.content_ratings.results.find(r => r.iso_3166_1 === "US");
-    if (us) contentRating = us.rating;
+    const regional = match.content_ratings.results.find(r => r.iso_3166_1 === effectiveRegion) ||
+                      match.content_ratings.results.find(r => r.iso_3166_1 === "US");
+    if (regional) contentRating = regional.rating;
   }
   
   // Extract trailer
@@ -7153,7 +7511,48 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType) {
     genres: genres,
     trailerKey: trailerKey,
     cast: cast,
-    director: director
+    director: director,
+    // Airing Next (client-side, 21_client-custom-list-builder.js) reads
+    // these straight off TMDB's own next_episode_to_air -- already present
+    // on this same /tv/{id} response fetched above, so this costs nothing
+    // extra. null on a movie, or a tv show with no scheduled next episode
+    // (ended/cancelled, or simply not yet renewed).
+    //
+    // Fallback: TMDB only populates next_episode_to_air once it has an
+    // actual episode row with a confirmed air date -- a renewed show whose
+    // next season has only a season-level premiere date announced (e.g.
+    // "Season 9 -- Jan 1, 2027") shows next_episode_to_air: null right up
+    // until TMDB adds that first episode's own row, even though the
+    // premiere date itself is already known. match.seasons (fetched as
+    // part of this same response, see seasonsData above) carries that
+    // season-level air_date, so fall back to the nearest not-yet-aired
+    // season in there rather than silently reporting "nothing scheduled".
+    ...(() => {
+      if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
+      if (match.next_episode_to_air) {
+        return {
+          nextEpisodeAirDate: match.next_episode_to_air.air_date || null,
+          nextEpisodeNumber: typeof match.next_episode_to_air.episode_number === "number" ? match.next_episode_to_air.episode_number : null,
+          nextEpisodeSeasonNumber: typeof match.next_episode_to_air.season_number === "number" ? match.next_episode_to_air.season_number : null,
+        };
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      const upcomingSeasons = Array.isArray(match.seasons)
+        ? match.seasons.filter((s) => s && s.season_number > 0 && s.air_date && s.air_date > today)
+        : [];
+      upcomingSeasons.sort((a, b) => a.air_date.localeCompare(b.air_date));
+      const nextSeason = upcomingSeasons[0];
+      if (nextSeason) {
+        return {
+          nextEpisodeAirDate: nextSeason.air_date,
+          nextEpisodeNumber: 1,
+          nextEpisodeSeasonNumber: nextSeason.season_number,
+        };
+      }
+      return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
+    })(),
+    lastEpisodeNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.episode_number === "number" ? match.last_episode_to_air.episode_number : null) : null,
+    lastEpisodeSeasonNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.season_number === "number" ? match.last_episode_to_air.season_number : null) : null,
   };
 }
 
@@ -8036,6 +8435,8 @@ function renderBuilder(
   const initialSimklUsername = initialKeys.simklUsername || "";
   const initialShuffleShelves = !!initialKeys.shuffleShelves;
   const initialShuffleItems = !!initialKeys.shuffleItems;
+  const initialRegion = initialKeys.region || "US";
+  const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -8133,6 +8534,34 @@ ${seoHeadHtml}
   if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
     document.documentElement.classList.add('dark-theme');
   }
+  (function() {
+    var p = location.pathname || '';
+    var h = location.hash || '';
+    var isDeep = (p.startsWith('/lists/') && p !== '/lists') || p.startsWith('/channels/') || h.startsWith('#/list?') || h.startsWith('#/item?');
+    var tab = 'discover';
+    if (isDeep) {
+      tab = h.startsWith('#/item?') ? 'item-details' : 'list-details';
+    } else {
+      try {
+        var s = localStorage.getItem('myListAddon:activeTab');
+        if (s && s !== 'list-details' && s !== 'item-details') tab = s;
+      } catch (e) {}
+    }
+    document.documentElement.setAttribute('data-initial-tab', tab);
+
+    try {
+      var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+      document.documentElement.setAttribute('data-initial-catalogs-sub', catSub);
+      var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+      document.documentElement.setAttribute('data-initial-lists-sub', listSub);
+      var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+      document.documentElement.setAttribute('data-initial-channels-sub', chSub);
+      var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
+      document.documentElement.setAttribute('data-initial-settings-sub', setSub);
+      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+      document.documentElement.setAttribute('data-initial-discover-sub', discSub);
+    } catch (e) {}
+  })();
 </script>
 <style>
   :root {
@@ -8312,6 +8741,241 @@ ${seoHeadHtml}
   .tab-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
   .tab-panel { display: grid; gap: 14px; width: 100%; max-width: 100%; min-width: 0; }
   .tab-panel[hidden] { display: none; }
+  /* Prevent FOUC: Show initial active tab and hide inactive ones before script execution */
+  html[data-initial-tab] .tab-panel {
+    display: none !important;
+  }
+  html[data-initial-tab="discover"] .tab-panel[data-tab-panel="discover"],
+  html[data-initial-tab="catalogs"] .tab-panel[data-tab-panel="catalogs"],
+  html[data-initial-tab="lists"] .tab-panel[data-tab-panel="lists"],
+  html[data-initial-tab="channels"] .tab-panel[data-tab-panel="channels"],
+  html[data-initial-tab="search"] .tab-panel[data-tab-panel="search"],
+  html[data-initial-tab="settings"] .tab-panel[data-tab-panel="settings"],
+  html[data-initial-tab="list-details"] .tab-panel[data-tab-panel="list-details"],
+  html[data-initial-tab="item-details"] .tab-panel[data-tab-panel="item-details"] {
+    display: grid !important;
+  }
+  html[data-initial-tab]:not([data-initial-tab="discover"]) .tab-btn[data-tab="discover"] {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: var(--shadow-sm) !important;
+  }
+  html[data-initial-tab]:not([data-initial-tab="discover"]) .bottom-nav-item[data-tab="discover"] {
+    color: var(--muted) !important;
+  }
+  html[data-initial-tab="catalogs"] .tab-btn[data-tab="catalogs"],
+  html[data-initial-tab="lists"] .tab-btn[data-tab="lists"],
+  html[data-initial-tab="channels"] .tab-btn[data-tab="channels"],
+  html[data-initial-tab="search"] .tab-btn[data-tab="search"],
+  html[data-initial-tab="settings"] .tab-btn[data-tab="settings"] {
+    background: var(--accent) !important;
+    color: #fff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 10px rgba(0,122,255,0.30) !important;
+  }
+  html[data-initial-tab="catalogs"] .bottom-nav-item[data-tab="catalogs"],
+  html[data-initial-tab="lists"] .bottom-nav-item[data-tab="lists"],
+  html[data-initial-tab="channels"] .bottom-nav-item[data-tab="channels"],
+  html[data-initial-tab="search"] .bottom-nav-item[data-tab="search"],
+  html[data-initial-tab="settings"] .bottom-nav-item[data-tab="settings"] {
+    color: var(--accent) !important;
+  }
+
+  /* --- Initial Subpanel & Subnav Styles (Zero FOUC on Refresh) --- */
+  /* Catalogs */
+  html[data-initial-catalogs-sub] #catalogsSubShelves,
+  html[data-initial-catalogs-sub] #catalogsSubQuickAdd,
+  html[data-initial-catalogs-sub] #catalogsSubBulk {
+    display: none !important;
+  }
+  html[data-initial-catalogs-sub="all"] #catalogsSubShelves,
+  html[data-initial-catalogs-sub="shelves"] #catalogsSubShelves {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub="quickadd"] #catalogsSubQuickAdd {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub="bulk"] #catalogsSubBulk {
+    display: block !important;
+  }
+  html[data-initial-catalogs-sub] #catalogsFilterBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-catalogs-sub] #catalogsFilterBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-catalogs-sub="all"] #catalogsFilterBar .subnav-pill[data-sub="all"],
+  html[data-initial-catalogs-sub="shelves"] #catalogsFilterBar .subnav-pill[data-sub="all"],
+  html[data-initial-catalogs-sub="quickadd"] #catalogsFilterBar .subnav-pill[data-sub="quickadd"],
+  html[data-initial-catalogs-sub="bulk"] #catalogsFilterBar .subnav-pill[data-sub="bulk"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Lists */
+  html[data-initial-lists-sub] #listsSubMyLists,
+  html[data-initial-lists-sub] #listsSubLiked,
+  html[data-initial-lists-sub] #listsSubImport,
+  html[data-initial-lists-sub] #listsSubBulk,
+  html[data-initial-lists-sub] #listsSubCreateList {
+    display: none !important;
+  }
+  html[data-initial-lists-sub="my-lists"] #listsSubMyLists {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="liked"] #listsSubLiked {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="import"] #listsSubImport {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="bulk"] #listsSubBulk {
+    display: block !important;
+  }
+  html[data-initial-lists-sub="create-list"] #listsSubCreateList {
+    display: block !important;
+  }
+  html[data-initial-lists-sub] #listsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-lists-sub] #listsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-lists-sub="my-lists"] #listsSubnavBar .subnav-pill[data-sub="my-lists"],
+  html[data-initial-lists-sub="liked"] #listsSubnavBar .subnav-pill[data-sub="liked"],
+  html[data-initial-lists-sub="import"] #listsSubnavBar .subnav-pill[data-sub="import"],
+  html[data-initial-lists-sub="bulk"] #listsSubnavBar .subnav-pill[data-sub="bulk"],
+  html[data-initial-lists-sub="create-list"] #listsSubnavBar .subnav-pill[data-sub="create-list"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Channels */
+  html[data-initial-channels-sub] #channelsSubMyChannels,
+  html[data-initial-channels-sub] #channelsSubStorylines,
+  html[data-initial-channels-sub] #channelsSubQuickAdd,
+  html[data-initial-channels-sub] #channelsSubImport,
+  html[data-initial-channels-sub] #channelsSubBuild {
+    display: none !important;
+  }
+  html[data-initial-channels-sub="my-channels"] #channelsSubMyChannels {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="storylines"] #channelsSubStorylines {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="quickadd"] #channelsSubQuickAdd {
+    display: block !important;
+  }
+  html[data-initial-channels-sub="import"] #channelsSubImport {
+    display: block !important;
+  }
+  html[data-initial-channels-sub] #channelsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-channels-sub] #channelsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-channels-sub="my-channels"] #channelsSubnavBar .subnav-pill[data-sub="my-channels"],
+  html[data-initial-channels-sub="storylines"] #channelsSubnavBar .subnav-pill[data-sub="storylines"],
+  html[data-initial-channels-sub="quickadd"] #channelsSubnavBar .subnav-pill[data-sub="quickadd"],
+  html[data-initial-channels-sub="import"] #channelsSubnavBar .subnav-pill[data-sub="import"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Settings */
+  html[data-initial-settings-sub] #settingsSubAccount,
+  html[data-initial-settings-sub] #settingsSubExternal,
+  html[data-initial-settings-sub] #settingsSubBackup,
+  html[data-initial-settings-sub] #settingsSubFeedback {
+    display: none !important;
+  }
+  html[data-initial-settings-sub="account"] #settingsSubAccount,
+  html[data-initial-settings-sub="keys"] #settingsSubAccount {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="external"] #settingsSubExternal {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="backup"] #settingsSubBackup {
+    display: block !important;
+  }
+  html[data-initial-settings-sub="feedback"] #settingsSubFeedback {
+    display: block !important;
+  }
+  html[data-initial-settings-sub] #settingsSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-settings-sub] #settingsSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-settings-sub="account"] #settingsSubnavBar .subnav-pill[data-sub="account"],
+  html[data-initial-settings-sub="keys"] #settingsSubnavBar .subnav-pill[data-sub="account"],
+  html[data-initial-settings-sub="external"] #settingsSubnavBar .subnav-pill[data-sub="external"],
+  html[data-initial-settings-sub="backup"] #settingsSubnavBar .subnav-pill[data-sub="backup"],
+  html[data-initial-settings-sub="feedback"] #settingsSubnavBar .subnav-pill[data-sub="feedback"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
+
+  /* Discover */
+  html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="popular"] #discoverListsFeed,
+  html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="curated"] #discoverListsFeed {
+    display: none !important;
+  }
+  html[data-initial-discover-sub="popular"] #discoverSubPopular {
+    display: block !important;
+  }
+  html[data-initial-discover-sub="curated"] #discoverSubCurated {
+    display: block !important;
+  }
+  html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill {
+    background: var(--surface) !important;
+    color: var(--text-2) !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: none !important;
+  }
+  html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill .check-icon {
+    display: none !important;
+  }
+  html[data-initial-discover-sub="all"] #discoverSubnavBar .subnav-pill[data-sub="all"],
+  html[data-initial-discover-sub="movie"] #discoverSubnavBar .subnav-pill[data-sub="movie"],
+  html[data-initial-discover-sub="series"] #discoverSubnavBar .subnav-pill[data-sub="series"],
+  html[data-initial-discover-sub="popular"] #discoverSubnavBar .subnav-pill[data-sub="popular"],
+  html[data-initial-discover-sub="curated"] #discoverSubnavBar .subnav-pill[data-sub="curated"],
+  html[data-initial-discover-sub="gems"] #discoverSubnavBar .subnav-pill[data-sub="gems"],
+  html[data-initial-discover-sub="kids"] #discoverSubnavBar .subnav-pill[data-sub="kids"],
+  html[data-initial-discover-sub="holidays"] #discoverSubnavBar .subnav-pill[data-sub="holidays"],
+  html[data-initial-discover-sub="genres"] #discoverSubnavBar .subnav-pill[data-sub="genres"] {
+    background: var(--accent) !important;
+    color: #ffffff !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(0,122,255,0.28) !important;
+  }
   /* Each direct child of .tab-panel (the subnav pill bar, each
      .lists-subpanel) is a grid item and inherits the same default
      min-width:auto issue .tab-panel itself was already guarded against
@@ -8324,6 +8988,13 @@ ${seoHeadHtml}
      a crossover-detection banner) could force the whole tab wider than
      the viewport on mobile instead of wrapping/scrolling within itself. */
   .channels-subpanel { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  /* Same fix, same reason, for the item-details page's direct content
+     wrapper -- it's a direct grid-item child of .tab-panel too, and
+     without its own min-width:0 override, wide unwrapped content inside
+     it (cast rows, provider/genre chip rows, etc.) could force the whole
+     page past the viewport width on mobile, same as the two subpanels
+     above. */
+  #itemDetailsBody { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
 
   /* --- Bottom Nav (Mobile Only - Persistent Glassmorphism) ---------------- */
   .bottom-nav { display: none; }
@@ -9123,6 +9794,32 @@ ${seoHeadHtml}
     white-space: nowrap;
     text-transform: uppercase;
   }
+  .cw-date-badge-premiere {
+    background: #2fa84f;
+    top: auto;
+    bottom: 4px;
+  }
+  .airing-next-filter-pills {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .airingNextFilterPill {
+    background: var(--panel-strong);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .airingNextFilterPill.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
   .list-card-mini-poster-img-wrap img {
     width: 100%;
     height: 100%;
@@ -9574,6 +10271,18 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 2px;
     flex-wrap: wrap;
+  }
+  /* .lc-btn's base white-space:nowrap (further up this stylesheet) is
+     correct for the short, fixed labels it's normally used with ("Copy
+     Key", "Reset Key", etc.), but the button here can carry a long,
+     dynamic label ("+ Add 15 Missing Crossover Episodes in Story Order")
+     -- nowrap forced it to render as one unbroken line wider than the
+     viewport on mobile instead of wrapping. Scoped to just this button so
+     every other .lc-btn usage keeps its normal nowrap behavior. */
+  .channel-crossover-actions .lc-btn {
+    white-space: normal;
+    text-align: center;
+    max-width: 100%;
   }
   /* Support & Feedback Chat */
   .support-chat-container {
@@ -10346,6 +11055,42 @@ ${seoHeadHtml}
     </button>
   </nav>
 
+  <script>
+    (function() {
+      var initTab = document.documentElement.getAttribute('data-initial-tab');
+      if (initTab) {
+        var titles = {
+          discover: { title: 'Discover', sub: 'Explore Popular & Streaming' },
+          catalogs: { title: 'Catalogs', sub: 'Manage Configured Catalogs' },
+          lists: { title: 'Lists', sub: 'Custom, Connected & Liked Lists' },
+          channels: { title: 'Channels', sub: '24/7 Continuous TV Streaming' },
+          search: { title: 'Search', sub: 'Find Movies, Shows & Lists' },
+          settings: { title: 'Settings', sub: 'Accounts, API Keys & Tools' }
+        };
+        var t = titles[initTab];
+        if (t) {
+          var titleEl = document.getElementById('pageMainTitle');
+          var subEl = document.getElementById('pageSubtitle');
+          if (titleEl) titleEl.textContent = t.title;
+          if (subEl) subEl.textContent = t.sub;
+        }
+      }
+      try {
+        var cName = localStorage.getItem('myListAddon:creatorName');
+        var cKey = localStorage.getItem('myListAddon:creatorKey');
+        var cDisp = localStorage.getItem('myListAddon:creatorDisplayName') || cName;
+        var cBar = document.getElementById('creatorProfileBar');
+        if (cBar) {
+          if (cName && cKey) {
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + (cDisp || cName) + '</button></div>';
+          } else {
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:6px;"><button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button></div>';
+          }
+        }
+      } catch (e) {}
+    })();
+  </script>
+
   <!-- Action Notification Toast -->
   <div id="actionToast" class="action-toast"></div>
 
@@ -10553,9 +11298,9 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
-    <button type="button" class="subnav-pill active" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
-    <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('quickadd', this)">Quick Add</button>
-    <button type="button" class="subnav-pill" onclick="switchCatalogsSubmenu('bulk', this)">Bulk Add</button>
+    <button type="button" class="subnav-pill active" data-sub="all" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
+    <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchCatalogsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="bulk" onclick="switchCatalogsSubmenu('bulk', this)">Bulk Add</button>
   </div>
 
   <div class="lists-subpanel" id="catalogsSubShelves">
@@ -10724,15 +11469,15 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('movie', this)">Movies</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('series', this)">Shows</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('curated', this)">Curated</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('kids', this)">Kids</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
-    <button type="button" class="subnav-pill" onclick="filterDiscoverShelves('genres', this)">Genres</button>
+    <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
+    <button type="button" class="subnav-pill" data-sub="movie" onclick="filterDiscoverShelves('movie', this)">Movies</button>
+    <button type="button" class="subnav-pill" data-sub="series" onclick="filterDiscoverShelves('series', this)">Shows</button>
+    <button type="button" class="subnav-pill" data-sub="popular" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
+    <button type="button" class="subnav-pill" data-sub="curated" onclick="filterDiscoverShelves('curated', this)">Curated</button>
+    <button type="button" class="subnav-pill" data-sub="gems" onclick="filterDiscoverShelves('gems', this)">Hidden Gems</button>
+    <button type="button" class="subnav-pill" data-sub="kids" onclick="filterDiscoverShelves('kids', this)">Kids</button>
+    <button type="button" class="subnav-pill" data-sub="holidays" onclick="filterDiscoverShelves('holidays', this)">Holidays</button>
+    <button type="button" class="subnav-pill" data-sub="genres" onclick="filterDiscoverShelves('genres', this)">Genres</button>
   </div>
 
   <!-- Discover Shelves Feed -->
@@ -10796,9 +11541,9 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('liked', this)">Liked</button>
-    <button type="button" class="subnav-pill" onclick="switchListsSubmenu('import', this)">Import</button>
+    <button type="button" class="subnav-pill active" data-sub="my-lists" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
+    <button type="button" class="subnav-pill" data-sub="liked" onclick="switchListsSubmenu('liked', this)">Liked</button>
+    <button type="button" class="subnav-pill" data-sub="import" onclick="switchListsSubmenu('import', this)">Import</button>
   </div>
 
   <!-- Submenu 1: User's Connected Account & Custom Lists -->
@@ -10815,7 +11560,7 @@ if ('serviceWorker' in navigator) {
       <div id="creatorDashboard"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-mdblist">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your MDBList Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -10827,7 +11572,7 @@ if ('serviceWorker' in navigator) {
       <div id="myMdblistListsResult"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-trakt">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Trakt Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -10840,7 +11585,7 @@ if ('serviceWorker' in navigator) {
       <div id="myPrivateTraktListsResult" style="margin-top:10px;"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-tmdb">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your TMDB Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -10852,7 +11597,7 @@ if ('serviceWorker' in navigator) {
       <div id="myTmdbListsResult"></div>
     </div>
 
-    <div class="panel" style="margin-top:12px;">
+    <div class="panel" style="margin-top:12px;" id="myListsSectionPanel-simkl">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Simkl Lists</h2>
         <div style="display:flex; gap:8px;">
@@ -10951,10 +11696,10 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="channels" hidden>
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
-    <button type="button" class="subnav-pill" onclick="switchChannelsSubmenu('import', this)">Import</button>
+    <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
+    <button type="button" class="subnav-pill" data-sub="storylines" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
+    <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="import" onclick="switchChannelsSubmenu('import', this)">Import</button>
   </div>
 
   <!-- Submenu: Storylines & Universes (Canon Timelines, Sagas & Bridges) -->
@@ -11151,10 +11896,10 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="settings" hidden>
   <!-- Settings Top Submenu Pills -->
   <div class="subnav-pills-bar" id="settingsSubnavBar">
-    <button type="button" class="subnav-pill active" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('external', this)">External Accounts &amp; API Keys</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('backup', this)">Presets &amp; Backup</button>
-    <button type="button" class="subnav-pill" onclick="switchSettingsSubmenu('feedback', this)">Feedback and Support</button>
+    <button type="button" class="subnav-pill active" data-sub="account" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
+    <button type="button" class="subnav-pill" data-sub="external" onclick="switchSettingsSubmenu('external', this)">External Accounts &amp; API Keys</button>
+    <button type="button" class="subnav-pill" data-sub="backup" onclick="switchSettingsSubmenu('backup', this)">Presets &amp; Backup</button>
+    <button type="button" class="subnav-pill" data-sub="feedback" onclick="switchSettingsSubmenu('feedback', this)">Feedback and Support</button>
   </div>
 
   <!-- Submenu 2: Presets & Backup -->
@@ -11238,6 +11983,31 @@ if ('serviceWorker' in navigator) {
       <h2 class="panel-title">Watchlist Preferences</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Customize how watched movies and TV shows are managed in your personal Watchlist.</p>
       <div id="watchlistPreferencesSection"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Hidden Lists</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Hide specific lists from My Lists, Airing Next, and Simkl Airing Next. A hidden list is still tracked and updated normally underneath -- only its display is suppressed, and it can be shown again here at any time.</p>
+      <div id="hiddenListsSettingsSection"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Region</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
+      <select id="regionSelect" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+        ${buildRegionOptionsHtml(initialRegion)}
+      </select>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Trending &amp; Popular Catalogs</h2>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
+        <input type="checkbox" id="hideNonDigitalReleasesCheckbox" ${initialHideNonDigitalReleases ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:hideNonDigitalReleases', this.checked ? '1' : '0'); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Hide items with no digital release</span>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Removes movies with no known digital or physical release from TMDB Trending Movies and Popular Movies catalogs -- useful for skipping still-in-theaters titles you can't stream or buy yet. Shows aren't affected (no equivalent release-type data exists for TV). Requires Save/Update to take effect on an existing install link.</p>
+        </div>
+      </label>
     </div>
 
     <div class="panel" style="margin-top:12px;">
@@ -11510,6 +12280,104 @@ const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+
+(function earlySubmenuSync() {
+  try {
+    // 1. Catalogs submenu early sync
+    var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+    var catBar = document.getElementById('catalogsFilterBar');
+    if (catBar) {
+      catBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === catSub || (p.getAttribute('onclick') || '').indexOf("'" + catSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subShelves = document.getElementById('catalogsSubShelves');
+    var subQuickAdd = document.getElementById('catalogsSubQuickAdd');
+    var subBulk = document.getElementById('catalogsSubBulk');
+    if (subShelves) subShelves.style.display = (catSub === 'all' || catSub === 'shelves') ? 'block' : 'none';
+    if (subQuickAdd) subQuickAdd.style.display = (catSub === 'quickadd') ? 'block' : 'none';
+    if (subBulk) subBulk.style.display = (catSub === 'bulk') ? 'block' : 'none';
+
+    // 2. Lists submenu early sync
+    var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+    var listBar = document.getElementById('listsSubnavBar');
+    if (listBar) {
+      listBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === listSub || (p.getAttribute('onclick') || '').indexOf("'" + listSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subMyLists = document.getElementById('listsSubMyLists');
+    var subLiked = document.getElementById('listsSubLiked');
+    var subListImport = document.getElementById('listsSubImport');
+    var subListBulk = document.getElementById('listsSubBulk');
+    var subCreate = document.getElementById('listsSubCreateList');
+    if (subMyLists) subMyLists.style.display = (listSub === 'my-lists') ? 'block' : 'none';
+    if (subLiked) subLiked.style.display = (listSub === 'liked') ? 'block' : 'none';
+    if (subListImport) subListImport.style.display = (listSub === 'import') ? 'block' : 'none';
+    if (subListBulk) subListBulk.style.display = (listSub === 'bulk') ? 'block' : 'none';
+    if (subCreate) subCreate.style.display = (listSub === 'create-list') ? 'block' : 'none';
+
+    // 3. Channels submenu early sync
+    var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
+    var chBar = document.getElementById('channelsSubnavBar');
+    if (chBar) {
+      chBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === chSub || (p.getAttribute('onclick') || '').indexOf("'" + chSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subMyChannels = document.getElementById('channelsSubMyChannels');
+    var subStorylines = document.getElementById('channelsSubStorylines');
+    var subChQuickAdd = document.getElementById('channelsSubQuickAdd');
+    var subChImport = document.getElementById('channelsSubImport');
+    var subBuild = document.getElementById('channelsSubBuild');
+    if (subMyChannels) subMyChannels.style.display = (chSub === 'my-channels') ? 'block' : 'none';
+    if (subStorylines) subStorylines.style.display = (chSub === 'storylines') ? 'block' : 'none';
+    if (subChQuickAdd) subChQuickAdd.style.display = (chSub === 'quickadd') ? 'block' : 'none';
+    if (subChImport) subChImport.style.display = (chSub === 'import') ? 'block' : 'none';
+    if (subBuild) subBuild.style.display = (chSub === 'build') ? 'block' : 'none';
+
+    // 4. Settings submenu early sync
+    var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
+    var setBar = document.getElementById('settingsSubnavBar');
+    if (setBar) {
+      setBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === setSub || (p.getAttribute('onclick') || '').indexOf("'" + setSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+    var subAccount = document.getElementById('settingsSubAccount');
+    var subExternal = document.getElementById('settingsSubExternal');
+    var subBackup = document.getElementById('settingsSubBackup');
+    var subFeedback = document.getElementById('settingsSubFeedback');
+    if (subAccount) subAccount.style.display = (setSub === 'account' || setSub === 'keys') ? 'block' : 'none';
+    if (subExternal) subExternal.style.display = (setSub === 'external') ? 'block' : 'none';
+    if (subBackup) subBackup.style.display = (setSub === 'backup') ? 'block' : 'none';
+    if (subFeedback) subFeedback.style.display = (setSub === 'feedback') ? 'block' : 'none';
+
+    // 5. Discover submenu early sync
+    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    var discBar = document.getElementById('discoverSubnavBar');
+    if (discBar) {
+      discBar.querySelectorAll('.subnav-pill').forEach(function(p) {
+        var match = p.getAttribute('data-sub') === discSub || (p.getAttribute('onclick') || '').indexOf("'" + discSub + "'") !== -1;
+        p.classList.toggle('active', match);
+        var c = p.querySelector('.check-icon'); if (c) c.remove();
+        if (match) p.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+      });
+    }
+  } catch (e) {}
+})();
 
 function deslugify(s) {
   return String(s || '')
@@ -11837,6 +12705,19 @@ function updateAllListAddButtons() {
     btn.textContent = isAdded ? 'Remove' : '+ Add';
     btn.style.color = isAdded ? 'var(--danger)' : '';
   });
+
+  // 6. Provider My Lists add buttons (Simkl, Trakt, MDBList)
+  document.querySelectorAll('.myListAddBtn').forEach((btn) => {
+    const url = btn.dataset.url;
+    const type = btn.dataset.type;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(url, type) || isListAddedToConfig(null, type, url)) : false;
+    btn.classList.toggle('is-added', isAdded);
+    btn.classList.toggle('secondary', isAdded);
+    btn.classList.toggle('primary', !isAdded);
+    btn.textContent = isAdded ? 'Remove' : '+ Add';
+    btn.style.color = isAdded ? 'var(--danger)' : '';
+    btn.disabled = false;
+  });
 }
 
 
@@ -11875,7 +12756,15 @@ function navigateBackFromDetail() {
 
 // Global state variables
 var suppressSave = false;
-var activeCreator = null;
+var activeCreator = (function() {
+  try {
+    const name = localStorage.getItem('myListAddon:creatorName');
+    const key = localStorage.getItem('myListAddon:creatorKey');
+    const disp = localStorage.getItem('myListAddon:creatorDisplayName') || name;
+    if (name && key) return { creatorName: name, displayName: disp };
+  } catch (e) {}
+  return null;
+})();
 var livePreviewShelfData = [];
 // No dedicated text input for this one (unlike the other keys) -- it's set
 // via the Connect Trakt button/OAuth flow, not typed in, so it lives as
@@ -11948,6 +12837,10 @@ function switchTab(name) {
   if (titleEl) titleEl.textContent = t.title;
   if (subEl) subEl.textContent = t.sub;
 
+  try {
+    document.documentElement.removeAttribute('data-initial-tab');
+  } catch (e) {}
+
   document.querySelectorAll('.tab-panel').forEach(function(p) {
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
   });
@@ -11983,6 +12876,7 @@ function switchTab(name) {
   }
 
   if (name === 'lists') {
+    if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
     if (!window._listsInitializedOnce) {
       window._listsInitializedOnce = true;
       let savedSub = 'my-lists';
@@ -12043,7 +12937,34 @@ function switchTab(name) {
   if (name === 'catalogs') {
     if (!window._catalogsInitializedOnce) {
       window._catalogsInitializedOnce = true;
-      if (typeof renderLivePreview === 'function') renderLivePreview();
+      // Rows are added by the page's own init sequence (addRow calls in
+      // 24_client-backup-restore-presets.js, driven by either the install
+      // link's serverEntries or a restored localStorage save) earlier in
+      // the same script, and restoreActiveTab (which reaches this via
+      // switchTab) runs after that block finishes -- so #lists should
+      // already be populated by the time this fires. But this is the
+      // first tab-switch of the page's life, run from the very tail of a
+      // long synchronous init script, and depends on that whole prior
+      // sequence having actually completed rather than merely being
+      // *scheduled* -- if anything upstream ever ends up deferring its
+      // own addRow calls (e.g. a slow-loading dependency, a future
+      // refactor), calling renderLivePreview against an empty #lists here
+      // finds zero enabled shelves and silently no-ops (see its own early
+      // return), permanently leaving every row on its "Click Refresh
+      // Preview" placeholder with nothing left to ever retry it. Guarding
+      // on an actual entry existing (rather than trusting a fixed delay,
+      // which either races on a slow device or wastes time on a fast one)
+      // makes this immune to exactly how long that upstream sequence
+      // takes, including if it ever changes.
+      const triggerLivePreview = () => {
+        const hasRows = document.getElementById('lists') && document.getElementById('lists').querySelector('.entry');
+        if (hasRows) {
+          if (typeof renderLivePreview === 'function') renderLivePreview();
+        } else {
+          setTimeout(triggerLivePreview, 50);
+        }
+      };
+      triggerLivePreview();
     }
   }
   if (name === 'discover') {
@@ -12157,6 +13078,7 @@ function restoreActiveTab() {
 
 function switchListsSubmenu(name, btn) {
   try {
+    document.documentElement.removeAttribute('data-initial-lists-sub');
     localStorage.setItem('myListAddon:listsSubmenu', name);
   } catch (e) {}
   document.querySelectorAll('#listsSubnavBar .subnav-pill').forEach(function(p) {
@@ -12222,6 +13144,7 @@ function switchListsSubmenu(name, btn) {
 
 function switchSettingsSubmenu(name, btn) {
   try {
+    document.documentElement.removeAttribute('data-initial-settings-sub');
     localStorage.setItem('myListAddon:settingsSubmenu', name);
   } catch (e) {}
   if (btn) {
@@ -12521,6 +13444,9 @@ function trackEventsBatch(eventType, items) {
 }
 
 function filterDiscoverShelves(filter, btn) {
+  try {
+    document.documentElement.removeAttribute('data-initial-discover-sub');
+  } catch (e) {}
   window._currentDiscoverFilter = filter || 'all';
   try {
     localStorage.setItem('myListAddon:discoverSubmenu', filter || 'all');
@@ -12669,15 +13595,15 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
 
   if (type === 'gems' || type === 'all') {
-    pushSingle('Hidden Gems (Movies)', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
-    pushSingle('Hidden Gems (Shows)', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
+    pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
+    pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
   }
 
   if (type === 'kids' || type === 'all') {
     if (window._CHARTS_KIDS) {
       window._CHARTS_KIDS.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Kids');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Kids');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Kids');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Kids');
       });
     }
   }
@@ -12685,8 +13611,8 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'holidays' || type === 'all') {
     if (window._CHARTS_HOLIDAYS) {
       window._CHARTS_HOLIDAYS.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Holidays');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Holidays');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Holidays');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Holidays');
       });
     }
   }
@@ -12694,8 +13620,8 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'genres' || type === 'all') {
     if (window._CHARTS_GENRES) {
       window._CHARTS_GENRES.forEach(function(item) {
-        if (item.movieUrl) pushSingle(item.name + (item.showUrl ? ' (Movies)' : ''), item.movieUrl, 'movie', 'Genres');
-        if (item.showUrl) pushSingle(item.name + (item.movieUrl ? ' (Shows)' : ''), item.showUrl, 'series', 'Genres');
+        if (item.movieUrl) pushSingle(item.name, item.movieUrl, 'movie', 'Genres');
+        if (item.showUrl) pushSingle(item.name, item.showUrl, 'series', 'Genres');
       });
     }
   }
@@ -12718,6 +13644,9 @@ function switchCatalogsSubmenu(filter, btn) {
     switchTab('channels');
     return;
   }
+  try {
+    document.documentElement.removeAttribute('data-initial-catalogs-sub');
+  } catch (e) {}
   window._currentCatalogsSubmenu = filter || 'all';
   try {
     localStorage.setItem('myListAddon:catalogsSubmenu', filter || 'all');
@@ -13424,7 +14353,9 @@ function renderMyMdblistLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isHistory = l.slug === 'history' || l.url === 'mdblist:history' || String(l.url || '').indexOf('mdblist:history') !== -1 || String(l.url || '').indexOf('/history/') !== -1;
     const isWatchlist = l.slug === 'watchlist' || l.url === 'mdblist:watchlist';
     const isSingleType = !isHistory && !isWatchlist && (l.contentType === 'movie' || l.contentType === 'series');
@@ -13474,7 +14405,8 @@ function renderMyMdblistLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -13546,7 +14478,9 @@ function renderMyTraktLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
@@ -13586,7 +14520,8 @@ function renderMyTraktLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -14075,7 +15010,9 @@ function renderMyPrivateTraktLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isHistory = l.url === 'trakt:history' || l.slug === 'history';
     const isWatchlist = l.url === 'trakt:watchlist' || l.slug === 'watchlist';
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
@@ -14122,7 +15059,8 @@ function renderMyPrivateTraktLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -14380,7 +15318,9 @@ function renderMyTmdbLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const listIdStr = String(l.id || '');
     const listUrlStr = String(l.url || '');
     const isWatchlist = listIdStr.includes('watchlist') || listUrlStr.includes('watchlist');
@@ -14456,7 +15396,8 @@ function renderMyTmdbLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
@@ -14491,6 +15432,7 @@ function disconnectSimkl() {
   try { window.simklAccessToken = ''; } catch (e) {}
   simklUsername = '';
   try { window.simklUsername = ''; } catch (e) {}
+  window._mySimklLists = [];
   try {
     localStorage.removeItem('myListAddon:simklAccessToken');
     localStorage.removeItem('myListAddon:simklUsername');
@@ -14651,8 +15593,86 @@ async function runMySimklLists() {
     }
     renderMySimklLists(data.lists);
   } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Simkl lists.</p>';
+    console.error('Simkl lists load error:', e);
+    box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml((e && e.message) ? e.message : 'Network error loading your Simkl lists.') + '</p>';
   }
+}
+
+let _simklAiringNextEnriching = false;
+let _simklAiringNextEnrichedAt = 0;
+async function enrichSimklAiringNextDates(list) {
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  if (_simklAiringNextEnriching) return;
+  if (_simklAiringNextEnrichedAt && (Date.now() - _simklAiringNextEnrichedAt < 300000)) return;
+  _simklAiringNextEnriching = true;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  try {
+    const rawCandidates = (window._simklRawAiringCandidates && window._simklRawAiringCandidates.length)
+      ? window._simklRawAiringCandidates
+      : (list.items || []);
+    const candidates = rawCandidates.slice(0, 80);
+    const enriched = [];
+    const concurrency = 5;
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const chunk = candidates.slice(i, i + concurrency);
+      await Promise.all(chunk.map(async (it) => {
+        try {
+          const showId = it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '');
+          if (!showId) return;
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey));
+          const data = await res.json();
+          const d = data && data.ok ? data.details : null;
+          // Only include shows with a real future air date (excludes ended shows with no upcoming episode)
+          if (d && d.nextEpisodeAirDate) {
+            it.airDate = d.nextEpisodeAirDate;
+            it.seasonNum = d.nextEpisodeSeasonNumber;
+            it.episodeNum = d.nextEpisodeNumber;
+            it.isSeasonPremiere = d.nextEpisodeNumber === 1;
+            it.isUnaired = true;
+            enriched.push(it);
+          }
+          // Shows with no nextEpisodeAirDate are silently dropped (ended, no renewal announced)
+        } catch (e) {}
+      }));
+    }
+    if (enriched.length) {
+      enriched.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+      list.items = enriched;
+      list.itemCount = enriched.length;
+      try {
+        localStorage.setItem('myListAddon:simklAiringNextCache', JSON.stringify(enriched));
+      } catch (e) {}
+      _simklAiringNextEnrichedAt = Date.now();
+      renderMySimklLists(window._mySimklLists);
+    }
+  } finally {
+    _simklAiringNextEnriching = false;
+  }
+}
+
+function openSimklAiringNextDetailsPage() {
+  const list = (window._mySimklLists || []).find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (!list) return;
+  const filtered = (list.items || []).filter((it) => it && it.airDate);
+  const sample = filtered.map((it) => {
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0');
+    return {
+      id: it.id,
+      type: 'series',
+      name: it.name,
+      subtitle: dateLabel ? (seasonEp + ' \u00b7 ' + dateLabel) : seasonEp,
+      poster: it.poster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: it.isSeasonPremiere,
+      hideDateBadge: !it.isSeasonPremiere,
+    };
+  });
+  openListDetailsPage('Simkl Airing Next', 'series', 'simkl:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
 }
 
 function renderMySimklLists(lists) {
@@ -14662,6 +15682,35 @@ function renderMySimklLists(lists) {
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No items found on your Simkl account.</small></p>';
     return;
+  }
+
+  const airingNextList = lists.find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (airingNextList && Array.isArray(airingNextList.items) && airingNextList.items.length) {
+    if (!window._simklRawAiringCandidates || !window._simklRawAiringCandidates.length) {
+      window._simklRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
+    }
+    if (!airingNextList._cachedApplied) {
+      try {
+        const cached = JSON.parse(localStorage.getItem('myListAddon:simklAiringNextCache') || '[]');
+        if (Array.isArray(cached) && cached.length) {
+          const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
+          airingNextList.items.forEach((it) => {
+            const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            if (c) {
+              it.airDate = c.airDate;
+              it.seasonNum = c.seasonNum;
+              it.episodeNum = c.episodeNum;
+              it.isSeasonPremiere = c.isSeasonPremiere;
+              it.isUnaired = true;
+            }
+          });
+        }
+      } catch (e) {}
+      airingNextList._cachedApplied = true;
+    }
+    if (!_simklAiringNextEnriching && (!_simklAiringNextEnrichedAt || Date.now() - _simklAiringNextEnrichedAt >= 120000)) {
+      enrichSimklAiringNextDates(airingNextList).catch(() => {});
+    }
   }
 
   const alreadyAdded = new Set();
@@ -14677,20 +15726,29 @@ function renderMySimklLists(lists) {
     if (l && l.url) window._simklListsMap[l.url] = l;
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const type = l.type === 'series' ? 'series' : 'movie';
     const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const totalCount = l.itemCount || (l.items || []).length;
-    const added = alreadyAdded.has(l.url + '|' + type);
+    const isAiringNext = l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'));
+
+    let filteredItems = l.items || [];
+    if (isAiringNext) {
+      filteredItems = filteredItems.filter((it) => it && it.airDate);
+    }
+
+    const totalCount = isAiringNext ? filteredItems.length : (l.itemCount || (l.items || []).length);
+    const added = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(l.url, type) || isListAddedToConfig(null, type, l.url)) : alreadyAdded.has(l.url + '|' + type);
 
     const isCompleted = (l.name && l.name.toLowerCase().includes('completed')) || (l.url && l.url.includes(':completed')) || l.statusKey === 'completed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
     const markWatchedBtn = isCompleted
       ? '<button type="button" class="lc-btn secondary" data-url="' + escapeAttr(l.url) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(type) + '" onclick="markSimklListAllWatched(this)">Mark all as Watched</button>'
       : '';
-    const addBtn = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+    const addBtn = '<button type="button" class="lc-btn ' + (added ? 'secondary is-added' : 'primary') + ' myListAddBtn" ' + (added ? 'style="color:var(--danger);"' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? 'Remove' : '+ Add') + '</button>';
 
-    const previewItems = (l.items || []).slice(0, 9);
+    const previewItems = filteredItems.slice(0, 9);
     let posterThumbs = '';
     if (previewItems.length) {
       posterThumbs = '<div class="list-card-posters poster-preview-static">' +
@@ -14698,31 +15756,46 @@ function renderMySimklLists(lists) {
           const isMobileEnd = (i === 2 && previewItems.length > 3);
           const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
           let overlays = '';
-          if (isMobileEnd) {
-            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-          }
-          if (isDesktopEnd) {
-            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          if (isAiringNext) {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+          } else {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
           }
           const simklStatus = l.statusKey || (l.url ? l.url.split(':')[3] : 'plantowatch');
-          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const removeBtn = isAiringNext
+            ? ''
+            : '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const isPremiere = it.isSeasonPremiere || it.episodeNum === 1;
+          const premiereBadge = isPremiere ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>' : '';
+          const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : (it.airDate || '');
+          const seasonEp = it.seasonNum != null && it.episodeNum != null
+            ? ('S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') + (dateLabel ? ' \u00b7 ' + dateLabel : ''))
+            : (dateLabel ? dateLabel : (it.year ? String(it.year) : ''));
+
           return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
             '<div class="list-card-mini-poster-img-wrap">' +
               (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              premiereBadge +
               removeBtn +
               overlays +
             '</div>' +
             '<div class="list-card-mini-poster-name">' + escapeHtml(it.name || '') + '</div>' +
-            (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+            (seasonEp ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(seasonEp) + '</div>' : '') +
           '</div>';
         }).join('') +
       '</div>';
+    } else if (isAiringNext) {
+      posterThumbs = '<p style="margin-top:8px; color:var(--muted);"><small>Nothing scheduled yet.</small></p>';
     }
+
+    const titleClick = isAiringNext ? 'onclick="openSimklAiringNextDetailsPage()"' : '';
 
     return '<div class="list-card" data-list-type="' + type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-title" ' + titleClick + ' style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
@@ -14736,19 +15809,28 @@ function renderMySimklLists(lists) {
       '</div>' +
       posterThumbs +
     '</div>';
-      posterThumbs +
-    '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 document.getElementById('mySimklListsResult')?.addEventListener('click', (e) => {
   const addBtn = e.target.closest('.myListAddBtn');
-  if (addBtn && !addBtn.disabled) {
-    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
-    addBtn.textContent = 'Added \u2713';
-    addBtn.disabled = true;
+  if (addBtn) {
+    const isAdded = addBtn.classList.contains('is-added');
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(addBtn.dataset.url, addBtn.dataset.type);
+        removeListFromConfig(null, addBtn.dataset.type, addBtn.dataset.url);
+      }
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Removed "' + (addBtn.dataset.name || 'List') + '" from your Catalogs.');
+    } else {
+      addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "' + (addBtn.dataset.name || 'List') + '" to your Catalogs.');
+    }
     return;
   }
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');
@@ -18411,9 +19493,11 @@ async function openItemDetailsModal(id, type, opts) {
   
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const regionEl = document.getElementById('regionSelect');
+  const region = (regionEl && regionEl.value) || localStorage.getItem('myListAddon:region') || 'US';
   
   try {
-    const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(id) + '&tmdbKey=' + encodeURIComponent(tmdbKey) + (type ? '&type=' + encodeURIComponent(type) : ''));
+    const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(id) + '&tmdbKey=' + encodeURIComponent(tmdbKey) + (type ? '&type=' + encodeURIComponent(type) : '') + '&region=' + encodeURIComponent(region));
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
       let parsed = null;
@@ -23995,6 +25079,358 @@ const TV_CROSSOVER_EVENTS = [
         "poster": "https://images.metahub.space/poster/medium/tt1674782/img"
       }
     ]
+  },
+  {
+    "id": "hawaii_five_0_magnum_pi_crossover_2020",
+    "name": "Hawaii Five-0 & Magnum P.I. Crossover (2020)",
+    "franchise": "Lenkov-verse",
+    "category": "tvuniverses",
+    "description": "2-part crossover: when a list of undercover CIA agents is stolen, Steve McGarrett and Five-0 enlist Magnum, Higgins, Rick, and TC to get it back and protect national security.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Hawaii Five-0",
+        "season": 10,
+        "episode": 12,
+        "title": "Ihea 'oe i ka wa a ka ua e loku ana?",
+        "tmdbId": 32798,
+        "imdbId": "tt1600194",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1600194/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Magnum P.I.",
+        "season": 2,
+        "episode": 12,
+        "title": "Desperate Measures",
+        "tmdbId": 79593,
+        "imdbId": "tt7942796",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7942796/img"
+      }
+    ]
+  },
+  {
+    "id": "911_lone_star_hold_the_line_2021",
+    "name": "9-1-1 & 9-1-1: Lone Star: Hold the Line (2021)",
+    "franchise": "9-1-1 Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover: Buck, Hen, and Eddie of Station 118 travel to Austin to help Station 126 battle a massive wildfire sparked by a volcanic eruption.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "9-1-1",
+        "season": 4,
+        "episode": 3,
+        "title": "Future Tense",
+        "tmdbId": 75219,
+        "imdbId": "tt7235466",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7235466/img"
+      },
+      {
+        "type": "episode",
+        "showName": "9-1-1: Lone Star",
+        "season": 2,
+        "episode": 3,
+        "title": "Hold the Line",
+        "tmdbId": 89393,
+        "imdbId": "tt10323338",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10323338/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_comic_perversion_2014",
+    "name": "One Chicago: Comic Perversion / Conventions (2014)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "The very first One Chicago crossover, and Chicago P.D.'s first with Law & Order: SVU: Erin Lindsay travels to New York seeking Olivia Benson's help on a case involving a string of similar sexual assault murders in Chicago.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 15,
+        "episode": 15,
+        "title": "Comic Perversion",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 1,
+        "episode": 6,
+        "title": "Conventions",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "buffy_angel_pangs_iwry_1999",
+    "name": "Buffy the Vampire Slayer & Angel: Pangs / I Will Remember You (1999)",
+    "franchise": "Buffyverse",
+    "category": "tvuniverses",
+    "description": "Angel secretly returns to Sunnydale to protect Buffy from a vengeful spirit on Thanksgiving, then reveals himself in Los Angeles the next day -- leading to a Mohra demon fight that briefly makes him human for one day with Buffy.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Buffy the Vampire Slayer",
+        "season": 4,
+        "episode": 8,
+        "title": "Pangs",
+        "tmdbId": 95,
+        "imdbId": "tt0118276",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0118276/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Angel",
+        "season": 1,
+        "episode": 8,
+        "title": "I Will Remember You",
+        "tmdbId": 2426,
+        "imdbId": "tt0162065",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0162065/img"
+      }
+    ]
+  },
+  {
+    "id": "buffy_angel_fool_for_love_darla_2000",
+    "name": "Buffy the Vampire Slayer & Angel: Fool for Love / Darla (2000)",
+    "franchise": "Buffyverse",
+    "category": "tvuniverses",
+    "description": "Companion episodes airing the same night: Spike recounts his vampire origins and how he killed two Slayers to Buffy, while Angel relives his own dangerous history with Darla -- both episodes share overlapping flashbacks.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Buffy the Vampire Slayer",
+        "season": 5,
+        "episode": 7,
+        "title": "Fool for Love",
+        "tmdbId": 95,
+        "imdbId": "tt0118276",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0118276/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Angel",
+        "season": 2,
+        "episode": 7,
+        "title": "Darla",
+        "tmdbId": 2426,
+        "imdbId": "tt0162065",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0162065/img"
+      }
+    ]
+  },
+  {
+    "id": "greys_private_practice_beat_your_heart_out_2009",
+    "name": "Grey's Anatomy & Private Practice: Beat Your Heart Out / Acceptance (2009)",
+    "franchise": "Grey's Anatomy Universe",
+    "category": "tvuniverses",
+    "description": "The biggest Grey's/Private Practice crossover event: Addison's brother Archer suffers a life-threatening seizure in LA, pulling in Derek's help from Seattle, while Grey's introduces Owen Hunt and the first meeting of Callie and Arizona.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Grey's Anatomy",
+        "season": 5,
+        "episode": 14,
+        "title": "Beat Your Heart Out",
+        "tmdbId": 1416,
+        "imdbId": "tt0413573",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0413573/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Private Practice",
+        "season": 2,
+        "episode": 15,
+        "title": "Acceptance",
+        "tmdbId": 3172,
+        "imdbId": "tt0972412",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0972412/img"
+      }
+    ]
+  },
+  {
+    "id": "tvd_originals_moonlight_streetcar_2016",
+    "name": "The Vampire Diaries & The Originals: Moonlight on the Bayou / A Streetcar Named Desire (2016)",
+    "franchise": "The Vampire Diaries Universe",
+    "category": "tvuniverses",
+    "description": "The CW's special 2-hour crossover event: Stefan flees to New Orleans to escape a vampire hunter and seek Valerie's help, pulling the Salvatores directly into the Mikaelsons' world.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "The Vampire Diaries",
+        "season": 7,
+        "episode": 14,
+        "title": "Moonlight on the Bayou",
+        "tmdbId": 18165,
+        "imdbId": "tt1405406",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1405406/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Originals",
+        "season": 3,
+        "episode": 14,
+        "title": "A Streetcar Named Desire",
+        "tmdbId": 46896,
+        "imdbId": "tt2632424",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2632424/img"
+      }
+    ]
+  },
+  {
+    "id": "csi_felony_flight_manhattan_manhunt_2005",
+    "name": "CSI: Miami & CSI: NY: Felony Flight / Manhattan Manhunt (2005)",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "A serial killer sabotages his own prisoner transport flight from New York to Miami, escapes, and goes on a killing spree -- pulling New York's Mac Taylor down to Miami, then Miami's Horatio Caine up to New York, to catch him.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "CSI: Miami",
+        "season": 4,
+        "episode": 7,
+        "title": "Felony Flight",
+        "tmdbId": 1620,
+        "imdbId": "tt0313043",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0313043/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: NY",
+        "season": 2,
+        "episode": 7,
+        "title": "Manhattan Manhunt",
+        "tmdbId": 2458,
+        "imdbId": "tt0395843",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0395843/img"
+      }
+    ]
+  },
+  {
+    "id": "csi_trilogy_2009",
+    "name": "CSI: Trilogy (2009)",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "The only 3-way crossover in CSI history, spanning all three original shows on consecutive nights: Miami, New York, and the flagship Las Vegas team all converge on a single case.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "CSI: Miami",
+        "season": 8,
+        "episode": 7,
+        "title": "Bone Voyage",
+        "tmdbId": 1620,
+        "imdbId": "tt0313043",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0313043/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: NY",
+        "season": 6,
+        "episode": 7,
+        "title": "Hammer Down",
+        "tmdbId": 2458,
+        "imdbId": "tt0395843",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0395843/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: Crime Scene Investigation",
+        "season": 10,
+        "episode": 7,
+        "title": "The Lost Girls",
+        "tmdbId": 1431,
+        "imdbId": "tt0247082",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0247082/img"
+      }
+    ]
+  },
+  {
+    "id": "empire_star_crossover_2017",
+    "name": "Empire & Star Crossover (2017)",
+    "franchise": "Lee Daniels Fox Universe",
+    "category": "tvuniverses",
+    "description": "Fox's two Lee Daniels musical dramas collide for their season premieres: Carlotta comes face-to-face with the Lyon family as Jamal Lyon crosses over to Star and Carlotta crosses over to Empire.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Empire",
+        "season": 4,
+        "episode": 1,
+        "title": "Noble Memory",
+        "tmdbId": 61733,
+        "imdbId": "tt3228904",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3228904/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Star",
+        "season": 2,
+        "episode": 1,
+        "title": "The Winner Takes It All",
+        "tmdbId": 68780,
+        "imdbId": "tt4941240",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4941240/img"
+      }
+    ]
+  },
+  {
+    "id": "bones_sleepy_hollow_crossover_2015",
+    "name": "Bones & Sleepy Hollow Crossover (2015)",
+    "franchise": "Fox Halloween Crossover",
+    "category": "tvuniverses",
+    "description": "One of TV's oddest crossovers: forensic anthropologist Temperance Brennan and FBI Agent Booth team up with time-displaced Ichabod Crane and Agent Abbie Mills to identify a 200-year-old headless corpse, before the case turns fully supernatural on the Sleepy Hollow side.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Bones",
+        "season": 11,
+        "episode": 5,
+        "title": "The Resurrection in the Remains",
+        "tmdbId": 1911,
+        "imdbId": "tt0460627",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0460627/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Sleepy Hollow",
+        "season": 3,
+        "episode": 5,
+        "title": "Dead Men Tell No Tales",
+        "tmdbId": 50825,
+        "imdbId": "tt2647544",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2647544/img"
+      }
+    ]
   }
 ];
 
@@ -24660,6 +26096,22 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   if (!container) return;
 
   const filtered = TV_CROSSOVER_EVENTS.filter((ev) => {
+    // Pure single-episode crossovers (NCIS, One Chicago, Arrowverse's
+    // individual crossover events, FBI, etc.) are meant to be discovered
+    // reactively -- add a relevant show to a channel and the "Crossover
+    // Event Detected" banner in the Channel Builder offers just its
+    // crossover episodes (see renderChannelCrossoverSuggestions, which
+    // still considers every event here regardless of this filter).
+    // They're deliberately left out of this browsable grid: clicking into
+    // one only ever lands on the parent show's generic details page (no
+    // episode-level page exists anywhere in this addon), so as a
+    // standalone browse card they don't offer anything a search for the
+    // show itself wouldn't -- unlike a real saga/universe entry, which is
+    // exactly the kind of multi-season, multi-show marathon a browse grid
+    // is for. Every episode-only crossover has episodes entirely of
+    // type "episode"; every saga/universe/movie-bridge entry that
+    // belongs here mixes in at least one "season"/"show"/"movie" part.
+    if (ev.episodes.every((ep) => ep.type === 'episode')) return false;
     if (category === 'all') return true;
     const cats = getStorylineCategories(ev);
     return cats.includes(category);
@@ -24959,9 +26411,22 @@ async function createInstantStorylineChannel(eventId, btn) {
     if (typeof saveLocalChannelsMap === 'function') {
       saveLocalChannelsMap(map);
     }
-    if (typeof removeListFromConfig === 'function') {
-      removeListFromConfig(null, null, chId);
-    }
+    // removeListFromConfig doesn't know how to match a channel:v1:{...}
+    // row at all -- it only recognizes custom:/autotrack:/customlist:v1:
+    // URL schemes (see its own slug-matching logic), so calling it here
+    // never actually found or removed this channel's row. The channel's
+    // own entry in localChannels storage above was correctly cleaned up,
+    // but the row stayed visible in the catalog/Live Preview whenever one
+    // existed -- this is the same substring-match approach
+    // deleteLocalChannel already uses successfully for the same URL
+    // scheme (chId is embedded in the row's channel:v1: JSON payload).
+    [...document.querySelectorAll('#lists .entry')].forEach((row) => {
+      const urlInputs = [...row.querySelectorAll('.url')];
+      urlInputs.forEach((u) => {
+        if (u.value.includes(chId)) row.remove();
+      });
+    });
+    if (typeof saveState === 'function') saveState();
     if (btn) {
       btn.textContent = '+ Add';
       btn.classList.remove('secondary', 'is-added');
@@ -25093,6 +26558,9 @@ async function loadStorylineToDraft(eventId, btn) {
 }
 
 function switchChannelsSubmenu(name, btn) {
+  try {
+    document.documentElement.removeAttribute('data-initial-channels-sub');
+  } catch (e) {}
   if (btn) {
     document.querySelectorAll('#channelsSubnavBar .subnav-pill').forEach((p) => {
       p.classList.remove('active');
@@ -25247,7 +26715,26 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
   
-  const sample = (channel.items || []).map((it, idx) => {
+  // A merged channel (see mergeChannelsIntoRow/loadLocalMergedChannels)
+  // stores channelIds -- references to the channels that were combined --
+  // instead of its own flat items array. Reading channel.items directly
+  // for one of these always came back empty, so "See All" on a merged
+  // channel showed zero posters even though the underlying channels
+  // themselves had plenty. Resolve items by concatenating each referenced
+  // channel's own items when channelIds is what this channel actually has.
+  let resolvedItems = channel.items;
+  if ((!Array.isArray(resolvedItems) || !resolvedItems.length) && Array.isArray(channel.channelIds) && channel.channelIds.length) {
+    const channelsMap = loadLocalChannels();
+    resolvedItems = [];
+    channel.channelIds.forEach((chId) => {
+      const sourceChannel = channelsMap[chId];
+      if (sourceChannel && Array.isArray(sourceChannel.items)) {
+        resolvedItems.push(...sourceChannel.items);
+      }
+    });
+  }
+  
+  const sample = (resolvedItems || []).map((it, idx) => {
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -25295,7 +26782,15 @@ function openChannelDetailsPage(channelIdOrDivId) {
 
     return {
       id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
-      type: 'series',
+      // Was hardcoded to 'series' unconditionally for every item -- fine
+      // for a channel's actual episodes, but wrong for movie-saga channels
+      // (MCU, Star Wars, etc.) where every item is a movie: clicking one
+      // opened the details modal thinking it was a whole show, showing
+      // "Mark Whole Show Watched" instead of "Mark as Watched". it.kind is
+      // set to 'movie' for these by fetchStorylineOrderedItems when the
+      // channel was first built (see its own comment there for why 'kind'
+      // rather than 'type' is the field channel-draft items use).
+      type: (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series',
       name: displayTitle,
       subtitle: epName,
       title: fullTitle,
@@ -25393,8 +26888,23 @@ function renderMyCreatedChannelsList() {
         ? '<img src="' + escapeAttr(p) + '" alt="" loading="lazy">'
         : '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:0.65rem;text-align:center;padding:4px;">No poster</div>';
       
+      // Each tile opens that item's own details -- was previously
+      // unclickable itself (only the shared container-level onclick below
+      // fired, always sending every click to "See All" regardless of
+      // which poster was actually tapped). "See All" is still one tap
+      // away via the count overlay ("N ›") already rendered above, so
+      // this doesn't remove that path, just stops it from being the only
+      // one. Mirrors the same movie/series type fix as
+      // openChannelDetailsPage just above (it.kind === 'movie', not
+      // it.type, is what fetchStorylineOrderedItems actually sets).
+      const itemId = it.imdbId || it.id || '';
+      const itemType = (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series';
+      const posterClickAttr = itemId
+        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
+        : '';
+      
       return '<div class="list-card-mini-poster-tile">' +
-        '<div class="list-card-mini-poster-img-wrap">' +
+        '<div class="list-card-mini-poster-img-wrap"' + posterClickAttr + '>' +
           imgHtml +
           overlays +
         '</div>' +
@@ -25421,7 +26931,7 @@ function renderMyCreatedChannelsList() {
           addBtnHtml +
         '</div>' +
       '</div>' +
-      (posterThumbs ? '<div class="list-card-posters poster-preview-static" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + posterThumbs + '</div>' : '') +
+      (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
 }
@@ -27042,6 +28552,11 @@ function setShowFullyWatched(showId, isFullyWatched) {
   if (isFullyWatched && typeof cleanWatchedFromWatchlists === 'function') {
     cleanWatchedFromWatchlists();
   }
+  // Keeps the already-computed Airing Next list in sync with a watched-
+  // state change the instant it happens (e.g. "Mark Whole Show Unwatched")
+  // instead of leaving a stale entry on screen until the next scheduled
+  // refresh -- see syncAiringNextWatchState's own comment further down.
+  if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
 }
 
 // Companion to setShowFullyWatched above -- marks a show as having an
@@ -27059,6 +28574,7 @@ function setShowInProgress(showId, isInProgress) {
     window._inProgressShowIds.delete(showId);
   }
   refreshWatchBadge(showId, 'series');
+  if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
 }
 
 // Automatically removes a watched item from any Custom List designated as the Watchlist.
@@ -27392,13 +28908,28 @@ window.toggleWatchStatus = function(id, type, name, poster) {
 
 // Batch-adds or batch-removes many items (episodes, mainly) to/from the
 // Watch History list in a single localStorage write.
-window.toggleBatchWatchStatus = function(items) {
+//
+// forceUnwatch (optional): overrides the auto-detected "are these all
+// already watched" check below with an explicit true/false from the
+// caller, instead of re-deriving it from window._watchedItemIds. Exists
+// for markShowWatched (below): that caller re-fetches every season fresh
+// from TMDB on every click, and if TMDB's episode ids for the aired-
+// episode set drift even slightly between the click that marked a show
+// watched and a later click meant to unwatch it (a metadata refresh, a
+// newly-aired episode changing which ids count as "aired", etc.), the
+// items.every(...) check below can come back false on what the person
+// sees as an "unwatch" click -- silently re-adding the (mostly already
+// watched) episodes instead of removing them, so the button visibly does
+// nothing and needs a second click once every id lines up. Passing the
+// button's own current state explicitly removes that class of mismatch
+// entirely for this caller.
+window.toggleBatchWatchStatus = function(items, forceUnwatch) {
   if (!items || !items.length) return { added: 0, removed: 0, nowWatched: false };
 
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
 
-  const allWatched = items.every(it => window._watchedItemIds.has(String(it.id)));
+  const allWatched = typeof forceUnwatch === 'boolean' ? forceUnwatch : items.every(it => window._watchedItemIds.has(String(it.id)));
   let added = 0;
   let removed = 0;
 
@@ -27474,6 +29005,12 @@ window.markShowWatched = async function(imdbId) {
   const seasons = d.seasonsData.filter(s => s.season_number !== 0);
   if (!seasons.length) return;
 
+  // Capture intent from the button's own state before it's disabled/
+  // relabeled below -- see toggleBatchWatchStatus's forceUnwatch comment
+  // for why this is passed through explicitly rather than re-derived from
+  // window._watchedItemIds after the fresh TMDB fetch below.
+  const wasFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
+
   if (btn) {
     btn.disabled = true;
     btn.innerHTML = 'Fetching episodes... (0/' + seasons.length + ')';
@@ -27542,7 +29079,7 @@ window.markShowWatched = async function(imdbId) {
     return;
   }
 
-  const result = window.toggleBatchWatchStatus(allEpisodes);
+  const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
   setShowFullyWatched(String(imdbId), nowWatched);
   if (nowWatched) {
@@ -27937,6 +29474,436 @@ function dismissContinueWatchingShow(showId, btn) {
   if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
 }
 
+// --- Airing Next ------------------------------------------------------------
+//
+// A read-only, client-computed shelf listing every watched show's next
+// upcoming episode, soonest first. A show's next air date itself only
+// changes when TMDB's own schedule changes, so the item list is
+// recomputed against TMDB on a timer (refreshAiringNext below) rather
+// than on every watch event -- but WHICH shows are even eligible changes
+// the instant this browser's own watch state does (marking something
+// watched/unwatched, etc.), so syncAiringNextWatchState below re-derives
+// that part immediately, purely from already-local data, no network
+// involved. No Fully Watched/In Progress split -- every watched show with
+// a known upcoming episode is listed together.
+
+const AIRING_NEXT_REFRESH_MS = 6 * 3600 * 1000; // matches the server Continue Watching cron's own cadence
+const AIRING_NEXT_MAX_SHOWS_PER_RUN = 60; // bounds one refresh's /api/details calls for anyone with very large history
+const AIRING_NEXT_CONCURRENCY = 4;
+
+
+function getOrCreateAiringNextList() {
+  const map = loadLocalCustomLists();
+  if (!map['airing-next']) {
+    map['airing-next'] = {
+      slug: 'airing-next',
+      localSlug: 'airing-next',
+      name: 'Airing Next',
+      description: 'Upcoming episodes for shows you have watched, soonest first.',
+      type: 'series',
+      items: [],
+      updatedAt: 0, // 0 (not Date.now()) so a fresh install refreshes on first load instead of waiting a full cycle
+      createdAt: Date.now(),
+    };
+    saveLocalCustomListsMap(map);
+  } else if (!map['airing-next'].slug) {
+    map['airing-next'].slug = 'airing-next';
+    saveLocalCustomListsMap(map);
+  }
+  return map['airing-next'];
+}
+
+// Every distinct show with at least one watched episode is a candidate --
+// this list shows all of them with a known upcoming episode, no Fully
+// Watched/In Progress split (that distinction was removed; see this
+// function's git history for the old bucketing logic if it's ever needed
+// again).
+function collectAiringNextCandidateShowIds() {
+  const ids = new Set();
+  const map = loadLocalCustomLists();
+  const watchHistoryItems = (map['watch-history'] || {}).items || [];
+  watchHistoryItems.forEach((it) => {
+    if (it && it.type === 'episode' && it.showId) ids.add(it.showId);
+  });
+  // Belt-and-suspenders: also counts a show explicitly known as fully
+  // watched even if Watch History was cleared.
+  if (window._fullyWatchedShowIds) {
+    window._fullyWatchedShowIds.forEach((id) => ids.add(id));
+  }
+  return ids;
+}
+
+// Re-derives the already-computed Airing Next list's eligibility against
+// current local state -- no network involved, unlike refreshAiringNext
+// below (which is the only thing that ever fetches a new next-air-date
+// from TMDB). Called from setShowFullyWatched/setShowInProgress (this
+// file) and removeWatchHistoryItemDirect (22_client-creator-profile.js)
+// so a show with no watched episodes left (e.g. "Mark Whole Show
+// Unwatched", or the last Watch History row for it removed) drops out of
+// the list immediately instead of lingering until the next 6-hour
+// refresh. Deliberately never ADDS a show that isn't already in the
+// cached list -- a newly-eligible show still needs its actual
+// next-air-date fetched from TMDB, which only refreshAiringNext does.
+function syncAiringNextWatchState() {
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return;
+  const map = loadLocalCustomLists();
+  const list = map['airing-next'];
+
+  const candidates = collectAiringNextCandidateShowIds();
+
+  // If there are candidate shows that aren't in the cached list at all, those
+  // newly-watched shows need a TMDB lookup to get their next air date. Force a
+  // full refresh so they appear without waiting up to 6 hours.
+  const cachedShowIds = new Set((list && Array.isArray(list.items) ? list.items : []).map((it) => it && it.showId).filter(Boolean));
+  const hasNewCandidates = [...candidates].some((id) => !cachedShowIds.has(id));
+  if (hasNewCandidates) {
+    refreshAiringNext(true).catch(() => {});
+    return;
+  }
+
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+
+  let changed = false;
+  const filtered = list.items.filter((it) => {
+    const stillCandidate = it && it.showId && candidates.has(it.showId);
+    if (!stillCandidate) changed = true;
+    return stillCandidate;
+  });
+  if (!changed) return;
+
+  list.items = filtered;
+  map['airing-next'] = list;
+  saveLocalCustomListsMap(map);
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  // Keeps a signed-in account's live "autotrack:airing-next:..." Stremio
+  // catalog in sync too, not just this browser's own dashboard preview --
+  // no-ops if not signed in, same guard as scheduleTrackingSync's own.
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+}
+
+// Recomputes the Airing Next list against TMDB, throttled to
+// AIRING_NEXT_CONCURRENCY parallel /api/details calls at a time -- each
+// call is a single cheap edge-cached lookup (same endpoint the item
+// details modal already uses), but a large watch history could still mean
+// dozens of shows, so this fans out a few at a time rather than one giant
+// Promise.all. No-ops (returns the existing list untouched) if the last
+// refresh is still within AIRING_NEXT_REFRESH_MS, unless force is true.
+async function refreshAiringNext(force) {
+  const existing = getOrCreateAiringNextList();
+  if (!force && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+    return existing;
+  }
+
+  const candidates = [...collectAiringNextCandidateShowIds()].slice(0, AIRING_NEXT_MAX_SHOWS_PER_RUN);
+  if (!candidates.length) return existing;
+
+  // Best-known title/poster for each show, straight from Watch History --
+  // avoids depending on /api/details (TMDB-only) for display fields that
+  // might already be known from a richer source (e.g. an imported Trakt
+  // history entry).
+  const knownByShow = new Map();
+  ((loadLocalCustomLists()['watch-history'] || {}).items || []).forEach((it) => {
+    if (it && it.showId && it.showTitle && !knownByShow.has(it.showId)) {
+      knownByShow.set(it.showId, { title: it.showTitle, poster: it.showPoster });
+    }
+  });
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+
+  const results = [];
+  let cursor = 0;
+  async function worker() {
+    while (cursor < candidates.length) {
+      const showId = candidates[cursor++];
+      try {
+        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey));
+        const data = await res.json();
+        const d = data && data.ok ? data.details : null;
+        if (d && d.nextEpisodeAirDate) {
+          const known = knownByShow.get(showId);
+          results.push({
+            id: showId,
+            showId: showId,
+            showTitle: (known && known.title) || d.title || '',
+            showPoster: (known && known.poster) || d.poster || '',
+            airDate: d.nextEpisodeAirDate,
+            seasonNum: d.nextEpisodeSeasonNumber,
+            episodeNum: d.nextEpisodeNumber,
+            isSeasonPremiere: d.nextEpisodeNumber === 1,
+            isUnaired: true,
+          });
+        }
+      } catch (e) {
+        // Network hiccup or no TMDB key configured -- this show is simply
+        // retried on the next refresh (or a manual "force" one) rather
+        // than blocking the rest of the batch.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
+
+  // Deduplicate by showId -- a show can appear under multiple IDs if Watch
+  // History recorded both an imdb and a tmdb-prefixed form; keep the first
+  // (earliest-resolved) entry for each show.
+  const seenIds = new Set();
+  const deduped = results.filter((it) => {
+    if (seenIds.has(it.showId)) return false;
+    seenIds.add(it.showId);
+    return true;
+  });
+  deduped.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+
+  const map = loadLocalCustomLists();
+  const fresh = getOrCreateAiringNextList();
+  fresh.items = deduped;
+  fresh.updatedAt = Date.now();
+  map['airing-next'] = fresh;
+  saveLocalCustomListsMap(map);
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  // Pushes the freshly computed list to this account's server-side
+  // tracking record (no-ops if not signed in -- see scheduleTrackingSync's
+  // own guard) so the "autotrack:airing-next:series:<username>" Stremio
+  // catalog (fetchAutoTrackedCatalog, 05_catalog-core.js) reflects it too,
+  // not just this browser's own dashboard preview.
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  return fresh;
+}
+
+// Kicked off after Watch History/Continue Watching have had a chance to
+// populate (initWatchHistory itself fires at 500ms -- see 21's own
+// setTimeout above) rather than racing them for the same localStorage
+// reads.
+setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
+
+// Builds the "Airing Next" dashboard card -- deliberately not part of
+// buildLocalListCardHtml/renderAutoTrackedListsHtml (22_client-creator-
+// profile.js): unlike Continue Watching/Watch History it has no local
+// commit-lock/dismiss machinery of its own, just a filter state and an
+// "+Add to Config" toggle, so it's simpler to keep self-contained. Adding
+// it to the Stremio config generates "autotrack:airing-next:series:
+// <username>" for a signed-in Creator account (served live by
+// fetchAutoTrackedCatalog, 05_catalog-core.js, off the airingNext field
+// pushed by pushTrackingSync) or a "customlist:v1:" snapshot of the
+// current items for a local-only browser, same as Watch History does for
+// local-only users -- see the README's "Stale install links" note for why
+// that snapshot needs a manual Configure -> Update to refresh later.
+function buildAiringNextCardHtml() {
+  const list = getOrCreateAiringNextList();
+  const filtered = list.items || [];
+  const totalCount = filtered.length;
+  const shown = filtered.slice(0, 9);
+
+  const posterThumbs = shown.map((it, i) => {
+    const isMobileEnd = (i === 2 && shown.length > 3);
+    const isDesktopEnd = (i === shown.length - 1 && shown.length >= 4);
+    let overlays = '';
+    if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    const dateBadge = it.isSeasonPremiere ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>' : '';
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0') + (dateLabel ? ' \u00b7 ' + dateLabel : '');
+    return '<div class="list-card-mini-poster-tile">' +
+      '<div class="list-card-mini-poster-img-wrap">' +
+        '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
+        dateBadge +
+        overlays +
+      '</div>' +
+      '<div class="list-card-mini-poster-name">' + escapeHtml(it.showTitle || '') + '</div>' +
+      '<div class="list-card-mini-poster-subtitle">' + escapeHtml(seasonEp) + '</div>' +
+    '</div>';
+  }).join('');
+
+  const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, 'series', 'airing-next') : false;
+  const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary localListAddToConfigBtn airingNextAddToConfigBtn is-added' : 'primary localListAddToConfigBtn airingNextAddToConfigBtn') + '" ' +
+    (isAdded ? 'style="color:var(--danger);"' : '') +
+    ' data-slug="airing-next">' + (isAdded ? 'Remove' : '+ Add') + '</button>';
+
+  return '<div class="creator-list-row list-card" draggable="true" data-slug="airing-next" data-list-type="series">' +
+    '<div class="list-card-header">' +
+      '<div class="list-card-body">' +
+        '<div class="list-card-title">' +
+          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          'Airing Next' +
+        '</div>' +
+        '<div class="list-card-meta">' +
+          '<span>Shows</span><span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="list-card-actions">' +
+        '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap;">Auto-tracked</span>' +
+        addBtnHtml +
+      '</div>' +
+    '</div>' +
+    (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '<p><small>Nothing scheduled yet.</small></p>') +
+  '</div>';
+}
+
+// Opens the full Airing Next list through the same generic list-details
+// page Continue Watching/Watch History already use -- see
+// openListDetailsPage's preloaded-sample branch (23_client-list-
+// management.js), which renders straight from the sample array below
+// without needing a server-side catalog route.
+function openAiringNextDetailsPage() {
+  const list = getOrCreateAiringNextList();
+  const sample = (list.items || []).map((it) => {
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0');
+    return {
+      id: it.showId,
+      type: 'series',
+      name: it.showTitle,
+      subtitle: dateLabel ? (seasonEp + ' \u00b7 ' + dateLabel) : seasonEp,
+      poster: it.showPoster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: it.isSeasonPremiere,
+      // The date already sits next to S/E in the subtitle above -- suppress
+      // livePreviewPosterHtml's own plain-date badge (23_client-list-
+      // management.js) for a non-premiere item so it isn't shown twice.
+      // A premiere item still shows its badge (now pinned to the bottom of
+      // the poster, see .cw-date-badge-premiere, 09_page-shell.js).
+      hideDateBadge: !it.isSeasonPremiere,
+    };
+  });
+  openListDetailsPage('Airing Next', 'series', 'custom:airing-next', { sample: sample, count: sample.length, maybeMore: false });
+}
+
+// --- Hidden Lists (Settings toggle) ------------------------------------
+//
+// Lets the person hide specific lists -- by identifier, not by section --
+// from every place lists get rendered: My Lists (local Custom Lists and
+// each connected provider's personal lists), the Airing Next dashboard
+// card, and Simkl Airing Next. A hidden list still exists and is still
+// tracked/updated normally underneath; only its rendering is suppressed,
+// the same way a browser bookmark folder can be collapsed without
+// deleting what's in it. Persisted as a flat array of identifiers in
+// localStorage so it survives reloads without needing a server round
+// trip -- this is a display preference, not data, so it doesn't need to
+// live in Watch History/Continue Watching's synced blob.
+//
+// Identifiers: a local Custom List (including the synthetic
+// 'airing-next' slug used by getOrCreateAiringNextList) is keyed by its
+// slug; every provider-backed list (MDBList/Trakt/TMDB/Simkl, including
+// 'simkl:user:shows:airing-next') is keyed by its url. Both happen to
+// already be the unique identifier each render function keys its own
+// lists by, so no extra id scheme was needed.
+const HIDDEN_LISTS_KEY = 'myListAddon:hiddenLists';
+
+function getHiddenListIds() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_LISTS_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function isListHidden(id) {
+  if (!id) return false;
+  return getHiddenListIds().includes(String(id));
+}
+
+// Adds or removes a single identifier from the hidden set and re-renders
+// every place a hidden list could currently be showing, so the change is
+// visible immediately without a full page reload. Each re-render call is
+// individually guarded (typeof ... === 'function') since not every one of
+// these is necessarily defined yet depending on where in the page's own
+// load sequence this fires from.
+function setListHidden(id, hidden) {
+  if (!id) return;
+  const idStr = String(id);
+  const current = getHiddenListIds();
+  const has = current.includes(idStr);
+  if (hidden === has) return; // already in the requested state
+  const next = hidden ? [...current, idStr] : current.filter((x) => x !== idStr);
+  try {
+    localStorage.setItem(HIDDEN_LISTS_KEY, JSON.stringify(next));
+  } catch (e) {
+    // non-critical -- worst case the toggle doesn't persist across reloads
+  }
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderMySimklLists === 'function' && window._mySimklLists) renderMySimklLists(window._mySimklLists);
+  if (typeof renderMyMdblistLists === 'function' && window._myMdblistLists) renderMyMdblistLists(window._myMdblistLists);
+  if (typeof renderMyTraktLists === 'function' && window._myTraktLists) renderMyTraktLists(window._myTraktLists);
+  if (typeof renderMyTmdbLists === 'function' && window._myTmdbLists) renderMyTmdbLists(window._myTmdbLists);
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+// --- Hidden My Lists Sections --------------------------------------------
+//
+// A coarser companion to the per-list hiding above: hides an entire
+// provider's "Your X Lists" panel on the My Lists tab (My MDBList/Trakt/
+// TMDB/Simkl Lists) -- for someone who's connected a provider account but
+// doesn't want that whole block cluttering My Lists, without having to
+// hide every individual list inside it one at a time (and without having
+// to re-hide new lists that provider adds later). Deliberately a separate
+// key/mechanism from HIDDEN_LISTS_KEY above -- these are section
+// identifiers (a fixed small set: 'mdblist', 'trakt', 'tmdb', 'simkl'),
+// not list identifiers, and mixing the two would make it ambiguous
+// whether a given hidden id in one list meant "this specific list" or
+// "this whole section" when read back.
+const HIDDEN_SECTIONS_KEY = 'myListAddon:hiddenMyListsSections';
+const MY_LISTS_SECTION_PANEL_IDS = {
+  mdblist: 'myListsSectionPanel-mdblist',
+  trakt: 'myListsSectionPanel-trakt',
+  tmdb: 'myListsSectionPanel-tmdb',
+  simkl: 'myListsSectionPanel-simkl',
+};
+
+function getHiddenMyListsSections() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_SECTIONS_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function isMyListsSectionHidden(section) {
+  if (!section) return false;
+  return getHiddenMyListsSections().includes(String(section));
+}
+
+// Applies the current hidden-sections state directly to each panel's own
+// display style -- no re-render needed the way per-list hiding requires,
+// since the section panels themselves are static markup (12_tab-custom-
+// lists.js) that already exists in the DOM; hiding/showing one is just a
+// style toggle, not a re-render of provider data. Safe to call any time
+// (e.g. on tab switch) since it's idempotent.
+function applyHiddenMyListsSections() {
+  const hidden = new Set(getHiddenMyListsSections());
+  Object.keys(MY_LISTS_SECTION_PANEL_IDS).forEach((section) => {
+    const el = document.getElementById(MY_LISTS_SECTION_PANEL_IDS[section]);
+    if (el) el.style.display = hidden.has(section) ? 'none' : '';
+  });
+}
+
+function setMyListsSectionHidden(section, hidden) {
+  if (!section || !MY_LISTS_SECTION_PANEL_IDS[section]) return;
+  const current = getHiddenMyListsSections();
+  const has = current.includes(section);
+  if (hidden === has) return;
+  const next = hidden ? [...current, section] : current.filter((s) => s !== section);
+  try {
+    localStorage.setItem(HIDDEN_SECTIONS_KEY, JSON.stringify(next));
+  } catch (e) {
+    // non-critical -- worst case the toggle doesn't persist across reloads
+  }
+  applyHiddenMyListsSections();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+// Applied once on page load and once more each time the Lists tab is
+// switched to (see switchTab, 16_client-row-core.js) -- the My Lists
+// section panels only exist once that panel's markup is in the DOM, and
+// while it's always present (not conditionally rendered), applying this
+// on every Lists-tab visit rather than assuming a single page-load call
+// suffices costs nothing and removes any ordering dependency on exactly
+// when this script runs relative to the panel markup existing.
+setTimeout(() => { applyHiddenMyListsSections(); }, 0);
+
+
 // --- Creator Profile system --------------------------------------------------
 //
 // No accounts, no email, no passwords -- see the matching server-side
@@ -28322,6 +30289,141 @@ function onRemoveWatchedFromWatchlistToggle(cb) {
   if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
 }
 
+// "Hidden Lists" panel on Settings -- lets the person hide specific lists
+// (by identifier -- see setListHidden's own comment, 21_client-custom-
+// list-builder.js) from My Lists, the Airing Next dashboard card, and
+// Simkl Airing Next, without deleting or unsyncing anything underneath.
+//
+// Enumerates every list this browser currently knows about across every
+// source that can produce one -- local Custom Lists (via
+// loadLocalCustomLists, same store getOrCreateAiringNextList uses, so
+// Airing Next's synthetic 'airing-next' entry shows up here too), a
+// signed-in Creator Profile's server-side lists (lastCreatorListsData,
+// already fetched by renderCreatorDashboard -- this panel doesn't re-fetch
+// on its own), and whichever of MDBList/Trakt/TMDB/Simkl the person has
+// connected (window._myMdblistLists/_myTraktLists/_myTmdbLists/
+// _mySimklLists -- each already populated by that provider's own "My
+// Lists" panel render, so this can be empty here until that panel has
+// loaded at least once). A list already hidden is included too (checkbox
+// unchecked) so it can be found and re-shown -- this panel is the only
+// place a hidden list is still visible at all.
+function renderHiddenListsSettingsSection() {
+  const box = document.getElementById('hiddenListsSettingsSection');
+  if (!box) return;
+
+  const rows = []; // { id, name, source }
+  const seenIds = new Set();
+  function addRow(id, name, source) {
+    if (!id || seenIds.has(id)) return;
+    seenIds.add(id);
+    rows.push({ id: id, name: name || id, source: source });
+  }
+
+  // Local Custom Lists (keyed by slug) -- includes the synthetic
+  // 'airing-next' entry once it has any items, matching how the dashboard
+  // itself only ever shows that card once it's eligible.
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    Object.keys(map).forEach((slug) => {
+      const l = map[slug];
+      if (!l || !l.slug) return;
+      if (l.slug === 'airing-next') {
+        addRow('airing-next', 'Airing Next', 'Dashboard');
+      } else {
+        addRow(l.slug, l.name || l.slug, 'My Lists');
+      }
+    });
+  } catch (e) {}
+  if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size) {
+    addRow('airing-next', 'Airing Next', 'Dashboard');
+  }
+
+  // A signed-in Creator Profile's server-side lists -- already fetched by
+  // renderCreatorDashboard into lastCreatorListsData; not re-fetched here.
+  if (Array.isArray(lastCreatorListsData)) {
+    lastCreatorListsData.forEach((l) => {
+      if (l && l.slug) addRow(l.slug, l.name || l.slug, 'My Lists');
+    });
+  }
+
+  // Connected providers -- each keyed by url, matching the filter applied
+  // in that provider's own render function (17_client-my-lists-and-trakt-
+  // oauth.js). Simkl's own 'simkl:user:shows:airing-next' entry naturally
+  // lands under its own "Simkl Airing Next" label via the url check below.
+  const providerLists = [
+    { arr: window._myMdblistLists, label: 'MDBList' },
+    { arr: window._myTraktLists, label: 'Trakt' },
+    { arr: window._myTmdbLists, label: 'TMDB' },
+    { arr: window._mySimklLists, label: 'Simkl' },
+  ];
+  providerLists.forEach(({ arr, label }) => {
+    if (!Array.isArray(arr)) return;
+    arr.forEach((l) => {
+      if (!l || !l.url) return;
+      const isSimklAiringNext = l.url.includes(':airing-next');
+      addRow(l.url, l.name || l.url, isSimklAiringNext ? 'Simkl Airing Next' : label);
+    });
+  });
+
+  if (!rows.length && Object.keys(MY_LISTS_SECTION_PANEL_IDS || {}).length === 0) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No lists found yet -- visit My Lists (and connect any providers you use) first, then come back here to manage what\u2019s shown.</small></p>';
+    return;
+  }
+
+  rows.sort((a, b) => a.source.localeCompare(b.source) || a.name.localeCompare(b.name));
+
+  const hiddenIds = new Set(typeof getHiddenListIds === 'function' ? getHiddenListIds() : []);
+  const hiddenSections = new Set(typeof getHiddenMyListsSections === 'function' ? getHiddenMyListsSections() : []);
+
+  // Whole-section toggles first -- coarser than the per-list rows below,
+  // for someone who wants an entire provider's "Your X Lists" panel gone
+  // from My Lists rather than hiding each list inside it one at a time.
+  // Always a fixed set of 4 (see MY_LISTS_SECTION_PANEL_IDS, 21_client-
+  // custom-list-builder.js) regardless of whether that provider is
+  // connected yet -- hiding ahead of connecting is harmless and saves a
+  // trip back here after connecting.
+  const sectionLabels = { mdblist: 'Your MDBList Lists', trakt: 'Your Trakt Lists', tmdb: 'Your TMDB Lists', simkl: 'Your Simkl Lists' };
+  const sectionsHtml = Object.keys(sectionLabels).map((section) => {
+    const checked = hiddenSections.has(section);
+    return '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-section-id="' + escapeAttr(section) + '" onchange="onHiddenSectionToggle(this)" style="cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<span style="font-weight:600;">' + escapeHtml(sectionLabels[section]) + '</span>' +
+    '</label>';
+  }).join('');
+
+  const rowsHtml = rows.length ? rows.map((r) => {
+    const checked = hiddenIds.has(String(r.id));
+    return '<label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-list-id="' + escapeAttr(r.id) + '" onchange="onHiddenListToggle(this)" style="margin-top:2px; cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<div style="min-width:0;">' +
+        '<span style="font-weight:600; overflow-wrap:anywhere;">' + escapeHtml(r.name) + '</span>' +
+        '<div style="color:var(--muted); font-size:0.78rem; margin-top:2px;">' + escapeHtml(r.source) + '</div>' +
+      '</div>' +
+    '</label>';
+  }).join('') : '<p style="color:var(--muted); font-size:0.85rem; margin-top:8px;"><small>No individual lists found yet -- visit My Lists (and connect any providers you use) first.</small></p>';
+
+  box.innerHTML =
+    '<p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Whole sections</p>' +
+    sectionsHtml +
+    '<p style="margin:14px 0 6px; font-weight:600; font-size:0.85rem;">Individual lists</p>' +
+    rowsHtml;
+}
+
+function onHiddenListToggle(cb) {
+  const id = cb && cb.dataset ? cb.dataset.listId : '';
+  if (!id) return;
+  // Checked = hidden, unchecked = visible -- matches the panel's own name
+  // ("Hidden Lists": check a box to hide that list).
+  if (typeof setListHidden === 'function') setListHidden(id, cb.checked);
+}
+
+function onHiddenSectionToggle(cb) {
+  const section = cb && cb.dataset ? cb.dataset.sectionId : '';
+  if (!section) return;
+  // Same checked = hidden convention as onHiddenListToggle above.
+  if (typeof setMyListsSectionHidden === 'function') setMyListsSectionHidden(section, cb.checked);
+}
+
 // that persists anywhere outside a single browser for that link to
 // point at in the first place.
 function renderTrackPlaybackSection() {
@@ -28563,6 +30665,7 @@ function clearLocalAccountData() {
   if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
   if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
   if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
@@ -28595,7 +30698,8 @@ function openRestoreModal() {
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
-    '</div>'
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
   );
 }
 
@@ -28623,6 +30727,7 @@ async function submitRestoreProfile() {
     clearLocalAccountData();
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
     renderCreatorProfileBar();
@@ -28636,7 +30741,66 @@ async function submitRestoreProfile() {
   }
 }
 
-// Silent on failure by design -- a browser with a stale/invalid stored key
+// Self-service key reset for anyone who set a recovery answer at signup
+// (see /api/creator/reset-key and its own comment). Reuses
+// showKeyRevealModal -- same one-time reveal UX as signup and the
+// admin-side reset -- and, once revealed, logs the new key straight in
+// the same way a successful restore would, since at that point the
+// person has fully proven who they are.
+function openForgotKeyModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<h2>Reset Your Key</h2>' +
+    '<p class="modal-sub">Enter your Username and the recovery answer you set when you created your account.</p>' +
+    '<div class="row"><input type="text" id="forgotKeyNameInput" placeholder="Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
+    '<div id="forgotKeyModalError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
+  );
+}
+
+async function submitForgotKey() {
+  const name = document.getElementById('forgotKeyNameInput').value.trim();
+  const answer = document.getElementById('forgotKeyAnswerInput').value.trim();
+  const errBox = document.getElementById('forgotKeyModalError');
+  if (!name || !answer) {
+    errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
+    return;
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/reset-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name, recoveryAnswer: answer }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' + escapeHtml(data.error || 'Could not reset your key.') + '</p>';
+      return;
+    }
+    clearLocalAccountData();
+    activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+    localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+    localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    closeModal();
+    showKeyRevealModal(data.displayName, data.creatorKey);
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderWatchlistPreferencesSection();
+    renderTrackPlaybackSection();
+    renderCreatorDashboard();
+    await loadCreatorSync();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  }
+}
+
+
 // (e.g. the profile was somehow deleted) just falls back to logged-out
 // rather than throwing an error at page load.
 async function tryAutoRestoreCreatorProfile() {
@@ -28652,6 +30816,7 @@ async function tryAutoRestoreCreatorProfile() {
     const data = await res.json();
     if (data.ok) {
       activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+      localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
       renderCreatorProfileBar();
       renderAccountKeySection();
       renderWatchlistPreferencesSection();
@@ -28793,6 +30958,12 @@ async function pushCreatorSync() {
         // their own, only when they actually change.
         collapsedPanels: collectCollapsedPanelsState(),
         likedLists: [...getLikedListsSet()],
+        hiddenLists: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch (e) { return []; }
+        })(),
+        hiddenMyListsSections: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
+        })(),
       }),
     });
   } catch (e) {
@@ -28824,6 +30995,7 @@ async function pushTrackingSync() {
         // merging.
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
+        airingNext: (localMap['airing-next'] && localMap['airing-next'].items) || [],
         watchlist: wlItems,
         watchlistUpdatedAt: wlUpdatedAt,
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
@@ -28876,7 +31048,26 @@ async function loadCreatorSync() {
     }
     renumber();
     suppressSave = false;
-    
+
+    // Restore hidden lists state from sync so the selections survive
+    // cross-browser logins. Both keys live only in localStorage locally;
+    // the server blob now carries them so this browser can adopt them.
+    if (Array.isArray(synced.hiddenLists)) {
+      try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(synced.hiddenLists)); } catch (e) {}
+    }
+    if (Array.isArray(synced.hiddenMyListsSections)) {
+      try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
+      if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
+    }
+
+    // Re-trigger the live preview if the Catalogs tab has already been
+    // visited this page load -- loadCreatorSync wipes and rebuilds #lists
+    // which resets every row to its "Click Refresh Preview" placeholder,
+    // so the preview needs to run again after the rebuild completes.
+    if (window._catalogsInitializedOnce && typeof renderLivePreview === 'function') {
+      renderLivePreview();
+    }
+
     if (synced.channels && typeof synced.channels === 'object') {
       if (typeof saveLocalChannelsMap === 'function') {
         saveLocalChannelsMap(synced.channels);
@@ -29107,6 +31298,30 @@ async function loadCreatorSync() {
       } catch (e) {}
     }
 
+    // Restore UI settings from synced.keys -- these are sent by collectKeys()
+    // on every pushCreatorSync but were never applied back to the DOM on load,
+    // so signing in from a different browser left them at their defaults.
+    if (synced.keys && typeof synced.keys === 'object') {
+      if (typeof synced.keys.hideNonDigitalReleases === 'boolean') {
+        const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+        if (cb) cb.checked = synced.keys.hideNonDigitalReleases;
+        try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+      }
+      if (typeof synced.keys.shuffleShelves === 'boolean') {
+        const el = document.getElementById('shuffleShelvesCheckbox');
+        if (el) el.checked = synced.keys.shuffleShelves;
+      }
+      if (typeof synced.keys.shuffleItems === 'boolean') {
+        const el = document.getElementById('shuffleItemsCheckbox');
+        if (el) el.checked = synced.keys.shuffleItems;
+      }
+      if (synced.keys.region) {
+        const el = document.getElementById('regionSelect');
+        if (el) el.value = synced.keys.region;
+        try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
+      }
+    }
+
     // Watch History / Continue Watching -- same wholesale-replace as
     // everything else in this blob (see this function's own comment).
     // getOrCreateWatchHistoryList/getOrCreateContinueWatchingList are used
@@ -29285,6 +31500,8 @@ function openCreateProfileModal() {
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -29295,6 +31512,7 @@ function openCreateProfileModal() {
 
 async function submitCreateProfile() {
   const name = document.getElementById('createProfileNameInput').value.trim();
+  const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
@@ -29304,7 +31522,7 @@ async function submitCreateProfile() {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: name }),
+      body: JSON.stringify({ creatorName: name, recoveryAnswer: recoveryAnswer || undefined }),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -29314,6 +31532,7 @@ async function submitCreateProfile() {
     }
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -29632,6 +31851,17 @@ async function renderCreatorDashboard(options) {
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
       ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
     ];
+    // Airing Next is local-only (see its own comment, 21_client-custom-
+    // list-builder.js) -- folded into the same array (rather than its own
+    // separate card type) purely so it sorts and drags alongside every
+    // other card via the shared savedOrder/persistCreatorListOrderFromDom
+    // machinery below; buildAiringNextCardHtml (unlike buildServerListCardHtml/
+    // buildLocalListCardHtml) takes no arguments, so "list" here is just a
+    if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function') {
+      allDashboardLists.push({ isAiringNext: true, list: { slug: 'airing-next' } });
+    }
+
+    const visibleDashboardLists = (typeof isListHidden === 'function') ? allDashboardLists.filter((item) => !isListHidden(item.list && item.list.slug)) : allDashboardLists;
 
     let savedOrder = [];
     if (Array.isArray(data.order) && data.order.length) {
@@ -29646,21 +31876,22 @@ async function renderCreatorDashboard(options) {
     }
     if (savedOrder && savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
-      allDashboardLists.sort((a, b) => {
+      visibleDashboardLists.sort((a, b) => {
         const posA = orderMap.has(a.list.slug) ? orderMap.get(a.list.slug) : 9999;
         const posB = orderMap.has(b.list.slug) ? orderMap.get(b.list.slug) : 9999;
         return posA - posB;
       });
     }
 
-    const rowsHtml = allDashboardLists.length
-      ? allDashboardLists.map((item) => item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list)).join('')
+    const rowsHtml = visibleDashboardLists.length
+      ? visibleDashboardLists.map((item) => item.isAiringNext ? buildAiringNextCardHtml() : (item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list))).join('')
       : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
 
     const prevScrollTop = box.scrollTop;
     box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+    if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   } catch (e) {
     if (!hasExistingContent) {
       box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
@@ -29853,30 +32084,44 @@ function renderLocalCustomListsDashboard(box, silent) {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
 
-  const lists = Object.keys(map).map((k) => map[k]);
+  // Airing Next lives in this same map (getOrCreateAiringNextList uses the
+  // same store) but needs its own render path (buildAiringNextCardHtml,
+  // no args) rather than the generic buildLocalListCardHtml -- filtered
+  // out of the plain loop below and re-added as a stub so it still
+  // participates in the shared saved-order sort/drag exactly like every
+  // other card (see the matching comment in renderCreatorDashboard above).
+  const lists = Object.keys(map).map((k) => map[k]).filter((l) => l && l.slug !== 'airing-next');
+  const airingNextEligible = typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function';
+  if (airingNextEligible) {
+    lists.push({ slug: 'airing-next', isAiringNext: true, updatedAt: (map['airing-next'] && map['airing-next'].updatedAt) || Date.now() });
+  }
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
+
   let savedOrder = [];
   try {
     savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
   } catch (e) {}
   if (savedOrder && savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
-    lists.sort((a, b) => {
+    visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
       const posB = orderMap.has(b.slug) ? orderMap.get(b.slug) : 9999;
       if (posA !== posB) return posA - posB;
       return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
   } else {
-    lists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    visibleLists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
-  lastLocalCustomListsData = lists;
-  const rowsHtml = lists.length
-    ? lists.map(buildLocalListCardHtml).join('')
+  lastLocalCustomListsData = visibleLists;
+  const rowsHtml = visibleLists.length
+    ? visibleLists.map((l) => l.isAiringNext ? buildAiringNextCardHtml() : buildLocalListCardHtml(l)).join('')
     : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
   const prevScrollTop = box ? box.scrollTop : 0;
   box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
   if (prevScrollTop) box.scrollTop = prevScrollTop;
   document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 
@@ -29884,6 +32129,51 @@ const _creatorDashEl = document.getElementById('creatorDashboard');
 if (_creatorDashEl) {
   _creatorDashEl.addEventListener('click', async (e) => {
     if (e.target.closest('.clickable-poster')) return;
+    const airingViewBtn = e.target.closest('.airingNextViewBtn');
+    if (airingViewBtn) {
+      if (typeof openAiringNextDetailsPage === 'function') openAiringNextDetailsPage();
+      return;
+    }
+    const airingAddBtn = e.target.closest('.airingNextAddToConfigBtn');
+    if (airingAddBtn) {
+      const list = (typeof getOrCreateAiringNextList === 'function') ? getOrCreateAiringNextList() : { items: [] };
+      let isAdded = airingAddBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, 'series', 'airing-next'));
+      if (isAdded) {
+        if (typeof removeListFromConfig === 'function') removeListFromConfig(null, 'series', 'airing-next');
+        if (typeof renumber === 'function') renumber();
+        if (typeof saveState === 'function') saveState();
+        airingAddBtn.classList.remove('is-added', 'secondary');
+        airingAddBtn.classList.add('primary');
+        airingAddBtn.textContent = '+ Add';
+        airingAddBtn.style.color = '';
+        if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+        if (typeof showAddedToast === 'function') showAddedToast('Removed "Airing Next" from your Catalogs.');
+        return;
+      }
+      // Signed-in Creator account: a live catalog reading server-side
+      // tracking data (see fetchAutoTrackedCatalog, 05_catalog-core.js).
+      // Local-only browser: a snapshot of today's items, same as Watch
+      // History/Continue Watching fall back to for local-only users --
+      // it'll go stale as the schedule moves and needs a manual Configure
+      // -> Update to refresh (see this repo's README).
+      const url = (typeof activeCreator !== 'undefined' && activeCreator)
+        ? 'autotrack:airing-next:series:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({
+            listId: (typeof generateChannelId === 'function') ? generateChannelId() : String(Date.now()),
+            localSlug: 'airing-next',
+            type: 'series',
+            items: (list.items || []).map((it) => ({ imdbId: it.showId, title: it.showTitle, poster: it.showPoster })),
+            shuffle: false,
+          });
+      if (typeof addRow === 'function') addRow('Airing Next', url, 'series', true, 'My Lists');
+      airingAddBtn.classList.add('is-added', 'secondary');
+      airingAddBtn.classList.remove('primary');
+      airingAddBtn.textContent = 'Remove';
+      airingAddBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "Airing Next" to your Catalogs.');
+      return;
+    }
     const viewBtn = e.target.closest('.creatorListViewBtn, .localListViewBtn, .creatorListViewTrigger, .localListViewTrigger');
   if (viewBtn) {
     const slug = viewBtn.dataset.slug;
@@ -30768,6 +33058,10 @@ function removeWatchHistoryItemDirect(id, btn) {
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
       if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
+      // Removing the last watched episode of a show drops it from Airing
+      // Next's candidate set -- see syncAiringNextWatchState's own
+      // comment (21_client-custom-list-builder.js).
+      if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
     }
   }
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
@@ -30852,6 +33146,7 @@ function clearWatchHistoryAll() {
 }
 window.clearWatchHistoryAll = clearWatchHistoryAll;
 // Reordering & position management
+// Reordering & position management
 function moveRow(btn, dir) {
   const entry = btn.closest('.entry');
   const container = document.getElementById('lists');
@@ -30884,6 +33179,7 @@ function renumber() {
   updateListGroupFilterOptions();
   filterLists();
   saveState();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
 }
 
 // Lets someone type a new position directly into a row's number box (e.g.
@@ -31155,13 +33451,17 @@ async function testSourceRow(btn) {
   resultEl.textContent = 'Testing\u2026';
 
   try {
+    const keys = typeof collectKeys === 'function' ? collectKeys() : {};
     const body = { url, type };
-    const mdblistKey = document.getElementById('mdblistKeyInput').value.trim();
-    if (mdblistKey) body.mdblistKey = mdblistKey;
-    const traktKey = document.getElementById('traktKeyInput').value.trim();
-    if (traktKey) body.traktKey = traktKey;
-    if (traktAccessToken) body.traktAccessToken = traktAccessToken;
-    const res = await fetch(\`\${ORIGIN}/api/preview\`, {
+    if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
+    if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+    if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
+    if (keys.traktKey) body.traktKey = keys.traktKey;
+    if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+    if (keys.simklKey) body.simklKey = keys.simklKey;
+    if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
+    if (keys.creatorName) body.creatorName = keys.creatorName;
+    const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -31241,10 +33541,15 @@ async function testAllSources() {
 
 function buildConfig(entries, keys) {
   const payload = { entries };
+  if (keys && keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
   if (keys && keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
+  if (keys && keys.mdblistAccessToken) payload.mdblistAccessToken = keys.mdblistAccessToken;
   if (keys && keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys && keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys && keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
+  if (keys && keys.simklKey) payload.simklKey = keys.simklKey;
+  if (keys && keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
+  if (keys && keys.simklUsername) payload.simklUsername = keys.simklUsername;
   if (keys && keys.track) {
     payload.track = true;
     payload.trackCreatorName = keys.trackCreatorName;
@@ -31252,6 +33557,8 @@ function buildConfig(entries, keys) {
   }
   if (keys && keys.shuffleShelves) payload.shuffleShelves = true;
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
+  if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
+  if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -31412,6 +33719,12 @@ function collectKeys() {
     simklUsername: simklUser,
     shuffleShelves: document.getElementById('shuffleShelvesCheckbox') ? document.getElementById('shuffleShelvesCheckbox').checked : false,
     shuffleItems: document.getElementById('shuffleItemsCheckbox') ? document.getElementById('shuffleItemsCheckbox').checked : false,
+    region: (function() {
+      const el = document.getElementById('regionSelect');
+      if (el && el.value) return el.value;
+      try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
+    })(),
+    hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -31506,9 +33819,13 @@ async function renderLivePreview() {
         const body = { url: s.url, type: s.type, sample: 100 };
         if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
         if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
+        if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
         if (keys.traktKey) body.traktKey = keys.traktKey;
         if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+        if (keys.simklKey) body.simklKey = keys.simklKey;
+        if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
+        if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
         const res = await fetch(ORIGIN + '/api/preview', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -31571,12 +33888,23 @@ function livePreviewPosterHtml(m) {
   }
 
   const yearHtml = m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '';
-  const addOverlay = '<div class="poster-add-overlay" title="Add to Lists">+</div>';
   let dateBadge = '';
-  if (m.airDate && (m.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: m.airDate })))) {
-    const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : m.airDate;
+  // hideDateBadge: Airing Next sets this on non-premiere items once its
+  // own subtitle line already spells out the air date next to S/E (see
+  // openAiringNextDetailsPage, 21_client-custom-list-builder.js) -- avoids
+  // showing the same date twice. Continue Watching/Watch History never set
+  // it, so their own plain-date badge is untouched.
+  if (!m.hideDateBadge && m.airDate && (m.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: m.airDate })))) {
+    // Airing Next passes isSeasonPremiere for episode 1 of a season -- a
+    // distinct green pill (matching the badge style used elsewhere for
+    // "premiere" callouts), pinned to the bottom of the poster (see
+    // .cw-date-badge-premiere, 09_page-shell.js) rather than the plain
+    // accent-colored date badge's usual top-left spot, so premieres stand
+    // out from ordinary upcoming episodes at a glance.
+    const badgeText = m.isSeasonPremiere ? 'Season Premiere' : (typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : m.airDate);
     if (badgeText) {
-      dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+      const badgeClass = m.isSeasonPremiere ? 'cw-date-badge cw-date-badge-premiere' : 'cw-date-badge';
+      dateBadge = '<div class="' + badgeClass + '" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
     }
   }
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
@@ -31584,7 +33912,6 @@ function livePreviewPosterHtml(m) {
       posterEl +
       dateBadge +
       removeBtn +
-      addOverlay +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
     (m.subtitle ? '<div class="live-preview-poster-subtitle">' + escapeHtml(m.subtitle) + '</div>' : '') +
@@ -32208,10 +34535,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     nLower.includes('recommended shows') ||
     nLower.includes('continue watching') ||
     nLower.includes('watch history') ||
+    nLower.includes('airing next') ||
     urlLower.startsWith('custom:curated:') ||
     urlLower.startsWith('autotrack:') ||
+    urlLower.startsWith('simkl:user:') ||
     urlLower === 'custom:continue-watching' ||
-    urlLower === 'custom:watch-history';
+    urlLower === 'custom:watch-history' ||
+    urlLower === 'custom:airing-next';
 
   if (isNoLikesList) {
     likesCount = null;
@@ -32377,7 +34707,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   if (likeBtn) {
-    if (listUrl && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:')) {
+    if (listUrl && !isNoLikesList && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
@@ -33479,10 +35809,23 @@ async function generate() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        entries, mdblistKey: keys.mdblistKey, mdblistAccessToken: keys.mdblistAccessToken, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
-        simklKey: keys.simklKey, simklAccessToken: keys.simklAccessToken,
-        track: keys.track, trackCreatorName: keys.trackCreatorName, trackCreatorKey: keys.trackCreatorKey,
-        shuffleShelves: keys.shuffleShelves, shuffleItems: keys.shuffleItems,
+        entries,
+        tmdbKey: keys.tmdbKey,
+        mdblistKey: keys.mdblistKey,
+        mdblistAccessToken: keys.mdblistAccessToken,
+        traktKey: keys.traktKey,
+        traktUsername: keys.traktUsername,
+        traktAccessToken: keys.traktAccessToken,
+        simklKey: keys.simklKey,
+        simklAccessToken: keys.simklAccessToken,
+        simklUsername: keys.simklUsername,
+        track: keys.track,
+        trackCreatorName: keys.trackCreatorName,
+        trackCreatorKey: keys.trackCreatorKey,
+        shuffleShelves: keys.shuffleShelves,
+        shuffleItems: keys.shuffleItems,
+        region: keys.region,
+        hideNonDigitalReleases: keys.hideNonDigitalReleases,
       }),
     });
     const data = await res.json();
@@ -33580,6 +35923,36 @@ if (serverEntries.length) {
   if (document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = serverShuffleItems;
   }
+  // Region has no equivalent "source of truth from the URL" concept the
+  // way entries/shuffle do here -- the region <select>'s server-rendered
+  // selected value only reflects whatever was in the saved config the
+  // *last* time this install link's config was generated/regenerated
+  // (see the note on stale install links elsewhere in this codebase:
+  // redeploying or changing a setting doesn't retroactively touch an
+  // already-generated link's stored config). If the person picked a
+  // region in this same browser more recently than that, localStorage
+  // has the truer answer -- apply it over the server-rendered default so
+  // the dropdown at least reflects their last real choice, even though
+  // making that choice actually take effect for catalog fetching still
+  // needs a Save/Update to regenerate the link, same as any other change.
+  const savedRegionForConfigView = (function() {
+    try { return localStorage.getItem('myListAddon:region'); } catch (e) { return null; }
+  })();
+  if (savedRegionForConfigView) {
+    const regionEl = document.getElementById('regionSelect');
+    if (regionEl) regionEl.value = savedRegionForConfigView;
+  }
+  // hideNonDigitalReleases: same localStorage-override pattern as region
+  // above -- if the person toggled this checkbox in this browser more
+  // recently than the last time they regenerated their install link,
+  // honour their local choice over the server-rendered default.
+  const savedHideNonDigital = (function() {
+    try { return localStorage.getItem('myListAddon:hideNonDigitalReleases'); } catch (e) { return null; }
+  })();
+  if (savedHideNonDigital !== null) {
+    const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+    if (cb) cb.checked = savedHideNonDigital === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved.
@@ -33592,6 +35965,9 @@ if (serverEntries.length) {
   }
   if (saved && document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
+  }
+  if (saved && saved.keys && document.getElementById('hideNonDigitalReleasesCheckbox')) {
+    document.getElementById('hideNonDigitalReleasesCheckbox').checked = !!saved.keys.hideNonDigitalReleases;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
@@ -33625,6 +36001,19 @@ if (serverEntries.length) {
   }
   if (!simklDisc && saved && saved.keys && saved.keys.simklUsername) {
     simklUsername = saved.keys.simklUsername;
+  }
+  // Region has no separate localStorage:XDisconnected flag to check
+  // against (it's not an external account), and it's saved directly under
+  // 'myListAddon:region' by the <select>'s own onchange handler as well as
+  // inside the collectKeys() blob saveState() writes on every change --
+  // check both, since a person who never touched the dropdown after this
+  // feature shipped will have it in neither, and that's fine (this whole
+  // block only runs on a fresh visit with no config in the URL, so falling
+  // through to the server-rendered default of "US" is correct for them).
+  const savedRegion = (saved && saved.keys && saved.keys.region) || localStorage.getItem('myListAddon:region');
+  if (savedRegion) {
+    const el = document.getElementById('regionSelect');
+    if (el) el.value = savedRegion;
   }
 }
 if (localStorage.getItem('myListAddon:mdblistDisconnected') === 'true') {
@@ -33693,6 +36082,7 @@ scheduleMyTraktListsRefresh();
 renderCreatorProfileBar();
 renderAccountKeySection();
 if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
@@ -34278,11 +36668,11 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
       return new Response(
         renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
           isConfigureMode: true,
         }),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
@@ -34555,12 +36945,13 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, trackCreatorName } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
 
       const source = detectSource(entry.url);
       const isAutoTrack = source === "autotrack";
+      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -34569,22 +36960,26 @@ self.addEventListener('fetch', e => {
       // before. Only active when a CONFIGS KV namespace is bound (optional,
       // same as the short-link feature) -- without one this behaves exactly
       // as it did previously.
-      const staleKey = env && env.CONFIGS && !isAutoTrack ? `lastgood:${config}:${type}:${id}` : null;
+      const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, shuffleItems, configParam: config, trackCreatorName, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
           );
         }
-        if (isAutoTrack) {
+        if (isUserPersonal) {
           return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
         return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
+        if (isUserPersonal) {
+          console.error("User personal catalog fetch error:", errMsg);
+          return json({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+        }
 
         if (skip === 0 && staleKey) {
           try {
@@ -34675,7 +37070,7 @@ self.addEventListener('fetch', e => {
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -34693,6 +37088,7 @@ self.addEventListener('fetch', e => {
         simklKey = reqBody.simklKey || "";
         simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
+        hideNonDigitalReleases = !!reqBody.hideNonDigitalReleases;
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
       } else {
@@ -34706,12 +37102,13 @@ self.addEventListener('fetch', e => {
         simklKey = url.searchParams.get("simklKey") || "";
         simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
+        hideNonDigitalReleases = url.searchParams.get("hideNonDigitalReleases") === "1";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
@@ -36360,7 +38757,15 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Please connect your Simkl account first." }, 400);
       }
       try {
-        const res = await fetch("https://api.simkl.com/sync/all-items/", {
+        // extended=full is required to get watched_episodes_count/
+        // total_episodes_count/not_aired_episodes_count back on each item --
+        // without it Simkl's default (summary) shape omits or zeroes these,
+        // which breaks isCaughtUp's fallback check in
+        // enrichSimklAiringNextDates (17_client-my-lists-and-trakt-oauth.js)
+        // for any show whose completion isn't otherwise obvious from
+        // status alone. No date_from on purpose -- this always wants the
+        // full current watchlist, not a delta since a stored checkpoint.
+        const res = await fetch("https://api.simkl.com/sync/all-items/?extended=full", {
           headers: {
             "Authorization": `Bearer ${token}`,
             "simkl-api-key": clientId,
@@ -36428,6 +38833,59 @@ self.addEventListener('fetch', e => {
               url: `simkl:user:${cat.key}:${stKey}`,
             });
           }
+        }
+
+        const airingCandidateItems = [
+          ...(Array.isArray(data.shows) ? data.shows : []),
+          ...(Array.isArray(data.anime) ? data.anime : []),
+        ].filter((it) => (it.status === "watching" || it.status === "completed"));
+
+        airingCandidateItems.sort((a, b) => {
+          const aTime = a.last_watched_at ? new Date(a.last_watched_at).getTime() : 0;
+          const bTime = b.last_watched_at ? new Date(b.last_watched_at).getTime() : 0;
+          if (a.status === "watching" && b.status !== "watching") return -1;
+          if (b.status === "watching" && a.status !== "watching") return 1;
+          return bTime - aTime;
+        });
+
+        const seenAiringIds = new Set();
+        const dedupedAiring = [];
+        for (const item of airingCandidateItems) {
+          const mediaObj = item.show || item.anime;
+          if (mediaObj && mediaObj.ids) {
+            const imdbId = mediaObj.ids.imdb || "";
+            const tmdbId = mediaObj.ids.tmdb || "";
+            const simklId = mediaObj.ids.simkl || "";
+            const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : (simklId ? `simkl:${simklId}` : ""));
+            if (bestId && !seenAiringIds.has(bestId)) {
+              seenAiringIds.add(bestId);
+              dedupedAiring.push({
+                id: bestId,
+                imdbId: imdbId || null,
+                tmdbId: tmdbId || null,
+                name: mediaObj.title || "",
+                year: mediaObj.year || "",
+                poster: mediaObj.ids.poster ? `https://simkl.in/posters/${mediaObj.ids.poster}_m.jpg` : (imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : ""),
+                type: "series",
+                status: item.status || "watching",
+                watchedCount: item.watched_episodes_count,
+                totalCount: item.total_episodes_count,
+                lastWatched: item.last_watched || null,
+              });
+            }
+          }
+        }
+
+        if (dedupedAiring.length > 0) {
+          lists.unshift({
+            name: "Simkl Airing Next",
+            type: "series",
+            itemCount: dedupedAiring.length,
+            statusKey: "airing-next",
+            categoryKey: "shows",
+            items: dedupedAiring,
+            url: "simkl:user:shows:airing-next",
+          });
         }
         let simklUsername = "";
         try {
@@ -38003,7 +40461,7 @@ self.addEventListener('fetch', e => {
       const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
-      const isAdmin = await isAdminRequest(request, env);
+      const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
       const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
@@ -38230,7 +40688,16 @@ self.addEventListener('fetch', e => {
           cf: { cacheTtl: 60, cacheEverything: false },
         });
         if (!res.ok) {
-          return json({ ok: false, error: `MDBList request failed (HTTP ${res.status}). Double check the API key or connection.` });
+          // 429 means MDBList's own rate limit was hit -- a bad/expired
+          // key would come back as 401/403, not 429, so don't tell the
+          // person to "double check the API key" for a rate limit; that
+          // sends them looking in the wrong place. See the matching hint
+          // logic in fetchMdblistList (06_source-fetchers-mdblist-trakt.js)
+          // for the same distinction on the other MDBList call site.
+          const hint = res.status === 429
+            ? " MDBList's rate limit was hit -- wait a bit and try again."
+            : (res.status === 401 || res.status === 403 ? " Double check the API key or connection." : "");
+          return json({ ok: false, error: `MDBList request failed (HTTP ${res.status}).${hint}` });
         }
         const data = await res.json();
         const rawLists = Array.isArray(data) ? data : Array.isArray(data.lists) ? data.lists : [];
@@ -38481,11 +40948,15 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "No lists provided." }, 400);
       }
       const payload = { entries };
+      if (body.tmdbKey) payload.tmdbKey = body.tmdbKey;
       if (body.mdblistKey) payload.mdblistKey = body.mdblistKey;
       if (body.mdblistAccessToken) payload.mdblistAccessToken = body.mdblistAccessToken;
       if (body.traktKey) payload.traktKey = body.traktKey;
       if (body.traktUsername) payload.traktUsername = body.traktUsername;
       if (body.traktAccessToken) payload.traktAccessToken = body.traktAccessToken;
+      if (body.simklKey) payload.simklKey = body.simklKey;
+      if (body.simklAccessToken) payload.simklAccessToken = body.simklAccessToken;
+      if (body.simklUsername) payload.simklUsername = body.simklUsername;
       if (body.track) {
         payload.track = true;
         payload.trackCreatorName = body.trackCreatorName || "";
@@ -38493,6 +40964,8 @@ self.addEventListener('fetch', e => {
       }
       if (body.shuffleShelves) payload.shuffleShelves = true;
       if (body.shuffleItems) payload.shuffleItems = true;
+      if (body.region && body.region !== "US") payload.region = body.region;
+      if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
 
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -38588,15 +41061,15 @@ self.addEventListener('fetch', e => {
         }
       } else {
         const q = url.searchParams;
-        reqBody = { imdbId: q.get("imdbId") || "", tmdbKey: q.get("tmdbKey") || "", type: q.get("type") || "" };
+        reqBody = { imdbId: q.get("imdbId") || q.get("id") || "", tmdbKey: q.get("tmdbKey") || "", type: q.get("type") || "", region: q.get("region") || "" };
       }
       
-      const imdbId = reqBody.imdbId;
+      const imdbId = reqBody.imdbId || reqBody.id;
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
       if (!imdbId) return json({ ok: false, error: "Missing imdbId" }, 400);
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       
-      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type);
+      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region);
       if (!details) return json({ ok: false, error: "Not found or TMDB error" }, 404);
       
       // Short max-age -- same reasoning as /api/season's own comment: this
@@ -39279,14 +41752,124 @@ self.addEventListener('fetch', e => {
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+      // Recovery answer is optional and, unlike the Creator Key itself,
+      // chosen by the person rather than generated -- normalized
+      // (trimmed + lowercased) before hashing so a small casing slip
+      // months later at reset time doesn't lock them out over nothing.
+      // Same PBKDF2 hash-only storage as the key: this value is never
+      // recoverable, only checkable, and it's never shown to an admin --
+      // self-service reset (/api/creator/reset-key) is the only thing
+      // that ever reads it.
+      const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
-        JSON.stringify({ displayName, keyHash, createdAt: Date.now() })
+        JSON.stringify({ displayName, keyHash, recoveryAnswerHash, createdAt: Date.now() })
       );
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
       return json({ ok: true, creatorName: v.normalized, displayName, creatorKey });
+    }
+
+    // /api/creator/reset-key  (POST)  { username, recoveryAnswer } -> { ok, creatorKey }
+    // Public, self-service. This is the reason recoveryAnswerHash exists
+    // at all: someone who's lost their Creator Key but still knows the
+    // recovery answer they set at signup can get a working key back
+    // without ever filing a Feedback ticket or needing an admin. Same
+    // reset-not-recovery shape as /admin/api/reset-creator-key -- a new
+    // key is generated and the old one stops working immediately -- the
+    // only difference is what proves the requester is allowed to do this
+    // (a matching recovery answer here, an authenticated admin there).
+    // The recovery answer itself is intentionally NOT rotated on a
+    // successful reset: unlike a single-use recovery code, this is a
+    // chosen, memorized answer meant to keep working for next time too,
+    // the same way a security question's answer would.
+    if (path === "/api/creator/reset-key" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const rateLimitKey = `resetkeyrate:${ip}:${statsToday()}`;
+      const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+      const rateCount = parseInt(rateCountRaw, 10) || 0;
+      if (rateCount >= 10) {
+        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." });
+      }
+      await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
+
+      const v = validateCreatorUsername(body.username);
+      const answer = String(body.recoveryAnswer || "").trim();
+      // Generic error for every failure case below (unknown username, no
+      // recovery answer on file, wrong answer) -- distinguishing them
+      // would let this endpoint be used to enumerate which usernames
+      // exist and which have a recovery answer set at all.
+      const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
+      if (!v.ok || !answer) return json({ ok: false, error: genericError });
+      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      if (!raw) return json({ ok: false, error: genericError });
+      let profile;
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: genericError });
+      }
+      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+      const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
+      if (!matches) return json({ ok: false, error: genericError });
+
+      const creatorKey = generateCreatorKey();
+      const keyHash = await hashCreatorKey(creatorKey);
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
+      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
+    }
+
+    // /admin/api/reset-creator-key  (POST)  { username } -> { ok, creatorKey }
+    // Admin-only. There's no email or password on a Creator Profile (see
+    // authenticateCreator's own comment above), so a lost key can never be
+    // recovered -- only a hash of it is ever stored. This is a reset, not
+    // a recovery: it generates a brand-new key the same way signup does,
+    // overwrites the stored hash, and hands the plaintext key back exactly
+    // once, same as /api/creator/create does. The old key stops working
+    // the instant this runs -- anywhere it was in use (other devices,
+    // scrobble webhook URLs that embed it) breaks until updated with the
+    // new one. This endpoint has no way to confirm the requester actually
+    // is the creator in question; that verification is left entirely to
+    // the admin using it, out of band, before calling it.
+    if (path === "/admin/api/reset-creator-key" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Unknown creator." });
+      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      if (!raw) return json({ ok: false, error: "Unknown creator." });
+      let profile;
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Could not read that creator's profile." });
+      }
+      const creatorKey = generateCreatorKey();
+      const keyHash = await hashCreatorKey(creatorKey);
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
+      return json({ ok: true, creatorKey });
     }
 
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
@@ -39576,6 +42159,8 @@ self.addEventListener('fetch', e => {
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
         collapsedPanels: body.collapsedPanels && typeof body.collapsedPanels === "object" ? body.collapsedPanels : {},
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
+        hiddenLists: Array.isArray(body.hiddenLists) ? body.hiddenLists.map(String) : [],
+        hiddenMyListsSections: Array.isArray(body.hiddenMyListsSections) ? body.hiddenMyListsSections.map(String) : [],
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -39633,6 +42218,14 @@ self.addEventListener('fetch', e => {
         continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
         watchlist: Array.isArray(body.watchlist) ? body.watchlist : [],
         watchlistUpdatedAt: watchlistUpdatedAt,
+        // Airing Next -- unlike watchHistory/continueWatching, this is
+        // purely derived (recomputed client-side against TMDB on a timer,
+        // see refreshAiringNext, 21_client-custom-list-builder.js), so
+        // there's nothing to migrate from an older creatorsync: blob the
+        // way ensureTrackingMigrated handles the other tracking fields --
+        // it just starts empty on an account that hasn't pushed one yet,
+        // same as a brand new field always would.
+        airingNext: Array.isArray(body.airingNext) ? body.airingNext : [],
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
@@ -40421,6 +43014,112 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
     }
 
+    // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }
+    // One-time migration for the switch (see recordTrackedEvent's own
+    // comment) from one KV key per (eventType/query, id, day) to one JSON
+    // blob per (eventType/query, id) holding every day's count. Old
+    // per-day keys are still sitting in KV from before that switch --
+    // this reads them, folds each into the corresponding new blob (merging
+    // with whatever's already there from live tracking since the switch,
+    // never overwriting), and deletes the old key once it's safely folded
+    // in. Deleting as it goes is what makes this safe to run repeatedly:
+    // a second run finds nothing left to migrate and reports done
+    // immediately, the same idempotent shape backfill-trending above has.
+    // Same paginated-cursor pattern as that endpoint too, for the same
+    // reason -- covers three prefixes in sequence (evtcount:watched:,
+    // evtcount:list-add:, searchquery:), storing which prefix and how far
+    // into its key list this run has reached in migratedaycounts:state so
+    // repeated calls make forward progress without redoing work.
+    if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: true, done: true, keysMigratedThisCall: 0 });
+
+      const PREFIXES = ["evtcount:watched:", "evtcount:list-add:", "searchquery:"];
+      const BATCH_LIMIT = 100;
+
+      let state;
+      try {
+        const stateRaw = await env.CONFIGS.get("migratedaycounts:state");
+        state = stateRaw ? JSON.parse(stateRaw) : { prefixIndex: 0, cursor: null };
+      } catch {
+        state = { prefixIndex: 0, cursor: null };
+      }
+
+      if (state.prefixIndex >= PREFIXES.length) {
+        return json({ ok: true, done: true, keysMigratedThisCall: 0 });
+      }
+
+      const prefix = PREFIXES[state.prefixIndex];
+      const listOpts = { prefix, limit: BATCH_LIMIT };
+      if (state.cursor) listOpts.cursor = state.cursor;
+      const listResult = await env.CONFIGS.list(listOpts);
+
+      // Old per-day keys only -- the running total (:alltime) and the
+      // new blob format itself (:days) share this same prefix and would
+      // otherwise get misread as if "alltime" or "days" were date strings.
+      const dayKeyPattern = /^\d{4}-\d{2}-\d{2}$/;
+      const oldDayKeys = listResult.keys.filter((k) => {
+        const rest = k.name.slice(prefix.length);
+        const lastColon = rest.lastIndexOf(":");
+        if (lastColon === -1) return false;
+        return dayKeyPattern.test(rest.slice(lastColon + 1));
+      });
+
+      // Group by id first so a title/query with many old day-keys in this
+      // batch costs one blob read-modify-write, not one per day.
+      const byId = new Map(); // id -> { day: count, ... } (partial, this batch only)
+      oldDayKeys.forEach((k) => {
+        const rest = k.name.slice(prefix.length);
+        const lastColon = rest.lastIndexOf(":");
+        const id = rest.slice(0, lastColon);
+        const day = rest.slice(lastColon + 1);
+        if (!byId.has(id)) byId.set(id, {});
+        byId.get(id)[day] = k.name; // stash the real key name for the read pass below
+      });
+
+      let keysMigratedThisCall = 0;
+      await Promise.all(
+        [...byId.entries()].map(async ([id, dayKeyNames]) => {
+          const days = Object.keys(dayKeyNames);
+          const [oldValues, existingBlobRaw] = await Promise.all([
+            Promise.all(days.map((d) => env.CONFIGS.get(dayKeyNames[d]))),
+            env.CONFIGS.get(`${prefix}${id}:days`),
+          ]);
+          let blob;
+          try {
+            blob = existingBlobRaw ? JSON.parse(existingBlobRaw) : {};
+          } catch {
+            blob = {};
+          }
+          days.forEach((d, i) => {
+            const oldCount = parseInt(oldValues[i], 10) || 0;
+            if (oldCount <= 0) return;
+            // Additive, not overwrite -- if live tracking already wrote
+            // something for this exact id+day since the format switch,
+            // that count is just as real as the migrated one.
+            blob[d] = (blob[d] || 0) + oldCount;
+          });
+          const dayKeysSorted = Object.keys(blob).sort();
+          if (dayKeysSorted.length > 95) {
+            dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
+          }
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
+          keysMigratedThisCall += days.length;
+        })
+      );
+
+      const prefixDone = listResult.list_complete || !listResult.cursor;
+      const nextState = prefixDone
+        ? { prefixIndex: state.prefixIndex + 1, cursor: null }
+        : { prefixIndex: state.prefixIndex, cursor: listResult.cursor };
+      await env.CONFIGS.put("migratedaycounts:state", JSON.stringify(nextState));
+
+      const done = nextState.prefixIndex >= PREFIXES.length;
+      return json({ ok: true, done, keysMigratedThisCall, prefix, prefixDone });
+    }
+
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
     // newest first. Reads up to 300 entries; feedback keys already sort
     // chronologically as plain strings (see /api/feedback's own comment),
@@ -40494,10 +43193,16 @@ self.addEventListener('fetch', e => {
       }
 
       if (!Array.isArray(entry.messages) || !entry.messages.length) {
+        // sender here mirrors renderFeedbackList's own fallback logic
+        // (isSelfLogged ? 'admin' : 'user') -- this used to be hardcoded
+        // to "user" unconditionally, which meant a self-logged "Log
+        // something yourself" entry's original message would flip to
+        // showing as if a user had written it the moment it got its
+        // first reply, instead of staying attributed to the admin.
         entry.messages = [{
           id: `msg_init`,
-          sender: "user",
-          senderName: entry.creatorName || "User",
+          sender: entry.creatorName === "admin" ? "admin" : "user",
+          senderName: entry.creatorName === "admin" ? "Admin" : (entry.creatorName || "User"),
           text: entry.message || "(Initial message)",
           timestamp: entry.createdAt || Date.now()
         }];
@@ -40582,7 +43287,21 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Could not read that feedback entry." }, 500);
       }
       if (typeof body.message === "string" && body.message.trim()) {
-        entry.message = body.message.trim().slice(0, 4000);
+        const trimmedMessage = body.message.trim().slice(0, 4000);
+        entry.message = trimmedMessage;
+        // Once a reply has landed on this entry (self-logged or not), the
+        // dashboard list renders from entry.messages[...] instead of the
+        // top-level entry.message that this edit form actually posts (see
+        // renderFeedbackList's own fallback: it only synthesizes a single
+        // message from entry.message when entry.messages is empty).
+        // Editing only entry.message left it invisible on any entry that
+        // already had a thread -- the save genuinely succeeded, nothing
+        // in the list ever reflected it. Keeping the first message in the
+        // thread (the original log/report) in sync fixes that regardless
+        // of which shape a given entry happens to be in.
+        if (Array.isArray(entry.messages) && entry.messages.length && entry.messages[0]) {
+          entry.messages[0].text = trimmedMessage;
+        }
       }
       if (typeof body.category === "string" && ["bug", "improvement", "idea", "other"].includes(body.category.trim())) {
         entry.category = body.category.trim();

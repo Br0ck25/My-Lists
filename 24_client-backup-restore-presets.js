@@ -772,10 +772,23 @@ async function generate() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        entries, mdblistKey: keys.mdblistKey, mdblistAccessToken: keys.mdblistAccessToken, traktKey: keys.traktKey, traktUsername: keys.traktUsername, traktAccessToken: keys.traktAccessToken,
-        simklKey: keys.simklKey, simklAccessToken: keys.simklAccessToken,
-        track: keys.track, trackCreatorName: keys.trackCreatorName, trackCreatorKey: keys.trackCreatorKey,
-        shuffleShelves: keys.shuffleShelves, shuffleItems: keys.shuffleItems,
+        entries,
+        tmdbKey: keys.tmdbKey,
+        mdblistKey: keys.mdblistKey,
+        mdblistAccessToken: keys.mdblistAccessToken,
+        traktKey: keys.traktKey,
+        traktUsername: keys.traktUsername,
+        traktAccessToken: keys.traktAccessToken,
+        simklKey: keys.simklKey,
+        simklAccessToken: keys.simklAccessToken,
+        simklUsername: keys.simklUsername,
+        track: keys.track,
+        trackCreatorName: keys.trackCreatorName,
+        trackCreatorKey: keys.trackCreatorKey,
+        shuffleShelves: keys.shuffleShelves,
+        shuffleItems: keys.shuffleItems,
+        region: keys.region,
+        hideNonDigitalReleases: keys.hideNonDigitalReleases,
       }),
     });
     const data = await res.json();
@@ -873,6 +886,36 @@ if (serverEntries.length) {
   if (document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = serverShuffleItems;
   }
+  // Region has no equivalent "source of truth from the URL" concept the
+  // way entries/shuffle do here -- the region <select>'s server-rendered
+  // selected value only reflects whatever was in the saved config the
+  // *last* time this install link's config was generated/regenerated
+  // (see the note on stale install links elsewhere in this codebase:
+  // redeploying or changing a setting doesn't retroactively touch an
+  // already-generated link's stored config). If the person picked a
+  // region in this same browser more recently than that, localStorage
+  // has the truer answer -- apply it over the server-rendered default so
+  // the dropdown at least reflects their last real choice, even though
+  // making that choice actually take effect for catalog fetching still
+  // needs a Save/Update to regenerate the link, same as any other change.
+  const savedRegionForConfigView = (function() {
+    try { return localStorage.getItem('myListAddon:region'); } catch (e) { return null; }
+  })();
+  if (savedRegionForConfigView) {
+    const regionEl = document.getElementById('regionSelect');
+    if (regionEl) regionEl.value = savedRegionForConfigView;
+  }
+  // hideNonDigitalReleases: same localStorage-override pattern as region
+  // above -- if the person toggled this checkbox in this browser more
+  // recently than the last time they regenerated their install link,
+  // honour their local choice over the server-rendered default.
+  const savedHideNonDigital = (function() {
+    try { return localStorage.getItem('myListAddon:hideNonDigitalReleases'); } catch (e) { return null; }
+  })();
+  if (savedHideNonDigital !== null) {
+    const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+    if (cb) cb.checked = savedHideNonDigital === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved.
@@ -885,6 +928,9 @@ if (serverEntries.length) {
   }
   if (saved && document.getElementById('shuffleItemsCheckbox')) {
     document.getElementById('shuffleItemsCheckbox').checked = !!saved.shuffleItems;
+  }
+  if (saved && saved.keys && document.getElementById('hideNonDigitalReleasesCheckbox')) {
+    document.getElementById('hideNonDigitalReleasesCheckbox').checked = !!saved.keys.hideNonDigitalReleases;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
@@ -918,6 +964,19 @@ if (serverEntries.length) {
   }
   if (!simklDisc && saved && saved.keys && saved.keys.simklUsername) {
     simklUsername = saved.keys.simklUsername;
+  }
+  // Region has no separate localStorage:XDisconnected flag to check
+  // against (it's not an external account), and it's saved directly under
+  // 'myListAddon:region' by the <select>'s own onchange handler as well as
+  // inside the collectKeys() blob saveState() writes on every change --
+  // check both, since a person who never touched the dropdown after this
+  // feature shipped will have it in neither, and that's fine (this whole
+  // block only runs on a fresh visit with no config in the URL, so falling
+  // through to the server-rendered default of "US" is correct for them).
+  const savedRegion = (saved && saved.keys && saved.keys.region) || localStorage.getItem('myListAddon:region');
+  if (savedRegion) {
+    const el = document.getElementById('regionSelect');
+    if (el) el.value = savedRegion;
   }
 }
 if (localStorage.getItem('myListAddon:mdblistDisconnected') === 'true') {
@@ -986,6 +1045,7 @@ scheduleMyTraktListsRefresh();
 renderCreatorProfileBar();
 renderAccountKeySection();
 if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();

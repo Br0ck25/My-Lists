@@ -21,6 +21,8 @@ async function resolveConfig(configParam, env) {
           trackCreatorKey: parsed.trackCreatorKey || "",
           shuffleShelves: !!parsed.shuffleShelves,
           shuffleItems: !!parsed.shuffleItems,
+          region: parsed.region || "US",
+          hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
         };
       } catch {
         // fall through to legacy decode below

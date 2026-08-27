@@ -69,7 +69,9 @@ function renderMyMdblistLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isHistory = l.slug === 'history' || l.url === 'mdblist:history' || String(l.url || '').indexOf('mdblist:history') !== -1 || String(l.url || '').indexOf('/history/') !== -1;
     const isWatchlist = l.slug === 'watchlist' || l.url === 'mdblist:watchlist';
     const isSingleType = !isHistory && !isWatchlist && (l.contentType === 'movie' || l.contentType === 'series');
@@ -119,7 +121,8 @@ function renderMyMdblistLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -191,7 +194,9 @@ function renderMyTraktLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
     const type = l.contentType === 'series' ? 'series' : 'movie';
     const typeLabel = l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed');
@@ -231,7 +236,8 @@ function renderMyTraktLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -720,7 +726,9 @@ function renderMyPrivateTraktLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const isHistory = l.url === 'trakt:history' || l.slug === 'history';
     const isWatchlist = l.url === 'trakt:watchlist' || l.slug === 'watchlist';
     const isSingleType = (l.contentType === 'movie' || l.contentType === 'series');
@@ -767,7 +775,8 @@ function renderMyPrivateTraktLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
 }
 
@@ -1025,7 +1034,9 @@ function renderMyTmdbLists(lists) {
     });
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const listIdStr = String(l.id || '');
     const listUrlStr = String(l.url || '');
     const isWatchlist = listIdStr.includes('watchlist') || listUrlStr.includes('watchlist');
@@ -1101,7 +1112,8 @@ function renderMyTmdbLists(lists) {
     '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
@@ -1136,6 +1148,7 @@ function disconnectSimkl() {
   try { window.simklAccessToken = ''; } catch (e) {}
   simklUsername = '';
   try { window.simklUsername = ''; } catch (e) {}
+  window._mySimklLists = [];
   try {
     localStorage.removeItem('myListAddon:simklAccessToken');
     localStorage.removeItem('myListAddon:simklUsername');
@@ -1296,8 +1309,86 @@ async function runMySimklLists() {
     }
     renderMySimklLists(data.lists);
   } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Simkl lists.</p>';
+    console.error('Simkl lists load error:', e);
+    box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml((e && e.message) ? e.message : 'Network error loading your Simkl lists.') + '</p>';
   }
+}
+
+let _simklAiringNextEnriching = false;
+let _simklAiringNextEnrichedAt = 0;
+async function enrichSimklAiringNextDates(list) {
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  if (_simklAiringNextEnriching) return;
+  if (_simklAiringNextEnrichedAt && (Date.now() - _simklAiringNextEnrichedAt < 300000)) return;
+  _simklAiringNextEnriching = true;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  try {
+    const rawCandidates = (window._simklRawAiringCandidates && window._simklRawAiringCandidates.length)
+      ? window._simklRawAiringCandidates
+      : (list.items || []);
+    const candidates = rawCandidates.slice(0, 80);
+    const enriched = [];
+    const concurrency = 5;
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const chunk = candidates.slice(i, i + concurrency);
+      await Promise.all(chunk.map(async (it) => {
+        try {
+          const showId = it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '');
+          if (!showId) return;
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey));
+          const data = await res.json();
+          const d = data && data.ok ? data.details : null;
+          // Only include shows with a real future air date (excludes ended shows with no upcoming episode)
+          if (d && d.nextEpisodeAirDate) {
+            it.airDate = d.nextEpisodeAirDate;
+            it.seasonNum = d.nextEpisodeSeasonNumber;
+            it.episodeNum = d.nextEpisodeNumber;
+            it.isSeasonPremiere = d.nextEpisodeNumber === 1;
+            it.isUnaired = true;
+            enriched.push(it);
+          }
+          // Shows with no nextEpisodeAirDate are silently dropped (ended, no renewal announced)
+        } catch (e) {}
+      }));
+    }
+    if (enriched.length) {
+      enriched.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+      list.items = enriched;
+      list.itemCount = enriched.length;
+      try {
+        localStorage.setItem('myListAddon:simklAiringNextCache', JSON.stringify(enriched));
+      } catch (e) {}
+      _simklAiringNextEnrichedAt = Date.now();
+      renderMySimklLists(window._mySimklLists);
+    }
+  } finally {
+    _simklAiringNextEnriching = false;
+  }
+}
+
+function openSimklAiringNextDetailsPage() {
+  const list = (window._mySimklLists || []).find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (!list) return;
+  const filtered = (list.items || []).filter((it) => it && it.airDate);
+  const sample = filtered.map((it) => {
+    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0');
+    return {
+      id: it.id,
+      type: 'series',
+      name: it.name,
+      subtitle: dateLabel ? (seasonEp + ' \u00b7 ' + dateLabel) : seasonEp,
+      poster: it.poster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: it.isSeasonPremiere,
+      hideDateBadge: !it.isSeasonPremiere,
+    };
+  });
+  openListDetailsPage('Simkl Airing Next', 'series', 'simkl:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
 }
 
 function renderMySimklLists(lists) {
@@ -1307,6 +1398,35 @@ function renderMySimklLists(lists) {
   if (!lists || !lists.length) {
     box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No items found on your Simkl account.</small></p>';
     return;
+  }
+
+  const airingNextList = lists.find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (airingNextList && Array.isArray(airingNextList.items) && airingNextList.items.length) {
+    if (!window._simklRawAiringCandidates || !window._simklRawAiringCandidates.length) {
+      window._simklRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
+    }
+    if (!airingNextList._cachedApplied) {
+      try {
+        const cached = JSON.parse(localStorage.getItem('myListAddon:simklAiringNextCache') || '[]');
+        if (Array.isArray(cached) && cached.length) {
+          const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
+          airingNextList.items.forEach((it) => {
+            const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            if (c) {
+              it.airDate = c.airDate;
+              it.seasonNum = c.seasonNum;
+              it.episodeNum = c.episodeNum;
+              it.isSeasonPremiere = c.isSeasonPremiere;
+              it.isUnaired = true;
+            }
+          });
+        }
+      } catch (e) {}
+      airingNextList._cachedApplied = true;
+    }
+    if (!_simklAiringNextEnriching && (!_simklAiringNextEnrichedAt || Date.now() - _simklAiringNextEnrichedAt >= 120000)) {
+      enrichSimklAiringNextDates(airingNextList).catch(() => {});
+    }
   }
 
   const alreadyAdded = new Set();
@@ -1322,20 +1442,29 @@ function renderMySimklLists(lists) {
     if (l && l.url) window._simklListsMap[l.url] = l;
   });
 
-  const cardsHtml = lists.map((l) => {
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
     const type = l.type === 'series' ? 'series' : 'movie';
     const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const totalCount = l.itemCount || (l.items || []).length;
-    const added = alreadyAdded.has(l.url + '|' + type);
+    const isAiringNext = l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'));
+
+    let filteredItems = l.items || [];
+    if (isAiringNext) {
+      filteredItems = filteredItems.filter((it) => it && it.airDate);
+    }
+
+    const totalCount = isAiringNext ? filteredItems.length : (l.itemCount || (l.items || []).length);
+    const added = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(l.url, type) || isListAddedToConfig(null, type, l.url)) : alreadyAdded.has(l.url + '|' + type);
 
     const isCompleted = (l.name && l.name.toLowerCase().includes('completed')) || (l.url && l.url.includes(':completed')) || l.statusKey === 'completed';
     const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
     const markWatchedBtn = isCompleted
       ? '<button type="button" class="lc-btn secondary" data-url="' + escapeAttr(l.url) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(type) + '" onclick="markSimklListAllWatched(this)">Mark all as Watched</button>'
       : '';
-    const addBtn = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+    const addBtn = '<button type="button" class="lc-btn ' + (added ? 'secondary is-added' : 'primary') + ' myListAddBtn" ' + (added ? 'style="color:var(--danger);"' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? 'Remove' : '+ Add') + '</button>';
 
-    const previewItems = (l.items || []).slice(0, 9);
+    const previewItems = filteredItems.slice(0, 9);
     let posterThumbs = '';
     if (previewItems.length) {
       posterThumbs = '<div class="list-card-posters poster-preview-static">' +
@@ -1343,31 +1472,46 @@ function renderMySimklLists(lists) {
           const isMobileEnd = (i === 2 && previewItems.length > 3);
           const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
           let overlays = '';
-          if (isMobileEnd) {
-            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-          }
-          if (isDesktopEnd) {
-            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          if (isAiringNext) {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+          } else {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
           }
           const simklStatus = l.statusKey || (l.url ? l.url.split(':')[3] : 'plantowatch');
-          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const removeBtn = isAiringNext
+            ? ''
+            : '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const isPremiere = it.isSeasonPremiere || it.episodeNum === 1;
+          const premiereBadge = isPremiere ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>' : '';
+          const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : (it.airDate || '');
+          const seasonEp = it.seasonNum != null && it.episodeNum != null
+            ? ('S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') + (dateLabel ? ' \u00b7 ' + dateLabel : ''))
+            : (dateLabel ? dateLabel : (it.year ? String(it.year) : ''));
+
           return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
             '<div class="list-card-mini-poster-img-wrap">' +
               (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              premiereBadge +
               removeBtn +
               overlays +
             '</div>' +
             '<div class="list-card-mini-poster-name">' + escapeHtml(it.name || '') + '</div>' +
-            (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+            (seasonEp ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(seasonEp) + '</div>' : '') +
           '</div>';
         }).join('') +
       '</div>';
+    } else if (isAiringNext) {
+      posterThumbs = '<p style="margin-top:8px; color:var(--muted);"><small>Nothing scheduled yet.</small></p>';
     }
+
+    const titleClick = isAiringNext ? 'onclick="openSimklAiringNextDetailsPage()"' : '';
 
     return '<div class="list-card" data-list-type="' + type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-title" ' + titleClick + ' style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + typeLabel + '</span>' +
             '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
@@ -1381,19 +1525,28 @@ function renderMySimklLists(lists) {
       '</div>' +
       posterThumbs +
     '</div>';
-      posterThumbs +
-    '</div>';
   }).join('');
 
-  box.innerHTML = cardsHtml;
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 
 document.getElementById('mySimklListsResult')?.addEventListener('click', (e) => {
   const addBtn = e.target.closest('.myListAddBtn');
-  if (addBtn && !addBtn.disabled) {
-    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
-    addBtn.textContent = 'Added \u2713';
-    addBtn.disabled = true;
+  if (addBtn) {
+    const isAdded = addBtn.classList.contains('is-added');
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(addBtn.dataset.url, addBtn.dataset.type);
+        removeListFromConfig(null, addBtn.dataset.type, addBtn.dataset.url);
+      }
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Removed "' + (addBtn.dataset.name || 'List') + '" from your Catalogs.');
+    } else {
+      addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "' + (addBtn.dataset.name || 'List') + '" to your Catalogs.');
+    }
     return;
   }
   const copyBtn = e.target.closest('.myListCopyToCustomBtn');

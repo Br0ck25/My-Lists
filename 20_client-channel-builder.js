@@ -4469,6 +4469,358 @@ const TV_CROSSOVER_EVENTS = [
         "poster": "https://images.metahub.space/poster/medium/tt1674782/img"
       }
     ]
+  },
+  {
+    "id": "hawaii_five_0_magnum_pi_crossover_2020",
+    "name": "Hawaii Five-0 & Magnum P.I. Crossover (2020)",
+    "franchise": "Lenkov-verse",
+    "category": "tvuniverses",
+    "description": "2-part crossover: when a list of undercover CIA agents is stolen, Steve McGarrett and Five-0 enlist Magnum, Higgins, Rick, and TC to get it back and protect national security.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Hawaii Five-0",
+        "season": 10,
+        "episode": 12,
+        "title": "Ihea 'oe i ka wa a ka ua e loku ana?",
+        "tmdbId": 32798,
+        "imdbId": "tt1600194",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1600194/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Magnum P.I.",
+        "season": 2,
+        "episode": 12,
+        "title": "Desperate Measures",
+        "tmdbId": 79593,
+        "imdbId": "tt7942796",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7942796/img"
+      }
+    ]
+  },
+  {
+    "id": "911_lone_star_hold_the_line_2021",
+    "name": "9-1-1 & 9-1-1: Lone Star: Hold the Line (2021)",
+    "franchise": "9-1-1 Universe",
+    "category": "tvuniverses",
+    "description": "2-part crossover: Buck, Hen, and Eddie of Station 118 travel to Austin to help Station 126 battle a massive wildfire sparked by a volcanic eruption.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "9-1-1",
+        "season": 4,
+        "episode": 3,
+        "title": "Future Tense",
+        "tmdbId": 75219,
+        "imdbId": "tt7235466",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7235466/img"
+      },
+      {
+        "type": "episode",
+        "showName": "9-1-1: Lone Star",
+        "season": 2,
+        "episode": 3,
+        "title": "Hold the Line",
+        "tmdbId": 89393,
+        "imdbId": "tt10323338",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10323338/img"
+      }
+    ]
+  },
+  {
+    "id": "one_chicago_comic_perversion_2014",
+    "name": "One Chicago: Comic Perversion / Conventions (2014)",
+    "franchise": "One Chicago",
+    "category": "tvuniverses",
+    "description": "The very first One Chicago crossover, and Chicago P.D.'s first with Law & Order: SVU: Erin Lindsay travels to New York seeking Olivia Benson's help on a case involving a string of similar sexual assault murders in Chicago.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Law & Order: Special Victims Unit",
+        "season": 15,
+        "episode": 15,
+        "title": "Comic Perversion",
+        "tmdbId": 2734,
+        "imdbId": "tt0203259",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0203259/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Chicago P.D.",
+        "season": 1,
+        "episode": 6,
+        "title": "Conventions",
+        "tmdbId": 58841,
+        "imdbId": "tt2805096",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2805096/img"
+      }
+    ]
+  },
+  {
+    "id": "buffy_angel_pangs_iwry_1999",
+    "name": "Buffy the Vampire Slayer & Angel: Pangs / I Will Remember You (1999)",
+    "franchise": "Buffyverse",
+    "category": "tvuniverses",
+    "description": "Angel secretly returns to Sunnydale to protect Buffy from a vengeful spirit on Thanksgiving, then reveals himself in Los Angeles the next day -- leading to a Mohra demon fight that briefly makes him human for one day with Buffy.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Buffy the Vampire Slayer",
+        "season": 4,
+        "episode": 8,
+        "title": "Pangs",
+        "tmdbId": 95,
+        "imdbId": "tt0118276",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0118276/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Angel",
+        "season": 1,
+        "episode": 8,
+        "title": "I Will Remember You",
+        "tmdbId": 2426,
+        "imdbId": "tt0162065",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0162065/img"
+      }
+    ]
+  },
+  {
+    "id": "buffy_angel_fool_for_love_darla_2000",
+    "name": "Buffy the Vampire Slayer & Angel: Fool for Love / Darla (2000)",
+    "franchise": "Buffyverse",
+    "category": "tvuniverses",
+    "description": "Companion episodes airing the same night: Spike recounts his vampire origins and how he killed two Slayers to Buffy, while Angel relives his own dangerous history with Darla -- both episodes share overlapping flashbacks.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Buffy the Vampire Slayer",
+        "season": 5,
+        "episode": 7,
+        "title": "Fool for Love",
+        "tmdbId": 95,
+        "imdbId": "tt0118276",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0118276/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Angel",
+        "season": 2,
+        "episode": 7,
+        "title": "Darla",
+        "tmdbId": 2426,
+        "imdbId": "tt0162065",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0162065/img"
+      }
+    ]
+  },
+  {
+    "id": "greys_private_practice_beat_your_heart_out_2009",
+    "name": "Grey's Anatomy & Private Practice: Beat Your Heart Out / Acceptance (2009)",
+    "franchise": "Grey's Anatomy Universe",
+    "category": "tvuniverses",
+    "description": "The biggest Grey's/Private Practice crossover event: Addison's brother Archer suffers a life-threatening seizure in LA, pulling in Derek's help from Seattle, while Grey's introduces Owen Hunt and the first meeting of Callie and Arizona.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Grey's Anatomy",
+        "season": 5,
+        "episode": 14,
+        "title": "Beat Your Heart Out",
+        "tmdbId": 1416,
+        "imdbId": "tt0413573",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0413573/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Private Practice",
+        "season": 2,
+        "episode": 15,
+        "title": "Acceptance",
+        "tmdbId": 3172,
+        "imdbId": "tt0972412",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0972412/img"
+      }
+    ]
+  },
+  {
+    "id": "tvd_originals_moonlight_streetcar_2016",
+    "name": "The Vampire Diaries & The Originals: Moonlight on the Bayou / A Streetcar Named Desire (2016)",
+    "franchise": "The Vampire Diaries Universe",
+    "category": "tvuniverses",
+    "description": "The CW's special 2-hour crossover event: Stefan flees to New Orleans to escape a vampire hunter and seek Valerie's help, pulling the Salvatores directly into the Mikaelsons' world.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "The Vampire Diaries",
+        "season": 7,
+        "episode": 14,
+        "title": "Moonlight on the Bayou",
+        "tmdbId": 18165,
+        "imdbId": "tt1405406",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1405406/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Originals",
+        "season": 3,
+        "episode": 14,
+        "title": "A Streetcar Named Desire",
+        "tmdbId": 46896,
+        "imdbId": "tt2632424",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2632424/img"
+      }
+    ]
+  },
+  {
+    "id": "csi_felony_flight_manhattan_manhunt_2005",
+    "name": "CSI: Miami & CSI: NY: Felony Flight / Manhattan Manhunt (2005)",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "A serial killer sabotages his own prisoner transport flight from New York to Miami, escapes, and goes on a killing spree -- pulling New York's Mac Taylor down to Miami, then Miami's Horatio Caine up to New York, to catch him.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "CSI: Miami",
+        "season": 4,
+        "episode": 7,
+        "title": "Felony Flight",
+        "tmdbId": 1620,
+        "imdbId": "tt0313043",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0313043/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: NY",
+        "season": 2,
+        "episode": 7,
+        "title": "Manhattan Manhunt",
+        "tmdbId": 2458,
+        "imdbId": "tt0395843",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0395843/img"
+      }
+    ]
+  },
+  {
+    "id": "csi_trilogy_2009",
+    "name": "CSI: Trilogy (2009)",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "The only 3-way crossover in CSI history, spanning all three original shows on consecutive nights: Miami, New York, and the flagship Las Vegas team all converge on a single case.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "CSI: Miami",
+        "season": 8,
+        "episode": 7,
+        "title": "Bone Voyage",
+        "tmdbId": 1620,
+        "imdbId": "tt0313043",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0313043/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: NY",
+        "season": 6,
+        "episode": 7,
+        "title": "Hammer Down",
+        "tmdbId": 2458,
+        "imdbId": "tt0395843",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0395843/img"
+      },
+      {
+        "type": "episode",
+        "showName": "CSI: Crime Scene Investigation",
+        "season": 10,
+        "episode": 7,
+        "title": "The Lost Girls",
+        "tmdbId": 1431,
+        "imdbId": "tt0247082",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0247082/img"
+      }
+    ]
+  },
+  {
+    "id": "empire_star_crossover_2017",
+    "name": "Empire & Star Crossover (2017)",
+    "franchise": "Lee Daniels Fox Universe",
+    "category": "tvuniverses",
+    "description": "Fox's two Lee Daniels musical dramas collide for their season premieres: Carlotta comes face-to-face with the Lyon family as Jamal Lyon crosses over to Star and Carlotta crosses over to Empire.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Empire",
+        "season": 4,
+        "episode": 1,
+        "title": "Noble Memory",
+        "tmdbId": 61733,
+        "imdbId": "tt3228904",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3228904/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Star",
+        "season": 2,
+        "episode": 1,
+        "title": "The Winner Takes It All",
+        "tmdbId": 68780,
+        "imdbId": "tt4941240",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4941240/img"
+      }
+    ]
+  },
+  {
+    "id": "bones_sleepy_hollow_crossover_2015",
+    "name": "Bones & Sleepy Hollow Crossover (2015)",
+    "franchise": "Fox Halloween Crossover",
+    "category": "tvuniverses",
+    "description": "One of TV's oddest crossovers: forensic anthropologist Temperance Brennan and FBI Agent Booth team up with time-displaced Ichabod Crane and Agent Abbie Mills to identify a 200-year-old headless corpse, before the case turns fully supernatural on the Sleepy Hollow side.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Bones",
+        "season": 11,
+        "episode": 5,
+        "title": "The Resurrection in the Remains",
+        "tmdbId": 1911,
+        "imdbId": "tt0460627",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0460627/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Sleepy Hollow",
+        "season": 3,
+        "episode": 5,
+        "title": "Dead Men Tell No Tales",
+        "tmdbId": 50825,
+        "imdbId": "tt2647544",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2647544/img"
+      }
+    ]
   }
 ];
 
@@ -5134,6 +5486,22 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   if (!container) return;
 
   const filtered = TV_CROSSOVER_EVENTS.filter((ev) => {
+    // Pure single-episode crossovers (NCIS, One Chicago, Arrowverse's
+    // individual crossover events, FBI, etc.) are meant to be discovered
+    // reactively -- add a relevant show to a channel and the "Crossover
+    // Event Detected" banner in the Channel Builder offers just its
+    // crossover episodes (see renderChannelCrossoverSuggestions, which
+    // still considers every event here regardless of this filter).
+    // They're deliberately left out of this browsable grid: clicking into
+    // one only ever lands on the parent show's generic details page (no
+    // episode-level page exists anywhere in this addon), so as a
+    // standalone browse card they don't offer anything a search for the
+    // show itself wouldn't -- unlike a real saga/universe entry, which is
+    // exactly the kind of multi-season, multi-show marathon a browse grid
+    // is for. Every episode-only crossover has episodes entirely of
+    // type "episode"; every saga/universe/movie-bridge entry that
+    // belongs here mixes in at least one "season"/"show"/"movie" part.
+    if (ev.episodes.every((ep) => ep.type === 'episode')) return false;
     if (category === 'all') return true;
     const cats = getStorylineCategories(ev);
     return cats.includes(category);
@@ -5433,9 +5801,22 @@ async function createInstantStorylineChannel(eventId, btn) {
     if (typeof saveLocalChannelsMap === 'function') {
       saveLocalChannelsMap(map);
     }
-    if (typeof removeListFromConfig === 'function') {
-      removeListFromConfig(null, null, chId);
-    }
+    // removeListFromConfig doesn't know how to match a channel:v1:{...}
+    // row at all -- it only recognizes custom:/autotrack:/customlist:v1:
+    // URL schemes (see its own slug-matching logic), so calling it here
+    // never actually found or removed this channel's row. The channel's
+    // own entry in localChannels storage above was correctly cleaned up,
+    // but the row stayed visible in the catalog/Live Preview whenever one
+    // existed -- this is the same substring-match approach
+    // deleteLocalChannel already uses successfully for the same URL
+    // scheme (chId is embedded in the row's channel:v1: JSON payload).
+    [...document.querySelectorAll('#lists .entry')].forEach((row) => {
+      const urlInputs = [...row.querySelectorAll('.url')];
+      urlInputs.forEach((u) => {
+        if (u.value.includes(chId)) row.remove();
+      });
+    });
+    if (typeof saveState === 'function') saveState();
     if (btn) {
       btn.textContent = '+ Add';
       btn.classList.remove('secondary', 'is-added');
@@ -5567,6 +5948,9 @@ async function loadStorylineToDraft(eventId, btn) {
 }
 
 function switchChannelsSubmenu(name, btn) {
+  try {
+    document.documentElement.removeAttribute('data-initial-channels-sub');
+  } catch (e) {}
   if (btn) {
     document.querySelectorAll('#channelsSubnavBar .subnav-pill').forEach((p) => {
       p.classList.remove('active');
@@ -5721,7 +6105,26 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
   
-  const sample = (channel.items || []).map((it, idx) => {
+  // A merged channel (see mergeChannelsIntoRow/loadLocalMergedChannels)
+  // stores channelIds -- references to the channels that were combined --
+  // instead of its own flat items array. Reading channel.items directly
+  // for one of these always came back empty, so "See All" on a merged
+  // channel showed zero posters even though the underlying channels
+  // themselves had plenty. Resolve items by concatenating each referenced
+  // channel's own items when channelIds is what this channel actually has.
+  let resolvedItems = channel.items;
+  if ((!Array.isArray(resolvedItems) || !resolvedItems.length) && Array.isArray(channel.channelIds) && channel.channelIds.length) {
+    const channelsMap = loadLocalChannels();
+    resolvedItems = [];
+    channel.channelIds.forEach((chId) => {
+      const sourceChannel = channelsMap[chId];
+      if (sourceChannel && Array.isArray(sourceChannel.items)) {
+        resolvedItems.push(...sourceChannel.items);
+      }
+    });
+  }
+  
+  const sample = (resolvedItems || []).map((it, idx) => {
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -5769,7 +6172,15 @@ function openChannelDetailsPage(channelIdOrDivId) {
 
     return {
       id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
-      type: 'series',
+      // Was hardcoded to 'series' unconditionally for every item -- fine
+      // for a channel's actual episodes, but wrong for movie-saga channels
+      // (MCU, Star Wars, etc.) where every item is a movie: clicking one
+      // opened the details modal thinking it was a whole show, showing
+      // "Mark Whole Show Watched" instead of "Mark as Watched". it.kind is
+      // set to 'movie' for these by fetchStorylineOrderedItems when the
+      // channel was first built (see its own comment there for why 'kind'
+      // rather than 'type' is the field channel-draft items use).
+      type: (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series',
       name: displayTitle,
       subtitle: epName,
       title: fullTitle,
@@ -5867,8 +6278,23 @@ function renderMyCreatedChannelsList() {
         ? '<img src="' + escapeAttr(p) + '" alt="" loading="lazy">'
         : '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:0.65rem;text-align:center;padding:4px;">No poster</div>';
       
+      // Each tile opens that item's own details -- was previously
+      // unclickable itself (only the shared container-level onclick below
+      // fired, always sending every click to "See All" regardless of
+      // which poster was actually tapped). "See All" is still one tap
+      // away via the count overlay ("N ›") already rendered above, so
+      // this doesn't remove that path, just stops it from being the only
+      // one. Mirrors the same movie/series type fix as
+      // openChannelDetailsPage just above (it.kind === 'movie', not
+      // it.type, is what fetchStorylineOrderedItems actually sets).
+      const itemId = it.imdbId || it.id || '';
+      const itemType = (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series';
+      const posterClickAttr = itemId
+        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
+        : '';
+      
       return '<div class="list-card-mini-poster-tile">' +
-        '<div class="list-card-mini-poster-img-wrap">' +
+        '<div class="list-card-mini-poster-img-wrap"' + posterClickAttr + '>' +
           imgHtml +
           overlays +
         '</div>' +
@@ -5895,7 +6321,7 @@ function renderMyCreatedChannelsList() {
           addBtnHtml +
         '</div>' +
       '</div>' +
-      (posterThumbs ? '<div class="list-card-posters poster-preview-static" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + posterThumbs + '</div>' : '') +
+      (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
 }
