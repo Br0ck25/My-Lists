@@ -634,6 +634,8 @@ async function refreshTrackPlaybackStatus() {
     }
     const when = new Date(data.lastPingAt).toLocaleString();
     const serverLabel = data.lastServer ? '<strong>' + escapeHtml(data.lastServer) + '</strong>' : '<strong>In-App Streaming Player</strong>';
+    const rawMatched = data.matched || data.lastPingId || 'OK';
+    const displayMatched = rawMatched.replace(/^(yes|no|error)\b/i, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
     statusBox.innerHTML =
       '<div style="padding:10px 12px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.25); border-radius:8px; font-size:0.84rem;">' +
         '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
@@ -641,7 +643,7 @@ async function refreshTrackPlaybackStatus() {
           '<span style="color:var(--muted); font-size:0.78rem;">' + escapeHtml(when) + '</span>' +
         '</div>' +
         '<div style="color:var(--text);">' +
-          'Source: ' + serverLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(data.matched || data.lastPingId || 'OK') + '</code>' +
+          'Source: ' + serverLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(displayMatched) + '</code>' +
         '</div>' +
       '</div>';
   } catch (e) {
@@ -956,7 +958,7 @@ let creatorSyncSaveTimer = null;
 // typing into a preset name can all fire this repeatedly in quick
 // succession, and there's no need to push a request for every single one
 // of those when only the last matters.
-function scheduleCreatorSyncSave() {
+function scheduleCreatorSyncSave(opts) {
   if (!activeCreator) return;
   if (creatorSyncSaveTimer) clearTimeout(creatorSyncSaveTimer);
   creatorSyncSaveTimer = setTimeout(pushCreatorSync, 1200);
@@ -965,7 +967,7 @@ function scheduleCreatorSyncSave() {
   // that already calls this general scheduler also gets tracking synced
   // in lockstep, rather than auditing every individual call site for
   // whether it happens to touch tracking data too.
-  scheduleTrackingSync();
+  scheduleTrackingSync(opts);
 }
 
 // Debounced sibling of scheduleCreatorSyncSave, just for presets -- call
@@ -1024,10 +1026,11 @@ async function pushChannelsSync() {
 // catalog rows showing "No items found" even though the browser's own
 // local copy looked complete.
 let trackingSyncTimer = null;
-function scheduleTrackingSync() {
+function scheduleTrackingSync(opts) {
   if (!activeCreator) return;
   if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
-  trackingSyncTimer = setTimeout(pushTrackingSync, 300);
+  const intentionalRemoval = !!(opts && opts.intentionalRemoval);
+  trackingSyncTimer = setTimeout(() => pushTrackingSync({ intentionalRemoval }), 300);
 }
 
 async function pushCreatorSync() {
@@ -1068,7 +1071,7 @@ async function pushCreatorSync() {
 // Pushes Watch History/Continue Watching tracking data straight to the
 // account's dedicated tracking record (see /api/creator/sync/save-
 // tracking) -- the ONLY path this data travels to the server through now.
-async function pushTrackingSync() {
+async function pushTrackingSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
@@ -1086,7 +1089,10 @@ async function pushTrackingSync() {
         // Always the full current list, same overwrite-the-blob approach
         // as everything else synced here -- see loadCreatorSync's comment
         // for why signing in replaces local state wholesale rather than
-        // merging.
+        // merging. The one exception is a scrobble ping landing between
+        // this browser's last load and this push -- see save-tracking's
+        // own comment for the narrow rescue that covers that, and
+        // intentionalRemoval below for why a deliberate delete skips it.
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
         airingNext: (localMap['airing-next'] && localMap['airing-next'].items) || [],
@@ -1096,6 +1102,13 @@ async function pushTrackingSync() {
         removeWatchedFromWatchlist: localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0',
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
+        // Set only by flows that are deliberately shrinking Watch History
+        // (Clear Watch History, removing a single item) -- tells the
+        // server to trust this array exactly as sent instead of rescuing
+        // any item a recent scrobble might have added that isn't in it,
+        // so an intentional delete can never be silently undone by that
+        // rescue on the very next autosave.
+        intentionalRemoval: !!(opts && opts.intentionalRemoval),
       }),
     });
   } catch (e) {
@@ -1995,13 +2008,14 @@ async function renderCreatorDashboard(options) {
 
 function formatWatchItemLabel(it) {
   if (!it) return { title: '', subtitle: '' };
+  const epTitle = it.name || it.episodeTitle || (it.title !== it.showTitle ? it.title : '') || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')) || '';
   if (it.showTitle && it.seasonNum != null && it.episodeNum != null) {
     const s = String(it.seasonNum).padStart(2, '0');
     const e = String(it.episodeNum).padStart(2, '0');
-    return { title: it.showTitle + ' S' + s + 'E' + e, subtitle: it.name || it.title || '' };
+    return { title: it.showTitle + ' S' + s + 'E' + e, subtitle: epTitle };
   }
   if (it.showTitle) {
-    return { title: it.showTitle, subtitle: it.name || it.title || '' };
+    return { title: it.showTitle, subtitle: epTitle };
   }
   return { title: it.title || it.name || '', subtitle: '' };
 }
@@ -2043,8 +2057,8 @@ function buildLocalListCardHtml(l) {
     }
     const itemPoster = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
     let dateBadge = '';
-    if (it.airDate && (it.isUnaired || (typeof isEpisodeAired === 'function' && !isEpisodeAired({ air_date: it.airDate })))) {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : it.airDate;
+    if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
       if (badgeText) {
         dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
       }
@@ -3149,7 +3163,7 @@ function removeWatchHistoryItemDirect(id, btn) {
       if (window._watchedItemIds) window._watchedItemIds.delete(targetId);
       map['watch-history'].updatedAt = Date.now();
       if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
-      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
       if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
       // Removing the last watched episode of a show drops it from Airing
@@ -3214,8 +3228,8 @@ function clearWatchHistoryAll() {
         localStorage.removeItem('myListAddon:fullyWatchedShows');
       } catch (e) {}
 
-      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
+      if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
 
       // Refresh list details view if currently visible
       if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {

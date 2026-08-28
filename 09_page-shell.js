@@ -70,6 +70,12 @@ function renderBuilder(
         url: origin + "/",
       })}</script>`;
   const hasInitial = initialEntries.length > 0;
+  // Whether initialEntriesJson below ends up holding the caller's real,
+  // resolved entries or just this fallback first-time-visitor demo set --
+  // threaded to the client as usingDefaultEntries so it can tell the two
+  // apart (see the "pre-fill" block's own comment on why that distinction
+  // matters for when to trust localStorage over what the server sent).
+  const usingDefaultEntries = !hasInitial;
   const initialEntriesJson = JSON.stringify(
     hasInitial
       ? initialEntries
@@ -111,6 +117,18 @@ ${seoHeadHtml}
 <script>
   if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
     document.documentElement.classList.add('dark-theme');
+    try {
+      var metaTheme = document.querySelector('meta[name="theme-color"]');
+      if (metaTheme) metaTheme.setAttribute('content', '#000000');
+    } catch (e) {}
+  }
+  function toggleTheme() {
+    var isDark = document.documentElement.classList.toggle('dark-theme');
+    try {
+      localStorage.setItem('theme', isDark ? 'dark' : 'light');
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', isDark ? '#000000' : '#F2F2F7');
+    } catch (e) {}
   }
   (function() {
     var p = location.pathname || '';
@@ -286,6 +304,72 @@ ${seoHeadHtml}
     cursor: pointer;
     box-shadow: var(--shadow-sm);
     padding: 0;
+  }
+  .theme-toggle-btn, .dark-mode-toggle {
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    box-sizing: border-box;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    outline: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-2);
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    padding: 0;
+    position: relative;
+    overflow: hidden;
+    transition: background 0.2s ease, border-color 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease, color 0.2s ease;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .theme-toggle-btn:hover, .dark-mode-toggle:hover {
+    background: var(--panel-strong);
+    border-color: var(--accent);
+    color: var(--text);
+    transform: scale(1.06);
+    box-shadow: var(--shadow);
+  }
+  .theme-toggle-btn:active, .dark-mode-toggle:active {
+    transform: scale(0.92);
+  }
+  .theme-toggle-btn .theme-icon-sun,
+  .theme-toggle-btn .theme-icon-moon {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(1) rotate(0deg);
+    transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
+    pointer-events: none;
+  }
+  /* Light Mode default state: show moon, hide sun */
+  .theme-toggle-btn .theme-icon-sun {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.4) rotate(90deg);
+  }
+  .theme-toggle-btn .theme-icon-moon {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) rotate(0deg);
+    color: var(--text-2);
+  }
+  /* Dark Mode state: show sun, hide moon */
+  :root.dark-theme .theme-toggle-btn .theme-icon-sun,
+  html.dark-theme .theme-toggle-btn .theme-icon-sun,
+  body.dark-theme .theme-toggle-btn .theme-icon-sun {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) rotate(0deg);
+    color: #FFC107;
+  }
+  :root.dark-theme .theme-toggle-btn .theme-icon-moon,
+  html.dark-theme .theme-toggle-btn .theme-icon-moon,
+  body.dark-theme .theme-toggle-btn .theme-icon-moon {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.4) rotate(-90deg);
   }
 
   /* --- Top Tab Bar (Desktop View) ---------------------------------------------- */
@@ -2318,7 +2402,7 @@ ${seoHeadHtml}
     font-size: 0.95rem;
     color: var(--text);
   }
-  .live-preview-shelf-title span {
+  .live-preview-shelf-title .shelf-title-text {
     flex: 1;
     min-width: 0;
     white-space: nowrap;
@@ -2426,6 +2510,95 @@ ${seoHeadHtml}
   }
   .detail-header-info p {
     margin: 0; font-size: 0.85rem; color: var(--muted);
+  }
+
+  /* --- Season Cards & Headers --------------------------------------------- */
+  .season-card {
+    background: var(--surface-light);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .season-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 16px;
+    cursor: pointer;
+  }
+  .season-header-main {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    min-width: 0;
+    flex: 1;
+  }
+  .season-header-poster {
+    width: 80px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  }
+  .season-header-poster-placeholder {
+    width: 80px;
+    height: 120px;
+    background: #333;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .season-header-info {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+  }
+  .season-header-title {
+    margin: 0 0 4px;
+    font-size: 1.2rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .season-header-episodes {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .season-header-actions {
+    flex-shrink: 0;
+    margin-left: 12px;
+  }
+  .season-header-actions .btn-mark-season-watched {
+    padding: 6px 14px;
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 600px) {
+    .season-header {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+      padding: 12px;
+    }
+    .season-header-poster {
+      width: 60px;
+    }
+    .season-header-poster-placeholder {
+      width: 60px;
+      height: 90px;
+    }
+    .season-header-actions {
+      width: 100%;
+      margin-left: 0;
+    }
+    .season-header-actions .btn-mark-season-watched {
+      width: 100%;
+      text-align: center;
+      justify-content: center;
+      padding: 8px 12px;
+      font-size: 0.85rem;
+    }
   }
 
   /* --- Modals & Toasts ---------------------------------------------------- */
@@ -2559,6 +2732,161 @@ ${seoHeadHtml}
   .is-watch-history-shelf .watch-indicator-overlay {
     display: none !important;
   }
+
+  /* --- Live Preview Skeleton Shimmer Loader ----------------------------- */
+  @keyframes livePreviewShimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .live-preview-skeleton-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+  }
+  .live-preview-skeleton-poster {
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: linear-gradient(90deg, var(--panel-strong) 25%, var(--border-strong) 50%, var(--panel-strong) 75%);
+    background-size: 200% 100%;
+    animation: livePreviewShimmer 1.5s infinite ease-in-out;
+  }
+  .live-preview-skeleton-line {
+    height: 10px;
+    border-radius: 4px;
+    width: 80%;
+    background: linear-gradient(90deg, var(--panel-strong) 25%, var(--border-strong) 50%, var(--panel-strong) 75%);
+    background-size: 200% 100%;
+    animation: livePreviewShimmer 1.5s infinite ease-in-out;
+  }
+  .live-preview-skeleton-line-sub {
+    height: 8px;
+    border-radius: 4px;
+    width: 50%;
+    background: linear-gradient(90deg, var(--panel-strong) 25%, var(--border-strong) 50%, var(--panel-strong) 75%);
+    background-size: 200% 100%;
+    animation: livePreviewShimmer 1.5s infinite ease-in-out;
+  }
+
+  /* --- Shelf Drag Handle in Preview Mode ---------------------------------- */
+  .shelf-drag-handle {
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    color: var(--muted);
+    margin-right: 8px;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s ease, background-color 0.15s ease;
+    vertical-align: middle;
+    flex: none;
+    line-height: 1;
+  }
+  .shelf-drag-handle:hover {
+    color: var(--text);
+    background: var(--panel-strong);
+  }
+  .shelf-drag-handle:active {
+    cursor: grabbing;
+  }
+  .entry.dragging {
+    opacity: 0.45;
+    transform: scale(0.99);
+  }
+
+  /* --- Shelf Header Loading Status Badge ---------------------------------- */
+  .live-preview-shelf-status {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    gap: 4px;
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--muted);
+    margin-left: 6px;
+    letter-spacing: 0.01em;
+  }
+  .live-preview-shelf-status .status-spin {
+    display: inline-block;
+    animation: spin 0.9s linear infinite;
+  }
+
+  /* --- Floating Unsaved Changes to Install Link Banner -------------------- */
+  .unsaved-install-banner {
+    position: fixed;
+    bottom: calc(72px + env(safe-area-inset-bottom));
+    left: 50%;
+    transform: translateX(-50%) translateY(30px);
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+    padding: 8px 14px 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: var(--shadow-md);
+    z-index: 999;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    white-space: nowrap;
+    max-width: calc(100vw - 24px);
+    font-size: 0.86rem;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+  .unsaved-install-banner.show {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
+  .unsaved-install-banner-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+    box-shadow: 0 0 0 3px rgba(255, 149, 0, 0.2);
+    flex-shrink: 0;
+    animation: pulseDot 2s infinite ease-in-out;
+  }
+  .unsaved-install-banner-dot.up-to-date {
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
+    animation: none;
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.55; transform: scale(0.85); }
+  }
+  .unsaved-install-banner-btn {
+    background: var(--accent);
+    color: #ffffff;
+    border: none;
+    border-radius: var(--radius-pill);
+    padding: 5px 12px;
+    font-size: 0.80rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.1s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .unsaved-install-banner-btn:hover {
+    background: var(--accent-hover);
+  }
+  .unsaved-install-banner-btn:active {
+    transform: scale(0.96);
+  }
   </style>
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 </head>
@@ -2573,7 +2901,22 @@ ${seoHeadHtml}
       </div>
     </div>
     <div class="app-header-actions">
-      <button class="dark-mode-toggle" onclick="document.documentElement.classList.toggle('dark-theme'); localStorage.setItem('theme', document.documentElement.classList.contains('dark-theme') ? 'dark' : 'light');" style="background:transparent; border:none; color:var(--text); font-size:1.2rem; cursor:pointer; padding:4px;" title="Toggle Dark Mode">🌓</button>
+      <button type="button" class="theme-toggle-btn dark-mode-toggle" id="themeToggleBtn" onclick="toggleTheme()" aria-label="Toggle Light or Dark Mode" title="Toggle Light / Dark Mode">
+        <svg class="theme-icon-sun" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4" fill="currentColor"></circle>
+          <line x1="12" y1="2" x2="12" y2="4.5"></line>
+          <line x1="12" y1="19.5" x2="12" y2="22"></line>
+          <line x1="2" y1="12" x2="4.5" y2="12"></line>
+          <line x1="19.5" y1="12" x2="22" y2="12"></line>
+          <line x1="4.93" y1="4.93" x2="6.7" y2="6.7"></line>
+          <line x1="17.3" y1="17.3" x2="19.07" y2="19.07"></line>
+          <line x1="4.93" y1="19.07" x2="6.7" y2="17.3"></line>
+          <line x1="17.3" y1="6.7" x2="19.07" y2="4.93"></line>
+        </svg>
+        <svg class="theme-icon-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+      </button>
       <div id="creatorProfileBar"></div>
     </div>
   </header>
@@ -2586,6 +2929,12 @@ ${seoHeadHtml}
     <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
     <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
     <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <!-- Unsaved Changes Floating Banner -->
+  <div id="unsavedInstallBanner" class="unsaved-install-banner">
+    <span id="unsavedInstallText" style="font-weight:600;">Unsaved changes to install link</span>
+    <button type="button" class="unsaved-install-banner-btn" id="unsavedInstallBtn" onclick="updateInstallLinkFromBanner()">Update Link</button>
   </div>
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->

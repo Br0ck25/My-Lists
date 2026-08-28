@@ -89,7 +89,21 @@
       } catch {
         return;
       }
-      if (!track || !trackCreatorName || !trackCreatorKey) return;
+      if (!trackCreatorName || !trackCreatorKey) return;
+      if (!track) {
+        // Auto-track Playback resolved to off for this install link. This
+        // can happen even when the user sees the toggle on in Settings, if
+        // their install link is stale (see the config staleness note on
+        // resolveConfig / Configure -> Update) -- write a diagnostic so
+        // "nothing showed up" is visible and traceable instead of silent.
+        const diagnosticsKey = `creatortrack:${trackCreatorName.toLowerCase()}`;
+        await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+          lastPingAt: Date.now(),
+          lastPingId: `${stremioType}:${id}`,
+          matched: "no (Auto-track Playback is off for this install link -- go to Configure, re-enable it, then Update your install link)",
+        }));
+        return;
+      }
 
       const auth = await authenticateCreator(trackCreatorName, trackCreatorKey);
       const diagnosticsKey = `creatortrack:${auth.ok ? auth.username : String(trackCreatorName).toLowerCase()}`;
@@ -150,22 +164,13 @@
       try {
         await ensureTrackingMigrated(env, auth.username);
         const syncKey = `creatorsynctracking:${auth.username}`;
-        const raw = await env.CONFIGS.get(syncKey);
-        let blob = null;
-        if (raw) {
-          try {
-            blob = JSON.parse(raw);
-          } catch {
-            blob = null;
-          }
-        }
-        if (!blob || typeof blob !== "object") {
-          blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
-        }
-        blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
-        blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
-        blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
-        blob.dismissedContinueWatching = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === "object" ? blob.dismissedContinueWatching : {};
+
+        // Resolve what we're actually recording (TMDB lookups) exactly
+        // once, before touching KV at all -- these are the slow, expensive
+        // part and don't need to be repeated if the KV write below has to
+        // retry.
+        let recordEpisode = null; // { epIdStr, episodeEntry, showTitle }
+        let recordMovie = null; // { movieId, movieEntry, movieTitle }
 
         if (stremioType === "series" || (season != null && episode != null)) {
           if (season == null || episode == null || !Number.isFinite(season) || !Number.isFinite(episode)) {
@@ -187,9 +192,10 @@
                 ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, showDetails.title, "series"));
               }
               const epIdStr = String(ep.id || `${imdbId}:${season}:${episode}`);
-              const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
-              if (!alreadyWatched) {
-                blob.watchHistory.unshift({
+              recordEpisode = {
+                epIdStr,
+                showTitle: (showDetails && showDetails.title) || imdbId,
+                episodeEntry: {
                   id: epIdStr,
                   type: "episode",
                   name: ep.name || ("Episode " + episode),
@@ -199,7 +205,74 @@
                   showPoster: (showDetails && showDetails.poster) || "",
                   seasonNum: season,
                   episodeNum: episode,
-                });
+                },
+              };
+            }
+          }
+        } else if (stremioType === "movie") {
+          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const movieGenres = (details && details.genres) || [];
+          const movieYear = (details && (details.releaseYear || details.year || (details.releaseDate && details.releaseDate.slice(0, 4)))) || null;
+          ctx.waitUntil(recordPlaybackTelemetry(env, "movie", movieGenres, movieYear));
+          if (details && details.title) {
+            ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, details.title, "movie"));
+          }
+          const movieTitle = (details && details.title) || imdbId;
+          recordMovie = {
+            movieId: imdbId,
+            movieTitle,
+            movieEntry: {
+              id: imdbId,
+              type: "movie",
+              name: movieTitle,
+              poster: (details && details.poster) || "",
+            },
+          };
+        } else {
+          matched = "no (unrecognized id format)";
+        }
+
+        // Read-modify-write the shared per-account blob, with a bounded
+        // retry: two scrobble pings for the same account (e.g. Nuvio
+        // auto-advancing to the next episode and firing another ping
+        // moments later, or a player re-probing subtitles mid-playback)
+        // both run as independent ctx.waitUntil invocations with no
+        // coordination between them, and Cloudflare KV has no
+        // compare-and-swap -- if both read the blob before either writes,
+        // whichever writes second silently discards whatever the first
+        // one added. Re-reading fresh on each attempt and re-checking
+        // alreadyWatched against that fresh copy (rather than reusing the
+        // blob read at the top of this function) is what makes a retry
+        // actually fix the collision instead of just moving it later.
+        if (recordEpisode || recordMovie) {
+          const MAX_ATTEMPTS = 3;
+          let alreadyWatched = false;
+          for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            const raw = await env.CONFIGS.get(syncKey);
+            let blob = null;
+            if (raw) {
+              try {
+                blob = JSON.parse(raw);
+              } catch {
+                blob = null;
+              }
+            }
+            if (!blob || typeof blob !== "object") {
+              blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
+            }
+            blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
+            blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
+            blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
+            blob.dismissedContinueWatching = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === "object" ? blob.dismissedContinueWatching : {};
+            blob.watchlist = Array.isArray(blob.watchlist) ? blob.watchlist : [];
+
+            const beforeWrite = raw || "";
+
+            if (recordEpisode) {
+              const { epIdStr, episodeEntry } = recordEpisode;
+              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
+              if (!alreadyWatched) {
+                blob.watchHistory.unshift(episodeEntry);
               }
               // Recompute this show's Continue Watching the same way the
               // cron does (checkForNewEpisodes, 07_source-fetchers-tmdb-
@@ -238,38 +311,42 @@
                   }
                 }
               }
-              matched = alreadyWatched ? "yes (already watched)" : "yes";
+            } else if (recordMovie) {
+              const { movieId, movieEntry } = recordMovie;
+              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === movieId);
+              if (!alreadyWatched) {
+                blob.watchHistory.unshift(movieEntry);
+              }
             }
-          }
-        } else if (stremioType === "movie") {
-          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
-          const movieGenres = (details && details.genres) || [];
-          const movieYear = (details && (details.releaseYear || details.year || (details.releaseDate && details.releaseDate.slice(0, 4)))) || null;
-          ctx.waitUntil(recordPlaybackTelemetry(env, "movie", movieGenres, movieYear));
-          if (details && details.title) {
-            ctx.waitUntil(recordTrackedEvent(env, "watched", imdbId, details.title, "movie"));
-          }
-          const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === imdbId);
-          if (!alreadyWatched) {
-            blob.watchHistory.unshift({
-              id: imdbId,
-              type: "movie",
-              name: (details && details.title) || imdbId,
-              poster: (details && details.poster) || "",
-            });
-          }
-        } else {
-          matched = "no (unrecognized id format)";
-        }
 
-        blob.watchlist = Array.isArray(blob.watchlist) ? blob.watchlist : [];
-        if (blob.watchlist.length) {
-          const initLen = blob.watchlist.length;
-          blob.watchlist = blob.watchlist.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
-        }
+            if (blob.watchlist.length) {
+              blob.watchlist = blob.watchlist.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+            }
 
-        blob.updatedAt = Date.now();
-        await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+            blob.updatedAt = Date.now();
+            const serializedBlob = JSON.stringify(blob);
+
+            // Verify nothing else wrote to this key between our read and
+            // now before committing -- if it changed, another ping (or
+            // the client's own autosave) won the race for this attempt,
+            // so retry against a fresh read rather than clobber it.
+            const stillCurrent = await env.CONFIGS.get(syncKey);
+            if ((stillCurrent || "") !== beforeWrite && attempt < MAX_ATTEMPTS - 1) {
+              continue;
+            }
+            await env.CONFIGS.put(syncKey, serializedBlob);
+            break;
+          }
+
+          if (recordEpisode) {
+            const epLabel = recordEpisode.showTitle;
+            matched = alreadyWatched
+              ? `yes (already watched: ${epLabel} S${season}E${episode})`
+              : `yes (${epLabel} S${season}E${episode})`;
+          } else if (recordMovie) {
+            matched = alreadyWatched ? `yes (already watched: ${recordMovie.movieTitle})` : `yes (${recordMovie.movieTitle})`;
+          }
+        }
 
         // Auto-remove watched item from user's Creator Watchlist if present
         try {
@@ -1131,6 +1208,59 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
+
+      // Guard against a narrow but real race: handleSubtitlesTrack and
+      // handleMediaServerScrobble both read-modify-write this same KV key
+      // directly and outside of any request this browser initiated, so a
+      // scrobble can land *between* this browser's last load and this
+      // push. Since this endpoint's whole design is "always the full
+      // current list" (see pushTrackingSync's own comment -- deliberate,
+      // so Clear Watch History and per-item removal both work by just
+      // sending a shorter array), a stale client push would otherwise
+      // silently erase whatever a scrobble just added.
+      //
+      // Rather than merging the *entire* history (which would make Clear
+      // Watch History and per-item removal impossible to ever fully commit
+      // -- the deleted item would just come back on the next autosave),
+      // only rescue items added by a scrobble ping inside a short recency
+      // window right before this push, and skip the rescue entirely when
+      // the client flags this push as an intentional removal (Clear Watch
+      // History, deleting a single item) -- see pushTrackingSync's
+      // intentionalRemoval comment. That's the one case a stale client
+      // snapshot can plausibly be missing something real; anything older
+      // than that the client's own load would already have picked up.
+      const RESCUE_WINDOW_MS = 5 * 60 * 1000;
+      let rescuedCount = 0;
+      if (!body.intentionalRemoval) {
+        try {
+          const diagRaw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
+          if (diagRaw) {
+            const diag = JSON.parse(diagRaw);
+            if (diag && diag.lastPingAt && (Date.now() - diag.lastPingAt) < RESCUE_WINDOW_MS) {
+              const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+              if (existingRaw) {
+                const existingBlob = JSON.parse(existingRaw);
+                const incomingIds = new Set((Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id)));
+                const recentServerItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
+                  .filter((it) => it && !incomingIds.has(String(it.id)));
+                // Only rescue items the server itself added inside the
+                // recency window's ballpark -- everything currently in
+                // watchHistory server-side was either already known to
+                // this client (covered above) or was added since; there's
+                // no per-item timestamp to check more precisely than the
+                // diagnostics ping time already gates on above.
+                if (recentServerItems.length) {
+                  body.watchHistory = [...(Array.isArray(body.watchHistory) ? body.watchHistory : []), ...recentServerItems];
+                  rescuedCount = recentServerItems.length;
+                }
+              }
+            }
+          }
+        } catch {
+          // Diagnostics/rescue is best-effort -- never block the save over it.
+        }
+      }
+
       const blob = {
         watchHistory: Array.isArray(body.watchHistory) ? body.watchHistory : [],
         continueWatching: Array.isArray(body.continueWatching) ? body.continueWatching : [],
@@ -1170,7 +1300,7 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      return json({ ok: true, rescuedFromScrobble: rescuedCount });
     }
 
     // /api/creator/sync/save-presets  (POST)  { creatorName, creatorKey,
@@ -1503,7 +1633,11 @@
             const urlMatch = l.url && l.url.toLowerCase().includes(targetFilter);
             return nameMatch || creatorMatch || usernameMatch || urlMatch;
           })
-          .sort((a, b) => (b.likes || 0) - (a.likes || 0));
+          .sort((a, b) => {
+            const likesDiff = (b.likes || 0) - (a.likes || 0);
+            if (likesDiff !== 0) return likesDiff;
+            return (b.items || 0) - (a.items || 0);
+          });
         return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
@@ -2556,13 +2690,14 @@ export default {
 
   // Runs on whatever schedule this Worker's owner configured under
   // Triggers -> Cron Triggers in the Cloudflare dashboard (recommended:
-  // every 6 hours) -- see checkForNewEpisodes (07_source-fetchers-tmdb-
-  // simkl.js) for what it actually does and why it's scoped and batched
-  // the way it is. ctx.waitUntil keeps the invocation alive until that
-  // finishes, the same way a fetch handler would keep a response pending,
-  // since a scheduled trigger has no incoming request to hold it open on
-  // its own.
+  // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
+  // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkForNewEpisodes(env));
+    ctx.waitUntil(
+      Promise.all([
+        checkForNewEpisodes(env),
+        prewarmSharedCatalogs(env, ctx),
+      ])
+    );
   },
 };

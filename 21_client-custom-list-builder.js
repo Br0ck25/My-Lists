@@ -1994,7 +1994,9 @@ function syncAiringNextWatchState() {
 // refresh is still within AIRING_NEXT_REFRESH_MS, unless force is true.
 async function refreshAiringNext(force) {
   const existing = getOrCreateAiringNextList();
-  if (!force && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+  const hasExpiredItems = Array.isArray(existing.items) && existing.items.some(it => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it => it && !it.name && !it.episodeTitle);
+  if (!force && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
     return existing;
   }
 
@@ -2021,16 +2023,20 @@ async function refreshAiringNext(force) {
     while (cursor < candidates.length) {
       const showId = candidates[cursor++];
       try {
-        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey));
+        const bypass = (force || hasExpiredItems) ? '&fresh=1&_t=' + Date.now() : '';
+        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
         const data = await res.json();
         const d = data && data.ok ? data.details : null;
-        if (d && d.nextEpisodeAirDate) {
+        if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
           const known = knownByShow.get(showId);
+          const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
           results.push({
             id: showId,
             showId: showId,
             showTitle: (known && known.title) || d.title || '',
             showPoster: (known && known.poster) || d.poster || '',
+            name: epName,
+            episodeTitle: epName,
             airDate: d.nextEpisodeAirDate,
             seasonNum: d.nextEpisodeSeasonNumber,
             episodeNum: d.nextEpisodeNumber,
@@ -2104,17 +2110,31 @@ function buildAiringNextCardHtml() {
     let overlays = '';
     if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-    const dateBadge = it.isSeasonPremiere ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>' : '';
-    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0') + (dateLabel ? ' \u00b7 ' + dateLabel : '');
+    let dateBadge = '';
+    if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+      if (badgeText) {
+        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+      }
+    }
+    const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
+      ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
+      : '';
+    const label = (typeof formatWatchItemLabel === 'function')
+      ? formatWatchItemLabel(it)
+      : {
+          title: (it.showTitle || '') + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+          subtitle: it.name || it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+        };
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
+        premiereBadge +
         overlays +
       '</div>' +
-      '<div class="list-card-mini-poster-name">' + escapeHtml(it.showTitle || '') + '</div>' +
-      '<div class="list-card-mini-poster-subtitle">' + escapeHtml(seasonEp) + '</div>' +
+      '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
+      (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
     '</div>';
   }).join('');
 
@@ -2151,23 +2171,21 @@ function buildAiringNextCardHtml() {
 function openAiringNextDetailsPage() {
   const list = getOrCreateAiringNextList();
   const sample = (list.items || []).map((it) => {
-    const dateLabel = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-    const seasonEp = 'S' + String(it.seasonNum || 0).padStart(2, '0') + 'E' + String(it.episodeNum || 0).padStart(2, '0');
+    const label = (typeof formatWatchItemLabel === 'function')
+      ? formatWatchItemLabel(it)
+      : {
+          title: (it.showTitle || '') + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+          subtitle: it.name || it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+        };
     return {
       id: it.showId,
       type: 'series',
-      name: it.showTitle,
-      subtitle: dateLabel ? (seasonEp + ' \u00b7 ' + dateLabel) : seasonEp,
+      name: label.title,
+      subtitle: label.subtitle,
       poster: it.showPoster,
       airDate: it.airDate,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
-      // The date already sits next to S/E in the subtitle above -- suppress
-      // livePreviewPosterHtml's own plain-date badge (23_client-list-
-      // management.js) for a non-premiere item so it isn't shown twice.
-      // A premiere item still shows its badge (now pinned to the bottom of
-      // the poster, see .cw-date-badge-premiere, 09_page-shell.js).
-      hideDateBadge: !it.isSeasonPremiere,
     };
   });
   openListDetailsPage('Airing Next', 'series', 'custom:airing-next', { sample: sample, count: sample.length, maybeMore: false });

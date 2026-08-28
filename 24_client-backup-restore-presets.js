@@ -683,6 +683,65 @@ function exportDataToJson(target) {
 // doesn't lose their in-progress list or entered API keys. The stored state
 // is only used in the browser; it is never uploaded anywhere.
 const STORAGE_KEY = 'myListAddon:state';
+let lastGeneratedConfigHash = null;
+
+function computeConfigStateHash() {
+  try {
+    const entries = collectEntries();
+    const keys = collectKeys();
+    return JSON.stringify({
+      entries: entries.map(e => ({ name: e.name, url: e.url, type: e.type, group: e.group })),
+      keys: {
+        tmdbKey: keys.tmdbKey,
+        mdblistKey: keys.mdblistKey,
+        mdblistAccessToken: keys.mdblistAccessToken,
+        traktKey: keys.traktKey,
+        traktUsername: keys.traktUsername,
+        traktAccessToken: keys.traktAccessToken,
+        simklKey: keys.simklKey,
+        simklAccessToken: keys.simklAccessToken,
+        simklUsername: keys.simklUsername,
+        region: keys.region,
+        hideNonDigitalReleases: keys.hideNonDigitalReleases,
+        shuffleShelves: keys.shuffleShelves,
+        shuffleItems: keys.shuffleItems,
+        track: !!keys.track,
+      }
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+function checkUnsavedInstallLink() {
+  if (!lastGeneratedConfigHash) return;
+  const currentHash = computeConfigStateHash();
+  const banner = document.getElementById('unsavedInstallBanner');
+  const text = document.getElementById('unsavedInstallText');
+  const btn = document.getElementById('unsavedInstallBtn');
+  if (!banner || !text || !btn) return;
+  
+  if (currentHash !== lastGeneratedConfigHash) {
+    text.textContent = 'Unsaved changes to install link';
+    btn.style.display = 'inline-flex';
+    banner.classList.add('show');
+  } else {
+    banner.classList.remove('show');
+  }
+}
+
+async function updateInstallLinkFromBanner() {
+  const btn = document.getElementById('unsavedInstallBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Updating\u2026';
+  }
+  await generate();
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Update Link';
+  }
+}
 
 function saveState() {
   if (suppressSave) return;
@@ -699,6 +758,7 @@ function saveState() {
   }
   if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
   scheduleCreatorSyncSave();
+  checkUnsavedInstallLink();
 }
 
 function loadSavedState() {
@@ -869,17 +929,25 @@ async function generate() {
   // The mobile sticky CTA bar can be tapped from anywhere on a long page of
   // rows, so bring the result into view rather than leaving it rendered
   // off-screen above the fold the person's currently scrolled past.
+  lastGeneratedConfigHash = computeConfigStateHash();
+  const banner = document.getElementById('unsavedInstallBanner');
+  if (banner) banner.classList.remove('show');
   box.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // pre-fill
 suppressSave = true;
 const serverEntries = (${initialEntriesJson});
+const serverEntriesAreDefaults = ${usingDefaultEntries ? 'true' : 'false'};
 const serverShuffleShelves = ${initialShuffleShelves ? 'true' : 'false'};
 const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
-if (serverEntries.length) {
-  // Opened via a real install/configure link — this is the source of truth.
+if (serverEntries.length && !serverEntriesAreDefaults) {
+  // Opened via a real install/configure link with actual resolved entries
+  // -- this is the source of truth.
   serverEntries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  if (${isConfigureMode ? 'true' : 'false'}) {
+    setTimeout(() => { lastGeneratedConfigHash = computeConfigStateHash(); }, 0);
+  }
   if (document.getElementById('shuffleShelvesCheckbox')) {
     document.getElementById('shuffleShelvesCheckbox').checked = serverShuffleShelves;
   }
@@ -918,10 +986,16 @@ if (serverEntries.length) {
   }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
-  // last time, if anything was saved.
+  // last time, if anything was saved. Falls through to the server's
+  // first-time-visitor demo entries (still available in serverEntries even
+  // though serverEntriesAreDefaults kept them from being trusted as this
+  // browser's actual saved state above) only when there's truly nothing in
+  // localStorage yet -- a genuinely first-time visitor.
   const saved = loadSavedState();
   if (saved && Array.isArray(saved.entries) && saved.entries.length) {
     saved.entries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  } else if (serverEntries.length) {
+    serverEntries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
   }
   if (saved && document.getElementById('shuffleShelvesCheckbox')) {
     document.getElementById('shuffleShelvesCheckbox').checked = !!saved.shuffleShelves;
@@ -1252,29 +1326,29 @@ window.addEventListener('popstate', (e) => {
   const path = location.pathname || '';
   const hash = location.hash || '';
   const isListPath = (path.startsWith('/lists/') && path !== '/lists') || hash.startsWith('#/list?');
+  const isItemPath = hash.startsWith('#/item?');
 
-  if ((state && state.view === 'list') || isListPath) {
-    const listKey = state ? ((state.name || '') + '::' + (state.listUrl || '')) : '';
+  if (state && state.view === 'list') {
+    const listKey = (state.name || '') + '::' + (state.type || '') + '::' + (state.listUrl || '');
     const currentListKey = window._currentListDetailsKey || '';
     const gridEl = document.getElementById('detailGrid');
-    if (gridEl && gridEl.children.length > 0 && (!listKey || currentListKey === listKey || !state)) {
+    if (gridEl && gridEl.children.length > 0 && currentListKey === listKey) {
       switchTab('list-details');
       if (typeof window._listScrollY === 'number') {
         const targetScroll = window._listScrollY;
         window.scrollTo({ top: targetScroll, behavior: 'instant' });
-        requestAnimationFrame(() => {
-          window.scrollTo({ top: targetScroll, behavior: 'instant' });
-          setTimeout(() => {
-            window.scrollTo({ top: targetScroll, behavior: 'instant' });
-          }, 50);
-        });
       }
       return;
     }
-    if (state && state.view === 'list') {
-      openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true, restoreScrollY: window._listScrollY });
-    }
-  } else if ((state && state.view === 'item') || hash.startsWith('#/item?')) {
+    openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true, restoreScrollY: window._listScrollY });
+  } else if (isListPath && (!state || state.view !== 'tab')) {
+    // If landed or popped into a list path without explicit state
+    const params = new URLSearchParams(hash.slice('#/list?'.length));
+    const listName = params.get('name') || '';
+    const listType = params.get('type') || 'movie';
+    const listUrl = params.get('url') || '';
+    openListDetailsPage(listName, listType, listUrl, null, { skipPushState: true });
+  } else if ((state && state.view === 'item') || isItemPath) {
     const itemId = (state && state.id) || (new URLSearchParams(hash.slice('#/item?'.length)).get('id')) || '';
     const itemType = (state && state.type) || (new URLSearchParams(hash.slice('#/item?'.length)).get('type')) || 'movie';
     openItemDetailsModal(itemId, itemType, { skipPushState: true });

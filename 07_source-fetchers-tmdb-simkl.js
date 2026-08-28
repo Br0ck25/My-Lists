@@ -35,7 +35,7 @@ function mapSimklItems(data, type) {
 // pulls the anime category regardless of entry.type (anime trending mixes
 // movies and series under one Simkl category, so there's no clean
 // movie/series split to key off of -- see SIMKL_ANIME_LIST below).
-async function fetchSimklChart(entry, skip, clientId, chartKey) {
+async function fetchSimklChart(entry, skip, clientId, chartKey, env = null, ctx = null) {
   if (!clientId) {
     throw new Error(
       "Simkl charts aren't configured on this add-on yet — the Worker owner needs to set SIMKL_CLIENT_ID."
@@ -46,20 +46,35 @@ async function fetchSimklChart(entry, skip, clientId, chartKey) {
   const file = SIMKL_CHART_FILES[windowKey] || SIMKL_CHART_FILES.today;
   const category = isAnime ? "anime" : entry.type === "series" ? "tv" : "movies";
 
-  const src =
-    `https://data.simkl.in/discover/trending/${category}/${file}.json` +
-    `?client_id=${encodeURIComponent(clientId)}&app-name=my-lists-addon&app-version=${encodeURIComponent(ADDON_VERSION)}`;
-  const res = await fetch(src, {
-    headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
-    cf: { cacheTtl: 3600, cacheEverything: true },
-  });
-  if (!res.ok) {
-    throw new Error(`Simkl chart request failed (HTTP ${res.status}).`);
-  }
+  const cacheKey = `user_cache:simkl:chart:${chartKey}:${entry.type}:${skip}`;
+  const kvKey = `simkl:chart:${chartKey}:${entry.type}:${skip}`;
 
-  const data = await res.json();
-  const metas = mapSimklItems(data, entry.type);
-  return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "Simkl Chart",
+    fetchFn: async () => {
+      const src =
+        `https://data.simkl.in/discover/trending/${category}/${file}.json` +
+        `?client_id=${encodeURIComponent(clientId)}&app-name=my-lists-addon&app-version=${encodeURIComponent(ADDON_VERSION)}`;
+      const res = await fetch(src, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 3600, cacheEverything: true },
+      });
+      if (!res.ok) {
+        throw new Error(`Simkl chart request failed (HTTP ${res.status}).`);
+      }
+
+      const data = await res.json();
+      const metas = mapSimklItems(data, entry.type);
+      return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+    },
+  });
 }
 
 async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey) {
@@ -209,7 +224,7 @@ const TRAKT_CHART_PATHS = {
 // {movie: {...}} or {show: {...}} plus some stats fields (watchers,
 // revenue, etc. depending on chart) -- the same shape fetchTrakt's user-list
 // endpoint returns, so mapTraktItems handles both without changes.
-async function fetchTraktChart(entry, skip, traktKey, chartKey) {
+async function fetchTraktChart(entry, skip, traktKey, chartKey, env = null, ctx = null) {
   if (!traktKey) {
     throw new Error(
       "Trakt charts aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
@@ -224,21 +239,44 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey) {
 
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/${chartPath}?limit=${PAGE_SIZE}&page=${page}`;
-  const res = await fetch(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      "User-Agent": "my-list-addon/1.8",
-    },
-    cf: { cacheTtl: 900, cacheEverything: true },
-  });
-  if (!res.ok) {
-    const hint = res.status === 401 || res.status === 403 ? " Double-check the Trakt Client ID." : "";
-    throw new Error(`Trakt chart request failed (HTTP ${res.status}).${hint}`);
-  }
 
-  const data = await res.json();
+  const headers = {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": traktKey,
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+  };
+
+  const cacheKey = `user_cache:trakt:chart:${chartKey}:${wantKind}:${page}`;
+  const kvKey = `trakt:chart:${chartKey}:${wantKind}:${page}`;
+
+  const data = await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "Trakt Chart",
+    fetchFn: async () => {
+      const res = await fetchTraktWithRetry(src, {
+        headers,
+        cf: { cacheTtl: 900, cacheEverything: true },
+      });
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403
+            ? " Double-check the Trakt Client ID."
+            : res.status === 429
+            ? " Trakt is temporarily busy (rate limit). Please wait a few seconds and try again."
+            : "";
+        throw new Error(`Trakt chart request failed (HTTP ${res.status}).${hint}`);
+      }
+      return await res.json();
+    },
+  });
+
   return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
 }
 
@@ -363,6 +401,12 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
+  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null };
+
+  const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
+  const cached = getPerUserCache(cacheKey);
+  if (cached && cached.data) return cached.data;
+
   // release_dates is appended alongside external_ids/videos at no extra
   // request cost (same call, one more field) -- used by fetchTmdbChart
   // below to support the "hide items with no digital release" setting
@@ -372,7 +416,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
     apiKey
   )}&append_to_response=external_ids,videos,release_dates`;
   const res = await fetch(src, {
-    headers: { "User-Agent": "my-list-addon/1.14" },
+    headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
   if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
@@ -394,7 +438,10 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
       Array.isArray(r.release_dates) && r.release_dates.some((rd) => rd.type === 4 || rd.type === 5)
     );
   }
-  return { imdbId, videos, hasDigitalRelease };
+  const result = { imdbId, videos, hasDigitalRelease };
+  // Cache for 7 days (604800s)
+  setPerUserCache(cacheKey, result, 604800, 604800);
+  return result;
 }
 
 // Pulls a public themoviedb.org list via TMDB's v4 List Details endpoint.
@@ -496,7 +543,7 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
   return resolved.filter(Boolean);
 }
 
-async function fetchTmdbCollection(entry, skip = 0, apiKey = "") {
+async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx = null) {
   if (!apiKey) {
     throw new Error(
       "TMDB collections aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
@@ -508,33 +555,48 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "") {
     throw new Error("Couldn't parse that as a TMDB collection URL (expected themoviedb.org/collection/ID).");
   }
 
-  const src = `https://api.themoviedb.org/3/collection/${encodeURIComponent(collectionId)}?api_key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(src, {
-    headers: { "User-Agent": "my-list-addon/1.14" },
-    cf: { cacheTtl: 86400, cacheEverything: true },
+  const cacheKey = `user_cache:tmdb:collection:${collectionId}:${skip}`;
+  const kvKey = `tmdb:collection:${collectionId}:${skip}`;
+
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 604800, // 7 days
+    staleTtlSec: 30 * 86400,
+    kvTtlSec: 604800,
+    providerLabel: "TMDB Collection",
+    fetchFn: async () => {
+      const src = `https://api.themoviedb.org/3/collection/${encodeURIComponent(collectionId)}?api_key=${encodeURIComponent(apiKey)}`;
+      const res = await fetch(src, {
+        headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(`TMDB collection ${collectionId} not found.`);
+        }
+        throw new Error(`TMDB request failed (HTTP ${res.status}).`);
+      }
+
+      const data = await res.json();
+      const parts = Array.isArray(data.parts) ? data.parts : [];
+      
+      // Sort chronologically by release date
+      parts.sort((a, b) => (a.release_date || "9999").localeCompare(b.release_date || "9999"));
+
+      const windowItems = parts.slice(skip, skip + PAGE_SIZE);
+      const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
+        const { imdbId, videos } = await fetchTmdbDetails(it.id, "movie", apiKey);
+        if (!imdbId) return null;
+        return mapTmdbItem(it, imdbId, "movie", videos);
+      });
+
+      return resolved.filter(Boolean);
+    },
   });
-
-  if (!res.ok) {
-    if (res.status === 404) {
-      throw new Error(`TMDB collection ${collectionId} not found.`);
-    }
-    throw new Error(`TMDB request failed (HTTP ${res.status}).`);
-  }
-
-  const data = await res.json();
-  const parts = Array.isArray(data.parts) ? data.parts : [];
-  
-  // Sort chronologically by release date
-  parts.sort((a, b) => (a.release_date || "9999").localeCompare(b.release_date || "9999"));
-
-  const windowItems = parts.slice(skip, skip + PAGE_SIZE);
-  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-    const { imdbId, videos } = await fetchTmdbDetails(it.id, "movie", apiKey);
-    if (!imdbId) return null;
-    return mapTmdbItem(it, imdbId, "movie", videos);
-  });
-
-  return resolved.filter(Boolean);
 }
 
 // Shared meta-shaping for any TMDB item (list, chart, wherever), once its
@@ -682,50 +744,54 @@ function getTmdbNewReleasesChartPath(wantKind) {
 // fetches a specific user-curated list and has to walk pages defensively
 // since v3's /list/{id} pagination is flaky), these are standard, reliably-
 // paginated v3 endpoints -- see fetchTmdbPagedResults.
-async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigitalReleases) {
+async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigitalReleases, env = null, ctx = null) {
   if (!apiKey) {
     throw new Error(
       "TMDB charts aren't configured on this add-on yet — the Worker owner needs to set TMDB_API_KEY."
     );
   }
   const wantKind = entry.type === "series" ? "tv" : "movie";
-  let chartPath;
-  if (chartKey === "new_movies" || chartKey === "new_shows" || chartKey === "new_releases" || chartKey === "new") {
-    chartPath = getTmdbNewReleasesChartPath(wantKind);
-  } else {
-    const pathMap = TMDB_CHART_PATHS[chartKey];
-    chartPath = pathMap && pathMap[wantKind];
-  }
-  if (!chartPath) {
-    throw new Error("This TMDB chart doesn't have a shows version.");
-  }
-  chartPath = substituteWatchRegion(chartPath, region);
+  const effectiveRegion = region || "US";
+  const cacheKey = `user_cache:tmdb:chart:${chartKey}:${wantKind}:${skip}:${effectiveRegion}:${hideNonDigitalReleases ? "1" : "0"}`;
+  const kvKey = `tmdb:chart:${chartKey}:${wantKind}:${skip}:${effectiveRegion}:${hideNonDigitalReleases ? "1" : "0"}`;
 
-  const windowItems = await fetchTmdbPagedResults(chartPath, apiKey, skip);
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "TMDB Chart",
+    fetchFn: async () => {
+      let chartPath;
+      if (chartKey === "new_movies" || chartKey === "new_shows" || chartKey === "new_releases" || chartKey === "new") {
+        chartPath = getTmdbNewReleasesChartPath(wantKind);
+      } else {
+        const pathMap = TMDB_CHART_PATHS[chartKey];
+        chartPath = pathMap && pathMap[wantKind];
+      }
+      if (!chartPath) {
+        throw new Error("This TMDB chart doesn't have a shows version.");
+      }
+      chartPath = substituteWatchRegion(chartPath, region);
 
-  // Only Trending/Popular movie charts support this filter -- TV has no
-  // digital-release concept on TMDB (see fetchTmdbDetails's own comment),
-  // and every other chartKey (Top Rated, Now Playing, Upcoming, provider
-  // charts, etc.) is either already release-gated by its own nature or
-  // isn't what the "hide items with no digital release" setting was aimed
-  // at (Trending/Popular specifically, per how it was requested).
-  const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
+      const windowItems = await fetchTmdbPagedResults(chartPath, apiKey, skip);
+      const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
 
-  const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-    const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
-    if (!imdbId) return null;
-    // hasDigitalRelease === null means the lookup itself failed or didn't
-    // apply (see fetchTmdbDetails) -- treat that as "keep it" rather than
-    // "no digital release", so a transient TMDB hiccup can't silently
-    // shrink the list; only an explicit false (checked and confirmed
-    // absent) is filtered out.
-    if (applyDigitalFilter && hasDigitalRelease === false) return null;
-    return mapTmdbItem(it, imdbId, entry.type, videos);
+      const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
+        const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+        if (!imdbId) return null;
+        if (applyDigitalFilter && hasDigitalRelease === false) return null;
+        return mapTmdbItem(it, imdbId, entry.type, videos);
+      });
+
+      const res = resolved.filter(Boolean);
+      res.totalItems = windowItems.totalItems;
+      return res;
+    },
   });
-
-  const res = resolved.filter(Boolean);
-  res.totalItems = windowItems.totalItems;
-  return res;
 }
 
 // A hard-capped 10-item version of fetchTmdbChart, for the "Top 10" panel's
@@ -1047,25 +1113,23 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region) {
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
-  // effectiveRegion folded into the cache key (defaulting to "US" so every
-  // existing call site that doesn't pass one keeps sharing the exact same
-  // cache entries as before, zero regression) -- content ratings are
-  // region-specific (see fetchTmdbItemDetailsUncached below), so without
-  // this the first region to ever request a given title would silently
-  // poison the shared cache for every other region's users.
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+  if (!bypassCache) {
+    const cached = getPerUserCache(cacheKey);
+    if (cached && cached.isFresh && cached.data) {
+      if (cached.data.nextEpisodeAirDate && isEpisodeAiredServer(cached.data.nextEpisodeAirDate)) {
+        // Scheduled episode has already aired; refresh to resolve the new upcoming episode
+      } else {
+        return cached.data;
+      }
+    }
+  }
   return fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
-    // Matches the 7-day cacheTtl already on each individual fetch() below
-    // -- this is public, effectively-static title data (cast/rating/
-    // trailer rarely change), so a week-old copy is fine.
-    freshTtlSec: 604800,
-    // Longer than fresh on purpose: if TMDB is genuinely down or this
-    // specific title starts erroring, serving a month-old detail modal
-    // beats the modal failing to open at all.
+    freshTtlSec: (fallbackType === "series" || fallbackType === "tv") ? 7200 : 604800,
     staleTtlSec: 2592000,
     providerLabel: "TMDB Item Details",
     fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
@@ -1115,7 +1179,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
     const detailRes = await fetch(detailSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
-      cf: { cacheTtl: 604800, cacheEverything: true },
+      cf: { cacheTtl: resolvedType === "tv" ? 3600 : 604800, cacheEverything: true },
     });
     if (detailRes.ok) {
       match = await detailRes.json();
@@ -1136,7 +1200,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
       const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
       const tvRes = await fetch(tvSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
-        cf: { cacheTtl: 604800, cacheEverything: true },
+        cf: { cacheTtl: 3600, cacheEverything: true },
       });
       if (tvRes.ok) {
         match = await tvRes.json();
@@ -1185,19 +1249,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     }
   }
 
-  // Resolves the REAL IMDb id -- if the caller already had a real one,
-  // keep using exactly that (no reason to trust TMDB's own external_ids
-  // echo of what was already known); if the caller only had a bare
-  // tmdb:<id> (Search Movies & TV Shows), this is the ONLY place that ever
-  // turns it into a real IMDb id. Every downstream watched-status check or
-  // save (toggleWatchStatus, markShowWatched, Watch History) keys off this
-  // id -- without this, a title opened from Search silently tracked
-  // watched-state under a literal "tmdb:12345" placeholder that nothing
-  // else in the app ever recognized: marking it watched from Search never
-  // showed up anywhere else, and a title already marked watched via
-  // Discover/a chart never showed as watched when reopened from Search,
-  // since the two entry points were keying the exact same title under two
-  // different, unrelated ids.
+  // Resolves the REAL IMDb id
   const realImdbId = (match.external_ids && match.external_ids.imdb_id) || (String(imdbId).startsWith("tt") ? String(imdbId).split(":")[0] : ("tmdb:" + tmdbId));
 
   let poster = match.poster_path ? ("https://image.tmdb.org/t/p/w500" + match.poster_path) : (match.backdrop_path ? ("https://image.tmdb.org/t/p/w780" + match.backdrop_path) : "");
@@ -1230,6 +1282,64 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     }
   }
 
+  const nextEpInfo = await (async () => {
+    if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
+    const today = new Date().toISOString().slice(0, 10);
+    if (match.next_episode_to_air) {
+      const nextAir = match.next_episode_to_air.air_date || null;
+      if (nextAir && nextAir > today) {
+        return {
+          nextEpisodeAirDate: nextAir,
+          nextEpisodeNumber: typeof match.next_episode_to_air.episode_number === "number" ? match.next_episode_to_air.episode_number : null,
+          nextEpisodeSeasonNumber: typeof match.next_episode_to_air.season_number === "number" ? match.next_episode_to_air.season_number : null,
+          nextEpisodeName: match.next_episode_to_air.name || null,
+        };
+      }
+    }
+
+    // If next_episode_to_air is missing or points to an already-aired episode,
+    // inspect the season's episode list to find the actual next future episode
+    const seasonToSearch = (match.next_episode_to_air && match.next_episode_to_air.season_number) || (match.last_episode_to_air && match.last_episode_to_air.season_number);
+    if (seasonToSearch && tmdbId) {
+      try {
+        const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonToSearch + "?api_key=" + encodeURIComponent(apiKey), {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        });
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          if (Array.isArray(sData.episodes)) {
+            const futureEp = sData.episodes.find((ep) => ep && ep.air_date && ep.air_date > today);
+            if (futureEp) {
+              return {
+                nextEpisodeAirDate: futureEp.air_date,
+                nextEpisodeNumber: typeof futureEp.episode_number === "number" ? futureEp.episode_number : null,
+                nextEpisodeSeasonNumber: typeof futureEp.season_number === "number" ? futureEp.season_number : seasonToSearch,
+                nextEpisodeName: futureEp.name || null,
+              };
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // Fallback: check upcoming future seasons in match.seasons
+    const upcomingSeasons = Array.isArray(match.seasons)
+      ? match.seasons.filter((s) => s && s.season_number > 0 && s.air_date && s.air_date > today)
+      : [];
+    upcomingSeasons.sort((a, b) => a.air_date.localeCompare(b.air_date));
+    const nextSeason = upcomingSeasons[0];
+    if (nextSeason) {
+      return {
+        nextEpisodeAirDate: nextSeason.air_date,
+        nextEpisodeNumber: 1,
+        nextEpisodeSeasonNumber: nextSeason.season_number,
+        nextEpisodeName: nextSeason.name || null,
+      };
+    }
+    return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
+  })();
+
   return {
     id: realImdbId,
     title: match.title || match.name,
@@ -1249,47 +1359,8 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     trailerKey: trailerKey,
     cast: cast,
     director: director,
-    // Airing Next (client-side, 21_client-custom-list-builder.js) reads
-    // these straight off TMDB's own next_episode_to_air -- already present
-    // on this same /tv/{id} response fetched above, so this costs nothing
-    // extra. null on a movie, or a tv show with no scheduled next episode
-    // (ended/cancelled, or simply not yet renewed).
-    //
-    // Fallback: TMDB only populates next_episode_to_air once it has an
-    // actual episode row with a confirmed air date -- a renewed show whose
-    // next season has only a season-level premiere date announced (e.g.
-    // "Season 9 -- Jan 1, 2027") shows next_episode_to_air: null right up
-    // until TMDB adds that first episode's own row, even though the
-    // premiere date itself is already known. match.seasons (fetched as
-    // part of this same response, see seasonsData above) carries that
-    // season-level air_date, so fall back to the nearest not-yet-aired
-    // season in there rather than silently reporting "nothing scheduled".
-    ...(() => {
-      if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
-      if (match.next_episode_to_air) {
-        return {
-          nextEpisodeAirDate: match.next_episode_to_air.air_date || null,
-          nextEpisodeNumber: typeof match.next_episode_to_air.episode_number === "number" ? match.next_episode_to_air.episode_number : null,
-          nextEpisodeSeasonNumber: typeof match.next_episode_to_air.season_number === "number" ? match.next_episode_to_air.season_number : null,
-        };
-      }
-      const today = new Date().toISOString().slice(0, 10);
-      const upcomingSeasons = Array.isArray(match.seasons)
-        ? match.seasons.filter((s) => s && s.season_number > 0 && s.air_date && s.air_date > today)
-        : [];
-      upcomingSeasons.sort((a, b) => a.air_date.localeCompare(b.air_date));
-      const nextSeason = upcomingSeasons[0];
-      if (nextSeason) {
-        return {
-          nextEpisodeAirDate: nextSeason.air_date,
-          nextEpisodeNumber: 1,
-          nextEpisodeSeasonNumber: nextSeason.season_number,
-        };
-      }
-      return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null };
-    })(),
+    ...nextEpInfo,
     lastEpisodeNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.episode_number === "number" ? match.last_episode_to_air.episode_number : null) : null,
-    lastEpisodeSeasonNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.season_number === "number" ? match.last_episode_to_air.season_number : null) : null,
   };
 }
 
@@ -1439,10 +1510,20 @@ async function fetchStandardItemMeta(imdbId, type, apiKey) {
 // by findNextAiredEpisodeForShow below, for the Continue Watching cron
 // (checkForNewEpisodes, right below).
 function isEpisodeAiredServer(ep) {
-  if (!ep || !ep.air_date) return false;
-  const airDate = new Date(ep.air_date);
+  if (!ep) return false;
+  const dateStr = (typeof ep === 'string') ? ep : (ep.air_date || ep.airDate || '');
+  if (!dateStr) return false;
+  const parts = String(dateStr).split(/[-T\s]/);
+  if (parts.length < 3) return false;
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return false;
+  const airDate = new Date(year, month, day);
   if (isNaN(airDate.getTime())) return false;
-  return airDate.getTime() <= (Date.now() + 12 * 3600 * 1000);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return airDate.getTime() <= today.getTime();
 }
 
 // Given a show and the latest episode known to be watched, looks for the
@@ -1610,6 +1691,134 @@ async function checkForNewEpisodes(env) {
   }
 }
 
+// Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).
+// Populates KV and in-memory cache so visitors always experience instant cache hits with zero API rate limits across all providers.
+async function prewarmSharedCatalogs(env, ctx) {
+  if (!env || !env.CONFIGS) return;
 
+  const traktKey = (env && env.TRAKT_CLIENT_ID) || TRAKT_CLIENT_ID;
+  const tmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  const simklKey = (env && env.SIMKL_CLIENT_ID) || SIMKL_CLIENT_ID;
+  const mdblistKey = (env && env.MDBLIST_API_KEY) || MDBLIST_API_KEY;
+  const mdblistPopularKey = (env && env.MDBLIST_POPULAR_KEY) || MDBLIST_POPULAR_KEY;
 
+  // 1. Trakt Official Charts (every 6 mins)
+  if (traktKey) {
+    const traktCharts = [
+      { chartKey: "trending", type: "movie" },
+      { chartKey: "trending", type: "series" },
+      { chartKey: "popular", type: "movie" },
+      { chartKey: "popular", type: "series" },
+      { chartKey: "most_watched", type: "movie" },
+      { chartKey: "most_watched", type: "series" },
+      { chartKey: "most_anticipated", type: "movie" },
+      { chartKey: "most_anticipated", type: "series" },
+      { chartKey: "box_office", type: "movie" },
+    ];
+    for (const item of traktCharts) {
+      try {
+        await fetchTraktChart({ type: item.type }, 0, traktKey, item.chartKey, env, ctx);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } catch (e) {
+        console.warn(`[Cron] Prewarm Trakt chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
+      }
+    }
+  }
 
+  // 2. TMDB Official Charts & Streaming Services (every 6 mins)
+  if (tmdbKey) {
+    const tmdbCharts = [
+      { chartKey: "trending", type: "movie" },
+      { chartKey: "trending", type: "series" },
+      { chartKey: "popular", type: "movie" },
+      { chartKey: "popular", type: "series" },
+      { chartKey: "top_rated", type: "movie" },
+      { chartKey: "top_rated", type: "series" },
+      { chartKey: "now_playing", type: "movie" },
+      { chartKey: "upcoming", type: "movie" },
+      { chartKey: "new_movies", type: "movie" },
+      { chartKey: "new_shows", type: "series" },
+      { chartKey: "netflix", type: "movie" },
+      { chartKey: "netflix", type: "series" },
+      { chartKey: "disney", type: "movie" },
+      { chartKey: "disney", type: "series" },
+      { chartKey: "appletv", type: "movie" },
+      { chartKey: "appletv", type: "series" },
+      { chartKey: "primevideo", type: "movie" },
+      { chartKey: "primevideo", type: "series" },
+      { chartKey: "hbomax", type: "movie" },
+      { chartKey: "hbomax", type: "series" },
+      { chartKey: "hulu", type: "movie" },
+      { chartKey: "hulu", type: "series" },
+      { chartKey: "paramount", type: "movie" },
+      { chartKey: "paramount", type: "series" },
+    ];
+    for (const item of tmdbCharts) {
+      try {
+        await fetchTmdbChart({ type: item.type }, 0, tmdbKey, item.chartKey, "US", false, env, ctx);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      } catch (e) {
+        console.warn(`[Cron] Prewarm TMDB chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
+      }
+    }
+  }
+
+  // 3. Simkl Trending Charts (every 6 mins)
+  if (simklKey) {
+    const simklCharts = [
+      { chartKey: "today", type: "movie" },
+      { chartKey: "today", type: "series" },
+      { chartKey: "week", type: "movie" },
+      { chartKey: "week", type: "series" },
+      { chartKey: "month", type: "movie" },
+      { chartKey: "month", type: "series" },
+      { chartKey: "anime-week", type: "series" },
+    ];
+    for (const item of simklCharts) {
+      try {
+        await fetchSimklChart({ type: item.type }, 0, simklKey, item.chartKey, env, ctx);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      } catch (e) {
+        console.warn(`[Cron] Prewarm Simkl chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
+      }
+    }
+  }
+
+  // 4. MDBList Official Charts & Toplists (Throttled to once every 1 hour to preserve 1,000 req/day quota)
+  try {
+    const lastMdblistWarmRaw = await env.CONFIGS.get("cron:last_warmed:mdblist");
+    const lastMdblistWarm = lastMdblistWarmRaw ? parseInt(lastMdblistWarmRaw, 10) : 0;
+    const shouldWarmMdblist = !lastMdblistWarm || Date.now() - lastMdblistWarm >= 3600 * 1000;
+
+    if (shouldWarmMdblist) {
+      await env.CONFIGS.put("cron:last_warmed:mdblist", String(Date.now()));
+
+      if (mdblistPopularKey) {
+        try {
+          await fetchTopLists(mdblistPopularKey, env, ctx);
+        } catch (e) {
+          console.warn("[Cron] Prewarm MDBList toplists failed:", e && e.message ? e.message : e);
+        }
+      }
+
+      const mdblistCharts = [
+        { url: "https://mdblist.com/lists/official/movies/popular", type: "movie" },
+        { url: "https://mdblist.com/lists/official/shows/popular", type: "series" },
+        { url: "https://mdblist.com/lists/official/movies/justwatch-streaming-charts", type: "movie" },
+        { url: "https://mdblist.com/lists/official/shows/justwatch-streaming-charts", type: "series" },
+        { url: "https://mdblist.com/lists/official/movies/moviemeter", type: "movie" },
+        { url: "https://mdblist.com/lists/official/shows/moviemeter", type: "series" },
+      ];
+      for (const item of mdblistCharts) {
+        try {
+          await fetchMdblist({ url: item.url, type: item.type }, 0, mdblistKey, env, ctx);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        } catch (e) {
+          console.warn(`[Cron] Prewarm MDBList chart failed (${item.url} ${item.type}):`, e && e.message ? e.message : e);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[Cron] MDBList warm error:", e && e.message ? e.message : e);
+  }
+}

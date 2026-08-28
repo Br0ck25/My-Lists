@@ -8,13 +8,18 @@ function extractMdblistItem(it) {
   const ep = it.episode || null;
   const epShow = ep && ep.show ? ep.show : null;
   const inner = it.show || it.movie || epShow || it;
-  const rawId = inner.imdb_id || inner.imdbid || (inner.ids && inner.ids.imdb) || (typeof inner.id === 'string' && inner.id.startsWith('tt') ? inner.id : '');
-  const tmdbId = inner.tmdb_id || inner.tmdbid || (inner.ids && inner.ids.tmdb) || '';
-  const id = rawId || (tmdbId ? ('tmdb:' + tmdbId) : '');
-  if (!id) return null;
+
+  let rawImdb = inner.imdb_id || inner.imdbid || inner.imdb || (inner.ids && (inner.ids.imdb || inner.ids.imdb_id)) || (typeof inner.id === 'string' && inner.id.startsWith('tt') ? inner.id : '');
+  let rawTmdb = inner.tmdb_id || inner.tmdbid || inner.tmdb || (inner.ids && (inner.ids.tmdb || inner.ids.tmdb_id)) || '';
+  if (!rawTmdb && typeof inner.id === 'number') rawTmdb = String(inner.id);
+  else if (!rawTmdb && typeof inner.id === 'string' && /^\d+$/.test(inner.id)) rawTmdb = inner.id;
+  else if (!rawTmdb && typeof inner.id === 'string' && inner.id.startsWith('tmdb:')) rawTmdb = inner.id.slice(5);
+
+  const rawId = rawImdb || (rawTmdb ? ('tmdb:' + rawTmdb) : (inner.id ? String(inner.id) : ''));
+  if (!rawId) return null;
 
   const isEpisode = !!ep || !!epShow;
-  const isShow = isEpisode || !!it.show || inner.mediatype === 'show' || inner.mediatype === 'series' || inner.type === 'show' || inner.type === 'series' || !!inner.seasons;
+  const isShow = isEpisode || !!it.show || inner.mediatype === 'show' || inner.mediatype === 'series' || inner.mediatype === 'tv' || inner.type === 'show' || inner.type === 'series' || inner.type === 'tv' || !!inner.seasons;
   const mt = isShow ? 'series' : (it.movie || inner.mediatype === 'movie' || inner.type === 'movie' ? 'movie' : (inner.mediatype || inner.type || it.mediatype || it.type || 'movie')).toLowerCase();
 
   let name = inner.title || inner.name || it.title || it.name || 'Untitled';
@@ -25,13 +30,13 @@ function extractMdblistItem(it) {
     const epName = ep.name || ep.title ? ' \u2014 ' + (ep.name || ep.title) : '';
     name = (showTitle || 'Show') + ' S' + s + 'E' + e + epName;
   }
-  const showPoster = inner.poster || it.poster || (rawId ? `https://images.metahub.space/poster/medium/${rawId}/img` : undefined);
+  const showPoster = inner.poster || it.poster || (rawImdb ? `https://images.metahub.space/poster/medium/${rawImdb}/img` : undefined);
   const poster = isEpisode ? (ep && (ep.poster || ep.still) || showPoster) : showPoster;
   const releaseYear = inner.release_year || inner.year || it.release_year || it.year || undefined;
   return {
-    id,
-    imdbId: rawId,
-    tmdbId,
+    id: rawId,
+    imdbId: rawImdb || undefined,
+    tmdbId: rawTmdb ? String(rawTmdb) : undefined,
     mediatype: mt,
     name,
     showTitle,
@@ -48,43 +53,65 @@ function mapMdblistItems(data, type) {
   if (Array.isArray(data)) {
     rawList = data;
   } else if (data && typeof data === 'object') {
-    if (type === 'series') {
+    const d = data.watchlist || data.data || data;
+    if (Array.isArray(d)) {
+      rawList = d;
+    } else if (type === 'series') {
       rawList = [
-        ...(Array.isArray(data.shows) ? data.shows : []),
-        ...(Array.isArray(data.episodes) ? data.episodes : []),
-        ...(Array.isArray(data.seasons) ? data.seasons : []),
+        ...(Array.isArray(d.shows) ? d.shows : []),
+        ...(Array.isArray(d.series) ? d.series : []),
+        ...(Array.isArray(d.tv) ? d.tv : []),
+        ...(Array.isArray(d.episodes) ? d.episodes : []),
+        ...(Array.isArray(d.seasons) ? d.seasons : []),
       ];
+    } else if (type === 'movie') {
+      rawList = Array.isArray(d.movies) ? d.movies : [];
     } else {
-      rawList = Array.isArray(data.movies) ? data.movies : [];
+      rawList = [
+        ...(Array.isArray(d.movies) ? d.movies : []),
+        ...(Array.isArray(d.shows) ? d.shows : []),
+        ...(Array.isArray(d.series) ? d.series : []),
+        ...(Array.isArray(d.tv) ? d.tv : []),
+        ...(Array.isArray(d.episodes) ? d.episodes : []),
+        ...(Array.isArray(d.seasons) ? d.seasons : []),
+        ...(Array.isArray(d.results) ? d.results : []),
+        ...(Array.isArray(d.items) ? d.items : []),
+      ];
     }
     if (!rawList.length) {
-      if (Array.isArray(data.results)) rawList = data.results;
-      else if (Array.isArray(data.items)) rawList = data.items;
-      else {
+      if (Array.isArray(d.results)) rawList = d.results;
+      else if (Array.isArray(d.items)) rawList = d.items;
+      else if (Array.isArray(d.movies) || Array.isArray(d.shows)) {
         rawList = [
-          ...(Array.isArray(data.movies) ? data.movies : []),
-          ...(Array.isArray(data.shows) ? data.shows : []),
-          ...(Array.isArray(data.episodes) ? data.episodes : []),
-          ...(Array.isArray(data.seasons) ? data.seasons : []),
+          ...(Array.isArray(d.movies) ? d.movies : []),
+          ...(Array.isArray(d.shows) ? d.shows : []),
+          ...(Array.isArray(d.series) ? d.series : []),
+          ...(Array.isArray(d.tv) ? d.tv : []),
+          ...(Array.isArray(d.episodes) ? d.episodes : []),
+          ...(Array.isArray(d.seasons) ? d.seasons : []),
         ];
       }
     }
   }
 
+  const isMixed = !type || type === 'mixed' || type === 'unknown' || type === 'all';
+
   return rawList
     .map(extractMdblistItem)
     .filter(Boolean)
     .filter((it) => {
+      if (isMixed) return true;
       const mt = it.mediatype;
       if (type === 'series') return mt === 'show' || mt === 'series' || mt === 'tv';
       return mt === 'movie' || mt === '' || mt === 'unknown';
     })
     .map((it) => {
       const posterFallbackId = (it.imdbId && it.imdbId.startsWith('tt')) ? it.imdbId : (it.id && it.id.startsWith('tt') ? it.id : '');
+      const actualType = (it.mediatype === 'show' || it.mediatype === 'series' || it.mediatype === 'tv') ? 'series' : (it.mediatype === 'episode' ? 'episode' : 'movie');
       return {
         id: it.id,
         imdbId: it.imdbId,
-        type,
+        type: isMixed ? actualType : type,
         name: it.name,
         showTitle: it.showTitle,
         poster: it.poster || (posterFallbackId ? `https://images.metahub.space/poster/medium/${posterFallbackId}/img` : undefined),
@@ -95,7 +122,7 @@ function mapMdblistItems(data, type) {
     });
 }
 
-async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
+async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = null) {
   const src = mdblistJsonUrl(entry.url, mdblistKey);
   if (!src) {
     throw new Error(
@@ -103,35 +130,43 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "") {
     );
   }
 
-  const res = await fetch(src, {
-    headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
-    // Raised from 300s (5min) to 600s (10min) -- this is the default/
-    // fallback list source (detectSource's own catch-all), and it always
-    // carries an apikey -- the shared MDBLIST_API_KEY whenever a visitor
-    // hasn't pasted in their own -- so it draws against MDBList's shared
-    // 1,000-requests-per-day budget (a flat daily cap, no rolling window
-    // the way Trakt's works) every time it's a cache miss. Same tradeoff
-    // as the Trakt TTL bump above: a public list's own update takes up to
-    // 10min longer to show up for someone else browsing it.
-    cf: { cacheTtl: 600, cacheEverything: true },
+  const listId = await hashStringForKey(entry.url);
+  const cacheKey = `user_cache:mdblist:list:${listId}:${entry.type}:${skip}`;
+  const kvKey = `mdblist:list:${listId}:${entry.type}:${skip}`;
+
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 3600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "MDBList",
+    fetchFn: async () => {
+      const res = await fetch(src, {
+        headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 600, cacheEverything: true },
+      });
+
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(
+            "MDBList returned 404. Check that the user and list names match the URL on mdblist.com, and that the list is set to Public."
+          );
+        }
+        const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key or connection." : "";
+        throw new Error(`MDBList request failed (HTTP ${res.status}).${hint}`);
+      }
+
+      const data = await res.json();
+      const metas = mapMdblistItems(data, entry.type);
+      const total = metas.length;
+      const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+      enriched.totalItems = total;
+      return enriched;
+    },
   });
-
-  if (!res.ok) {
-    if (res.status === 404) {
-      throw new Error(
-        "MDBList returned 404. Check that the user and list names match the URL on mdblist.com, and that the list is set to Public."
-      );
-    }
-    const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key or connection." : "";
-    throw new Error(`MDBList request failed (HTTP ${res.status}).${hint}`);
-  }
-
-  const data = await res.json();
-  const metas = mapMdblistItems(data, entry.type);
-  const total = metas.length;
-  const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
-  enriched.totalItems = total;
-  return enriched;
 }
 
 // Pulls the user's watchlist from MDBList
@@ -143,25 +178,64 @@ async function fetchMdblistWatchlist(entry, skip = 0, mdblistKey = "", mdblistAc
     );
   }
 
-  const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}`, "Accept": "application/json" };
-  const authQuery = mdblistAccessToken ? "" : `?apikey=${encodeURIComponent(mdblistKey)}`;
+  const headers = {
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+    "Accept": "application/json",
+  };
   if (mdblistAccessToken) {
     headers["Authorization"] = `Bearer ${mdblistAccessToken}`;
   }
-
-  const res = await fetch(`https://api.mdblist.com/watchlist${authQuery}`, {
-    headers,
-    cf: { cacheTtl: 300, cacheEverything: true },
-  });
-
-  if (!res.ok) {
-    const hint = res.status === 401 || res.status === 403 ? " Double-check your MDBList API key or connection." : "";
-    throw new Error(`MDBList watchlist request failed (HTTP ${res.status}).${hint}`);
+  if (mdblistKey) {
+    headers["x-api-key"] = mdblistKey;
   }
 
-  const data = await res.json();
-  const metas = mapMdblistItems(data, entry.type);
-  return enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+  const authQuery = `?apikey=${encodeURIComponent(token)}`;
+  const endpoints = [
+    `https://api.mdblist.com/watchlist${authQuery}`,
+    `https://api.mdblist.com/watchlist/items${authQuery}`,
+    `https://api.mdblist.com/sync/watchlist${authQuery}`,
+    `https://api.mdblist.com/lists/user${authQuery}`,
+  ];
+
+  let rawData = null;
+  for (const ep of endpoints) {
+    try {
+      const res = await fetch(ep, {
+        headers,
+        cf: { cacheTtl: 120, cacheEverything: false },
+      });
+      if (res.ok) {
+        const d = await res.json().catch(() => null);
+        if (d) {
+          if (ep.includes('/lists/user')) {
+            const userLists = Array.isArray(d) ? d : (Array.isArray(d.lists) ? d.lists : []);
+            const wlList = userLists.find(l => l && (l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.is_watchlist || l.watchlist));
+            if (wlList && wlList.id) {
+              const itemsRes = await fetch(`https://api.mdblist.com/lists/${encodeURIComponent(wlList.id)}/items${authQuery}`, { headers }).catch(() => null);
+              if (itemsRes && itemsRes.ok) {
+                rawData = await itemsRes.json().catch(() => null);
+                if (rawData) break;
+              }
+            }
+          } else {
+            const hasItems = Array.isArray(d) ? d.length > 0 : (d.movies?.length > 0 || d.shows?.length > 0 || d.results?.length > 0 || d.items?.length > 0 || d.watchlist);
+            if (hasItems) {
+              rawData = d;
+              break;
+            } else if (!rawData) {
+              rawData = d;
+            }
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  const metas = mapMdblistItems(rawData, entry.type);
+  const total = metas.length;
+  const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
+  enriched.totalItems = total;
+  return enriched;
 }
 
 // Pulls the user's watched history from MDBList, paginated.
@@ -283,7 +357,7 @@ function mapTraktItems(data, type) {
 // install link, if any. A key the user didn't supply falls back to the
 // Worker-wide MDBLIST_API_KEY/TRAKT_CLIENT_ID constants at the top of the
 // file.
-async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
+async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env = null, ctx = null) {
   if (!traktKey) {
     throw new Error(
       "Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
@@ -307,31 +381,22 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
     "Content-Type": "application/json",
     "trakt-api-version": "2",
     "trakt-api-key": traktKey,
-    "User-Agent": "my-list-addon/1.4",
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
   };
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
   const userHash = accessToken ? safeUserHash(accessToken, parsed.user) : "public";
   const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${skip}:${userHash}`;
+  const kvKey = !accessToken ? `trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${page}` : "";
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
-    // Public/unauthenticated fetches (the ones that fall back to the
-    // shared TRAKT_CLIENT_ID and so draw against Trakt's shared
-    // 1,000-calls-per-5-minutes app-level limit -- see this function's
-    // own header comment) get a longer fresh window than a personal,
-    // per-user-token fetch: 600s (10min) here, 1200s (20min) on the raw
-    // fetch()'s own cf.cacheTtl below. Since 600 < 1200, the in-memory
-    // layer here will actually re-run more often than the edge cache
-    // beneath it changes -- real protection against hitting Trakt's
-    // origin again is bounded by the 1200s edge figure, not this one;
-    // this number mainly buys a fresher response for whoever's waiting
-    // on it, not fewer real Trakt calls. Personal-token fetches keep
-    // their short 60s window (unrelated to the shared-quota concern this
-    // is protecting against -- authed calls draw from Trakt's separate,
-    // per-user limit instead).
+    kvKey,
+    env,
+    ctx,
     freshTtlSec: accessToken ? 60 : 600,
-    staleTtlSec: 1800,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
     providerLabel: "Trakt List",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -348,6 +413,8 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "") {
             ? accessToken
               ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
               : " Double-check your Trakt Client ID."
+            : res.status === 429
+            ? " Trakt is temporarily busy (rate limit). Please wait a few seconds and try again."
             : "";
         throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
       }
@@ -397,6 +464,8 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
         const hint =
           res.status === 401 || res.status === 403
             ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : res.status === 429
+            ? " Trakt is temporarily busy (rate limit). Please wait a few seconds and try again."
             : "";
         throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
       }
@@ -485,6 +554,8 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
         const hint =
           res.status === 401 || res.status === 403
             ? " Your Trakt connection may have expired (they last about 3 months) -- try reconnecting in Settings."
+            : res.status === 429
+            ? " Trakt is temporarily busy (rate limit). Please wait a few seconds and try again."
             : "";
         throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
       }
@@ -493,5 +564,235 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
   });
 
   return enrichTrailers(mapTraktHistoryItems(data, entry.type), entry.type, TMDB_API_KEY);
+}
+
+// Pulls the connected account's Trakt Airing Next shows
+async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken = "", tmdbApiKey = "", env = null, ctx = null) {
+  if (!accessToken) {
+    throw new Error(
+      "Connect Trakt in Settings first — your Airing Next shelf needs your Trakt sign-in."
+    );
+  }
+  if (!traktKey) {
+    throw new Error(
+      "Trakt isn't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
+    );
+  }
+
+  const tmdbKey = tmdbApiKey || TMDB_API_KEY;
+  const userHash = safeUserHash(accessToken);
+  const cacheKey = `user_cache:trakt:airing_next:${skip}:${userHash}`;
+
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 300,
+    staleTtlSec: 3600,
+    providerLabel: "Trakt Airing Next",
+    fetchFn: async () => {
+      const headers = {
+        "Content-Type": "application/json",
+        "trakt-api-version": "2",
+        "trakt-api-key": traktKey,
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+      };
+
+      const [watchedRes, watchlistRes] = await Promise.all([
+        fetchTraktWithRetry("https://api.trakt.tv/users/me/watched/shows?extended=noseasons", {
+          headers,
+          cf: { cacheTtl: 60, cacheEverything: false },
+        }).catch(() => null),
+        fetchTraktWithRetry("https://api.trakt.tv/users/me/watchlist/shows?limit=50", {
+          headers,
+          cf: { cacheTtl: 60, cacheEverything: false },
+        }).catch(() => null),
+      ]);
+
+      const candidateShows = [];
+      if (watchedRes && watchedRes.ok) {
+        try {
+          const wData = await watchedRes.json();
+          if (Array.isArray(wData)) candidateShows.push(...wData);
+        } catch {}
+      }
+      if (watchlistRes && watchlistRes.ok) {
+        try {
+          const wlData = await watchlistRes.json();
+          if (Array.isArray(wlData)) candidateShows.push(...wlData);
+        } catch {}
+      }
+
+      candidateShows.sort((a, b) => {
+        const aTime = a.last_watched_at ? new Date(a.last_watched_at).getTime() : 0;
+        const bTime = b.last_watched_at ? new Date(b.last_watched_at).getTime() : 0;
+        return bTime - aTime;
+      });
+
+      const seen = new Set();
+      const candidateMetas = [];
+      candidateShows.forEach((it) => {
+        const show = it.show || it;
+        if (show && show.ids) {
+          const imdbId = show.ids.imdb || "";
+          const tmdbId = show.ids.tmdb || "";
+          const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "");
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            candidateMetas.push({
+              id,
+              imdbId,
+              tmdbId,
+              name: show.title || "",
+              poster: imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "",
+              year: show.year ? String(show.year) : undefined,
+            });
+          }
+        }
+      });
+
+      const airingMetas = [];
+      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+        try {
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          if (details && details.nextEpisodeAirDate) {
+            const isPremiere = details.nextEpisodeNumber === 1;
+            const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
+            const eNum = details.nextEpisodeNumber ? `E${String(details.nextEpisodeNumber).padStart(2, "0")}` : "";
+            const epLabel = sNum && eNum ? `${sNum}${eNum}` : "";
+            const realId = (item.imdbId && item.imdbId.startsWith("tt")) ? item.imdbId : (details.imdbId && String(details.imdbId).startsWith("tt") ? details.imdbId : (item.id || item.imdbId));
+            airingMetas.push({
+              id: realId,
+              type: "series",
+              name: item.name || details.title || "",
+              poster: item.poster || details.poster || "",
+              background: details.background || undefined,
+              airDate: details.nextEpisodeAirDate,
+              isSeasonPremiere: isPremiere,
+              description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+              trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
+            });
+          }
+        } catch {}
+      });
+
+      airingMetas.sort((a, b) => (a.airDate || "").localeCompare(b.airDate || ""));
+      return airingMetas.slice(skip, skip + PAGE_SIZE);
+    },
+  });
+}
+
+// Pulls the connected account's MDBList Airing Next shows
+async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistAccessToken = "", tmdbApiKey = "", env = null, ctx = null) {
+  const token = mdblistAccessToken || mdblistKey;
+  if (!token) {
+    throw new Error(
+      "Your MDBList Airing Next needs your connected MDBList account or API key."
+    );
+  }
+
+  const tmdbKey = tmdbApiKey || TMDB_API_KEY;
+  const authQuery = mdblistAccessToken ? "" : `?apikey=${encodeURIComponent(mdblistKey)}`;
+  const headers = { "User-Agent": `my-list-addon/${ADDON_VERSION}`, "Accept": "application/json" };
+  if (mdblistAccessToken) headers["Authorization"] = `Bearer ${mdblistAccessToken}`;
+
+  const cacheKey = `user_cache:mdblist:airing_next:${skip}:${safeUserHash(token)}`;
+
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 300,
+    staleTtlSec: 3600,
+    providerLabel: "MDBList Airing Next",
+    fetchFn: async () => {
+      const sep = authQuery ? "&" : "?";
+      const [showsRes, episodesRes, watchlistRes] = await Promise.all([
+        fetch(`https://api.mdblist.com/sync/watched${authQuery}${sep}mediatype=show&limit=50&append_to_response=poster`, {
+          headers,
+          cf: { cacheTtl: 60, cacheEverything: false },
+        }).catch(() => null),
+        fetch(`https://api.mdblist.com/sync/watched${authQuery}${sep}mediatype=episode&limit=50&append_to_response=poster`, {
+          headers,
+          cf: { cacheTtl: 60, cacheEverything: false },
+        }).catch(() => null),
+        fetch(`https://api.mdblist.com/watchlist${authQuery}`, {
+          headers,
+          cf: { cacheTtl: 300, cacheEverything: true },
+        }).catch(() => null),
+      ]);
+
+      const rawItems = [];
+      if (showsRes && showsRes.ok) {
+        try {
+          const d = await showsRes.json();
+          if (Array.isArray(d)) rawItems.push(...d);
+          else if (d && Array.isArray(d.shows)) rawItems.push(...d.shows);
+          else if (d && Array.isArray(d.results)) rawItems.push(...d.results);
+        } catch {}
+      }
+      if (episodesRes && episodesRes.ok) {
+        try {
+          const d = await episodesRes.json();
+          if (Array.isArray(d)) rawItems.push(...d);
+          else if (d && Array.isArray(d.episodes)) rawItems.push(...d.episodes);
+          else if (d && Array.isArray(d.results)) rawItems.push(...d.results);
+        } catch {}
+      }
+      if (watchlistRes && watchlistRes.ok) {
+        try {
+          const d = await watchlistRes.json();
+          if (Array.isArray(d)) rawItems.push(...d);
+          else if (d && Array.isArray(d.shows)) rawItems.push(...d.shows);
+          else if (d && Array.isArray(d.results)) rawItems.push(...d.results);
+        } catch {}
+      }
+
+      const seen = new Set();
+      const candidateMetas = [];
+      rawItems.forEach((it) => {
+        const extracted = extractMdblistItem(it);
+        if (extracted && extracted.mediatype === "series") {
+          const id = extracted.id;
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            candidateMetas.push({
+              id,
+              imdbId: extracted.imdbId || "",
+              tmdbId: extracted.tmdbId || "",
+              name: extracted.showTitle || extracted.name || "",
+              poster: extracted.poster || (extracted.imdbId ? `https://images.metahub.space/poster/medium/${extracted.imdbId}/img` : ""),
+              year: extracted.releaseInfo,
+            });
+          }
+        }
+      });
+
+      const airingMetas = [];
+      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+        try {
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          if (details && details.nextEpisodeAirDate) {
+            const isPremiere = details.nextEpisodeNumber === 1;
+            const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
+            const eNum = details.nextEpisodeNumber ? `E${String(details.nextEpisodeNumber).padStart(2, "0")}` : "";
+            const epLabel = sNum && eNum ? `${sNum}${eNum}` : "";
+            const realId = (item.imdbId && item.imdbId.startsWith("tt")) ? item.imdbId : (details.imdbId && String(details.imdbId).startsWith("tt") ? details.imdbId : (item.id || item.imdbId));
+            airingMetas.push({
+              id: realId,
+              type: "series",
+              name: item.name || details.title || "",
+              poster: item.poster || details.poster || "",
+              background: details.background || undefined,
+              airDate: details.nextEpisodeAirDate,
+              isSeasonPremiere: isPremiere,
+              description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+              trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
+            });
+          }
+        } catch {}
+      });
+
+      airingMetas.sort((a, b) => (a.airDate || "").localeCompare(b.airDate || ""));
+      return airingMetas.slice(skip, skip + PAGE_SIZE);
+    },
+  });
 }
 

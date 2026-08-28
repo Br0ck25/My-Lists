@@ -1,8 +1,19 @@
 # My Lists Addon
 
-A powerful, self-hosted [Stremio](https://stremio.com) and [wako](https://wako.app) add-on that transforms your **MDBList**, **Trakt**, **TMDB**, and **Simkl** lists into dynamic catalog rows on your home screen — featuring a full **Custom List Builder**, **Letterboxd CSV Import**, **Virtual TV Channels**, **Continue Watching & Watch History Sync**, **Creator Profiles**, and an **Admin Analytics Dashboard**, all running on a single free [Cloudflare Workers](https://workers.cloudflare.com) deployment.
+> **Official Website & Live Web App**: [**mylistsaddon.com**](https://mylistsaddon.com)
+
+A powerful, full-featured [Stremio](https://stremio.com) and [wako](https://wako.app) add-on that transforms your **MDBList**, **Trakt**, **TMDB**, and **Simkl** lists into dynamic catalog rows on your home screen — featuring a full **Custom List Builder**, **Letterboxd CSV Import**, **Virtual TV Channels**, **Airing Next Calendars**, **Continue Watching & Watch History Sync**, **Creator Profiles**, and an **Admin Analytics Dashboard**, all running on a single free [Cloudflare Workers](https://workers.cloudflare.com) deployment or directly at [**mylistsaddon.com**](https://mylistsaddon.com).
 
 There are no servers to manage, no external databases required, and no subscription fees. Your configuration is encoded directly into your install link or securely synchronized via your own private Cloudflare KV storage.
+
+---
+
+## 🌐 Quick Start (Try It Online)
+
+You can use the official hosted instance right now without deploying anything:
+👉 **[mylistsaddon.com](https://mylistsaddon.com)**
+
+Or follow the instructions below to self-host on your own free Cloudflare Worker.
 
 ---
 
@@ -130,13 +141,13 @@ To access the `/admin` telemetry and management console:
 
 ---
 
-### Step 6 — (Optional) Set Up Continue Watching Cron Trigger
+### Step 6 — (Optional) Set Up 6-Minute Cron Trigger (Global Catalog Pre-Warming & Continue Watching)
 
-To automatically check for newly-aired episodes every 6 hours for users with a Creator Profile:
+To automatically pre-warm shared **Trakt**, **TMDB**, **Simkl**, and **MDBList** charts into Cloudflare KV every 6 minutes (preventing API rate limits for all visitors and ensuring instant `< 50ms` catalog loads) and check for newly-aired episodes:
 1. In Cloudflare Dashboard, go to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
 2. Go to **Settings**, scroll down to **Trigger events** (or **Triggers** &rarr; **Cron Triggers**).
 3. Click **Add Trigger** (or **Add Cron Trigger**).
-4. Set the cron expression to: `0 */6 * * *` (every 6 hours).
+4. Set the cron expression to: `*/6 * * * *` (every 6 minutes).
 5. Click **Save** / **Deploy**.
 
 ---

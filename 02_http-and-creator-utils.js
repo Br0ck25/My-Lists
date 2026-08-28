@@ -454,36 +454,75 @@ function invalidatePerUserCache(provider, userHash = "") {
 }
 
 // Executes an external fetch with safe per-user caching and circuit-breaker fallback.
-// If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response if available.
+// If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response from in-memory or KV.
 async function fetchWithPerUserCacheAndCircuitBreaker({
   cacheKey,
   fetchFn,
   freshTtlSec = 60,
   staleTtlSec = 1800,
-  providerLabel = "External API"
+  providerLabel = "External API",
+  env = null,
+  ctx = null,
+  kvKey = "",
+  kvTtlSec = 86400,
 }) {
   const cached = getPerUserCache(cacheKey);
   if (cached && cached.isFresh) {
     return cached.data;
   }
 
+  let kvData = null;
+  if (!cached && env && env.CONFIGS && kvKey) {
+    try {
+      const raw = await env.CONFIGS.get(`cache:${kvKey}`, "json");
+      if (raw && raw.data !== undefined) {
+        kvData = raw;
+        setPerUserCache(cacheKey, raw.data, freshTtlSec, staleTtlSec);
+        const now = Date.now();
+        if (raw.freshUntil && now <= raw.freshUntil) {
+          return raw.data;
+        }
+      }
+    } catch {}
+  }
+
   try {
     const freshData = await fetchFn();
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
+      if (env && env.CONFIGS && kvKey) {
+        const p = env.CONFIGS.put(
+          `cache:${kvKey}`,
+          JSON.stringify({
+            data: freshData,
+            freshUntil: Date.now() + freshTtlSec * 1000,
+          }),
+          { expirationTtl: kvTtlSec }
+        ).catch(() => {});
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(p);
+        }
+      }
       return freshData;
     }
   } catch (err) {
     const errMsg = String(err && err.message ? err.message : err);
     if (cached && cached.data) {
-      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good cached data.`);
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good in-memory cached data.`);
       return cached.data;
+    }
+    if (kvData && kvData.data) {
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good KV cached data.`);
+      return kvData.data;
     }
     throw err;
   }
 
   if (cached && cached.data) {
     return cached.data;
+  }
+  if (kvData && kvData.data) {
+    return kvData.data;
   }
   return null;
 }
@@ -492,7 +531,8 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
   let res = await fetch(url, options);
   if (res.status === 429 && retries > 0) {
     const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
-    const delayMs = Math.min(3000, Math.max(1000, retrySec * 1000));
+    const jitter = Math.floor(Math.random() * 500);
+    const delayMs = Math.min(3000, Math.max(1000, retrySec * 1000)) + jitter;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return fetchTraktWithRetry(url, options, retries - 1);
   }

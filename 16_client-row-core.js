@@ -458,24 +458,34 @@ function updateAllListAddButtons() {
 
 function navigateBackFromDetail() {
   const currentTab = document.querySelector('.tab-panel:not([hidden])')?.dataset?.tabPanel;
-  if (history.length > 1) {
-    history.back();
-  } else if (currentTab === 'item-details' && window._previousTab === 'list-details') {
-    switchTab('list-details');
-    if (typeof window._listScrollY === 'number') {
-      const scrollPos = window._listScrollY;
-      window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      requestAnimationFrame(() => {
+  if (currentTab === 'item-details' && window._previousTab === 'list-details') {
+    if (history.length > 1) {
+      history.back();
+    } else {
+      switchTab('list-details');
+      if (typeof window._listScrollY === 'number') {
+        const scrollPos = window._listScrollY;
         window.scrollTo({ top: scrollPos, behavior: 'instant' });
-        setTimeout(() => {
-          window.scrollTo({ top: scrollPos, behavior: 'instant' });
-        }, 50);
-      });
+      }
     }
+  } else if (history.length > 1 && window._previousTab && window._previousTab !== 'list-details' && window._previousTab !== 'item-details') {
+    history.back();
   } else {
     const targetTab = window._originTab || window._previousTab || localStorage.getItem('myListAddon:activeTab') || 'discover';
     const cleanTab = (targetTab === 'list-details' || targetTab === 'item-details') ? 'discover' : targetTab;
+    if (location.pathname.startsWith('/lists/') || location.pathname.startsWith('/channels/')) {
+      try {
+        history.replaceState({ view: 'tab', tab: cleanTab }, '', '/');
+      } catch (e) {}
+    }
     switchTab(cleanTab);
+    if (cleanTab === 'catalogs') {
+      const targetSubmenu = window._previousCatalogsSubmenu || localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
+      if (typeof switchCatalogsSubmenu === 'function') switchCatalogsSubmenu(targetSubmenu);
+    } else if (cleanTab === 'channels') {
+      const targetSubmenu = window._previousChannelsSubmenu || localStorage.getItem('myListAddon:channelsSubmenu') || 'storylines';
+      if (typeof switchChannelsSubmenu === 'function') switchChannelsSubmenu(targetSubmenu);
+    }
     if (typeof window._previousScrollY === 'number') {
       const scrollPos = window._previousScrollY;
       window.scrollTo({ top: scrollPos, behavior: 'instant' });
@@ -722,6 +732,12 @@ function switchTab(name) {
       filterDiscoverShelves(activeFilter, targetBtn || pills[0]);
     }
   }
+  if (name === 'search') {
+    const input = document.getElementById('catalogSearchInput');
+    if (input && !input.value.trim()) {
+      if (typeof renderDefaultCatalogSearch === 'function') renderDefaultCatalogSearch();
+    }
+  }
 }
 
 function showAddedToast(msg) {
@@ -738,6 +754,69 @@ function showAddedToast(msg) {
   toast._timer = setTimeout(() => {
     toast.classList.remove('show');
   }, 2200);
+}
+
+function handlePosterImgError(img) {
+  if (!img || img.dataset.hasFailedFallback) {
+    if (img) {
+      img.style.display = 'none';
+      const parent = img.parentElement;
+      if (parent && !parent.querySelector('.live-preview-poster-placeholder')) {
+        const ph = document.createElement('div');
+        ph.className = 'live-preview-poster live-preview-poster-placeholder';
+        ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
+        parent.appendChild(ph);
+      }
+    }
+    return;
+  }
+  img.dataset.hasFailedFallback = '1';
+  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
+  const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
+  const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
+  const id = (card && card.dataset.id) || (card && card.dataset.imdbId) || '';
+  if (title || id) {
+    const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
+    const imdbId = id.startsWith('tt') ? id : '';
+    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.ok && data.poster) {
+          img.src = data.poster;
+          img.style.display = '';
+        }
+      })
+      .catch(() => {});
+  }
+}
+
+function resolveMissingPostersInDom(rootEl) {
+  const container = rootEl || document;
+  container.querySelectorAll('.live-preview-poster-placeholder[data-needs-fallback="1"]').forEach(ph => {
+    if (ph.dataset.fallbackRequested) return;
+    ph.dataset.fallbackRequested = '1';
+    const card = ph.closest('.live-preview-poster-card') || ph.closest('.list-card') || ph.closest('[data-title]');
+    const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
+    const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
+    const id = (card && card.dataset.id) || '';
+    if (!title && !id) return;
+    const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
+    const imdbId = id.startsWith('tt') ? id : '';
+    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.ok && data.poster) {
+          const newImg = document.createElement('img');
+          newImg.className = 'live-preview-poster';
+          newImg.src = data.poster;
+          newImg.alt = '';
+          newImg.loading = 'lazy';
+          newImg.onerror = function() { handlePosterImgError(this); };
+          ph.replaceWith(newImg);
+        }
+      })
+      .catch(() => {});
+  });
 }
 
 function showModal(innerHtml, extraClass) {
@@ -1815,11 +1894,12 @@ function addRow(name, url, type, enabled, group, channelId) {
       : (isChannel || isCustomList || isPremade)
         ? ''
         : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>') +
-    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span>' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
+    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span class="shelf-drag-handle" draggable="true" title="Drag to reorder catalog">&#x2630;</span><span class="shelf-title-text">' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><span class="live-preview-shelf-status"></span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
   container.appendChild(div);
   updateSourceRemoveButtons(div);
   relocateAddSourceBtn(div);
   initTouchDrag(div.querySelector('.drag-handle'));
+  initTouchDrag(div.querySelector('.shelf-drag-handle'));
   checkAllDuplicateUrls();
   renumber();
   if (!suppressSave) {

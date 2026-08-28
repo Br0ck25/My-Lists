@@ -127,8 +127,10 @@ function detectSource(input) {
   const s = (input || "").trim();
   if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:")) return "mdblist-watchlist";
   if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/history\//i.test(s)) return "mdblist-history";
+  if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
   if (s === "trakt:watchlist") return "trakt-watchlist";
   if (s === "trakt:history") return "trakt-history";
+  if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
@@ -190,36 +192,51 @@ function tmdbCollectionId(input) {
 // via their REST API and normalizes each entry into something the builder
 // page can turn into an entry with one click. Requires an MDBList API key —
 // same one used for private lists / the watchlist quick-add.
-async function fetchTopLists(apikey) {
+async function fetchTopLists(apikey, env = null, ctx = null) {
   if (!apikey) {
     throw new Error(
       "Popular Lists isn't configured on this add-on yet — the Worker owner needs to set MDBLIST_POPULAR_KEY."
     );
   }
 
-  const res = await fetch(
-    `https://api.mdblist.com/lists/top?apikey=${encodeURIComponent(apikey)}`,
-    {
-      headers: { "User-Agent": "my-list-addon/1.3" },
-      cf: { cacheTtl: 3600, cacheEverything: true },
-    }
-  );
-  if (!res.ok) {
-    const hint =
-      res.status === 401 || res.status === 403 ? " Double-check your MDBList API key." : "";
-    throw new Error(`MDBList top-lists request failed (HTTP ${res.status}).${hint}`);
-  }
+  const cacheKey = "user_cache:mdblist:toplists";
+  const kvKey = "mdblist:toplists";
 
-  const data = await res.json();
-  return (Array.isArray(data) ? data : []).map((l) => ({
-    name: l.name,
-    user: l.user_name,
-    slug: l.slug,
-    type: l.mediatype === "show" ? "series" : "movie",
-    items: l.items,
-    likes: l.likes,
-    url: `https://mdblist.com/lists/${encodeURIComponent(l.user_name)}/${encodeURIComponent(l.slug)}`,
-  }));
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 3600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "MDBList Toplists",
+    fetchFn: async () => {
+      const res = await fetch(
+        `https://api.mdblist.com/lists/top?apikey=${encodeURIComponent(apikey)}`,
+        {
+          headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        }
+      );
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403 ? " Double-check your MDBList API key." : "";
+        throw new Error(`MDBList top-lists request failed (HTTP ${res.status}).${hint}`);
+      }
+
+      const data = await res.json();
+      return (Array.isArray(data) ? data : []).map((l) => ({
+        name: l.name,
+        user: l.user_name,
+        slug: l.slug,
+        type: l.mediatype === "show" ? "series" : "movie",
+        items: l.items,
+        likes: l.likes,
+        url: `https://mdblist.com/lists/${encodeURIComponent(l.user_name)}/${encodeURIComponent(l.slug)}`,
+      }));
+    },
+  });
 }
 
 // Searches trakt.tv's public lists by name via their official search API.

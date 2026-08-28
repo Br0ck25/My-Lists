@@ -185,7 +185,7 @@
     <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search to find movies, shows and lists to add to your lists.</p>
     
     <div class="row">
-      <input type="text" id="catalogSearchInput" placeholder="Search by title or list name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
+      <input type="text" id="catalogSearchInput" placeholder="Search by title or list name..." oninput="handleCatalogSearchInput(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
       <button type="button" class="primary" onclick="runCatalogSearch()">Search</button>
     </div>
 
@@ -193,6 +193,52 @@
       <button type="button" class="subnav-pill active" onclick="setCatalogSearchFilter('movie', this)"><span class="check-icon">&#x2713;</span> Movies</button>
       <button type="button" class="subnav-pill" onclick="setCatalogSearchFilter('tv', this)">Shows</button>
       <button type="button" class="subnav-pill" onclick="setCatalogSearchFilter('lists', this)">Lists</button>
+    </div>
+
+    <!-- Quick Filter Dropdowns for Movies & Shows -->
+    <div id="catalogSearchFiltersRow" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center;">
+      <select id="catalogSearchGenreSelect" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+        <option value="">All Genres</option>
+        <option value="28,10759">Action &amp; Adventure</option>
+        <option value="16">Animation</option>
+        <option value="35">Comedy</option>
+        <option value="80">Crime</option>
+        <option value="99">Documentary</option>
+        <option value="18">Drama</option>
+        <option value="10751,10762">Family &amp; Kids</option>
+        <option value="14,878,10765">Fantasy &amp; Sci-Fi</option>
+        <option value="36">History</option>
+        <option value="27">Horror</option>
+        <option value="10402">Music</option>
+        <option value="9648">Mystery</option>
+        <option value="10749">Romance</option>
+        <option value="53">Thriller</option>
+        <option value="10752,10768">War &amp; Politics</option>
+        <option value="37">Western</option>
+      </select>
+
+      <select id="catalogSearchYearSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+        <option value="">All Years</option>
+        <option value="2026">2026</option>
+        <option value="2025">2025</option>
+        <option value="2024">2024</option>
+        <option value="2023">2023</option>
+        <option value="2020-2022">2020–2022</option>
+        <option value="2010-2019">2010s</option>
+        <option value="2000-2009">2000s</option>
+        <option value="1990-1999">1990s</option>
+        <option value="<1990">1980s &amp; Older</option>
+      </select>
+
+      <select id="catalogSearchRatingSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+        <option value="">All Ratings</option>
+        <option value="8.0">8.0+ ⭐</option>
+        <option value="7.0">7.0+ ⭐</option>
+        <option value="6.0">6.0+ ⭐</option>
+        <option value="5.0">5.0+ ⭐</option>
+      </select>
+
+      <button type="button" id="catalogSearchResetFiltersBtn" class="secondary lc-btn" onclick="resetSearchFilters()" style="font-size:0.8rem; padding:6px 10px; height:auto; display:none;">Reset</button>
     </div>
 
     <div id="catalogSearchResult" style="margin-top:14px;"></div>

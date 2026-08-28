@@ -397,20 +397,20 @@ async function populateSearchResultPosters() {
   async function fetchPreviewOnce(listUrl, type) {
     const payload = { url: listUrl, type: type, sample: 12 };
     const mkInput = document.getElementById('mdblistKeyInput');
-    if (mkInput && mkInput.value) payload.mdblistKey = mkInput.value.trim();
+    payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
     const tkInput = document.getElementById('tmdbKeyInput');
-    if (tkInput && tkInput.value) payload.tmdbKey = tkInput.value.trim();
+    payload.tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
     const trkInput = document.getElementById('traktKeyInput');
-    if (trkInput && trkInput.value) payload.traktKey = trkInput.value.trim();
-    // trakt:watchlist and trakt:history (the "Watchlist"/"Watch History"
-    // cards under Your Trakt Lists) are both OAuth-only sources -- see
-    // fetchTraktWatchlist/fetchTraktHistory, which throw immediately
-    // without an accessToken, traktKey alone isn't enough for either.
-    if (typeof traktAccessToken !== 'undefined' && traktAccessToken) payload.traktAccessToken = traktAccessToken;
-    if (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) payload.mdblistAccessToken = mdblistAccessToken;
-    if (typeof simklAccessToken !== 'undefined' && simklAccessToken) payload.simklAccessToken = simklAccessToken;
+    payload.traktKey = (trkInput && trkInput.value ? trkInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
+    
+    const trkToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    if (trkToken) payload.traktAccessToken = trkToken;
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    if (mdbToken) payload.mdblistAccessToken = mdbToken;
+    const smkToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+    if (smkToken) payload.simklAccessToken = smkToken;
     const skInput = document.getElementById('simklKeyInput');
-    if (skInput && skInput.value) payload.simklKey = skInput.value.trim();
+    payload.simklKey = (skInput && skInput.value ? skInput.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1284,11 +1284,21 @@ document.addEventListener('click', async (e) => {
 // markShowWatched (also 21) to exclude future episodes from "fully
 // watched" detection and from what Mark Whole Show Watched fetches.
 function isEpisodeAired(ep) {
-  if (!ep || !ep.air_date) return false;
-  const airDate = new Date(ep.air_date);
+  if (!ep) return false;
+  const dateStr = (typeof ep === 'string') ? ep : (ep.air_date || ep.airDate || '');
+  if (!dateStr) return false;
+  const parts = String(dateStr).split(/[-T\s]/);
+  if (parts.length < 3) return false;
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return false;
+  const airDate = new Date(year, month, day);
   if (isNaN(airDate.getTime())) return false;
-  // Compare against end of current day UTC (with 12h buffer for timezone differences)
-  return airDate.getTime() <= (Date.now() + 12 * 3600 * 1000);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // If airDate is on or before today, the episode has already aired
+  return airDate.getTime() <= today.getTime();
 }
 
 function formatAirDateBadge(airDateStr) {
@@ -1306,7 +1316,8 @@ function formatAirDateBadge(airDateStr) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const diffDays = Math.round((d.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
 
-  if (diffDays === 0) return 'Today';
+  // If already aired or airs today, no upcoming badge is shown
+  if (diffDays <= 0) return '';
   if (diffDays === 1) return 'Tomorrow';
   if (diffDays > 1 && diffDays < 7) {
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1629,17 +1640,17 @@ async function openItemDetailsModal(id, type, opts) {
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : '';
         const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
         seasonsHtml += 
-          '<div style="background:var(--surface-light); border:1px solid var(--border); border-radius:8px; overflow:hidden;">' +
-            '<div style="display:flex; justify-content:space-between; align-items:center; gap:16px; padding:16px; cursor:pointer;" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
-              '<div style="display:flex; gap:16px; align-items:center; min-width:0;">' +
-                (sPoster ? '<img src="' + escapeAttr(sPoster) + '" style="width:80px; border-radius:4px; flex-shrink:0; box-shadow:0 2px 8px rgba(0,0,0,0.3);">' : '<div style="width:80px; height:120px; background:#333; border-radius:4px; flex-shrink:0;"></div>') +
-                '<div style="display:flex; flex-direction:column; justify-content:center; min-width:0;">' +
-                  '<h4 style="margin:0 0 4px; font-size:1.2rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(season.name) + '</h4>' +
-                  '<div style="color:var(--muted); font-size:0.9rem;">' + season.episode_count + ' episodes</div>' +
+          '<div class="season-card">' +
+            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+              '<div class="season-header-main">' +
+                (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
+                '<div class="season-header-info">' +
+                  '<h4 class="season-header-title">' + escapeHtml(season.name) + '</h4>' +
+                  '<div class="season-header-episodes">' + season.episode_count + ' episodes</div>' +
                 '</div>' +
               '</div>' +
-              '<div style="flex-shrink:0; margin-left:12px;">' +
-                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" style="padding:6px 14px; font-size:0.82rem; white-space:nowrap;" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
+              '<div class="season-header-actions">' +
+                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
                   (isSeasonWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched' : 'Mark Season Watched') +
                 '</button>' +
               '</div>' +
@@ -1887,6 +1898,8 @@ function openSelectListModal(id, type, title, poster) {
       try {
         const payload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
         if (!payload.localSlug && !payload.creatorSlug) return;
+        if (payload.localSlug === 'airing-next' || payload.localSlug === 'watch-history' || payload.localSlug === 'continue-watching') return;
+        if (payload.creatorSlug === 'airing-next' || payload.creatorSlug === 'watch-history' || payload.creatorSlug === 'continue-watching') return;
         if (payload.type && payload.type !== 'mixed' && payload.type !== type) return;
         const nameInput = row.querySelector('.name');
         customLists.push({
@@ -1901,7 +1914,7 @@ function openSelectListModal(id, type, title, poster) {
   try {
     const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     Object.keys(localMap).forEach(slug => {
-      if (slug === 'watch-history' || slug === 'continue-watching') return;
+      if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'airing-next') return;
       const l = localMap[slug];
       if (!l) return;
       if (l.type && l.type !== 'mixed' && l.type !== type) return;
@@ -1919,6 +1932,7 @@ function openSelectListModal(id, type, title, poster) {
   if (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
     lastCreatorListsData.forEach(l => {
       if (!l || !l.slug) return;
+      if (l.slug === 'watch-history' || l.slug === 'continue-watching' || l.slug === 'airing-next') return;
       if (l.type && l.type !== 'mixed' && l.type !== type) return;
       const existing = customLists.find(c => c.url && (c.url.includes(l.slug) || (c.name && c.name.toLowerCase() === (l.name || '').toLowerCase())));
       if (!existing) {
@@ -2550,6 +2564,21 @@ async function syncCustomListPayload(payload, name) {
 
 
 let currentCatalogSearchType = 'movie';
+let catalogSearchDebounceTimer = null;
+window._rawCatalogTitleItems = [];
+
+function handleCatalogSearchInput(input) {
+  const q = (input ? input.value : '').trim();
+  if (!q) {
+    if (catalogSearchDebounceTimer) clearTimeout(catalogSearchDebounceTimer);
+    renderDefaultCatalogSearch();
+    return;
+  }
+  if (catalogSearchDebounceTimer) clearTimeout(catalogSearchDebounceTimer);
+  catalogSearchDebounceTimer = setTimeout(() => {
+    runCatalogSearch();
+  }, 350);
+}
 
 function setCatalogSearchFilter(filter, btn) {
   if (btn) {
@@ -2562,8 +2591,165 @@ function setCatalogSearchFilter(filter, btn) {
     btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
   }
   currentCatalogSearchType = filter;
-  if (document.getElementById('catalogSearchInput').value.trim()) {
+  const filtersRow = document.getElementById('catalogSearchFiltersRow');
+  if (filtersRow) {
+    filtersRow.style.display = (filter === 'lists') ? 'none' : 'flex';
+  }
+  const q = (document.getElementById('catalogSearchInput')?.value || '').trim();
+  if (q) {
     runCatalogSearch();
+  } else {
+    renderDefaultCatalogSearch();
+  }
+}
+
+function resetSearchFilters() {
+  const gEl = document.getElementById('catalogSearchGenreSelect');
+  const yEl = document.getElementById('catalogSearchYearSelect');
+  const rEl = document.getElementById('catalogSearchRatingSelect');
+  if (gEl) gEl.value = '';
+  if (yEl) yEl.value = '';
+  if (rEl) rEl.value = '';
+  applySearchFilters();
+}
+
+function applySearchFilters() {
+  if (currentCatalogSearchType === 'lists') return;
+  const resEl = document.getElementById('catalogSearchResult');
+  if (!resEl) return;
+
+  const gVal = (document.getElementById('catalogSearchGenreSelect')?.value || '').trim();
+  const yVal = (document.getElementById('catalogSearchYearSelect')?.value || '').trim();
+  const rVal = (document.getElementById('catalogSearchRatingSelect')?.value || '').trim();
+
+  const resetBtn = document.getElementById('catalogSearchResetFiltersBtn');
+  if (resetBtn) {
+    resetBtn.style.display = (gVal || yVal || rVal) ? 'inline-block' : 'none';
+  }
+
+  const rawItems = Array.isArray(window._rawCatalogTitleItems) ? window._rawCatalogTitleItems : [];
+  if (!rawItems.length) return;
+
+  const genreFilterIds = gVal ? gVal.split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean) : [];
+  const minRating = rVal ? parseFloat(rVal) : 0;
+
+  const filtered = rawItems.filter(m => {
+    // 1. Genre filter
+    if (genreFilterIds.length > 0) {
+      const itemGenres = Array.isArray(m.genreIds) ? m.genreIds : [];
+      const hasMatch = itemGenres.some(id => genreFilterIds.includes(id));
+      if (!hasMatch) return false;
+    }
+
+    // 2. Year filter
+    if (yVal) {
+      const yr = parseInt(m.year, 10);
+      if (yVal === '<1990') {
+        if (!yr || yr >= 1990) return false;
+      } else if (yVal.includes('-')) {
+        const parts = yVal.split('-').map(s => parseInt(s, 10));
+        if (parts.length === 2 && (yr < parts[0] || yr > parts[1])) return false;
+      } else {
+        if (String(m.year) !== yVal) return false;
+      }
+    }
+
+    // 3. Rating filter
+    if (minRating > 0) {
+      if (typeof m.rating !== 'number' || m.rating < minRating) return false;
+    }
+
+    return true;
+  });
+
+  renderTitlePosterCards(filtered, rawItems.length, resEl);
+}
+
+function renderTitlePosterCards(items, totalCount, resEl) {
+  if (!items || !items.length) {
+    resEl.innerHTML = '<p style="margin:16px 0; color:var(--muted); font-size:0.9rem;"><small>No titles match the selected filters.</small></p>';
+    return;
+  }
+
+  const countBadge = (typeof totalCount === 'number' && totalCount > items.length)
+    ? '<div style="margin-bottom:10px; font-size:0.82rem; color:var(--muted);">Showing ' + items.length + ' of ' + totalCount + ' results</div>'
+    : ((typeof totalCount === 'number' && totalCount > 20) ? '<div style="margin-bottom:10px; font-size:0.82rem; color:var(--muted);">' + items.length + ' results found</div>' : '');
+
+  const postersHtml = items.map(m => {
+    const posterClass = 'live-preview-poster';
+    const posterEl = m.poster
+      ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+      : '<div class="' + posterClass + ' live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    
+    const title = m.title || '';
+    const type = currentCatalogSearchType === 'tv' ? 'series' : 'movie';
+    const id = 'tmdb:' + m.tmdbId;
+    const ratingHtml = (typeof m.rating === 'number' && m.rating > 0)
+      ? '<span style="color:#f5c518; font-weight:700; font-size:0.75rem; margin-left:auto;">&#9733; ' + m.rating.toFixed(1) + '</span>'
+      : '';
+    
+    return '<div class="live-preview-poster-card clickable-poster" ' +
+      'data-id="' + escapeAttr(id || '') + '" ' +
+      'data-type="' + escapeAttr(type) + '" ' +
+      'data-title="' + escapeAttr(m.title || '') + '" ' +
+      'data-poster="' + escapeAttr(m.poster || '') + '" ' +
+      '>' +
+      '<div style="position:relative; width:100%;">' +
+        posterEl +
+        '<div class="poster-add-overlay" title="Add to Custom List">+</div>' +
+      '</div>' +
+      '<div class="live-preview-poster-name">' + escapeHtml(title) + '</div>' +
+      '<div class="live-preview-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px;">' +
+        '<span>' + escapeHtml(m.year || '') + '</span>' +
+        ratingHtml +
+      '</div>' +
+      '</div>';
+  }).join('');
+  
+  resEl.innerHTML = countBadge + '<div class="poster-grid-3">' + postersHtml + '</div>';
+  if (typeof resolveMissingPostersInDom === 'function') {
+    resolveMissingPostersInDom(resEl);
+  }
+}
+
+async function renderDefaultCatalogSearch() {
+  const resEl = document.getElementById('catalogSearchResult');
+  if (!resEl) return;
+  const inputEl = document.getElementById('catalogSearchInput');
+  if (inputEl && inputEl.value.trim()) return;
+
+  resEl.innerHTML = '<p><small>Loading top ' + (currentCatalogSearchType === 'lists' ? 'public lists' : (currentCatalogSearchType === 'tv' ? 'shows' : 'movies')) + '...</small></p>';
+
+  if (currentCatalogSearchType === 'lists') {
+    window._rawCatalogTitleItems = [];
+    try {
+      const res = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' });
+      const data = await res.json();
+      if (inputEl && inputEl.value.trim()) return;
+      if (!data.ok || !data.lists || !data.lists.length) {
+        resEl.innerHTML = '<p><small>No public lists available yet.</small></p>';
+        return;
+      }
+      const top20 = data.lists.slice(0, 20);
+      renderListSearchResults([], [], null, top20, [], resEl);
+    } catch (e) {
+      resEl.innerHTML = '<p class="testresult err">✗ Could not load public lists.</p>';
+    }
+    return;
+  }
+
+  try {
+    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
+    const data = await res.json();
+    if (inputEl && inputEl.value.trim()) return;
+    if (!data.ok || !data.results || !data.results.length) {
+      resEl.innerHTML = '<p><small>No titles found.</small></p>';
+      return;
+    }
+    window._rawCatalogTitleItems = data.results;
+    applySearchFilters();
+  } catch (e) {
+    resEl.innerHTML = '<p class="testresult err">✗ Could not load top titles.</p>';
   }
 }
 
@@ -2571,7 +2757,7 @@ async function runCatalogSearch() {
   const q = document.getElementById('catalogSearchInput').value.trim();
   const resEl = document.getElementById('catalogSearchResult');
   if (!q) {
-    resEl.innerHTML = '';
+    renderDefaultCatalogSearch();
     return;
   }
   resEl.innerHTML = '<p><small>Searching...</small></p>';
@@ -2627,41 +2813,13 @@ async function runCatalogSearch() {
       return;
     }
     if (!data.results || !data.results.length) {
-      resEl.innerHTML = '<p><small>No results found.</small></p>';
+      window._rawCatalogTitleItems = [];
+      resEl.innerHTML = '<p><small>No results found for "' + escapeHtml(q) + '".</small></p>';
       return;
     }
     
-    const postersHtml = data.results.map(m => {
-      const posterClass = 'live-preview-poster';
-      const posterEl = m.poster
-        ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy">'
-        : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
-      
-      const title = m.title || '';
-      const type = currentCatalogSearchType === 'tv' ? 'series' : 'movie';
-      // A bare "tmdb:<id>" -- fetchTmdbItemDetails (07_source-fetchers-
-      // tmdb-simkl.js) resolves this into the title's real IMDb id
-      // server-side before it ever reaches window._currentItemDetails, so
-      // every downstream watched-status check/save keys off the same real
-      // id a title opened from Discover/a chart would have used too.
-      const id = 'tmdb:' + m.tmdbId;
-      
-      return '<div class="live-preview-poster-card clickable-poster" ' +
-        'data-id="' + escapeAttr(id || '') + '" ' +
-        'data-type="' + escapeAttr(type) + '" ' +
-        'data-title="' + escapeAttr(m.title || '') + '" ' +
-        'data-poster="' + escapeAttr(m.poster || '') + '" ' +
-        '>' +
-        '<div style="position:relative; width:100%;">' +
-          posterEl +
-          '<div class="poster-add-overlay" title="Add to Custom List">+</div>' +
-        '</div>' +
-        '<div class="live-preview-poster-name">' + escapeHtml(title) + '</div>' +
-        (m.year ? '<div class="live-preview-poster-year">' + escapeHtml(m.year) + '</div>' : '') +
-        '</div>';
-    }).join('');
-    
-    resEl.innerHTML = '<div class="poster-grid-3">' + postersHtml + '</div>';
+    window._rawCatalogTitleItems = data.results;
+    applySearchFilters();
   } catch (e) {
     resEl.innerHTML = '<p class="testresult err">✗ Network error.</p>';
   }
