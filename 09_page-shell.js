@@ -159,7 +159,15 @@ ${seoHeadHtml}
     } catch (e) {}
   })();
 </script>
-<style>
+<!--
+  Marked for extraction the same way the client bundle is (see
+  splitAppBundle, 02_http-and-creator-utils.js). This stylesheet is ~85KB,
+  identical for every visitor and every route, and was inlined into every
+  page alongside the script. Verified deploy-constant by the same test that
+  covers the bundle: rendered across origins, configure mode and deep links,
+  it comes back byte-identical every time and carries no injected value.
+-->
+<style>/*MYLISTS_APP_CSS_START*/
   :root {
     /* Wako-inspired iOS-native modern light theme */
     --bg:           #F2F2F7;
@@ -1162,6 +1170,27 @@ ${seoHeadHtml}
     line-height: 1.4;
   }
   .list-card-meta-sep { color: var(--border-strong); }
+  .list-source-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    border-radius: 4px;
+    letter-spacing: 0.3px;
+    line-height: 1.2;
+    margin-right: 4px;
+    vertical-align: middle;
+    background: var(--surface-2, rgba(255,255,255,0.06));
+    border: 1px solid var(--border);
+    color: var(--text-2);
+  }
+  .list-source-badge.badge-mdblist { background: rgba(52,199,89,0.12); color: #34c759; border-color: rgba(52,199,89,0.3); }
+  .list-source-badge.badge-trakt { background: rgba(255,59,48,0.12); color: #ff3b30; border-color: rgba(255,59,48,0.3); }
+  .list-source-badge.badge-tmdb { background: rgba(90,200,250,0.12); color: #5ac8fa; border-color: rgba(90,200,250,0.3); }
+  .list-source-badge.badge-simkl { background: rgba(0,122,255,0.12); color: #007aff; border-color: rgba(0,122,255,0.3); }
+  .list-source-badge.badge-mylists, .list-source-badge.badge-profile { background: rgba(175,82,222,0.12); color: #af52de; border-color: rgba(175,82,222,0.3); }
+  .list-source-badge.badge-streaming { background: rgba(255,149,0,0.12); color: #ff9500; border-color: rgba(255,149,0,0.3); }
   .list-card-actions {
     display: flex; gap: 5px; align-items: center; flex-shrink: 0; flex-wrap: wrap;
   }
@@ -1460,7 +1489,58 @@ ${seoHeadHtml}
     background: #2fa84f;
     top: auto;
     bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
   }
+  .cw-date-badge-finale {
+    background: var(--warn, #FF9500);
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+  .cw-date-badge-finale-date {
+    background: rgba(20, 20, 24, 0.92);
+    color: #ffd166;
+    border: 1px solid rgba(255, 149, 0, 0.35);
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+    font-size: 0.58rem;
+    font-weight: 700;
+  }
+  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date) { display: none !important; }
+  body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }
+  body.hide-badge-season-finale .cw-date-badge-finale { display: none !important; }
+  body.hide-badge-season-finale-date .cw-date-badge-finale-date { display: none !important; }
+  body.hide-badge-rating .rating-badge, body.hide-badge-rating .poster-rating { display: none !important; }
+  body.hide-badge-watched .watched-badge, body.hide-badge-watched .cw-watched-indicator { display: none !important; }
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
+  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .rating-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .watched-badge { display: none !important; }
+  body.hide-airing-next-badges #myPrivateTraktListsResult .cw-date-badge,
+  body.hide-airing-next-badges #mySimklListsResult .cw-date-badge,
+  body.hide-airing-next-badges #myMdblistListsResult .cw-date-badge,
+  body.hide-airing-next-badges [data-list-key="airing-next"] .cw-date-badge,
+  body.hide-airing-next-badges .airing-next-card .cw-date-badge,
+  body.hide-airing-next-badges .live-preview-shelf-row[data-list-slug="airing-next"] .cw-date-badge,
+  body.hide-airing-next-badges .live-preview-posters.is-airing-next-shelf .cw-date-badge { display: none !important; }
+  body.hide-continue-watching-badges [data-list-key="continue-watching"] .cw-date-badge,
+  body.hide-continue-watching-badges .continue-watching-card .cw-date-badge,
+  body.hide-continue-watching-badges .live-preview-shelf-row[data-list-slug="continue-watching"] .cw-date-badge,
+  body.hide-continue-watching-badges .live-preview-posters.is-continue-watching-shelf .cw-date-badge { display: none !important; }
   .airing-next-filter-pills {
     display: flex;
     gap: 6px;
@@ -2887,7 +2967,7 @@ ${seoHeadHtml}
   .unsaved-install-banner-btn:active {
     transform: scale(0.96);
   }
-  </style>
+/*MYLISTS_APP_CSS_END*/</style>
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 </head>
 <body>
@@ -3047,10 +3127,11 @@ ${seoHeadHtml}
         </label>
         <button type="button" class="subnav-pill" id="whClearHistoryBtn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear History</button>
       </div>
-      <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center;">
+      <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center; width:100%;">
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
         <label for="whSortSelect" style="font-size:0.75rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:0.02em;">Sort</label>

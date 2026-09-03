@@ -13,7 +13,7 @@
         <h2 class="shelf-title">Your Custom Lists</h2>
         <div style="display:flex; gap:8px;">
           <button type="button" class="primary lc-btn" onclick="openCreateListModal('custom')">+ New List</button>
-          <button type="button" class="secondary lc-btn" onclick="renderCreatorDashboard()">Refresh</button>
+          <button type="button" class="secondary lc-btn" onclick="(async()=>{await loadCreatorSync();renderCreatorDashboard();})()">Refresh</button>
         </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Custom lists you've created locally or on your profile.</p>

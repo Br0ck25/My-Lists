@@ -142,14 +142,180 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-async function runListSearch() {
-  const q = document.getElementById('listSearchInput').value.trim();
-  const box = document.getElementById('listSearchResult');
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
+}
+
+function parseListSearchIntent(rawQuery) {
+  const raw = String(rawQuery || '').trim();
+  const q = raw.toLowerCase().replace(/['"“”]/g, '').trim();
+  if (!q) return { raw, term: '', source: null, isSourceOnly: false };
+
+  let source = null;
+  let term = q;
+
+  const patterns = [
+    { source: 'MDBList', regex: /^(?:mdblist|mdb)\b\s*/i },
+    { source: 'Trakt', regex: /^(?:trakt|trakt\.tv)\b\s*/i },
+    { source: 'TMDB', regex: /^(?:tmdb|themoviedb|franchise|collection|collections)\b\s*/i },
+    { source: 'Simkl', regex: /^(?:simkl|anime)\b\s*/i },
+    { source: 'My Lists Addon', regex: /^(?:my\s*lists\s*addon|my\s*lists|mylists|profile|profiles|community)\b\s*/i },
+    { source: 'Streaming', regex: /^(?:netflix|disney\+?|hbo\s*max|max|hulu|apple\s*tv\+?|prime\s*video|amazon|paramount\+?|peacock)\b\s*/i },
+  ];
+
+  for (const p of patterns) {
+    if (p.regex.test(q)) {
+      source = p.source;
+      term = q.replace(p.regex, '').trim();
+      break;
+    }
+  }
+
+  const aliases = {
+    'mdblist': 'MDBList', 'mdb': 'MDBList',
+    'trakt': 'Trakt', 'trakt.tv': 'Trakt',
+    'tmdb': 'TMDB', 'themoviedb': 'TMDB', 'franchise': 'TMDB', 'collection': 'TMDB', 'collections': 'TMDB',
+    'simkl': 'Simkl', 'anime': 'Simkl',
+    'my lists addon': 'My Lists Addon', 'mylistsaddon': 'My Lists Addon', 'my lists': 'My Lists Addon', 'mylists': 'My Lists Addon', 'profile': 'My Lists Addon', 'profiles': 'My Lists Addon', 'community': 'My Lists Addon',
+    'streaming': 'Streaming', 'netflix': 'Streaming', 'disney': 'Streaming', 'disney+': 'Streaming', 'hbo': 'Streaming', 'max': 'Streaming', 'hulu': 'Streaming', 'apple': 'Streaming', 'apple tv': 'Streaming', 'prime': 'Streaming', 'prime video': 'Streaming', 'paramount': 'Streaming', 'peacock': 'Streaming',
+  };
+  if (aliases[q]) {
+    source = aliases[q];
+    term = '';
+  }
+
+  return {
+    raw,
+    term,
+    source,
+    isSourceOnly: (source && !term),
+  };
+}
+
+function scoreListSearchMatch(list, rawQuery, intent) {
+  if (!list) return -1;
+  const listName = (list.name || '').toLowerCase().trim();
+  const listUser = (list.creatorName || list.user || list.username || '').toLowerCase().trim();
+  const listUrl = (list.url || '').toLowerCase();
+  const listSource = (list.source || (listUrl.includes('mdblist') ? 'MDBList' : (listUrl.includes('trakt') ? 'Trakt' : (listUrl.includes('simkl') ? 'Simkl' : (listUrl.includes('themoviedb') || listUrl.startsWith('tmdb:') ? 'TMDB' : 'My Lists Addon'))))).toLowerCase();
+
+  const q = (rawQuery || '').toLowerCase().trim();
+  const targetTerm = (intent && intent.term ? intent.term : q).toLowerCase().trim();
+  const targetSource = (intent && intent.source ? intent.source : '').toLowerCase();
+
+  let score = 0;
+
+  // Source match boost
+  if (targetSource) {
+    if (listSource.includes(targetSource) || (targetSource === 'my lists addon' && (listSource.includes('my lists') || listSource.includes('profile'))) || (targetSource === 'streaming' && (listUrl.startsWith('tmdb:chart:') || listName.includes('netflix') || listName.includes('disney') || listName.includes('hbo') || listName.includes('hulu') || listName.includes('apple') || listName.includes('prime')))) {
+      score += 600;
+    }
+  }
+
+  // Pure source search (no extra keyword)
+  if (!targetTerm) {
+    if (targetSource && (listSource.includes(targetSource) || (targetSource === 'streaming' && listUrl.startsWith('tmdb:chart:')))) {
+      const likes = typeof list.likes === 'number' ? list.likes : (parseInt(list.likes, 10) || 0);
+      const items = typeof list.items === 'number' ? list.items : (parseInt(list.items, 10) || 0);
+      return score + Math.min(400, likes * 2 + items);
+    }
+    return score > 0 ? score : -1;
+  }
+
+  // Check if anything matched title, user, source, or url
+  const tokens = targetTerm.split(/\s+/).filter(Boolean);
+  let matchedTokensInName = 0;
+  let matchedTokensInUser = 0;
+  for (const token of tokens) {
+    if (listName.includes(token)) matchedTokensInName++;
+    if (listUser.includes(token)) matchedTokensInUser++;
+  }
+
+  const hasAnyMatch = (matchedTokensInName > 0 || matchedTokensInUser > 0 || listName.includes(targetTerm) || listUser.includes(targetTerm) || listSource.includes(targetTerm) || listUrl.includes(targetTerm));
+  if (!hasAnyMatch) {
+    return -1;
+  }
+
+  // 1. Exact title match
+  if (listName === targetTerm || listName === q) {
+    score += 2500;
+  } else if (listName.startsWith(targetTerm) || listName.startsWith(q)) {
+    score += 1500;
+  } else if (listName.includes(targetTerm) || listName.includes(q)) {
+    score += 900;
+  }
+
+  // 2. Exact creator match
+  if (listUser === targetTerm || listUser === q) {
+    score += 2000;
+  } else if (listUser.startsWith(targetTerm) || listUser.startsWith(q)) {
+    score += 1300;
+  } else if (listUser.includes(targetTerm) || listUser.includes(q)) {
+    score += 800;
+  }
+
+  // 3. Multi-token title & creator matching
+  if (tokens.length > 1) {
+    if (matchedTokensInName === tokens.length) {
+      score += 1000;
+    } else if (matchedTokensInName > 0) {
+      score += matchedTokensInName * 250;
+    }
+
+    if (matchedTokensInUser === tokens.length) {
+      score += 900;
+    } else if (matchedTokensInUser > 0) {
+      score += matchedTokensInUser * 200;
+    }
+  }
+
+  // 4. Word boundary matches
+  try {
+    const rx = new RegExp('\\b' + escapeRegex(targetTerm) + '\\b', 'i');
+    if (rx.test(listName)) score += 400;
+    if (rx.test(listUser)) score += 400;
+  } catch (e) {}
+
+  // 5. Source / tag matches
+  if (listSource.includes(targetTerm)) {
+    score += 300;
+  }
+
+  // 6. Popularity & item count tie-breakers
+  const likes = typeof list.likes === 'number' ? list.likes : (parseInt(list.likes, 10) || 0);
+  const items = typeof list.items === 'number' ? list.items : (parseInt(list.items, 10) || 0);
+  score += Math.min(250, Math.log10(likes + 1) * 50);
+  score += Math.min(60, Math.log10(items + 1) * 15);
+
+  return score;
+}
+
+window._unifiedSearchCache = window._unifiedSearchCache || new Map();
+let currentListSearchSequence = 0;
+
+async function executeUnifiedListSearch(rawQuery, targetBox) {
+  const q = (rawQuery || '').trim();
+  const box = targetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
+  if (!box) return;
   if (!q) {
     box.innerHTML = '';
     return;
   }
-  box.innerHTML = '<p><small>Searching\u2026</small></p>';
+
+  const thisSeq = ++currentListSearchSequence;
+  const qLower = q.toLowerCase();
+  const cacheKey = qLower;
+
+  // Check client memory cache (1-hour expiry)
+  const cached = window._unifiedSearchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.time < 3600000)) {
+    renderListSearchResults(cached.mdblistMatches, cached.traktMatches, cached.traktError, cached.myListsMatches, cached.tmdbMatches, box, cached.intent);
+    return;
+  }
+
+  if (!box.children.length) {
+    box.innerHTML = '<p><small>Searching lists\u2026</small></p>';
+  }
 
   try {
     fetch(ORIGIN + '/api/track-search', {
@@ -160,35 +326,66 @@ async function runListSearch() {
     }).catch(() => {});
   } catch (e) {}
 
-  const qLower = q.toLowerCase();
+  const intent = parseListSearchIntent(q);
+  const searchTerm = intent.term || q;
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  const traktKey = document.getElementById('traktKeyInput').value.trim();
+  const traktKey = (document.getElementById('traktKeyInput')?.value || '').trim();
 
-  const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
-    ensureMdblistPopularLoaded(),
-    fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
+  const fetches = [
+    ensureMdblistPopularLoaded().catch(() => []),
+    fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(searchTerm) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
       .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
-    fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
+    fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(searchTerm))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
+    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-  ]);
+  ];
 
-  const mdblistMatches = mdblistAll
-    .filter((l) => l.name.toLowerCase().includes(qLower) || l.user.toLowerCase().includes(qLower))
-    .slice(0, 30);
-  const traktMatches = traktResult.ok ? traktResult.lists.slice(0, 30) : [];
-  const myListsMatches = myListsResult.ok ? myListsResult.lists : [];
-  const tmdbMatches = tmdbResult.ok ? tmdbResult.lists : [];
+  if (intent.source === 'Trakt' || intent.isSourceOnly) {
+    fetches.push(ensureTraktPopularLoaded().catch(() => []));
+  }
 
-  renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches);
+  const [mdblistAll, traktResult, myListsResult, tmdbResult, traktPopular] = await Promise.all(fetches);
+
+  // If a newer search query was already submitted by the user while this one was running, discard this response!
+  if (thisSeq !== currentListSearchSequence) {
+    return;
+  }
+
+  const mdblistMatches = Array.isArray(mdblistAll) ? mdblistAll : [];
+  const traktMatches = [
+    ...(traktResult && traktResult.ok && Array.isArray(traktResult.lists) ? traktResult.lists : []),
+    ...(Array.isArray(traktPopular) ? traktPopular : [])
+  ];
+  const myListsMatches = myListsResult && myListsResult.ok && Array.isArray(myListsResult.lists) ? myListsResult.lists : [];
+  const tmdbMatches = tmdbResult && tmdbResult.ok && Array.isArray(tmdbResult.lists) ? tmdbResult.lists : [];
+  const traktError = traktResult && !traktResult.ok ? traktResult.error : null;
+
+  // Save to client cache
+  window._unifiedSearchCache.set(cacheKey, {
+    time: Date.now(),
+    mdblistMatches,
+    traktMatches,
+    traktError,
+    myListsMatches,
+    tmdbMatches,
+    intent,
+  });
+
+  renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, box, intent);
 }
 
-function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox) {
+async function runListSearch() {
+  const q = document.getElementById('listSearchInput').value.trim();
+  const box = document.getElementById('listSearchResult');
+  return executeUnifiedListSearch(q, box);
+}
+
+function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox, queryOrIntent) {
   let realTmdbMatches = tmdbMatches;
   let realTargetBox = targetBox;
   if (tmdbMatches && (tmdbMatches.nodeType || !Array.isArray(tmdbMatches))) {
@@ -200,6 +397,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
   if (!Array.isArray(realTmdbMatches)) realTmdbMatches = [];
   const box = realTargetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
   if (!box) return;
+
   const alreadyAdded = new Set();
   document.querySelectorAll('#lists .entry').forEach((entry) => {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
@@ -208,171 +406,173 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     });
   });
 
-  const combinedCards = [];
+  const intent = (typeof queryOrIntent === 'object' && queryOrIntent !== null)
+    ? queryOrIntent
+    : parseListSearchIntent(typeof queryOrIntent === 'string' ? queryOrIntent : '');
 
-  // Build one .list-card per TMDB collection / chart result
+  const candidates = [];
+
+  // TMDB / Simkl matches
   realTmdbMatches.forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span style="color:var(--brand); font-weight:600;">' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + typeLabel + '</span>' +
-      (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + escapeHtml(l.items) + '</span>' : '') +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: 50, html: cardHtml });
+    if (!l || !l.url) return;
+    const source = l.source || (l.url.startsWith('simkl:') ? 'Simkl' : 'TMDB');
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || (source === 'Simkl' ? 'Simkl Official' : 'TMDB Official'),
+      url: l.url,
+      type: l.type || 'movie',
+      items: l.items || (source === 'Simkl' ? 'Simkl Chart' : 'Franchise'),
+      likes: l.likes || 0,
+      source: source,
+      isCollection: !!l.isCollection,
+    });
   });
 
-  // Build one .list-card per mdblist result
-  mdblistMatches.forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + typeLabel + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
+  // MDBList matches
+  (mdblistMatches || []).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || 'MDBList Curator',
+      url: l.url,
+      type: l.type || 'movie',
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'MDBList',
+    });
   });
 
-  // Build one .list-card per Trakt result
-  traktMatches.forEach((l) => {
-    const addedMovie = alreadyAdded.has(l.url + '|movie');
-    const addedSeries = alreadyAdded.has(l.url + '|series');
-    const viewType = (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : 'movie';
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    // Determine the card's data-list-type for chip filtering
-    const cardType = (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : 'mixed';
+  // Trakt matches
+  (traktMatches || []).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || 'Trakt User',
+      slug: l.slug,
+      url: l.url,
+      type: (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : (l.type || 'mixed'),
+      contentType: l.contentType,
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'Trakt',
+    });
+  });
 
-    let addBtns;
-    if (l.contentType === 'movie' || l.contentType === 'series') {
-      const added = l.contentType === 'movie' ? addedMovie : addedSeries;
-      addBtns = '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-        (added ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.contentType + '">' +
-        (added ? 'Remove' : '+ Add') + '</button>';
-    } else {
-      addBtns =
-        '<button type="button" class="lc-btn ' + (addedMovie ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+  // My Lists Addon matches
+  (myListsMatches || []).filter((l) => l && (l.items || 0) > 0).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.creatorName || l.username || 'Anonymous',
+      creatorName: l.creatorName,
+      username: l.username,
+      url: l.url,
+      type: l.type || 'mixed',
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'My Lists Addon',
+    });
+  });
+
+  const seenUrls = new Set();
+  const scoredCards = [];
+
+  for (const item of candidates) {
+    const normUrl = item.url.trim().toLowerCase().replace(new RegExp('/+$'), '');
+    if (seenUrls.has(normUrl)) continue;
+    seenUrls.add(normUrl);
+
+    const matchScore = (intent && intent.raw) ? scoreListSearchMatch(item, intent.raw, intent) : (item.likes || 0);
+    if (intent && intent.raw && matchScore < 0) continue;
+
+    const addedMovie = alreadyAdded.has(item.url + '|movie');
+    const addedSeries = alreadyAdded.has(item.url + '|series');
+    const addedDirect = alreadyAdded.has(item.url + '|' + item.type);
+    const alreadyLikedExt = getLikedListsSet().has(item.url);
+
+    let usernameSlug = '';
+    if (item.source === 'My Lists Addon' || item.source === 'Profile') {
+      try {
+        const parts = (item.url || '').split('/lists/')[1]?.split('/');
+        if (parts && parts.length >= 2) usernameSlug = parts[0] + '/' + parts[1];
+      } catch (e) {}
+    }
+    const alreadyLikedProfile = usernameSlug && getLikedListsSet().has(usernameSlug);
+
+    const typeLabel = item.type === 'series' ? 'Shows' : (item.type === 'mixed' ? 'Movies & Shows' : 'Movies');
+    const slotType = (item.type === 'movie' || item.type === 'series') ? item.type : 'mixed';
+
+    let badgeClass = 'badge-custom';
+    if (item.source === 'MDBList') badgeClass = 'badge-mdblist';
+    else if (item.source === 'Trakt') badgeClass = 'badge-trakt';
+    else if (item.source === 'TMDB') badgeClass = 'badge-tmdb';
+    else if (item.source === 'Simkl') badgeClass = 'badge-simkl';
+    else if (item.source === 'My Lists Addon' || item.source === 'Profile') badgeClass = 'badge-mylists';
+    else if (item.source === 'Streaming') badgeClass = 'badge-streaming';
+
+    const sourceBadgeHtml = '<span class="list-source-badge ' + badgeClass + '">' + escapeHtml(item.source === 'Profile' ? 'My Lists Addon' : item.source) + '</span>';
+
+    let actionsHtml = '';
+    if ((item.source === 'My Lists Addon' || item.source === 'Profile') && usernameSlug) {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829; Unlike' : '&#9825; Like') + '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+        (addedDirect ? 'style="color:var(--danger);"' : '') +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + (item.type || 'movie') + '">' +
+        (addedDirect ? 'Remove' : '+ Add') +
+        '</button>';
+    } else if (item.source === 'Trakt' && item.contentType === 'unknown') {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
+        (alreadyLikedExt ? '&#9829;' : '&#9825;') +
+        '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedMovie ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedMovie ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="movie">' +
         (addedMovie ? 'Remove (Movies)' : '+ Movies') + '</button>' +
         '<button type="button" class="lc-btn ' + (addedSeries ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedSeries ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="series">' +
         (addedSeries ? 'Remove (Shows)' : '+ Shows') + '</button>';
+    } else {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
+        (alreadyLikedExt ? '&#9829;' : '&#9825;') +
+        '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+        (addedDirect ? 'style="color:var(--danger);"' : '') +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(item.type || 'movie') + '">' +
+        (addedDirect ? 'Remove' : '+ Add') +
+        '</button>';
     }
 
-    const cardHtml = '<div class="list-card" data-list-type="' + cardType + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(viewType) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      addBtns +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' +
-      (l.contentType === 'movie' || l.contentType === 'series' ? l.contentType : 'movie') + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
-  });
+    const creatorLabel = item.user ? (item.user.includes('Official') || item.user.includes('Franchise') ? escapeHtml(item.user) : 'by ' + escapeHtml(item.user)) : '';
+    const itemCountLabel = typeof item.items === 'number' ? (item.items + ' items') : (item.items ? escapeHtml(String(item.items)) : '');
 
-  // My Lists results (exclude lists with 0 items)
-  (myListsMatches || []).filter((l) => l && (l.items || 0) > 0).forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    let usernameSlug = '';
-    try {
-      const parts = (l.url || '').split('/lists/')[1]?.split('/');
-      if (parts && parts.length >= 2) usernameSlug = parts[0] + '/' + parts[1];
-    } catch (e) {}
-    const alreadyLiked = usernameSlug && getLikedListsSet().has(usernameSlug);
-    const typeLabel = l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Movies & Shows' : 'Movies');
-    const slotType = (l.type === 'movie' || l.type === 'series') ? l.type : 'mixed';
-    const cardHtml = '<div class="list-card" data-list-type="' + (l.type || 'mixed') + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(l.creatorName || 'Anonymous') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
+    const cardHtml = '<div class="list-card" data-list-type="' + escapeAttr(item.type || 'mixed') + '" data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(item.user || '') + '" data-items="' + escapeAttr(item.items || '') + '" data-likes="' + escapeAttr(item.likes || 0) + '" data-source="' + escapeAttr(item.source) + '">' +
       '<div class="list-card-header">' +
       '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + sourceBadgeHtml + escapeHtml(item.name) + '</div>' +
       '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.creatorName || 'Anonymous') + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
+      (creatorLabel ? '<span>' + creatorLabel + '</span>' : '') +
+      (creatorLabel ? '<span class="list-card-meta-sep">&middot;</span>' : '') +
       '<span>' + typeLabel + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes like-count">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
+      (itemCountLabel ? '<span class="list-card-meta-sep">&middot;</span><span>' + itemCountLabel + '</span>' : '') +
+      (item.likes !== undefined ? '<span class="list-card-meta-sep">&middot;</span><span class="list-card-likes like-count">&#9829; <span class="like-num">' + (item.likes || 0) + '</span></span>' : '') +
       '</div>' +
       '</div>' +
       '<div class="list-card-actions">' +
-      (usernameSlug ? '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLiked ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLiked ? '&#9829; Unlike' : '&#9825; Like') + '</button>' : '') +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (l.type || 'movie') + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
+      actionsHtml +
       '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(l.creatorName || 'Anonymous') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(item.user || '') + '" data-items="' + escapeAttr(item.items || '') + '" data-likes="' + escapeAttr(item.likes || 0) + '"></div>' +
       '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
-  });
 
-  combinedCards.sort((a, b) => b.likes - a.likes);
-  let html = combinedCards.map(c => c.html).join('');
-  
-  if (combinedCards.length === 0) {
+    scoredCards.push({ score: matchScore, html: cardHtml });
+  }
+
+  scoredCards.sort((a, b) => b.score - a.score);
+  const topCards = scoredCards.slice(0, 30);
+  let html = topCards.map(c => c.html).join('');
+
+  if (topCards.length === 0) {
     html = '<p style="color:var(--muted); font-size:0.9rem; padding:8px 0;"><small>No lists match that search.</small></p>';
   }
   if (traktError) {
@@ -391,9 +591,7 @@ async function populateSearchResultPosters() {
   const slots = [...document.querySelectorAll('.poster-preview-slot')];
   let idx = 0;
   const CONCURRENCY = 5;
-  // Fetches one /api/preview call for a single declared type -- split out
-  // so a mixed-content list (see fetchPreviewForSlot below) can fire two
-  // of these in parallel instead of duplicating the request logic.
+
   async function fetchPreviewOnce(listUrl, type) {
     const payload = { url: listUrl, type: type, sample: 12 };
     const mkInput = document.getElementById('mdblistKeyInput');
@@ -411,24 +609,23 @@ async function populateSearchResultPosters() {
     if (smkToken) payload.simklAccessToken = smkToken;
     const skInput = document.getElementById('simklKeyInput');
     payload.simklKey = (skInput && skInput.value ? skInput.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
-    const res = await fetch(ORIGIN + '/api/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      cache: 'no-store',
-    });
-    if (!res.ok) return { ok: false };
-    const ct = res.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) return { ok: false };
-    return await res.json();
+    
+    try {
+      const res = await fetch(ORIGIN + '/api/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+      });
+      if (!res.ok) return { ok: false };
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) return { ok: false };
+      return await res.json();
+    } catch (e) {
+      return { ok: false };
+    }
   }
-  // A list card that mixes movies and shows (MDBList/Trakt lists don't
-  // have to be one or the other) gets marked data-type="mixed" by its
-  // render function rather than being forced to either type -- /api/preview
-  // itself only ever answers for one declared type per call (movie or
-  // series, see its own coercion), so a single request here would only
-  // ever surface that list's movies and leave a TV-heavy or TV-only list
-  // showing no posters at all. Two parallel requests, merged, covers both.
+
   async function fetchPreviewForSlot(listUrl, type) {
     if (type !== 'mixed') {
       return fetchPreviewOnce(listUrl, type);
@@ -442,10 +639,6 @@ async function populateSearchResultPosters() {
     if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
     const movieSample = movieOk ? (movieResult.sample || []) : [];
     const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
-    // Interleaved rather than movies-then-shows, so a list that's mostly
-    // one type still shows a representative mix in the first few tiles
-    // rather than, say, nine movie posters and zero show posters just
-    // because movies happened to be fetched first.
     const merged = [];
     const maxLen = Math.max(movieSample.length, seriesSample.length);
     for (let i = 0; i < maxLen; i++) {
@@ -458,17 +651,13 @@ async function populateSearchResultPosters() {
       count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
     };
   }
+
   async function worker() {
     while (idx < slots.length) {
       const slot = slots[idx++];
+      if (!slot) continue;
       const listUrl = slot.dataset.url;
       const type = slot.dataset.type || 'movie';
-      // Falls back to the url only if a card genuinely has no name to give
-      // (shouldn't happen in practice -- every current caller sets
-      // data-name alongside data-url) rather than always preferring the
-      // url, which is what put a raw "tmdb:top10:netflix"-style internal
-      // source string in the See All modal's title instead of an actual
-      // display name.
       const listName = slot.dataset.name || listUrl;
       const parentCard = slot.closest('.list-card');
       const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
@@ -483,8 +672,6 @@ async function populateSearchResultPosters() {
             const totalCount = cardItems || data.count || (validPosters.length * 10);
             const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
             const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
-            const isTmdbSlot = !!slot.closest('#myTmdbListsResult');
-            const isSimklSlot = !!slot.closest('#mySimklListsResult');
 
             let inner = '';
             validPosters.forEach((s, i) => {
@@ -527,12 +714,11 @@ async function populateSearchResultPosters() {
             slot.innerHTML = inner;
           }
         }
-      } catch (e) {
-        // Posters are a nice-to-have here
-      }
+      } catch (e) {}
     }
   }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker()));
+
+  Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
 function getLikedListsSet() {
@@ -998,6 +1184,19 @@ async function loadCuratedListsFeed(forceRefresh) {
     const publicListsPool = [...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
     let sectionsHtml = '';
 
+    // Keep a copy of exactly what these two cards are about to render, so
+    // the catalog row for the same list can serve the same items rather
+    // than re-deriving its own. fetchCuratedCatalog (05_catalog-core.js)
+    // can only see server-side tracking data, while these cards are built
+    // from this browser's whole picture -- Continue Watching, Watch
+    // History, Watchlist and every other custom list -- so re-deriving
+    // could never land on the same 40 items. pushTrackingSync
+    // (22_client-creator-profile.js) carries this up alongside Airing
+    // Next, which is a snapshot for exactly the same reason.
+    if (typeof persistCuratedRecommendations === 'function' && recData && recData.ok) {
+      persistCuratedRecommendations(recData.movies, recData.shows);
+    }
+
     // Section A: Recommended Movies List
     if (recData && recData.ok && recData.movies && recData.movies.length) {
       sectionsHtml += buildCuratedRecommendationCard('Recommended Movies', 'movie', 'custom:curated:recommended-movies', 'Based on your movie watch history & watchlist', recData.movies);
@@ -1247,33 +1446,30 @@ function render5PosterListsFeed(container, lists) {
 // --- Clickable Posters & Add to List Modal Logic ---
 document.addEventListener('click', async (e) => {
   const addOverlayBtn = e.target.closest('.poster-add-overlay');
-  const posterEl = addOverlayBtn ? addOverlayBtn.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-img-wrap, .list-card-mini-poster-tile') : e.target.closest('.clickable-poster');
+  const posterEl = addOverlayBtn ? addOverlayBtn.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-img-wrap, .list-card-mini-poster-tile') : e.target.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-tile, .list-card-mini-poster-img-wrap');
   
   if (addOverlayBtn && posterEl) {
     e.stopPropagation(); // prevent opening the details modal
-    const id = posterEl.dataset.id || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.id) || '';
-    const type = posterEl.dataset.type || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.type) || 'movie';
-    const title = posterEl.dataset.title || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.title) || '';
-    const poster = posterEl.dataset.poster || (posterEl.querySelector('img') && posterEl.querySelector('img').src) || '';
+    const clickEl = posterEl.matches('.clickable-poster') ? posterEl : (posterEl.querySelector('.clickable-poster') || posterEl);
+    let id = clickEl.dataset.id || posterEl.dataset.id || '';
+    if (id && id.startsWith('tt') && id.includes(':')) id = id.split(':')[0];
+    const type = clickEl.dataset.type || posterEl.dataset.type || 'movie';
+    const title = clickEl.dataset.title || posterEl.dataset.title || '';
+    const poster = clickEl.dataset.poster || posterEl.dataset.poster || (posterEl.querySelector('img') && posterEl.querySelector('img').src) || '';
     openSelectListModal(id, type, title, poster);
     return;
   }
   
-  if (posterEl && !e.target.closest('.searchViewListBtn, .curatedViewBtn, .list-card-count-overlay, .creatorListViewBtn, .discover-chart-seeall')) {
-    // Posters clicked from inside a "See All" overlay (either kind -- the
-    // Discover tab's chart overlay, or the Catalogs/Shelves Live Preview's
-    // showModal()-based one) share this same handler, but opening item
-    // details only ever switches to the item-details tab underneath --
-    // neither overlay is a tab panel, so nothing was ever telling them to
-    // close, and they stayed sitting on top of the item details page that
-    // had just opened behind them. Closing both here is harmless when
-    // neither is actually open (closeDetailOverlay/closeModal are already
-    // no-ops in that case), so this covers every current and future
-    // "click a poster from inside an overlay" spot without needing to
-    // special-case each overlay's own trigger.
+  if (posterEl && !e.target.closest('.searchViewListBtn, .curatedViewBtn, .list-card-count-overlay, .creatorListViewBtn, .discover-chart-seeall, .cw-remove-btn')) {
     closeDetailOverlay();
     closeModal();
-    openItemDetailsModal(posterEl.dataset.id, posterEl.dataset.type);
+    const clickEl = posterEl.matches('.clickable-poster') ? posterEl : (posterEl.querySelector('.clickable-poster') || posterEl);
+    let id = clickEl.dataset.id || posterEl.dataset.id || '';
+    if (id && id.startsWith('tt') && id.includes(':')) id = id.split(':')[0];
+    const type = clickEl.dataset.type || posterEl.dataset.type || 'movie';
+    if (id) {
+      openItemDetailsModal(id, type);
+    }
     return;
   }
 });
@@ -1297,8 +1493,8 @@ function isEpisodeAired(ep) {
   if (isNaN(airDate.getTime())) return false;
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  // If airDate is on or before today, the episode has already aired
-  return airDate.getTime() <= today.getTime();
+  // If airDate is before today, the episode has already aired (same-day airs today)
+  return airDate.getTime() < today.getTime();
 }
 
 function formatAirDateBadge(airDateStr) {
@@ -1316,8 +1512,9 @@ function formatAirDateBadge(airDateStr) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const diffDays = Math.round((d.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
 
-  // If already aired or airs today, no upcoming badge is shown
-  if (diffDays <= 0) return '';
+  // If already aired before today, no upcoming badge is shown
+  if (diffDays < 0) return '';
+  if (diffDays === 0) return 'Today';
   if (diffDays === 1) return 'Tomorrow';
   if (diffDays > 1 && diffDays < 7) {
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1344,7 +1541,30 @@ function openEpisodeDetails(epNum) {
   if (ep.vote_average) infoHtml += '<div style="margin-bottom:6px;">\u2605 ' + escapeHtml(Number(ep.vote_average).toFixed(1)) + ' TMDB</div>';
   
   window._currentEpisodeDetails = ep;
-  const isWatched = window._watchedItemIds && window._watchedItemIds.has(String(ep.id));
+  
+  let isWatched = window._watchedItemIds && window._watchedItemIds.has(String(ep.id));
+  if (!isWatched && window._watchedItemIds) {
+    const d = window._currentItemDetails;
+    if (d && ep.season_number != null && ep.episode_number != null) {
+      if (d.id && window._watchedItemIds.has(d.id + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+      if (d.tmdbId && window._watchedItemIds.has('tmdb:' + d.tmdbId + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+      if (d.title && window._watchedItemIds.has(d.title + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+    }
+  }
+  if (!isWatched && Array.isArray(window._rawWatchHistoryItems)) {
+    const d = window._currentItemDetails;
+    const epNum = Number(ep.episode_number);
+    const sNum = Number(ep.season_number);
+    isWatched = window._rawWatchHistoryItems.some((it) => {
+      if (!it || it.type !== 'episode') return false;
+      if (String(it.id) === String(ep.id)) return true;
+      if (Number(it.seasonNum) === sNum && Number(it.episodeNum) === epNum) {
+        if (d && d.id && (String(it.showId) === String(d.id) || String(it.showId) === ('tmdb:' + d.tmdbId))) return true;
+        if (d && d.title && (it.showTitle === d.title || String(it.showId) === d.title)) return true;
+      }
+      return false;
+    });
+  }
   const innerHtml = 
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
@@ -1388,23 +1608,73 @@ window.openSelectListModalFromItemModal = function() {
 
 function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   if (!showId || seasonNum == null) return false;
-  if (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(showId))) {
-    return true;
+  const sNum = Number(seasonNum);
+  const d = window._currentItemDetails;
+  const showIdsToCheck = new Set([
+    String(showId),
+    String(showId).startsWith('tmdb:') ? String(showId).slice(5) : ('tmdb:' + String(showId)),
+    (d && d.id) ? String(d.id) : null,
+    (d && d.id && String(d.id).startsWith('tmdb:')) ? String(d.id).slice(5) : (d && d.id ? ('tmdb:' + String(d.id)) : null),
+    (d && d.imdbId) ? String(d.imdbId) : null,
+    (d && d.tmdbId) ? String(d.tmdbId) : null,
+    (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
+  ].filter(Boolean));
+
+  if (window._fullyWatchedShowIds) {
+    for (const sid of showIdsToCheck) {
+      if (window._fullyWatchedShowIds.has(sid)) return true;
+    }
   }
+
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
     if (!hist || !Array.isArray(hist.items)) return false;
-    const cleanShowId = String(showId);
-    const watchedEps = hist.items.filter((it) => it && it.type === 'episode' && String(it.showId) === cleanShowId && Number(it.seasonNum) === Number(seasonNum));
-    if (episodeCount && episodeCount > 0) {
-      return watchedEps.length >= episodeCount;
+
+    const watchedEps = hist.items.filter((it) => {
+      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return false;
+      if (it.showId && showIdsToCheck.has(String(it.showId))) return true;
+      if (d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase()) return true;
+      return false;
+    });
+
+    const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
+
+    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
+      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
+      if (aired.length > 0) return distinctEps.size >= aired.length;
     }
-    return watchedEps.length > 0;
+
+    if (episodeCount && episodeCount > 0) {
+      return distinctEps.size >= episodeCount;
+    }
+    return distinctEps.size > 0;
   } catch (e) {
     return false;
   }
 }
+window.isSeasonFullyWatched = isSeasonFullyWatched;
+
+function updateSeasonWatchedButton(seasonNum) {
+  const d = window._currentItemDetails;
+  if (!d) return;
+  const sNum = Number(seasonNum);
+  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum);
+  const epCount = seasonMeta ? seasonMeta.episode_count : 0;
+  const isWatched = isSeasonFullyWatched(d.id, sNum, epCount);
+  document.querySelectorAll('.btn-mark-season-watched[data-season="' + sNum + '"]').forEach(btn => {
+    if (isWatched) {
+      btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
+      btn.classList.remove('primary');
+      btn.classList.add('secondary');
+    } else {
+      btn.innerHTML = 'Mark Season Watched';
+      btn.classList.remove('secondary');
+      btn.classList.add('primary');
+    }
+  });
+}
+window.updateSeasonWatchedButton = updateSeasonWatchedButton;
 
 window.markSeasonWatched = async function(seasonNum, btn) {
   const d = window._currentItemDetails;
@@ -1650,7 +1920,7 @@ async function openItemDetailsModal(id, type, opts) {
                 '</div>' +
               '</div>' +
               '<div class="season-header-actions">' +
-                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
+                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" data-season="' + season.season_number + '" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
                   (isSeasonWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched' : 'Mark Season Watched') +
                 '</button>' +
               '</div>' +
@@ -1724,13 +1994,16 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     const data = await res.json();
     if (!data.ok || !data.season || !data.season.episodes) throw new Error(data.error || 'Failed to load season');
     
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+    
     let epsHtml = '';
     if (!window._episodeDataCache) window._episodeDataCache = {};
     data.season.episodes.forEach(ep => {
       window._episodeDataCache[ep.episode_number] = ep;
       const still = ep.still_path ? escapeAttr(ep.still_path) : '';
       epsHtml += 
-        '<div class="clickable-episode" data-id="' + ep.id + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
+        '<div class="clickable-episode" data-id="' + ep.id + '" data-season="' + seasonNum + '" data-episode="' + ep.episode_number + '" data-show-id="' + escapeAttr(imdbId || '') + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
           '<div style="width:100%; aspect-ratio:16/9; background:#222; border-radius:6px; overflow:hidden; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4);">' +
             (still ? '<img src="' + still + '" style="width:100%; height:100%; object-fit:cover;">' : '') +
             '<div style="position:absolute; bottom:4px; left:4px; background:rgba(0,0,0,0.8); color:var(--brand); padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem;">E' + ep.episode_number + '</div>' +
@@ -1739,6 +2012,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
         '</div>';
     });
     grid.innerHTML = epsHtml || '<div style="grid-column: 1 / -1; color:var(--muted);">No episodes found.</div>';
+    if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(seasonNum);
   } catch (err) {
     grid.innerHTML = '<div style="grid-column: 1 / -1; color:red;">Error loading episodes.</div>';
   }
@@ -1892,6 +2166,7 @@ function openSelectListModal(id, type, title, poster) {
 
   // 1. Custom Lists (local & creator)
   const customLists = [];
+  const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
     if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
@@ -1901,6 +2176,14 @@ function openSelectListModal(id, type, title, poster) {
         if (payload.localSlug === 'airing-next' || payload.localSlug === 'watch-history' || payload.localSlug === 'continue-watching') return;
         if (payload.creatorSlug === 'airing-next' || payload.creatorSlug === 'watch-history' || payload.creatorSlug === 'continue-watching') return;
         if (payload.type && payload.type !== 'mixed' && payload.type !== type) return;
+        const slug = payload.localSlug || payload.creatorSlug || payload.listSlug;
+        const localList = slug ? localMap[slug] : null;
+        const serverList = (slug && typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) ? lastCreatorListsData.find(l => l && l.slug === slug) : null;
+        const liveItems = (serverList && Array.isArray(serverList.items)) ? serverList.items : ((localList && Array.isArray(localList.items)) ? localList.items : null);
+        if (liveItems && liveItems.length >= (payload.items || []).length) {
+          payload.items = liveItems.slice();
+          urlInput.value = 'customlist:v1:' + JSON.stringify(payload);
+        }
         const nameInput = row.querySelector('.name');
         customLists.push({
           name: nameInput ? nameInput.value : (payload.listName || 'Unnamed List'),
@@ -1912,7 +2195,6 @@ function openSelectListModal(id, type, title, poster) {
   });
 
   try {
-    const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     Object.keys(localMap).forEach(slug => {
       if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'airing-next') return;
       const l = localMap[slug];
@@ -1938,7 +2220,7 @@ function openSelectListModal(id, type, title, poster) {
       if (!existing) {
         customLists.push({
           name: l.name || 'Custom List',
-          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), creatorSlug: l.slug, type: l.type || 'mixed', items: l.items || [], shuffle: false, visibility: l.visibility || 'private' }),
+          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), creatorSlug: l.slug, creatorOwner: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : undefined, type: l.type || 'mixed', items: l.items || [], shuffle: false, visibility: l.visibility || 'private' }),
           row: null
         });
       }
@@ -2448,6 +2730,17 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     }
     if (!payload) return false;
     if (!Array.isArray(payload.items)) payload.items = [];
+
+    const targetSlug = payload.localSlug || payload.creatorSlug || payload.listSlug || '';
+    if (targetSlug) {
+      const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      const localList = localMap[targetSlug];
+      const serverList = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) ? lastCreatorListsData.find(l => l && l.slug === targetSlug) : null;
+      const liveItems = (serverList && Array.isArray(serverList.items)) ? serverList.items : ((localList && Array.isArray(localList.items)) ? localList.items : null);
+      if (liveItems && liveItems.length >= payload.items.length) {
+        payload.items = liveItems.slice();
+      }
+    }
     
     // Check for existing items using imdbId or originalId
     const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
@@ -2517,6 +2810,16 @@ async function syncCustomListPayload(payload, name) {
     const creatorName = localStorage.getItem('myListAddon:creatorName');
     if (creatorKey && creatorName && name) {
       try {
+        const creatorListMeta = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData))
+          ? lastCreatorListsData.find((l) => l.slug === payload.creatorSlug)
+          : null;
+        const finalType = (creatorListMeta && creatorListMeta.type) ? creatorListMeta.type : (payload.type || 'movie');
+        let combinedItems = payload.items;
+        if (finalType === 'mixed' && creatorListMeta && Array.isArray(creatorListMeta.items)) {
+          const currentIds = new Set((payload.items || []).map(it => it.imdbId || it.id));
+          const otherItems = creatorListMeta.items.filter(it => !currentIds.has(it.imdbId || it.id));
+          combinedItems = (payload.items || []).concat(otherItems);
+        }
         const res = await fetch(ORIGIN + '/api/creator/lists/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2524,33 +2827,50 @@ async function syncCustomListPayload(payload, name) {
             creatorName: creatorName,
             creatorKey: creatorKey,
             slug: payload.creatorSlug,
-            name: name,
-            type: payload.type,
-            items: payload.items,
-            visibility: payload.visibility || 'private'
+            name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+            type: finalType,
+            items: combinedItems,
+            visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private')
           })
         });
         const data = await res.json();
-        if (data.ok && typeof renderCreatorDashboard === 'function') {
-          renderCreatorDashboard({ silent: true });
+        if (data.ok) {
+          if (creatorListMeta) {
+            creatorListMeta.items = combinedItems;
+            creatorListMeta.itemCount = combinedItems.length;
+          }
+          if (typeof renderCreatorDashboard === 'function') {
+            renderCreatorDashboard({ silent: true });
+          }
         }
+        payload.items = combinedItems;
+        payload.type = finalType;
       } catch(e) {}
     }
   }
   if (payload.localSlug && !isWatchlist) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
       const map = loadLocalCustomLists();
-      if (map[payload.localSlug]) {
-        map[payload.localSlug].items = payload.items;
-        map[payload.localSlug].updatedAt = Date.now();
+      const existing = map[payload.localSlug];
+      const finalType = (existing && existing.type) ? existing.type : (payload.type || 'movie');
+      let combinedItems = payload.items;
+      if (finalType === 'mixed' && existing && Array.isArray(existing.items)) {
+        const currentIds = new Set((payload.items || []).map(it => it.imdbId || it.id));
+        const otherItems = existing.items.filter(it => !currentIds.has(it.imdbId || it.id));
+        combinedItems = (payload.items || []).concat(otherItems);
+      }
+      if (existing) {
+        existing.items = combinedItems;
+        existing.type = finalType;
+        existing.updatedAt = Date.now();
         saveLocalCustomListsMap(map);
       } else {
         map[payload.localSlug] = {
           slug: payload.localSlug,
-          name: name || payload.localSlug,
-          type: payload.type || 'mixed',
+          name: (name || payload.localSlug).replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+          type: finalType,
           isWatchlist: payload.localSlug === 'watchlist',
-          items: payload.items,
+          items: combinedItems,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -2558,7 +2878,14 @@ async function syncCustomListPayload(payload, name) {
       }
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      payload.items = combinedItems;
+      payload.type = finalType;
     }
+  }
+
+  const slug = payload.localSlug || payload.creatorSlug || payload.listSlug || payload.slug;
+  if (slug && typeof syncCustomListToCatalogRows === 'function') {
+    syncCustomListToCatalogRows(slug, payload.items, name, payload.type);
   }
 }
 
@@ -2723,15 +3050,14 @@ async function renderDefaultCatalogSearch() {
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
-      const res = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' });
-      const data = await res.json();
+      const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
       if (inputEl && inputEl.value.trim()) return;
-      if (!data.ok || !data.lists || !data.lists.length) {
-        resEl.innerHTML = '<p><small>No public lists available yet.</small></p>';
+      const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
+      if (!pubLists.length) {
+        resEl.innerHTML = '<p><small>No published My Lists Addon lists available yet.</small></p>';
         return;
       }
-      const top20 = data.lists.slice(0, 20);
-      renderListSearchResults([], [], null, top20, [], resEl);
+      renderListSearchResults([], [], null, pubLists, [], resEl);
     } catch (e) {
       resEl.innerHTML = '<p class="testresult err">✗ Could not load public lists.</p>';
     }
@@ -2760,6 +3086,11 @@ async function runCatalogSearch() {
     renderDefaultCatalogSearch();
     return;
   }
+
+  if (currentCatalogSearchType === 'lists') {
+    return executeUnifiedListSearch(q, resEl);
+  }
+
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -2770,40 +3101,6 @@ async function runCatalogSearch() {
       keepalive: true,
     }).catch(() => {});
   } catch (e) {}
-
-  if (currentCatalogSearchType === 'lists') {
-    const qLower = q.toLowerCase();
-    const tkInput = document.getElementById('tmdbKeyInput');
-    const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-    const traktKey = (document.getElementById('traktKeyInput')?.value || '').trim();
-    try {
-      const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
-        ensureMdblistPopularLoaded(),
-        fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
-          .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
-        fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
-          .catch(() => ({ ok: false, lists: [] })),
-        fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
-          .catch(() => ({ ok: false, lists: [] })),
-      ]);
-
-      const mdblistMatches = mdblistAll
-        .filter((l) => l.name.toLowerCase().includes(qLower) || (l.user && l.user.toLowerCase().includes(qLower)))
-        .slice(0, 30);
-      const traktMatches = traktResult.ok ? (traktResult.lists || []).slice(0, 30) : [];
-      const myListsMatches = myListsResult.ok ? (myListsResult.lists || []) : [];
-      const tmdbMatches = tmdbResult.ok ? (tmdbResult.lists || []) : [];
-
-      renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches, resEl);
-      return;
-    } catch (e) {
-      resEl.innerHTML = '<p class="testresult err">✗ Network error searching lists.</p>';
-      return;
-    }
-  }
 
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));

@@ -54,9 +54,17 @@ async function bumpStatBy(env, kind, amount) {
   if (!env || !env.CONFIGS || !amount) return;
   try {
     const totalKey = `stats:${kind}:total`;
-    const totalRaw = await env.CONFIGS.get(totalKey);
-    const total = (parseInt(totalRaw, 10) || 0) + amount;
-    await env.CONFIGS.put(totalKey, String(total));
+    
+    if (env.DB && kind.startsWith("sourcegroup:")) {
+      const groupName = kind.slice("sourcegroup:".length);
+      await env.DB.prepare(
+        "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = source_groups.install_count + excluded.install_count"
+      ).bind(groupName, groupName, amount).run();
+    } else {
+      const totalRaw = await env.CONFIGS.get(totalKey);
+      const total = (parseInt(totalRaw, 10) || 0) + amount;
+      await env.CONFIGS.put(totalKey, String(total));
+    }
   } catch (e) {
     // best-effort, see bumpStat above
   }
@@ -128,8 +136,8 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
     const [genreBlobRaw, decadeBlobRaw, genreList, decadeList] = await Promise.all([
       env.CONFIGS.get("stats:genres:alltime"),
       env.CONFIGS.get("stats:decades:alltime"),
-      env.CONFIGS.list({ prefix: "stats:genre:", limit: 1000 }),
-      env.CONFIGS.list({ prefix: "stats:decade:", limit: 1000 }),
+      listAllKeys(env.CONFIGS, "stats:genre:"),
+      listAllKeys(env.CONFIGS, "stats:decade:"),
     ]);
 
     let genreCounts = {};
@@ -296,7 +304,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
   const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
 
   if (window === "alltime") {
-    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
     const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
@@ -329,7 +337,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
         if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
           try {
             if (typeof fetchTmdbItemDetails === "function") {
-              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
               if (det && det.title) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
@@ -418,7 +426,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
       if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
         try {
           if (typeof fetchTmdbItemDetails === "function") {
-            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
             if (det && det.title) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
@@ -521,7 +529,7 @@ async function computeSearchLeaderboard(env, window) {
   if (!env || !env.CONFIGS) return [];
   const prefix = "searchquery:";
   if (window === "alltime") {
-    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
     const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
@@ -629,8 +637,8 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
   const [catalogList, sourceGroupList] = await Promise.all([
-    env.CONFIGS.list({ prefix: "stats:catalog_add:", limit: 1000 }),
-    env.CONFIGS.list({ prefix: "stats:sourcegroup:", limit: 1000 }),
+    listAllKeys(env.CONFIGS, "stats:catalog_add:"),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
   ]);
 
   const catalogMap = new Map();
@@ -656,14 +664,33 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   catalogEntries.sort((a, b) => b.count - a.count);
 
   // 2. Community / Creator Lists
-  const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: 1000 });
+  let communityListsRaw = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM creator_lists").all();
+    communityListsRaw = results.filter(row => row.visibility !== 'private').map(row => ({
+      slug: row.id.split(':')[1] || row.id,
+      name: row.name,
+      creatorName: row.username,
+      type: row.type || 'mixed',
+      items: JSON.parse(row.items_json || '[]'),
+      updatedAt: row.updated_at || row.created_at || 0,
+    }));
+  } else {
+    const listResult = await listAllKeys(env.CONFIGS, "creatorlist:");
+    communityListsRaw = (await Promise.all(
+      listResult.keys.map(async (k) => {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) return null;
+        let data;
+        try { data = JSON.parse(raw); } catch { return null; }
+        if (!data || !data.slug || !data.creatorName) return null;
+        return data;
+      })
+    )).filter(Boolean);
+  }
+
   const communityLists = await Promise.all(
-    listResult.keys.map(async (k) => {
-      const raw = await env.CONFIGS.get(k.name);
-      if (!raw) return null;
-      let data;
-      try { data = JSON.parse(raw); } catch { return null; }
-      if (!data || !data.slug || !data.creatorName) return null;
+    communityListsRaw.map(async (data) => {
       const [likesRaw, copiesRaw] = await Promise.all([
         env.CONFIGS.get(`creatorlistlikes:${data.slug}`),
         env.CONFIGS.get(`stats:list_copy:${data.slug}:total`),
@@ -758,7 +785,7 @@ function sanitizeStatGroupName(raw) {
 async function loadStatsByDay(env, kind) {
   if (!env || !env.CONFIGS) return {};
   const prefix = `stats:${kind}:`;
-  const result = await env.CONFIGS.list({ prefix, limit: 1000 });
+  const result = await listAllKeys(env.CONFIGS, prefix);
   const byDay = {};
   await Promise.all(
     result.keys.map(async (k) => {
@@ -974,8 +1001,8 @@ async function renderAdminDashboard(env) {
     // "creator:" (with the colon) is deliberately narrow -- creatorlist:,
     // creatorsync:, etc. all start with "creator" too but not "creator:",
     // so this can't accidentally sweep those in as if they were accounts.
-    env.CONFIGS.list({ prefix: "creator:", limit: 1000 }),
-    env.CONFIGS.list({ prefix: "stats:sourcegroup:", limit: 1000 }),
+    listAllKeys(env.CONFIGS, "creator:"),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
   ]);
 
   // Walks the last 30 calendar days explicitly (rather than just listing
@@ -990,35 +1017,47 @@ async function renderAdminDashboard(env) {
     rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
   }
 
-  const creatorAccounts = await Promise.all(
-    creatorResult.keys.map(async (k) => {
-      const username = k.name.slice("creator:".length);
-      let displayName = username;
-      let createdAt = null;
-      try {
-        const raw = await env.CONFIGS.get(k.name);
-        if (raw) {
-          const data = JSON.parse(raw);
-          displayName = data.displayName || username;
-          createdAt = typeof data.createdAt === "number" ? data.createdAt : null;
-        }
-      } catch {
-        // fall back to the raw username slug above
-      }
-      // Best-effort -- see touchCreatorLastSeen's own comment. An account
-      // that predates this feature, or simply hasn't made an authenticated
-      // request since it shipped, just shows as "\u2014" below rather than
-      // a wrong or misleading date.
+  let creatorAccounts = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM creators").all();
+    creatorAccounts = await Promise.all(results.map(async (row) => {
       let lastActive = null;
       try {
-        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${row.username}`);
         lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
-      } catch {
-        // non-critical
-      }
-      return { username, displayName, createdAt, lastActive };
-    })
-  );
+      } catch {}
+      return {
+        username: row.username,
+        displayName: row.display_name,
+        createdAt: row.created_at || null,
+        lastActive,
+      };
+    }));
+  } else {
+    // Fallback if D1 isn't working yet
+    creatorAccounts = await Promise.all(
+      creatorResult.keys.map(async (k) => {
+        const username = k.name.slice("creator:".length);
+        let displayName = username;
+        let createdAt = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          if (raw) {
+            const data = JSON.parse(raw);
+            displayName = data.displayName || username;
+            createdAt = typeof data.createdAt === "number" ? data.createdAt : null;
+          }
+        } catch {}
+        let lastActive = null;
+        try {
+          const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+          lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
+        } catch {}
+        return { username, displayName, createdAt, lastActive };
+      })
+    );
+  }
+
   creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
   const accountRows = creatorAccounts
     .map(
@@ -1046,14 +1085,20 @@ async function renderAdminDashboard(env) {
   // total-only design above), so a plain slice is enough, no need to guard
   // against a stray per-day key existing alongside it the way
   // loadStatsByDay has to for pageviews/installs.
-  const sourceGroupPrefix = "stats:sourcegroup:";
-  const sourceGroups = await Promise.all(
-    sourceGroupResult.keys.map(async (k) => {
-      const group = k.name.slice(sourceGroupPrefix.length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      return { group, count: parseInt(raw, 10) || 0 };
-    })
-  );
+  let sourceGroups = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM source_groups").all();
+    sourceGroups = results.map(row => ({ group: row.name, count: row.install_count }));
+  } else {
+    const sourceGroupPrefix = "stats:sourcegroup:";
+    sourceGroups = await Promise.all(
+      sourceGroupResult.keys.map(async (k) => {
+        const group = k.name.slice(sourceGroupPrefix.length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        return { group, count: parseInt(raw, 10) || 0 };
+      })
+    );
+  }
   sourceGroups.sort((a, b) => b.count - a.count);
   const sourceGroupTotal = sourceGroups.reduce((sum, g) => sum + g.count, 0);
   const sourceGroupRows = sourceGroups

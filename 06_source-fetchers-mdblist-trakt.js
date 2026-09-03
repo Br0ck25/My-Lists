@@ -426,7 +426,7 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
 }
 
 // Pulls the connected account's Trakt watchlist
-async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "") {
+async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "", env = null, ctx = null) {
   if (!accessToken) {
     throw new Error(
       "Connect Trakt in Settings first — your watchlist needs your own Trakt sign-in, there's no public version of it."
@@ -446,8 +446,12 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Trakt Watchlist",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -488,35 +492,88 @@ function mapTraktHistoryItems(data, type) {
   };
   if (type === "series") {
     return items
-      .filter((it) => it && it.episode && it.show && it.show.ids && it.show.ids.imdb)
       .map((it) => {
-        const imdbId = it.show.ids.imdb;
-        const s = it.episode.season;
-        const e = it.episode.number;
-        const epTitle = it.episode.title ? ` \u2014 ${it.episode.title}` : "";
+        if (!it) return null;
+        const show = it.show || (it.episode && it.episode.show) || it;
+        const ep = it.episode || it;
+        const ids = (show && show.ids) || (ep && ep.ids) || it.ids || {};
+        const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+        if (!imdbId) return null;
+        const s = ep.season;
+        const e = ep.number;
+        const epTitle = ep.title ? ` \u2014 ${ep.title}` : "";
+        const showTitle = show.title || it.title || "Show";
+        const seasonEpStr = (s != null && e != null) ? ` S${s}E${e}` : "";
         return {
           id: imdbId,
-          type,
-          name: `${it.show.title} S${s}E${e}${epTitle}`,
-          showTitle: it.show.title,
-          poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
+          type: "series",
+          name: `${showTitle}${seasonEpStr}${epTitle}`,
+          showTitle: showTitle,
+          poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
           releaseInfo: watchedLabel(it.watched_at),
         };
-      });
+      })
+      .filter(Boolean);
+  }
+  if (type === "mixed") {
+    return items
+      .map((it) => {
+        if (!it) return null;
+        const isEpisode = !!(it.episode || it.type === "episode" || (it.show && !it.movie));
+        if (isEpisode) {
+          const show = it.show || (it.episode && it.episode.show) || it;
+          const ep = it.episode || it;
+          const ids = (show && show.ids) || (ep && ep.ids) || it.ids || {};
+          const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+          if (!imdbId) return null;
+          const s = ep.season;
+          const e = ep.number;
+          const epTitle = ep.title ? ` \u2014 ${ep.title}` : "";
+          const showTitle = show.title || it.title || "Show";
+          const seasonEpStr = (s != null && e != null) ? ` S${s}E${e}` : "";
+          return {
+            id: imdbId,
+            type: "series",
+            name: `${showTitle}${seasonEpStr}${epTitle}`,
+            showTitle: showTitle,
+            poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+            releaseInfo: watchedLabel(it.watched_at),
+          };
+        }
+        const movie = it.movie || it;
+        const ids = (movie && movie.ids) || it.ids || {};
+        const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+        if (!imdbId) return null;
+        return {
+          id: imdbId,
+          type: "movie",
+          name: movie.title || it.title || "Movie",
+          poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+          releaseInfo: watchedLabel(it.watched_at) || (movie.year ? String(movie.year) : undefined),
+        };
+      })
+      .filter(Boolean);
   }
   return items
-    .filter((it) => it && it.movie && it.movie.ids && it.movie.ids.imdb)
-    .map((it) => ({
-      id: it.movie.ids.imdb,
-      type,
-      name: it.movie.title,
-      poster: `https://images.metahub.space/poster/medium/${it.movie.ids.imdb}/img`,
-      releaseInfo: watchedLabel(it.watched_at) || (it.movie.year ? String(it.movie.year) : undefined),
-    }));
+    .map((it) => {
+      if (!it) return null;
+      const movie = it.movie || it;
+      const ids = (movie && movie.ids) || it.ids || {};
+      const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+      if (!imdbId) return null;
+      return {
+        id: imdbId,
+        type: "movie",
+        name: movie.title || it.title || "Movie",
+        poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+        releaseInfo: watchedLabel(it.watched_at) || (movie.year ? String(movie.year) : undefined),
+      };
+    })
+    .filter(Boolean);
 }
 
 // Pulls the connected account's Trakt watch history
-async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "") {
+async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "", env = null, ctx = null) {
   if (!accessToken) {
     throw new Error(
       "Connect Trakt in Settings first — your watch history needs your own Trakt sign-in, there's no public version of it."
@@ -527,17 +584,22 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
       "Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
     );
   }
-  const itemKind = entry.type === "series" ? "episodes" : "movies";
+  const itemKind = entry.type === "series" ? "episodes" : (entry.type === "mixed" ? "" : "movies");
+  const pathKind = itemKind ? `/${itemKind}` : "";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
-  const src = `https://api.trakt.tv/users/me/history/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
+  const src = `https://api.trakt.tv/users/me/history${pathKind}?limit=${PAGE_SIZE}&page=${page}`;
 
   const userHash = safeUserHash(accessToken);
-  const cacheKey = `user_cache:trakt:history:${itemKind}:${skip}:${userHash}`;
+  const cacheKey = `user_cache:trakt:history:${itemKind || "mixed"}:${skip}:${userHash}`;
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Trakt History",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -585,8 +647,12 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
 
   return await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 300,
     staleTtlSec: 3600,
+    kvTtlSec: 3600,
     providerLabel: "Trakt Airing Next",
     fetchFn: async () => {
       const headers = {
@@ -651,9 +717,9 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
       });
 
       const airingMetas = [];
-      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+      await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
         try {
-          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series", "", false, env, ctx);
           if (details && details.nextEpisodeAirDate) {
             const isPremiere = details.nextEpisodeNumber === 1;
             const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -668,6 +734,9 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
               background: details.background || undefined,
               airDate: details.nextEpisodeAirDate,
               isSeasonPremiere: isPremiere,
+              isSeasonFinale: !!details.isSeasonFinale,
+              seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+              seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
               description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
               trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
             });
@@ -699,8 +768,12 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
 
   return await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 300,
     staleTtlSec: 3600,
+    kvTtlSec: 3600,
     providerLabel: "MDBList Airing Next",
     fetchFn: async () => {
       const sep = authQuery ? "&" : "?";
@@ -766,9 +839,9 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
       });
 
       const airingMetas = [];
-      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+      await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
         try {
-          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series", "", false, env, ctx);
           if (details && details.nextEpisodeAirDate) {
             const isPremiere = details.nextEpisodeNumber === 1;
             const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -783,6 +856,9 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
               background: details.background || undefined,
               airDate: details.nextEpisodeAirDate,
               isSeasonPremiere: isPremiere,
+              isSeasonFinale: !!details.isSeasonFinale,
+              seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+              seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
               description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
               trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
             });

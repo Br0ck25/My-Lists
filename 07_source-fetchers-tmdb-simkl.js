@@ -77,7 +77,7 @@ async function fetchSimklChart(entry, skip, clientId, chartKey, env = null, ctx 
   });
 }
 
-async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey) {
+async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey, env = null, ctx = null) {
   if (!token) {
     throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
   }
@@ -92,8 +92,12 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Simkl User Sync",
     fetchFn: async () => {
       const res = await fetch("https://api.simkl.com/sync/all-items/", {
@@ -149,9 +153,9 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
     });
 
     const airingMetas = [];
-    await mapWithConcurrency(candidateMetas.slice(0, 35), 6, async (item) => {
+    await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
       try {
-        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series");
+        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series", "", false, env, ctx);
         if (details && details.nextEpisodeAirDate) {
           const isPremiere = details.nextEpisodeNumber === 1;
           const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -170,6 +174,9 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
             // original release year, which is noise in this context.
             airDate: details.nextEpisodeAirDate,
             isSeasonPremiere: isPremiere,
+            isSeasonFinale: !!details.isSeasonFinale,
+            seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+            seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
             description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
             trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
           });
@@ -374,14 +381,12 @@ async function fetchTrailerForImdb(imdbId, type, apiKey) {
 
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
-// fetchTmdbDetails's append_to_response=videos, see below). Silently a
-// no-op when no TMDB_API_KEY is configured on this Worker.
+// fetchTmdbDetails's append_to_response=videos, see below).
+// NOTE: Catalogs in Stremio/wako/Nuvio do not play trailers on home screen thumbnails;
+// Stremio's title details page resolves official YouTube trailers directly via Cinemeta.
+// Returning immediately eliminates ~100,000+ redundant TMDB subrequests per day and
+// dramatically speeds up catalog response times.
 async function enrichTrailers(metas, type, apiKey) {
-  if (!apiKey || !metas.length) return metas;
-  await mapWithConcurrency(metas, 8, async (m) => {
-    const ytKey = await fetchTrailerForImdb(m.id, type, apiKey);
-    if (ytKey) m.trailerStreams = trailerStreamsFor(ytKey);
-  });
   return metas;
 }
 
@@ -395,7 +400,7 @@ async function enrichTrailers(metas, type, apiKey) {
 // (now) fetching trailer videos -- into the single per-item TMDB request
 // this add-on was already making, via append_to_response. Same hard-cached
 // cost as before; trailers just ride along for free.
-async function fetchTmdbDetails(tmdbId, kind, apiKey) {
+async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
   let cleanTmdbId = String(tmdbId || "").trim();
   while (cleanTmdbId.startsWith("tmdb:")) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
@@ -406,6 +411,18 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
   const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
   const cached = getPerUserCache(cacheKey);
   if (cached && cached.data) return cached.data;
+
+  // Check KV cache across all workers
+  if (env && env.CONFIGS) {
+    try {
+      const kvRaw = await env.CONFIGS.get(`tmdbdetail:${kind}:${cleanTmdbId}`);
+      if (kvRaw) {
+        const kvParsed = JSON.parse(kvRaw);
+        setPerUserCache(cacheKey, kvParsed, 604800, 2592000);
+        return kvParsed;
+      }
+    } catch {}
+  }
 
   // release_dates is appended alongside external_ids/videos at no extra
   // request cost (same call, one more field) -- used by fetchTmdbChart
@@ -440,7 +457,14 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
   }
   const result = { imdbId, videos, hasDigitalRelease };
   // Cache for 7 days (604800s)
-  setPerUserCache(cacheKey, result, 604800, 604800);
+  setPerUserCache(cacheKey, result, 604800, 2592000);
+
+  // Persist to Cloudflare KV for 30 days so no other worker or edge ever re-queries this ID
+  if (env && env.CONFIGS && imdbId) {
+    try {
+      env.CONFIGS.put(`tmdbdetail:${kind}:${cleanTmdbId}`, JSON.stringify(result), { expirationTtl: 2592000 }).catch(() => {});
+    } catch {}
+  }
   return result;
 }
 
@@ -781,7 +805,7 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigi
       const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
 
       const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-        const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+        const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey, env);
         if (!imdbId) return null;
         if (applyDigitalFilter && hasDigitalRelease === false) return null;
         return mapTmdbItem(it, imdbId, entry.type, videos);
@@ -1113,7 +1137,7 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache) {
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
@@ -1132,6 +1156,10 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     freshTtlSec: (fallbackType === "series" || fallbackType === "tv") ? 7200 : 604800,
     staleTtlSec: 2592000,
     providerLabel: "TMDB Item Details",
+    env: env,
+    ctx: ctx,
+    kvKey: apiKey ? cacheKey : "",
+    kvTtlSec: 604800,
     fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
   });
 }
@@ -1139,6 +1167,7 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
 async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  const today = new Date().toISOString().slice(0, 10);
   let rawStr = String(imdbId).trim();
   let tmdbId = null;
   let type = (fallbackType === "series" || fallbackType === "tv") ? "tv" : (fallbackType === "movie" ? "movie" : null);
@@ -1155,20 +1184,51 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   if (!tmdbId) {
     const baseImdbId = rawStr.startsWith("tt") ? rawStr.split(":")[0] : rawStr;
-    const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
-    const findRes = await fetch(findSrc, {
-      headers: { "User-Agent": "my-list-addon/1.14" },
-      cf: { cacheTtl: 604800, cacheEverything: true },
-    });
-    if (findRes.ok) {
-      const findData = await findRes.json();
-      if (findData.movie_results && findData.movie_results.length > 0) {
-        tmdbId = findData.movie_results[0].id;
-        type = "movie";
-      } else if (findData.tv_results && findData.tv_results.length > 0) {
-        tmdbId = findData.tv_results[0].id;
-        type = "tv";
+    if (baseImdbId.startsWith("tt")) {
+      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+      const findRes = await fetch(findSrc, {
+        headers: { "User-Agent": "my-list-addon/1.14" },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (findRes.ok) {
+        const findData = await findRes.json();
+        if (findData.movie_results && findData.movie_results.length > 0) {
+          tmdbId = findData.movie_results[0].id;
+          type = "movie";
+        } else if (findData.tv_results && findData.tv_results.length > 0) {
+          tmdbId = findData.tv_results[0].id;
+          type = "tv";
+        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+          tmdbId = findData.tv_episode_results[0].show_id;
+          type = "tv";
+        }
       }
+    } else if (baseImdbId) {
+      // Query fallback for title strings
+      const searchType = (type === "tv" || type === "series" || fallbackType === "series" || fallbackType === "tv") ? "tv" : (type === "movie" || fallbackType === "movie" ? "movie" : "multi");
+      const cleanTitle = String(baseImdbId)
+        .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+        .replace(/[\s._-]+\d+x\d+.*$/i, "")
+        .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+        .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+        .replace(/\s*\(\d{4}\).*$/, "")
+        .trim();
+      try {
+        const searchRes = await fetch("https://api.themoviedb.org/3/search/" + searchType + "?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || baseImdbId) + "&page=1", {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (searchRes.ok) {
+          const sd = await searchRes.json();
+          if (sd.results && sd.results.length > 0) {
+            const first = sd.results[0];
+            tmdbId = first.id;
+            if (!type) {
+              type = first.media_type === "tv" ? "tv" : (first.media_type === "movie" ? "movie" : (fallbackType === "series" || fallbackType === "tv" ? "tv" : "movie"));
+            }
+          }
+        }
+      } catch {}
     }
   }
   if (!tmdbId) return null;
@@ -1284,7 +1344,6 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   const nextEpInfo = await (async () => {
     if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
-    const today = new Date().toISOString().slice(0, 10);
     if (match.next_episode_to_air) {
       const nextAir = match.next_episode_to_air.air_date || null;
       if (nextAir && nextAir > today) {
@@ -1340,6 +1399,50 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
   })();
 
+  let isSeasonPremiere = false;
+  let isSeasonFinale = false;
+  let seasonFinaleAirDate = null;
+  let seasonFinaleEpisodeNumber = null;
+  let totalEpisodesInSeason = null;
+
+  const isUnairedFuture = !!(nextEpInfo && nextEpInfo.nextEpisodeAirDate && nextEpInfo.nextEpisodeAirDate > today);
+
+  if (type === "tv" && isUnairedFuture && nextEpInfo.nextEpisodeSeasonNumber) {
+    const targetSeason = Array.isArray(match.seasons)
+      ? match.seasons.find((s) => s && s.season_number === nextEpInfo.nextEpisodeSeasonNumber)
+      : null;
+    if (targetSeason && typeof targetSeason.episode_count === "number") {
+      totalEpisodesInSeason = targetSeason.episode_count;
+      seasonFinaleEpisodeNumber = targetSeason.episode_count;
+    }
+
+    if (nextEpInfo.nextEpisodeNumber === 1) {
+      isSeasonPremiere = true;
+    } else if (totalEpisodesInSeason && nextEpInfo.nextEpisodeNumber === totalEpisodesInSeason && nextEpInfo.nextEpisodeNumber > 1) {
+      isSeasonFinale = true;
+    }
+
+    // If mid-season (episodes 2..N-1), resolve the finale episode's air date
+    if (!isSeasonPremiere && !isSeasonFinale && tmdbId && nextEpInfo.nextEpisodeSeasonNumber) {
+      try {
+        const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + nextEpInfo.nextEpisodeSeasonNumber + "?api_key=" + encodeURIComponent(apiKey), {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        });
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          if (Array.isArray(sData.episodes) && sData.episodes.length > 0) {
+            const lastEp = sData.episodes[sData.episodes.length - 1];
+            if (lastEp) {
+              if (lastEp.air_date) seasonFinaleAirDate = lastEp.air_date;
+              if (typeof lastEp.episode_number === "number") seasonFinaleEpisodeNumber = lastEp.episode_number;
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
   return {
     id: realImdbId,
     title: match.title || match.name,
@@ -1360,6 +1463,11 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     cast: cast,
     director: director,
     ...nextEpInfo,
+    isSeasonPremiere: isSeasonPremiere,
+    isSeasonFinale: isSeasonFinale,
+    seasonFinaleAirDate: seasonFinaleAirDate,
+    seasonFinaleEpisodeNumber: seasonFinaleEpisodeNumber,
+    totalEpisodesInSeason: totalEpisodesInSeason,
     lastEpisodeNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.episode_number === "number" ? match.last_episode_to_air.episode_number : null) : null,
   };
 }
@@ -1371,7 +1479,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 // (knownTmdbId when supplied, else the raw imdbId) plus the season number,
 // since a season's episode list is public, static-ish data no different
 // per requester.
-async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
+async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId, env, ctx) {
   if (!apiKey) return null;
   const cacheKey = `tmdb:season:${knownTmdbId || imdbId}:${seasonNum}`;
   return fetchWithPerUserCacheAndCircuitBreaker({
@@ -1379,6 +1487,10 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
     freshTtlSec: 604800,
     staleTtlSec: 2592000,
     providerLabel: "TMDB Season Details",
+    env: env,
+    ctx: ctx,
+    kvKey: apiKey ? cacheKey : "",
+    kvTtlSec: 604800,
     fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId),
   });
 }
@@ -1395,22 +1507,44 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
   // mark watched either.
   let tmdbId = knownTmdbId || null;
   if (!tmdbId) {
-    if (imdbId.startsWith('tmdb:')) {
-      tmdbId = imdbId.split(':')[1];
-    } else {
-      // First, find TMDB ID from IMDB ID
-      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(imdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+    const raw = String(imdbId || '').trim();
+    if (raw.startsWith('tmdb:')) {
+      tmdbId = raw.split(':')[1];
+    } else if (/^\d+$/.test(raw)) {
+      tmdbId = raw;
+    } else if (raw.startsWith('tt')) {
+      const baseImdbId = raw.split(':')[0];
+      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
       const findRes = await fetch(findSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
-      if (!findRes.ok) return null;
-      const findData = await findRes.json();
-
-      if (!findData.tv_results || findData.tv_results.length === 0) return null;
-      tmdbId = findData.tv_results[0].id;
+      if (findRes.ok) {
+        const findData = await findRes.json();
+        if (findData.tv_results && findData.tv_results.length > 0) {
+          tmdbId = findData.tv_results[0].id;
+        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+          tmdbId = findData.tv_episode_results[0].show_id;
+        }
+      }
+    } else if (raw) {
+      // Query fallback for title strings, e.g. "Ted Lasso"
+      const cleanTitle = raw.replace(/\s+S\d+E\d+.*$/i, '').trim();
+      try {
+        const searchRes = await fetch("https://api.themoviedb.org/3/search/tv?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || raw) + "&page=1", {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (searchRes.ok) {
+          const sd = await searchRes.json();
+          if (sd.results && sd.results.length > 0) {
+            tmdbId = sd.results[0].id;
+          }
+        }
+      } catch {}
     }
   }
+  if (!tmdbId) return null;
 
   const src = "https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonNum + "?api_key=" + encodeURIComponent(apiKey);
   const res = await fetch(src, {
@@ -1437,10 +1571,10 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
 // Builds standard Stremio/Nuvio metadata for any movie or series keyed by IMDb id.
 // Provides full metadata (details, ratings, cast, genres, seasons, and episodes)
 // so clients without a dedicated metadata addon (like Nuvio) render rich pages automatically.
-async function fetchStandardItemMeta(imdbId, type, apiKey) {
+async function fetchStandardItemMeta(imdbId, type, apiKey, env = null, ctx = null) {
   if (!apiKey || !imdbId) return null;
   const wantType = type === "series" ? "series" : "movie";
-  const details = await fetchTmdbItemDetails(imdbId, apiKey, wantType);
+  const details = await fetchTmdbItemDetails(imdbId, apiKey, wantType, "", false, env, ctx);
   if (!details) return null;
 
   const meta = {
@@ -1472,7 +1606,7 @@ async function fetchStandardItemMeta(imdbId, type, apiKey) {
     const regularSeasons = details.seasonsData.filter((s) => s && s.season_number > 0);
     const seasonResults = await Promise.all(
       regularSeasons.map((s) =>
-        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId).catch(() => null)
+        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId, env, ctx).catch(() => null)
       )
     );
 
@@ -1532,14 +1666,16 @@ function isEpisodeAiredServer(ep) {
 // (21_client-custom-list-builder.js), reimplemented server-side for the
 // same reason as isEpisodeAiredServer above. Returns { episode, seasonNum }
 // or null if nothing new has aired since latestSeasonNum/latestEpisodeNum.
-async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisodeNum, apiKey) {
-  const data = await fetchTmdbSeasonDetails(imdbId, latestSeasonNum, apiKey);
+async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisodeNum, apiKey, env, ctx) {
+  const sNum = Number(latestSeasonNum);
+  const eNum = Number(latestEpisodeNum);
+  const data = await fetchTmdbSeasonDetails(imdbId, sNum, apiKey, null, env, ctx);
   if (data && data.episodes) {
-    const nextInSeason = data.episodes.find((ep) => ep.episode_number > latestEpisodeNum);
-    if (nextInSeason) return { episode: nextInSeason, seasonNum: latestSeasonNum, isUnaired: !isEpisodeAiredServer(nextInSeason) };
+    const nextInSeason = data.episodes.find((ep) => ep.episode_number > eNum);
+    if (nextInSeason) return { episode: nextInSeason, seasonNum: sNum, isUnaired: !isEpisodeAiredServer(nextInSeason) };
   }
-  const nextSeasonNum = latestSeasonNum + 1;
-  const data2 = await fetchTmdbSeasonDetails(imdbId, nextSeasonNum, apiKey);
+  const nextSeasonNum = sNum + 1;
+  const data2 = await fetchTmdbSeasonDetails(imdbId, nextSeasonNum, apiKey, null, env, ctx);
   if (data2 && data2.episodes && data2.episodes.length) {
     const sorted = [...data2.episodes].sort((a, b) => a.episode_number - b.episode_number);
     if (sorted.length) return { episode: sorted[0], seasonNum: nextSeasonNum, isUnaired: !isEpisodeAiredServer(sorted[0]) };
@@ -1639,7 +1775,7 @@ async function checkForNewEpisodes(env) {
       showChecksUsed++;
       let next = null;
       try {
-        next = await findNextAiredEpisodeForShow(showId, latest.seasonNum, latest.episodeNum, env.TMDB_API_KEY);
+        next = await findNextAiredEpisodeForShow(showId, latest.seasonNum, latest.episodeNum, env.TMDB_API_KEY, env);
       } catch (e) {
         stillFullyWatched.push(showId); // network hiccup -- try again next run instead of assuming still fully watched
         continue;

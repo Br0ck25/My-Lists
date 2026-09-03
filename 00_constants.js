@@ -2,6 +2,16 @@ const ADDON_ID = "app.my-list";
 const ADDON_VERSION = "1.5.0";
 const ADDON_NAME = "My Lists";
 
+// How many items a "Recommended Movies"/"Recommended Shows" list holds --
+// shared deliberately by the two places that build one, because they used
+// to disagree. /api/recommendations (25_api-catalog-routes.js) is what the
+// Discover tab's card renders and counts; fetchCuratedCatalog
+// (05_catalog-core.js) is what the actual catalog row and the Live Preview
+// serve. The card said 40 and the shelf said 100 (PAGE_SIZE) purely
+// because each hardcoded its own number. One constant so they cannot
+// drift apart again.
+const CURATED_RECOMMENDATION_LIMIT = 40;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

@@ -303,6 +303,71 @@ async function verifyCreatorKey(key, storedHash) {
   }
 }
 
+// --- Verified-key memo (per-isolate, in memory only) -------------------------
+// verifyCreatorKey above runs PBKDF2 at 100,000 iterations, and because a
+// Creator Profile issues no session or token, EVERY authenticated request
+// re-runs it from scratch -- routine autosaves, the dashboard load, each
+// Auto-Track Playback ping, and the sync poll that fires while the
+// dashboard is simply open. That made key verification the single largest
+// CPU cost of being signed in, paid over and over for a credential that
+// had already been proven correct moments earlier.
+//
+// This memoizes only the RESULT of a verification that already succeeded,
+// for a few minutes, in this isolate's memory:
+//   * Nothing is written to KV, D1, or any response -- it cannot outlive
+//     the isolate and cannot be read by another request path.
+//   * The memo is keyed on a SHA-256 of the username, the presented key,
+//     AND the stored hash, so a wrong key never collides with a right one,
+//     and rotating the key (which changes the stored hash) invalidates
+//     every existing entry for that account immediately.
+//   * A key that has NOT been verified before still pays the full PBKDF2
+//     cost. This is a cache of successes, never a shortcut past one, so
+//     brute-forcing is exactly as expensive as it was before.
+// Failures are deliberately not memoized -- caching them would let a
+// transient issue lock out a correct key for the rest of the TTL.
+const CREATOR_AUTH_MEMO = new Map();
+const CREATOR_AUTH_MEMO_TTL_MS = 5 * 60 * 1000;
+const CREATOR_AUTH_MEMO_MAX = 500;
+
+async function creatorAuthMemoKey(username, key, storedHash) {
+  const data = new TextEncoder().encode(String(username) + "\u0000" + String(key) + "\u0000" + String(storedHash));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyCreatorKeyMemoized(key, storedHash, username) {
+  if (!key || !storedHash) return false;
+  let memoKey = "";
+  try {
+    memoKey = await creatorAuthMemoKey(username || "", key, storedHash);
+  } catch {
+    // Digest unavailable for some reason -- fall straight through to the
+    // real verification rather than failing the request.
+    return await verifyCreatorKey(key, storedHash);
+  }
+  const now = Date.now();
+  const hit = CREATOR_AUTH_MEMO.get(memoKey);
+  if (hit !== undefined && now < hit) return true;
+  if (hit !== undefined) CREATOR_AUTH_MEMO.delete(memoKey);
+  const valid = await verifyCreatorKey(key, storedHash);
+  if (valid) {
+    if (CREATOR_AUTH_MEMO.size >= CREATOR_AUTH_MEMO_MAX) {
+      const oldest = CREATOR_AUTH_MEMO.keys().next().value;
+      if (oldest !== undefined) CREATOR_AUTH_MEMO.delete(oldest);
+    }
+    CREATOR_AUTH_MEMO.set(memoKey, now + CREATOR_AUTH_MEMO_TTL_MS);
+  }
+  return valid;
+}
+
+// Drops every memoized verification for one account. Called after any
+// change to the stored key hash so a rotated key cannot keep working from
+// a warm isolate. (The hash is part of the memo key above, so this is
+// belt-and-braces rather than strictly required.)
+function invalidateCreatorAuthMemo() {
+  CREATOR_AUTH_MEMO.clear();
+}
+
 // MYL-XXXX-XXXX-XXXX -- excludes visually-ambiguous characters (0/O, 1/I/L)
 // so a key someone's reading off a screen to type into another device
 // doesn't turn into a guessing game. 12 real characters from a 32-symbol
@@ -398,20 +463,258 @@ async function hashStringForKey(s) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
 
+// --- Builder page: render memo + conditional requests ------------------------
+// The builder page is roughly 1.6MB of HTML with the entire client script
+// inlined, and it was rebuilt from scratch on every single navigation and
+// sent in full every time -- no ETag, no Last-Modified, and on most routes
+// an explicit Cache-Control: no-store that told the browser never even to
+// keep a copy. So opening the app, following a shared list link, and
+// pressing back each re-downloaded and re-parsed the whole thing.
+//
+// Two separate fixes, both of which depend on the same fact: for a given
+// origin and a given set of arguments, renderBuilder is deterministic
+// (verified by rendering twice and comparing). Nothing in it varies per
+// request -- no timestamp, no random id.
+//
+//  1. renderBuilderCached memoizes the argument-free variants (the default
+//     page and the bare /configure page) per origin, so the Worker stops
+//     re-concatenating 1.6MB of string on every page load. Config-bearing
+//     and deep-link variants are not memoized -- they differ per request --
+//     but still get an ETag below.
+//  2. htmlPageResponse hashes the HTML into an ETag and answers a matching
+//     If-None-Match with a bare 304. Cache-Control is "no-cache", which is
+//     often misread as "do not cache": it means "you may store this, but
+//     revalidate before reusing it". That is exactly right here -- the page
+//     must never go stale after a deploy, and revalidating costs a 304
+//     instead of 1.6MB.
+//
+// Worth being explicit about why this is safe on the routes that previously
+// said no-store: the ETag is a hash of the actual bytes being returned, so
+// a page whose content depends on a config or a deep-linked list gets a
+// different ETag the moment that content differs. A 304 can only ever be
+// sent when the browser already holds a byte-identical copy.
+const BUILDER_PAGE_MEMO = new Map();
+
+function renderBuilderCached(origin, opts) {
+  // Only the argument-free variants are stable enough to memoize; anything
+  // carrying entries, keys or a deep link is rendered fresh.
+  const isDefault = !opts || Object.keys(opts).length === 0;
+  const isBareConfigure = !!(opts && opts.isConfigureMode === true && Object.keys(opts).length === 1);
+  if (!isDefault && !isBareConfigure) {
+    return renderBuilder(origin, opts || {});
+  }
+  const memoKey = `${origin}::${isBareConfigure ? "configure" : "default"}`;
+  const hit = BUILDER_PAGE_MEMO.get(memoKey);
+  if (hit) return hit;
+  const html = renderBuilder(origin, opts || {});
+  // Bounded purely as a guard against an unexpected flood of distinct
+  // origins; in practice this holds one or two entries.
+  if (BUILDER_PAGE_MEMO.size >= 8) {
+    const oldest = BUILDER_PAGE_MEMO.keys().next().value;
+    if (oldest !== undefined) BUILDER_PAGE_MEMO.delete(oldest);
+  }
+  BUILDER_PAGE_MEMO.set(memoKey, html);
+  return html;
+}
+
+// ETags are cached alongside the HTML they describe so a repeat request for
+// a memoized page does not re-hash 1.6MB to decide it can send a 304.
+const BUILDER_ETAG_MEMO = new Map();
+
+async function htmlEtagFor(html) {
+  const cached = BUILDER_ETAG_MEMO.get(html);
+  if (cached) return cached;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(html));
+  const etag = `"${[...new Uint8Array(digest)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("")}"`;
+  if (BUILDER_ETAG_MEMO.size >= 16) {
+    const oldest = BUILDER_ETAG_MEMO.keys().next().value;
+    if (oldest !== undefined) BUILDER_ETAG_MEMO.delete(oldest);
+  }
+  BUILDER_ETAG_MEMO.set(html, etag);
+  return etag;
+}
+
+// --- App bundle extraction ---------------------------------------------------
+// renderBuilder emits the client script as two elements: a small per-request
+// preamble, then a bundle wrapped in the markers below (see the comment in
+// 16_client-row-core.js for why the split falls where it does). Everything
+// between the markers is identical for every visitor and every route --
+// which is checked rather than assumed: the verification suite renders the
+// page with sentinel OAuth tokens, entries, deep links and origins, then
+// asserts the extracted bundle is byte-identical every time and contains
+// none of them.
+//
+// So it is lifted out of the HTML and served from /app.js?v=<hash> with
+// immutable caching. ETags already made a repeat visit to an UNCHANGED page
+// cheap, but they do nothing for the pages people actually share: every
+// distinct shared list URL, configure link and deep link renders different
+// HTML, so each one re-sent all 1.3MB. Now they all share one cached
+// bundle, and the browser can reuse its compiled copy instead of re-parsing
+// inline script on every page load.
+const APP_BUNDLE_START = "<script>/*MYLISTS_APP_BUNDLE_START*/";
+const APP_BUNDLE_END = "/*MYLISTS_APP_BUNDLE_END*/<" + "/script>";
+
+// A single entry, because the bundle is the same for everyone. Populated by
+// whichever happens first -- a page render or a direct /app.js hit.
+let APP_BUNDLE = null;
+
+async function getAppBundle(origin) {
+  if (APP_BUNDLE) return APP_BUNDLE;
+  await splitAppBundle(renderBuilderCached(origin, {}));
+  return APP_BUNDLE;
+}
+
+// Returns { page, bundle }, where page has the bundle element replaced by a
+// script src. If the markers are missing for any reason the original HTML
+// comes back untouched and nothing is cached -- an unrecognised page is
+// served exactly as it was before this existed, rather than half-rewritten.
+async function splitAppBundle(html) {
+  const start = html.indexOf(APP_BUNDLE_START);
+  if (start === -1) return { page: html, bundle: null };
+  const bodyStart = start + APP_BUNDLE_START.length;
+  const end = html.indexOf(APP_BUNDLE_END, bodyStart);
+  if (end === -1) return { page: html, bundle: null };
+
+  const bundle = html.slice(bodyStart, end);
+  if (!APP_BUNDLE) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bundle));
+    const hash = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+    APP_BUNDLE = { js: bundle, hash };
+  }
+  const page =
+    html.slice(0, start) +
+    '<script src="/app.js?v=' + APP_BUNDLE.hash + '"><' + '/script>' +
+    html.slice(end + APP_BUNDLE_END.length);
+  return { page, bundle: APP_BUNDLE };
+}
+
+// The stylesheet gets exactly the same treatment as the script bundle, for
+// exactly the same reason: ~85KB, identical for everyone, and previously
+// re-sent inline with every page. Splitting it out also means the browser
+// can start fetching it in parallel with the page's own parse rather than
+// after re-reading it inline.
+const APP_CSS_START = "<style>/*MYLISTS_APP_CSS_START*/";
+const APP_CSS_END = "/*MYLISTS_APP_CSS_END*/<" + "/style>";
+
+let APP_CSS = null;
+
+async function getAppCss(origin) {
+  if (APP_CSS) return APP_CSS;
+  await splitAppCss(renderBuilderCached(origin, {}));
+  return APP_CSS;
+}
+
+async function splitAppCss(html) {
+  const start = html.indexOf(APP_CSS_START);
+  if (start === -1) return { page: html, css: null };
+  const bodyStart = start + APP_CSS_START.length;
+  const end = html.indexOf(APP_CSS_END, bodyStart);
+  if (end === -1) return { page: html, css: null };
+
+  const css = html.slice(bodyStart, end);
+  if (!APP_CSS) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(css));
+    const hash = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+    APP_CSS = { css, hash };
+  }
+  // rel=stylesheet in <head> still blocks first paint, which is what we
+  // want -- swapping to a non-blocking load here would trade a re-download
+  // for a flash of unstyled content on every page.
+  const page =
+    html.slice(0, start) +
+    '<link rel="stylesheet" href="/app.css?v=' + APP_CSS.hash + '">' +
+    html.slice(end + APP_CSS_END.length);
+  return { page, css: APP_CSS };
+}
+
+// Rewritten pages are remembered per distinct HTML string, so a repeat
+// request for the same page does not re-scan 1.6MB looking for the markers.
+const SPLIT_PAGE_MEMO = new Map();
+
+async function pageWithExternalBundle(html) {
+  const memo = SPLIT_PAGE_MEMO.get(html);
+  if (memo) return memo;
+  let page = html;
+  try {
+    page = (await splitAppBundle(html)).page;
+    page = (await splitAppCss(page)).page;
+  } catch {
+    // Nothing unexpected here is worth costing somebody their page.
+    return html;
+  }
+  if (SPLIT_PAGE_MEMO.size >= 16) {
+    const oldest = SPLIT_PAGE_MEMO.keys().next().value;
+    if (oldest !== undefined) SPLIT_PAGE_MEMO.delete(oldest);
+  }
+  SPLIT_PAGE_MEMO.set(html, page);
+  return page;
+}
+
+async function htmlPageResponse(request, fullHtml, extraHeaders) {
+  // The ~1.3MB client bundle is lifted out to /app.js?v=<hash> first, so
+  // both the body sent below and the ETag computed from it describe the
+  // small page rather than the page-plus-bundle.
+  const html = await pageWithExternalBundle(fullHtml);
+  let etag = "";
+  try {
+    etag = await htmlEtagFor(html);
+  } catch {
+    // No digest available -- fall through and just send the page, exactly
+    // as this did before there was an ETag at all.
+  }
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-cache",
+    ...(extraHeaders || {}),
+  };
+  if (!etag) return new Response(html, { headers });
+  headers["ETag"] = etag;
+
+  // If-None-Match can carry a list, and a cache is allowed to weaken a tag
+  // it stores, so compare against each entry with any W/ prefix removed
+  // rather than string-equalling the whole header.
+  const inm = request && request.headers ? (request.headers.get("If-None-Match") || "") : "";
+  if (inm) {
+    const match = inm
+      .split(",")
+      .map((s) => s.trim().replace(/^W\//, ""))
+      .some((s) => s === etag || s === "*");
+    if (match) {
+      return new Response(null, { status: 304, headers });
+    }
+  }
+  return new Response(html, { headers });
+}
+
 // --- Per-User Cache & Circuit Breaker Shield ---------------------------------
 // Safe in-memory LRU cache with rolling window and Stale-If-Error degradation.
 // Ensures bearer-authenticated user data is safely isolated and never leaks between users.
 const PER_USER_CACHE_MAP = new Map();
 const PER_USER_CACHE_MAX_ENTRIES = 1000;
 
+// Widened from a single 32-bit accumulator to two independently-seeded ones
+// (~64 bits combined). This value separates one person's cached provider
+// data from another's, and with only 32 bits a collision between two users
+// of this add-on was already possible in memory -- it becomes more
+// consequential now that the same value also names a KV entry, where an
+// entry outlives the isolate that wrote it. Still a fast non-cryptographic
+// hash, which is all this needs: nothing outside the Worker can choose the
+// input, so the only failure mode worth engineering against is accidental
+// collision, not a deliberate one.
 function safeUserHash(token = "", username = "") {
   const input = `${token}:${username}`;
-  let hash = 0;
+  let h1 = 0;
+  let h2 = 0x9e3779b9;
   for (let i = 0; i < input.length; i++) {
-    hash = ((hash << 5) - hash) + input.charCodeAt(i);
-    hash |= 0;
+    const c = input.charCodeAt(i);
+    h1 = ((h1 << 5) - h1) + c;
+    h1 |= 0;
+    h2 = ((h2 << 7) - h2) + (c * 31 + i);
+    h2 |= 0;
   }
-  return (Math.abs(hash) || 1).toString(36);
+  const a = (Math.abs(h1) || 1).toString(36);
+  const b = (Math.abs(h2) || 1).toString(36);
+  return a + b;
 }
 
 function getPerUserCache(key) {
@@ -455,7 +758,50 @@ function invalidatePerUserCache(provider, userHash = "") {
 
 // Executes an external fetch with safe per-user caching and circuit-breaker fallback.
 // If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response from in-memory or KV.
-async function fetchWithPerUserCacheAndCircuitBreaker({
+// --- In-flight request coalescing --------------------------------------------
+// Nothing below deduplicated concurrent work for the same cacheKey, so N
+// simultaneous misses meant N identical upstream calls. That is not a rare
+// case here: an Airing Next refresh fires several /api/details lookups at
+// once and shows routinely resolve to the same series, a catalog row can ask
+// for the same chart from several shelves, and a popular list being
+// requested by several people at the same moment lands in one isolate. Each
+// of those spent a provider request -- against the shared key or, worse,
+// against somebody's personal quota -- to compute an answer another
+// in-progress request was about to produce.
+//
+// The first miss for a key registers its promise here; everyone else who
+// arrives before it settles awaits that same promise. A rejection is shared
+// too, which is correct: the callers all made the same request, so they all
+// get the same outcome (including the circuit breaker's stale fallback,
+// which happens inside the shared promise). The entry is always removed
+// once settled, so a failure never poisons the key for later attempts.
+const IN_FLIGHT_FETCHES = new Map();
+
+async function fetchWithPerUserCacheAndCircuitBreaker(options) {
+  const cacheKey = options && options.cacheKey;
+  const cachedFresh = cacheKey ? getPerUserCache(cacheKey) : null;
+  if (cachedFresh && cachedFresh.isFresh) {
+    return cachedFresh.data;
+  }
+  // No usable key to coalesce on -- run it directly rather than letting every
+  // keyless call collapse onto one shared entry.
+  if (!cacheKey) {
+    return await fetchWithPerUserCacheUncoalesced(options);
+  }
+  const existing = IN_FLIGHT_FETCHES.get(cacheKey);
+  if (existing) {
+    return await existing;
+  }
+  const p = fetchWithPerUserCacheUncoalesced(options);
+  IN_FLIGHT_FETCHES.set(cacheKey, p);
+  try {
+    return await p;
+  } finally {
+    IN_FLIGHT_FETCHES.delete(cacheKey);
+  }
+}
+
+async function fetchWithPerUserCacheUncoalesced({
   cacheKey,
   fetchFn,
   freshTtlSec = 60,
@@ -486,23 +832,57 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
     } catch {}
   }
 
+  let edgeCacheData = null;
+  const edgeCacheReq = new Request(`https://my-lists-addon.internal/cache/${encodeURIComponent(cacheKey)}`);
+  if (!cached && !kvData) {
+    try {
+      const edgeRes = await caches.default.match(edgeCacheReq);
+      if (edgeRes) {
+        const raw = await edgeRes.json();
+        if (raw && raw.data !== undefined) {
+          edgeCacheData = raw;
+          setPerUserCache(cacheKey, raw.data, freshTtlSec, staleTtlSec);
+          const now = Date.now();
+          if (raw.freshUntil && now <= raw.freshUntil) {
+            return raw.data;
+          }
+        }
+      }
+    } catch {}
+  }
+
   try {
     const freshData = await fetchFn();
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
+      
+      const cachePayload = JSON.stringify({
+        data: freshData,
+        freshUntil: Date.now() + freshTtlSec * 1000,
+      });
+
       if (env && env.CONFIGS && kvKey) {
-        const p = env.CONFIGS.put(
-          `cache:${kvKey}`,
-          JSON.stringify({
-            data: freshData,
-            freshUntil: Date.now() + freshTtlSec * 1000,
-          }),
-          { expirationTtl: kvTtlSec }
-        ).catch(() => {});
+        const p = env.CONFIGS.put(`cache:${kvKey}`, cachePayload, { expirationTtl: kvTtlSec }).catch(() => {});
         if (ctx && typeof ctx.waitUntil === "function") {
           ctx.waitUntil(p);
         }
       }
+
+      try {
+        const edgeRes = new Response(cachePayload, {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `s-maxage=${Math.max(freshTtlSec, kvTtlSec)}`
+          }
+        });
+        const cachePromise = caches.default.put(edgeCacheReq, edgeRes);
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(cachePromise);
+        } else {
+          cachePromise.catch(() => {});
+        }
+      } catch {}
+
       return freshData;
     }
   } catch (err) {
@@ -515,6 +895,10 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
       console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good KV cached data.`);
       return kvData.data;
     }
+    if (edgeCacheData && edgeCacheData.data) {
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good Edge cached data.`);
+      return edgeCacheData.data;
+    }
     throw err;
   }
 
@@ -523,6 +907,9 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
   }
   if (kvData && kvData.data) {
     return kvData.data;
+  }
+  if (edgeCacheData && edgeCacheData.data) {
+    return edgeCacheData.data;
   }
   return null;
 }
@@ -537,5 +924,104 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
     return fetchTraktWithRetry(url, options, retries - 1);
   }
   return res;
+}
+
+
+async function listAllKeys(namespace, prefix) {
+  const keys = [];
+  let cursor;
+  do {
+    const result = await namespace.list({
+      prefix,
+      limit: 1000,
+      ...(cursor ? { cursor } : {})
+    });
+    keys.push(...result.keys);
+    cursor = result.cursor;
+    if (result.list_complete) {
+      break;
+    }
+  } while (cursor);
+  return { keys, list_complete: true };
+}
+
+async function getCreator(env, username) {
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      if (results.length > 0) {
+        const row = results[0];
+        return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
+      }
+      return null;
+    } catch(e) {}
+  }
+  return await env.CONFIGS.get(`creator:${username}`);
+}
+
+async function getCreatorList(env, username, slug) {
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
+      if (results.length > 0) {
+        const row = results[0];
+        return JSON.stringify({ 
+          slug: row.id.split(':')[1] || slug, 
+          name: row.name, 
+          type: row.type, 
+          visibility: row.visibility, 
+          items: JSON.parse(row.items_json || '[]'), 
+          createdAt: row.created_at, 
+          updatedAt: row.updated_at,
+          likes: row.likes || 0
+        });
+      }
+      return null;
+    } catch(e) {}
+  }
+  return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+}
+
+function isEpisodeAired(airDateStr) {
+  if (!airDateStr) return false;
+  const parts = String(airDateStr).split(/[-T\s]/);
+  if (parts.length < 3) return false;
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return false;
+  const d = new Date(year, month, day);
+  if (isNaN(d.getTime())) return false;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return d.getTime() < today.getTime();
+}
+
+function formatAirDateBadge(airDateStr) {
+  if (!airDateStr) return '';
+  const parts = String(airDateStr).split(/[-T\s]/);
+  if (parts.length < 3) return '';
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return '';
+  const d = new Date(year, month, day);
+  if (isNaN(d.getTime())) return '';
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((d.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays <= 0) return 'TODAY';
+  if (diffDays === 1) return 'TOMORROW';
+  if (diffDays > 1 && diffDays < 7) {
+    const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+    return days[d.getDay()];
+  }
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  if (d.getFullYear() !== now.getFullYear()) {
+    return months[d.getMonth()] + ' ' + String(d.getFullYear()).slice(-2);
+  }
+  return months[d.getMonth()] + ' ' + d.getDate();
 }
 

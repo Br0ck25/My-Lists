@@ -1,0 +1,14 @@
+name = "my-lists-addon"
+main = "worker_entry_combined.js"
+compatibility_date = "2024-01-01"
+
+# Bind your KV namespace (replace with your actual KV ID)
+# [[kv_namespaces]]
+# binding = "CONFIGS"
+# id = "YOUR_KV_NAMESPACE_ID"
+
+# Bind the D1 Database we just created
+[[d1_databases]]
+binding = "DB"
+database_name = "my-lists-db"
+database_id = "YOUR_DATABASE_ID" # You can get this by running `npx wrangler d1 info my-lists-db`

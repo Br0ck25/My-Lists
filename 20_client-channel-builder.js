@@ -802,6 +802,7 @@ function renderChannelPosterPicker() {
   });
 
   grid.innerHTML = html;
+  if (typeof syncChannelPosterUrlInput === 'function') syncChannelPosterUrlInput();
 }
 
 function selectChannelPoster(posterUrl, backdropUrl) {
@@ -818,6 +819,105 @@ function selectChannelPoster(posterUrl, backdropUrl) {
       card.classList.remove('selected');
     }
   });
+  // Clear URL input if a grid card was chosen
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  if (urlInput) urlInput.value = '';
+  if (preview) preview.style.display = 'none';
+}
+
+function applyChannelPosterUrl() {
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  const previewImg = document.getElementById('channelPosterUrlImg');
+  const status = document.getElementById('channelPosterUrlStatus');
+  if (!urlInput) return;
+
+  const raw = urlInput.value.trim();
+  if (!raw) return;
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (_) {
+    if (status) { status.textContent = 'Invalid URL \u2014 please enter a full URL starting with https://'; status.style.color = 'var(--err, #ff453a)'; }
+    if (preview) preview.style.display = 'flex';
+    if (previewImg) previewImg.style.display = 'none';
+    return;
+  }
+
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    if (status) { status.textContent = 'Only http:// or https:// URLs are supported.'; status.style.color = 'var(--err, #ff453a)'; }
+    if (preview) preview.style.display = 'flex';
+    if (previewImg) previewImg.style.display = 'none';
+    return;
+  }
+
+  // Apply the URL immediately — don't wait for the preview to load
+  channelDraftPoster = url.href;
+  channelDraftBackdrop = null;
+  const cards = document.querySelectorAll('#channelPosterChoicesGrid .channel-poster-choice');
+  cards.forEach((card) => card.classList.remove('selected'));
+
+  if (status) { status.textContent = 'Poster URL applied \u2713 (preview loading\u2026)'; status.style.color = 'var(--success, #30d158)'; }
+  if (preview) preview.style.display = 'flex';
+
+  if (previewImg) {
+    previewImg.style.display = 'none';
+
+    let settled = false;
+
+    const settle = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (ok) {
+        previewImg.style.display = '';
+        if (status) { status.textContent = 'Poster URL applied \u2713'; status.style.color = 'var(--success, #30d158)'; }
+      } else {
+        previewImg.style.display = 'none';
+        if (status) {
+          status.textContent = 'URL applied \u2713 (preview unavailable \u2014 the image may have hotlink protection, but it will still be used as the poster)';
+          status.style.color = 'var(--muted)';
+        }
+      }
+    };
+
+    previewImg.onerror = () => settle(false);
+    previewImg.onload = () => settle(true);
+
+    // If neither fires within 4 seconds, show a friendly fallback message
+    setTimeout(() => settle(false), 4000);
+
+    previewImg.src = url.href;
+  }
+}
+
+// Restore URL input when editing a channel that has a custom URL poster
+function syncChannelPosterUrlInput() {
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  const previewImg = document.getElementById('channelPosterUrlImg');
+  const status = document.getElementById('channelPosterUrlStatus');
+  if (!urlInput) return;
+
+  const isUrlPoster = channelDraftPoster
+    && channelDraftPoster !== 'custom'
+    && !channelDraftPoster.includes('/api/channel-')
+    // It's a custom URL if it isn't one of the auto-extracted show posters in the grid
+    && !document.querySelector('#channelPosterChoicesGrid .channel-poster-choice.selected');
+
+  if (isUrlPoster) {
+    urlInput.value = channelDraftPoster;
+    if (previewImg) {
+      previewImg.src = channelDraftPoster;
+      previewImg.style.display = '';
+    }
+    if (status) { status.textContent = 'Poster URL applied \u2713'; status.style.color = 'var(--success, #30d158)'; }
+    if (preview) preview.style.display = 'flex';
+  } else {
+    urlInput.value = '';
+    if (preview) preview.style.display = 'none';
+  }
 }
 
 // --- // --- Sagas, Universes & Movie Franchises Registry ---------------------------
@@ -5287,7 +5387,7 @@ function saveChannel() {
   let horizontalBackdrop = null;
   if (verticalPoster) {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
-    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || null;
+    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 

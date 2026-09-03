@@ -6,8 +6,50 @@ async function resolveConfig(configParam, env) {
     if (stored) {
       try {
         const parsed = JSON.parse(stored);
+        let watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+        let continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+        let watchlist = Array.isArray(parsed.watchlist) ? parsed.watchlist : [];
+        let airingNext = Array.isArray(parsed.airingNext) ? parsed.airingNext : [];
+
+        let creatorName = parsed.trackCreatorName || parsed.creatorName || "";
+        if (!creatorName && Array.isArray(parsed.entries)) {
+          for (const e of parsed.entries) {
+            if (e && e.url && typeof e.url === 'string' && e.url.startsWith("autotrack:")) {
+              const parts = e.url.split(":");
+              if (parts.length >= 4 && parts[3]) {
+                creatorName = parts[3];
+                break;
+              }
+            }
+          }
+        }
+        if (creatorName && env.CONFIGS) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${creatorName}`);
+          if (trackingRaw) {
+            try {
+              const tracking = JSON.parse(trackingRaw);
+              if (Array.isArray(tracking.watchHistory) && tracking.watchHistory.length && !watchHistory.length) {
+                watchHistory = tracking.watchHistory;
+              }
+              if (Array.isArray(tracking.continueWatching) && tracking.continueWatching.length && !continueWatching.length) {
+                continueWatching = tracking.continueWatching;
+              }
+              if (Array.isArray(tracking.watchlist) && tracking.watchlist.length && !watchlist.length) {
+                watchlist = tracking.watchlist;
+              }
+              if (Array.isArray(tracking.airingNext) && tracking.airingNext.length && !airingNext.length) {
+                airingNext = tracking.airingNext;
+              }
+            } catch {}
+          }
+        }
+
         return {
           entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+          watchHistory,
+          continueWatching,
+          watchlist,
+          airingNext,
           tmdbKey: parsed.tmdbKey || "",
           mdblistKey: parsed.mdblistKey || "",
           mdblistAccessToken: parsed.mdblistAccessToken || "",
@@ -23,6 +65,13 @@ async function resolveConfig(configParam, env) {
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
+          showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
+          showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
+          showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
+          showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
+          showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {
         // fall through to legacy decode below
@@ -125,11 +174,11 @@ function parseTmdbWebChartUrl(rawUrl) {
 
 function detectSource(input) {
   const s = (input || "").trim();
-  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:")) return "mdblist-watchlist";
-  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/history\//i.test(s)) return "mdblist-history";
+  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
+  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
   if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
-  if (s === "trakt:watchlist") return "trakt-watchlist";
-  if (s === "trakt:history") return "trakt-history";
+  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?$/i.test(s)) return "trakt-watchlist";
+  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/history\/?$/i.test(s)) return "trakt-history";
   if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
@@ -281,59 +330,75 @@ async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
 }
 
 async function searchTraktLists(query, traktKeyOverride) {
-  const q = (query || "").trim();
-  if (!q) return [];
+  const rawQ = (query || "").trim();
+  if (!rawQ) return [];
+  const q = rawQ.replace(/^@/, "").trim();
   const traktKey = traktKeyOverride || TRAKT_CLIENT_ID;
   if (!traktKey) {
     throw new Error("Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID.");
   }
 
-  const src = `https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=20`;
-  const res = await fetchTraktWithRetry(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    cf: { cacheTtl: 900, cacheEverything: true },
-  });
-  if (!res.ok) {
-    if (res.status === 403) {
-      throw new Error(
-        traktKeyOverride
-          ? "Trakt rejected the Client ID you entered (HTTP 403 = invalid or unapproved app). Double check it against https://trakt.tv/oauth/applications."
-          : "Trakt rejected this add-on's API key (HTTP 403 = invalid or unapproved app, per Trakt's own error docs). " +
-            "This isn't fixable from a search query -- either the Worker owner needs to check the app behind TRAKT_CLIENT_ID at https://trakt.tv/oauth/applications, or you can enter your own Trakt Client ID in the box above to bypass it."
-      );
-    }
-    if (res.status === 429) {
-      throw new Error("Trakt is temporarily busy (rate limit). Please wait a few seconds and try again.");
-    }
-    throw new Error(`Trakt list search failed (HTTP ${res.status}).`);
+  const headers = {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": traktKey,
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+  };
+
+  const requests = [
+    fetchTraktWithRetry(`https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=30`, {
+      headers,
+      cf: { cacheTtl: 900, cacheEverything: true },
+    }).then(async (r) => (r.ok ? await r.json() : [])).catch(() => [])
+  ];
+
+  // If query looks like a possible username (single token without spaces), also query user lists directly
+  const isPossibleUsername = /^[a-zA-Z0-9_-]{2,32}$/.test(q);
+  if (isPossibleUsername) {
+    requests.push(
+      fetchTraktWithRetry(`https://api.trakt.tv/users/${encodeURIComponent(q)}/lists`, {
+        headers,
+        cf: { cacheTtl: 900, cacheEverything: true },
+      }).then(async (r) => {
+        if (!r.ok) return [];
+        const userLists = await r.json();
+        if (!Array.isArray(userLists)) return [];
+        return userLists.map((l) => ({ list: { ...l, user: l.user || { ids: { slug: q }, username: q } } }));
+      }).catch(() => [])
+    );
   }
 
-  const data = await res.json();
-  const lists = (Array.isArray(data) ? data : [])
-    .map((r) => r.list)
-    .filter((l) => l && l.ids && l.ids.slug && l.user && l.user.ids && l.user.ids.slug)
-    .map((l) => {
-      const name = l.name || "";
-      const isMovie = /\bmovie(s)?\b/i.test(name);
-      const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
-      const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
-      return {
-        name: l.name,
-        user: l.user.username || l.user.ids.slug,
-        slug: l.ids.slug,
-        items: l.item_count || 0,
-        likes: l.likes || 0,
-        contentType,
-        url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
-          l.ids.slug
-        )}`,
-      };
+  const [searchData, userData] = await Promise.all(requests);
+  const combinedRaw = [...(Array.isArray(searchData) ? searchData : []), ...(Array.isArray(userData) ? userData : [])];
+
+  const seenUrls = new Set();
+  const lists = [];
+
+  for (const r of combinedRaw) {
+    const l = r && r.list ? r.list : r;
+    if (!l || !l.ids || !l.ids.slug) continue;
+    const userSlug = (l.user && l.user.ids && l.user.ids.slug) || (l.user && l.user.username) || (isPossibleUsername ? q : '');
+    if (!userSlug) continue;
+    const url = `https://trakt.tv/users/${encodeURIComponent(userSlug)}/lists/${encodeURIComponent(l.ids.slug)}`;
+    if (seenUrls.has(url.toLowerCase())) continue;
+    seenUrls.add(url.toLowerCase());
+
+    const name = l.name || "";
+    const isMovie = /\bmovie(s)?\b/i.test(name);
+    const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+    const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+
+    lists.push({
+      name: l.name || l.ids.slug,
+      user: (l.user && l.user.username) || userSlug,
+      slug: l.ids.slug,
+      items: l.item_count || 0,
+      likes: l.likes || 0,
+      contentType,
+      url,
+      source: "Trakt",
     });
+  }
 
   return lists;
 }

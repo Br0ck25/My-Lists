@@ -316,8 +316,15 @@ async function markTraktHistoryAllWatched(btn) {
   }
 
   if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-  const whResult = await addItemsToWatchHistory(whItems);
+  const whResult = await addItemsToWatchHistory(whItems, true);
   if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  if (whResult.quotaExceeded) {
+    const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+    if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+    else alert(msg);
+    return;
+  }
 
   let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
   if (whResult.cwTotal) {
@@ -425,8 +432,15 @@ function mapMdblistItemsToWatchHistory(rawItems) {
                 name: sep.name || sep.title || ('Episode ' + epNum),
                 showTitle: showTitle,
                 showId: showId,
+                showPoster: showPoster,
                 seasonNum: seasonNum,
-                epNum: epNum,
+                // episodeNum, not epNum. Every reader of a Watch History
+                // entry -- the SxxExx label, the Continue Watching
+                // recompute, the episode-still backfill in
+                // 21_client-custom-list-builder.js -- looks for
+                // episodeNum, so an entry written with epNum was
+                // effectively an episode with no episode number.
+                episodeNum: epNum,
                 poster: showPoster,
                 watchedAt: sep.watched_at || sep.last_watched_at ? (new Date(sep.watched_at || sep.last_watched_at).getTime() || watchedAtMs) : watchedAtMs,
               });
@@ -444,8 +458,9 @@ function mapMdblistItemsToWatchHistory(rawItems) {
           name: inner.episode_title || showTitle,
           showTitle: showTitle,
           showId: showId,
+          showPoster: showPoster,
           seasonNum: inner.season || 1,
-          epNum: inner.episode || 1,
+          episodeNum: inner.episode || 1,
           poster: showPoster,
           watchedAt: watchedAtMs,
         });
@@ -523,8 +538,15 @@ async function markMdblistHistoryAllWatched(btn) {
   }
 
   if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-  const whResult = await addItemsToWatchHistory(whItems);
+  const whResult = await addItemsToWatchHistory(whItems, true);
   if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  if (whResult.quotaExceeded) {
+    const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+    if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+    else alert(msg);
+    return;
+  }
 
   let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
   if (whResult.cwTotal) {
@@ -620,8 +642,15 @@ async function markSimklListAllWatched(btn) {
     }
 
     if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-    const whResult = await addItemsToWatchHistory(whItems);
+    const whResult = await addItemsToWatchHistory(whItems, true);
     if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+    if (whResult.quotaExceeded) {
+      const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+      if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+      else alert(msg);
+      return;
+    }
 
     let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
     if (whResult.cwTotal) {
@@ -936,7 +965,7 @@ async function runTraktExportImport() {
       });
       if (whItems.length && typeof addItemsToWatchHistory === 'function') {
         if (btn) btn.textContent = 'Checking Continue Watching for ' + new Set(whItems.filter((it) => it.showId).map((it) => it.showId)).size + ' show(s)\u2026';
-        const whResult = await addItemsToWatchHistory(whItems);
+        const whResult = await addItemsToWatchHistory(whItems, true);
         watchedAdded += whResult.added;
         cwSucceeded += whResult.cwSucceeded || 0;
         cwTotal += whResult.cwTotal || 0;
@@ -1189,7 +1218,7 @@ window.runLetterboxdExportImport = async function() {
     if (markWatchedChecked.has(cat.key) && typeof addItemsToWatchHistory === 'function') {
       if (progressLine) progressLine.textContent = 'Marking ' + cat.label + ' as watched...';
       const whItems = resolvedItems.map((it) => ({ id: it.imdbId, type: 'movie', name: it.title, poster: it.poster }));
-      const whResult = await addItemsToWatchHistory(whItems);
+      const whResult = await addItemsToWatchHistory(whItems, true);
       watchedAdded += whResult.added;
     }
   }
@@ -1807,7 +1836,7 @@ async function runUnifiedListImport() {
     } else if (targetList === 'watch-history') {
       listDisplayName = 'Watch History';
       if (typeof addItemsToWatchHistory === 'function') {
-        const whResult = await addItemsToWatchHistory(finalItems);
+        const whResult = await addItemsToWatchHistory(finalItems, true);
         savedCount = whResult.added;
       }
     } else if (targetList.startsWith('list:')) {
@@ -1846,7 +1875,7 @@ async function runUnifiedListImport() {
     }
 
     if (alsoMarkWatched && targetList !== 'watch-history' && typeof addItemsToWatchHistory === 'function') {
-      const whResult = await addItemsToWatchHistory(finalItems);
+      const whResult = await addItemsToWatchHistory(finalItems, true);
       totalWatchedAdded += whResult.added;
     }
 

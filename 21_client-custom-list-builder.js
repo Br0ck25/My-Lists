@@ -95,13 +95,13 @@ if (customListSearchBox) {
 
 async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
   const itemType = searchType === 'tv' ? 'series' : 'movie';
-  if (customListDraftType && customListDraftType !== 'mixed' && customListDraftType !== itemType) {
-    if (!customListDraftItems.length) {
-      customListDraftType = itemType;
-      updateCustomListTypeRadio(itemType);
-    } else {
+  if (customListDraftType !== 'mixed') {
+    if (customListDraftItems.length > 0 && customListDraftType !== itemType) {
       customListDraftType = 'mixed';
       updateCustomListTypeRadio('mixed');
+    } else if (!customListDraftItems.length && !customListDraftType) {
+      customListDraftType = itemType;
+      updateCustomListTypeRadio(itemType);
     }
   }
   if (btn) {
@@ -461,25 +461,91 @@ function saveCustomList() {
     renumber();
     checkAllDuplicateUrls();
     saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
+    showAddedToast('"' + name + '" updated \u2713');
   } else {
-    if (listType === 'mixed') {
-      const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type)));
-      const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv'));
-      if (movies.length > 0) {
-        const moviePayload = { listId: generateChannelId(), type: 'movie', items: movies, shuffle: shuffle };
-        const movieUrl = 'customlist:v1:' + JSON.stringify(moviePayload);
-        const movieRow = addRow(name + (series.length > 0 ? ' (Movies)' : ''), movieUrl, 'movie', true, 'Custom Lists');
-        if (!sourceRow) sourceRow = movieRow ? movieRow.querySelector('.source-row') : null;
-      }
-      if (series.length > 0 || movies.length === 0) {
-        const seriesPayload = { listId: generateChannelId(), type: 'series', items: series, shuffle: shuffle };
-        const seriesUrl = 'customlist:v1:' + JSON.stringify(seriesPayload);
-        const seriesRow = addRow(name + (movies.length > 0 ? ' (Shows)' : ''), seriesUrl, 'series', true, 'Custom Lists');
-        if (!sourceRow) sourceRow = seriesRow ? seriesRow.querySelector('.source-row') : null;
-      }
+    const visSelect = document.getElementById('customListVisibilitySelect');
+    const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+    if (activeCreator) {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      fetch(ORIGIN + '/api/creator/lists/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          name: name,
+          type: listType,
+          items: customListDraftItems,
+          visibility: visibility,
+        }),
+      }).then(async (res) => {
+        const data = await res.json();
+        if (!data.ok) {
+          alert('Could not save list: ' + (data.error || 'unknown error'));
+          return;
+        }
+        const slug = data.slug;
+        if (listType === 'mixed') {
+          const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const moviePayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: 'movie', items: movies, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(moviePayload), 'movie', true, 'Custom Lists');
+          const seriesPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: 'series', items: series, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(seriesPayload), 'series', true, 'Custom Lists');
+        } else {
+          const payload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: listType, items: customListDraftItems, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name, 'customlist:v1:' + JSON.stringify(payload), listType, true, 'Custom Lists');
+        }
+        saveState();
+        renderCreatorDashboard();
+        if (typeof renderLivePreview === 'function') renderLivePreview();
+        if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+        if (typeof showSavedCustomListModal === 'function') {
+          showSavedCustomListModal(name, visibility, data.url);
+        } else {
+          showAddedToast('"' + name + '" saved \u2713');
+        }
+      }).catch(() => {
+        alert('Network error while saving list.');
+      });
     } else {
-      const newRowDiv = addRow(name, newUrl, customListDraftType, true, 'Custom Lists');
-      sourceRow = newRowDiv ? newRowDiv.querySelector('.source-row') : null;
+      const map = loadLocalCustomLists();
+      const base = slugify(name) || 'list';
+      let slug = base;
+      let n = 2;
+      while (map[slug]) {
+        slug = base + '-' + n;
+        n++;
+      }
+      map[slug] = {
+        slug: slug,
+        name: name,
+        type: listType,
+        items: customListDraftItems,
+        visibility: visibility,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
+      if (listType === 'mixed') {
+        const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        const moviePayload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: shuffle };
+        addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(moviePayload), 'movie', true, 'Custom Lists');
+        const seriesPayload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: shuffle };
+        addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(seriesPayload), 'series', true, 'Custom Lists');
+      } else {
+        const payload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: listType, items: customListDraftItems, shuffle: shuffle };
+        addRow(name, 'customlist:v1:' + JSON.stringify(payload), listType, true, 'Custom Lists');
+      }
+      saveState();
+      renderCreatorDashboard();
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      showAddedToast('"' + name + '" saved \u2713');
     }
   }
 
@@ -494,17 +560,6 @@ function saveCustomList() {
   if (searchRes) searchRes.innerHTML = '';
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
-
-  // Straight into the same save flow the row's own "Save List" button
-  // uses (creator-profile signed-in -> visibility picker directly;
-  // otherwise the anonymous-vs-create-a-profile choice) -- no separate
-  // trip down to the list below and a second click needed.
-  const urlInput = sourceRow ? sourceRow.querySelector('.url') : null;
-  if (sourceRow && urlInput) {
-    beginSaveListFlow(sourceRow, urlInput, name);
-  } else {
-    alert('List "' + name + '" saved, but the save dialog couldn\\'t open automatically -- use the "Save List" button on it below.');
-  }
 }
 
 // Saves changes to a list already living on the creator's profile --
@@ -513,7 +568,7 @@ function saveCustomList() {
 // the one on the server, not a row in this particular install link.
 async function saveCreatorListEdit(name) {
   if (!activeCreator) {
-    alert('Your Creator Profile session expired -- please restore it again.');
+    alert('Your Profile session expired -- please restore it again.');
     editingCreatorListSlug = null;
     updateCustomListSaveButtonLabel();
     return;
@@ -553,6 +608,9 @@ async function saveCreatorListEdit(name) {
         saveLocalCustomListsMap(map);
       }
       if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    }
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows(editingCreatorListSlug, customListDraftItems, name, customListDraftType);
     }
     if (typeof showSavedCustomListModal === 'function') {
       showSavedCustomListModal(name, visibility, data.url);
@@ -594,6 +652,9 @@ async function saveLocalCustomListEdit(name) {
   }
   if (typeof scheduleCreatorSyncSave === 'function') {
     scheduleCreatorSyncSave();
+  }
+  if (typeof syncCustomListToCatalogRows === 'function') {
+    syncCustomListToCatalogRows(slug, customListDraftItems, name, customListDraftType);
   }
 
   let finalUrl = ((typeof activeCreator !== 'undefined' && activeCreator)
@@ -764,6 +825,86 @@ function updateCustomListTypeRadio(type) {
 // --- Watch History --------------------------------------------------------
 
 window._watchedItemIds = new Set();
+
+// Every key a watch-history item can be looked up by.
+//
+// These permutations used to be spelled out separately in three places (the
+// initial index build, and the add/remove halves of toggleWatchStatus), and
+// computeWatchBadgeState carried a linear scan of the whole history as a
+// safety net for anything they missed. That scan ran for every poster that
+// was NOT already known to be watched -- which is most of them -- so a page
+// of 1,200 posters against a 1,200-item history cost 1.44 million
+// comparisons per pass. Collecting the permutations here means the set can
+// answer every one of those questions in O(1), and the scan can go.
+function watchedIndexKeysFor(it, details) {
+  if (!it) return [];
+  const keys = [];
+  if (it.id) keys.push(String(it.id));
+  if (it.imdbId) keys.push(String(it.imdbId));
+  if (it.tmdbId) {
+    keys.push(String(it.tmdbId));
+    keys.push('tmdb:' + it.tmdbId);
+  }
+  if (it.seasonNum != null && it.episodeNum != null) {
+    const se = ':' + it.seasonNum + ':' + it.episodeNum;
+    if (it.showId) {
+      const sid = String(it.showId);
+      keys.push(sid + se);
+      // A show is stored sometimes as "tmdb:123" and sometimes as "123",
+      // while the poster on screen may carry either form in data-show-id.
+      // Indexing both directions is what the old linear scan was really
+      // doing when it compared against 'tmdb:' + sid.
+      if (sid.indexOf('tmdb:') === 0) keys.push(sid.slice(5) + se);
+      else keys.push('tmdb:' + sid + se);
+    }
+    if (it.showTitle) keys.push(String(it.showTitle) + se);
+    if (details) {
+      if (details.id) keys.push(String(details.id) + se);
+      if (details.imdbId) keys.push(String(details.imdbId) + se);
+      if (details.tmdbId) keys.push('tmdb:' + details.tmdbId + se);
+      if (details.title) keys.push(String(details.title) + se);
+    }
+  }
+  return keys;
+}
+window.watchedIndexKeysFor = watchedIndexKeysFor;
+
+// Rebuilds the whole index from an item array. Cheap enough to run on any
+// change (one pass over the history) and far cheaper than the per-poster
+// scan it replaces.
+function rebuildWatchedIndex(items) {
+  const list = Array.isArray(items) ? items : [];
+  window._rawWatchHistoryItems = list;
+  window._watchedItemIds = new Set();
+  for (let i = 0; i < list.length; i++) {
+    const keys = watchedIndexKeysFor(list[i], null);
+    for (let k = 0; k < keys.length; k++) window._watchedItemIds.add(keys[k]);
+  }
+  window._watchedIndexLength = list.length;
+  // The old observer re-badged every poster on the page on ANY mutation,
+  // which incidentally covered the case where watch state changes after the
+  // posters are already on screen -- history arriving from the account
+  // mid-session, for instance. Now that it only looks at nodes as they are
+  // added, that case needs saying out loud: whenever the index is rebuilt,
+  // sweep what is currently visible. One pass over the posters on screen,
+  // not one pass per poster per mutation.
+  if (typeof window._badgeExistingPosters === 'function') {
+    try { window._badgeExistingPosters(); } catch (e) {}
+  }
+  return window._watchedItemIds;
+}
+window.rebuildWatchedIndex = rebuildWatchedIndex;
+
+// The scan that was removed also quietly covered the case where the history
+// array had changed without the set being updated alongside it. That is
+// still worth guarding, just not once per poster: a length change is enough
+// to notice, and the rebuild is a single pass.
+function ensureWatchedIndexFresh() {
+  const list = window._rawWatchHistoryItems;
+  if (!Array.isArray(list)) return;
+  if (window._watchedIndexLength !== list.length) rebuildWatchedIndex(list);
+}
+window.ensureWatchedIndexFresh = ensureWatchedIndexFresh;
 // Shows where every currently-aired episode has been watched -- separate
 // from _watchedItemIds (which only ever holds movie/episode ids, never a
 // show's own id) since a show's poster is never itself added to Watch
@@ -810,13 +951,34 @@ function findWatchBadgeWrap(el) {
 // never lands in Watch History -- only its episodes do. Episodes/movies
 // have no data-type "series", so they fall through to the plain
 // watched-item check same as always.
-function computeWatchBadgeState(id, type) {
+function computeWatchBadgeState(id, type, el) {
   if (type === 'series') {
     if (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(id)) return 'full';
     if (window._inProgressShowIds && window._inProgressShowIds.has(id)) return 'partial';
     return null;
   }
-  return (window._watchedItemIds && window._watchedItemIds.has(id)) ? 'full' : null;
+  if (window._watchedItemIds && window._watchedItemIds.has(id)) return 'full';
+  if (el && el.dataset) {
+    const s = el.dataset.season;
+    const ep = el.dataset.episode;
+    const sid = el.dataset.showId;
+    if (s != null && ep != null) {
+      if (sid && window._watchedItemIds) {
+        const sidStr = String(sid);
+        if (window._watchedItemIds.has(sidStr + ':' + s + ':' + ep)) return 'full';
+        // Same show, other id spelling -- see watchedIndexKeysFor.
+        const alt = sidStr.indexOf('tmdb:') === 0 ? sidStr.slice(5) : ('tmdb:' + sidStr);
+        if (window._watchedItemIds.has(alt + ':' + s + ':' + ep)) return 'full';
+      }
+      const d = window._currentItemDetails;
+      if (d) {
+        if (d.id && window._watchedItemIds && window._watchedItemIds.has(d.id + ':' + s + ':' + ep)) return 'full';
+        if (d.tmdbId && window._watchedItemIds && window._watchedItemIds.has('tmdb:' + d.tmdbId + ':' + s + ':' + ep)) return 'full';
+        if (d.title && window._watchedItemIds && window._watchedItemIds.has(d.title + ':' + s + ':' + ep)) return 'full';
+      }
+    }
+  }
+  return null;
 }
 
 // Builds the badge markup for a given state -- shared by the observer and
@@ -834,14 +996,7 @@ function initWatchHistory() {
       const l = map[key];
       if (key === 'watch-history' || key.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
         const items = (l && l.items) || [];
-        items.forEach(it => {
-          if (it.id) window._watchedItemIds.add(String(it.id));
-          if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
-          if (it.tmdbId) {
-            window._watchedItemIds.add(String(it.tmdbId));
-            window._watchedItemIds.add('tmdb:' + it.tmdbId);
-          }
-        });
+        rebuildWatchedIndex(items);
       }
       if (key === 'continue-watching' || (l && l.name && l.name.toLowerCase().includes('continue watching'))) {
         const items = (l && l.items) || [];
@@ -852,10 +1007,14 @@ function initWatchHistory() {
   try {
     const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
     if (Array.isArray(rawWh)) {
-      rawWh.forEach(it => {
-        if (it.id) window._watchedItemIds.add(String(it.id));
-        if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
+      if (!window._rawWatchHistoryItems || !window._rawWatchHistoryItems.length) window._rawWatchHistoryItems = rawWh;
+      // Legacy standalone key -- merged into the same index rather than
+      // indexed differently, so lookups need only consult one set.
+      rawWh.forEach((it) => {
+        const keys = watchedIndexKeysFor(it, null);
+        for (let k = 0; k < keys.length; k++) window._watchedItemIds.add(keys[k]);
       });
+      window._watchedIndexLength = (window._rawWatchHistoryItems || []).length;
     }
   } catch (e) {}
   try {
@@ -875,28 +1034,88 @@ function initWatchHistory() {
     // non-critical -- a dismissed show might just reappear once
   }
 
-  const observer = new MutationObserver(mutations => {
+  // Badges new posters as they appear.
+  //
+  // This used to run its whole body synchronously on every mutation record,
+  // and the body was a document-wide querySelectorAll for
+  // .clickable-poster/.clickable-episode followed by a badge computation for
+  // every match -- everything already on the page, not just what had just
+  // changed. Two things made that expensive enough to notice:
+  //
+  //   * The grid renderer appends posters in batches across animation frames
+  //     (renderPosterGridChunked, 23_client-list-management.js), so a 1,200
+  //     item See All page fires this ~20 times over a grid that keeps
+  //     growing -- re-badging everything already placed, each time.
+  //   * Inserting a badge is itself a childList mutation inside the observed
+  //     subtree, so every pass scheduled more passes.
+  //
+  // Now: mutation records are collected and drained once per animation
+  // frame, and only the nodes that were actually added get looked at. The
+  // badge insertions still re-enter, but an inserted overlay contains no
+  // posters, so that pass finds nothing and costs nothing. Work per frame is
+  // proportional to what just appeared rather than to the size of the page.
+  let _badgeQueue = [];
+  let _badgeScheduled = false;
+
+  function badgeElement(el) {
+    if (!el || !el.dataset) return;
+    const id = el.dataset.id;
+    if (!id) return;
+    const state = computeWatchBadgeState(id, el.dataset.type, el);
+    if (!state) return;
+    const wrap = findWatchBadgeWrap(el);
+    if (!wrap) return;
+    // Checking wrap (not el) for an existing badge matters: when el is an
+    // <img> (it can't hold children), wrap is el.parentElement -- checking el
+    // itself here would always find nothing and insert another badge every
+    // time this runs.
+    if (!wrap.querySelector('.watch-indicator-overlay')) {
+      wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
+    }
+  }
+
+  function drainBadgeQueue() {
+    _badgeScheduled = false;
+    const nodes = _badgeQueue;
+    _badgeQueue = [];
     if (!window._watchedItemIds) return;
-    document.querySelectorAll('.clickable-poster, .clickable-episode').forEach(el => {
-      const id = el.dataset.id;
-      if (!id) return;
-      const state = computeWatchBadgeState(id, el.dataset.type);
-      if (!state) return;
-      const wrap = findWatchBadgeWrap(el);
-      if (!wrap) return;
-      // Checking wrap (not el) for an existing badge matters: when el is
-      // an <img> (it can't hold children), wrap is el.parentElement --
-      // checking el itself here would always find nothing, insert another
-      // badge into wrap every time this observer fires, and since that
-      // insertion is itself a mutation under the very subtree being
-      // observed, immediately re-trigger this same callback -- an
-      // unbounded loop that floods the DOM and freezes the tab.
-      if (!wrap.querySelector('.watch-indicator-overlay')) {
-        wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
+    // One freshness check per frame rather than one per poster -- see
+    // ensureWatchedIndexFresh.
+    if (typeof ensureWatchedIndexFresh === 'function') ensureWatchedIndexFresh();
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node || node.nodeType !== 1) continue;
+      if (!node.isConnected) continue;
+      if (node.matches && node.matches('.clickable-poster, .clickable-episode')) badgeElement(node);
+      if (node.querySelectorAll) {
+        const found = node.querySelectorAll('.clickable-poster, .clickable-episode');
+        for (let j = 0; j < found.length; j++) badgeElement(found[j]);
       }
-    });
+    }
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const added = mutations[i].addedNodes;
+      for (let j = 0; j < added.length; j++) _badgeQueue.push(added[j]);
+    }
+    if (!_badgeQueue.length || _badgeScheduled) return;
+    _badgeScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drainBadgeQueue);
+    else setTimeout(drainBadgeQueue, 16);
   });
   observer.observe(document.body, { childList: true, subtree: true });
+
+  // Badges anything already on the page when this first runs, since the
+  // observer only ever sees what arrives after it.
+  window._badgeExistingPosters = function() {
+    _badgeQueue.push(document.body);
+    if (_badgeScheduled) return;
+    _badgeScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drainBadgeQueue);
+    else setTimeout(drainBadgeQueue, 16);
+  };
+  window._badgeExistingPosters();
   try { cleanWatchedFromWatchlists(); } catch (e) {}
 }
 setTimeout(initWatchHistory, 500);
@@ -909,20 +1128,15 @@ setTimeout(initWatchHistory, 500);
 // that's already on screen).
 function refreshWatchBadge(id, type) {
   const strId = String(id);
-  const state = computeWatchBadgeState(strId, type);
   document.querySelectorAll('.clickable-poster[data-id="' + escapeAttr(strId) + '"], .clickable-episode[data-id="' + escapeAttr(strId) + '"]').forEach(el => {
     const wrap = findWatchBadgeWrap(el);
     if (!wrap) return;
-    // See the matching comment in initWatchHistory's observer above -- this
-    // has to check wrap, not el, for the same reason.
+    const state = computeWatchBadgeState(strId, type || (el.dataset ? el.dataset.type : undefined), el);
     const overlay = wrap.querySelector('.watch-indicator-overlay');
     if (state) {
       if (!overlay) {
         wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
       } else {
-        // Swap in place (rather than remove+reinsert) when a show flips
-        // straight from partial to full on its last episode -- keeps the
-        // existing badge element instead of a flicker of removal.
         overlay.className = 'watch-indicator-overlay' + (state === 'partial' ? ' watch-indicator-partial' : '');
         overlay.innerHTML = state === 'partial' ? '&#x25D0;' : '&#x2713;';
       }
@@ -1245,10 +1459,46 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
   
-  const existingIdx = list.items.findIndex(it => it.id === id);
+  let existingIdx = list.items.findIndex(it => it.id === id);
+  
+  if (existingIdx < 0 && type === 'episode') {
+    const d = window._currentItemDetails;
+    if (d) {
+      const cache = window._episodeDataCache || {};
+      const found = Object.values(cache).find(ep => String(ep.id) === String(id));
+      if (found && found.season_number != null && found.episode_number != null) {
+        const fallbackId = d.id + ':' + found.season_number + ':' + found.episode_number;
+        existingIdx = list.items.findIndex(it => it.id === fallbackId);
+        if (existingIdx >= 0) id = fallbackId;
+      }
+    }
+  }
+
   if (existingIdx >= 0) {
-    list.items.splice(existingIdx, 1);
-    window._watchedItemIds.delete(id);
+    const removedItem = list.items.splice(existingIdx, 1)[0];
+    if (removedItem) {
+      if (removedItem.id) window._watchedItemIds.delete(String(removedItem.id));
+      if (removedItem.imdbId) window._watchedItemIds.delete(String(removedItem.imdbId));
+      if (removedItem.tmdbId) {
+        window._watchedItemIds.delete(String(removedItem.tmdbId));
+        window._watchedItemIds.delete('tmdb:' + removedItem.tmdbId);
+      }
+      if (removedItem.seasonNum != null && removedItem.episodeNum != null) {
+        if (removedItem.showId) window._watchedItemIds.delete(String(removedItem.showId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        if (removedItem.showTitle) window._watchedItemIds.delete(String(removedItem.showTitle) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        const d = window._currentItemDetails;
+        if (d) {
+          if (d.id) window._watchedItemIds.delete(String(d.id) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          if (d.imdbId) window._watchedItemIds.delete(String(d.imdbId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          if (d.tmdbId) {
+            window._watchedItemIds.delete(String(d.tmdbId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+            window._watchedItemIds.delete('tmdb:' + d.tmdbId + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          }
+          if (d.title) window._watchedItemIds.delete(String(d.title) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        }
+      }
+    }
+    window._watchedItemIds.delete(String(id));
   } else {
     // If this is an episode, embed show/season/episode context so
     // updateContinueWatching() can find "next unwatched" without extra API calls.
@@ -1270,22 +1520,42 @@ window.toggleWatchStatus = function(id, type, name, poster) {
       }
     }
     list.items.unshift(item);
-    window._watchedItemIds.add(id);
+    window._watchedItemIds.add(String(id));
+    if (item.seasonNum != null && item.episodeNum != null) {
+      if (item.showId) window._watchedItemIds.add(String(item.showId) + ':' + item.seasonNum + ':' + item.episodeNum);
+      if (item.showTitle) window._watchedItemIds.add(String(item.showTitle) + ':' + item.seasonNum + ':' + item.episodeNum);
+      const d = window._currentItemDetails;
+      if (d) {
+        if (d.id) window._watchedItemIds.add(String(d.id) + ':' + item.seasonNum + ':' + item.episodeNum);
+        if (d.imdbId) window._watchedItemIds.add(String(d.imdbId) + ':' + item.seasonNum + ':' + item.episodeNum);
+        if (d.tmdbId) {
+          window._watchedItemIds.add(String(d.tmdbId) + ':' + item.seasonNum + ':' + item.episodeNum);
+          window._watchedItemIds.add('tmdb:' + d.tmdbId + ':' + item.seasonNum + ':' + item.episodeNum);
+        }
+        if (d.title) window._watchedItemIds.add(String(d.title) + ':' + item.seasonNum + ':' + item.episodeNum);
+      }
+    }
     removeWatchedItemFromWatchlist(id, item.showId || (type === 'movie' ? id : null));
     if (typeof trackEvent === 'function') {
       trackEvent('watched', item.showId || id, item.showTitle || name, type === 'movie' ? 'movie' : 'series');
     }
   }
-  
+
+  window._rawWatchHistoryItems = list.items;
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof scheduleCreatorSyncSave === 'function') {
+    scheduleCreatorSyncSave(existingIdx >= 0 ? { intentionalRemoval: true } : undefined);
+  }
 
   // Update Continue Watching for episode toggles
   if (type === 'episode') {
     const d = window._currentItemDetails;
     if (d && d.id) updateContinueWatching(d.id).catch(() => {});
+    if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
+      updateSeasonWatchedButton(window._currentSeasonNum);
+    }
   }
   
   // Re-render UI
@@ -1339,12 +1609,47 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
 
   if (allWatched) {
     const removeIds = new Set(items.map(it => String(it.id)));
+    const removeCompositeKeys = new Set();
+    items.forEach(it => {
+      removeIds.add(String(it.id));
+      if (it.imdbId) removeIds.add(String(it.imdbId));
+      if (it.tmdbId) {
+        removeIds.add(String(it.tmdbId));
+        removeIds.add('tmdb:' + it.tmdbId);
+      }
+      if (it.seasonNum != null && it.episodeNum != null) {
+        if (it.showId) {
+          removeCompositeKeys.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (String(it.showId).startsWith('tmdb:')) {
+            removeCompositeKeys.add(String(it.showId).slice(5) + ':' + it.seasonNum + ':' + it.episodeNum);
+          } else {
+            removeCompositeKeys.add('tmdb:' + it.showId + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        }
+        if (it.showTitle) removeCompositeKeys.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+        const d = window._currentItemDetails;
+        if (d) {
+          if (d.id) removeCompositeKeys.add(String(d.id) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (d.imdbId) removeCompositeKeys.add(String(d.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (d.tmdbId) {
+            removeCompositeKeys.add(String(d.tmdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            removeCompositeKeys.add('tmdb:' + d.tmdbId + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+          if (d.title) removeCompositeKeys.add(String(d.title) + ':' + it.seasonNum + ':' + it.episodeNum);
+        }
+      }
+    });
+
     list.items = list.items.filter(it => !removeIds.has(String(it.id)));
+    window._rawWatchHistoryItems = list.items;
     removeIds.forEach(id => {
-      if (window._watchedItemIds.has(id)) {
+      if (window._watchedItemIds) {
         window._watchedItemIds.delete(id);
         removed++;
       }
+    });
+    removeCompositeKeys.forEach(k => {
+      if (window._watchedItemIds) window._watchedItemIds.delete(k);
     });
   } else {
     const existingIds = new Set(list.items.map(it => String(it.id)));
@@ -1357,9 +1662,38 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
         existingIds.add(id);
         added++;
       }
-      window._watchedItemIds.add(id);
+      if (window._watchedItemIds) {
+        window._watchedItemIds.add(id);
+        if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
+        if (it.tmdbId) {
+          window._watchedItemIds.add(String(it.tmdbId));
+          window._watchedItemIds.add('tmdb:' + it.tmdbId);
+        }
+        if (it.seasonNum != null && it.episodeNum != null) {
+          if (it.showId) {
+            window._watchedItemIds.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (String(it.showId).startsWith('tmdb:')) {
+              window._watchedItemIds.add(String(it.showId).slice(5) + ':' + it.seasonNum + ':' + it.episodeNum);
+            } else {
+              window._watchedItemIds.add('tmdb:' + it.showId + ':' + it.seasonNum + ':' + it.episodeNum);
+            }
+          }
+          if (it.showTitle) window._watchedItemIds.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+          const d = window._currentItemDetails;
+          if (d) {
+            if (d.id) window._watchedItemIds.add(String(d.id) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (d.imdbId) window._watchedItemIds.add(String(d.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (d.tmdbId) {
+              window._watchedItemIds.add(String(d.tmdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+              window._watchedItemIds.add('tmdb:' + d.tmdbId + ':' + it.seasonNum + ':' + it.episodeNum);
+            }
+            if (d.title) window._watchedItemIds.add(String(d.title) + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        }
+      }
       removeWatchedItemFromWatchlist(id, it.showId || (it.type === 'movie' ? id : null));
     });
+    window._rawWatchHistoryItems = list.items;
     if (typeof trackEventsBatch === 'function') {
       const seen = new Set();
       const trackItems = [];
@@ -1376,7 +1710,9 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof scheduleCreatorSyncSave === 'function') {
+    scheduleCreatorSyncSave(allWatched ? { intentionalRemoval: true } : undefined);
+  }
 
   updateContinueWatchingForBatch(items).catch(() => {});
 
@@ -1516,7 +1852,7 @@ window.markShowWatched = async function(imdbId) {
 // overlaps an earlier one) should never accidentally unmark something that
 // was already logged as watched, which a toggle-based call would risk the
 // moment every item in a batch happened to already be watched.
-window.addItemsToWatchHistory = async function(items) {
+window.addItemsToWatchHistory = async function(items, skipExternalSync = false) {
   if (!items || !items.length) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
@@ -1535,22 +1871,38 @@ window.addItemsToWatchHistory = async function(items) {
     window._watchedItemIds.add(id);
     added++;
   });
-  if (!added) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
-  if (typeof trackEventsBatch === 'function') {
-    const seen = new Set();
-    const trackItems = [];
-    items.forEach((it) => {
-      const key = it.showId || it.id;
-      if (seen.has(key)) return;
-      seen.add(key);
-      trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
-    });
-    trackEventsBatch('watched', trackItems);
+  if (added > 0) {
+    if (typeof trackEventsBatch === 'function') {
+      const seen = new Set();
+      const trackItems = [];
+      items.forEach((it) => {
+        const key = it.showId || it.id;
+        if (seen.has(key)) return;
+        seen.add(key);
+        trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+      });
+      trackEventsBatch('watched', trackItems);
+    }
+    list.updatedAt = Date.now();
+    map['watch-history'] = list;
+    const saved = saveLocalCustomListsMap(map);
+    if (!saved) return { added: 0, cwSucceeded: 0, cwTotal: 0, quotaExceeded: true };
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    // Imports (Trakt/MDBList history) are the only source of entries
+    // that carry a show poster where an episode still belongs, so this is
+    // the one place worth kicking the backfill from directly rather than
+    // waiting for the next page load. Not awaited -- the caller's own
+    // "done" message should not sit behind a cosmetic fetch.
+    if (typeof backfillWatchHistoryEpisodeStills === 'function') {
+      backfillWatchHistoryEpisodeStills().catch(() => {});
+    }
+  } else if (!skipExternalSync) {
+    // If nothing was added, and this is NOT a mass import, just return.
+    // Mass imports (skipExternalSync=true) should proceed to retry Continue Watching
+    // even if added=0, so the user can explicitly "run this again" as the alert suggests.
+    return { added: 0, cwSucceeded: 0, cwTotal: 0 };
   }
-  list.updatedAt = Date.now();
-  map['watch-history'] = list;
-  saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
   // Awaited (unlike toggleBatchWatchStatus's own fire-and-forget call
   // above) -- this is what a bulk importer processing dozens or hundreds
   // of shows actually needs: the caller's own "done" message shouldn't
@@ -1560,7 +1912,7 @@ window.addItemsToWatchHistory = async function(items) {
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   items.forEach((it) => {
     refreshWatchBadge(it.id, it.type);
-    if (typeof syncSingleItemToConnectedProviders === 'function') {
+    if (!skipExternalSync && typeof syncSingleItemToConnectedProviders === 'function') {
       syncSingleItemToConnectedProviders(it, 'add');
     }
   });
@@ -1579,17 +1931,30 @@ window.addItemsToWatchHistory = async function(items) {
 function dedupeContinueWatchingItems(items) {
   if (!items || !items.length) return items || [];
   const seenShowIds = new Set();
-  const watchedSet = window._watchedItemIds || new Set();
+  const seenTitles = new Set();
+  const watchedSet = window._watchedItemIds || (function() {
+    try {
+      const map = loadLocalCustomLists();
+      const wh = map['watch-history'];
+      return new Set(((wh && wh.items) || []).map(it => String(it && (it.id || it.imdbId))).filter(Boolean));
+    } catch (e) { return new Set(); }
+  })();
   return items.filter((it) => {
     if (!it) return false;
+    const epId = String(it.id || '');
     // An episode already marked as watched in Watch History must never be in Continue Watching
-    if (it.id && watchedSet.has(String(it.id))) return false;
-    if (!it.showId) return true;
-    if (seenShowIds.has(String(it.showId))) return false;
-    seenShowIds.add(String(it.showId));
+    if (epId && watchedSet.has(epId)) return false;
+    const showId = String(it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || epId))) || '');
+    const titleKey = (it.showTitle || '').toLowerCase().trim();
+    if (!showId) return true;
+    if (seenShowIds.has(showId)) return false;
+    if (titleKey && seenTitles.has(titleKey)) return false;
+    seenShowIds.add(showId);
+    if (titleKey) seenTitles.add(titleKey);
     return true;
   });
 }
+
 
 function getOrCreateContinueWatchingList() {
   const map = loadLocalCustomLists();
@@ -1706,6 +2071,10 @@ async function updateContinueWatching(showId) {
 
     if (nextInSeason) {
       const aired = isEpisodeAired(nextInSeason);
+      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1;
+      const isFinale = nextInSeason.episode_number === allEps.length;
+      const lastEp = allEps[allEps.length - 1];
+      const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
       newEntry = {
         id: String(nextInSeason.id),
         type: 'episode',
@@ -1718,6 +2087,9 @@ async function updateContinueWatching(showId) {
         episodeNum: nextInSeason.episode_number,
         airDate: nextInSeason.air_date || null,
         isUnaired: !aired,
+        isSeasonPremiere: isPremiere,
+        isSeasonFinale: isFinale,
+        seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
       };
       // If the next episode has not aired yet, all currently aired episodes have been watched
       showFullyWatched = !aired;
@@ -1727,9 +2099,14 @@ async function updateContinueWatching(showId) {
         '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
       const data2 = await res2.json();
       if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
-        const firstNext = data2.season.episodes[0];
+        const allEpsNext = data2.season.episodes;
+        const firstNext = allEpsNext[0];
         if (firstNext) {
           const aired = isEpisodeAired(firstNext);
+          const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1;
+          const isFinale = allEpsNext.length === 1;
+          const lastEp = allEpsNext[allEpsNext.length - 1];
+          const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
           newEntry = {
             id: String(firstNext.id),
             type: 'episode',
@@ -1742,6 +2119,9 @@ async function updateContinueWatching(showId) {
             episodeNum: firstNext.episode_number,
             airDate: firstNext.air_date || null,
             isUnaired: !aired,
+            isSeasonPremiere: isPremiere,
+            isSeasonFinale: isFinale,
+            seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
           };
           showFullyWatched = !aired;
         } else {
@@ -1798,13 +2178,21 @@ async function updateContinueWatchingForBatch(items) {
   async function worker() {
     while (nextIdx < showIds.length) {
       const showId = showIds[nextIdx++];
-      try {
-        const result = await updateContinueWatching(showId);
-        if (result && result.ok) succeeded++;
-      } catch (e) {
-        // updateContinueWatching doesn't normally throw (see its own
-        // try/catch), but guard anyway so one unexpected error can't abort
-        // the rest of the batch.
+      let attempts = 0;
+      let success = false;
+      while (attempts < 3 && !success) {
+        attempts++;
+        try {
+          const result = await updateContinueWatching(showId);
+          if (result && result.ok) {
+            success = true;
+            succeeded++;
+          } else if (attempts < 3) {
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        } catch (e) {
+          if (attempts < 3) await new Promise(r => setTimeout(r, 1000));
+        }
       }
     }
   }
@@ -1875,7 +2263,7 @@ function dismissContinueWatchingShow(showId, btn) {
   // checkmark, and the cron will still periodically check TMDB in case a
   // real new episode later supersedes this dismissal.
   setShowFullyWatched(showId, true);
-  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
 }
 
 // --- Airing Next ------------------------------------------------------------
@@ -1996,7 +2384,16 @@ async function refreshAiringNext(force) {
   const existing = getOrCreateAiringNextList();
   const hasExpiredItems = Array.isArray(existing.items) && existing.items.some(it => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
   const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it => it && !it.name && !it.episodeTitle);
-  if (!force && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+  if (!force && Array.isArray(existing.items) && existing.items.length > 0 && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+    // Reconciled with the account even though nothing was recomputed.
+    // The push at the bottom of this function is otherwise the only one
+    // that ever happens, so a list that was built while sign-in had not
+    // finished yet -- pushTrackingSync bails without activeCreator --
+    // would be cached as fresh here and never sent, leaving the
+    // autotrack:airing-next catalog row empty for as long as the cache
+    // held. scheduleTrackingSync's signature guard makes this a no-op
+    // when the account already has this exact list.
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
     return existing;
   }
 
@@ -2018,48 +2415,109 @@ async function refreshAiringNext(force) {
   const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
 
   const results = [];
-  let cursor = 0;
-  async function worker() {
-    while (cursor < candidates.length) {
-      const showId = candidates[cursor++];
-      try {
-        const bypass = (force || hasExpiredItems) ? '&fresh=1&_t=' + Date.now() : '';
-        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
-        const data = await res.json();
-        const d = data && data.ok ? data.details : null;
-        if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
-          const known = knownByShow.get(showId);
-          const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
-          results.push({
-            id: showId,
-            showId: showId,
-            showTitle: (known && known.title) || d.title || '',
-            showPoster: (known && known.poster) || d.poster || '',
-            name: epName,
-            episodeTitle: epName,
-            airDate: d.nextEpisodeAirDate,
-            seasonNum: d.nextEpisodeSeasonNumber,
-            episodeNum: d.nextEpisodeNumber,
-            isSeasonPremiere: d.nextEpisodeNumber === 1,
-            isUnaired: true,
-          });
-        }
-      } catch (e) {
-        // Network hiccup or no TMDB key configured -- this show is simply
-        // retried on the next refresh (or a manual "force" one) rather
-        // than blocking the rest of the batch.
+  const bypassFresh = !!(force || hasExpiredItems);
+
+  // Turns one /api/details payload into an Airing Next entry, or null when
+  // the show has no upcoming episode. Shared by the batch path and the
+  // per-id fallback below so both produce identical entries.
+  function airingEntryFrom(showId, d) {
+    if (!d || !d.nextEpisodeAirDate) return null;
+    if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    const known = knownByShow.get(showId);
+    const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
+    const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
+    return {
+      id: showId,
+      showId: showId,
+      canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
+      showTitle: (known && known.title) || d.title || '',
+      showPoster: (known && known.poster) || d.poster || '',
+      name: epName,
+      episodeTitle: epName,
+      airDate: d.nextEpisodeAirDate,
+      seasonNum: d.nextEpisodeSeasonNumber,
+      episodeNum: d.nextEpisodeNumber,
+      isSeasonPremiere: d.nextEpisodeNumber === 1,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: d.seasonFinaleAirDate || null,
+      seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      isUnaired: true,
+    };
+  }
+
+  // One request for the whole candidate set instead of up to 60 separate
+  // ones at a concurrency of 4 -- which was fifteen sequential waves of
+  // request latency before this shelf could be rebuilt. The server resolves
+  // each id through the same cached path a single /api/details call would
+  // have used, so this removes round trips rather than adding upstream
+  // calls. See /api/details/batch, 25_api-catalog-routes.js.
+  let batchOk = false;
+  try {
+    const batchRes = await fetch(ORIGIN + '/api/details/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ids: candidates,
+        type: 'series',
+        tmdbKey: tmdbKey,
+        fresh: bypassFresh ? '1' : '',
+      }),
+    });
+    const batchData = await batchRes.json();
+    if (batchData && batchData.ok && batchData.results) {
+      batchOk = true;
+      // Iterated over candidates rather than over the response keys so
+      // entries stay in candidate order, which is what the dedupe below
+      // relies on for its "keep the earliest" behaviour.
+      for (let i = 0; i < candidates.length; i++) {
+        const showId = candidates[i];
+        const entry = airingEntryFrom(showId, batchData.results[showId]);
+        if (entry) results.push(entry);
       }
     }
+  } catch (e) {
+    // Falls through to the per-id path below.
   }
-  await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
 
-  // Deduplicate by showId -- a show can appear under multiple IDs if Watch
-  // History recorded both an imdb and a tmdb-prefixed form; keep the first
-  // (earliest-resolved) entry for each show.
+  // Fallback for anything that did not get a usable batch response (an
+  // older self-hosted Worker without the batch route, or a network
+  // hiccup). Behaviourally identical to what this function did before.
+  if (!batchOk) {
+    let cursor = 0;
+    async function worker() {
+      while (cursor < candidates.length) {
+        const showId = candidates[cursor++];
+        try {
+          const bypass = bypassFresh ? '&fresh=1&_t=' + Date.now() : '';
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+          const data = await res.json();
+          const entry = airingEntryFrom(showId, data && data.ok ? data.details : null);
+          if (entry) results.push(entry);
+        } catch (e) {
+          // Network hiccup or no TMDB key configured -- this show is simply
+          // retried on the next refresh (or a manual "force" one) rather
+          // than blocking the rest of the batch.
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
+  }
+
+  // Deduplicate by canonical TMDB ID or showId -- a show can appear under
+  // multiple IDs if Watch History recorded both an imdb and a tmdb-prefixed
+  // form; keep the first (earliest-resolved) entry for each show.
   const seenIds = new Set();
   const deduped = results.filter((it) => {
-    if (seenIds.has(it.showId)) return false;
-    seenIds.add(it.showId);
+    const normalizedShowId = it.showId.startsWith('tmdb:') ? it.showId.slice(5) : it.showId;
+    const key1 = it.canonicalTmdbId ? 'tmdb:' + it.canonicalTmdbId : 'id:' + normalizedShowId;
+    
+    if (seenIds.has(key1)) return false;
+    seenIds.add(key1);
+    
+    // Also track the original showId so we don't duplicate on fallback
+    if (seenIds.has('id:' + normalizedShowId)) return false;
+    seenIds.add('id:' + normalizedShowId);
+    
     return true;
   });
   deduped.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
@@ -2086,6 +2544,149 @@ async function refreshAiringNext(force) {
 // reads.
 setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
 
+// --- Watch History episode stills -------------------------------------------
+//
+// A Watch History entry keeps the episode's own still image in poster and
+// the series artwork in showPoster, and every renderer reads poster first,
+// falling back to showPoster. The paths that build an entry from TMDB
+// directly -- markShowWatched above, and the two scrobble handlers in
+// 26_api-creator-and-admin-routes.js -- all fill in the real still. The
+// import paths cannot: Trakt's and MDBList's history rows carry no
+// per-episode image at all, so they write the show poster into BOTH
+// fields. That is the whole of "sometimes the episodes get show posters":
+// scrobbled episodes have stills, imported ones never did.
+//
+// This fills them in afterwards from the same /api/season endpoint
+// markShowWatched already uses -- one call per show+season, and that
+// endpoint's TMDB fetch is edge-cached for a week, so a large history
+// costs a handful of cheap requests rather than one per episode. An
+// episode whose season genuinely has no still on TMDB simply keeps the
+// show poster, which is the intended fallback; the season is recorded as
+// checked so it is not re-fetched on every page load.
+const EPISODE_STILL_CHECKS_KEY = 'myListAddon:episodeStillChecks';
+const EPISODE_STILL_RECHECK_MS = 7 * 24 * 3600 * 1000;
+const EPISODE_STILL_MAX_GROUPS_PER_RUN = 12;
+const EPISODE_STILL_CONCURRENCY = 3;
+
+function loadEpisodeStillChecks() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(EPISODE_STILL_CHECKS_KEY) || '{}');
+    return (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveEpisodeStillChecks(checks) {
+  try {
+    localStorage.setItem(EPISODE_STILL_CHECKS_KEY, JSON.stringify(checks));
+  } catch (e) {}
+}
+
+// True when this entry is showing series artwork where an episode still
+// belongs. Three ways that happens: no poster at all, a poster identical
+// to the entry's own showPoster, or a metahub poster URL -- metahub only
+// ever serves show artwork, never episode stills, so one appearing in the
+// poster field is always a fallback that got written in.
+function needsEpisodeStill(it) {
+  if (!it) return false;
+  const isEpisode = it.type === 'episode' || (it.seasonNum != null && it.episodeNum != null);
+  if (!isEpisode) return false;
+  if (!it.showId || it.seasonNum == null || it.episodeNum == null) return false;
+  const poster = String(it.poster || '');
+  if (!poster) return true;
+  if (it.showPoster && poster === String(it.showPoster)) return true;
+  if (poster.indexOf('images.metahub.space/poster/') !== -1) return true;
+  return false;
+}
+
+async function backfillWatchHistoryEpisodeStills() {
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  const list = map['watch-history'];
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  if (!items.length) return 0;
+
+  const checks = loadEpisodeStillChecks();
+  const now = Date.now();
+  const groups = new Map();
+  items.forEach((it) => {
+    if (!needsEpisodeStill(it)) return;
+    const key = String(it.showId) + '|' + String(it.seasonNum);
+    const lastChecked = Number(checks[key]) || 0;
+    if (lastChecked && (now - lastChecked) < EPISODE_STILL_RECHECK_MS) return;
+    if (!groups.has(key)) groups.set(key, { showId: it.showId, seasonNum: it.seasonNum, items: [] });
+    groups.get(key).items.push(it);
+  });
+  if (!groups.size) return 0;
+
+  const pending = [...groups.entries()].slice(0, EPISODE_STILL_MAX_GROUPS_PER_RUN);
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  let changed = 0;
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < pending.length) {
+      const entry = pending[nextIdx++];
+      const key = entry[0];
+      const group = entry[1];
+      try {
+        const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(group.showId) +
+          '&seasonNum=' + encodeURIComponent(group.seasonNum) +
+          (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
+        const data = await res.json();
+        const episodes = (data && data.ok && data.season && Array.isArray(data.season.episodes)) ? data.season.episodes : null;
+        // A miss here is a network or TMDB failure, not "this season has
+        // no stills" -- deliberately left unrecorded so the next run
+        // retries it rather than writing it off for a week.
+        if (!episodes) continue;
+        const byNumber = new Map();
+        episodes.forEach((ep) => {
+          if (ep && ep.episode_number != null) byNumber.set(Number(ep.episode_number), ep);
+        });
+        group.items.forEach((it) => {
+          const ep = byNumber.get(Number(it.episodeNum));
+          if (!ep || !ep.still_path) return;
+          const raw = String(ep.still_path);
+          const still = raw.indexOf('http') === 0 ? raw : ('https://image.tmdb.org/t/p/w500' + raw);
+          if (it.poster === still) return;
+          // Keep the artwork that was in poster as the show-level
+          // fallback if this entry never had one recorded separately,
+          // so replacing poster can never leave it with nothing to fall
+          // back to.
+          if (!it.showPoster && it.poster) it.showPoster = it.poster;
+          it.poster = still;
+          changed++;
+        });
+        checks[key] = now;
+      } catch (e) {
+        // Same as above -- retried on the next run.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(EPISODE_STILL_CONCURRENCY, pending.length) }, worker));
+
+  saveEpisodeStillChecks(checks);
+  if (changed) {
+    list.items = items;
+    list.updatedAt = Date.now();
+    map['watch-history'] = list;
+    saveLocalCustomListsMap(map);
+    if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  }
+  return changed;
+}
+window.backfillWatchHistoryEpisodeStills = backfillWatchHistoryEpisodeStills;
+
+// Deliberately after the Airing Next kick above rather than alongside it:
+// both read the same Watch History out of localStorage, and this one is
+// the strictly less urgent of the two (a poster improving a moment later
+// is invisible; an Airing Next row that has not populated is not).
+setTimeout(() => { backfillWatchHistoryEpisodeStills().catch(() => {}); }, 1400);
+
 // Builds the "Airing Next" dashboard card -- deliberately not part of
 // buildLocalListCardHtml/renderAutoTrackedListsHtml (22_client-creator-
 // profile.js): unlike Continue Watching/Watch History it has no local
@@ -2104,22 +2705,41 @@ function buildAiringNextCardHtml() {
   const totalCount = filtered.length;
   const shown = filtered.slice(0, 9);
 
+  const showAirDate = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true;
+  const showPremiere = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true;
+  const showFinale = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true;
+  const showFinaleDate = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true;
+
   const posterThumbs = shown.map((it, i) => {
     const isMobileEnd = (i === 2 && shown.length > 3);
     const isDesktopEnd = (i === shown.length - 1 && shown.length >= 4);
     let overlays = '';
     if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+    const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
-    if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+    if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
       const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
       if (badgeText) {
         dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
       }
     }
-    const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
-      ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
-      : '';
+    const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+    const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+    let bottomBadge = '';
+    if (isUnairedEp) {
+      if (showPremiere && isSeasonPremiere) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+      } else if (showFinale && it.isSeasonFinale) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+      } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+        const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+        if (finaleText) {
+          bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+        }
+      }
+    }
     const label = (typeof formatWatchItemLabel === 'function')
       ? formatWatchItemLabel(it)
       : {
@@ -2130,7 +2750,7 @@ function buildAiringNextCardHtml() {
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
-        premiereBadge +
+        bottomBadge +
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -2163,9 +2783,7 @@ function buildAiringNextCardHtml() {
   '</div>';
 }
 
-// Opens the full Airing Next list through the same generic list-details
-// page Continue Watching/Watch History already use -- see
-// openListDetailsPage's preloaded-sample branch (23_client-list-
+// Opens the dedicated full-page Airing Next view (openListDetailsPage, 23_list-
 // management.js), which renders straight from the sample array below
 // without needing a server-side catalog route.
 function openAiringNextDetailsPage() {
@@ -2186,6 +2804,9 @@ function openAiringNextDetailsPage() {
       airDate: it.airDate,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
+      isSeasonFinale: it.isSeasonFinale,
+      seasonFinaleAirDate: it.seasonFinaleAirDate,
+      seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber,
     };
   });
   openListDetailsPage('Airing Next', 'series', 'custom:airing-next', { sample: sample, count: sample.length, maybeMore: false });

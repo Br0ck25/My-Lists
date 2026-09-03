@@ -15,13 +15,13 @@
  *    lists work fine with no key at all.
  *  - Public trakt.tv lists (https://trakt.tv/users/USER/lists/LIST-SLUG)
  *    are supported too. Trakt requires a Client ID (their term for an API
- *    key) on every request, even for public lists â€” this Worker uses a
+ *    key) on every request, even for public lists — this Worker uses a
  *    single fixed TRAKT_CLIENT_ID (below) for all users; there's no
  *    per-user override in the builder page.
  *  - Public themoviedb.org lists (https://www.themoviedb.org/list/LIST_ID)
  *    are supported too, the same fixed-key way as Trakt (TMDB_API_KEY
  *    below). TMDB list items only carry a TMDB id, so each item needs an
- *    extra external_ids lookup to resolve its IMDB id â€” those lookups are
+ *    extra external_ids lookup to resolve its IMDB id — those lookups are
  *    throttled and cached hard at Cloudflare's edge to stay well under
  *    TMDB's soft per-IP connection limit.
  *  - GET /                            -> builder page (fresh install, external browser)
@@ -42,9 +42,20 @@
  * Deploy with `wrangler deploy` or paste directly into the Cloudflare dashboard.
  * No environment variables or bindings required.
  */
+
 const ADDON_ID = "app.my-list";
 const ADDON_VERSION = "1.5.0";
 const ADDON_NAME = "My Lists";
+
+// How many items a "Recommended Movies"/"Recommended Shows" list holds --
+// shared deliberately by the two places that build one, because they used
+// to disagree. /api/recommendations (25_api-catalog-routes.js) is what the
+// Discover tab's card renders and counts; fetchCuratedCatalog
+// (05_catalog-core.js) is what the actual catalog row and the Live Preview
+// serve. The card said 40 and the shelf said 100 (PAGE_SIZE) purely
+// because each hardcoded its own number. One constant so they cannot
+// drift apart again.
+const CURATED_RECOMMENDATION_LIMIT = 40;
 
 // --- Env-backed API keys ----------------------------------------------------
 //
@@ -1808,6 +1819,71 @@ async function verifyCreatorKey(key, storedHash) {
   }
 }
 
+// --- Verified-key memo (per-isolate, in memory only) -------------------------
+// verifyCreatorKey above runs PBKDF2 at 100,000 iterations, and because a
+// Creator Profile issues no session or token, EVERY authenticated request
+// re-runs it from scratch -- routine autosaves, the dashboard load, each
+// Auto-Track Playback ping, and the sync poll that fires while the
+// dashboard is simply open. That made key verification the single largest
+// CPU cost of being signed in, paid over and over for a credential that
+// had already been proven correct moments earlier.
+//
+// This memoizes only the RESULT of a verification that already succeeded,
+// for a few minutes, in this isolate's memory:
+//   * Nothing is written to KV, D1, or any response -- it cannot outlive
+//     the isolate and cannot be read by another request path.
+//   * The memo is keyed on a SHA-256 of the username, the presented key,
+//     AND the stored hash, so a wrong key never collides with a right one,
+//     and rotating the key (which changes the stored hash) invalidates
+//     every existing entry for that account immediately.
+//   * A key that has NOT been verified before still pays the full PBKDF2
+//     cost. This is a cache of successes, never a shortcut past one, so
+//     brute-forcing is exactly as expensive as it was before.
+// Failures are deliberately not memoized -- caching them would let a
+// transient issue lock out a correct key for the rest of the TTL.
+const CREATOR_AUTH_MEMO = new Map();
+const CREATOR_AUTH_MEMO_TTL_MS = 5 * 60 * 1000;
+const CREATOR_AUTH_MEMO_MAX = 500;
+
+async function creatorAuthMemoKey(username, key, storedHash) {
+  const data = new TextEncoder().encode(String(username) + "\u0000" + String(key) + "\u0000" + String(storedHash));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyCreatorKeyMemoized(key, storedHash, username) {
+  if (!key || !storedHash) return false;
+  let memoKey = "";
+  try {
+    memoKey = await creatorAuthMemoKey(username || "", key, storedHash);
+  } catch {
+    // Digest unavailable for some reason -- fall straight through to the
+    // real verification rather than failing the request.
+    return await verifyCreatorKey(key, storedHash);
+  }
+  const now = Date.now();
+  const hit = CREATOR_AUTH_MEMO.get(memoKey);
+  if (hit !== undefined && now < hit) return true;
+  if (hit !== undefined) CREATOR_AUTH_MEMO.delete(memoKey);
+  const valid = await verifyCreatorKey(key, storedHash);
+  if (valid) {
+    if (CREATOR_AUTH_MEMO.size >= CREATOR_AUTH_MEMO_MAX) {
+      const oldest = CREATOR_AUTH_MEMO.keys().next().value;
+      if (oldest !== undefined) CREATOR_AUTH_MEMO.delete(oldest);
+    }
+    CREATOR_AUTH_MEMO.set(memoKey, now + CREATOR_AUTH_MEMO_TTL_MS);
+  }
+  return valid;
+}
+
+// Drops every memoized verification for one account. Called after any
+// change to the stored key hash so a rotated key cannot keep working from
+// a warm isolate. (The hash is part of the memo key above, so this is
+// belt-and-braces rather than strictly required.)
+function invalidateCreatorAuthMemo() {
+  CREATOR_AUTH_MEMO.clear();
+}
+
 // MYL-XXXX-XXXX-XXXX -- excludes visually-ambiguous characters (0/O, 1/I/L)
 // so a key someone's reading off a screen to type into another device
 // doesn't turn into a guessing game. 12 real characters from a 32-symbol
@@ -1903,20 +1979,258 @@ async function hashStringForKey(s) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
 
+// --- Builder page: render memo + conditional requests ------------------------
+// The builder page is roughly 1.6MB of HTML with the entire client script
+// inlined, and it was rebuilt from scratch on every single navigation and
+// sent in full every time -- no ETag, no Last-Modified, and on most routes
+// an explicit Cache-Control: no-store that told the browser never even to
+// keep a copy. So opening the app, following a shared list link, and
+// pressing back each re-downloaded and re-parsed the whole thing.
+//
+// Two separate fixes, both of which depend on the same fact: for a given
+// origin and a given set of arguments, renderBuilder is deterministic
+// (verified by rendering twice and comparing). Nothing in it varies per
+// request -- no timestamp, no random id.
+//
+//  1. renderBuilderCached memoizes the argument-free variants (the default
+//     page and the bare /configure page) per origin, so the Worker stops
+//     re-concatenating 1.6MB of string on every page load. Config-bearing
+//     and deep-link variants are not memoized -- they differ per request --
+//     but still get an ETag below.
+//  2. htmlPageResponse hashes the HTML into an ETag and answers a matching
+//     If-None-Match with a bare 304. Cache-Control is "no-cache", which is
+//     often misread as "do not cache": it means "you may store this, but
+//     revalidate before reusing it". That is exactly right here -- the page
+//     must never go stale after a deploy, and revalidating costs a 304
+//     instead of 1.6MB.
+//
+// Worth being explicit about why this is safe on the routes that previously
+// said no-store: the ETag is a hash of the actual bytes being returned, so
+// a page whose content depends on a config or a deep-linked list gets a
+// different ETag the moment that content differs. A 304 can only ever be
+// sent when the browser already holds a byte-identical copy.
+const BUILDER_PAGE_MEMO = new Map();
+
+function renderBuilderCached(origin, opts) {
+  // Only the argument-free variants are stable enough to memoize; anything
+  // carrying entries, keys or a deep link is rendered fresh.
+  const isDefault = !opts || Object.keys(opts).length === 0;
+  const isBareConfigure = !!(opts && opts.isConfigureMode === true && Object.keys(opts).length === 1);
+  if (!isDefault && !isBareConfigure) {
+    return renderBuilder(origin, opts || {});
+  }
+  const memoKey = `${origin}::${isBareConfigure ? "configure" : "default"}`;
+  const hit = BUILDER_PAGE_MEMO.get(memoKey);
+  if (hit) return hit;
+  const html = renderBuilder(origin, opts || {});
+  // Bounded purely as a guard against an unexpected flood of distinct
+  // origins; in practice this holds one or two entries.
+  if (BUILDER_PAGE_MEMO.size >= 8) {
+    const oldest = BUILDER_PAGE_MEMO.keys().next().value;
+    if (oldest !== undefined) BUILDER_PAGE_MEMO.delete(oldest);
+  }
+  BUILDER_PAGE_MEMO.set(memoKey, html);
+  return html;
+}
+
+// ETags are cached alongside the HTML they describe so a repeat request for
+// a memoized page does not re-hash 1.6MB to decide it can send a 304.
+const BUILDER_ETAG_MEMO = new Map();
+
+async function htmlEtagFor(html) {
+  const cached = BUILDER_ETAG_MEMO.get(html);
+  if (cached) return cached;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(html));
+  const etag = `"${[...new Uint8Array(digest)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("")}"`;
+  if (BUILDER_ETAG_MEMO.size >= 16) {
+    const oldest = BUILDER_ETAG_MEMO.keys().next().value;
+    if (oldest !== undefined) BUILDER_ETAG_MEMO.delete(oldest);
+  }
+  BUILDER_ETAG_MEMO.set(html, etag);
+  return etag;
+}
+
+// --- App bundle extraction ---------------------------------------------------
+// renderBuilder emits the client script as two elements: a small per-request
+// preamble, then a bundle wrapped in the markers below (see the comment in
+// 16_client-row-core.js for why the split falls where it does). Everything
+// between the markers is identical for every visitor and every route --
+// which is checked rather than assumed: the verification suite renders the
+// page with sentinel OAuth tokens, entries, deep links and origins, then
+// asserts the extracted bundle is byte-identical every time and contains
+// none of them.
+//
+// So it is lifted out of the HTML and served from /app.js?v=<hash> with
+// immutable caching. ETags already made a repeat visit to an UNCHANGED page
+// cheap, but they do nothing for the pages people actually share: every
+// distinct shared list URL, configure link and deep link renders different
+// HTML, so each one re-sent all 1.3MB. Now they all share one cached
+// bundle, and the browser can reuse its compiled copy instead of re-parsing
+// inline script on every page load.
+const APP_BUNDLE_START = "<script>/*MYLISTS_APP_BUNDLE_START*/";
+const APP_BUNDLE_END = "/*MYLISTS_APP_BUNDLE_END*/<" + "/script>";
+
+// A single entry, because the bundle is the same for everyone. Populated by
+// whichever happens first -- a page render or a direct /app.js hit.
+let APP_BUNDLE = null;
+
+async function getAppBundle(origin) {
+  if (APP_BUNDLE) return APP_BUNDLE;
+  await splitAppBundle(renderBuilderCached(origin, {}));
+  return APP_BUNDLE;
+}
+
+// Returns { page, bundle }, where page has the bundle element replaced by a
+// script src. If the markers are missing for any reason the original HTML
+// comes back untouched and nothing is cached -- an unrecognised page is
+// served exactly as it was before this existed, rather than half-rewritten.
+async function splitAppBundle(html) {
+  const start = html.indexOf(APP_BUNDLE_START);
+  if (start === -1) return { page: html, bundle: null };
+  const bodyStart = start + APP_BUNDLE_START.length;
+  const end = html.indexOf(APP_BUNDLE_END, bodyStart);
+  if (end === -1) return { page: html, bundle: null };
+
+  const bundle = html.slice(bodyStart, end);
+  if (!APP_BUNDLE) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bundle));
+    const hash = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+    APP_BUNDLE = { js: bundle, hash };
+  }
+  const page =
+    html.slice(0, start) +
+    '<script src="/app.js?v=' + APP_BUNDLE.hash + '"><' + '/script>' +
+    html.slice(end + APP_BUNDLE_END.length);
+  return { page, bundle: APP_BUNDLE };
+}
+
+// The stylesheet gets exactly the same treatment as the script bundle, for
+// exactly the same reason: ~85KB, identical for everyone, and previously
+// re-sent inline with every page. Splitting it out also means the browser
+// can start fetching it in parallel with the page's own parse rather than
+// after re-reading it inline.
+const APP_CSS_START = "<style>/*MYLISTS_APP_CSS_START*/";
+const APP_CSS_END = "/*MYLISTS_APP_CSS_END*/<" + "/style>";
+
+let APP_CSS = null;
+
+async function getAppCss(origin) {
+  if (APP_CSS) return APP_CSS;
+  await splitAppCss(renderBuilderCached(origin, {}));
+  return APP_CSS;
+}
+
+async function splitAppCss(html) {
+  const start = html.indexOf(APP_CSS_START);
+  if (start === -1) return { page: html, css: null };
+  const bodyStart = start + APP_CSS_START.length;
+  const end = html.indexOf(APP_CSS_END, bodyStart);
+  if (end === -1) return { page: html, css: null };
+
+  const css = html.slice(bodyStart, end);
+  if (!APP_CSS) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(css));
+    const hash = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+    APP_CSS = { css, hash };
+  }
+  // rel=stylesheet in <head> still blocks first paint, which is what we
+  // want -- swapping to a non-blocking load here would trade a re-download
+  // for a flash of unstyled content on every page.
+  const page =
+    html.slice(0, start) +
+    '<link rel="stylesheet" href="/app.css?v=' + APP_CSS.hash + '">' +
+    html.slice(end + APP_CSS_END.length);
+  return { page, css: APP_CSS };
+}
+
+// Rewritten pages are remembered per distinct HTML string, so a repeat
+// request for the same page does not re-scan 1.6MB looking for the markers.
+const SPLIT_PAGE_MEMO = new Map();
+
+async function pageWithExternalBundle(html) {
+  const memo = SPLIT_PAGE_MEMO.get(html);
+  if (memo) return memo;
+  let page = html;
+  try {
+    page = (await splitAppBundle(html)).page;
+    page = (await splitAppCss(page)).page;
+  } catch {
+    // Nothing unexpected here is worth costing somebody their page.
+    return html;
+  }
+  if (SPLIT_PAGE_MEMO.size >= 16) {
+    const oldest = SPLIT_PAGE_MEMO.keys().next().value;
+    if (oldest !== undefined) SPLIT_PAGE_MEMO.delete(oldest);
+  }
+  SPLIT_PAGE_MEMO.set(html, page);
+  return page;
+}
+
+async function htmlPageResponse(request, fullHtml, extraHeaders) {
+  // The ~1.3MB client bundle is lifted out to /app.js?v=<hash> first, so
+  // both the body sent below and the ETag computed from it describe the
+  // small page rather than the page-plus-bundle.
+  const html = await pageWithExternalBundle(fullHtml);
+  let etag = "";
+  try {
+    etag = await htmlEtagFor(html);
+  } catch {
+    // No digest available -- fall through and just send the page, exactly
+    // as this did before there was an ETag at all.
+  }
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-cache",
+    ...(extraHeaders || {}),
+  };
+  if (!etag) return new Response(html, { headers });
+  headers["ETag"] = etag;
+
+  // If-None-Match can carry a list, and a cache is allowed to weaken a tag
+  // it stores, so compare against each entry with any W/ prefix removed
+  // rather than string-equalling the whole header.
+  const inm = request && request.headers ? (request.headers.get("If-None-Match") || "") : "";
+  if (inm) {
+    const match = inm
+      .split(",")
+      .map((s) => s.trim().replace(/^W\//, ""))
+      .some((s) => s === etag || s === "*");
+    if (match) {
+      return new Response(null, { status: 304, headers });
+    }
+  }
+  return new Response(html, { headers });
+}
+
 // --- Per-User Cache & Circuit Breaker Shield ---------------------------------
 // Safe in-memory LRU cache with rolling window and Stale-If-Error degradation.
 // Ensures bearer-authenticated user data is safely isolated and never leaks between users.
 const PER_USER_CACHE_MAP = new Map();
 const PER_USER_CACHE_MAX_ENTRIES = 1000;
 
+// Widened from a single 32-bit accumulator to two independently-seeded ones
+// (~64 bits combined). This value separates one person's cached provider
+// data from another's, and with only 32 bits a collision between two users
+// of this add-on was already possible in memory -- it becomes more
+// consequential now that the same value also names a KV entry, where an
+// entry outlives the isolate that wrote it. Still a fast non-cryptographic
+// hash, which is all this needs: nothing outside the Worker can choose the
+// input, so the only failure mode worth engineering against is accidental
+// collision, not a deliberate one.
 function safeUserHash(token = "", username = "") {
   const input = `${token}:${username}`;
-  let hash = 0;
+  let h1 = 0;
+  let h2 = 0x9e3779b9;
   for (let i = 0; i < input.length; i++) {
-    hash = ((hash << 5) - hash) + input.charCodeAt(i);
-    hash |= 0;
+    const c = input.charCodeAt(i);
+    h1 = ((h1 << 5) - h1) + c;
+    h1 |= 0;
+    h2 = ((h2 << 7) - h2) + (c * 31 + i);
+    h2 |= 0;
   }
-  return (Math.abs(hash) || 1).toString(36);
+  const a = (Math.abs(h1) || 1).toString(36);
+  const b = (Math.abs(h2) || 1).toString(36);
+  return a + b;
 }
 
 function getPerUserCache(key) {
@@ -1960,7 +2274,50 @@ function invalidatePerUserCache(provider, userHash = "") {
 
 // Executes an external fetch with safe per-user caching and circuit-breaker fallback.
 // If provider returns 429, 1015, or 5xx, or network fails, serves last-known-good stale response from in-memory or KV.
-async function fetchWithPerUserCacheAndCircuitBreaker({
+// --- In-flight request coalescing --------------------------------------------
+// Nothing below deduplicated concurrent work for the same cacheKey, so N
+// simultaneous misses meant N identical upstream calls. That is not a rare
+// case here: an Airing Next refresh fires several /api/details lookups at
+// once and shows routinely resolve to the same series, a catalog row can ask
+// for the same chart from several shelves, and a popular list being
+// requested by several people at the same moment lands in one isolate. Each
+// of those spent a provider request -- against the shared key or, worse,
+// against somebody's personal quota -- to compute an answer another
+// in-progress request was about to produce.
+//
+// The first miss for a key registers its promise here; everyone else who
+// arrives before it settles awaits that same promise. A rejection is shared
+// too, which is correct: the callers all made the same request, so they all
+// get the same outcome (including the circuit breaker's stale fallback,
+// which happens inside the shared promise). The entry is always removed
+// once settled, so a failure never poisons the key for later attempts.
+const IN_FLIGHT_FETCHES = new Map();
+
+async function fetchWithPerUserCacheAndCircuitBreaker(options) {
+  const cacheKey = options && options.cacheKey;
+  const cachedFresh = cacheKey ? getPerUserCache(cacheKey) : null;
+  if (cachedFresh && cachedFresh.isFresh) {
+    return cachedFresh.data;
+  }
+  // No usable key to coalesce on -- run it directly rather than letting every
+  // keyless call collapse onto one shared entry.
+  if (!cacheKey) {
+    return await fetchWithPerUserCacheUncoalesced(options);
+  }
+  const existing = IN_FLIGHT_FETCHES.get(cacheKey);
+  if (existing) {
+    return await existing;
+  }
+  const p = fetchWithPerUserCacheUncoalesced(options);
+  IN_FLIGHT_FETCHES.set(cacheKey, p);
+  try {
+    return await p;
+  } finally {
+    IN_FLIGHT_FETCHES.delete(cacheKey);
+  }
+}
+
+async function fetchWithPerUserCacheUncoalesced({
   cacheKey,
   fetchFn,
   freshTtlSec = 60,
@@ -1991,23 +2348,57 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
     } catch {}
   }
 
+  let edgeCacheData = null;
+  const edgeCacheReq = new Request(`https://my-lists-addon.internal/cache/${encodeURIComponent(cacheKey)}`);
+  if (!cached && !kvData) {
+    try {
+      const edgeRes = await caches.default.match(edgeCacheReq);
+      if (edgeRes) {
+        const raw = await edgeRes.json();
+        if (raw && raw.data !== undefined) {
+          edgeCacheData = raw;
+          setPerUserCache(cacheKey, raw.data, freshTtlSec, staleTtlSec);
+          const now = Date.now();
+          if (raw.freshUntil && now <= raw.freshUntil) {
+            return raw.data;
+          }
+        }
+      }
+    } catch {}
+  }
+
   try {
     const freshData = await fetchFn();
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
+      
+      const cachePayload = JSON.stringify({
+        data: freshData,
+        freshUntil: Date.now() + freshTtlSec * 1000,
+      });
+
       if (env && env.CONFIGS && kvKey) {
-        const p = env.CONFIGS.put(
-          `cache:${kvKey}`,
-          JSON.stringify({
-            data: freshData,
-            freshUntil: Date.now() + freshTtlSec * 1000,
-          }),
-          { expirationTtl: kvTtlSec }
-        ).catch(() => {});
+        const p = env.CONFIGS.put(`cache:${kvKey}`, cachePayload, { expirationTtl: kvTtlSec }).catch(() => {});
         if (ctx && typeof ctx.waitUntil === "function") {
           ctx.waitUntil(p);
         }
       }
+
+      try {
+        const edgeRes = new Response(cachePayload, {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `s-maxage=${Math.max(freshTtlSec, kvTtlSec)}`
+          }
+        });
+        const cachePromise = caches.default.put(edgeCacheReq, edgeRes);
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(cachePromise);
+        } else {
+          cachePromise.catch(() => {});
+        }
+      } catch {}
+
       return freshData;
     }
   } catch (err) {
@@ -2020,6 +2411,10 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
       console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good KV cached data.`);
       return kvData.data;
     }
+    if (edgeCacheData && edgeCacheData.data) {
+      console.warn(`[CircuitBreaker] ${providerLabel} request issue (${errMsg}). Gracefully serving last-known-good Edge cached data.`);
+      return edgeCacheData.data;
+    }
     throw err;
   }
 
@@ -2028,6 +2423,9 @@ async function fetchWithPerUserCacheAndCircuitBreaker({
   }
   if (kvData && kvData.data) {
     return kvData.data;
+  }
+  if (edgeCacheData && edgeCacheData.data) {
+    return edgeCacheData.data;
   }
   return null;
 }
@@ -2042,6 +2440,105 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
     return fetchTraktWithRetry(url, options, retries - 1);
   }
   return res;
+}
+
+
+async function listAllKeys(namespace, prefix) {
+  const keys = [];
+  let cursor;
+  do {
+    const result = await namespace.list({
+      prefix,
+      limit: 1000,
+      ...(cursor ? { cursor } : {})
+    });
+    keys.push(...result.keys);
+    cursor = result.cursor;
+    if (result.list_complete) {
+      break;
+    }
+  } while (cursor);
+  return { keys, list_complete: true };
+}
+
+async function getCreator(env, username) {
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      if (results.length > 0) {
+        const row = results[0];
+        return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
+      }
+      return null;
+    } catch(e) {}
+  }
+  return await env.CONFIGS.get(`creator:${username}`);
+}
+
+async function getCreatorList(env, username, slug) {
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
+      if (results.length > 0) {
+        const row = results[0];
+        return JSON.stringify({ 
+          slug: row.id.split(':')[1] || slug, 
+          name: row.name, 
+          type: row.type, 
+          visibility: row.visibility, 
+          items: JSON.parse(row.items_json || '[]'), 
+          createdAt: row.created_at, 
+          updatedAt: row.updated_at,
+          likes: row.likes || 0
+        });
+      }
+      return null;
+    } catch(e) {}
+  }
+  return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+}
+
+function isEpisodeAired(airDateStr) {
+  if (!airDateStr) return false;
+  const parts = String(airDateStr).split(/[-T\s]/);
+  if (parts.length < 3) return false;
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return false;
+  const d = new Date(year, month, day);
+  if (isNaN(d.getTime())) return false;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return d.getTime() < today.getTime();
+}
+
+function formatAirDateBadge(airDateStr) {
+  if (!airDateStr) return '';
+  const parts = String(airDateStr).split(/[-T\s]/);
+  if (parts.length < 3) return '';
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return '';
+  const d = new Date(year, month, day);
+  if (isNaN(d.getTime())) return '';
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((d.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays <= 0) return 'TODAY';
+  if (diffDays === 1) return 'TOMORROW';
+  if (diffDays > 1 && diffDays < 7) {
+    const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+    return days[d.getDay()];
+  }
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  if (d.getFullYear() !== now.getFullYear()) {
+    return months[d.getMonth()] + ' ' + String(d.getFullYear()).slice(-2);
+  }
+  return months[d.getMonth()] + ' ' + d.getDate();
 }
 
 // --- Admin stats (page views, install links generated) -----------------
@@ -2100,9 +2597,17 @@ async function bumpStatBy(env, kind, amount) {
   if (!env || !env.CONFIGS || !amount) return;
   try {
     const totalKey = `stats:${kind}:total`;
-    const totalRaw = await env.CONFIGS.get(totalKey);
-    const total = (parseInt(totalRaw, 10) || 0) + amount;
-    await env.CONFIGS.put(totalKey, String(total));
+    
+    if (env.DB && kind.startsWith("sourcegroup:")) {
+      const groupName = kind.slice("sourcegroup:".length);
+      await env.DB.prepare(
+        "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = source_groups.install_count + excluded.install_count"
+      ).bind(groupName, groupName, amount).run();
+    } else {
+      const totalRaw = await env.CONFIGS.get(totalKey);
+      const total = (parseInt(totalRaw, 10) || 0) + amount;
+      await env.CONFIGS.put(totalKey, String(total));
+    }
   } catch (e) {
     // best-effort, see bumpStat above
   }
@@ -2174,8 +2679,8 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
     const [genreBlobRaw, decadeBlobRaw, genreList, decadeList] = await Promise.all([
       env.CONFIGS.get("stats:genres:alltime"),
       env.CONFIGS.get("stats:decades:alltime"),
-      env.CONFIGS.list({ prefix: "stats:genre:", limit: 1000 }),
-      env.CONFIGS.list({ prefix: "stats:decade:", limit: 1000 }),
+      listAllKeys(env.CONFIGS, "stats:genre:"),
+      listAllKeys(env.CONFIGS, "stats:decade:"),
     ]);
 
     let genreCounts = {};
@@ -2342,7 +2847,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
   const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
 
   if (window === "alltime") {
-    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
     const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
@@ -2375,7 +2880,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
         if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
           try {
             if (typeof fetchTmdbItemDetails === "function") {
-              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
               if (det && det.title) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
@@ -2464,7 +2969,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
       if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
         try {
           if (typeof fetchTmdbItemDetails === "function") {
-            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
             if (det && det.title) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
@@ -2567,7 +3072,7 @@ async function computeSearchLeaderboard(env, window) {
   if (!env || !env.CONFIGS) return [];
   const prefix = "searchquery:";
   if (window === "alltime") {
-    const listResult = await env.CONFIGS.list({ prefix, limit: 1000 });
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
     const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
@@ -2675,8 +3180,8 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
   const [catalogList, sourceGroupList] = await Promise.all([
-    env.CONFIGS.list({ prefix: "stats:catalog_add:", limit: 1000 }),
-    env.CONFIGS.list({ prefix: "stats:sourcegroup:", limit: 1000 }),
+    listAllKeys(env.CONFIGS, "stats:catalog_add:"),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
   ]);
 
   const catalogMap = new Map();
@@ -2702,14 +3207,33 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   catalogEntries.sort((a, b) => b.count - a.count);
 
   // 2. Community / Creator Lists
-  const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: 1000 });
+  let communityListsRaw = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM creator_lists").all();
+    communityListsRaw = results.filter(row => row.visibility !== 'private').map(row => ({
+      slug: row.id.split(':')[1] || row.id,
+      name: row.name,
+      creatorName: row.username,
+      type: row.type || 'mixed',
+      items: JSON.parse(row.items_json || '[]'),
+      updatedAt: row.updated_at || row.created_at || 0,
+    }));
+  } else {
+    const listResult = await listAllKeys(env.CONFIGS, "creatorlist:");
+    communityListsRaw = (await Promise.all(
+      listResult.keys.map(async (k) => {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) return null;
+        let data;
+        try { data = JSON.parse(raw); } catch { return null; }
+        if (!data || !data.slug || !data.creatorName) return null;
+        return data;
+      })
+    )).filter(Boolean);
+  }
+
   const communityLists = await Promise.all(
-    listResult.keys.map(async (k) => {
-      const raw = await env.CONFIGS.get(k.name);
-      if (!raw) return null;
-      let data;
-      try { data = JSON.parse(raw); } catch { return null; }
-      if (!data || !data.slug || !data.creatorName) return null;
+    communityListsRaw.map(async (data) => {
       const [likesRaw, copiesRaw] = await Promise.all([
         env.CONFIGS.get(`creatorlistlikes:${data.slug}`),
         env.CONFIGS.get(`stats:list_copy:${data.slug}:total`),
@@ -2804,7 +3328,7 @@ function sanitizeStatGroupName(raw) {
 async function loadStatsByDay(env, kind) {
   if (!env || !env.CONFIGS) return {};
   const prefix = `stats:${kind}:`;
-  const result = await env.CONFIGS.list({ prefix, limit: 1000 });
+  const result = await listAllKeys(env.CONFIGS, prefix);
   const byDay = {};
   await Promise.all(
     result.keys.map(async (k) => {
@@ -3020,8 +3544,8 @@ async function renderAdminDashboard(env) {
     // "creator:" (with the colon) is deliberately narrow -- creatorlist:,
     // creatorsync:, etc. all start with "creator" too but not "creator:",
     // so this can't accidentally sweep those in as if they were accounts.
-    env.CONFIGS.list({ prefix: "creator:", limit: 1000 }),
-    env.CONFIGS.list({ prefix: "stats:sourcegroup:", limit: 1000 }),
+    listAllKeys(env.CONFIGS, "creator:"),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
   ]);
 
   // Walks the last 30 calendar days explicitly (rather than just listing
@@ -3036,35 +3560,47 @@ async function renderAdminDashboard(env) {
     rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
   }
 
-  const creatorAccounts = await Promise.all(
-    creatorResult.keys.map(async (k) => {
-      const username = k.name.slice("creator:".length);
-      let displayName = username;
-      let createdAt = null;
-      try {
-        const raw = await env.CONFIGS.get(k.name);
-        if (raw) {
-          const data = JSON.parse(raw);
-          displayName = data.displayName || username;
-          createdAt = typeof data.createdAt === "number" ? data.createdAt : null;
-        }
-      } catch {
-        // fall back to the raw username slug above
-      }
-      // Best-effort -- see touchCreatorLastSeen's own comment. An account
-      // that predates this feature, or simply hasn't made an authenticated
-      // request since it shipped, just shows as "\u2014" below rather than
-      // a wrong or misleading date.
+  let creatorAccounts = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM creators").all();
+    creatorAccounts = await Promise.all(results.map(async (row) => {
       let lastActive = null;
       try {
-        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${row.username}`);
         lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
-      } catch {
-        // non-critical
-      }
-      return { username, displayName, createdAt, lastActive };
-    })
-  );
+      } catch {}
+      return {
+        username: row.username,
+        displayName: row.display_name,
+        createdAt: row.created_at || null,
+        lastActive,
+      };
+    }));
+  } else {
+    // Fallback if D1 isn't working yet
+    creatorAccounts = await Promise.all(
+      creatorResult.keys.map(async (k) => {
+        const username = k.name.slice("creator:".length);
+        let displayName = username;
+        let createdAt = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          if (raw) {
+            const data = JSON.parse(raw);
+            displayName = data.displayName || username;
+            createdAt = typeof data.createdAt === "number" ? data.createdAt : null;
+          }
+        } catch {}
+        let lastActive = null;
+        try {
+          const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+          lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
+        } catch {}
+        return { username, displayName, createdAt, lastActive };
+      })
+    );
+  }
+
   creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
   const accountRows = creatorAccounts
     .map(
@@ -3092,14 +3628,20 @@ async function renderAdminDashboard(env) {
   // total-only design above), so a plain slice is enough, no need to guard
   // against a stray per-day key existing alongside it the way
   // loadStatsByDay has to for pageviews/installs.
-  const sourceGroupPrefix = "stats:sourcegroup:";
-  const sourceGroups = await Promise.all(
-    sourceGroupResult.keys.map(async (k) => {
-      const group = k.name.slice(sourceGroupPrefix.length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      return { group, count: parseInt(raw, 10) || 0 };
-    })
-  );
+  let sourceGroups = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM source_groups").all();
+    sourceGroups = results.map(row => ({ group: row.name, count: row.install_count }));
+  } else {
+    const sourceGroupPrefix = "stats:sourcegroup:";
+    sourceGroups = await Promise.all(
+      sourceGroupResult.keys.map(async (k) => {
+        const group = k.name.slice(sourceGroupPrefix.length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        return { group, count: parseInt(raw, 10) || 0 };
+      })
+    );
+  }
   sourceGroups.sort((a, b) => b.count - a.count);
   const sourceGroupTotal = sourceGroups.reduce((sum, g) => sum + g.count, 0);
   const sourceGroupRows = sourceGroups
@@ -4394,8 +4936,50 @@ async function resolveConfig(configParam, env) {
     if (stored) {
       try {
         const parsed = JSON.parse(stored);
+        let watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+        let continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+        let watchlist = Array.isArray(parsed.watchlist) ? parsed.watchlist : [];
+        let airingNext = Array.isArray(parsed.airingNext) ? parsed.airingNext : [];
+
+        let creatorName = parsed.trackCreatorName || parsed.creatorName || "";
+        if (!creatorName && Array.isArray(parsed.entries)) {
+          for (const e of parsed.entries) {
+            if (e && e.url && typeof e.url === 'string' && e.url.startsWith("autotrack:")) {
+              const parts = e.url.split(":");
+              if (parts.length >= 4 && parts[3]) {
+                creatorName = parts[3];
+                break;
+              }
+            }
+          }
+        }
+        if (creatorName && env.CONFIGS) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${creatorName}`);
+          if (trackingRaw) {
+            try {
+              const tracking = JSON.parse(trackingRaw);
+              if (Array.isArray(tracking.watchHistory) && tracking.watchHistory.length && !watchHistory.length) {
+                watchHistory = tracking.watchHistory;
+              }
+              if (Array.isArray(tracking.continueWatching) && tracking.continueWatching.length && !continueWatching.length) {
+                continueWatching = tracking.continueWatching;
+              }
+              if (Array.isArray(tracking.watchlist) && tracking.watchlist.length && !watchlist.length) {
+                watchlist = tracking.watchlist;
+              }
+              if (Array.isArray(tracking.airingNext) && tracking.airingNext.length && !airingNext.length) {
+                airingNext = tracking.airingNext;
+              }
+            } catch {}
+          }
+        }
+
         return {
           entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+          watchHistory,
+          continueWatching,
+          watchlist,
+          airingNext,
           tmdbKey: parsed.tmdbKey || "",
           mdblistKey: parsed.mdblistKey || "",
           mdblistAccessToken: parsed.mdblistAccessToken || "",
@@ -4411,6 +4995,13 @@ async function resolveConfig(configParam, env) {
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
+          showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
+          showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
+          showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
+          showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
+          showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {
         // fall through to legacy decode below
@@ -4513,11 +5104,11 @@ function parseTmdbWebChartUrl(rawUrl) {
 
 function detectSource(input) {
   const s = (input || "").trim();
-  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:")) return "mdblist-watchlist";
-  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/history\//i.test(s)) return "mdblist-history";
+  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
+  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
   if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
-  if (s === "trakt:watchlist") return "trakt-watchlist";
-  if (s === "trakt:history") return "trakt-history";
+  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?$/i.test(s)) return "trakt-watchlist";
+  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/history\/?$/i.test(s)) return "trakt-history";
   if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
@@ -4669,59 +5260,75 @@ async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
 }
 
 async function searchTraktLists(query, traktKeyOverride) {
-  const q = (query || "").trim();
-  if (!q) return [];
+  const rawQ = (query || "").trim();
+  if (!rawQ) return [];
+  const q = rawQ.replace(/^@/, "").trim();
   const traktKey = traktKeyOverride || TRAKT_CLIENT_ID;
   if (!traktKey) {
     throw new Error("Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID.");
   }
 
-  const src = `https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=20`;
-  const res = await fetchTraktWithRetry(src, {
-    headers: {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    },
-    cf: { cacheTtl: 900, cacheEverything: true },
-  });
-  if (!res.ok) {
-    if (res.status === 403) {
-      throw new Error(
-        traktKeyOverride
-          ? "Trakt rejected the Client ID you entered (HTTP 403 = invalid or unapproved app). Double check it against https://trakt.tv/oauth/applications."
-          : "Trakt rejected this add-on's API key (HTTP 403 = invalid or unapproved app, per Trakt's own error docs). " +
-            "This isn't fixable from a search query -- either the Worker owner needs to check the app behind TRAKT_CLIENT_ID at https://trakt.tv/oauth/applications, or you can enter your own Trakt Client ID in the box above to bypass it."
-      );
-    }
-    if (res.status === 429) {
-      throw new Error("Trakt is temporarily busy (rate limit). Please wait a few seconds and try again.");
-    }
-    throw new Error(`Trakt list search failed (HTTP ${res.status}).`);
+  const headers = {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": traktKey,
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+  };
+
+  const requests = [
+    fetchTraktWithRetry(`https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=30`, {
+      headers,
+      cf: { cacheTtl: 900, cacheEverything: true },
+    }).then(async (r) => (r.ok ? await r.json() : [])).catch(() => [])
+  ];
+
+  // If query looks like a possible username (single token without spaces), also query user lists directly
+  const isPossibleUsername = /^[a-zA-Z0-9_-]{2,32}$/.test(q);
+  if (isPossibleUsername) {
+    requests.push(
+      fetchTraktWithRetry(`https://api.trakt.tv/users/${encodeURIComponent(q)}/lists`, {
+        headers,
+        cf: { cacheTtl: 900, cacheEverything: true },
+      }).then(async (r) => {
+        if (!r.ok) return [];
+        const userLists = await r.json();
+        if (!Array.isArray(userLists)) return [];
+        return userLists.map((l) => ({ list: { ...l, user: l.user || { ids: { slug: q }, username: q } } }));
+      }).catch(() => [])
+    );
   }
 
-  const data = await res.json();
-  const lists = (Array.isArray(data) ? data : [])
-    .map((r) => r.list)
-    .filter((l) => l && l.ids && l.ids.slug && l.user && l.user.ids && l.user.ids.slug)
-    .map((l) => {
-      const name = l.name || "";
-      const isMovie = /\bmovie(s)?\b/i.test(name);
-      const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
-      const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
-      return {
-        name: l.name,
-        user: l.user.username || l.user.ids.slug,
-        slug: l.ids.slug,
-        items: l.item_count || 0,
-        likes: l.likes || 0,
-        contentType,
-        url: `https://trakt.tv/users/${encodeURIComponent(l.user.ids.slug)}/lists/${encodeURIComponent(
-          l.ids.slug
-        )}`,
-      };
+  const [searchData, userData] = await Promise.all(requests);
+  const combinedRaw = [...(Array.isArray(searchData) ? searchData : []), ...(Array.isArray(userData) ? userData : [])];
+
+  const seenUrls = new Set();
+  const lists = [];
+
+  for (const r of combinedRaw) {
+    const l = r && r.list ? r.list : r;
+    if (!l || !l.ids || !l.ids.slug) continue;
+    const userSlug = (l.user && l.user.ids && l.user.ids.slug) || (l.user && l.user.username) || (isPossibleUsername ? q : '');
+    if (!userSlug) continue;
+    const url = `https://trakt.tv/users/${encodeURIComponent(userSlug)}/lists/${encodeURIComponent(l.ids.slug)}`;
+    if (seenUrls.has(url.toLowerCase())) continue;
+    seenUrls.add(url.toLowerCase());
+
+    const name = l.name || "";
+    const isMovie = /\bmovie(s)?\b/i.test(name);
+    const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+    const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+
+    lists.push({
+      name: l.name || l.ids.slug,
+      user: (l.user && l.user.username) || userSlug,
+      slug: l.ids.slug,
+      items: l.item_count || 0,
+      likes: l.likes || 0,
+      contentType,
+      url,
+      source: "Trakt",
     });
+  }
 
   return lists;
 }
@@ -4833,8 +5440,8 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "mdblist-history") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistHistory(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
     else if (source === "mdblist-airing-next") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistAiringNext(entry, skip, mdblistKey, keys.mdblistAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
     else if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
-    else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || ""); }
-    else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || ""); }
+    else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
+    else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "trakt-airing-next") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktAiringNext(entry, skip, traktKey, keys.traktAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
     else if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdb(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-chart") {
@@ -4851,7 +5458,7 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length), keys.region); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length), keys.env, keys.ctx); }
-    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey); }
+    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey, keys.env, keys.ctx); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
     else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env, keys);
@@ -4868,6 +5475,27 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     result = deterministicDailyShuffle(result, `items:${entry.id || entry.name}:${keys.configParam || ''}`);
     result.totalItems = tot;
   }
+
+  if (keys.isStremioCatalog === true && keys.origin && Array.isArray(result) && result.length > 0) {
+    const entryUrl = String(entry.url || '');
+    const entryName = String(entry.name || '').toLowerCase();
+    const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
+    const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+
+    let allowBadges = false;
+    if (isAiringNext) {
+      allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
+    } else if (isContinueWatching) {
+      allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else {
+      allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
+    }
+
+    if (allowBadges) {
+      result = applyBadgedPostersToMetas(result, keys.origin);
+    }
+  }
+
   return result || [];
 }
 
@@ -5191,6 +5819,10 @@ function getChannelBackdropUrl(payload) {
       if (it.thumbnail && it.thumbnail.startsWith("http") && !it.thumbnail.includes("/api/channel-")) return it.thumbnail;
     }
   }
+  // If a custom URL poster was set but no separate backdrop was saved, use the poster URL as the backdrop too
+  if (payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-")) {
+    return payload.poster;
+  }
   return "";
 }
 
@@ -5256,6 +5888,88 @@ function getPremadeChannelLogo(payload, origin, isLandscape = false) {
   return `/api/channel-logo?${params.toString()}`;
 }
 
+function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg, bottomBorder, bottomColor }) {
+  const safePoster = escapeXml(posterUrl || '');
+  const safeAirDate = escapeXml(airDateText || '');
+  const safeBottom = escapeXml(bottomText || '');
+
+  // Top Air Date pill: Extra-large 36px font, 72px height, generous padding
+  const topPillWidth = Math.max(160, (safeAirDate.length * 26) + 56);
+
+  // Bottom Badge pill: Extra-large 38px font, 84px height, centered
+  const bottomPillWidth = Math.max(380, (safeBottom.length * 24) + 64);
+
+  const topBadgeSvg = safeAirDate ? `
+    <g transform="translate(24, 24)">
+      <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
+      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+    </g>` : '';
+
+  const bottomBadgeSvg = safeBottom ? `
+    <g transform="translate(250, 715)">
+      <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
+      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+    </g>` : '';
+
+  const topGradient = safeAirDate ? `
+    <rect x="0" y="0" width="500" height="220" fill="url(#topScrim)" opacity="0.85"/>` : '';
+
+  const bottomGradient = safeBottom ? `
+    <rect x="0" y="420" width="500" height="330" fill="url(#bottomScrim)" opacity="0.95"/>` : '';
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="500" height="750" viewBox="0 0 500 750">
+  <defs>
+    <linearGradient id="topScrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bottomScrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.98"/>
+    </linearGradient>
+  </defs>
+  <rect width="500" height="750" fill="#151722"/>
+  ${safePoster ? `<image href="${safePoster}" xlink:href="${safePoster}" x="0" y="0" width="500" height="750" preserveAspectRatio="xMidYMid slice"/>` : ''}
+  ${topGradient}
+  ${bottomGradient}
+  ${topBadgeSvg}
+  ${bottomBadgeSvg}
+</svg>`;
+}
+
+function applyBadgedPostersToMetas(metas, origin) {
+  if (!Array.isArray(metas) || !metas.length || !origin) return metas;
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge")) return m;
+    const isPremiereEp = m.episodeNumber === 1 || m.episodeNum === 1 || (m.episodeNum == null && m.episodeNumber == null);
+    const hasAired = m.airDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.airDate) : false;
+    const hasPremiere = !!(m.isSeasonPremiere && isPremiereEp && !hasAired);
+    const hasFinale = !!(m.isSeasonFinale && !hasAired);
+    const finaleAired = m.seasonFinaleAirDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.seasonFinaleAirDate) : false;
+    const hasFinaleDate = !!(m.seasonFinaleAirDate && !finaleAired);
+    const hasAirDate = !!(m.airDate && !m.hideDateBadge && !hasAired);
+    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate) return m;
+
+    const params = new URLSearchParams();
+    params.set("poster", m.poster);
+    params.set("v", "5");
+    if (m.id) params.set("id", m.id);
+    if (hasAirDate) params.set("airDate", m.airDate);
+    if (hasPremiere) params.set("premiere", "1");
+    if (hasFinale) params.set("finale", "1");
+    if (hasFinaleDate) params.set("finaleDate", m.seasonFinaleAirDate);
+
+    const badgedUrl = `${origin.replace(/\/+$/, "")}/api/poster-badge?${params.toString()}`;
+    return {
+      ...m,
+      poster: badgedUrl,
+    };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
 function fetchChannelCatalog(entry, origin) {
   const rawUrls = String(entry.url || "").split(/[\r\n]+/).map((u) => u.trim()).filter(Boolean);
   const metas = [];
@@ -5305,6 +6019,32 @@ function fetchChannelCatalog(entry, origin) {
 // A hand-picked list of movies, shows, or mixed items built by search-and-pick
 // in the builder. When served in a catalog shelf, items are automatically filtered
 // to match the shelf type (entry.type).
+//
+// A Custom List someone built lives one of two places: purely in this
+// browser's localStorage (no Creator Profile), or on this Worker's own KV
+// under creatorlist:{username}:{slug} (signed in, saved via
+// /api/creator/lists/save -- see 26_api-creator-and-admin-routes.js). Either
+// way, adding it to Catalogs used to bake a one-time snapshot of `items`
+// straight into this URL, so an edit made afterward (add/remove/reorder a
+// pick) never reached a catalog shelf that already existed -- the shelf,
+// and the Live Preview reading the same source, both kept serving whatever
+// was true at the moment "+ Add to Catalogs" was clicked. For a
+// Creator-hosted list this function now re-reads creatorlist:{owner}:{slug}
+// fresh on every catalog request instead, the same live-by-identity
+// approach fetchPublishedListCatalog already uses for the separate
+// publishedlist: URL scheme just above. A local-only list has no
+// server-reachable copy to re-read (localStorage never leaves the browser),
+// so those stay snapshot-based -- there's no way around that without also
+// giving local lists a KV-backed presence, a much bigger change than this.
+// The embedded snapshot is kept as a fallback in all cases: if this isn't a
+// creatorSlug row at all, or the owner can't be determined (see liveOwner
+// below -- an older saved row's payload may only have creatorSlug, from
+// before creatorOwner started getting stamped in; keys.trackCreatorName/
+// keys.creatorName cover that using the request's own signed-in account),
+// or the KV lookup comes back empty (list since deleted, KV hiccup, made
+// private -- fetchLiveCreatorListItems only returns public lists' items),
+// this drops straight back to the old behavior rather than serving an
+// empty shelf.
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -5317,9 +6057,45 @@ function parseCustomListPayload(rawUrl) {
   }
 }
 
-function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
+// Re-reads a Creator-hosted list's current items straight from this
+// Worker's own KV, the same key shape /api/creator/lists/save writes to
+// and the /lists/:username/:slug viewer route already reads from. Returns
+// null (never []) on anything short of a confirmed, parseable, public hit,
+// so callers can tell "list has zero items right now" apart from "couldn't
+// resolve this live, fall back to the snapshot".
+async function fetchLiveCreatorListItems(owner, slug, env) {
+  if (!owner || !slug || !env || !env.CONFIGS) return null;
+  const ownerLower = String(owner).toLowerCase();
+  const slugLower = String(slug).toLowerCase();
+  const keysToTry = [
+    `creatorlist:${ownerLower}:${slugLower}`,
+    `creatorlist:${owner}:${slug}`,
+  ];
+  for (const k of keysToTry) {
+    const raw = await env.CONFIGS.get(k);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.items) && parsed.visibility !== "private") {
+        return parsed.items;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   const payload = parseCustomListPayload(entry.url);
-  if (!payload || !payload.items || !payload.items.length) {
+  if (!payload) return [];
+
+  let sourceItems = payload.items;
+  const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
+  if (payload.creatorSlug && liveOwner) {
+    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env);
+    if (liveItems) sourceItems = liveItems;
+  }
+
+  if (!sourceItems || !sourceItems.length) {
     if (payload && (
       (payload.listSlug && (payload.listSlug.startsWith('custom:curated:') || payload.listSlug.startsWith('curated:'))) ||
       (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows') || payload.name.toLowerCase().trim() === 'recommended'))
@@ -5329,8 +6105,8 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
     return [];
   }
   const items = payload.shuffle
-    ? seededShuffle(payload.items, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
-    : payload.items;
+    ? seededShuffle(sourceItems, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
+    : sourceItems;
   return items
     .filter((it) => {
       if (!it || !it.imdbId) return false;
@@ -5351,10 +6127,55 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
     }));
 }
 
+// Turns one stored recommendation entry (the exact shape the Discover
+// card renders -- see /api/recommendations, 25_api-catalog-routes.js, and
+// the snapshot the client pushes with its tracking data) into a catalog
+// meta. The only thing that has to be looked up is the IMDb id: the card
+// only ever needs TMDB's own id, but a Stremio/wako catalog row has to
+// carry an id stream add-ons can resolve, so each entry costs one
+// external_ids call. Those are edge-cached for a day, and the list is
+// capped at CURATED_RECOMMENDATION_LIMIT, so this is a bounded, mostly
+// cache-served fan-out rather than the up-to-PAGE_SIZE one this replaced.
+async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
+  if (!it) return null;
+  const tmdbId = String(it.tmdbId || String(it.id || '').replace(/^tmdb:/, '') || '').trim();
+  const name = it.name || it.title || 'Untitled';
+  const poster = it.poster || undefined;
+  const releaseInfo = it.year || it.releaseInfo || undefined;
+  let resolvedId = '';
+  if (tmdbId) {
+    try {
+      const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${encodeURIComponent(tmdbId)}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
+        cf: { cacheTtl: 86400, cacheEverything: true }
+      });
+      const detailData = await detailRes.json();
+      if (detailData && detailData.imdb_id) resolvedId = detailData.imdb_id;
+    } catch {}
+    if (!resolvedId) resolvedId = `tmdb:${tmdbId}`;
+  }
+  if (!resolvedId) return null;
+  return {
+    id: resolvedId,
+    type: isSeries ? 'series' : 'movie',
+    name: name,
+    poster: poster,
+    releaseInfo: releaseInfo,
+  };
+}
+
 async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
   const isSeries = entry.type === 'series' || (entry.url && entry.url.includes('shows'));
   const tmdbKey = keys.tmdbKey || TMDB_API_KEY;
   let sampleIds = [];
+  // The exact list the Discover tab last showed for this account, pushed
+  // up alongside Watch History/Continue Watching/Airing Next by
+  // pushTrackingSync (22_client-creator-profile.js). Preferred over
+  // re-deriving below because re-deriving cannot reproduce it: the card's
+  // seeds come from the browser's full picture (Continue Watching + Watch
+  // History + Watchlist + every other custom list), while this function
+  // can only see what tracking data made it to the server. Same reason
+  // Airing Next is served from a pushed snapshot rather than recomputed.
+  let storedRecs = null;
 
   if (keys.env && keys.env.CONFIGS) {
     let username = keys.username || keys.creatorName || '';
@@ -5369,6 +6190,11 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
         const trackingRaw = await keys.env.CONFIGS.get(`creatorsynctracking:${username}`);
         if (trackingRaw) {
           const tracking = JSON.parse(trackingRaw);
+          const recBlob = tracking.curatedRecommendations;
+          if (recBlob && typeof recBlob === 'object') {
+            const candidate = isSeries ? recBlob.shows : recBlob.movies;
+            if (Array.isArray(candidate) && candidate.length) storedRecs = candidate;
+          }
           if (isSeries) {
             const list = Array.isArray(tracking.continueWatching) && tracking.continueWatching.length
               ? tracking.continueWatching
@@ -5380,6 +6206,26 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
           }
         }
       } catch {}
+    }
+  }
+
+  // The snapshot path. Serves exactly the items the Discover card last
+  // showed, in exactly that order, cut to exactly the same length -- so
+  // "40 items" on the card and 40 items in the shelf are the same 40.
+  if (storedRecs) {
+    const capped = storedRecs.slice(0, CURATED_RECOMMENDATION_LIMIT);
+    if (skip >= capped.length) return [];
+    const mapped = await Promise.all(
+      capped.slice(skip, skip + PAGE_SIZE).map((it) => mapStoredRecommendationToMeta(it, isSeries, tmdbKey).catch(() => null))
+    );
+    const out = mapped.filter(Boolean);
+    // Only trust the snapshot if it actually resolved to something. An
+    // empty result here (every external_ids call failed, say) falls
+    // through to the live derivation below rather than serving an empty
+    // shelf, the same fallback shape fetchCustomListCatalog already uses.
+    if (out.length) {
+      out.totalItems = capped.length;
+      return out;
     }
   }
 
@@ -5432,10 +6278,16 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
       });
 
       if (combined.length > 0) {
-        if (skip >= combined.length) {
+        // CURATED_RECOMMENDATION_LIMIT, not PAGE_SIZE: this list is the
+        // same list the Discover card shows, and that card is built from
+        // a response cut to exactly this many items. Cutting the pool
+        // first (rather than the page) also means paging stops where the
+        // card says the list ends instead of running on to 100.
+        const capped = combined.slice(0, CURATED_RECOMMENDATION_LIMIT);
+        if (skip >= capped.length) {
           return [];
         }
-        const mapped = await Promise.all(combined.slice(skip, skip + PAGE_SIZE).map(async (it) => {
+        const mapped = await Promise.all(capped.slice(skip, skip + PAGE_SIZE).map(async (it) => {
           try {
             let imdbId = '';
             const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${it.id}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
@@ -5456,7 +6308,9 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
             return null;
           }
         }));
-        return mapped.filter(Boolean);
+        const derived = mapped.filter(Boolean);
+        derived.totalItems = capped.length;
+        return derived;
       }
     } catch {}
   }
@@ -5579,6 +6433,10 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
            it.poster);
       const mapped = {
         id: isMovie ? (it.imdbId || it.id) : (showId || it.id),
+        showId: showId || undefined,
+        showTitle: isMovie ? undefined : (it.showTitle || it.title || it.name),
+        seasonNum: it.seasonNum != null ? it.seasonNum : undefined,
+        episodeNum: it.episodeNum != null ? it.episodeNum : undefined,
         type: targetType,
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
         poster: showPoster,
@@ -5586,6 +6444,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         airDate: it.airDate || undefined,
         isUnaired: it.isUnaired ? true : undefined,
         isSeasonPremiere: it.isSeasonPremiere ? true : undefined,
+        isSeasonFinale: it.isSeasonFinale ? true : undefined,
+        seasonFinaleAirDate: it.seasonFinaleAirDate || undefined,
+        seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber || undefined,
       };
       
       if (!mapped.id) return;
@@ -6256,7 +7117,7 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
 }
 
 // Pulls the connected account's Trakt watchlist
-async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "") {
+async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken = "", env = null, ctx = null) {
   if (!accessToken) {
     throw new Error(
       "Connect Trakt in Settings first — your watchlist needs your own Trakt sign-in, there's no public version of it."
@@ -6276,8 +7137,12 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Trakt Watchlist",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -6318,35 +7183,88 @@ function mapTraktHistoryItems(data, type) {
   };
   if (type === "series") {
     return items
-      .filter((it) => it && it.episode && it.show && it.show.ids && it.show.ids.imdb)
       .map((it) => {
-        const imdbId = it.show.ids.imdb;
-        const s = it.episode.season;
-        const e = it.episode.number;
-        const epTitle = it.episode.title ? ` \u2014 ${it.episode.title}` : "";
+        if (!it) return null;
+        const show = it.show || (it.episode && it.episode.show) || it;
+        const ep = it.episode || it;
+        const ids = (show && show.ids) || (ep && ep.ids) || it.ids || {};
+        const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+        if (!imdbId) return null;
+        const s = ep.season;
+        const e = ep.number;
+        const epTitle = ep.title ? ` \u2014 ${ep.title}` : "";
+        const showTitle = show.title || it.title || "Show";
+        const seasonEpStr = (s != null && e != null) ? ` S${s}E${e}` : "";
         return {
           id: imdbId,
-          type,
-          name: `${it.show.title} S${s}E${e}${epTitle}`,
-          showTitle: it.show.title,
-          poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
+          type: "series",
+          name: `${showTitle}${seasonEpStr}${epTitle}`,
+          showTitle: showTitle,
+          poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
           releaseInfo: watchedLabel(it.watched_at),
         };
-      });
+      })
+      .filter(Boolean);
+  }
+  if (type === "mixed") {
+    return items
+      .map((it) => {
+        if (!it) return null;
+        const isEpisode = !!(it.episode || it.type === "episode" || (it.show && !it.movie));
+        if (isEpisode) {
+          const show = it.show || (it.episode && it.episode.show) || it;
+          const ep = it.episode || it;
+          const ids = (show && show.ids) || (ep && ep.ids) || it.ids || {};
+          const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+          if (!imdbId) return null;
+          const s = ep.season;
+          const e = ep.number;
+          const epTitle = ep.title ? ` \u2014 ${ep.title}` : "";
+          const showTitle = show.title || it.title || "Show";
+          const seasonEpStr = (s != null && e != null) ? ` S${s}E${e}` : "";
+          return {
+            id: imdbId,
+            type: "series",
+            name: `${showTitle}${seasonEpStr}${epTitle}`,
+            showTitle: showTitle,
+            poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+            releaseInfo: watchedLabel(it.watched_at),
+          };
+        }
+        const movie = it.movie || it;
+        const ids = (movie && movie.ids) || it.ids || {};
+        const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+        if (!imdbId) return null;
+        return {
+          id: imdbId,
+          type: "movie",
+          name: movie.title || it.title || "Movie",
+          poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+          releaseInfo: watchedLabel(it.watched_at) || (movie.year ? String(movie.year) : undefined),
+        };
+      })
+      .filter(Boolean);
   }
   return items
-    .filter((it) => it && it.movie && it.movie.ids && it.movie.ids.imdb)
-    .map((it) => ({
-      id: it.movie.ids.imdb,
-      type,
-      name: it.movie.title,
-      poster: `https://images.metahub.space/poster/medium/${it.movie.ids.imdb}/img`,
-      releaseInfo: watchedLabel(it.watched_at) || (it.movie.year ? String(it.movie.year) : undefined),
-    }));
+    .map((it) => {
+      if (!it) return null;
+      const movie = it.movie || it;
+      const ids = (movie && movie.ids) || it.ids || {};
+      const imdbId = ids.imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : null);
+      if (!imdbId) return null;
+      return {
+        id: imdbId,
+        type: "movie",
+        name: movie.title || it.title || "Movie",
+        poster: String(imdbId).startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : undefined,
+        releaseInfo: watchedLabel(it.watched_at) || (movie.year ? String(movie.year) : undefined),
+      };
+    })
+    .filter(Boolean);
 }
 
 // Pulls the connected account's Trakt watch history
-async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "") {
+async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "", env = null, ctx = null) {
   if (!accessToken) {
     throw new Error(
       "Connect Trakt in Settings first — your watch history needs your own Trakt sign-in, there's no public version of it."
@@ -6357,17 +7275,22 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
       "Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID."
     );
   }
-  const itemKind = entry.type === "series" ? "episodes" : "movies";
+  const itemKind = entry.type === "series" ? "episodes" : (entry.type === "mixed" ? "" : "movies");
+  const pathKind = itemKind ? `/${itemKind}` : "";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
-  const src = `https://api.trakt.tv/users/me/history/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
+  const src = `https://api.trakt.tv/users/me/history${pathKind}?limit=${PAGE_SIZE}&page=${page}`;
 
   const userHash = safeUserHash(accessToken);
-  const cacheKey = `user_cache:trakt:history:${itemKind}:${skip}:${userHash}`;
+  const cacheKey = `user_cache:trakt:history:${itemKind || "mixed"}:${skip}:${userHash}`;
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Trakt History",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -6415,8 +7338,12 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
 
   return await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 300,
     staleTtlSec: 3600,
+    kvTtlSec: 3600,
     providerLabel: "Trakt Airing Next",
     fetchFn: async () => {
       const headers = {
@@ -6481,9 +7408,9 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
       });
 
       const airingMetas = [];
-      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+      await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
         try {
-          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series", "", false, env, ctx);
           if (details && details.nextEpisodeAirDate) {
             const isPremiere = details.nextEpisodeNumber === 1;
             const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -6498,6 +7425,9 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
               background: details.background || undefined,
               airDate: details.nextEpisodeAirDate,
               isSeasonPremiere: isPremiere,
+              isSeasonFinale: !!details.isSeasonFinale,
+              seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+              seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
               description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
               trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
             });
@@ -6529,8 +7459,12 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
 
   return await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 300,
     staleTtlSec: 3600,
+    kvTtlSec: 3600,
     providerLabel: "MDBList Airing Next",
     fetchFn: async () => {
       const sep = authQuery ? "&" : "?";
@@ -6596,9 +7530,9 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
       });
 
       const airingMetas = [];
-      await mapWithConcurrency(candidateMetas.slice(0, 40), 6, async (item) => {
+      await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
         try {
-          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series");
+          const details = await fetchTmdbItemDetails(item.id, tmdbKey, "series", "", false, env, ctx);
           if (details && details.nextEpisodeAirDate) {
             const isPremiere = details.nextEpisodeNumber === 1;
             const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -6613,6 +7547,9 @@ async function fetchMdblistAiringNext(entry, skip = 0, mdblistKey = "", mdblistA
               background: details.background || undefined,
               airDate: details.nextEpisodeAirDate,
               isSeasonPremiere: isPremiere,
+              isSeasonFinale: !!details.isSeasonFinale,
+              seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+              seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
               description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
               trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
             });
@@ -6705,7 +7642,7 @@ async function fetchSimklChart(entry, skip, clientId, chartKey, env = null, ctx 
   });
 }
 
-async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey) {
+async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKey, env = null, ctx = null) {
   if (!token) {
     throw new Error("Simkl user list requires connecting your Simkl account in Settings.");
   }
@@ -6720,8 +7657,12 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
+    kvKey: cacheKey,
+    env,
+    ctx,
     freshTtlSec: 60,
     staleTtlSec: 1800,
+    kvTtlSec: 1800,
     providerLabel: "Simkl User Sync",
     fetchFn: async () => {
       const res = await fetch("https://api.simkl.com/sync/all-items/", {
@@ -6777,9 +7718,9 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
     });
 
     const airingMetas = [];
-    await mapWithConcurrency(candidateMetas.slice(0, 35), 6, async (item) => {
+    await mapWithConcurrency(candidateMetas.slice(0, 90), 6, async (item) => {
       try {
-        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series");
+        const details = await fetchTmdbItemDetails(item.id, tmdbApiKey, "series", "", false, env, ctx);
         if (details && details.nextEpisodeAirDate) {
           const isPremiere = details.nextEpisodeNumber === 1;
           const sNum = details.nextEpisodeSeasonNumber ? `S${String(details.nextEpisodeSeasonNumber).padStart(2, "0")}` : "";
@@ -6798,6 +7739,9 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
             // original release year, which is noise in this context.
             airDate: details.nextEpisodeAirDate,
             isSeasonPremiere: isPremiere,
+            isSeasonFinale: !!details.isSeasonFinale,
+            seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
+            seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
             description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
             trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
           });
@@ -7002,14 +7946,12 @@ async function fetchTrailerForImdb(imdbId, type, apiKey) {
 
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
-// fetchTmdbDetails's append_to_response=videos, see below). Silently a
-// no-op when no TMDB_API_KEY is configured on this Worker.
+// fetchTmdbDetails's append_to_response=videos, see below).
+// NOTE: Catalogs in Stremio/wako/Nuvio do not play trailers on home screen thumbnails;
+// Stremio's title details page resolves official YouTube trailers directly via Cinemeta.
+// Returning immediately eliminates ~100,000+ redundant TMDB subrequests per day and
+// dramatically speeds up catalog response times.
 async function enrichTrailers(metas, type, apiKey) {
-  if (!apiKey || !metas.length) return metas;
-  await mapWithConcurrency(metas, 8, async (m) => {
-    const ytKey = await fetchTrailerForImdb(m.id, type, apiKey);
-    if (ytKey) m.trailerStreams = trailerStreamsFor(ytKey);
-  });
   return metas;
 }
 
@@ -7023,7 +7965,7 @@ async function enrichTrailers(metas, type, apiKey) {
 // (now) fetching trailer videos -- into the single per-item TMDB request
 // this add-on was already making, via append_to_response. Same hard-cached
 // cost as before; trailers just ride along for free.
-async function fetchTmdbDetails(tmdbId, kind, apiKey) {
+async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
   let cleanTmdbId = String(tmdbId || "").trim();
   while (cleanTmdbId.startsWith("tmdb:")) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
@@ -7034,6 +7976,18 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
   const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
   const cached = getPerUserCache(cacheKey);
   if (cached && cached.data) return cached.data;
+
+  // Check KV cache across all workers
+  if (env && env.CONFIGS) {
+    try {
+      const kvRaw = await env.CONFIGS.get(`tmdbdetail:${kind}:${cleanTmdbId}`);
+      if (kvRaw) {
+        const kvParsed = JSON.parse(kvRaw);
+        setPerUserCache(cacheKey, kvParsed, 604800, 2592000);
+        return kvParsed;
+      }
+    } catch {}
+  }
 
   // release_dates is appended alongside external_ids/videos at no extra
   // request cost (same call, one more field) -- used by fetchTmdbChart
@@ -7068,7 +8022,14 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey) {
   }
   const result = { imdbId, videos, hasDigitalRelease };
   // Cache for 7 days (604800s)
-  setPerUserCache(cacheKey, result, 604800, 604800);
+  setPerUserCache(cacheKey, result, 604800, 2592000);
+
+  // Persist to Cloudflare KV for 30 days so no other worker or edge ever re-queries this ID
+  if (env && env.CONFIGS && imdbId) {
+    try {
+      env.CONFIGS.put(`tmdbdetail:${kind}:${cleanTmdbId}`, JSON.stringify(result), { expirationTtl: 2592000 }).catch(() => {});
+    } catch {}
+  }
   return result;
 }
 
@@ -7409,7 +8370,7 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigi
       const applyDigitalFilter = !!hideNonDigitalReleases && wantKind === "movie" && (chartKey === "trending" || chartKey === "popular");
 
       const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-        const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey);
+        const { imdbId, videos, hasDigitalRelease } = await fetchTmdbDetails(it.id, wantKind, apiKey, env);
         if (!imdbId) return null;
         if (applyDigitalFilter && hasDigitalRelease === false) return null;
         return mapTmdbItem(it, imdbId, entry.type, videos);
@@ -7741,7 +8702,7 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache) {
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
@@ -7760,6 +8721,10 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     freshTtlSec: (fallbackType === "series" || fallbackType === "tv") ? 7200 : 604800,
     staleTtlSec: 2592000,
     providerLabel: "TMDB Item Details",
+    env: env,
+    ctx: ctx,
+    kvKey: apiKey ? cacheKey : "",
+    kvTtlSec: 604800,
     fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
   });
 }
@@ -7767,6 +8732,7 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
 async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
+  const today = new Date().toISOString().slice(0, 10);
   let rawStr = String(imdbId).trim();
   let tmdbId = null;
   let type = (fallbackType === "series" || fallbackType === "tv") ? "tv" : (fallbackType === "movie" ? "movie" : null);
@@ -7783,20 +8749,51 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   if (!tmdbId) {
     const baseImdbId = rawStr.startsWith("tt") ? rawStr.split(":")[0] : rawStr;
-    const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
-    const findRes = await fetch(findSrc, {
-      headers: { "User-Agent": "my-list-addon/1.14" },
-      cf: { cacheTtl: 604800, cacheEverything: true },
-    });
-    if (findRes.ok) {
-      const findData = await findRes.json();
-      if (findData.movie_results && findData.movie_results.length > 0) {
-        tmdbId = findData.movie_results[0].id;
-        type = "movie";
-      } else if (findData.tv_results && findData.tv_results.length > 0) {
-        tmdbId = findData.tv_results[0].id;
-        type = "tv";
+    if (baseImdbId.startsWith("tt")) {
+      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+      const findRes = await fetch(findSrc, {
+        headers: { "User-Agent": "my-list-addon/1.14" },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (findRes.ok) {
+        const findData = await findRes.json();
+        if (findData.movie_results && findData.movie_results.length > 0) {
+          tmdbId = findData.movie_results[0].id;
+          type = "movie";
+        } else if (findData.tv_results && findData.tv_results.length > 0) {
+          tmdbId = findData.tv_results[0].id;
+          type = "tv";
+        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+          tmdbId = findData.tv_episode_results[0].show_id;
+          type = "tv";
+        }
       }
+    } else if (baseImdbId) {
+      // Query fallback for title strings
+      const searchType = (type === "tv" || type === "series" || fallbackType === "series" || fallbackType === "tv") ? "tv" : (type === "movie" || fallbackType === "movie" ? "movie" : "multi");
+      const cleanTitle = String(baseImdbId)
+        .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+        .replace(/[\s._-]+\d+x\d+.*$/i, "")
+        .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+        .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+        .replace(/\s*\(\d{4}\).*$/, "")
+        .trim();
+      try {
+        const searchRes = await fetch("https://api.themoviedb.org/3/search/" + searchType + "?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || baseImdbId) + "&page=1", {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (searchRes.ok) {
+          const sd = await searchRes.json();
+          if (sd.results && sd.results.length > 0) {
+            const first = sd.results[0];
+            tmdbId = first.id;
+            if (!type) {
+              type = first.media_type === "tv" ? "tv" : (first.media_type === "movie" ? "movie" : (fallbackType === "series" || fallbackType === "tv" ? "tv" : "movie"));
+            }
+          }
+        }
+      } catch {}
     }
   }
   if (!tmdbId) return null;
@@ -7912,7 +8909,6 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   const nextEpInfo = await (async () => {
     if (type !== "tv") return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
-    const today = new Date().toISOString().slice(0, 10);
     if (match.next_episode_to_air) {
       const nextAir = match.next_episode_to_air.air_date || null;
       if (nextAir && nextAir > today) {
@@ -7968,6 +8964,50 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     return { nextEpisodeAirDate: null, nextEpisodeNumber: null, nextEpisodeSeasonNumber: null, nextEpisodeName: null };
   })();
 
+  let isSeasonPremiere = false;
+  let isSeasonFinale = false;
+  let seasonFinaleAirDate = null;
+  let seasonFinaleEpisodeNumber = null;
+  let totalEpisodesInSeason = null;
+
+  const isUnairedFuture = !!(nextEpInfo && nextEpInfo.nextEpisodeAirDate && nextEpInfo.nextEpisodeAirDate > today);
+
+  if (type === "tv" && isUnairedFuture && nextEpInfo.nextEpisodeSeasonNumber) {
+    const targetSeason = Array.isArray(match.seasons)
+      ? match.seasons.find((s) => s && s.season_number === nextEpInfo.nextEpisodeSeasonNumber)
+      : null;
+    if (targetSeason && typeof targetSeason.episode_count === "number") {
+      totalEpisodesInSeason = targetSeason.episode_count;
+      seasonFinaleEpisodeNumber = targetSeason.episode_count;
+    }
+
+    if (nextEpInfo.nextEpisodeNumber === 1) {
+      isSeasonPremiere = true;
+    } else if (totalEpisodesInSeason && nextEpInfo.nextEpisodeNumber === totalEpisodesInSeason && nextEpInfo.nextEpisodeNumber > 1) {
+      isSeasonFinale = true;
+    }
+
+    // If mid-season (episodes 2..N-1), resolve the finale episode's air date
+    if (!isSeasonPremiere && !isSeasonFinale && tmdbId && nextEpInfo.nextEpisodeSeasonNumber) {
+      try {
+        const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + nextEpInfo.nextEpisodeSeasonNumber + "?api_key=" + encodeURIComponent(apiKey), {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        });
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          if (Array.isArray(sData.episodes) && sData.episodes.length > 0) {
+            const lastEp = sData.episodes[sData.episodes.length - 1];
+            if (lastEp) {
+              if (lastEp.air_date) seasonFinaleAirDate = lastEp.air_date;
+              if (typeof lastEp.episode_number === "number") seasonFinaleEpisodeNumber = lastEp.episode_number;
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
   return {
     id: realImdbId,
     title: match.title || match.name,
@@ -7988,6 +9028,11 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     cast: cast,
     director: director,
     ...nextEpInfo,
+    isSeasonPremiere: isSeasonPremiere,
+    isSeasonFinale: isSeasonFinale,
+    seasonFinaleAirDate: seasonFinaleAirDate,
+    seasonFinaleEpisodeNumber: seasonFinaleEpisodeNumber,
+    totalEpisodesInSeason: totalEpisodesInSeason,
     lastEpisodeNumber: (type === "tv" && match.last_episode_to_air) ? (typeof match.last_episode_to_air.episode_number === "number" ? match.last_episode_to_air.episode_number : null) : null,
   };
 }
@@ -7999,7 +9044,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 // (knownTmdbId when supplied, else the raw imdbId) plus the season number,
 // since a season's episode list is public, static-ish data no different
 // per requester.
-async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
+async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId, env, ctx) {
   if (!apiKey) return null;
   const cacheKey = `tmdb:season:${knownTmdbId || imdbId}:${seasonNum}`;
   return fetchWithPerUserCacheAndCircuitBreaker({
@@ -8007,6 +9052,10 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId) {
     freshTtlSec: 604800,
     staleTtlSec: 2592000,
     providerLabel: "TMDB Season Details",
+    env: env,
+    ctx: ctx,
+    kvKey: apiKey ? cacheKey : "",
+    kvTtlSec: 604800,
     fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId),
   });
 }
@@ -8023,22 +9072,44 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
   // mark watched either.
   let tmdbId = knownTmdbId || null;
   if (!tmdbId) {
-    if (imdbId.startsWith('tmdb:')) {
-      tmdbId = imdbId.split(':')[1];
-    } else {
-      // First, find TMDB ID from IMDB ID
-      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(imdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+    const raw = String(imdbId || '').trim();
+    if (raw.startsWith('tmdb:')) {
+      tmdbId = raw.split(':')[1];
+    } else if (/^\d+$/.test(raw)) {
+      tmdbId = raw;
+    } else if (raw.startsWith('tt')) {
+      const baseImdbId = raw.split(':')[0];
+      const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
       const findRes = await fetch(findSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
-      if (!findRes.ok) return null;
-      const findData = await findRes.json();
-
-      if (!findData.tv_results || findData.tv_results.length === 0) return null;
-      tmdbId = findData.tv_results[0].id;
+      if (findRes.ok) {
+        const findData = await findRes.json();
+        if (findData.tv_results && findData.tv_results.length > 0) {
+          tmdbId = findData.tv_results[0].id;
+        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+          tmdbId = findData.tv_episode_results[0].show_id;
+        }
+      }
+    } else if (raw) {
+      // Query fallback for title strings, e.g. "Ted Lasso"
+      const cleanTitle = raw.replace(/\s+S\d+E\d+.*$/i, '').trim();
+      try {
+        const searchRes = await fetch("https://api.themoviedb.org/3/search/tv?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || raw) + "&page=1", {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (searchRes.ok) {
+          const sd = await searchRes.json();
+          if (sd.results && sd.results.length > 0) {
+            tmdbId = sd.results[0].id;
+          }
+        }
+      } catch {}
     }
   }
+  if (!tmdbId) return null;
 
   const src = "https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonNum + "?api_key=" + encodeURIComponent(apiKey);
   const res = await fetch(src, {
@@ -8065,10 +9136,10 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
 // Builds standard Stremio/Nuvio metadata for any movie or series keyed by IMDb id.
 // Provides full metadata (details, ratings, cast, genres, seasons, and episodes)
 // so clients without a dedicated metadata addon (like Nuvio) render rich pages automatically.
-async function fetchStandardItemMeta(imdbId, type, apiKey) {
+async function fetchStandardItemMeta(imdbId, type, apiKey, env = null, ctx = null) {
   if (!apiKey || !imdbId) return null;
   const wantType = type === "series" ? "series" : "movie";
-  const details = await fetchTmdbItemDetails(imdbId, apiKey, wantType);
+  const details = await fetchTmdbItemDetails(imdbId, apiKey, wantType, "", false, env, ctx);
   if (!details) return null;
 
   const meta = {
@@ -8100,7 +9171,7 @@ async function fetchStandardItemMeta(imdbId, type, apiKey) {
     const regularSeasons = details.seasonsData.filter((s) => s && s.season_number > 0);
     const seasonResults = await Promise.all(
       regularSeasons.map((s) =>
-        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId).catch(() => null)
+        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId, env, ctx).catch(() => null)
       )
     );
 
@@ -8160,14 +9231,16 @@ function isEpisodeAiredServer(ep) {
 // (21_client-custom-list-builder.js), reimplemented server-side for the
 // same reason as isEpisodeAiredServer above. Returns { episode, seasonNum }
 // or null if nothing new has aired since latestSeasonNum/latestEpisodeNum.
-async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisodeNum, apiKey) {
-  const data = await fetchTmdbSeasonDetails(imdbId, latestSeasonNum, apiKey);
+async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisodeNum, apiKey, env, ctx) {
+  const sNum = Number(latestSeasonNum);
+  const eNum = Number(latestEpisodeNum);
+  const data = await fetchTmdbSeasonDetails(imdbId, sNum, apiKey, null, env, ctx);
   if (data && data.episodes) {
-    const nextInSeason = data.episodes.find((ep) => ep.episode_number > latestEpisodeNum);
-    if (nextInSeason) return { episode: nextInSeason, seasonNum: latestSeasonNum, isUnaired: !isEpisodeAiredServer(nextInSeason) };
+    const nextInSeason = data.episodes.find((ep) => ep.episode_number > eNum);
+    if (nextInSeason) return { episode: nextInSeason, seasonNum: sNum, isUnaired: !isEpisodeAiredServer(nextInSeason) };
   }
-  const nextSeasonNum = latestSeasonNum + 1;
-  const data2 = await fetchTmdbSeasonDetails(imdbId, nextSeasonNum, apiKey);
+  const nextSeasonNum = sNum + 1;
+  const data2 = await fetchTmdbSeasonDetails(imdbId, nextSeasonNum, apiKey, null, env, ctx);
   if (data2 && data2.episodes && data2.episodes.length) {
     const sorted = [...data2.episodes].sort((a, b) => a.episode_number - b.episode_number);
     if (sorted.length) return { episode: sorted[0], seasonNum: nextSeasonNum, isUnaired: !isEpisodeAiredServer(sorted[0]) };
@@ -8267,7 +9340,7 @@ async function checkForNewEpisodes(env) {
       showChecksUsed++;
       let next = null;
       try {
-        next = await findNextAiredEpisodeForShow(showId, latest.seasonNum, latest.episodeNum, env.TMDB_API_KEY);
+        next = await findNextAiredEpisodeForShow(showId, latest.seasonNum, latest.episodeNum, env.TMDB_API_KEY, env);
       } catch (e) {
         stillFullyWatched.push(showId); // network hiccup -- try again next run instead of assuming still fully watched
         continue;
@@ -9155,7 +10228,15 @@ ${seoHeadHtml}
     } catch (e) {}
   })();
 </script>
-<style>
+<!--
+  Marked for extraction the same way the client bundle is (see
+  splitAppBundle, 02_http-and-creator-utils.js). This stylesheet is ~85KB,
+  identical for every visitor and every route, and was inlined into every
+  page alongside the script. Verified deploy-constant by the same test that
+  covers the bundle: rendered across origins, configure mode and deep links,
+  it comes back byte-identical every time and carries no injected value.
+-->
+<style>/*MYLISTS_APP_CSS_START*/
   :root {
     /* Wako-inspired iOS-native modern light theme */
     --bg:           #F2F2F7;
@@ -10158,6 +11239,27 @@ ${seoHeadHtml}
     line-height: 1.4;
   }
   .list-card-meta-sep { color: var(--border-strong); }
+  .list-source-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    border-radius: 4px;
+    letter-spacing: 0.3px;
+    line-height: 1.2;
+    margin-right: 4px;
+    vertical-align: middle;
+    background: var(--surface-2, rgba(255,255,255,0.06));
+    border: 1px solid var(--border);
+    color: var(--text-2);
+  }
+  .list-source-badge.badge-mdblist { background: rgba(52,199,89,0.12); color: #34c759; border-color: rgba(52,199,89,0.3); }
+  .list-source-badge.badge-trakt { background: rgba(255,59,48,0.12); color: #ff3b30; border-color: rgba(255,59,48,0.3); }
+  .list-source-badge.badge-tmdb { background: rgba(90,200,250,0.12); color: #5ac8fa; border-color: rgba(90,200,250,0.3); }
+  .list-source-badge.badge-simkl { background: rgba(0,122,255,0.12); color: #007aff; border-color: rgba(0,122,255,0.3); }
+  .list-source-badge.badge-mylists, .list-source-badge.badge-profile { background: rgba(175,82,222,0.12); color: #af52de; border-color: rgba(175,82,222,0.3); }
+  .list-source-badge.badge-streaming { background: rgba(255,149,0,0.12); color: #ff9500; border-color: rgba(255,149,0,0.3); }
   .list-card-actions {
     display: flex; gap: 5px; align-items: center; flex-shrink: 0; flex-wrap: wrap;
   }
@@ -10456,7 +11558,58 @@ ${seoHeadHtml}
     background: #2fa84f;
     top: auto;
     bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
   }
+  .cw-date-badge-finale {
+    background: var(--warn, #FF9500);
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+  .cw-date-badge-finale-date {
+    background: rgba(20, 20, 24, 0.92);
+    color: #ffd166;
+    border: 1px solid rgba(255, 149, 0, 0.35);
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+    font-size: 0.58rem;
+    font-weight: 700;
+  }
+  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date) { display: none !important; }
+  body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }
+  body.hide-badge-season-finale .cw-date-badge-finale { display: none !important; }
+  body.hide-badge-season-finale-date .cw-date-badge-finale-date { display: none !important; }
+  body.hide-badge-rating .rating-badge, body.hide-badge-rating .poster-rating { display: none !important; }
+  body.hide-badge-watched .watched-badge, body.hide-badge-watched .cw-watched-indicator { display: none !important; }
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
+  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .rating-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .watched-badge { display: none !important; }
+  body.hide-airing-next-badges #myPrivateTraktListsResult .cw-date-badge,
+  body.hide-airing-next-badges #mySimklListsResult .cw-date-badge,
+  body.hide-airing-next-badges #myMdblistListsResult .cw-date-badge,
+  body.hide-airing-next-badges [data-list-key="airing-next"] .cw-date-badge,
+  body.hide-airing-next-badges .airing-next-card .cw-date-badge,
+  body.hide-airing-next-badges .live-preview-shelf-row[data-list-slug="airing-next"] .cw-date-badge,
+  body.hide-airing-next-badges .live-preview-posters.is-airing-next-shelf .cw-date-badge { display: none !important; }
+  body.hide-continue-watching-badges [data-list-key="continue-watching"] .cw-date-badge,
+  body.hide-continue-watching-badges .continue-watching-card .cw-date-badge,
+  body.hide-continue-watching-badges .live-preview-shelf-row[data-list-slug="continue-watching"] .cw-date-badge,
+  body.hide-continue-watching-badges .live-preview-posters.is-continue-watching-shelf .cw-date-badge { display: none !important; }
   .airing-next-filter-pills {
     display: flex;
     gap: 6px;
@@ -11883,7 +13036,7 @@ ${seoHeadHtml}
   .unsaved-install-banner-btn:active {
     transform: scale(0.96);
   }
-  </style>
+/*MYLISTS_APP_CSS_END*/</style>
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 </head>
 <body>
@@ -12043,10 +13196,11 @@ ${seoHeadHtml}
         </label>
         <button type="button" class="subnav-pill" id="whClearHistoryBtn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear History</button>
       </div>
-      <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center;">
+      <div id="genericTypeFilterControls" style="display:none; gap:6px; flex-wrap:wrap; align-items:center; width:100%;">
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
         <label for="whSortSelect" style="font-size:0.75rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:0.02em;">Sort</label>
@@ -12476,7 +13630,7 @@ if ('serviceWorker' in navigator) {
         <h2 class="shelf-title">Your Custom Lists</h2>
         <div style="display:flex; gap:8px;">
           <button type="button" class="primary lc-btn" onclick="openCreateListModal('custom')">+ New List</button>
-          <button type="button" class="secondary lc-btn" onclick="renderCreatorDashboard()">Refresh</button>
+          <button type="button" class="secondary lc-btn" onclick="(async()=>{await loadCreatorSync();renderCreatorDashboard();})()">Refresh</button>
         </div>
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Custom lists you've created locally or on your profile.</p>
@@ -12784,6 +13938,17 @@ if ('serviceWorker' in navigator) {
         <p style="margin:0 0 4px; font-weight:600; font-size:0.85rem;">Channel Poster:</p>
         <p style="margin:0 0 10px; color:var(--muted); font-size:0.8rem;">Choose a show poster (ranked by most episodes) or choose our custom channel poster.</p>
         <div id="channelPosterChoicesGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:10px;"></div>
+        <div style="margin-top:12px;">
+          <p style="margin:0 0 6px; font-size:0.8rem; font-weight:600; color:var(--muted);">Or use a custom image URL (JPEG, PNG, WebP, GIF):</p>
+          <div class="row" style="gap:8px;">
+            <input type="url" id="channelPosterUrlInput" placeholder="https://example.com/poster.jpg" style="flex:1; font-size:0.82rem;">
+            <button type="button" class="secondary" style="white-space:nowrap; font-size:0.82rem;" onclick="applyChannelPosterUrl()">Use This</button>
+          </div>
+          <div id="channelPosterUrlPreview" style="margin-top:8px; align-items:center; gap:10px; display:none;">
+            <img id="channelPosterUrlImg" src="" alt="Poster preview" style="width:54px; height:80px; object-fit:cover; border-radius:4px; border:2px solid var(--accent);" loading="lazy">
+            <span id="channelPosterUrlStatus" style="font-size:0.78rem; color:var(--muted);"></span>
+          </div>
+        </div>
       </div>
 
       <div class="row" style="margin-top:12px;">
@@ -12891,7 +14056,7 @@ if ('serviceWorker' in navigator) {
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Backup &amp; Restore</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Export your complete setup as JSON or import an existing configuration.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Export a complete backup snapshot of your catalogs, custom lists, watchlist, watch history, continue watching, channels, presets, and settings &mdash; or restore from a previous JSON backup.</p>
       <textarea id="configJsonBox" rows="5" style="width:100%;font-family:monospace;font-size:14px;" placeholder="Paste config JSON here to restore..."></textarea>
       <div class="backup-actions-grid" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="exportConfigJson()">Export current</button>
@@ -12906,6 +14071,7 @@ if ('serviceWorker' in navigator) {
         <div class="row">
           <input type="text" id="importLinkInput" placeholder="Paste an install or configure link here">
           <button type="button" class="secondary lc-btn" onclick="importFromLink()">Import link</button>
+          <button type="button" class="secondary lc-btn" onclick="restoreListsFromLink()" title="Rebuild and restore custom lists &amp; channels from this link into My Lists without altering your catalog shelves">Restore Lists</button>
         </div>
       </div>
     </div>
@@ -12980,10 +14146,111 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Watch History</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History.</p>
-      <div id="watchHistorySettingsSection">
+      <h2 class="panel-title">Poster Badges &amp; Labels</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Customize which badges and indicators are displayed on posters across your website dashboard, catalogs, and Stremio/Nuvio.</p>
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        <div style="border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:4px; display:flex; flex-direction:column; gap:10px;">
+          <div style="font-size:0.85rem; font-weight:700; color:var(--text);">Website &amp; Dashboard</div>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Airing Next (Dashboard &amp; My Lists)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and upcoming air date badges on the Airing Next shelf and provider lists.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeContinueWatchingCheckbox" checked onchange="toggleBadgeSetting('showBadgesContinueWatching', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Continue Watching (Dashboard)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your in-progress Continue Watching series.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeCatalogsCheckbox" checked onchange="toggleBadgeSetting('showBadgesCatalogs', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Catalogs &amp; Live Preview</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show badges on catalog rows, the Catalogs Live Preview &amp; Editor, and catalog See All views.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:4px; display:flex; flex-direction:column; gap:10px;">
+          <div style="font-size:0.85rem; font-weight:700; color:var(--text);">Stremio &amp; Nuvio (Artwork Overlays)</div>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Airing Next Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Airing Next poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioContinueWatchingCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioContinueWatching', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioCatalogsCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioCatalogs', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay badges on MDBList, Trakt, Simkl, and Custom list catalog rows in Stremio.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="font-size:0.85rem; font-weight:700; color:var(--text); margin-top:2px;">Badge Types</div>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeAirDateCheckbox" checked onchange="toggleBadgeSetting('showBadgeAirDate', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Upcoming Air Date</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows the upcoming air date tag (e.g. <code>TODAY</code>, <code>TOMORROW</code>, <code>WED</code>, <code>SEP 4</code>) on upcoming episode posters.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeSeasonPremiereCheckbox" checked onchange="toggleBadgeSetting('showBadgeSeasonPremiere', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Season Premiere Badge</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows the green <code>Season Premiere</code> badge on upcoming Episode 1s (only when the episode has not yet aired).</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeSeasonFinaleCheckbox" checked onchange="toggleBadgeSetting('showBadgeSeasonFinale', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Season Finale Badge</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows the orange <code>Season Finale</code> badge when the upcoming episode is the final episode of that season.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeSeasonFinaleDateCheckbox" checked onchange="toggleBadgeSetting('showBadgeSeasonFinaleDate', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Season Finale Date Badge</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows when the season finale will air (e.g. <code>Finale: Nov 12</code>) on mid-season episodes (Episodes 2–9).</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeRatingCheckbox" checked onchange="toggleBadgeSetting('showBadgeRating', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Rating Badges</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows ratings (e.g. <code>★ 8.4</code>) on catalog and search poster cards.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="badgeWatchedCheckbox" checked onchange="toggleBadgeSetting('showBadgeWatched', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Watched Status Badges</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows the watched badge on movies and shows you've already watched.</p>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Watch History &amp; Continue Watching</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History or in-progress Continue Watching.</p>
+      <div id="watchHistorySettingsSection" style="display:flex; gap:10px; flex-wrap:wrap;">
         <button type="button" class="secondary lc-btn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Watch History</button>
+        <button type="button" class="secondary lc-btn" onclick="clearContinueWatchingAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Continue Watching</button>
       </div>
     </div>
 
@@ -12998,7 +14265,7 @@ if ('serviceWorker' in navigator) {
   <div class="settings-subpanel" id="settingsSubExternal" style="display:none;">
     <div class="panel">
       <h2 class="panel-title">External Accounts &amp; API Keys</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Connect your external service accounts and API keys. When signed in to your Creator Profile, your connected accounts stay synchronized across devices and logouts.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Connect your external service accounts and API keys. When signed in to your Profile, your connected accounts stay synchronized across devices and logouts.</p>
 
       <!-- TMDB Section -->
       <div id="tmdbSection" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
@@ -13218,6 +14485,13 @@ if ('serviceWorker' in navigator) {
       </div>
     </div>
 
+    <!-- Guide Link Section -->
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Guide</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Step-by-step how-to guides covering every tab: adding catalogs, building Channels, Storylines &amp; Universes, importing lists, and more.</p>
+      <a href="/guide" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
+    </div>
+
     <!-- Support & Recommended Debrid Section -->
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Support &amp; Recommended Debrid</h2>
@@ -13232,6 +14506,28 @@ if ('serviceWorker' in navigator) {
 </div>
 
 
+<!--
+  Two script elements follow, and the split between them is deliberate.
+
+  The client bundle is around 1.3MB, and it used to be inlined into this
+  page in full. That is fine for the home page, which is byte-identical for
+  everyone and now answers a repeat visit with a 304 -- but it is not fine
+  for the pages people actually share. Every distinct shared list URL, every
+  configure link and every deep link produces different HTML, so each one
+  re-sent the entire bundle, and the browser re-parsed it from scratch every
+  time because inline script gets no code cache.
+
+  So everything that varies per request lives in the small inline preamble
+  below, and everything that does not lives in a separate script served from
+  a content-hashed URL with immutable caching. The bundle is then fetched
+  once and reused across every page of the site, and a deploy changes the
+  hash so nobody is ever served a stale one.
+
+  Both are plain classic scripts with no defer/async, so they still execute
+  in order, and the preamble's const/let bindings are script-scoped globals
+  that the bundle reads and assigns exactly as it did when the two were one
+  element.
+-->
 <script>
 const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
@@ -13244,11 +14540,38 @@ const IS_CONFIGURE = ${isConfigureMode};
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
 const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+// The signed-in person's OAuth tokens. These are the reason the preamble
+// exists at all: they are specific to one page load and must never end up
+// in the shared bundle below, which is cached publicly under a URL that is
+// identical for every visitor.
+let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
+let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
+let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
+let simklUsername = ${JSON.stringify(initialSimklUsername)};
+// Resolved from an install/configure link by the route that rendered this
+// page. Previously declared far down in 24_client-backup-restore-presets.js;
+// hoisted here because they differ per config. Moving a const declaration
+// earlier is always safe -- anything that read it before would have been a
+// temporal-dead-zone error, so nothing could have been relying on the old
+// position.
+const serverEntries = (${initialEntriesJson});
+const serverEntriesAreDefaults = ${usingDefaultEntries ? 'true' : 'false'};
+const serverShuffleShelves = ${initialShuffleShelves ? 'true' : 'false'};
+const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
+</script>
+<script>/*MYLISTS_APP_BUNDLE_START*/
 // Every native/official chart's (slug, name, movieUrl, showUrl) -- lets
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+function escapeAttr(s) { return escapeHtml(s); }
 
 (function earlySubmenuSync() {
   try {
@@ -13519,7 +14842,7 @@ function isListAddedToConfig(url, type, slug) {
       targetSlug = url.slice('custom:'.length);
     } else if (url.startsWith('customlist:v1:')) {
       const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
-      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+      if (p) targetSlug = p.localSlug || p.listSlug || p.creatorSlug || p.slug || '';
     }
   }
 
@@ -13540,7 +14863,7 @@ function isListAddedToConfig(url, type, slug) {
         if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) return true;
         if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) return true;
         const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
-        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) return true;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.creatorSlug === targetSlug || payload.slug === targetSlug)) return true;
       }
     }
     if (targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
@@ -13563,7 +14886,7 @@ function removeListFromConfig(url, type, slug) {
       targetSlug = url.slice('custom:'.length);
     } else if (url.startsWith('customlist:v1:')) {
       const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
-      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+      if (p) targetSlug = p.localSlug || p.listSlug || p.creatorSlug || p.slug || '';
     }
   }
 
@@ -13586,7 +14909,7 @@ function removeListFromConfig(url, type, slug) {
         if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) { match = true; break; }
         if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) { match = true; break; }
         const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
-        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.creatorSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
       }
     }
     if (!match && targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
@@ -13749,10 +15072,13 @@ var livePreviewShelfData = [];
 // via the Connect Trakt button/OAuth flow, not typed in, so it lives as
 // its own piece of state instead of being read from a DOM field.
 var activeTraktToken = null;
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+// traktAccessToken / mdblistAccessToken / simklAccessToken / simklUsername
+// are declared in the small per-request preamble at the top of this script
+// section, not here. They carry the signed-in person's OAuth tokens, so
+// they must stay in the inline page, out of the shared, cacheable bundle
+// below -- see the preamble's own comment. They are still ordinary
+// script-scoped bindings, so every assignment and read in this file works
+// exactly as before.
 
 async function compressJsonToBase64(obj) {
   try {
@@ -13820,15 +15146,23 @@ function switchTab(name) {
     document.documentElement.removeAttribute('data-initial-tab');
   } catch (e) {}
 
-  document.querySelectorAll('.tab-panel').forEach(function(p) {
+  // Instant DOM tab switching
+  const panels = document.querySelectorAll('.tab-panel');
+  for (let i = 0; i < panels.length; i++) {
+    const p = panels[i];
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
-  });
-  document.querySelectorAll('.tab-btn').forEach(function(b) {
+  }
+  const tabBtns = document.querySelectorAll('.tab-btn');
+  for (let i = 0; i < tabBtns.length; i++) {
+    const b = tabBtns[i];
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
-  });
-  document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
+  }
+  const navItems = document.querySelectorAll('.bottom-nav-item');
+  for (let i = 0; i < navItems.length; i++) {
+    const b = navItems[i];
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
-  });
+  }
+
   if (name !== 'list-details' && name !== 'item-details') {
     window._originTab = name;
     window._previousTab = name;
@@ -13916,25 +15250,6 @@ function switchTab(name) {
   if (name === 'catalogs') {
     if (!window._catalogsInitializedOnce) {
       window._catalogsInitializedOnce = true;
-      // Rows are added by the page's own init sequence (addRow calls in
-      // 24_client-backup-restore-presets.js, driven by either the install
-      // link's serverEntries or a restored localStorage save) earlier in
-      // the same script, and restoreActiveTab (which reaches this via
-      // switchTab) runs after that block finishes -- so #lists should
-      // already be populated by the time this fires. But this is the
-      // first tab-switch of the page's life, run from the very tail of a
-      // long synchronous init script, and depends on that whole prior
-      // sequence having actually completed rather than merely being
-      // *scheduled* -- if anything upstream ever ends up deferring its
-      // own addRow calls (e.g. a slow-loading dependency, a future
-      // refactor), calling renderLivePreview against an empty #lists here
-      // finds zero enabled shelves and silently no-ops (see its own early
-      // return), permanently leaving every row on its "Click Refresh
-      // Preview" placeholder with nothing left to ever retry it. Guarding
-      // on an actual entry existing (rather than trusting a fixed delay,
-      // which either races on a slow device or wastes time on a fast one)
-      // makes this immune to exactly how long that upstream sequence
-      // takes, including if it ever changes.
       const triggerLivePreview = () => {
         const hasRows = document.getElementById('lists') && document.getElementById('lists').querySelector('.entry');
         if (hasRows) {
@@ -14116,6 +15431,22 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
 }
 
 function restoreActiveTab() {
+  const p = (typeof location !== 'undefined' && location.pathname) ? location.pathname : '';
+  const h = (typeof location !== 'undefined' && location.hash) ? location.hash : '';
+  const isDeep = (typeof SERVER_DEEP_LINK_LIST !== 'undefined' && SERVER_DEEP_LINK_LIST) ||
+    (p.startsWith('/lists/') && p !== '/lists') ||
+    p.startsWith('/channels/') ||
+    h.startsWith('#/list?') ||
+    h.startsWith('#/item?');
+
+  if (isDeep) {
+    try {
+      window._originTab = localStorage.getItem('myListAddon:activeTab') || 'discover';
+      window._previousTab = window._originTab;
+    } catch (e) {}
+    return;
+  }
+
   let tab = 'discover';
   try {
     tab = localStorage.getItem('myListAddon:activeTab') || 'discover';
@@ -14218,6 +15549,9 @@ function switchSettingsSubmenu(name, btn) {
   const activeId = subpanels[name] || 'settingsSubAccount';
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
+  if (name === 'backup' && typeof renderPresetsList === 'function') {
+    renderPresetsList();
+  }
   if (name === 'external' && typeof populateImportTargetLists === 'function') {
     populateImportTargetLists();
   }
@@ -14927,11 +16261,70 @@ function parseCustomListPayloadClient(u) {
     if (!raw.startsWith('customlist:v1:')) return null;
     const data = JSON.parse(raw.slice('customlist:v1:'.length));
     if (!data || !Array.isArray(data.items)) return null;
-    if (data.type !== 'movie' && data.type !== 'series') return null;
+    if (data.type && data.type !== 'movie' && data.type !== 'series' && data.type !== 'mixed') return null;
     return data;
   } catch (e) {
     return null;
   }
+}
+
+function findCustomListBySlugOrName(slug, name) {
+  if (!slug && !name) return null;
+  const sLower = String(slug || '').toLowerCase().trim();
+  const nLower = String(name || '').toLowerCase().trim();
+  const slugifiedName = (typeof slugify === 'function' && name) ? slugify(name).toLowerCase() : '';
+  const deslugified = (typeof deslugify === 'function' && slug) ? deslugify(slug).toLowerCase() : '';
+
+  function matches(l) {
+    if (!l) return false;
+    const lSlug = String(l.slug || l.localSlug || l.creatorSlug || l.listSlug || '').toLowerCase();
+    const lName = String(l.name || '').toLowerCase();
+    const lNameSlug = (typeof slugify === 'function' && l.name) ? slugify(l.name).toLowerCase() : '';
+    if (sLower && (lSlug === sLower || lName === sLower || lNameSlug === sLower || (deslugified && lName === deslugified))) return true;
+    if (nLower && (lName === nLower || lSlug === nLower || lNameSlug === nLower || (slugifiedName && (lSlug === slugifiedName || lNameSlug === slugifiedName)))) return true;
+    return false;
+  }
+
+  // 1. Check loadLocalCustomLists()
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    if (sLower && map[sLower]) return map[sLower];
+    const found = Object.values(map).find(matches);
+    if (found) return found;
+  } catch (e) {}
+
+  // 2. Check DOM entries (#lists .entry)
+  try {
+    const entries = document.querySelectorAll('#lists .entry');
+    for (const entry of entries) {
+      const urlInput = entry.querySelector('.url');
+      if (!urlInput || !urlInput.value) continue;
+      const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(urlInput.value) : null;
+      if (payload && matches(payload)) return payload;
+    }
+  } catch (e) {}
+
+  // 3. Check lastCreatorListsData
+  if (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
+    const found = lastCreatorListsData.find(matches);
+    if (found) return found;
+  }
+
+  // 4. Check lastLocalCustomListsData
+  if (typeof lastLocalCustomListsData !== 'undefined' && Array.isArray(lastLocalCustomListsData)) {
+    const found = lastLocalCustomListsData.find(matches);
+    if (found) return found;
+  }
+
+  // 5. Check livePreviewShelfData
+  if (typeof livePreviewShelfData !== 'undefined' && Array.isArray(livePreviewShelfData)) {
+    const shelf = livePreviewShelfData.find(s => s && matches(s));
+    if (shelf && Array.isArray(shelf.sample) && shelf.sample.length) {
+      return { name: shelf.name, type: shelf.type, items: shelf.sample, slug: slug || shelf.slug };
+    }
+  }
+
+  return null;
 }
 
 function customListSourceRowHtml(u) {
@@ -14954,6 +16347,73 @@ function customListSourceRowHtml(u) {
     publishedLinkHtml +
     '<input type="hidden" class="url" value="' + escapeAttr(u) + '">' +
     '</div>';
+}
+
+function syncCustomListToCatalogRows(slug, items, name, type) {
+  if (!slug || !Array.isArray(items)) return;
+  let updatedAny = false;
+
+  document.querySelectorAll('#lists .entry').forEach((entry) => {
+    const sourceRows = entry.querySelectorAll('.source-row');
+    sourceRows.forEach((sourceRow) => {
+      const urlInput = sourceRow.querySelector('.url');
+      if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+      try {
+        const payload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+        const matchesSlug = payload.localSlug === slug || payload.listSlug === slug || payload.creatorSlug === slug || payload.slug === slug || (slug && payload.listId === slug);
+        if (!matchesSlug) return;
+
+        const shelfType = payload.type || type || 'movie';
+        let shelfItems = items;
+        if (shelfType === 'movie' && (type === 'mixed' || !type || items.some((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId)))) {
+          shelfItems = items.filter((it) => it && (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        } else if (shelfType === 'series' && (type === 'mixed' || !type || items.some((it) => it && (it.kind === 'movie' || it.type === 'movie')))) {
+          shelfItems = items.filter((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        }
+
+        payload.items = shelfItems;
+        if (name && payload.name) payload.name = name;
+
+        const newUrl = 'customlist:v1:' + JSON.stringify(payload);
+        if (typeof customListSourceRowHtml === 'function') {
+          const temp = document.createElement('div');
+          temp.innerHTML = customListSourceRowHtml(newUrl);
+          if (temp.firstElementChild) {
+            sourceRow.replaceWith(temp.firstElementChild);
+          } else {
+            urlInput.value = newUrl;
+          }
+        } else {
+          urlInput.value = newUrl;
+        }
+
+        if (name && entry.querySelectorAll('.url').length === 1) {
+          const rowNameInput = entry.querySelector('.name');
+          if (rowNameInput) {
+            const isMixed = type === 'mixed' || (!type && items.some((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId)) && items.some((it) => it && (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId))));
+            if (isMixed) {
+              if (payload.type === 'movie' && !name.toLowerCase().includes('(movies)')) {
+                rowNameInput.value = name + ' (Movies)';
+              } else if (payload.type === 'series' && !name.toLowerCase().includes('(shows)')) {
+                rowNameInput.value = name + ' (Shows)';
+              } else {
+                rowNameInput.value = name;
+              }
+            } else {
+              rowNameInput.value = name;
+            }
+          }
+        }
+
+        updatedAny = true;
+      } catch (e) {}
+    });
+  });
+
+  if (updatedAny) {
+    if (typeof saveState === 'function') saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
+  }
 }
 
 // A short, stable random id for a Channel row -- generated once when the
@@ -15419,9 +16879,12 @@ async function enrichMdblistAiringNextDates(list) {
             it.airDate = d.nextEpisodeAirDate;
             it.seasonNum = d.nextEpisodeSeasonNumber;
             it.episodeNum = d.nextEpisodeNumber;
-            it.isSeasonPremiere = d.nextEpisodeNumber === 1;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
             it.isUnaired = true;
-            it.episodeTitle = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : ('Episode ' + d.nextEpisodeNumber));
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
             enriched.push(it);
           }
         } catch (e) {}
@@ -15446,12 +16909,18 @@ function openMdblistAiringNextDetailsPage() {
   const list = (window._myMdblistLists || []).find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
   if (!list) return;
   const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
   const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
     const label = (typeof formatWatchItemLabel === 'function')
-      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
       : {
           title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
-          subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
         };
     return {
       id: it.id,
@@ -15461,7 +16930,9 @@ function openMdblistAiringNextDetailsPage() {
       poster: it.poster,
       airDate: it.airDate,
       isUnaired: true,
-      isSeasonPremiere: it.isSeasonPremiere,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
     };
   });
   openListDetailsPage('MDBList Airing Next', 'series', 'mdblist:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
@@ -15482,6 +16953,7 @@ function renderMyMdblistLists(lists) {
     if (!window._mdblistRawAiringCandidates || !window._mdblistRawAiringCandidates.length) {
       window._mdblistRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
     }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
     if (!airingNextList._cachedApplied) {
       try {
         const cached = JSON.parse(localStorage.getItem('myListAddon:mdblistAiringNextCache') || '[]');
@@ -15489,13 +16961,30 @@ function renderMyMdblistLists(lists) {
           const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
           airingNextList.items.forEach((it) => {
             const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
             if (c) {
               it.airDate = c.airDate;
               it.seasonNum = c.seasonNum;
               it.episodeNum = c.episodeNum;
-              it.isSeasonPremiere = c.isSeasonPremiere;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
               it.isUnaired = true;
-              it.episodeTitle = c.episodeTitle || (c.isSeasonPremiere ? 'Season Premiere' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : ''));
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
             }
           });
         }
@@ -15566,14 +17055,34 @@ function renderMyMdblistLists(lists) {
             if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openMdblistAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
             if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openMdblistAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
 
+            const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+            const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+            const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+            const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+            const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+            const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+            const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
-            if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+            if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
               const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
               if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
             }
-            const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
-              ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
-              : '';
+            const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+            const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+            let bottomBadge = '';
+            if (isUnairedEp) {
+              if (showPremiere && isSeasonPremiere) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+              } else if (showFinale && it.isSeasonFinale) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+              } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+                const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+                if (finaleText) {
+                  bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+                }
+              }
+            }
             const label = (typeof formatWatchItemLabel === 'function')
               ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
               : {
@@ -15584,7 +17093,7 @@ function renderMyMdblistLists(lists) {
             return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
               '<div class="list-card-mini-poster-img-wrap">' +
                 (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
-                (dateBadge + premiereBadge) +
+                (dateBadge + bottomBadge) +
                 overlays +
               '</div>' +
               '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -16180,9 +17689,12 @@ async function enrichTraktAiringNextDates(list) {
             it.airDate = d.nextEpisodeAirDate;
             it.seasonNum = d.nextEpisodeSeasonNumber;
             it.episodeNum = d.nextEpisodeNumber;
-            it.isSeasonPremiere = d.nextEpisodeNumber === 1;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
             it.isUnaired = true;
-            it.episodeTitle = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : ('Episode ' + d.nextEpisodeNumber));
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
             enriched.push(it);
           }
         } catch (e) {}
@@ -16208,12 +17720,18 @@ function openTraktAiringNextDetailsPage() {
   const list = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
   if (!list) return;
   const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
   const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
     const label = (typeof formatWatchItemLabel === 'function')
-      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
       : {
           title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
-          subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
         };
     return {
       id: it.id,
@@ -16223,7 +17741,9 @@ function openTraktAiringNextDetailsPage() {
       poster: it.poster,
       airDate: it.airDate,
       isUnaired: true,
-      isSeasonPremiere: it.isSeasonPremiere,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
     };
   });
   openListDetailsPage('Trakt Airing Next', 'series', 'trakt:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
@@ -16248,6 +17768,7 @@ function renderMyPrivateTraktLists(lists) {
     if (!window._traktRawAiringCandidates || !window._traktRawAiringCandidates.length) {
       window._traktRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
     }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
     if (!airingNextList._cachedApplied) {
       try {
         const cached = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || '[]');
@@ -16255,13 +17776,30 @@ function renderMyPrivateTraktLists(lists) {
           const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
           airingNextList.items.forEach((it) => {
             const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
             if (c) {
               it.airDate = c.airDate;
               it.seasonNum = c.seasonNum;
               it.episodeNum = c.episodeNum;
-              it.isSeasonPremiere = c.isSeasonPremiere;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
               it.isUnaired = true;
-              it.episodeTitle = c.episodeTitle || (c.isSeasonPremiere ? 'Season Premiere' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : ''));
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
             }
           });
         }
@@ -16333,14 +17871,34 @@ function renderMyPrivateTraktLists(lists) {
             if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openTraktAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
             if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openTraktAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
 
+            const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+            const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+            const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+            const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+            const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+            const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+            const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
-            if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+            if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
               const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
               if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
             }
-            const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
-              ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
-              : '';
+            const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+            const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+            let bottomBadge = '';
+            if (isUnairedEp) {
+              if (showPremiere && isSeasonPremiere) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+              } else if (showFinale && it.isSeasonFinale) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+              } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+                const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+                if (finaleText) {
+                  bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+                }
+              }
+            }
             const label = (typeof formatWatchItemLabel === 'function')
               ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
               : {
@@ -16351,7 +17909,7 @@ function renderMyPrivateTraktLists(lists) {
             return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
               '<div class="list-card-mini-poster-img-wrap">' +
                 (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
-                (dateBadge + premiereBadge) +
+                (dateBadge + bottomBadge) +
                 overlays +
               '</div>' +
               '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -16962,9 +18520,12 @@ async function enrichSimklAiringNextDates(list) {
             it.airDate = d.nextEpisodeAirDate;
             it.seasonNum = d.nextEpisodeSeasonNumber;
             it.episodeNum = d.nextEpisodeNumber;
-            it.isSeasonPremiere = d.nextEpisodeNumber === 1;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
             it.isUnaired = true;
-            it.episodeTitle = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : ('Episode ' + d.nextEpisodeNumber));
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
             enriched.push(it);
           }
           // Shows with no nextEpisodeAirDate are silently dropped (ended, no renewal announced)
@@ -16990,12 +18551,18 @@ function openSimklAiringNextDetailsPage() {
   const list = (window._mySimklLists || []).find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
   if (!list) return;
   const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
   const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
     const label = (typeof formatWatchItemLabel === 'function')
-      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
       : {
           title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
-          subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
         };
     return {
       id: it.id,
@@ -17005,7 +18572,9 @@ function openSimklAiringNextDetailsPage() {
       poster: it.poster,
       airDate: it.airDate,
       isUnaired: true,
-      isSeasonPremiere: it.isSeasonPremiere,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
     };
   });
   openListDetailsPage('Simkl Airing Next', 'series', 'simkl:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
@@ -17025,6 +18594,7 @@ function renderMySimklLists(lists) {
     if (!window._simklRawAiringCandidates || !window._simklRawAiringCandidates.length) {
       window._simklRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
     }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
     if (!airingNextList._cachedApplied) {
       try {
         const cached = JSON.parse(localStorage.getItem('myListAddon:simklAiringNextCache') || '[]');
@@ -17032,13 +18602,30 @@ function renderMySimklLists(lists) {
           const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
           airingNextList.items.forEach((it) => {
             const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
             if (c) {
               it.airDate = c.airDate;
               it.seasonNum = c.seasonNum;
               it.episodeNum = c.episodeNum;
-              it.isSeasonPremiere = c.isSeasonPremiere;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
               it.isUnaired = true;
-              it.episodeTitle = c.episodeTitle || (c.isSeasonPremiere ? 'Season Premiere' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : ''));
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
             }
           });
         }
@@ -17106,16 +18693,36 @@ function renderMySimklLists(lists) {
           const removeBtn = isAiringNext
             ? ''
             : '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+          const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+          const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+          const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+          const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+          const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+          const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
           let dateBadge = '';
-          if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+          if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
             const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
             if (badgeText) {
               dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
             }
           }
-          const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
-            ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
-            : '';
+          const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+          const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+          let bottomBadge = '';
+          if (isUnairedEp) {
+            if (showPremiere && isSeasonPremiere) {
+              bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+            } else if (showFinale && it.isSeasonFinale) {
+              bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+            } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+              const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+              if (finaleText) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+              }
+            }
+          }
           const label = (typeof formatWatchItemLabel === 'function')
             ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
             : {
@@ -17126,7 +18733,7 @@ function renderMySimklLists(lists) {
           return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
             '<div class="list-card-mini-poster-img-wrap">' +
               (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
-              (isAiringNext ? (dateBadge + premiereBadge) : '') +
+              (isAiringNext ? (dateBadge + bottomBadge) : '') +
               removeBtn +
               overlays +
             '</div>' +
@@ -17717,8 +19324,15 @@ async function markTraktHistoryAllWatched(btn) {
   }
 
   if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-  const whResult = await addItemsToWatchHistory(whItems);
+  const whResult = await addItemsToWatchHistory(whItems, true);
   if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  if (whResult.quotaExceeded) {
+    const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+    if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+    else alert(msg);
+    return;
+  }
 
   let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
   if (whResult.cwTotal) {
@@ -17826,8 +19440,15 @@ function mapMdblistItemsToWatchHistory(rawItems) {
                 name: sep.name || sep.title || ('Episode ' + epNum),
                 showTitle: showTitle,
                 showId: showId,
+                showPoster: showPoster,
                 seasonNum: seasonNum,
-                epNum: epNum,
+                // episodeNum, not epNum. Every reader of a Watch History
+                // entry -- the SxxExx label, the Continue Watching
+                // recompute, the episode-still backfill in
+                // 21_client-custom-list-builder.js -- looks for
+                // episodeNum, so an entry written with epNum was
+                // effectively an episode with no episode number.
+                episodeNum: epNum,
                 poster: showPoster,
                 watchedAt: sep.watched_at || sep.last_watched_at ? (new Date(sep.watched_at || sep.last_watched_at).getTime() || watchedAtMs) : watchedAtMs,
               });
@@ -17845,8 +19466,9 @@ function mapMdblistItemsToWatchHistory(rawItems) {
           name: inner.episode_title || showTitle,
           showTitle: showTitle,
           showId: showId,
+          showPoster: showPoster,
           seasonNum: inner.season || 1,
-          epNum: inner.episode || 1,
+          episodeNum: inner.episode || 1,
           poster: showPoster,
           watchedAt: watchedAtMs,
         });
@@ -17924,8 +19546,15 @@ async function markMdblistHistoryAllWatched(btn) {
   }
 
   if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-  const whResult = await addItemsToWatchHistory(whItems);
+  const whResult = await addItemsToWatchHistory(whItems, true);
   if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+  if (whResult.quotaExceeded) {
+    const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+    if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+    else alert(msg);
+    return;
+  }
 
   let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
   if (whResult.cwTotal) {
@@ -18021,8 +19650,15 @@ async function markSimklListAllWatched(btn) {
     }
 
     if (btn) btn.textContent = 'Marking ' + whItems.length + ' item(s) as watched\u2026';
-    const whResult = await addItemsToWatchHistory(whItems);
+    const whResult = await addItemsToWatchHistory(whItems, true);
     if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+
+    if (whResult.quotaExceeded) {
+      const msg = 'Not enough local storage space to save your history. Your browser limits storage to ~5MB. Please delete some large custom lists and try again.';
+      if (typeof showAppAlert === 'function') showAppAlert('Storage Full', msg, false);
+      else alert(msg);
+      return;
+    }
 
     let msg = 'Marked ' + whResult.added + ' item' + (whResult.added === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
     if (whResult.cwTotal) {
@@ -18337,7 +19973,7 @@ async function runTraktExportImport() {
       });
       if (whItems.length && typeof addItemsToWatchHistory === 'function') {
         if (btn) btn.textContent = 'Checking Continue Watching for ' + new Set(whItems.filter((it) => it.showId).map((it) => it.showId)).size + ' show(s)\u2026';
-        const whResult = await addItemsToWatchHistory(whItems);
+        const whResult = await addItemsToWatchHistory(whItems, true);
         watchedAdded += whResult.added;
         cwSucceeded += whResult.cwSucceeded || 0;
         cwTotal += whResult.cwTotal || 0;
@@ -18590,7 +20226,7 @@ window.runLetterboxdExportImport = async function() {
     if (markWatchedChecked.has(cat.key) && typeof addItemsToWatchHistory === 'function') {
       if (progressLine) progressLine.textContent = 'Marking ' + cat.label + ' as watched...';
       const whItems = resolvedItems.map((it) => ({ id: it.imdbId, type: 'movie', name: it.title, poster: it.poster }));
-      const whResult = await addItemsToWatchHistory(whItems);
+      const whResult = await addItemsToWatchHistory(whItems, true);
       watchedAdded += whResult.added;
     }
   }
@@ -19208,7 +20844,7 @@ async function runUnifiedListImport() {
     } else if (targetList === 'watch-history') {
       listDisplayName = 'Watch History';
       if (typeof addItemsToWatchHistory === 'function') {
-        const whResult = await addItemsToWatchHistory(finalItems);
+        const whResult = await addItemsToWatchHistory(finalItems, true);
         savedCount = whResult.added;
       }
     } else if (targetList.startsWith('list:')) {
@@ -19247,7 +20883,7 @@ async function runUnifiedListImport() {
     }
 
     if (alsoMarkWatched && targetList !== 'watch-history' && typeof addItemsToWatchHistory === 'function') {
-      const whResult = await addItemsToWatchHistory(finalItems);
+      const whResult = await addItemsToWatchHistory(finalItems, true);
       totalWatchedAdded += whResult.added;
     }
 
@@ -19426,14 +21062,180 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-async function runListSearch() {
-  const q = document.getElementById('listSearchInput').value.trim();
-  const box = document.getElementById('listSearchResult');
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
+}
+
+function parseListSearchIntent(rawQuery) {
+  const raw = String(rawQuery || '').trim();
+  const q = raw.toLowerCase().replace(/['"“”]/g, '').trim();
+  if (!q) return { raw, term: '', source: null, isSourceOnly: false };
+
+  let source = null;
+  let term = q;
+
+  const patterns = [
+    { source: 'MDBList', regex: /^(?:mdblist|mdb)\b\s*/i },
+    { source: 'Trakt', regex: /^(?:trakt|trakt\.tv)\b\s*/i },
+    { source: 'TMDB', regex: /^(?:tmdb|themoviedb|franchise|collection|collections)\b\s*/i },
+    { source: 'Simkl', regex: /^(?:simkl|anime)\b\s*/i },
+    { source: 'My Lists Addon', regex: /^(?:my\s*lists\s*addon|my\s*lists|mylists|profile|profiles|community)\b\s*/i },
+    { source: 'Streaming', regex: /^(?:netflix|disney\+?|hbo\s*max|max|hulu|apple\s*tv\+?|prime\s*video|amazon|paramount\+?|peacock)\b\s*/i },
+  ];
+
+  for (const p of patterns) {
+    if (p.regex.test(q)) {
+      source = p.source;
+      term = q.replace(p.regex, '').trim();
+      break;
+    }
+  }
+
+  const aliases = {
+    'mdblist': 'MDBList', 'mdb': 'MDBList',
+    'trakt': 'Trakt', 'trakt.tv': 'Trakt',
+    'tmdb': 'TMDB', 'themoviedb': 'TMDB', 'franchise': 'TMDB', 'collection': 'TMDB', 'collections': 'TMDB',
+    'simkl': 'Simkl', 'anime': 'Simkl',
+    'my lists addon': 'My Lists Addon', 'mylistsaddon': 'My Lists Addon', 'my lists': 'My Lists Addon', 'mylists': 'My Lists Addon', 'profile': 'My Lists Addon', 'profiles': 'My Lists Addon', 'community': 'My Lists Addon',
+    'streaming': 'Streaming', 'netflix': 'Streaming', 'disney': 'Streaming', 'disney+': 'Streaming', 'hbo': 'Streaming', 'max': 'Streaming', 'hulu': 'Streaming', 'apple': 'Streaming', 'apple tv': 'Streaming', 'prime': 'Streaming', 'prime video': 'Streaming', 'paramount': 'Streaming', 'peacock': 'Streaming',
+  };
+  if (aliases[q]) {
+    source = aliases[q];
+    term = '';
+  }
+
+  return {
+    raw,
+    term,
+    source,
+    isSourceOnly: (source && !term),
+  };
+}
+
+function scoreListSearchMatch(list, rawQuery, intent) {
+  if (!list) return -1;
+  const listName = (list.name || '').toLowerCase().trim();
+  const listUser = (list.creatorName || list.user || list.username || '').toLowerCase().trim();
+  const listUrl = (list.url || '').toLowerCase();
+  const listSource = (list.source || (listUrl.includes('mdblist') ? 'MDBList' : (listUrl.includes('trakt') ? 'Trakt' : (listUrl.includes('simkl') ? 'Simkl' : (listUrl.includes('themoviedb') || listUrl.startsWith('tmdb:') ? 'TMDB' : 'My Lists Addon'))))).toLowerCase();
+
+  const q = (rawQuery || '').toLowerCase().trim();
+  const targetTerm = (intent && intent.term ? intent.term : q).toLowerCase().trim();
+  const targetSource = (intent && intent.source ? intent.source : '').toLowerCase();
+
+  let score = 0;
+
+  // Source match boost
+  if (targetSource) {
+    if (listSource.includes(targetSource) || (targetSource === 'my lists addon' && (listSource.includes('my lists') || listSource.includes('profile'))) || (targetSource === 'streaming' && (listUrl.startsWith('tmdb:chart:') || listName.includes('netflix') || listName.includes('disney') || listName.includes('hbo') || listName.includes('hulu') || listName.includes('apple') || listName.includes('prime')))) {
+      score += 600;
+    }
+  }
+
+  // Pure source search (no extra keyword)
+  if (!targetTerm) {
+    if (targetSource && (listSource.includes(targetSource) || (targetSource === 'streaming' && listUrl.startsWith('tmdb:chart:')))) {
+      const likes = typeof list.likes === 'number' ? list.likes : (parseInt(list.likes, 10) || 0);
+      const items = typeof list.items === 'number' ? list.items : (parseInt(list.items, 10) || 0);
+      return score + Math.min(400, likes * 2 + items);
+    }
+    return score > 0 ? score : -1;
+  }
+
+  // Check if anything matched title, user, source, or url
+  const tokens = targetTerm.split(/\s+/).filter(Boolean);
+  let matchedTokensInName = 0;
+  let matchedTokensInUser = 0;
+  for (const token of tokens) {
+    if (listName.includes(token)) matchedTokensInName++;
+    if (listUser.includes(token)) matchedTokensInUser++;
+  }
+
+  const hasAnyMatch = (matchedTokensInName > 0 || matchedTokensInUser > 0 || listName.includes(targetTerm) || listUser.includes(targetTerm) || listSource.includes(targetTerm) || listUrl.includes(targetTerm));
+  if (!hasAnyMatch) {
+    return -1;
+  }
+
+  // 1. Exact title match
+  if (listName === targetTerm || listName === q) {
+    score += 2500;
+  } else if (listName.startsWith(targetTerm) || listName.startsWith(q)) {
+    score += 1500;
+  } else if (listName.includes(targetTerm) || listName.includes(q)) {
+    score += 900;
+  }
+
+  // 2. Exact creator match
+  if (listUser === targetTerm || listUser === q) {
+    score += 2000;
+  } else if (listUser.startsWith(targetTerm) || listUser.startsWith(q)) {
+    score += 1300;
+  } else if (listUser.includes(targetTerm) || listUser.includes(q)) {
+    score += 800;
+  }
+
+  // 3. Multi-token title & creator matching
+  if (tokens.length > 1) {
+    if (matchedTokensInName === tokens.length) {
+      score += 1000;
+    } else if (matchedTokensInName > 0) {
+      score += matchedTokensInName * 250;
+    }
+
+    if (matchedTokensInUser === tokens.length) {
+      score += 900;
+    } else if (matchedTokensInUser > 0) {
+      score += matchedTokensInUser * 200;
+    }
+  }
+
+  // 4. Word boundary matches
+  try {
+    const rx = new RegExp('\\b' + escapeRegex(targetTerm) + '\\b', 'i');
+    if (rx.test(listName)) score += 400;
+    if (rx.test(listUser)) score += 400;
+  } catch (e) {}
+
+  // 5. Source / tag matches
+  if (listSource.includes(targetTerm)) {
+    score += 300;
+  }
+
+  // 6. Popularity & item count tie-breakers
+  const likes = typeof list.likes === 'number' ? list.likes : (parseInt(list.likes, 10) || 0);
+  const items = typeof list.items === 'number' ? list.items : (parseInt(list.items, 10) || 0);
+  score += Math.min(250, Math.log10(likes + 1) * 50);
+  score += Math.min(60, Math.log10(items + 1) * 15);
+
+  return score;
+}
+
+window._unifiedSearchCache = window._unifiedSearchCache || new Map();
+let currentListSearchSequence = 0;
+
+async function executeUnifiedListSearch(rawQuery, targetBox) {
+  const q = (rawQuery || '').trim();
+  const box = targetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
+  if (!box) return;
   if (!q) {
     box.innerHTML = '';
     return;
   }
-  box.innerHTML = '<p><small>Searching\u2026</small></p>';
+
+  const thisSeq = ++currentListSearchSequence;
+  const qLower = q.toLowerCase();
+  const cacheKey = qLower;
+
+  // Check client memory cache (1-hour expiry)
+  const cached = window._unifiedSearchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.time < 3600000)) {
+    renderListSearchResults(cached.mdblistMatches, cached.traktMatches, cached.traktError, cached.myListsMatches, cached.tmdbMatches, box, cached.intent);
+    return;
+  }
+
+  if (!box.children.length) {
+    box.innerHTML = '<p><small>Searching lists\u2026</small></p>';
+  }
 
   try {
     fetch(ORIGIN + '/api/track-search', {
@@ -19444,35 +21246,66 @@ async function runListSearch() {
     }).catch(() => {});
   } catch (e) {}
 
-  const qLower = q.toLowerCase();
+  const intent = parseListSearchIntent(q);
+  const searchTerm = intent.term || q;
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  const traktKey = document.getElementById('traktKeyInput').value.trim();
+  const traktKey = (document.getElementById('traktKeyInput')?.value || '').trim();
 
-  const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
-    ensureMdblistPopularLoaded(),
-    fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
+  const fetches = [
+    ensureMdblistPopularLoaded().catch(() => []),
+    fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(searchTerm) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
       .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
-    fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
+    fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(searchTerm))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
+    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-  ]);
+  ];
 
-  const mdblistMatches = mdblistAll
-    .filter((l) => l.name.toLowerCase().includes(qLower) || l.user.toLowerCase().includes(qLower))
-    .slice(0, 30);
-  const traktMatches = traktResult.ok ? traktResult.lists.slice(0, 30) : [];
-  const myListsMatches = myListsResult.ok ? myListsResult.lists : [];
-  const tmdbMatches = tmdbResult.ok ? tmdbResult.lists : [];
+  if (intent.source === 'Trakt' || intent.isSourceOnly) {
+    fetches.push(ensureTraktPopularLoaded().catch(() => []));
+  }
 
-  renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches);
+  const [mdblistAll, traktResult, myListsResult, tmdbResult, traktPopular] = await Promise.all(fetches);
+
+  // If a newer search query was already submitted by the user while this one was running, discard this response!
+  if (thisSeq !== currentListSearchSequence) {
+    return;
+  }
+
+  const mdblistMatches = Array.isArray(mdblistAll) ? mdblistAll : [];
+  const traktMatches = [
+    ...(traktResult && traktResult.ok && Array.isArray(traktResult.lists) ? traktResult.lists : []),
+    ...(Array.isArray(traktPopular) ? traktPopular : [])
+  ];
+  const myListsMatches = myListsResult && myListsResult.ok && Array.isArray(myListsResult.lists) ? myListsResult.lists : [];
+  const tmdbMatches = tmdbResult && tmdbResult.ok && Array.isArray(tmdbResult.lists) ? tmdbResult.lists : [];
+  const traktError = traktResult && !traktResult.ok ? traktResult.error : null;
+
+  // Save to client cache
+  window._unifiedSearchCache.set(cacheKey, {
+    time: Date.now(),
+    mdblistMatches,
+    traktMatches,
+    traktError,
+    myListsMatches,
+    tmdbMatches,
+    intent,
+  });
+
+  renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, box, intent);
 }
 
-function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox) {
+async function runListSearch() {
+  const q = document.getElementById('listSearchInput').value.trim();
+  const box = document.getElementById('listSearchResult');
+  return executeUnifiedListSearch(q, box);
+}
+
+function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox, queryOrIntent) {
   let realTmdbMatches = tmdbMatches;
   let realTargetBox = targetBox;
   if (tmdbMatches && (tmdbMatches.nodeType || !Array.isArray(tmdbMatches))) {
@@ -19484,6 +21317,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
   if (!Array.isArray(realTmdbMatches)) realTmdbMatches = [];
   const box = realTargetBox || document.getElementById('listSearchResult') || document.getElementById('catalogSearchResult');
   if (!box) return;
+
   const alreadyAdded = new Set();
   document.querySelectorAll('#lists .entry').forEach((entry) => {
     const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
@@ -19492,171 +21326,173 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
     });
   });
 
-  const combinedCards = [];
+  const intent = (typeof queryOrIntent === 'object' && queryOrIntent !== null)
+    ? queryOrIntent
+    : parseListSearchIntent(typeof queryOrIntent === 'string' ? queryOrIntent : '');
 
-  // Build one .list-card per TMDB collection / chart result
+  const candidates = [];
+
+  // TMDB / Simkl matches
   realTmdbMatches.forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span style="color:var(--brand); font-weight:600;">' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + typeLabel + '</span>' +
-      (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + escapeHtml(l.items) + '</span>' : '') +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '" data-creator="' + escapeAttr(l.user || 'TMDB') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: 50, html: cardHtml });
+    if (!l || !l.url) return;
+    const source = l.source || (l.url.startsWith('simkl:') ? 'Simkl' : 'TMDB');
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || (source === 'Simkl' ? 'Simkl Official' : 'TMDB Official'),
+      url: l.url,
+      type: l.type || 'movie',
+      items: l.items || (source === 'Simkl' ? 'Simkl Chart' : 'Franchise'),
+      likes: l.likes || 0,
+      source: source,
+      isCollection: !!l.isCollection,
+    });
   });
 
-  // Build one .list-card per mdblist result
-  mdblistMatches.forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
-    const cardHtml = '<div class="list-card" data-list-type="' + l.type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.type) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + typeLabel + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.type + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
+  // MDBList matches
+  (mdblistMatches || []).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || 'MDBList Curator',
+      url: l.url,
+      type: l.type || 'movie',
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'MDBList',
+    });
   });
 
-  // Build one .list-card per Trakt result
-  traktMatches.forEach((l) => {
-    const addedMovie = alreadyAdded.has(l.url + '|movie');
-    const addedSeries = alreadyAdded.has(l.url + '|series');
-    const viewType = (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : 'movie';
-    const alreadyLikedExt = getLikedListsSet().has(l.url);
-    // Determine the card's data-list-type for chip filtering
-    const cardType = (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : 'mixed';
+  // Trakt matches
+  (traktMatches || []).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.user || 'Trakt User',
+      slug: l.slug,
+      url: l.url,
+      type: (l.contentType === 'movie' || l.contentType === 'series') ? l.contentType : (l.type || 'mixed'),
+      contentType: l.contentType,
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'Trakt',
+    });
+  });
 
-    let addBtns;
-    if (l.contentType === 'movie' || l.contentType === 'series') {
-      const added = l.contentType === 'movie' ? addedMovie : addedSeries;
-      addBtns = '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-        (added ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + l.contentType + '">' +
-        (added ? 'Remove' : '+ Add') + '</button>';
-    } else {
-      addBtns =
-        '<button type="button" class="lc-btn ' + (addedMovie ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+  // My Lists Addon matches
+  (myListsMatches || []).filter((l) => l && (l.items || 0) > 0).forEach((l) => {
+    if (!l || !l.url) return;
+    candidates.push({
+      name: l.name || 'Unnamed List',
+      user: l.creatorName || l.username || 'Anonymous',
+      creatorName: l.creatorName,
+      username: l.username,
+      url: l.url,
+      type: l.type || 'mixed',
+      items: l.items || 0,
+      likes: l.likes || 0,
+      source: 'My Lists Addon',
+    });
+  });
+
+  const seenUrls = new Set();
+  const scoredCards = [];
+
+  for (const item of candidates) {
+    const normUrl = item.url.trim().toLowerCase().replace(new RegExp('/+$'), '');
+    if (seenUrls.has(normUrl)) continue;
+    seenUrls.add(normUrl);
+
+    const matchScore = (intent && intent.raw) ? scoreListSearchMatch(item, intent.raw, intent) : (item.likes || 0);
+    if (intent && intent.raw && matchScore < 0) continue;
+
+    const addedMovie = alreadyAdded.has(item.url + '|movie');
+    const addedSeries = alreadyAdded.has(item.url + '|series');
+    const addedDirect = alreadyAdded.has(item.url + '|' + item.type);
+    const alreadyLikedExt = getLikedListsSet().has(item.url);
+
+    let usernameSlug = '';
+    if (item.source === 'My Lists Addon' || item.source === 'Profile') {
+      try {
+        const parts = (item.url || '').split('/lists/')[1]?.split('/');
+        if (parts && parts.length >= 2) usernameSlug = parts[0] + '/' + parts[1];
+      } catch (e) {}
+    }
+    const alreadyLikedProfile = usernameSlug && getLikedListsSet().has(usernameSlug);
+
+    const typeLabel = item.type === 'series' ? 'Shows' : (item.type === 'mixed' ? 'Movies & Shows' : 'Movies');
+    const slotType = (item.type === 'movie' || item.type === 'series') ? item.type : 'mixed';
+
+    let badgeClass = 'badge-custom';
+    if (item.source === 'MDBList') badgeClass = 'badge-mdblist';
+    else if (item.source === 'Trakt') badgeClass = 'badge-trakt';
+    else if (item.source === 'TMDB') badgeClass = 'badge-tmdb';
+    else if (item.source === 'Simkl') badgeClass = 'badge-simkl';
+    else if (item.source === 'My Lists Addon' || item.source === 'Profile') badgeClass = 'badge-mylists';
+    else if (item.source === 'Streaming') badgeClass = 'badge-streaming';
+
+    const sourceBadgeHtml = '<span class="list-source-badge ' + badgeClass + '">' + escapeHtml(item.source === 'Profile' ? 'My Lists Addon' : item.source) + '</span>';
+
+    let actionsHtml = '';
+    if ((item.source === 'My Lists Addon' || item.source === 'Profile') && usernameSlug) {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829; Unlike' : '&#9825; Like') + '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+        (addedDirect ? 'style="color:var(--danger);"' : '') +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + (item.type || 'movie') + '">' +
+        (addedDirect ? 'Remove' : '+ Add') +
+        '</button>';
+    } else if (item.source === 'Trakt' && item.contentType === 'unknown') {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
+        (alreadyLikedExt ? '&#9829;' : '&#9825;') +
+        '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedMovie ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedMovie ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="movie">' +
         (addedMovie ? 'Remove (Movies)' : '+ Movies') + '</button>' +
         '<button type="button" class="lc-btn ' + (addedSeries ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedSeries ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="series">' +
         (addedSeries ? 'Remove (Shows)' : '+ Shows') + '</button>';
+    } else {
+      actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
+        (alreadyLikedExt ? '&#9829;' : '&#9825;') +
+        '</button>';
+      actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
+        (addedDirect ? 'style="color:var(--danger);"' : '') +
+        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(item.type || 'movie') + '">' +
+        (addedDirect ? 'Remove' : '+ Add') +
+        '</button>';
     }
 
-    const cardHtml = '<div class="list-card" data-list-type="' + cardType + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(viewType) + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
-      '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
-      '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.user) + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-actions">' +
-      '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-      (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-      '</button>' +
-      addBtns +
-      '</div>' +
-      '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' +
-      (l.contentType === 'movie' || l.contentType === 'series' ? l.contentType : 'movie') + '" data-creator="' + escapeAttr(l.user || '') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
-      '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
-  });
+    const creatorLabel = item.user ? (item.user.includes('Official') || item.user.includes('Franchise') ? escapeHtml(item.user) : 'by ' + escapeHtml(item.user)) : '';
+    const itemCountLabel = typeof item.items === 'number' ? (item.items + ' items') : (item.items ? escapeHtml(String(item.items)) : '');
 
-  // My Lists results (exclude lists with 0 items)
-  (myListsMatches || []).filter((l) => l && (l.items || 0) > 0).forEach((l) => {
-    const added = alreadyAdded.has(l.url + '|' + l.type);
-    let usernameSlug = '';
-    try {
-      const parts = (l.url || '').split('/lists/')[1]?.split('/');
-      if (parts && parts.length >= 2) usernameSlug = parts[0] + '/' + parts[1];
-    } catch (e) {}
-    const alreadyLiked = usernameSlug && getLikedListsSet().has(usernameSlug);
-    const typeLabel = l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Movies & Shows' : 'Movies');
-    const slotType = (l.type === 'movie' || l.type === 'series') ? l.type : 'mixed';
-    const cardHtml = '<div class="list-card" data-list-type="' + (l.type || 'mixed') + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(l.creatorName || 'Anonymous') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
+    const cardHtml = '<div class="list-card" data-list-type="' + escapeAttr(item.type || 'mixed') + '" data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(item.user || '') + '" data-items="' + escapeAttr(item.items || '') + '" data-likes="' + escapeAttr(item.likes || 0) + '" data-source="' + escapeAttr(item.source) + '">' +
       '<div class="list-card-header">' +
       '<div class="list-card-body">' +
-      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+      '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + sourceBadgeHtml + escapeHtml(item.name) + '</div>' +
       '<div class="list-card-meta">' +
-      '<span>by ' + escapeHtml(l.creatorName || 'Anonymous') + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
+      (creatorLabel ? '<span>' + creatorLabel + '</span>' : '') +
+      (creatorLabel ? '<span class="list-card-meta-sep">&middot;</span>' : '') +
       '<span>' + typeLabel + '</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span>' + l.items + ' items</span>' +
-      '<span class="list-card-meta-sep">&middot;</span>' +
-      '<span class="list-card-likes like-count">&#9829; <span class="like-num">' + (l.likes || 0) + '</span></span>' +
+      (itemCountLabel ? '<span class="list-card-meta-sep">&middot;</span><span>' + itemCountLabel + '</span>' : '') +
+      (item.likes !== undefined ? '<span class="list-card-meta-sep">&middot;</span><span class="list-card-likes like-count">&#9829; <span class="like-num">' + (item.likes || 0) + '</span></span>' : '') +
       '</div>' +
       '</div>' +
       '<div class="list-card-actions">' +
-      (usernameSlug ? '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLiked ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLiked ? '&#9829; Unlike' : '&#9825; Like') + '</button>' : '') +
-      '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-      (added ? 'style="color:var(--danger);"' : '') +
-      ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (l.type || 'movie') + '">' +
-      (added ? 'Remove' : '+ Add') +
-      '</button>' +
+      actionsHtml +
       '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(l.creatorName || 'Anonymous') + '" data-items="' + escapeAttr(l.items || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(slotType) + '" data-creator="' + escapeAttr(item.user || '') + '" data-items="' + escapeAttr(item.items || '') + '" data-likes="' + escapeAttr(item.likes || 0) + '"></div>' +
       '</div>';
-    combinedCards.push({ likes: l.likes || 0, html: cardHtml });
-  });
 
-  combinedCards.sort((a, b) => b.likes - a.likes);
-  let html = combinedCards.map(c => c.html).join('');
-  
-  if (combinedCards.length === 0) {
+    scoredCards.push({ score: matchScore, html: cardHtml });
+  }
+
+  scoredCards.sort((a, b) => b.score - a.score);
+  const topCards = scoredCards.slice(0, 30);
+  let html = topCards.map(c => c.html).join('');
+
+  if (topCards.length === 0) {
     html = '<p style="color:var(--muted); font-size:0.9rem; padding:8px 0;"><small>No lists match that search.</small></p>';
   }
   if (traktError) {
@@ -19675,9 +21511,7 @@ async function populateSearchResultPosters() {
   const slots = [...document.querySelectorAll('.poster-preview-slot')];
   let idx = 0;
   const CONCURRENCY = 5;
-  // Fetches one /api/preview call for a single declared type -- split out
-  // so a mixed-content list (see fetchPreviewForSlot below) can fire two
-  // of these in parallel instead of duplicating the request logic.
+
   async function fetchPreviewOnce(listUrl, type) {
     const payload = { url: listUrl, type: type, sample: 12 };
     const mkInput = document.getElementById('mdblistKeyInput');
@@ -19695,24 +21529,23 @@ async function populateSearchResultPosters() {
     if (smkToken) payload.simklAccessToken = smkToken;
     const skInput = document.getElementById('simklKeyInput');
     payload.simklKey = (skInput && skInput.value ? skInput.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
-    const res = await fetch(ORIGIN + '/api/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      cache: 'no-store',
-    });
-    if (!res.ok) return { ok: false };
-    const ct = res.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) return { ok: false };
-    return await res.json();
+    
+    try {
+      const res = await fetch(ORIGIN + '/api/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+      });
+      if (!res.ok) return { ok: false };
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) return { ok: false };
+      return await res.json();
+    } catch (e) {
+      return { ok: false };
+    }
   }
-  // A list card that mixes movies and shows (MDBList/Trakt lists don't
-  // have to be one or the other) gets marked data-type="mixed" by its
-  // render function rather than being forced to either type -- /api/preview
-  // itself only ever answers for one declared type per call (movie or
-  // series, see its own coercion), so a single request here would only
-  // ever surface that list's movies and leave a TV-heavy or TV-only list
-  // showing no posters at all. Two parallel requests, merged, covers both.
+
   async function fetchPreviewForSlot(listUrl, type) {
     if (type !== 'mixed') {
       return fetchPreviewOnce(listUrl, type);
@@ -19726,10 +21559,6 @@ async function populateSearchResultPosters() {
     if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
     const movieSample = movieOk ? (movieResult.sample || []) : [];
     const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
-    // Interleaved rather than movies-then-shows, so a list that's mostly
-    // one type still shows a representative mix in the first few tiles
-    // rather than, say, nine movie posters and zero show posters just
-    // because movies happened to be fetched first.
     const merged = [];
     const maxLen = Math.max(movieSample.length, seriesSample.length);
     for (let i = 0; i < maxLen; i++) {
@@ -19742,17 +21571,13 @@ async function populateSearchResultPosters() {
       count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
     };
   }
+
   async function worker() {
     while (idx < slots.length) {
       const slot = slots[idx++];
+      if (!slot) continue;
       const listUrl = slot.dataset.url;
       const type = slot.dataset.type || 'movie';
-      // Falls back to the url only if a card genuinely has no name to give
-      // (shouldn't happen in practice -- every current caller sets
-      // data-name alongside data-url) rather than always preferring the
-      // url, which is what put a raw "tmdb:top10:netflix"-style internal
-      // source string in the See All modal's title instead of an actual
-      // display name.
       const listName = slot.dataset.name || listUrl;
       const parentCard = slot.closest('.list-card');
       const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
@@ -19767,8 +21592,6 @@ async function populateSearchResultPosters() {
             const totalCount = cardItems || data.count || (validPosters.length * 10);
             const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
             const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
-            const isTmdbSlot = !!slot.closest('#myTmdbListsResult');
-            const isSimklSlot = !!slot.closest('#mySimklListsResult');
 
             let inner = '';
             validPosters.forEach((s, i) => {
@@ -19811,12 +21634,11 @@ async function populateSearchResultPosters() {
             slot.innerHTML = inner;
           }
         }
-      } catch (e) {
-        // Posters are a nice-to-have here
-      }
+      } catch (e) {}
     }
   }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker()));
+
+  Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
 function getLikedListsSet() {
@@ -20282,6 +22104,19 @@ async function loadCuratedListsFeed(forceRefresh) {
     const publicListsPool = [...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
     let sectionsHtml = '';
 
+    // Keep a copy of exactly what these two cards are about to render, so
+    // the catalog row for the same list can serve the same items rather
+    // than re-deriving its own. fetchCuratedCatalog (05_catalog-core.js)
+    // can only see server-side tracking data, while these cards are built
+    // from this browser's whole picture -- Continue Watching, Watch
+    // History, Watchlist and every other custom list -- so re-deriving
+    // could never land on the same 40 items. pushTrackingSync
+    // (22_client-creator-profile.js) carries this up alongside Airing
+    // Next, which is a snapshot for exactly the same reason.
+    if (typeof persistCuratedRecommendations === 'function' && recData && recData.ok) {
+      persistCuratedRecommendations(recData.movies, recData.shows);
+    }
+
     // Section A: Recommended Movies List
     if (recData && recData.ok && recData.movies && recData.movies.length) {
       sectionsHtml += buildCuratedRecommendationCard('Recommended Movies', 'movie', 'custom:curated:recommended-movies', 'Based on your movie watch history & watchlist', recData.movies);
@@ -20531,33 +22366,30 @@ function render5PosterListsFeed(container, lists) {
 // --- Clickable Posters & Add to List Modal Logic ---
 document.addEventListener('click', async (e) => {
   const addOverlayBtn = e.target.closest('.poster-add-overlay');
-  const posterEl = addOverlayBtn ? addOverlayBtn.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-img-wrap, .list-card-mini-poster-tile') : e.target.closest('.clickable-poster');
+  const posterEl = addOverlayBtn ? addOverlayBtn.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-img-wrap, .list-card-mini-poster-tile') : e.target.closest('.clickable-poster, .live-preview-poster-card, .list-card-mini-poster-tile, .list-card-mini-poster-img-wrap');
   
   if (addOverlayBtn && posterEl) {
     e.stopPropagation(); // prevent opening the details modal
-    const id = posterEl.dataset.id || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.id) || '';
-    const type = posterEl.dataset.type || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.type) || 'movie';
-    const title = posterEl.dataset.title || (posterEl.querySelector('.clickable-poster') && posterEl.querySelector('.clickable-poster').dataset.title) || '';
-    const poster = posterEl.dataset.poster || (posterEl.querySelector('img') && posterEl.querySelector('img').src) || '';
+    const clickEl = posterEl.matches('.clickable-poster') ? posterEl : (posterEl.querySelector('.clickable-poster') || posterEl);
+    let id = clickEl.dataset.id || posterEl.dataset.id || '';
+    if (id && id.startsWith('tt') && id.includes(':')) id = id.split(':')[0];
+    const type = clickEl.dataset.type || posterEl.dataset.type || 'movie';
+    const title = clickEl.dataset.title || posterEl.dataset.title || '';
+    const poster = clickEl.dataset.poster || posterEl.dataset.poster || (posterEl.querySelector('img') && posterEl.querySelector('img').src) || '';
     openSelectListModal(id, type, title, poster);
     return;
   }
   
-  if (posterEl && !e.target.closest('.searchViewListBtn, .curatedViewBtn, .list-card-count-overlay, .creatorListViewBtn, .discover-chart-seeall')) {
-    // Posters clicked from inside a "See All" overlay (either kind -- the
-    // Discover tab's chart overlay, or the Catalogs/Shelves Live Preview's
-    // showModal()-based one) share this same handler, but opening item
-    // details only ever switches to the item-details tab underneath --
-    // neither overlay is a tab panel, so nothing was ever telling them to
-    // close, and they stayed sitting on top of the item details page that
-    // had just opened behind them. Closing both here is harmless when
-    // neither is actually open (closeDetailOverlay/closeModal are already
-    // no-ops in that case), so this covers every current and future
-    // "click a poster from inside an overlay" spot without needing to
-    // special-case each overlay's own trigger.
+  if (posterEl && !e.target.closest('.searchViewListBtn, .curatedViewBtn, .list-card-count-overlay, .creatorListViewBtn, .discover-chart-seeall, .cw-remove-btn')) {
     closeDetailOverlay();
     closeModal();
-    openItemDetailsModal(posterEl.dataset.id, posterEl.dataset.type);
+    const clickEl = posterEl.matches('.clickable-poster') ? posterEl : (posterEl.querySelector('.clickable-poster') || posterEl);
+    let id = clickEl.dataset.id || posterEl.dataset.id || '';
+    if (id && id.startsWith('tt') && id.includes(':')) id = id.split(':')[0];
+    const type = clickEl.dataset.type || posterEl.dataset.type || 'movie';
+    if (id) {
+      openItemDetailsModal(id, type);
+    }
     return;
   }
 });
@@ -20581,8 +22413,8 @@ function isEpisodeAired(ep) {
   if (isNaN(airDate.getTime())) return false;
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  // If airDate is on or before today, the episode has already aired
-  return airDate.getTime() <= today.getTime();
+  // If airDate is before today, the episode has already aired (same-day airs today)
+  return airDate.getTime() < today.getTime();
 }
 
 function formatAirDateBadge(airDateStr) {
@@ -20600,8 +22432,9 @@ function formatAirDateBadge(airDateStr) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const diffDays = Math.round((d.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
 
-  // If already aired or airs today, no upcoming badge is shown
-  if (diffDays <= 0) return '';
+  // If already aired before today, no upcoming badge is shown
+  if (diffDays < 0) return '';
+  if (diffDays === 0) return 'Today';
   if (diffDays === 1) return 'Tomorrow';
   if (diffDays > 1 && diffDays < 7) {
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -20628,7 +22461,30 @@ function openEpisodeDetails(epNum) {
   if (ep.vote_average) infoHtml += '<div style="margin-bottom:6px;">\u2605 ' + escapeHtml(Number(ep.vote_average).toFixed(1)) + ' TMDB</div>';
   
   window._currentEpisodeDetails = ep;
-  const isWatched = window._watchedItemIds && window._watchedItemIds.has(String(ep.id));
+  
+  let isWatched = window._watchedItemIds && window._watchedItemIds.has(String(ep.id));
+  if (!isWatched && window._watchedItemIds) {
+    const d = window._currentItemDetails;
+    if (d && ep.season_number != null && ep.episode_number != null) {
+      if (d.id && window._watchedItemIds.has(d.id + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+      if (d.tmdbId && window._watchedItemIds.has('tmdb:' + d.tmdbId + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+      if (d.title && window._watchedItemIds.has(d.title + ':' + ep.season_number + ':' + ep.episode_number)) isWatched = true;
+    }
+  }
+  if (!isWatched && Array.isArray(window._rawWatchHistoryItems)) {
+    const d = window._currentItemDetails;
+    const epNum = Number(ep.episode_number);
+    const sNum = Number(ep.season_number);
+    isWatched = window._rawWatchHistoryItems.some((it) => {
+      if (!it || it.type !== 'episode') return false;
+      if (String(it.id) === String(ep.id)) return true;
+      if (Number(it.seasonNum) === sNum && Number(it.episodeNum) === epNum) {
+        if (d && d.id && (String(it.showId) === String(d.id) || String(it.showId) === ('tmdb:' + d.tmdbId))) return true;
+        if (d && d.title && (it.showTitle === d.title || String(it.showId) === d.title)) return true;
+      }
+      return false;
+    });
+  }
   const innerHtml = 
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
@@ -20672,23 +22528,73 @@ window.openSelectListModalFromItemModal = function() {
 
 function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   if (!showId || seasonNum == null) return false;
-  if (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(showId))) {
-    return true;
+  const sNum = Number(seasonNum);
+  const d = window._currentItemDetails;
+  const showIdsToCheck = new Set([
+    String(showId),
+    String(showId).startsWith('tmdb:') ? String(showId).slice(5) : ('tmdb:' + String(showId)),
+    (d && d.id) ? String(d.id) : null,
+    (d && d.id && String(d.id).startsWith('tmdb:')) ? String(d.id).slice(5) : (d && d.id ? ('tmdb:' + String(d.id)) : null),
+    (d && d.imdbId) ? String(d.imdbId) : null,
+    (d && d.tmdbId) ? String(d.tmdbId) : null,
+    (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
+  ].filter(Boolean));
+
+  if (window._fullyWatchedShowIds) {
+    for (const sid of showIdsToCheck) {
+      if (window._fullyWatchedShowIds.has(sid)) return true;
+    }
   }
+
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
     if (!hist || !Array.isArray(hist.items)) return false;
-    const cleanShowId = String(showId);
-    const watchedEps = hist.items.filter((it) => it && it.type === 'episode' && String(it.showId) === cleanShowId && Number(it.seasonNum) === Number(seasonNum));
-    if (episodeCount && episodeCount > 0) {
-      return watchedEps.length >= episodeCount;
+
+    const watchedEps = hist.items.filter((it) => {
+      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return false;
+      if (it.showId && showIdsToCheck.has(String(it.showId))) return true;
+      if (d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase()) return true;
+      return false;
+    });
+
+    const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
+
+    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
+      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
+      if (aired.length > 0) return distinctEps.size >= aired.length;
     }
-    return watchedEps.length > 0;
+
+    if (episodeCount && episodeCount > 0) {
+      return distinctEps.size >= episodeCount;
+    }
+    return distinctEps.size > 0;
   } catch (e) {
     return false;
   }
 }
+window.isSeasonFullyWatched = isSeasonFullyWatched;
+
+function updateSeasonWatchedButton(seasonNum) {
+  const d = window._currentItemDetails;
+  if (!d) return;
+  const sNum = Number(seasonNum);
+  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum);
+  const epCount = seasonMeta ? seasonMeta.episode_count : 0;
+  const isWatched = isSeasonFullyWatched(d.id, sNum, epCount);
+  document.querySelectorAll('.btn-mark-season-watched[data-season="' + sNum + '"]').forEach(btn => {
+    if (isWatched) {
+      btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
+      btn.classList.remove('primary');
+      btn.classList.add('secondary');
+    } else {
+      btn.innerHTML = 'Mark Season Watched';
+      btn.classList.remove('secondary');
+      btn.classList.add('primary');
+    }
+  });
+}
+window.updateSeasonWatchedButton = updateSeasonWatchedButton;
 
 window.markSeasonWatched = async function(seasonNum, btn) {
   const d = window._currentItemDetails;
@@ -20934,7 +22840,7 @@ async function openItemDetailsModal(id, type, opts) {
                 '</div>' +
               '</div>' +
               '<div class="season-header-actions">' +
-                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
+                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" data-season="' + season.season_number + '" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
                   (isSeasonWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched' : 'Mark Season Watched') +
                 '</button>' +
               '</div>' +
@@ -21008,13 +22914,16 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     const data = await res.json();
     if (!data.ok || !data.season || !data.season.episodes) throw new Error(data.error || 'Failed to load season');
     
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+    
     let epsHtml = '';
     if (!window._episodeDataCache) window._episodeDataCache = {};
     data.season.episodes.forEach(ep => {
       window._episodeDataCache[ep.episode_number] = ep;
       const still = ep.still_path ? escapeAttr(ep.still_path) : '';
       epsHtml += 
-        '<div class="clickable-episode" data-id="' + ep.id + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
+        '<div class="clickable-episode" data-id="' + ep.id + '" data-season="' + seasonNum + '" data-episode="' + ep.episode_number + '" data-show-id="' + escapeAttr(imdbId || '') + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
           '<div style="width:100%; aspect-ratio:16/9; background:#222; border-radius:6px; overflow:hidden; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4);">' +
             (still ? '<img src="' + still + '" style="width:100%; height:100%; object-fit:cover;">' : '') +
             '<div style="position:absolute; bottom:4px; left:4px; background:rgba(0,0,0,0.8); color:var(--brand); padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem;">E' + ep.episode_number + '</div>' +
@@ -21023,6 +22932,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
         '</div>';
     });
     grid.innerHTML = epsHtml || '<div style="grid-column: 1 / -1; color:var(--muted);">No episodes found.</div>';
+    if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(seasonNum);
   } catch (err) {
     grid.innerHTML = '<div style="grid-column: 1 / -1; color:red;">Error loading episodes.</div>';
   }
@@ -21176,6 +23086,7 @@ function openSelectListModal(id, type, title, poster) {
 
   // 1. Custom Lists (local & creator)
   const customLists = [];
+  const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   document.querySelectorAll('#lists .entry').forEach(row => {
     const urlInput = row.querySelector('.url');
     if (urlInput && urlInput.value.startsWith('customlist:v1:')) {
@@ -21185,6 +23096,14 @@ function openSelectListModal(id, type, title, poster) {
         if (payload.localSlug === 'airing-next' || payload.localSlug === 'watch-history' || payload.localSlug === 'continue-watching') return;
         if (payload.creatorSlug === 'airing-next' || payload.creatorSlug === 'watch-history' || payload.creatorSlug === 'continue-watching') return;
         if (payload.type && payload.type !== 'mixed' && payload.type !== type) return;
+        const slug = payload.localSlug || payload.creatorSlug || payload.listSlug;
+        const localList = slug ? localMap[slug] : null;
+        const serverList = (slug && typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) ? lastCreatorListsData.find(l => l && l.slug === slug) : null;
+        const liveItems = (serverList && Array.isArray(serverList.items)) ? serverList.items : ((localList && Array.isArray(localList.items)) ? localList.items : null);
+        if (liveItems && liveItems.length >= (payload.items || []).length) {
+          payload.items = liveItems.slice();
+          urlInput.value = 'customlist:v1:' + JSON.stringify(payload);
+        }
         const nameInput = row.querySelector('.name');
         customLists.push({
           name: nameInput ? nameInput.value : (payload.listName || 'Unnamed List'),
@@ -21196,7 +23115,6 @@ function openSelectListModal(id, type, title, poster) {
   });
 
   try {
-    const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     Object.keys(localMap).forEach(slug => {
       if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'airing-next') return;
       const l = localMap[slug];
@@ -21222,7 +23140,7 @@ function openSelectListModal(id, type, title, poster) {
       if (!existing) {
         customLists.push({
           name: l.name || 'Custom List',
-          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), creatorSlug: l.slug, type: l.type || 'mixed', items: l.items || [], shuffle: false, visibility: l.visibility || 'private' }),
+          url: 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), creatorSlug: l.slug, creatorOwner: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : undefined, type: l.type || 'mixed', items: l.items || [], shuffle: false, visibility: l.visibility || 'private' }),
           row: null
         });
       }
@@ -21732,6 +23650,17 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     }
     if (!payload) return false;
     if (!Array.isArray(payload.items)) payload.items = [];
+
+    const targetSlug = payload.localSlug || payload.creatorSlug || payload.listSlug || '';
+    if (targetSlug) {
+      const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      const localList = localMap[targetSlug];
+      const serverList = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) ? lastCreatorListsData.find(l => l && l.slug === targetSlug) : null;
+      const liveItems = (serverList && Array.isArray(serverList.items)) ? serverList.items : ((localList && Array.isArray(localList.items)) ? localList.items : null);
+      if (liveItems && liveItems.length >= payload.items.length) {
+        payload.items = liveItems.slice();
+      }
+    }
     
     // Check for existing items using imdbId or originalId
     const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
@@ -21801,6 +23730,16 @@ async function syncCustomListPayload(payload, name) {
     const creatorName = localStorage.getItem('myListAddon:creatorName');
     if (creatorKey && creatorName && name) {
       try {
+        const creatorListMeta = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData))
+          ? lastCreatorListsData.find((l) => l.slug === payload.creatorSlug)
+          : null;
+        const finalType = (creatorListMeta && creatorListMeta.type) ? creatorListMeta.type : (payload.type || 'movie');
+        let combinedItems = payload.items;
+        if (finalType === 'mixed' && creatorListMeta && Array.isArray(creatorListMeta.items)) {
+          const currentIds = new Set((payload.items || []).map(it => it.imdbId || it.id));
+          const otherItems = creatorListMeta.items.filter(it => !currentIds.has(it.imdbId || it.id));
+          combinedItems = (payload.items || []).concat(otherItems);
+        }
         const res = await fetch(ORIGIN + '/api/creator/lists/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -21808,33 +23747,50 @@ async function syncCustomListPayload(payload, name) {
             creatorName: creatorName,
             creatorKey: creatorKey,
             slug: payload.creatorSlug,
-            name: name,
-            type: payload.type,
-            items: payload.items,
-            visibility: payload.visibility || 'private'
+            name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+            type: finalType,
+            items: combinedItems,
+            visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private')
           })
         });
         const data = await res.json();
-        if (data.ok && typeof renderCreatorDashboard === 'function') {
-          renderCreatorDashboard({ silent: true });
+        if (data.ok) {
+          if (creatorListMeta) {
+            creatorListMeta.items = combinedItems;
+            creatorListMeta.itemCount = combinedItems.length;
+          }
+          if (typeof renderCreatorDashboard === 'function') {
+            renderCreatorDashboard({ silent: true });
+          }
         }
+        payload.items = combinedItems;
+        payload.type = finalType;
       } catch(e) {}
     }
   }
   if (payload.localSlug && !isWatchlist) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
       const map = loadLocalCustomLists();
-      if (map[payload.localSlug]) {
-        map[payload.localSlug].items = payload.items;
-        map[payload.localSlug].updatedAt = Date.now();
+      const existing = map[payload.localSlug];
+      const finalType = (existing && existing.type) ? existing.type : (payload.type || 'movie');
+      let combinedItems = payload.items;
+      if (finalType === 'mixed' && existing && Array.isArray(existing.items)) {
+        const currentIds = new Set((payload.items || []).map(it => it.imdbId || it.id));
+        const otherItems = existing.items.filter(it => !currentIds.has(it.imdbId || it.id));
+        combinedItems = (payload.items || []).concat(otherItems);
+      }
+      if (existing) {
+        existing.items = combinedItems;
+        existing.type = finalType;
+        existing.updatedAt = Date.now();
         saveLocalCustomListsMap(map);
       } else {
         map[payload.localSlug] = {
           slug: payload.localSlug,
-          name: name || payload.localSlug,
-          type: payload.type || 'mixed',
+          name: (name || payload.localSlug).replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+          type: finalType,
           isWatchlist: payload.localSlug === 'watchlist',
-          items: payload.items,
+          items: combinedItems,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -21842,7 +23798,14 @@ async function syncCustomListPayload(payload, name) {
       }
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      payload.items = combinedItems;
+      payload.type = finalType;
     }
+  }
+
+  const slug = payload.localSlug || payload.creatorSlug || payload.listSlug || payload.slug;
+  if (slug && typeof syncCustomListToCatalogRows === 'function') {
+    syncCustomListToCatalogRows(slug, payload.items, name, payload.type);
   }
 }
 
@@ -22007,15 +23970,14 @@ async function renderDefaultCatalogSearch() {
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
-      const res = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' });
-      const data = await res.json();
+      const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
       if (inputEl && inputEl.value.trim()) return;
-      if (!data.ok || !data.lists || !data.lists.length) {
-        resEl.innerHTML = '<p><small>No public lists available yet.</small></p>';
+      const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
+      if (!pubLists.length) {
+        resEl.innerHTML = '<p><small>No published My Lists Addon lists available yet.</small></p>';
         return;
       }
-      const top20 = data.lists.slice(0, 20);
-      renderListSearchResults([], [], null, top20, [], resEl);
+      renderListSearchResults([], [], null, pubLists, [], resEl);
     } catch (e) {
       resEl.innerHTML = '<p class="testresult err">✗ Could not load public lists.</p>';
     }
@@ -22044,6 +24006,11 @@ async function runCatalogSearch() {
     renderDefaultCatalogSearch();
     return;
   }
+
+  if (currentCatalogSearchType === 'lists') {
+    return executeUnifiedListSearch(q, resEl);
+  }
+
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -22054,40 +24021,6 @@ async function runCatalogSearch() {
       keepalive: true,
     }).catch(() => {});
   } catch (e) {}
-
-  if (currentCatalogSearchType === 'lists') {
-    const qLower = q.toLowerCase();
-    const tkInput = document.getElementById('tmdbKeyInput');
-    const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-    const traktKey = (document.getElementById('traktKeyInput')?.value || '').trim();
-    try {
-      const [mdblistAll, traktResult, myListsResult, tmdbResult] = await Promise.all([
-        ensureMdblistPopularLoaded(),
-        fetch(ORIGIN + '/api/trakt-search?q=' + encodeURIComponent(q) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : ''), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, error: 'Could not search trakt.tv.' }))
-          .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
-        fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(q), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
-          .catch(() => ({ ok: false, lists: [] })),
-        fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(q) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''), { cache: 'no-store' })
-          .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
-          .catch(() => ({ ok: false, lists: [] })),
-      ]);
-
-      const mdblistMatches = mdblistAll
-        .filter((l) => l.name.toLowerCase().includes(qLower) || (l.user && l.user.toLowerCase().includes(qLower)))
-        .slice(0, 30);
-      const traktMatches = traktResult.ok ? (traktResult.lists || []).slice(0, 30) : [];
-      const myListsMatches = myListsResult.ok ? (myListsResult.lists || []) : [];
-      const tmdbMatches = tmdbResult.ok ? (tmdbResult.lists || []) : [];
-
-      renderListSearchResults(mdblistMatches, traktMatches, traktResult.ok ? null : traktResult.error, myListsMatches, tmdbMatches, resEl);
-      return;
-    } catch (e) {
-      resEl.innerHTML = '<p class="testresult err">✗ Network error searching lists.</p>';
-      return;
-    }
-  }
 
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
@@ -22918,6 +24851,7 @@ function renderChannelPosterPicker() {
   });
 
   grid.innerHTML = html;
+  if (typeof syncChannelPosterUrlInput === 'function') syncChannelPosterUrlInput();
 }
 
 function selectChannelPoster(posterUrl, backdropUrl) {
@@ -22934,6 +24868,105 @@ function selectChannelPoster(posterUrl, backdropUrl) {
       card.classList.remove('selected');
     }
   });
+  // Clear URL input if a grid card was chosen
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  if (urlInput) urlInput.value = '';
+  if (preview) preview.style.display = 'none';
+}
+
+function applyChannelPosterUrl() {
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  const previewImg = document.getElementById('channelPosterUrlImg');
+  const status = document.getElementById('channelPosterUrlStatus');
+  if (!urlInput) return;
+
+  const raw = urlInput.value.trim();
+  if (!raw) return;
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (_) {
+    if (status) { status.textContent = 'Invalid URL \u2014 please enter a full URL starting with https://'; status.style.color = 'var(--err, #ff453a)'; }
+    if (preview) preview.style.display = 'flex';
+    if (previewImg) previewImg.style.display = 'none';
+    return;
+  }
+
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    if (status) { status.textContent = 'Only http:// or https:// URLs are supported.'; status.style.color = 'var(--err, #ff453a)'; }
+    if (preview) preview.style.display = 'flex';
+    if (previewImg) previewImg.style.display = 'none';
+    return;
+  }
+
+  // Apply the URL immediately — don't wait for the preview to load
+  channelDraftPoster = url.href;
+  channelDraftBackdrop = null;
+  const cards = document.querySelectorAll('#channelPosterChoicesGrid .channel-poster-choice');
+  cards.forEach((card) => card.classList.remove('selected'));
+
+  if (status) { status.textContent = 'Poster URL applied \u2713 (preview loading\u2026)'; status.style.color = 'var(--success, #30d158)'; }
+  if (preview) preview.style.display = 'flex';
+
+  if (previewImg) {
+    previewImg.style.display = 'none';
+
+    let settled = false;
+
+    const settle = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (ok) {
+        previewImg.style.display = '';
+        if (status) { status.textContent = 'Poster URL applied \u2713'; status.style.color = 'var(--success, #30d158)'; }
+      } else {
+        previewImg.style.display = 'none';
+        if (status) {
+          status.textContent = 'URL applied \u2713 (preview unavailable \u2014 the image may have hotlink protection, but it will still be used as the poster)';
+          status.style.color = 'var(--muted)';
+        }
+      }
+    };
+
+    previewImg.onerror = () => settle(false);
+    previewImg.onload = () => settle(true);
+
+    // If neither fires within 4 seconds, show a friendly fallback message
+    setTimeout(() => settle(false), 4000);
+
+    previewImg.src = url.href;
+  }
+}
+
+// Restore URL input when editing a channel that has a custom URL poster
+function syncChannelPosterUrlInput() {
+  const urlInput = document.getElementById('channelPosterUrlInput');
+  const preview = document.getElementById('channelPosterUrlPreview');
+  const previewImg = document.getElementById('channelPosterUrlImg');
+  const status = document.getElementById('channelPosterUrlStatus');
+  if (!urlInput) return;
+
+  const isUrlPoster = channelDraftPoster
+    && channelDraftPoster !== 'custom'
+    && !channelDraftPoster.includes('/api/channel-')
+    // It's a custom URL if it isn't one of the auto-extracted show posters in the grid
+    && !document.querySelector('#channelPosterChoicesGrid .channel-poster-choice.selected');
+
+  if (isUrlPoster) {
+    urlInput.value = channelDraftPoster;
+    if (previewImg) {
+      previewImg.src = channelDraftPoster;
+      previewImg.style.display = '';
+    }
+    if (status) { status.textContent = 'Poster URL applied \u2713'; status.style.color = 'var(--success, #30d158)'; }
+    if (preview) preview.style.display = 'flex';
+  } else {
+    urlInput.value = '';
+    if (preview) preview.style.display = 'none';
+  }
 }
 
 // --- // --- Sagas, Universes & Movie Franchises Registry ---------------------------
@@ -27403,7 +29436,7 @@ function saveChannel() {
   let horizontalBackdrop = null;
   if (verticalPoster) {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
-    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || null;
+    horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
   const shuffle = document.getElementById('channelRandomizeCheck').checked;
 
@@ -29197,13 +31230,13 @@ if (customListSearchBox) {
 
 async function addToCustomListDraft(searchType, tmdbId, title, year, poster, btn) {
   const itemType = searchType === 'tv' ? 'series' : 'movie';
-  if (customListDraftType && customListDraftType !== 'mixed' && customListDraftType !== itemType) {
-    if (!customListDraftItems.length) {
-      customListDraftType = itemType;
-      updateCustomListTypeRadio(itemType);
-    } else {
+  if (customListDraftType !== 'mixed') {
+    if (customListDraftItems.length > 0 && customListDraftType !== itemType) {
       customListDraftType = 'mixed';
       updateCustomListTypeRadio('mixed');
+    } else if (!customListDraftItems.length && !customListDraftType) {
+      customListDraftType = itemType;
+      updateCustomListTypeRadio(itemType);
     }
   }
   if (btn) {
@@ -29563,25 +31596,91 @@ function saveCustomList() {
     renumber();
     checkAllDuplicateUrls();
     saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
+    showAddedToast('"' + name + '" updated \u2713');
   } else {
-    if (listType === 'mixed') {
-      const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type)));
-      const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv'));
-      if (movies.length > 0) {
-        const moviePayload = { listId: generateChannelId(), type: 'movie', items: movies, shuffle: shuffle };
-        const movieUrl = 'customlist:v1:' + JSON.stringify(moviePayload);
-        const movieRow = addRow(name + (series.length > 0 ? ' (Movies)' : ''), movieUrl, 'movie', true, 'Custom Lists');
-        if (!sourceRow) sourceRow = movieRow ? movieRow.querySelector('.source-row') : null;
-      }
-      if (series.length > 0 || movies.length === 0) {
-        const seriesPayload = { listId: generateChannelId(), type: 'series', items: series, shuffle: shuffle };
-        const seriesUrl = 'customlist:v1:' + JSON.stringify(seriesPayload);
-        const seriesRow = addRow(name + (movies.length > 0 ? ' (Shows)' : ''), seriesUrl, 'series', true, 'Custom Lists');
-        if (!sourceRow) sourceRow = seriesRow ? seriesRow.querySelector('.source-row') : null;
-      }
+    const visSelect = document.getElementById('customListVisibilitySelect');
+    const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+    if (activeCreator) {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      fetch(ORIGIN + '/api/creator/lists/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          name: name,
+          type: listType,
+          items: customListDraftItems,
+          visibility: visibility,
+        }),
+      }).then(async (res) => {
+        const data = await res.json();
+        if (!data.ok) {
+          alert('Could not save list: ' + (data.error || 'unknown error'));
+          return;
+        }
+        const slug = data.slug;
+        if (listType === 'mixed') {
+          const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const moviePayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: 'movie', items: movies, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(moviePayload), 'movie', true, 'Custom Lists');
+          const seriesPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: 'series', items: series, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(seriesPayload), 'series', true, 'Custom Lists');
+        } else {
+          const payload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: activeCreator.creatorName, type: listType, items: customListDraftItems, shuffle: shuffle, publishedUrl: visibility === 'public' ? data.url : undefined };
+          addRow(name, 'customlist:v1:' + JSON.stringify(payload), listType, true, 'Custom Lists');
+        }
+        saveState();
+        renderCreatorDashboard();
+        if (typeof renderLivePreview === 'function') renderLivePreview();
+        if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+        if (typeof showSavedCustomListModal === 'function') {
+          showSavedCustomListModal(name, visibility, data.url);
+        } else {
+          showAddedToast('"' + name + '" saved \u2713');
+        }
+      }).catch(() => {
+        alert('Network error while saving list.');
+      });
     } else {
-      const newRowDiv = addRow(name, newUrl, customListDraftType, true, 'Custom Lists');
-      sourceRow = newRowDiv ? newRowDiv.querySelector('.source-row') : null;
+      const map = loadLocalCustomLists();
+      const base = slugify(name) || 'list';
+      let slug = base;
+      let n = 2;
+      while (map[slug]) {
+        slug = base + '-' + n;
+        n++;
+      }
+      map[slug] = {
+        slug: slug,
+        name: name,
+        type: listType,
+        items: customListDraftItems,
+        visibility: visibility,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
+      if (listType === 'mixed') {
+        const movies = customListDraftItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        const series = customListDraftItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        const moviePayload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: shuffle };
+        addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(moviePayload), 'movie', true, 'Custom Lists');
+        const seriesPayload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: shuffle };
+        addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(seriesPayload), 'series', true, 'Custom Lists');
+      } else {
+        const payload = { listId: generateChannelId(), localSlug: slug, listSlug: slug, type: listType, items: customListDraftItems, shuffle: shuffle };
+        addRow(name, 'customlist:v1:' + JSON.stringify(payload), listType, true, 'Custom Lists');
+      }
+      saveState();
+      renderCreatorDashboard();
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      showAddedToast('"' + name + '" saved \u2713');
     }
   }
 
@@ -29596,17 +31695,6 @@ function saveCustomList() {
   if (searchRes) searchRes.innerHTML = '';
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
-
-  // Straight into the same save flow the row's own "Save List" button
-  // uses (creator-profile signed-in -> visibility picker directly;
-  // otherwise the anonymous-vs-create-a-profile choice) -- no separate
-  // trip down to the list below and a second click needed.
-  const urlInput = sourceRow ? sourceRow.querySelector('.url') : null;
-  if (sourceRow && urlInput) {
-    beginSaveListFlow(sourceRow, urlInput, name);
-  } else {
-    alert('List "' + name + '" saved, but the save dialog couldn\\'t open automatically -- use the "Save List" button on it below.');
-  }
 }
 
 // Saves changes to a list already living on the creator's profile --
@@ -29615,7 +31703,7 @@ function saveCustomList() {
 // the one on the server, not a row in this particular install link.
 async function saveCreatorListEdit(name) {
   if (!activeCreator) {
-    alert('Your Creator Profile session expired -- please restore it again.');
+    alert('Your Profile session expired -- please restore it again.');
     editingCreatorListSlug = null;
     updateCustomListSaveButtonLabel();
     return;
@@ -29655,6 +31743,9 @@ async function saveCreatorListEdit(name) {
         saveLocalCustomListsMap(map);
       }
       if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    }
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows(editingCreatorListSlug, customListDraftItems, name, customListDraftType);
     }
     if (typeof showSavedCustomListModal === 'function') {
       showSavedCustomListModal(name, visibility, data.url);
@@ -29696,6 +31787,9 @@ async function saveLocalCustomListEdit(name) {
   }
   if (typeof scheduleCreatorSyncSave === 'function') {
     scheduleCreatorSyncSave();
+  }
+  if (typeof syncCustomListToCatalogRows === 'function') {
+    syncCustomListToCatalogRows(slug, customListDraftItems, name, customListDraftType);
   }
 
   let finalUrl = ((typeof activeCreator !== 'undefined' && activeCreator)
@@ -29866,6 +31960,86 @@ function updateCustomListTypeRadio(type) {
 // --- Watch History --------------------------------------------------------
 
 window._watchedItemIds = new Set();
+
+// Every key a watch-history item can be looked up by.
+//
+// These permutations used to be spelled out separately in three places (the
+// initial index build, and the add/remove halves of toggleWatchStatus), and
+// computeWatchBadgeState carried a linear scan of the whole history as a
+// safety net for anything they missed. That scan ran for every poster that
+// was NOT already known to be watched -- which is most of them -- so a page
+// of 1,200 posters against a 1,200-item history cost 1.44 million
+// comparisons per pass. Collecting the permutations here means the set can
+// answer every one of those questions in O(1), and the scan can go.
+function watchedIndexKeysFor(it, details) {
+  if (!it) return [];
+  const keys = [];
+  if (it.id) keys.push(String(it.id));
+  if (it.imdbId) keys.push(String(it.imdbId));
+  if (it.tmdbId) {
+    keys.push(String(it.tmdbId));
+    keys.push('tmdb:' + it.tmdbId);
+  }
+  if (it.seasonNum != null && it.episodeNum != null) {
+    const se = ':' + it.seasonNum + ':' + it.episodeNum;
+    if (it.showId) {
+      const sid = String(it.showId);
+      keys.push(sid + se);
+      // A show is stored sometimes as "tmdb:123" and sometimes as "123",
+      // while the poster on screen may carry either form in data-show-id.
+      // Indexing both directions is what the old linear scan was really
+      // doing when it compared against 'tmdb:' + sid.
+      if (sid.indexOf('tmdb:') === 0) keys.push(sid.slice(5) + se);
+      else keys.push('tmdb:' + sid + se);
+    }
+    if (it.showTitle) keys.push(String(it.showTitle) + se);
+    if (details) {
+      if (details.id) keys.push(String(details.id) + se);
+      if (details.imdbId) keys.push(String(details.imdbId) + se);
+      if (details.tmdbId) keys.push('tmdb:' + details.tmdbId + se);
+      if (details.title) keys.push(String(details.title) + se);
+    }
+  }
+  return keys;
+}
+window.watchedIndexKeysFor = watchedIndexKeysFor;
+
+// Rebuilds the whole index from an item array. Cheap enough to run on any
+// change (one pass over the history) and far cheaper than the per-poster
+// scan it replaces.
+function rebuildWatchedIndex(items) {
+  const list = Array.isArray(items) ? items : [];
+  window._rawWatchHistoryItems = list;
+  window._watchedItemIds = new Set();
+  for (let i = 0; i < list.length; i++) {
+    const keys = watchedIndexKeysFor(list[i], null);
+    for (let k = 0; k < keys.length; k++) window._watchedItemIds.add(keys[k]);
+  }
+  window._watchedIndexLength = list.length;
+  // The old observer re-badged every poster on the page on ANY mutation,
+  // which incidentally covered the case where watch state changes after the
+  // posters are already on screen -- history arriving from the account
+  // mid-session, for instance. Now that it only looks at nodes as they are
+  // added, that case needs saying out loud: whenever the index is rebuilt,
+  // sweep what is currently visible. One pass over the posters on screen,
+  // not one pass per poster per mutation.
+  if (typeof window._badgeExistingPosters === 'function') {
+    try { window._badgeExistingPosters(); } catch (e) {}
+  }
+  return window._watchedItemIds;
+}
+window.rebuildWatchedIndex = rebuildWatchedIndex;
+
+// The scan that was removed also quietly covered the case where the history
+// array had changed without the set being updated alongside it. That is
+// still worth guarding, just not once per poster: a length change is enough
+// to notice, and the rebuild is a single pass.
+function ensureWatchedIndexFresh() {
+  const list = window._rawWatchHistoryItems;
+  if (!Array.isArray(list)) return;
+  if (window._watchedIndexLength !== list.length) rebuildWatchedIndex(list);
+}
+window.ensureWatchedIndexFresh = ensureWatchedIndexFresh;
 // Shows where every currently-aired episode has been watched -- separate
 // from _watchedItemIds (which only ever holds movie/episode ids, never a
 // show's own id) since a show's poster is never itself added to Watch
@@ -29912,13 +32086,34 @@ function findWatchBadgeWrap(el) {
 // never lands in Watch History -- only its episodes do. Episodes/movies
 // have no data-type "series", so they fall through to the plain
 // watched-item check same as always.
-function computeWatchBadgeState(id, type) {
+function computeWatchBadgeState(id, type, el) {
   if (type === 'series') {
     if (window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(id)) return 'full';
     if (window._inProgressShowIds && window._inProgressShowIds.has(id)) return 'partial';
     return null;
   }
-  return (window._watchedItemIds && window._watchedItemIds.has(id)) ? 'full' : null;
+  if (window._watchedItemIds && window._watchedItemIds.has(id)) return 'full';
+  if (el && el.dataset) {
+    const s = el.dataset.season;
+    const ep = el.dataset.episode;
+    const sid = el.dataset.showId;
+    if (s != null && ep != null) {
+      if (sid && window._watchedItemIds) {
+        const sidStr = String(sid);
+        if (window._watchedItemIds.has(sidStr + ':' + s + ':' + ep)) return 'full';
+        // Same show, other id spelling -- see watchedIndexKeysFor.
+        const alt = sidStr.indexOf('tmdb:') === 0 ? sidStr.slice(5) : ('tmdb:' + sidStr);
+        if (window._watchedItemIds.has(alt + ':' + s + ':' + ep)) return 'full';
+      }
+      const d = window._currentItemDetails;
+      if (d) {
+        if (d.id && window._watchedItemIds && window._watchedItemIds.has(d.id + ':' + s + ':' + ep)) return 'full';
+        if (d.tmdbId && window._watchedItemIds && window._watchedItemIds.has('tmdb:' + d.tmdbId + ':' + s + ':' + ep)) return 'full';
+        if (d.title && window._watchedItemIds && window._watchedItemIds.has(d.title + ':' + s + ':' + ep)) return 'full';
+      }
+    }
+  }
+  return null;
 }
 
 // Builds the badge markup for a given state -- shared by the observer and
@@ -29936,14 +32131,7 @@ function initWatchHistory() {
       const l = map[key];
       if (key === 'watch-history' || key.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
         const items = (l && l.items) || [];
-        items.forEach(it => {
-          if (it.id) window._watchedItemIds.add(String(it.id));
-          if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
-          if (it.tmdbId) {
-            window._watchedItemIds.add(String(it.tmdbId));
-            window._watchedItemIds.add('tmdb:' + it.tmdbId);
-          }
-        });
+        rebuildWatchedIndex(items);
       }
       if (key === 'continue-watching' || (l && l.name && l.name.toLowerCase().includes('continue watching'))) {
         const items = (l && l.items) || [];
@@ -29954,10 +32142,14 @@ function initWatchHistory() {
   try {
     const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
     if (Array.isArray(rawWh)) {
-      rawWh.forEach(it => {
-        if (it.id) window._watchedItemIds.add(String(it.id));
-        if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
+      if (!window._rawWatchHistoryItems || !window._rawWatchHistoryItems.length) window._rawWatchHistoryItems = rawWh;
+      // Legacy standalone key -- merged into the same index rather than
+      // indexed differently, so lookups need only consult one set.
+      rawWh.forEach((it) => {
+        const keys = watchedIndexKeysFor(it, null);
+        for (let k = 0; k < keys.length; k++) window._watchedItemIds.add(keys[k]);
       });
+      window._watchedIndexLength = (window._rawWatchHistoryItems || []).length;
     }
   } catch (e) {}
   try {
@@ -29977,28 +32169,88 @@ function initWatchHistory() {
     // non-critical -- a dismissed show might just reappear once
   }
 
-  const observer = new MutationObserver(mutations => {
+  // Badges new posters as they appear.
+  //
+  // This used to run its whole body synchronously on every mutation record,
+  // and the body was a document-wide querySelectorAll for
+  // .clickable-poster/.clickable-episode followed by a badge computation for
+  // every match -- everything already on the page, not just what had just
+  // changed. Two things made that expensive enough to notice:
+  //
+  //   * The grid renderer appends posters in batches across animation frames
+  //     (renderPosterGridChunked, 23_client-list-management.js), so a 1,200
+  //     item See All page fires this ~20 times over a grid that keeps
+  //     growing -- re-badging everything already placed, each time.
+  //   * Inserting a badge is itself a childList mutation inside the observed
+  //     subtree, so every pass scheduled more passes.
+  //
+  // Now: mutation records are collected and drained once per animation
+  // frame, and only the nodes that were actually added get looked at. The
+  // badge insertions still re-enter, but an inserted overlay contains no
+  // posters, so that pass finds nothing and costs nothing. Work per frame is
+  // proportional to what just appeared rather than to the size of the page.
+  let _badgeQueue = [];
+  let _badgeScheduled = false;
+
+  function badgeElement(el) {
+    if (!el || !el.dataset) return;
+    const id = el.dataset.id;
+    if (!id) return;
+    const state = computeWatchBadgeState(id, el.dataset.type, el);
+    if (!state) return;
+    const wrap = findWatchBadgeWrap(el);
+    if (!wrap) return;
+    // Checking wrap (not el) for an existing badge matters: when el is an
+    // <img> (it can't hold children), wrap is el.parentElement -- checking el
+    // itself here would always find nothing and insert another badge every
+    // time this runs.
+    if (!wrap.querySelector('.watch-indicator-overlay')) {
+      wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
+    }
+  }
+
+  function drainBadgeQueue() {
+    _badgeScheduled = false;
+    const nodes = _badgeQueue;
+    _badgeQueue = [];
     if (!window._watchedItemIds) return;
-    document.querySelectorAll('.clickable-poster, .clickable-episode').forEach(el => {
-      const id = el.dataset.id;
-      if (!id) return;
-      const state = computeWatchBadgeState(id, el.dataset.type);
-      if (!state) return;
-      const wrap = findWatchBadgeWrap(el);
-      if (!wrap) return;
-      // Checking wrap (not el) for an existing badge matters: when el is
-      // an <img> (it can't hold children), wrap is el.parentElement --
-      // checking el itself here would always find nothing, insert another
-      // badge into wrap every time this observer fires, and since that
-      // insertion is itself a mutation under the very subtree being
-      // observed, immediately re-trigger this same callback -- an
-      // unbounded loop that floods the DOM and freezes the tab.
-      if (!wrap.querySelector('.watch-indicator-overlay')) {
-        wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
+    // One freshness check per frame rather than one per poster -- see
+    // ensureWatchedIndexFresh.
+    if (typeof ensureWatchedIndexFresh === 'function') ensureWatchedIndexFresh();
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node || node.nodeType !== 1) continue;
+      if (!node.isConnected) continue;
+      if (node.matches && node.matches('.clickable-poster, .clickable-episode')) badgeElement(node);
+      if (node.querySelectorAll) {
+        const found = node.querySelectorAll('.clickable-poster, .clickable-episode');
+        for (let j = 0; j < found.length; j++) badgeElement(found[j]);
       }
-    });
+    }
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const added = mutations[i].addedNodes;
+      for (let j = 0; j < added.length; j++) _badgeQueue.push(added[j]);
+    }
+    if (!_badgeQueue.length || _badgeScheduled) return;
+    _badgeScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drainBadgeQueue);
+    else setTimeout(drainBadgeQueue, 16);
   });
   observer.observe(document.body, { childList: true, subtree: true });
+
+  // Badges anything already on the page when this first runs, since the
+  // observer only ever sees what arrives after it.
+  window._badgeExistingPosters = function() {
+    _badgeQueue.push(document.body);
+    if (_badgeScheduled) return;
+    _badgeScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drainBadgeQueue);
+    else setTimeout(drainBadgeQueue, 16);
+  };
+  window._badgeExistingPosters();
   try { cleanWatchedFromWatchlists(); } catch (e) {}
 }
 setTimeout(initWatchHistory, 500);
@@ -30011,20 +32263,15 @@ setTimeout(initWatchHistory, 500);
 // that's already on screen).
 function refreshWatchBadge(id, type) {
   const strId = String(id);
-  const state = computeWatchBadgeState(strId, type);
   document.querySelectorAll('.clickable-poster[data-id="' + escapeAttr(strId) + '"], .clickable-episode[data-id="' + escapeAttr(strId) + '"]').forEach(el => {
     const wrap = findWatchBadgeWrap(el);
     if (!wrap) return;
-    // See the matching comment in initWatchHistory's observer above -- this
-    // has to check wrap, not el, for the same reason.
+    const state = computeWatchBadgeState(strId, type || (el.dataset ? el.dataset.type : undefined), el);
     const overlay = wrap.querySelector('.watch-indicator-overlay');
     if (state) {
       if (!overlay) {
         wrap.insertAdjacentHTML('beforeend', watchBadgeHtml(state));
       } else {
-        // Swap in place (rather than remove+reinsert) when a show flips
-        // straight from partial to full on its last episode -- keeps the
-        // existing badge element instead of a flicker of removal.
         overlay.className = 'watch-indicator-overlay' + (state === 'partial' ? ' watch-indicator-partial' : '');
         overlay.innerHTML = state === 'partial' ? '&#x25D0;' : '&#x2713;';
       }
@@ -30347,10 +32594,46 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
   
-  const existingIdx = list.items.findIndex(it => it.id === id);
+  let existingIdx = list.items.findIndex(it => it.id === id);
+  
+  if (existingIdx < 0 && type === 'episode') {
+    const d = window._currentItemDetails;
+    if (d) {
+      const cache = window._episodeDataCache || {};
+      const found = Object.values(cache).find(ep => String(ep.id) === String(id));
+      if (found && found.season_number != null && found.episode_number != null) {
+        const fallbackId = d.id + ':' + found.season_number + ':' + found.episode_number;
+        existingIdx = list.items.findIndex(it => it.id === fallbackId);
+        if (existingIdx >= 0) id = fallbackId;
+      }
+    }
+  }
+
   if (existingIdx >= 0) {
-    list.items.splice(existingIdx, 1);
-    window._watchedItemIds.delete(id);
+    const removedItem = list.items.splice(existingIdx, 1)[0];
+    if (removedItem) {
+      if (removedItem.id) window._watchedItemIds.delete(String(removedItem.id));
+      if (removedItem.imdbId) window._watchedItemIds.delete(String(removedItem.imdbId));
+      if (removedItem.tmdbId) {
+        window._watchedItemIds.delete(String(removedItem.tmdbId));
+        window._watchedItemIds.delete('tmdb:' + removedItem.tmdbId);
+      }
+      if (removedItem.seasonNum != null && removedItem.episodeNum != null) {
+        if (removedItem.showId) window._watchedItemIds.delete(String(removedItem.showId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        if (removedItem.showTitle) window._watchedItemIds.delete(String(removedItem.showTitle) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        const d = window._currentItemDetails;
+        if (d) {
+          if (d.id) window._watchedItemIds.delete(String(d.id) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          if (d.imdbId) window._watchedItemIds.delete(String(d.imdbId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          if (d.tmdbId) {
+            window._watchedItemIds.delete(String(d.tmdbId) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+            window._watchedItemIds.delete('tmdb:' + d.tmdbId + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+          }
+          if (d.title) window._watchedItemIds.delete(String(d.title) + ':' + removedItem.seasonNum + ':' + removedItem.episodeNum);
+        }
+      }
+    }
+    window._watchedItemIds.delete(String(id));
   } else {
     // If this is an episode, embed show/season/episode context so
     // updateContinueWatching() can find "next unwatched" without extra API calls.
@@ -30372,22 +32655,42 @@ window.toggleWatchStatus = function(id, type, name, poster) {
       }
     }
     list.items.unshift(item);
-    window._watchedItemIds.add(id);
+    window._watchedItemIds.add(String(id));
+    if (item.seasonNum != null && item.episodeNum != null) {
+      if (item.showId) window._watchedItemIds.add(String(item.showId) + ':' + item.seasonNum + ':' + item.episodeNum);
+      if (item.showTitle) window._watchedItemIds.add(String(item.showTitle) + ':' + item.seasonNum + ':' + item.episodeNum);
+      const d = window._currentItemDetails;
+      if (d) {
+        if (d.id) window._watchedItemIds.add(String(d.id) + ':' + item.seasonNum + ':' + item.episodeNum);
+        if (d.imdbId) window._watchedItemIds.add(String(d.imdbId) + ':' + item.seasonNum + ':' + item.episodeNum);
+        if (d.tmdbId) {
+          window._watchedItemIds.add(String(d.tmdbId) + ':' + item.seasonNum + ':' + item.episodeNum);
+          window._watchedItemIds.add('tmdb:' + d.tmdbId + ':' + item.seasonNum + ':' + item.episodeNum);
+        }
+        if (d.title) window._watchedItemIds.add(String(d.title) + ':' + item.seasonNum + ':' + item.episodeNum);
+      }
+    }
     removeWatchedItemFromWatchlist(id, item.showId || (type === 'movie' ? id : null));
     if (typeof trackEvent === 'function') {
       trackEvent('watched', item.showId || id, item.showTitle || name, type === 'movie' ? 'movie' : 'series');
     }
   }
-  
+
+  window._rawWatchHistoryItems = list.items;
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof scheduleCreatorSyncSave === 'function') {
+    scheduleCreatorSyncSave(existingIdx >= 0 ? { intentionalRemoval: true } : undefined);
+  }
 
   // Update Continue Watching for episode toggles
   if (type === 'episode') {
     const d = window._currentItemDetails;
     if (d && d.id) updateContinueWatching(d.id).catch(() => {});
+    if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
+      updateSeasonWatchedButton(window._currentSeasonNum);
+    }
   }
   
   // Re-render UI
@@ -30441,12 +32744,47 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
 
   if (allWatched) {
     const removeIds = new Set(items.map(it => String(it.id)));
+    const removeCompositeKeys = new Set();
+    items.forEach(it => {
+      removeIds.add(String(it.id));
+      if (it.imdbId) removeIds.add(String(it.imdbId));
+      if (it.tmdbId) {
+        removeIds.add(String(it.tmdbId));
+        removeIds.add('tmdb:' + it.tmdbId);
+      }
+      if (it.seasonNum != null && it.episodeNum != null) {
+        if (it.showId) {
+          removeCompositeKeys.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (String(it.showId).startsWith('tmdb:')) {
+            removeCompositeKeys.add(String(it.showId).slice(5) + ':' + it.seasonNum + ':' + it.episodeNum);
+          } else {
+            removeCompositeKeys.add('tmdb:' + it.showId + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        }
+        if (it.showTitle) removeCompositeKeys.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+        const d = window._currentItemDetails;
+        if (d) {
+          if (d.id) removeCompositeKeys.add(String(d.id) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (d.imdbId) removeCompositeKeys.add(String(d.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+          if (d.tmdbId) {
+            removeCompositeKeys.add(String(d.tmdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            removeCompositeKeys.add('tmdb:' + d.tmdbId + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+          if (d.title) removeCompositeKeys.add(String(d.title) + ':' + it.seasonNum + ':' + it.episodeNum);
+        }
+      }
+    });
+
     list.items = list.items.filter(it => !removeIds.has(String(it.id)));
+    window._rawWatchHistoryItems = list.items;
     removeIds.forEach(id => {
-      if (window._watchedItemIds.has(id)) {
+      if (window._watchedItemIds) {
         window._watchedItemIds.delete(id);
         removed++;
       }
+    });
+    removeCompositeKeys.forEach(k => {
+      if (window._watchedItemIds) window._watchedItemIds.delete(k);
     });
   } else {
     const existingIds = new Set(list.items.map(it => String(it.id)));
@@ -30459,9 +32797,38 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
         existingIds.add(id);
         added++;
       }
-      window._watchedItemIds.add(id);
+      if (window._watchedItemIds) {
+        window._watchedItemIds.add(id);
+        if (it.imdbId) window._watchedItemIds.add(String(it.imdbId));
+        if (it.tmdbId) {
+          window._watchedItemIds.add(String(it.tmdbId));
+          window._watchedItemIds.add('tmdb:' + it.tmdbId);
+        }
+        if (it.seasonNum != null && it.episodeNum != null) {
+          if (it.showId) {
+            window._watchedItemIds.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (String(it.showId).startsWith('tmdb:')) {
+              window._watchedItemIds.add(String(it.showId).slice(5) + ':' + it.seasonNum + ':' + it.episodeNum);
+            } else {
+              window._watchedItemIds.add('tmdb:' + it.showId + ':' + it.seasonNum + ':' + it.episodeNum);
+            }
+          }
+          if (it.showTitle) window._watchedItemIds.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+          const d = window._currentItemDetails;
+          if (d) {
+            if (d.id) window._watchedItemIds.add(String(d.id) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (d.imdbId) window._watchedItemIds.add(String(d.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (d.tmdbId) {
+              window._watchedItemIds.add(String(d.tmdbId) + ':' + it.seasonNum + ':' + it.episodeNum);
+              window._watchedItemIds.add('tmdb:' + d.tmdbId + ':' + it.seasonNum + ':' + it.episodeNum);
+            }
+            if (d.title) window._watchedItemIds.add(String(d.title) + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        }
+      }
       removeWatchedItemFromWatchlist(id, it.showId || (it.type === 'movie' ? id : null));
     });
+    window._rawWatchHistoryItems = list.items;
     if (typeof trackEventsBatch === 'function') {
       const seen = new Set();
       const trackItems = [];
@@ -30478,7 +32845,9 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
   list.updatedAt = Date.now();
   map['watch-history'] = list;
   saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof scheduleCreatorSyncSave === 'function') {
+    scheduleCreatorSyncSave(allWatched ? { intentionalRemoval: true } : undefined);
+  }
 
   updateContinueWatchingForBatch(items).catch(() => {});
 
@@ -30618,7 +32987,7 @@ window.markShowWatched = async function(imdbId) {
 // overlaps an earlier one) should never accidentally unmark something that
 // was already logged as watched, which a toggle-based call would risk the
 // moment every item in a batch happened to already be watched.
-window.addItemsToWatchHistory = async function(items) {
+window.addItemsToWatchHistory = async function(items, skipExternalSync = false) {
   if (!items || !items.length) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
   const map = loadLocalCustomLists();
   const list = getOrCreateWatchHistoryList();
@@ -30637,22 +33006,38 @@ window.addItemsToWatchHistory = async function(items) {
     window._watchedItemIds.add(id);
     added++;
   });
-  if (!added) return { added: 0, cwSucceeded: 0, cwTotal: 0 };
-  if (typeof trackEventsBatch === 'function') {
-    const seen = new Set();
-    const trackItems = [];
-    items.forEach((it) => {
-      const key = it.showId || it.id;
-      if (seen.has(key)) return;
-      seen.add(key);
-      trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
-    });
-    trackEventsBatch('watched', trackItems);
+  if (added > 0) {
+    if (typeof trackEventsBatch === 'function') {
+      const seen = new Set();
+      const trackItems = [];
+      items.forEach((it) => {
+        const key = it.showId || it.id;
+        if (seen.has(key)) return;
+        seen.add(key);
+        trackItems.push({ id: it.showId || it.id, title: it.showTitle || it.name, mediaType: it.type === 'movie' ? 'movie' : 'series' });
+      });
+      trackEventsBatch('watched', trackItems);
+    }
+    list.updatedAt = Date.now();
+    map['watch-history'] = list;
+    const saved = saveLocalCustomListsMap(map);
+    if (!saved) return { added: 0, cwSucceeded: 0, cwTotal: 0, quotaExceeded: true };
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    // Imports (Trakt/MDBList history) are the only source of entries
+    // that carry a show poster where an episode still belongs, so this is
+    // the one place worth kicking the backfill from directly rather than
+    // waiting for the next page load. Not awaited -- the caller's own
+    // "done" message should not sit behind a cosmetic fetch.
+    if (typeof backfillWatchHistoryEpisodeStills === 'function') {
+      backfillWatchHistoryEpisodeStills().catch(() => {});
+    }
+  } else if (!skipExternalSync) {
+    // If nothing was added, and this is NOT a mass import, just return.
+    // Mass imports (skipExternalSync=true) should proceed to retry Continue Watching
+    // even if added=0, so the user can explicitly "run this again" as the alert suggests.
+    return { added: 0, cwSucceeded: 0, cwTotal: 0 };
   }
-  list.updatedAt = Date.now();
-  map['watch-history'] = list;
-  saveLocalCustomListsMap(map);
-  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+
   // Awaited (unlike toggleBatchWatchStatus's own fire-and-forget call
   // above) -- this is what a bulk importer processing dozens or hundreds
   // of shows actually needs: the caller's own "done" message shouldn't
@@ -30662,7 +33047,7 @@ window.addItemsToWatchHistory = async function(items) {
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   items.forEach((it) => {
     refreshWatchBadge(it.id, it.type);
-    if (typeof syncSingleItemToConnectedProviders === 'function') {
+    if (!skipExternalSync && typeof syncSingleItemToConnectedProviders === 'function') {
       syncSingleItemToConnectedProviders(it, 'add');
     }
   });
@@ -30681,17 +33066,30 @@ window.addItemsToWatchHistory = async function(items) {
 function dedupeContinueWatchingItems(items) {
   if (!items || !items.length) return items || [];
   const seenShowIds = new Set();
-  const watchedSet = window._watchedItemIds || new Set();
+  const seenTitles = new Set();
+  const watchedSet = window._watchedItemIds || (function() {
+    try {
+      const map = loadLocalCustomLists();
+      const wh = map['watch-history'];
+      return new Set(((wh && wh.items) || []).map(it => String(it && (it.id || it.imdbId))).filter(Boolean));
+    } catch (e) { return new Set(); }
+  })();
   return items.filter((it) => {
     if (!it) return false;
+    const epId = String(it.id || '');
     // An episode already marked as watched in Watch History must never be in Continue Watching
-    if (it.id && watchedSet.has(String(it.id))) return false;
-    if (!it.showId) return true;
-    if (seenShowIds.has(String(it.showId))) return false;
-    seenShowIds.add(String(it.showId));
+    if (epId && watchedSet.has(epId)) return false;
+    const showId = String(it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || epId))) || '');
+    const titleKey = (it.showTitle || '').toLowerCase().trim();
+    if (!showId) return true;
+    if (seenShowIds.has(showId)) return false;
+    if (titleKey && seenTitles.has(titleKey)) return false;
+    seenShowIds.add(showId);
+    if (titleKey) seenTitles.add(titleKey);
     return true;
   });
 }
+
 
 function getOrCreateContinueWatchingList() {
   const map = loadLocalCustomLists();
@@ -30808,6 +33206,10 @@ async function updateContinueWatching(showId) {
 
     if (nextInSeason) {
       const aired = isEpisodeAired(nextInSeason);
+      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1;
+      const isFinale = nextInSeason.episode_number === allEps.length;
+      const lastEp = allEps[allEps.length - 1];
+      const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
       newEntry = {
         id: String(nextInSeason.id),
         type: 'episode',
@@ -30820,6 +33222,9 @@ async function updateContinueWatching(showId) {
         episodeNum: nextInSeason.episode_number,
         airDate: nextInSeason.air_date || null,
         isUnaired: !aired,
+        isSeasonPremiere: isPremiere,
+        isSeasonFinale: isFinale,
+        seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
       };
       // If the next episode has not aired yet, all currently aired episodes have been watched
       showFullyWatched = !aired;
@@ -30829,9 +33234,14 @@ async function updateContinueWatching(showId) {
         '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
       const data2 = await res2.json();
       if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
-        const firstNext = data2.season.episodes[0];
+        const allEpsNext = data2.season.episodes;
+        const firstNext = allEpsNext[0];
         if (firstNext) {
           const aired = isEpisodeAired(firstNext);
+          const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1;
+          const isFinale = allEpsNext.length === 1;
+          const lastEp = allEpsNext[allEpsNext.length - 1];
+          const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
           newEntry = {
             id: String(firstNext.id),
             type: 'episode',
@@ -30844,6 +33254,9 @@ async function updateContinueWatching(showId) {
             episodeNum: firstNext.episode_number,
             airDate: firstNext.air_date || null,
             isUnaired: !aired,
+            isSeasonPremiere: isPremiere,
+            isSeasonFinale: isFinale,
+            seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
           };
           showFullyWatched = !aired;
         } else {
@@ -30900,13 +33313,21 @@ async function updateContinueWatchingForBatch(items) {
   async function worker() {
     while (nextIdx < showIds.length) {
       const showId = showIds[nextIdx++];
-      try {
-        const result = await updateContinueWatching(showId);
-        if (result && result.ok) succeeded++;
-      } catch (e) {
-        // updateContinueWatching doesn't normally throw (see its own
-        // try/catch), but guard anyway so one unexpected error can't abort
-        // the rest of the batch.
+      let attempts = 0;
+      let success = false;
+      while (attempts < 3 && !success) {
+        attempts++;
+        try {
+          const result = await updateContinueWatching(showId);
+          if (result && result.ok) {
+            success = true;
+            succeeded++;
+          } else if (attempts < 3) {
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        } catch (e) {
+          if (attempts < 3) await new Promise(r => setTimeout(r, 1000));
+        }
       }
     }
   }
@@ -30977,7 +33398,7 @@ function dismissContinueWatchingShow(showId, btn) {
   // checkmark, and the cron will still periodically check TMDB in case a
   // real new episode later supersedes this dismissal.
   setShowFullyWatched(showId, true);
-  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
 }
 
 // --- Airing Next ------------------------------------------------------------
@@ -31098,7 +33519,16 @@ async function refreshAiringNext(force) {
   const existing = getOrCreateAiringNextList();
   const hasExpiredItems = Array.isArray(existing.items) && existing.items.some(it => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
   const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it => it && !it.name && !it.episodeTitle);
-  if (!force && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+  if (!force && Array.isArray(existing.items) && existing.items.length > 0 && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
+    // Reconciled with the account even though nothing was recomputed.
+    // The push at the bottom of this function is otherwise the only one
+    // that ever happens, so a list that was built while sign-in had not
+    // finished yet -- pushTrackingSync bails without activeCreator --
+    // would be cached as fresh here and never sent, leaving the
+    // autotrack:airing-next catalog row empty for as long as the cache
+    // held. scheduleTrackingSync's signature guard makes this a no-op
+    // when the account already has this exact list.
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
     return existing;
   }
 
@@ -31120,48 +33550,109 @@ async function refreshAiringNext(force) {
   const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
 
   const results = [];
-  let cursor = 0;
-  async function worker() {
-    while (cursor < candidates.length) {
-      const showId = candidates[cursor++];
-      try {
-        const bypass = (force || hasExpiredItems) ? '&fresh=1&_t=' + Date.now() : '';
-        const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
-        const data = await res.json();
-        const d = data && data.ok ? data.details : null;
-        if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
-          const known = knownByShow.get(showId);
-          const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
-          results.push({
-            id: showId,
-            showId: showId,
-            showTitle: (known && known.title) || d.title || '',
-            showPoster: (known && known.poster) || d.poster || '',
-            name: epName,
-            episodeTitle: epName,
-            airDate: d.nextEpisodeAirDate,
-            seasonNum: d.nextEpisodeSeasonNumber,
-            episodeNum: d.nextEpisodeNumber,
-            isSeasonPremiere: d.nextEpisodeNumber === 1,
-            isUnaired: true,
-          });
-        }
-      } catch (e) {
-        // Network hiccup or no TMDB key configured -- this show is simply
-        // retried on the next refresh (or a manual "force" one) rather
-        // than blocking the rest of the batch.
+  const bypassFresh = !!(force || hasExpiredItems);
+
+  // Turns one /api/details payload into an Airing Next entry, or null when
+  // the show has no upcoming episode. Shared by the batch path and the
+  // per-id fallback below so both produce identical entries.
+  function airingEntryFrom(showId, d) {
+    if (!d || !d.nextEpisodeAirDate) return null;
+    if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    const known = knownByShow.get(showId);
+    const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
+    const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
+    return {
+      id: showId,
+      showId: showId,
+      canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
+      showTitle: (known && known.title) || d.title || '',
+      showPoster: (known && known.poster) || d.poster || '',
+      name: epName,
+      episodeTitle: epName,
+      airDate: d.nextEpisodeAirDate,
+      seasonNum: d.nextEpisodeSeasonNumber,
+      episodeNum: d.nextEpisodeNumber,
+      isSeasonPremiere: d.nextEpisodeNumber === 1,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: d.seasonFinaleAirDate || null,
+      seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      isUnaired: true,
+    };
+  }
+
+  // One request for the whole candidate set instead of up to 60 separate
+  // ones at a concurrency of 4 -- which was fifteen sequential waves of
+  // request latency before this shelf could be rebuilt. The server resolves
+  // each id through the same cached path a single /api/details call would
+  // have used, so this removes round trips rather than adding upstream
+  // calls. See /api/details/batch, 25_api-catalog-routes.js.
+  let batchOk = false;
+  try {
+    const batchRes = await fetch(ORIGIN + '/api/details/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ids: candidates,
+        type: 'series',
+        tmdbKey: tmdbKey,
+        fresh: bypassFresh ? '1' : '',
+      }),
+    });
+    const batchData = await batchRes.json();
+    if (batchData && batchData.ok && batchData.results) {
+      batchOk = true;
+      // Iterated over candidates rather than over the response keys so
+      // entries stay in candidate order, which is what the dedupe below
+      // relies on for its "keep the earliest" behaviour.
+      for (let i = 0; i < candidates.length; i++) {
+        const showId = candidates[i];
+        const entry = airingEntryFrom(showId, batchData.results[showId]);
+        if (entry) results.push(entry);
       }
     }
+  } catch (e) {
+    // Falls through to the per-id path below.
   }
-  await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
 
-  // Deduplicate by showId -- a show can appear under multiple IDs if Watch
-  // History recorded both an imdb and a tmdb-prefixed form; keep the first
-  // (earliest-resolved) entry for each show.
+  // Fallback for anything that did not get a usable batch response (an
+  // older self-hosted Worker without the batch route, or a network
+  // hiccup). Behaviourally identical to what this function did before.
+  if (!batchOk) {
+    let cursor = 0;
+    async function worker() {
+      while (cursor < candidates.length) {
+        const showId = candidates[cursor++];
+        try {
+          const bypass = bypassFresh ? '&fresh=1&_t=' + Date.now() : '';
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+          const data = await res.json();
+          const entry = airingEntryFrom(showId, data && data.ok ? data.details : null);
+          if (entry) results.push(entry);
+        } catch (e) {
+          // Network hiccup or no TMDB key configured -- this show is simply
+          // retried on the next refresh (or a manual "force" one) rather
+          // than blocking the rest of the batch.
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(AIRING_NEXT_CONCURRENCY, candidates.length) }, worker));
+  }
+
+  // Deduplicate by canonical TMDB ID or showId -- a show can appear under
+  // multiple IDs if Watch History recorded both an imdb and a tmdb-prefixed
+  // form; keep the first (earliest-resolved) entry for each show.
   const seenIds = new Set();
   const deduped = results.filter((it) => {
-    if (seenIds.has(it.showId)) return false;
-    seenIds.add(it.showId);
+    const normalizedShowId = it.showId.startsWith('tmdb:') ? it.showId.slice(5) : it.showId;
+    const key1 = it.canonicalTmdbId ? 'tmdb:' + it.canonicalTmdbId : 'id:' + normalizedShowId;
+    
+    if (seenIds.has(key1)) return false;
+    seenIds.add(key1);
+    
+    // Also track the original showId so we don't duplicate on fallback
+    if (seenIds.has('id:' + normalizedShowId)) return false;
+    seenIds.add('id:' + normalizedShowId);
+    
     return true;
   });
   deduped.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
@@ -31188,6 +33679,149 @@ async function refreshAiringNext(force) {
 // reads.
 setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
 
+// --- Watch History episode stills -------------------------------------------
+//
+// A Watch History entry keeps the episode's own still image in poster and
+// the series artwork in showPoster, and every renderer reads poster first,
+// falling back to showPoster. The paths that build an entry from TMDB
+// directly -- markShowWatched above, and the two scrobble handlers in
+// 26_api-creator-and-admin-routes.js -- all fill in the real still. The
+// import paths cannot: Trakt's and MDBList's history rows carry no
+// per-episode image at all, so they write the show poster into BOTH
+// fields. That is the whole of "sometimes the episodes get show posters":
+// scrobbled episodes have stills, imported ones never did.
+//
+// This fills them in afterwards from the same /api/season endpoint
+// markShowWatched already uses -- one call per show+season, and that
+// endpoint's TMDB fetch is edge-cached for a week, so a large history
+// costs a handful of cheap requests rather than one per episode. An
+// episode whose season genuinely has no still on TMDB simply keeps the
+// show poster, which is the intended fallback; the season is recorded as
+// checked so it is not re-fetched on every page load.
+const EPISODE_STILL_CHECKS_KEY = 'myListAddon:episodeStillChecks';
+const EPISODE_STILL_RECHECK_MS = 7 * 24 * 3600 * 1000;
+const EPISODE_STILL_MAX_GROUPS_PER_RUN = 12;
+const EPISODE_STILL_CONCURRENCY = 3;
+
+function loadEpisodeStillChecks() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(EPISODE_STILL_CHECKS_KEY) || '{}');
+    return (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveEpisodeStillChecks(checks) {
+  try {
+    localStorage.setItem(EPISODE_STILL_CHECKS_KEY, JSON.stringify(checks));
+  } catch (e) {}
+}
+
+// True when this entry is showing series artwork where an episode still
+// belongs. Three ways that happens: no poster at all, a poster identical
+// to the entry's own showPoster, or a metahub poster URL -- metahub only
+// ever serves show artwork, never episode stills, so one appearing in the
+// poster field is always a fallback that got written in.
+function needsEpisodeStill(it) {
+  if (!it) return false;
+  const isEpisode = it.type === 'episode' || (it.seasonNum != null && it.episodeNum != null);
+  if (!isEpisode) return false;
+  if (!it.showId || it.seasonNum == null || it.episodeNum == null) return false;
+  const poster = String(it.poster || '');
+  if (!poster) return true;
+  if (it.showPoster && poster === String(it.showPoster)) return true;
+  if (poster.indexOf('images.metahub.space/poster/') !== -1) return true;
+  return false;
+}
+
+async function backfillWatchHistoryEpisodeStills() {
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  const list = map['watch-history'];
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  if (!items.length) return 0;
+
+  const checks = loadEpisodeStillChecks();
+  const now = Date.now();
+  const groups = new Map();
+  items.forEach((it) => {
+    if (!needsEpisodeStill(it)) return;
+    const key = String(it.showId) + '|' + String(it.seasonNum);
+    const lastChecked = Number(checks[key]) || 0;
+    if (lastChecked && (now - lastChecked) < EPISODE_STILL_RECHECK_MS) return;
+    if (!groups.has(key)) groups.set(key, { showId: it.showId, seasonNum: it.seasonNum, items: [] });
+    groups.get(key).items.push(it);
+  });
+  if (!groups.size) return 0;
+
+  const pending = [...groups.entries()].slice(0, EPISODE_STILL_MAX_GROUPS_PER_RUN);
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  let changed = 0;
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < pending.length) {
+      const entry = pending[nextIdx++];
+      const key = entry[0];
+      const group = entry[1];
+      try {
+        const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(group.showId) +
+          '&seasonNum=' + encodeURIComponent(group.seasonNum) +
+          (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
+        const data = await res.json();
+        const episodes = (data && data.ok && data.season && Array.isArray(data.season.episodes)) ? data.season.episodes : null;
+        // A miss here is a network or TMDB failure, not "this season has
+        // no stills" -- deliberately left unrecorded so the next run
+        // retries it rather than writing it off for a week.
+        if (!episodes) continue;
+        const byNumber = new Map();
+        episodes.forEach((ep) => {
+          if (ep && ep.episode_number != null) byNumber.set(Number(ep.episode_number), ep);
+        });
+        group.items.forEach((it) => {
+          const ep = byNumber.get(Number(it.episodeNum));
+          if (!ep || !ep.still_path) return;
+          const raw = String(ep.still_path);
+          const still = raw.indexOf('http') === 0 ? raw : ('https://image.tmdb.org/t/p/w500' + raw);
+          if (it.poster === still) return;
+          // Keep the artwork that was in poster as the show-level
+          // fallback if this entry never had one recorded separately,
+          // so replacing poster can never leave it with nothing to fall
+          // back to.
+          if (!it.showPoster && it.poster) it.showPoster = it.poster;
+          it.poster = still;
+          changed++;
+        });
+        checks[key] = now;
+      } catch (e) {
+        // Same as above -- retried on the next run.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(EPISODE_STILL_CONCURRENCY, pending.length) }, worker));
+
+  saveEpisodeStillChecks(checks);
+  if (changed) {
+    list.items = items;
+    list.updatedAt = Date.now();
+    map['watch-history'] = list;
+    saveLocalCustomListsMap(map);
+    if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  }
+  return changed;
+}
+window.backfillWatchHistoryEpisodeStills = backfillWatchHistoryEpisodeStills;
+
+// Deliberately after the Airing Next kick above rather than alongside it:
+// both read the same Watch History out of localStorage, and this one is
+// the strictly less urgent of the two (a poster improving a moment later
+// is invisible; an Airing Next row that has not populated is not).
+setTimeout(() => { backfillWatchHistoryEpisodeStills().catch(() => {}); }, 1400);
+
 // Builds the "Airing Next" dashboard card -- deliberately not part of
 // buildLocalListCardHtml/renderAutoTrackedListsHtml (22_client-creator-
 // profile.js): unlike Continue Watching/Watch History it has no local
@@ -31206,22 +33840,41 @@ function buildAiringNextCardHtml() {
   const totalCount = filtered.length;
   const shown = filtered.slice(0, 9);
 
+  const showAirDate = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true;
+  const showPremiere = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true;
+  const showFinale = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true;
+  const showFinaleDate = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true;
+
   const posterThumbs = shown.map((it, i) => {
     const isMobileEnd = (i === 2 && shown.length > 3);
     const isDesktopEnd = (i === shown.length - 1 && shown.length >= 4);
     let overlays = '';
     if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only airingNextViewBtn" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+    const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
-    if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
+    if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
       const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
       if (badgeText) {
         dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
       }
     }
-    const premiereBadge = (it.isSeasonPremiere || it.episodeNum === 1)
-      ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>'
-      : '';
+    const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+    const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+    let bottomBadge = '';
+    if (isUnairedEp) {
+      if (showPremiere && isSeasonPremiere) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+      } else if (showFinale && it.isSeasonFinale) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+      } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+        const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+        if (finaleText) {
+          bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+        }
+      }
+    }
     const label = (typeof formatWatchItemLabel === 'function')
       ? formatWatchItemLabel(it)
       : {
@@ -31232,7 +33885,7 @@ function buildAiringNextCardHtml() {
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
-        premiereBadge +
+        bottomBadge +
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -31265,9 +33918,7 @@ function buildAiringNextCardHtml() {
   '</div>';
 }
 
-// Opens the full Airing Next list through the same generic list-details
-// page Continue Watching/Watch History already use -- see
-// openListDetailsPage's preloaded-sample branch (23_client-list-
+// Opens the dedicated full-page Airing Next view (openListDetailsPage, 23_list-
 // management.js), which renders straight from the sample array below
 // without needing a server-side catalog route.
 function openAiringNextDetailsPage() {
@@ -31288,6 +33939,9 @@ function openAiringNextDetailsPage() {
       airDate: it.airDate,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
+      isSeasonFinale: it.isSeasonFinale,
+      seasonFinaleAirDate: it.seasonFinaleAirDate,
+      seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber,
     };
   });
   openListDetailsPage('Airing Next', 'series', 'custom:airing-next', { sample: sample, count: sample.length, maybeMore: false });
@@ -31458,28 +34112,199 @@ let lastLocalCustomListsData = null; // cached result of the last local-dashboar
 // "Public" to mean anything, so a local save just saves, no modal at all.
 const LOCAL_CUSTOM_LISTS_KEY = 'myListAddon:localCustomLists';
 
+let _memoryCustomListsString = null;
+let _memoryCustomListsObj = null;
+
+function compactCustomListItem(it) {
+  if (!it || typeof it !== 'object') return it;
+  const clean = {
+    id: it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : undefined),
+    type: it.type || it.mediatype || it.kind || 'movie',
+    name: it.name || it.title || 'Untitled',
+  };
+  if (it.year) clean.year = String(it.year).slice(0, 4);
+  if (it.poster) clean.poster = it.poster;
+  if (it.showPoster && it.showPoster !== it.poster) clean.showPoster = it.showPoster;
+  if (it.showId) clean.showId = it.showId;
+  if (it.showTitle) clean.showTitle = it.showTitle;
+  if (it.seasonNum != null) clean.seasonNum = Number(it.seasonNum);
+  if (it.episodeNum != null) clean.episodeNum = Number(it.episodeNum);
+  if (it.season != null && clean.seasonNum == null) clean.seasonNum = Number(it.season);
+  if (it.episode != null && clean.episodeNum == null) clean.episodeNum = Number(it.episode);
+  if (it.watchedAt) clean.watchedAt = it.watchedAt;
+  if (it.imdbId) clean.imdbId = it.imdbId;
+  if (it.tmdbId) clean.tmdbId = it.tmdbId;
+  if (it.airDate) clean.airDate = it.airDate;
+  if (it.isUnaired) clean.isUnaired = true;
+  if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
+  if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
+  if (it.isSeasonFinale) clean.isSeasonFinale = true;
+  return clean;
+}
+
+// Told once per session, naming the lists and the count, because losing
+// items off the end of a list is not something a person can be expected to
+// notice on their own.
+let _trimNotified = false;
+function notifyListsTrimmed(trimmed) {
+  if (_trimNotified || !trimmed || !trimmed.length) return;
+  _trimNotified = true;
+  const detail = trimmed.slice(0, 4).map((t) => t.slug + ' (' + t.dropped + ')').join(', ');
+  const msg = 'Some lists are too large to store in this browser, so the oldest items were dropped to make them fit: ' +
+    detail + (trimmed.length > 4 ? ', and others' : '') +
+    '. Creating a Creator Profile stores your lists on your account instead, with no size limit.';
+  try {
+    if (typeof showAppAlert === 'function') showAppAlert('Some list items could not be kept', msg, false);
+    else console.warn(msg);
+  } catch (e) {}
+}
+window.notifyListsTrimmed = notifyListsTrimmed;
+
+// Lists trimmed by the most recent compaction pass -- see the note inside.
+let _lastCompactionTrimmed = [];
+
+function compactCustomListMap(map, maxItemsPerList) {
+  _lastCompactionTrimmed = [];
+  if (!map || typeof map !== 'object') return {};
+  const maxItems = maxItemsPerList || 1000;
+  const result = {};
+  for (const slug in map) {
+    const list = map[slug];
+    if (!list || typeof list !== 'object') continue;
+    const cleanList = {
+      slug: list.slug || slug,
+      name: list.name || 'Custom List',
+      type: list.type || 'mixed',
+      createdAt: list.createdAt,
+      updatedAt: list.updatedAt,
+      visibility: list.visibility || 'private',
+    };
+    if (list.localSlug) cleanList.localSlug = list.localSlug;
+    if (list.creatorSlug) cleanList.creatorSlug = list.creatorSlug;
+    if (list.isWatchlist) cleanList.isWatchlist = true;
+    if (list.isContinueWatching) cleanList.isContinueWatching = true;
+    if (list.isWatchHistory) cleanList.isWatchHistory = true;
+    if (Array.isArray(list.items)) {
+      // Truncation here is permanent: the trimmed map is what gets written
+      // AND what is held in memory afterwards, so anything cut is gone at
+      // the next save. A real account exported 1,157 watch-history items
+      // against a 1,000 cap -- the next successful save would have silently
+      // discarded 157 of them, and the 500-item retry path would have
+      // discarded 657. Record it so the caller can say so.
+      if (list.items.length > maxItems) {
+        _lastCompactionTrimmed.push({ slug: cleanList.slug, dropped: list.items.length - maxItems });
+      }
+      const trimmedItems = list.items.slice(0, maxItems);
+      cleanList.items = trimmedItems.map(compactCustomListItem);
+    } else {
+      cleanList.items = [];
+    }
+    result[slug] = cleanList;
+  }
+  return result;
+}
+
 function loadLocalCustomLists() {
   try {
-    return JSON.parse(localStorage.getItem(LOCAL_CUSTOM_LISTS_KEY) || '{}');
+    if (_memoryCustomListsObj && typeof _memoryCustomListsObj === 'object') return _memoryCustomListsObj;
+    let str = _memoryCustomListsString;
+    if (!str) {
+      try { str = sessionStorage.getItem(LOCAL_CUSTOM_LISTS_KEY); } catch(e) {}
+    }
+    if (!str) {
+      str = localStorage.getItem(LOCAL_CUSTOM_LISTS_KEY);
+    }
+    const map = JSON.parse(str || '{}');
+    if (map && typeof map === 'object') {
+      _memoryCustomListsString = str;
+      _memoryCustomListsObj = map;
+      return map;
+    }
+    return {};
   } catch (e) {
     return {};
   }
 }
-function saveLocalCustomListsMap(map) {
+
+// Shown once per session when local storage can no longer hold the custom
+// lists. Silence was the actual bug here -- the write failed, the UI said
+// nothing, and the loss only became visible much later.
+let _storageFullNotified = false;
+function notifyStorageFull(savedToAccount) {
+  if (_storageFullNotified) return;
+  _storageFullNotified = true;
+  const msg = savedToAccount
+    ? 'This browser has run out of local storage, so your lists are being saved to your account instead. Nothing has been lost. Removing a few very large lists or channels will restore offline access.'
+    : 'This browser has run out of local storage and your latest changes could NOT be saved. Create a Creator Profile to store your lists on your account, or remove a few very large lists or channels, then try again.';
   try {
-    localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, JSON.stringify(map));
+    if (typeof showAppAlert === 'function') showAppAlert('Local storage is full', msg, false);
+    else console.warn(msg);
+  } catch (e) {}
+}
+window.notifyStorageFull = notifyStorageFull;
+
+function saveLocalCustomListsMap(map) {
+  if (!map || typeof map !== 'object') return false;
+  
+  // Compact items to strip bloated descriptions/cast/extra metadata.
+  //
+  // The per-list cap exists only to fit the browser's ~5MB ceiling. A
+  // signed-in account stores each list as its own server-side record with no
+  // such ceiling, so capping there is pure data loss for no benefit -- the
+  // limit is raised well clear of any realistic list. Signed out, the cap
+  // still applies (there is nowhere else for the data to go), but it is no
+  // longer silent.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  const leanMap = compactCustomListMap(map, signedIn ? 100000 : 1000);
+  if (_lastCompactionTrimmed.length) {
+    notifyListsTrimmed(_lastCompactionTrimmed.slice());
+  }
+  _memoryCustomListsObj = leanMap;
+  
+  try {
+    const str = JSON.stringify(leanMap);
+    _memoryCustomListsString = str;
+    
+    // Always attempt to save to sessionStorage as a fast backup
+    try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str); } catch(e) {}
+    
+    localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str);
     return true;
   } catch (e) {
-    // Most commonly a QuotaExceededError -- localStorage is capped
-    // (~5-10MB per origin depending on browser) and every Custom List
-    // lives in one combined blob under this key, so a large import (or
-    // just a lot of accumulated lists already) can push a save over the
-    // limit. Callers now get told about this instead of it failing
-    // silently -- see saveItemsAsNewCustomList below, which used to
-    // report { ok: true } here unconditionally even when this write
-    // never actually landed.
-    console.error('saveLocalCustomListsMap failed:', e);
-    return false;
+    // If quota exceeded, try a tighter compression (500 items max per list)
+    try {
+      const ultraLeanMap = compactCustomListMap(map, 500);
+      if (_lastCompactionTrimmed.length) {
+        notifyListsTrimmed(_lastCompactionTrimmed.slice());
+      }
+      _memoryCustomListsObj = ultraLeanMap;
+      const ultraStr = JSON.stringify(ultraLeanMap);
+      _memoryCustomListsString = ultraStr;
+      try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, ultraStr); } catch(e) {}
+      localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, ultraStr);
+      return true;
+    } catch (retryErr) {
+      // Both writes failed. This used to return true regardless, which meant
+      // every caller believed a save had happened when nothing had been
+      // written -- the data lived only in memory, and the next page load read
+      // whatever older copy localStorage still held. That is how one account
+      // lost 24 of its 51 custom lists with no error shown anywhere.
+      //
+      // It now reports the truth. For a signed-in account the data is pushed
+      // straight to the server instead, which has no such ceiling, and THAT
+      // is a real save -- so true is honest there. For everyone else it is a
+      // failure, and the caller (and the person) get told.
+      console.warn('saveLocalCustomListsMap: localStorage quota exceeded:', retryErr.message || retryErr);
+      window._localStorageFull = true;
+      if (typeof activeCreator !== 'undefined' && activeCreator) {
+        try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (e) {}
+        try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (e) {}
+        notifyStorageFull(true);
+        return true;
+      }
+      notifyStorageFull(false);
+      return false;
+    }
   }
 }
 
@@ -31595,8 +34420,8 @@ async function migrateLocalCustomListsToAccount() {
   if (failedCount) {
     alert(
       migratedCount
-        ? migratedCount + ' list' + (migratedCount === 1 ? '' : 's') + ' moved to your account, but ' + failedCount + ' couldn\\'t be moved -- they\\'re still saved locally, try again from this browser.'
-        : 'Could not move your local lists to your account -- they\\'re still saved locally, try again from this browser.'
+        ? migratedCount + ' list' + (migratedCount === 1 ? '' : 's') + " moved to your account, but " + failedCount + " couldn't be moved -- they're still saved locally, try again from this browser."
+        : "Could not move your local lists to your account -- they're still saved locally, try again from this browser."
     );
   }
 }
@@ -31664,12 +34489,86 @@ function renderAccountKeySection() {
     '<button type="button" class="secondary" onclick="copyAccountKey()">Copy Key</button>' +
     '</div>' +
     '<p style="margin-top:10px;"><small>Anyone with this key can sign in as you and edit your lists &mdash; keep it somewhere safe, and don&apos;t share it.</small></p>' +
-    '<div class="danger-zone" style="margin-top:20px; padding:14px 16px; border:1px solid rgba(255,59,48,0.3); border-radius:12px; background:rgba(255,59,48,0.05);">' +
+    '<div class="danger-zone" style="margin-top:20px; padding:14px 16px; border:1px solid rgba(255,149,0,0.35); border-radius:12px; background:rgba(255,149,0,0.06);">' +
+      '<div style="font-weight:700; font-size:0.9rem; color:#ff9500; margin-bottom:4px;">Reset Account</div>' +
+      '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Delete every list, channel, preset, watch history entry and catalog row on this account, returning it to how it was when you created it. Your account and key stay the same, and you stay signed in.</p>' +
+      '<button type="button" class="lc-btn" style="background:#ff9500; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openResetAccountModal()">Reset Account Data</button>' +
+    '</div>' +
+    '<div class="danger-zone" style="margin-top:12px; padding:14px 16px; border:1px solid rgba(255,59,48,0.3); border-radius:12px; background:rgba(255,59,48,0.05);">' +
       '<div style="font-weight:700; font-size:0.9rem; color:var(--danger, #ff3b30); margin-bottom:4px;">Delete Account</div>' +
       '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Permanently delete your account, all published lists, and all synced data from the server.</p>' +
       '<button type="button" class="lc-btn" style="background:#ff3b30; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openDeleteAccountModal()">Delete Account &amp; All Data</button>' +
     '</div>';
 }
+
+// Empties the account without deleting it: every list, channel, preset,
+// catalog row and tracking record goes, the account and its key stay, and
+// the person remains signed in on a blank slate.
+//
+// Local state is cleared FIRST and the server call made second, deliberately.
+// The reverse order leaves a window where the browser still holds the old
+// lists and any autosave, scrobble ping or background sync landing in that
+// window would push them straight back up to the account that was just
+// wiped. Clearing locally first means the worst case is a browser that has
+// forgotten data the server still holds -- recoverable by signing in again --
+// rather than a reset that silently undoes itself.
+async function openResetAccountModal() {
+  if (!activeCreator) return;
+  const confirmFn = typeof showAppConfirm === 'function'
+    ? showAppConfirm
+    : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Reset Account Data',
+    'This deletes every list, channel, preset, catalog row and watch history entry on your account, on this device and on the server. Your account name and key stay the same and you will remain signed in. This cannot be undone.',
+    'Reset Everything',
+    async () => {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      const creatorName = activeCreator.creatorName;
+      const displayName = activeCreator.displayName;
+      if (!creatorKey) return;
+
+      // Stop anything in flight from re-uploading what we are about to clear.
+      window._suppressCreatorSync = true;
+      try {
+        if (typeof clearLocalAccountData === 'function') clearLocalAccountData();
+
+        const res = await fetch(ORIGIN + '/api/creator/account/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ creatorName: creatorName, creatorKey: creatorKey, confirm: 'RESET' }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          const msg = (data && data.error) || 'The reset could not be completed.';
+          if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', msg + ' Your local data has been cleared; sign in again to restore it from your account.', false);
+          else alert(msg);
+          return;
+        }
+
+        // clearLocalAccountData signs the person out as a side effect, so put
+        // them back where they were -- on their own, now-empty account.
+        // The same three keys sign-in writes (see signInCreatorProfile) --
+        // not an 'activeCreator' blob, which nothing reads.
+        activeCreator = { creatorName: creatorName, displayName: displayName };
+        localStorage.setItem('myListAddon:creatorName', creatorName);
+        localStorage.setItem('myListAddon:creatorDisplayName', displayName || creatorName);
+        localStorage.setItem('myListAddon:creatorKey', creatorKey);
+
+        if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+        if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+        if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Account Reset', 'Your account is now empty and ready to start again.', true);
+        }
+      } catch (e) {
+        if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', 'Could not reach the server. Your local data has been cleared; sign in again to restore it from your account.', false);
+      } finally {
+        window._suppressCreatorSync = false;
+      }
+    }
+  );
+}
+window.openResetAccountModal = openResetAccountModal;
 
 function openDeleteAccountModal() {
   if (!activeCreator) return;
@@ -31927,9 +34826,9 @@ function renderHiddenListsSettingsSection() {
   }).join('') : '<p style="color:var(--muted); font-size:0.85rem; margin-top:8px;"><small>No individual lists found yet -- visit My Lists (and connect any providers you use) first.</small></p>';
 
   box.innerHTML =
-    '<p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Whole sections</p>' +
+    '<p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Whole Sections</p>' +
     sectionsHtml +
-    '<p style="margin:14px 0 6px; font-weight:600; font-size:0.85rem;">Individual lists</p>' +
+    '<p style="margin:14px 0 6px; font-weight:600; font-size:0.85rem;">Individual Lists</p>' +
     rowsHtml;
 }
 
@@ -31954,13 +34853,22 @@ function renderTrackPlaybackSection() {
   const box = document.getElementById('trackPlaybackSection');
   if (!box) return;
   if (!activeCreator) {
-    box.innerHTML = '<p><small>Sign in to a Creator Profile above to enable automatic scrobbling \u2014 without one, there\u2019s no account on file to sync playback to.</small></p>';
+    box.innerHTML = '<p><small>Sign in to a Profile above to enable automatic scrobbling \u2014 without one, there\u2019s no account on file to sync playback to.</small></p>';
     return;
   }
   let enabled = false;
   try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  const webhookUrl = ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(activeCreator.creatorName) + '&key=' + encodeURIComponent(creatorKey);
+  const webhookUrl = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
+
+  let filterUsers = false;
+  let allowedUsers = '';
+  let blockAnon = false;
+  try {
+    allowedUsers = localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '';
+    filterUsers = localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' || (allowedUsers.trim().length > 0);
+    blockAnon = localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1';
+  } catch (e) {}
 
   box.innerHTML =
     '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
@@ -31978,6 +34886,27 @@ function renderTrackPlaybackSection() {
       '<div class="webhook-input-group">' +
         '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
         '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
+      '</div>' +
+
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 4px;">' +
+          '<input type="checkbox" id="scrobbleFilterUsersCb" ' + (filterUsers ? 'checked' : '') + ' onchange="onScrobbleFilterUsersToggle(this)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+          '<span style="font-weight:600;">Enable Media Server User Filtering</span>' +
+        '</label>' +
+        '<p style="margin:0 0 8px; color:var(--muted); font-size:0.8rem;">When enabled, only selected or specified media server user profiles will scrobble into your lists. Unselected users will be ignored.</p>' +
+        '<div id="scrobbleFilterDetails" style="' + (filterUsers ? '' : 'display:none;') + ' margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06);">' +
+          '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">' +
+            '<p style="margin:0; font-size:0.8rem; font-weight:600; color:var(--text);">Select Allowed Users:</p>' +
+            '<button type="button" class="secondary lc-btn" onclick="loadScrobbleSeenUsers()" style="padding:3px 8px; font-size:0.75rem;">Refresh Users</button>' +
+          '</div>' +
+          '<div id="scrobbleSeenUsersBox" style="font-size:0.82rem; color:var(--muted); margin-bottom:10px;"><small>Loading\u2026</small></div>' +
+          '<p style="margin:0 0 4px; font-size:0.8rem; color:var(--muted);">Additional / Manual Usernames (comma-separated):</p>' +
+          '<input type="text" id="scrobbleAllowedUsersInput" placeholder="e.g. James, Alice" value="' + escapeHtml(allowedUsers) + '" oninput="onScrobbleAllowedUsersChange()" style="width:100%; box-sizing:border-box; margin-bottom:8px; font-size:0.84rem;">' +
+          '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.84rem; user-select:none; margin:0;">' +
+            '<input type="checkbox" id="scrobbleBlockAnonCb" ' + (blockAnon ? 'checked' : '') + ' onchange="onScrobbleBlockAnonChange(this)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+            '<span>Block scrobbles with no username in the payload</span>' +
+          '</label>' +
+        '</div>' +
       '</div>' +
 
       '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
@@ -32013,6 +34942,135 @@ function renderTrackPlaybackSection() {
     '<div id="trackPlaybackStatus" style="margin-top:8px;"></div>';
 
   refreshTrackPlaybackStatus();
+  loadScrobbleSeenUsers();
+}
+
+function buildScrobbleWebhookUrl(creatorName, creatorKey) {
+  return ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(creatorName) + '&key=' + encodeURIComponent(creatorKey);
+}
+
+function onScrobbleFilterUsersToggle(cb) {
+  try { localStorage.setItem('myListAddon:scrobbleFilterUsers', cb.checked ? '1' : '0'); } catch (e) {}
+  const details = document.getElementById('scrobbleFilterDetails');
+  if (details) details.style.display = cb.checked ? '' : 'none';
+  if (cb.checked) {
+    syncScrobbleUserCheckboxes();
+  }
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+function onScrobbleAllowedUsersChange() {
+  try {
+    const val = (document.getElementById('scrobbleAllowedUsersInput') || {}).value || '';
+    localStorage.setItem('myListAddon:scrobbleAllowedUsers', val);
+    const filterCb = document.getElementById('scrobbleFilterUsersCb');
+    if (filterCb && !filterCb.checked && val.trim().length > 0) {
+      filterCb.checked = true;
+      localStorage.setItem('myListAddon:scrobbleFilterUsers', '1');
+      const details = document.getElementById('scrobbleFilterDetails');
+      if (details) details.style.display = '';
+    }
+  } catch (e) {}
+  syncScrobbleUserCheckboxes();
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+function onScrobbleBlockAnonChange(cb) {
+  try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', cb.checked ? '1' : '0'); } catch (e) {}
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+function _refreshScrobbleWebhookInput() {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  input.value = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
+}
+
+function syncScrobbleUserCheckboxes() {
+  const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const checkboxes = document.querySelectorAll('.scrobble-user-cb');
+  checkboxes.forEach((cb) => {
+    cb.checked = allowed.includes(cb.value.toLowerCase());
+  });
+}
+
+function onScrobbleUserCheckboxToggle() {
+  try {
+    const currentAllowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const checkboxes = Array.from(document.querySelectorAll('.scrobble-user-cb'));
+    const detectedNames = checkboxes.map((cb) => cb.value.toLowerCase());
+    const manualKept = currentAllowed.filter((name) => !detectedNames.includes(name.toLowerCase()));
+    const checkedDetected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+    const combined = [...manualKept, ...checkedDetected];
+    const val = combined.join(', ');
+    localStorage.setItem('myListAddon:scrobbleAllowedUsers', val);
+    const input = document.getElementById('scrobbleAllowedUsersInput');
+    if (input) input.value = val;
+    // When a checkbox is toggled, ensure user filter is enabled
+    localStorage.setItem('myListAddon:scrobbleFilterUsers', '1');
+    const filterCb = document.getElementById('scrobbleFilterUsersCb');
+    if (filterCb) filterCb.checked = true;
+    const details = document.getElementById('scrobbleFilterDetails');
+    if (details) details.style.display = '';
+  } catch (e) {}
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+async function loadScrobbleSeenUsers() {
+  const box = document.getElementById('scrobbleSeenUsersBox');
+  if (!box || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">Checking detected users\u2026</span>';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-seen-users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.users || !Object.keys(data.users).length) {
+      box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">No users detected yet. Once Plex, Jellyfin, or Emby sends a webhook event, detected user profiles will appear here as selectable checkboxes.</span>';
+      return;
+    }
+    const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+    let html = '<div style="display:flex; flex-direction:column; gap:4px; margin-top:4px;">';
+    for (const [username, info] of Object.entries(data.users)) {
+      const isChecked = allowed.includes(username.toLowerCase());
+      let timeStr = '';
+      if (info && info.lastSeen) {
+        const diff = Math.max(0, Date.now() - info.lastSeen);
+        const mins = Math.floor(diff / 60000);
+        if (mins < 1) timeStr = ' \u2014 seen just now';
+        else if (mins < 60) timeStr = ' \u2014 seen ' + mins + 'm ago';
+        else {
+          const hours = Math.floor(mins / 60);
+          if (hours < 24) timeStr = ' \u2014 seen ' + hours + 'h ago';
+          else timeStr = ' \u2014 seen ' + Math.floor(hours / 24) + 'd ago';
+        }
+      }
+      const serverName = (info && info.server) || 'Media Server';
+      html +=
+        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.84rem; padding:3px 0;">' +
+          '<input type="checkbox" class="scrobble-user-cb" value="' + escapeHtml(username) + '" ' + (isChecked ? 'checked' : '') + ' onchange="onScrobbleUserCheckboxToggle()" style="width:15px; height:15px; cursor:pointer; flex:none;">' +
+          '<span><strong>' + escapeHtml(username) + '</strong> <span style="color:var(--muted); font-size:0.78rem;">(' + escapeHtml(serverName) + timeStr + ')</span></span>' +
+        '</label>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">Could not load detected users right now.</span>';
+  }
 }
 
 function copyScrobbleWebhookUrl() {
@@ -32064,6 +35122,7 @@ async function refreshTrackPlaybackStatus() {
     }
     const when = new Date(data.lastPingAt).toLocaleString();
     const serverLabel = data.lastServer ? '<strong>' + escapeHtml(data.lastServer) + '</strong>' : '<strong>In-App Streaming Player</strong>';
+    const userLabel = data.lastUser ? ' &bull; User: <strong>' + escapeHtml(data.lastUser) + '</strong>' : '';
     const rawMatched = data.matched || data.lastPingId || 'OK';
     const displayMatched = rawMatched.replace(/^(yes|no|error)\b/i, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
     statusBox.innerHTML =
@@ -32073,7 +35132,7 @@ async function refreshTrackPlaybackStatus() {
           '<span style="color:var(--muted); font-size:0.78rem;">' + escapeHtml(when) + '</span>' +
         '</div>' +
         '<div style="color:var(--text);">' +
-          'Source: ' + serverLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(displayMatched) + '</code>' +
+          'Source: ' + serverLabel + userLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(displayMatched) + '</code>' +
         '</div>' +
       '</div>';
   } catch (e) {
@@ -32096,6 +35155,7 @@ function clearLocalAccountData() {
   activeCreator = null;
   editingCreatorListSlug = null;
   lastCreatorListsData = null;
+  resetCreatorListsCache();
 
   // Clear in-memory tokens and credentials
   traktAccessToken = '';
@@ -32114,13 +35174,31 @@ function clearLocalAccountData() {
   window._myTmdbLists = [];
   window._mySimklLists = [];
   window._myMdblistLists = [];
-  window._dismissedContinueWatching = new Set();
+  // Read everywhere else as a plain object (Object.keys(...), map lookups by
+  // show id), so resetting it to a Set left a value nothing could use.
+  window._dismissedContinueWatching = {};
   window._fullyWatchedShowIds = new Set();
+  window._inProgressShowIds = new Set();
+
+  // The watch-badge index. Left in place, the previous account's watched
+  // ticks kept appearing on posters after signing out.
+  window._watchedItemIds = new Set();
+  window._rawWatchHistoryItems = [];
+  window._watchedIndexLength = 0;
+  window._currentItemDetails = null;
+  window._episodeDataCache = {};
+  window._currentListDetailsAllItems = [];
+
+  // Caches held by other modules that key off the same data.
+  if (typeof resetPresetsCache === 'function') resetPresetsCache();
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
   if (typeof channelDraftItems !== 'undefined') channelDraftItems = [];
   if (typeof channelDraftPoster !== 'undefined') channelDraftPoster = null;
   if (typeof channelDraftBackdrop !== 'undefined') channelDraftBackdrop = null;
   if (typeof editingChannelId !== 'undefined') editingChannelId = null;
   if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
+  _memoryCustomListsString = null;
+  _memoryCustomListsObj = null;
 
   // Clear all localStorage keys for account data, credentials, and custom lists
   try {
@@ -32150,6 +35228,24 @@ function clearLocalAccountData() {
       }
     }
     keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch (e) {}
+
+  // The reason signing out left Watch History, Continue Watching, Watchlist,
+  // Airing Next and every Custom List on screen: saveLocalCustomListsMap
+  // mirrors the map into sessionStorage as a fast backup, and
+  // loadLocalCustomLists reads sessionStorage BEFORE localStorage. Wiping
+  // only localStorage therefore cleared the slower copy and left the one
+  // that actually gets read, so the next render pulled the signed-out
+  // account's lists straight back.
+  try {
+    const sessionKeys = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && (k.indexOf('myListAddon:') === 0 || k === 'localCustomLists' || k === 'localChannels' || k === 'localMergedChannels' || k === 'presets')) {
+        sessionKeys.push(k);
+      }
+    }
+    sessionKeys.forEach((k) => sessionStorage.removeItem(k));
   } catch (e) {}
 
   // Clear form inputs
@@ -32410,7 +35506,11 @@ let presetsSyncTimer = null;
 function schedulePresetsSync() {
   if (!activeCreator) return;
   if (presetsSyncTimer) clearTimeout(presetsSyncTimer);
-  presetsSyncTimer = setTimeout(() => { pushPresetsDirectly(loadPresetsMap()); }, 1200);
+  presetsSyncTimer = setTimeout(() => {
+    const fn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+    const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+    if (fn) fn(getMapFn());
+  }, 1200);
 }
 
 // Debounced sibling of scheduleCreatorSyncSave, just for TV Channels --
@@ -32424,6 +35524,10 @@ function scheduleChannelsSync() {
 }
 
 async function pushChannelsSync() {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
   if (typeof activeCreator === 'undefined' || !activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
@@ -32456,14 +35560,26 @@ async function pushChannelsSync() {
 // catalog rows showing "No items found" even though the browser's own
 // local copy looked complete.
 let trackingSyncTimer = null;
+let _pendingIntentionalRemoval = false;
 function scheduleTrackingSync(opts) {
   if (!activeCreator) return;
   if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
-  const intentionalRemoval = !!(opts && opts.intentionalRemoval);
-  trackingSyncTimer = setTimeout(() => pushTrackingSync({ intentionalRemoval }), 300);
+  if (opts && opts.intentionalRemoval) {
+    _pendingIntentionalRemoval = true;
+    try { localStorage.setItem('myListAddon:lastIntentionalRemoval', Date.now()); } catch(e) {}
+  }
+  trackingSyncTimer = setTimeout(() => {
+    const flag = _pendingIntentionalRemoval;
+    _pendingIntentionalRemoval = false;
+    pushTrackingSync({ intentionalRemoval: flag });
+  }, 300);
 }
 
 async function pushCreatorSync() {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
@@ -32493,20 +35609,154 @@ async function pushCreatorSync() {
         })(),
       }),
     });
+    window._lastCreatorSyncPushedAt = Date.now();
   } catch (e) {
     // silently fail, it's a background sync
   }
 }
 
+// Cheap fingerprint of everything pushTrackingSync would send, used to
+// skip the request entirely when none of it has actually changed.
+//
+// scheduleCreatorSyncSave calls scheduleTrackingSync in lockstep on
+// purpose (see its own comment -- it avoids auditing every call site for
+// whether it happens to touch tracking data), but the consequence was
+// that collapsing a panel, reordering a row, or renaming a preset each
+// re-uploaded a watchHistory that can run to thousands of items, and made
+// the server re-read, merge and rewrite the whole record for nothing.
+// Keeping the lockstep call but making the push itself a no-op when
+// nothing tracking-related moved gets the same safety with none of the
+// cost.
+//
+// Deliberately NOT a hash of the full payload -- building that string is
+// most of the work being avoided. Length plus the first and last id plus
+// the newest watchedAt of each list catches every real mutation (add,
+// remove, reorder, re-watch), and anything it somehow missed is corrected
+// by the heartbeat below rather than lost.
+// --- Discover recommendations snapshot --------------------------------------
+//
+// The Discover tab's Recommended Movies/Recommended Shows cards are built
+// in the browser from this account's whole picture: Continue Watching,
+// Watch History, Watchlist and every other custom list. The catalog row
+// those cards add (custom:curated:recommended-movies) is served by
+// fetchCuratedCatalog (05_catalog-core.js), which can only see whatever
+// tracking data reached the server -- so left to re-derive, it produced a
+// different set of items, and a different number of them, from the card
+// that advertised the list. Carrying the rendered list up with the rest of
+// the tracking data is the same approach Airing Next already takes, and
+// for the same reason.
+const CURATED_RECS_KEY = 'myListAddon:curatedRecommendations';
+
+function loadCuratedRecommendations() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CURATED_RECS_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      movies: Array.isArray(raw.movies) ? raw.movies : [],
+      shows: Array.isArray(raw.shows) ? raw.shows : [],
+      updatedAt: Number(raw.updatedAt) || 0,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Same cheap-fingerprint idea as trackingSyncSignature's own listSig --
+// length plus the first and last id of each side. Enough to notice the
+// recommendations actually changing without stringifying eighty items on
+// every autosave.
+function curatedRecsSignature(blob) {
+  if (!blob) return '0';
+  var m = Array.isArray(blob.movies) ? blob.movies : [];
+  var s = Array.isArray(blob.shows) ? blob.shows : [];
+  function ends(arr) {
+    if (!arr.length) return '0';
+    return arr.length + '/' + ((arr[0] && arr[0].id) || '') + '/' + ((arr[arr.length - 1] && arr[arr.length - 1].id) || '');
+  }
+  return ends(m) + '|' + ends(s);
+}
+
+// Called by the Discover tab every time it renders those two cards (see
+// 19_client-search-and-likes.js). Writing unconditionally would bump
+// updatedAt on every visit and make the tracking signature look changed,
+// forcing a pointless full push each time -- so an unchanged list is a
+// no-op.
+function persistCuratedRecommendations(movies, shows) {
+  const blob = {
+    movies: Array.isArray(movies) ? movies : [],
+    shows: Array.isArray(shows) ? shows : [],
+    updatedAt: Date.now(),
+  };
+  if (!blob.movies.length && !blob.shows.length) return;
+  const existing = loadCuratedRecommendations();
+  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob)) return;
+  try {
+    localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(blob));
+  } catch (e) {}
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+}
+window.persistCuratedRecommendations = persistCuratedRecommendations;
+
+function trackingSyncSignature(localMap) {
+  function listSig(items) {
+    if (!Array.isArray(items) || !items.length) return '0';
+    var first = items[0] || {};
+    var last = items[items.length - 1] || {};
+    var newest = 0;
+    for (var i = 0; i < items.length; i++) {
+      var w = (items[i] && items[i].watchedAt) || 0;
+      if (w > newest) newest = w;
+    }
+    return items.length + '/' + (first.id || first.imdbId || first.showId || '') +
+      '/' + (last.id || last.imdbId || last.showId || '') + '/' + newest;
+  }
+  var wl = localMap['watchlist'] || {};
+  return [
+    listSig((localMap['watch-history'] || {}).items),
+    listSig((localMap['continue-watching'] || {}).items),
+    listSig((localMap['airing-next'] || {}).items),
+    curatedRecsSignature(loadCuratedRecommendations()),
+    listSig(wl.items),
+    Number(wl.updatedAt) || 0,
+    (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
+    Object.keys(window._dismissedContinueWatching || {}).length,
+    localStorage.getItem('myListAddon:trackPlayback') === '1' ? 1 : 0,
+    localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0' ? 1 : 0,
+    localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' ? 1 : 0,
+    localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
+    localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1' ? 1 : 0,
+  ].join('|');
+}
+
+// Even with an unchanged signature, push at least this often. A scrobble
+// landing server-side is rescued by save-tracking's own merge, so this is
+// purely a self-healing floor: if the signature ever failed to notice
+// something, the account is at most this far out of date rather than
+// permanently stale.
+var TRACKING_SYNC_HEARTBEAT_MS = 10 * 60 * 1000;
+
 // Pushes Watch History/Continue Watching tracking data straight to the
 // account's dedicated tracking record (see /api/creator/sync/save-
 // tracking) -- the ONLY path this data travels to the server through now.
 async function pushTrackingSync(opts) {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
     const localMap = loadLocalCustomLists();
+    // An intentional removal must always reach the server -- it is the one
+    // push whose whole purpose is to make the stored list shorter, and
+    // save-tracking treats it specially (it skips the scrobble rescue).
+    const isIntentional = !!(opts && opts.intentionalRemoval);
+    const sig = trackingSyncSignature(localMap);
+    const sinceLast = Date.now() - (window._lastTrackingSyncPushedAt || 0);
+    if (!isIntentional && sig === window._lastTrackingSig && sinceLast < TRACKING_SYNC_HEARTBEAT_MS) {
+      return;
+    }
     const wl = localMap['watchlist'] || {};
     const wlItems = Array.isArray(wl.items) ? wl.items : [];
     const wlUpdatedAt = Number(wl.updatedAt) || Date.now();
@@ -32526,10 +35776,14 @@ async function pushTrackingSync(opts) {
         watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
         continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
         airingNext: (localMap['airing-next'] && localMap['airing-next'].items) || [],
+        curatedRecommendations: loadCuratedRecommendations(),
         watchlist: wlItems,
         watchlistUpdatedAt: wlUpdatedAt,
         trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
         removeWatchedFromWatchlist: localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0',
+        scrobbleFilterUsers: localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1',
+        scrobbleAllowedUsers: localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
+        scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
         // Set only by flows that are deliberately shrinking Watch History
@@ -32541,6 +35795,8 @@ async function pushTrackingSync(opts) {
         intentionalRemoval: !!(opts && opts.intentionalRemoval),
       }),
     });
+    window._lastTrackingSyncPushedAt = Date.now();
+    window._lastTrackingSig = sig;
   } catch (e) {
     // silently fail, it's a background sync
   }
@@ -32553,7 +35809,8 @@ async function pushTrackingSync(opts) {
 // account's first save. A real 'data' means the opposite: signing in
 // replaces this browser's local state with the account's, the same way
 // signing into any other synced account would.
-async function loadCreatorSync() {
+async function loadCreatorSync(opts) {
+  const isBackgroundResume = !!(opts && opts.background);
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
@@ -32565,6 +35822,7 @@ async function loadCreatorSync() {
     });
     const data = await res.json();
     if (!data.ok) return;
+    window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
       pushCreatorSync();
       const localPresets = loadPresetsMap();
@@ -32578,13 +35836,43 @@ async function loadCreatorSync() {
       return;
     }
     const synced = data.data;
-    suppressSave = true;
-    document.getElementById('lists').innerHTML = '';
-    if (Array.isArray(synced.config)) {
-      synced.config.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+    // Snapshot of the four stamps this browser is now level with. The
+    // background poll compares /api/creator/sync/meta against exactly
+    // these and skips the full load when none of them has moved -- see
+    // handleForegroundResumeSync below.
+    window._syncMetaStamps = {
+      config: Number(synced.updatedAt) || 0,
+      tracking: Number(synced.trackingUpdatedAt) || 0,
+      presets: Number(synced.presetsUpdatedAt) || 0,
+      channels: Number(synced.channelsUpdatedAt) || 0,
+    };
+    const timeChanged = typeof window._serverSyncUpdatedAt === 'undefined' || (synced.updatedAt && synced.updatedAt > window._serverSyncUpdatedAt);
+    if (synced.updatedAt !== undefined) window._serverSyncUpdatedAt = synced.updatedAt;
+    
+    const currentConfigStr = JSON.stringify(synced.config || []);
+    const configDataChanged = currentConfigStr !== window._lastConfigStr;
+    window._lastConfigStr = currentConfigStr;
+    
+    const configChanged = timeChanged && configDataChanged;
+
+    const trackingChanged = typeof window._serverTrackingUpdatedAt === 'undefined' || (synced.trackingUpdatedAt && synced.trackingUpdatedAt > window._serverTrackingUpdatedAt);
+    if (synced.trackingUpdatedAt !== undefined) window._serverTrackingUpdatedAt = synced.trackingUpdatedAt;
+
+    // Only rebuild lists table DOM if the list config actually changed or it's a full initial load
+    if (!isBackgroundResume || configChanged) {
+      suppressSave = true;
+      document.getElementById('lists').innerHTML = '';
+      if (Array.isArray(synced.config)) {
+        synced.config.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+      }
+      renumber();
+      suppressSave = false;
+
+      // Re-trigger live preview if catalogs tab has already been visited
+      if (window._catalogsInitializedOnce && typeof renderLivePreview === 'function') {
+        renderLivePreview();
+      }
     }
-    renumber();
-    suppressSave = false;
 
     // Restore hidden lists state from sync so the selections survive
     // cross-browser logins. Both keys live only in localStorage locally;
@@ -32595,14 +35883,6 @@ async function loadCreatorSync() {
     if (Array.isArray(synced.hiddenMyListsSections)) {
       try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
       if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
-    }
-
-    // Re-trigger the live preview if the Catalogs tab has already been
-    // visited this page load -- loadCreatorSync wipes and rebuilds #lists
-    // which resets every row to its "Click Refresh Preview" placeholder,
-    // so the preview needs to run again after the rebuild completes.
-    if (window._catalogsInitializedOnce && typeof renderLivePreview === 'function') {
-      renderLivePreview();
     }
 
     if (synced.channels && typeof synced.channels === 'object') {
@@ -32620,14 +35900,38 @@ async function loadCreatorSync() {
     
     if (synced.presetsB64) {
       decompressBase64ToJson(synced.presetsB64).then(parsedPresets => {
-        if (parsedPresets) {
-          savePresetsMap(parsedPresets);
-          renderPresetsList();
+        const normFn = (typeof extractNormalizedPresetsMap === 'function') ? extractNormalizedPresetsMap : (window.extractNormalizedPresetsMap || (x => x));
+        const normalized = normFn(parsedPresets);
+        if (normalized && typeof normalized === 'object' && Object.keys(normalized).length > 0) {
+          const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+          const saveMapFn = (typeof savePresetsMap === 'function') ? savePresetsMap : (window.savePresetsMap || (() => {}));
+          const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+          const localMap = getMapFn();
+          const merged = { ...localMap, ...normalized };
+          saveMapFn(merged);
+          renderFn();
         }
-      });
-    } else if (synced.presets && typeof synced.presets === 'object') {
-      savePresetsMap(synced.presets);
-      renderPresetsList();
+      }).catch(() => {});
+    } else if (synced.presets && typeof synced.presets === 'object' && Object.keys(synced.presets).length > 0) {
+      const normFn = (typeof extractNormalizedPresetsMap === 'function') ? extractNormalizedPresetsMap : (window.extractNormalizedPresetsMap || (x => x));
+      const normalized = normFn(synced.presets);
+      const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+      const saveMapFn = (typeof savePresetsMap === 'function') ? savePresetsMap : (window.savePresetsMap || (() => {}));
+      const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+      const localMap = getMapFn();
+      const merged = { ...localMap, ...normalized };
+      saveMapFn(merged);
+      renderFn();
+    } else {
+      // Server presets are empty: keep local presets and push them up to sync so they are preserved in Cloudflare KV
+      const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+      const pushFn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+      const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+      const localMap = getMapFn();
+      if (localMap && Object.keys(localMap).length > 0) {
+        if (pushFn) pushFn(localMap);
+      }
+      renderFn();
     }
     
     applyCollapsedPanelsState(synced.collapsedPanels);
@@ -32638,6 +35942,18 @@ async function loadCreatorSync() {
     if (typeof synced.removeWatchedFromWatchlist === 'boolean') {
       try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', synced.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
       if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+    }
+    if (typeof synced.scrobbleFilterUsers === 'boolean') {
+      try { localStorage.setItem('myListAddon:scrobbleFilterUsers', synced.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+    }
+    if (typeof synced.scrobbleAllowedUsers === 'string') {
+      try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', synced.scrobbleAllowedUsers); } catch (e) {}
+    }
+    if (typeof synced.scrobbleBlockAnonymous === 'boolean') {
+      try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', synced.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+    }
+    if (synced.scrobbleFilterUsers !== undefined || synced.scrobbleAllowedUsers !== undefined || synced.scrobbleBlockAnonymous !== undefined) {
+      if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
     }
     if (Array.isArray(synced.likedLists)) {
       try {
@@ -32826,11 +36142,12 @@ async function loadCreatorSync() {
         if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
         if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
         if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
-        if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
-        if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
-        if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
-        if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
-        if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
+        if (!isBackgroundResume) {
+          if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+          if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
+          if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
+          if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
+        }
         if (needPushSync && typeof pushCreatorSync === 'function') pushCreatorSync();
       } catch (e) {}
     }
@@ -32857,133 +36174,204 @@ async function loadCreatorSync() {
         if (el) el.value = synced.keys.region;
         try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
       }
+      const badgeKeys = [
+        { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
+        { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+        { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
+        { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
+        { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
+        { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
+        { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
+        { key: 'showBadgeSeasonPremiere', id: 'badgeSeasonPremiereCheckbox' },
+        { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
+        { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
+        { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+        { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
+      ];
+      badgeKeys.forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
     }
 
-    // Watch History / Continue Watching -- same wholesale-replace as
-    // everything else in this blob (see this function's own comment).
-    // getOrCreateWatchHistoryList/getOrCreateContinueWatchingList are used
-    // just to get a properly-shaped, slugged entry to overwrite the items
-    // on, rather than hand-building one here and risking it drifting out
-    // of sync with that shape later.
+    // Watch History / Continue Watching -- merge server tracking items with
+    // any local-only items so server scrobbles take immediate precedence without
+    // losing un-pushed local edits.
     let touchedTracking = false;
-    if (Array.isArray(synced.watchHistory)) {
-      const localWH = loadLocalCustomLists()['watch-history'];
-      const localWHItems = (localWH && localWH.items) || [];
-      if (localWHItems.length > synced.watchHistory.length) {
-        // Local has more than the server -- almost certainly an earlier
-        // sync of this data never actually completed (see
-        // pushTrackingSync's own comment on why Watch History was split
-        // out of the main sync blob in the first place: a large
-        // watchHistory could silently fail to save under the old combined
-        // payload). Don't adopt the server's smaller copy over data
-        // that's visibly sitting in this browser right now -- push local
-        // up instead so the server catches up.
-        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
-      } else {
+    if (!isBackgroundResume || trackingChanged) {
+      let isRecentRemoval = false;
+      try {
+        const lastRemovalStr = localStorage.getItem('myListAddon:lastIntentionalRemoval');
+        if (lastRemovalStr && Date.now() - parseInt(lastRemovalStr, 10) < 30000) {
+          isRecentRemoval = true;
+        }
+      } catch(e) {}
+
+      if (Array.isArray(synced.watchHistory)) {
+        const serverItems = synced.watchHistory;
+        const localWH = loadLocalCustomLists()['watch-history'];
+        const localWHItems = (localWH && Array.isArray(localWH.items)) ? localWH.items : [];
+        const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
+        const localOnlyWH = localWHItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)));
+        
+        let mergedWH = [...serverItems, ...localOnlyWH];
+        if (isRecentRemoval) {
+          mergedWH = localWHItems;
+        }
+
         const wh = getOrCreateWatchHistoryList();
-        wh.items = synced.watchHistory;
+        wh.items = mergedWH;
         wh.updatedAt = Date.now();
         const map = loadLocalCustomLists();
         map['watch-history'] = wh;
         saveLocalCustomListsMap(map);
-        window._watchedItemIds = new Set(synced.watchHistory.map((it) => String(it.id)));
+        const watchedIds = new Set();
+        mergedWH.forEach((it) => {
+          if (!it) return;
+          if (it.id) watchedIds.add(String(it.id));
+          if (it.imdbId) watchedIds.add(String(it.imdbId));
+          if (it.tmdbId) {
+            watchedIds.add(String(it.tmdbId));
+            watchedIds.add('tmdb:' + it.tmdbId);
+          }
+          if (it.type === 'episode' && it.seasonNum != null && it.episodeNum != null) {
+            if (it.showId) watchedIds.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (it.showTitle) watchedIds.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        });
+        window._watchedItemIds = watchedIds;
+        window._rawWatchHistoryItems = mergedWH;
+
+        if (localOnlyWH.length > 0 && typeof scheduleTrackingSync === 'function') {
+          scheduleTrackingSync();
+        }
+        touchedTracking = true;
       }
-      touchedTracking = true;
-    }
-    if (Array.isArray(synced.continueWatching)) {
-      const localCW = loadLocalCustomLists()['continue-watching'];
-      const localCWItems = (localCW && localCW.items) || [];
-      const dedupedIncoming = dedupeContinueWatchingItems(synced.continueWatching);
-      if (localCWItems.length > dedupedIncoming.length) {
-        // Same self-heal as Watch History just above.
-        if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
-      } else {
+      if (Array.isArray(synced.continueWatching)) {
+        const serverCW = dedupeContinueWatchingItems(synced.continueWatching);
+        const localCW = loadLocalCustomLists()['continue-watching'];
+        const localCWItems = (localCW && Array.isArray(localCW.items)) ? localCW.items : [];
+        const serverShowIds = new Set(serverCW.map((it) => String(it && it.showId)).filter(Boolean));
+        
+        const localOnlyCW = localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))));
+        let mergedCW = dedupeContinueWatchingItems([...serverCW, ...localOnlyCW]);
+        if (isRecentRemoval) {
+          mergedCW = localCWItems;
+        }
+
         const cw = getOrCreateContinueWatchingList();
-        cw.items = dedupedIncoming;
+        cw.items = mergedCW;
         cw.updatedAt = Date.now();
         const map = loadLocalCustomLists();
         map['continue-watching'] = cw;
         saveLocalCustomListsMap(map);
-        window._inProgressShowIds = new Set(dedupedIncoming.map((it) => String(it.showId)).filter(Boolean));
-        // The server's own copy may still carry whatever duplicate this
-        // just cleaned up (if it was ever written by an older, race-prone
-        // version of this code) -- push the corrected version back so it
-        // doesn't just reappear on the next sync-down.
-        if (dedupedIncoming.length !== synced.continueWatching.length && typeof scheduleTrackingSync === 'function') {
+        window._inProgressShowIds = new Set(mergedCW.map((it) => String(it && it.showId)).filter(Boolean));
+
+        if (localOnlyCW.length > 0 && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
         }
+        touchedTracking = true;
       }
-      touchedTracking = true;
-    }
-    if (Array.isArray(synced.watchlist)) {
-      const map = loadLocalCustomLists();
-      backfillAutoTrackedListSlugs(map);
-      // Only use the dedicated watchlistUpdatedAt from the tracking blob.
-      // Do NOT fall back to synced.updatedAt (the profile's overall last-
-      // modified time) -- that timestamp has nothing to do with the
-      // watchlist and would cause the server to falsely "win" the
-      // comparison against a local change that hadn't synced up yet
-      // (e.g. the user added an item and refreshed before the push completed).
-      const localWL = map['watchlist'] || { items: [], updatedAt: 0 };
-      const localTime = Number(localWL.updatedAt) || 0;
-      const serverTime = Number(synced.watchlistUpdatedAt) || 0;
+      if (Array.isArray(synced.watchlist)) {
+        const map = loadLocalCustomLists();
+        backfillAutoTrackedListSlugs(map);
+        const localWL = map['watchlist'] || { items: [], updatedAt: 0 };
+        const serverItems = synced.watchlist;
+        const localItems = (localWL && Array.isArray(localWL.items)) ? localWL.items : [];
+        
+        const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
+        const localOnly = localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)));
+        const mergedWL = [...serverItems, ...localOnly];
 
-      if (localTime >= serverTime) {
-        // Local is same age or newer — keep local and push it up so the
-        // server catches up (covers the case where push was interrupted
-        // by a page refresh before it completed).
-        if (localWL.items && localWL.items.length > 0 && typeof pushTrackingSync === 'function') {
+        map['watchlist'].items = mergedWL;
+        map['watchlist'].updatedAt = Date.now();
+        saveLocalCustomListsMap(map);
+
+        if (localOnly.length > 0 && typeof pushTrackingSync === 'function') {
           pushTrackingSync();
         }
-      } else {
-        // Server is genuinely newer (e.g. another device added something).
-        map['watchlist'].items = synced.watchlist;
-        map['watchlist'].updatedAt = serverTime;
-        saveLocalCustomListsMap(map);
+        touchedTracking = true;
       }
-      touchedTracking = true;
-    }
-    // Both feed the server-side Continue Watching cron and, once adopted
-    // here, the exact same badge/dismissal logic Watch History and
-    // Continue Watching already use client-side (see updateContinueWatching
-    // and setShowFullyWatched in 21_client-custom-list-builder.js) --
-    // without adopting these too, a show newly re-flagged fully-watched by
-    // the cron wouldn't show its badge here until this browser happened to
-    // recompute it independently, and a dismissal made on another device
-    // wouldn't be respected on this one.
-    if (Array.isArray(synced.fullyWatchedShowIds)) {
-      window._fullyWatchedShowIds = new Set(synced.fullyWatchedShowIds.map(String));
-      try {
-        localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(synced.fullyWatchedShowIds));
-      } catch (e) {
-        // non-critical
+      // Adopted only when this browser has nothing of its own. The
+      // server copy is whatever some browser last rendered; if this one
+      // has already rendered its own, that is the fresher of the two and
+      // opening Discover will push it back up anyway.
+      if (synced.curatedRecommendations && typeof synced.curatedRecommendations === 'object') {
+        const serverRecs = synced.curatedRecommendations;
+        const localRecs = loadCuratedRecommendations();
+        const serverHas = (Array.isArray(serverRecs.movies) && serverRecs.movies.length) ||
+          (Array.isArray(serverRecs.shows) && serverRecs.shows.length);
+        const localHas = !!(localRecs && (((localRecs.movies || []).length) || ((localRecs.shows || []).length)));
+        if (serverHas && !localHas) {
+          try {
+            localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(serverRecs));
+          } catch (e) {}
+        }
+      }
+      if (Array.isArray(synced.airingNext)) {
+        const map = loadLocalCustomLists();
+        const currentAN = map['airing-next'] || { slug: 'airing-next', name: 'Airing Next', type: 'series', items: [] };
+        const localAiringCount = Array.isArray(currentAN.items) ? currentAN.items.length : 0;
+        if (synced.airingNext.length || !localAiringCount) {
+          currentAN.items = synced.airingNext;
+          currentAN.updatedAt = Date.now();
+          map['airing-next'] = currentAN;
+          saveLocalCustomListsMap(map);
+          touchedTracking = true;
+        } else {
+          // The account has no Airing Next but this browser has computed
+          // one, so this browser's copy is the only one that exists --
+          // send it up rather than taking the empty one.
+          //
+          // This is also the one reliable moment to do it. Airing Next is
+          // only ever pushed by the refresh that builds it, and that
+          // refresh runs on a load timer that routinely wins the race
+          // against sign-in restoring activeCreator -- pushTrackingSync
+          // bails when it is not set yet, and the list is left cached
+          // locally as fresh, so every later load short-circuits the
+          // refresh and never pushes either. The account stayed empty
+          // indefinitely while this browser's own dashboard card looked
+          // fine, which is exactly what made the autotrack:airing-next
+          // row (and the Live Preview of it) report no items while the
+          // signed-out snapshot version of the same list worked. Here
+          // activeCreator is set by definition, so the push lands.
+          if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+        }
+      }
+      if (Array.isArray(synced.fullyWatchedShowIds)) {
+        window._fullyWatchedShowIds = new Set(synced.fullyWatchedShowIds.map(String));
+        try {
+          localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(synced.fullyWatchedShowIds));
+        } catch (e) {}
+      }
+      if (!isRecentRemoval && synced.dismissedContinueWatching && typeof synced.dismissedContinueWatching === 'object') {
+        window._dismissedContinueWatching = synced.dismissedContinueWatching;
+        try {
+          localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(synced.dismissedContinueWatching));
+        } catch (e) {}
+      }
+      if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
+        try {
+          localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(synced.dashboardListOrder));
+        } catch (e) {}
+        touchedTracking = true;
       }
     }
-    if (synced.dismissedContinueWatching && typeof synced.dismissedContinueWatching === 'object') {
-      window._dismissedContinueWatching = synced.dismissedContinueWatching;
-      try {
-        localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(synced.dismissedContinueWatching));
-      } catch (e) {
-        // non-critical
-      }
+    if (touchedTracking) {
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      if (typeof renderContinueWatchingGrid === 'function') renderContinueWatchingGrid();
     }
-    if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
-      try {
-        localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(synced.dashboardListOrder));
-      } catch (e) {
-        // non-critical
-      }
-      touchedTracking = true;
-    }
-    // The dashboard may have already rendered (from before this fetch
-    // resolved) with whatever was on this browser beforehand -- refresh it
-    // now that the synced watch data has landed, or a device signing in
-    // for the first time would show a stale/empty Watch History card
-    // until something else happened to trigger a re-render.
-    if (touchedTracking && typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     try { if (typeof cleanWatchedFromWatchlists === 'function') cleanWatchedFromWatchlists(); } catch (e) {}
 
+    suppressSave = true;
     saveState();
+    suppressSave = false;
   } catch (e) {
     // Network hiccup -- stay with whatever's already on this browser
     // rather than blocking on a retry.
@@ -33094,7 +36482,7 @@ async function submitCreateProfile() {
 // visibility step next.
 function showKeyRevealModal(displayName, creatorKey) {
   showModal(
-    '<h2>Creator Profile Created</h2>' +
+    '<h2>Profile Created</h2>' +
     '<p class="modal-sub" style="margin-bottom:4px;">Username</p>' +
     '<p style="margin:0 0 14px; font-weight:600;">' + escapeHtml(displayName) + '</p>' +
     '<p class="modal-sub" style="margin-bottom:4px;">Key</p>' +
@@ -33132,7 +36520,7 @@ function openVisibilityModal() {
     '<div class="modal-body">' +
       '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">Save Custom List</h2>' +
-      '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Creator Profile.</p>' +
+      '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Profile.</p>' +
       '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:12px; margin: 16px 0 20px;">' +
         '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg);">' +
           '<input type="radio" name="listVisibility" value="public" checked style="margin-top:3px; accent-color:var(--brand);">' +
@@ -33262,6 +36650,199 @@ function showAppNoticeModal(title, message, isError) {
 
 // --- Creator Dashboard ---------------------------------------------------------
 
+// Joins an already-in-flight /api/creator/lists request instead of starting
+// a second one.
+//
+// renderCreatorDashboard is routinely invoked twice in immediate succession
+// -- sign-in and restore both call it and then call loadCreatorSync, which
+// calls it again itself -- and each invocation was its own POST. That
+// endpoint returns the FULL items array for every list the account owns, so
+// for anyone with large Custom Lists the duplicate was megabytes of
+// identical data plus a second key verification, every time.
+//
+// Deliberately in-flight only, with no time-based cache. A request that
+// begins after the previous one has finished always goes to the network, so
+// this can never serve a stale list -- which matters because saving,
+// deleting or reordering a list re-renders the dashboard immediately
+// afterwards and must see the change. It only ever collapses calls that
+// genuinely overlap, where the second was going to receive the same bytes
+// as the first regardless.
+let _creatorListsInFlight = null;
+// The last full response, kept so an unchanged reply can be answered from
+// memory. Nothing mutates lastCreatorListsData in place -- every consumer
+// only reads it (find/forEach) -- so handing back the same object is safe
+// rather than a shared-mutable-state trap.
+let _lastCreatorListsResponse = null;
+let _creatorListsVersion = '';
+
+// Cleared whenever the cached lists are dropped, so the browser can never
+// claim to hold a version it no longer has.
+function resetCreatorListsCache() {
+  _lastCreatorListsResponse = null;
+  _creatorListsVersion = '';
+}
+
+async function fetchCreatorListsOnce(creatorKey) {
+  if (_creatorListsInFlight) return await _creatorListsInFlight;
+  const p = (async () => {
+    // Only claim a version if the data that version describes is still
+    // here; otherwise an "unchanged" reply would leave nothing to render.
+    const canReuse = !!(_creatorListsVersion && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+    const res = await fetch(ORIGIN + '/api/creator/lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        knownVersion: canReuse ? _creatorListsVersion : '',
+      }),
+    });
+    const data = await res.json();
+    if (data && data.ok && data.unchanged) {
+      // Nothing changed server-side -- reuse the copy already in memory.
+      if (canReuse) return _lastCreatorListsResponse;
+      // Should be unreachable (the version was only sent when reusable),
+      // but if it ever happens, ask again without a version rather than
+      // returning a response with no lists in it.
+      resetCreatorListsCache();
+      const retry = await fetch(ORIGIN + '/api/creator/lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+      });
+      const retryData = await retry.json();
+      if (retryData && retryData.ok) {
+        _lastCreatorListsResponse = retryData;
+        _creatorListsVersion = retryData.version || '';
+      }
+      return retryData;
+    }
+    if (data && data.ok) {
+      _lastCreatorListsResponse = data;
+      _creatorListsVersion = data.version || '';
+    } else {
+      resetCreatorListsCache();
+    }
+    return data;
+  })();
+  _creatorListsInFlight = p;
+  try {
+    return await p;
+  } finally {
+    _creatorListsInFlight = null;
+  }
+}
+
+// --- Recovering lists the browser lost --------------------------------------
+// A signed-in account keeps every Custom List as its own server-side record
+// (creatorlist:<user>:<slug>), and since the quota fix those records are
+// written even when localStorage refuses. But nothing ever wrote them BACK.
+// The reconciliation further down only ever flowed row -> server and
+// row -> local, and it is driven by iterating the rows currently in the
+// page, so a list that had disappeared from localStorage entirely was never
+// even considered -- the dashboard would render it from the server response
+// while the local map, which is what catalog rows, See All and editing all
+// read, stayed empty.
+//
+// That is the whole remaining gap, and it is why this is a backfill rather
+// than the much larger change of making the server authoritative at runtime.
+// The data is already in the response the dashboard just fetched; it costs
+// nothing to put it back.
+const DELETED_CREATOR_LISTS_KEY = 'myListAddon:deletedCreatorLists';
+const DELETED_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function loadDeletedCreatorLists() {
+  try {
+    const raw = localStorage.getItem(DELETED_CREATOR_LISTS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    if (!map || typeof map !== 'object') return {};
+    // Tombstones expire. Keeping them forever would mean a list deleted a
+    // year ago could never be recovered from the account if the browser
+    // cache were later lost for an unrelated reason.
+    const now = Date.now();
+    let changed = false;
+    Object.keys(map).forEach((k) => {
+      if (!(now - (Number(map[k]) || 0) < DELETED_TOMBSTONE_TTL_MS)) { delete map[k]; changed = true; }
+    });
+    if (changed) { try { localStorage.setItem(DELETED_CREATOR_LISTS_KEY, JSON.stringify(map)); } catch (e) {} }
+    return map;
+  } catch (e) {
+    return {};
+  }
+}
+
+// Called when a list is deleted, BEFORE the server confirms.
+//
+// One of the two delete paths removes the list locally and then fires the
+// server delete without waiting for it (.catch(() => {})). If that request
+// never lands, the list survives on the server while being gone locally --
+// which is exactly the shape the backfill below would read as "lost" and
+// helpfully restore. Resurrecting a list somebody deliberately deleted is a
+// bug this project has already had once, so the tombstone is recorded at
+// request time rather than on success.
+function recordCreatorListDeletion(slug) {
+  if (!slug) return;
+  try {
+    const map = loadDeletedCreatorLists();
+    map[String(slug)] = Date.now();
+    localStorage.setItem(DELETED_CREATOR_LISTS_KEY, JSON.stringify(map));
+  } catch (e) {}
+}
+window.recordCreatorListDeletion = recordCreatorListDeletion;
+
+// Matches the way the delete paths look a list up: a local entry can be
+// keyed by its map key while carrying the slug under any of several fields.
+function localMapHasList(map, slug) {
+  if (!map || !slug) return false;
+  if (map[slug]) return true;
+  return Object.keys(map).some((k) => {
+    const l = map[k];
+    return !!l && (l.slug === slug || l.creatorSlug === slug || l.localSlug === slug || l.listSlug === slug);
+  });
+}
+
+// The auto-tracked lists are generated locally from watch state, not owned by
+// the account in the same way. Writing a server copy over them would fight
+// the tracking code for control of the same slug.
+const BACKFILL_SKIP_SLUGS = new Set(['watchlist', 'watch-history', 'continue-watching', 'airing-next']);
+
+// Restores lists that exist on the account but are missing from this
+// browser. Deliberately narrow: it only ever ADDS a list that is entirely
+// absent. It never merges items into a list that already exists locally,
+// because a local copy may legitimately be ahead of the server (an edit made
+// while offline), and picking a winner there is a different problem with a
+// different right answer.
+function backfillCreatorListsIntoLocalMap(serverLists) {
+  if (!Array.isArray(serverLists) || !serverLists.length) return 0;
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  const tombstones = loadDeletedCreatorLists();
+  const restored = [];
+  serverLists.forEach((l) => {
+    if (!l || !l.slug) return;
+    if (BACKFILL_SKIP_SLUGS.has(l.slug)) return;
+    if (tombstones[l.slug]) return;
+    if (localMapHasList(map, l.slug)) return;
+    if (!Array.isArray(l.items)) return;
+    map[l.slug] = {
+      slug: l.slug,
+      creatorSlug: l.slug,
+      name: l.name || l.slug,
+      type: l.type || 'mixed',
+      items: l.items,
+      visibility: l.visibility || 'private',
+      createdAt: l.createdAt || Date.now(),
+      updatedAt: Date.now(),
+    };
+    restored.push(l.slug);
+  });
+  if (!restored.length) return 0;
+  saveLocalCustomListsMap(map);
+  console.info('Restored ' + restored.length + ' list(s) from your account that were missing from this browser:', restored.join(', '));
+  return restored.length;
+}
+window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -33276,12 +36857,7 @@ async function renderCreatorDashboard(options) {
   }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   try {
-    const res = await fetch(ORIGIN + '/api/creator/lists', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
-    });
-    const data = await res.json();
+    const data = await fetchCreatorListsOnce(creatorKey);
     if (!data.ok) {
       if (!hasExistingContent) {
         box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your lists.') + '</p>';
@@ -33304,18 +36880,85 @@ async function renderCreatorDashboard(options) {
       });
       if (pruned && typeof saveState === 'function') saveState();
     }
+
+    // Sync items from live Catalog rows if the row contains more items
+    let hasLocalUpdates = false;
+    const localMapForCreator = loadLocalCustomLists();
+    document.querySelectorAll('#lists .entry').forEach((entry) => {
+      const urlInput = entry.querySelector('.url');
+      if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+      try {
+        const rowPayload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+        const slug = rowPayload.creatorSlug || rowPayload.localSlug || rowPayload.listSlug;
+        if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
+        const sList = (data.lists || []).find(l => l && l.slug === slug);
+        if (sList && rowPayload.items.length > (sList.items || []).length) {
+          sList.items = rowPayload.items;
+          sList.itemCount = rowPayload.items.length;
+          fetch(ORIGIN + '/api/creator/lists/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              creatorName: activeCreator.creatorName,
+              creatorKey: creatorKey,
+              slug: slug,
+              name: sList.name,
+              type: sList.type || rowPayload.type || 'movie',
+              items: rowPayload.items,
+              visibility: sList.visibility || 'private',
+            })
+          }).catch(() => {});
+        }
+        if (localMapForCreator[slug] && rowPayload.items.length > (localMapForCreator[slug].items || []).length) {
+          localMapForCreator[slug].items = rowPayload.items;
+          localMapForCreator[slug].updatedAt = Date.now();
+          hasLocalUpdates = true;
+        }
+      } catch (e) {}
+    });
+    if (hasLocalUpdates) saveLocalCustomListsMap(localMapForCreator);
+
+    // ...and the other direction: anything the account has that this browser
+    // has lost. See backfillCreatorListsIntoLocalMap for why this is an
+    // add-only operation.
+    try { backfillCreatorListsIntoLocalMap(data.lists || []); } catch (e) {}
     
     const autoTracked = renderAutoTrackedListsHtml();
     lastLocalCustomListsData = autoTracked.lists;
 
     function buildServerListCardHtml(l) {
+      if (!l) return '';
       const shareBtn = l.visibility === 'private'
         ? ''
         : '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '">Share</button>';
-      const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist');
+      const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
       const deleteBtnHtml = isWatchlist ? '' : '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
-      const allPosters = (l.items || []).slice(0, 9).filter((it) => it.poster);
-      const totalCount = l.itemCount || allPosters.length;
+      
+      const matchingRow = document.querySelector('#lists .entry .url[value*="' + l.slug + '"]');
+      if (matchingRow && matchingRow.value.startsWith('customlist:v1:')) {
+        try {
+          const rp = JSON.parse(matchingRow.value.slice('customlist:v1:'.length));
+          if (Array.isArray(rp.items) && rp.items.length > (l.items || []).length) {
+            l.items = rp.items;
+            l.itemCount = rp.items.length;
+          }
+        } catch (e) {}
+      }
+
+      const resolveItemPoster = (it) => {
+        if (!it) return '';
+        let p = it.poster || it.showPoster;
+        if (!p) {
+          const epId = String(it.id || '');
+          const sId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (it.imdbId || it.id));
+          if (sId && String(sId).startsWith('tt')) {
+            p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
+          }
+        }
+        return p || '';
+      };
+      const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
+      const totalCount = l.itemCount || (l.items || []).length || allPosters.length;
       const posterThumbs = allPosters.map((it, i) => {
         const isMobileEnd = (i === 2 && allPosters.length > 3);
         const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
@@ -33330,22 +36973,28 @@ async function renderCreatorDashboard(options) {
           ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
           : '';
         const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
-        return '<div class="list-card-mini-poster-tile">' +
+        const itemPoster = resolveItemPoster(it);
+        const label = formatWatchItemLabel(it);
+        const posterEl = itemPoster
+          ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '')) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+          : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+        return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || '') + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
           '<div class="list-card-mini-poster-img-wrap">' +
-            '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.imdbId || it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+            posterEl +
             removeBtn +
             overlays +
           '</div>' +
-          '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
+          '<div class="list-card-mini-poster-name">' + escapeHtml(label.title || it.title || it.name || '') + '</div>' +
+          (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
           (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
         '</div>';
       }).join('');
       const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
       return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
         '<div class="list-card-header">' +
-          '<div class="list-card-body">' +
+          '<div class="list-card-body creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' +
             '<div class="list-card-title">' +
-              '<span class="drag-handle-list" title="Drag to reorder">&#x2630;</span>' +
+              '<span class="drag-handle-list" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
               escapeHtml(l.name) +
             '</div>' +
             '<div class="list-card-meta">' +
@@ -33384,8 +37033,37 @@ async function renderCreatorDashboard(options) {
       }
     }
 
+    // Merge any local/restored custom lists that are not yet on the server
+    const serverSlugs = new Set((data.lists || []).map(l => l.slug));
+    const localRestoredCustomLists = [];
+    Object.keys(localMapForCreator || {}).forEach((k) => {
+      if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
+      const l = localMapForCreator[k];
+      if (!l) return;
+      if (!l.slug) l.slug = k;
+      if (!serverSlugs.has(l.slug)) {
+        localRestoredCustomLists.push(l);
+        if (activeCreator && creatorKey) {
+          fetch(ORIGIN + '/api/creator/lists/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              creatorName: activeCreator.creatorName,
+              creatorKey: creatorKey,
+              slug: l.slug,
+              name: l.name || l.slug,
+              type: l.type || 'movie',
+              items: l.items || [],
+              visibility: l.visibility || 'private',
+            })
+          }).catch(() => {});
+        }
+      }
+    });
+
     const allDashboardLists = [
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
+      ...localRestoredCustomLists.map((l) => ({ isServer: false, list: l })),
       ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
     ];
     // Airing Next is local-only (see its own comment, 21_client-custom-
@@ -33414,14 +37092,21 @@ async function renderCreatorDashboard(options) {
     if (savedOrder && savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       visibleDashboardLists.sort((a, b) => {
-        const posA = orderMap.has(a.list.slug) ? orderMap.get(a.list.slug) : 9999;
-        const posB = orderMap.has(b.list.slug) ? orderMap.get(b.list.slug) : 9999;
+        const slugA = (a && a.list && a.list.slug) || '';
+        const slugB = (b && b.list && b.list.slug) || '';
+        const posA = (slugA && orderMap.has(slugA)) ? orderMap.get(slugA) : 9999;
+        const posB = (slugB && orderMap.has(slugB)) ? orderMap.get(slugB) : 9999;
         return posA - posB;
       });
     }
 
     const rowsHtml = visibleDashboardLists.length
-      ? visibleDashboardLists.map((item) => item.isAiringNext ? buildAiringNextCardHtml() : (item.isServer ? buildServerListCardHtml(item.list) : buildLocalListCardHtml(item.list))).join('')
+      ? visibleDashboardLists.map((item) => {
+          if (!item) return '';
+          if (item.isAiringNext) return (typeof buildAiringNextCardHtml === 'function' ? buildAiringNextCardHtml() : '');
+          if (item.isServer) return buildServerListCardHtml(item.list);
+          return buildLocalListCardHtml(item.list);
+        }).filter(Boolean).join('')
       : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
 
     const prevScrollTop = box.scrollTop;
@@ -33430,6 +37115,7 @@ async function renderCreatorDashboard(options) {
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
     if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
   } catch (e) {
+    console.error('renderCreatorDashboard error:', e);
     if (!hasExistingContent) {
       box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
     }
@@ -33438,7 +37124,7 @@ async function renderCreatorDashboard(options) {
 
 function formatWatchItemLabel(it) {
   if (!it) return { title: '', subtitle: '' };
-  const epTitle = it.name || it.episodeTitle || (it.title !== it.showTitle ? it.title : '') || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')) || '';
+  const epTitle = it.name || it.episodeTitle || (it.title !== it.showTitle ? it.title : '') || ((it.isSeasonPremiere && it.seasonNum != null && it.seasonNum > 1) ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')) || '';
   if (it.showTitle && it.seasonNum != null && it.episodeNum != null) {
     const s = String(it.seasonNum).padStart(2, '0');
     const e = String(it.episodeNum).padStart(2, '0');
@@ -33451,20 +37137,33 @@ function formatWatchItemLabel(it) {
 }
 
 function buildLocalListCardHtml(l) {
+  if (!l) return '';
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
-  const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist');
-  if (isWatchlist) {
-    const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
-    const liveWL = liveMap ? liveMap['watchlist'] : null;
-    if (liveWL && Array.isArray(liveWL.items)) {
-      l.items = liveWL.items;
-      if (liveWL.visibility) l.visibility = liveWL.visibility;
-    }
+  const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
+  const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
+  const liveEntry = (liveMap && l.slug) ? liveMap[l.slug] : null;
+  if (liveEntry && Array.isArray(liveEntry.items)) {
+    l.items = liveEntry.items;
+    if (liveEntry.visibility) l.visibility = liveEntry.visibility;
+    if (liveEntry.type && !l.type) l.type = liveEntry.type;
   }
+  const resolveItemPoster = (it) => {
+    if (!it) return '';
+    let p = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
+    if (!p) {
+      const epId = String(it.id || '');
+      const sId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (it.imdbId || it.id));
+      if (sId && String(sId).startsWith('tt')) {
+        p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
+      }
+    }
+    return p || '';
+  };
   const itemCount = (l.items || []).length;
-  const allPosters = (l.items || []).slice(0, 9).filter((it) => (l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster)));
+  const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
   const totalCount = itemCount || allPosters.length;
   const posterThumbs = allPosters.map((it, i) => {
+    if (!it) return '';
     const isMobileEnd = (i === 2 && allPosters.length > 3);
     const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
     let overlays = '';
@@ -33472,9 +37171,9 @@ function buildLocalListCardHtml(l) {
       overlays += '<div class="list-card-count-overlay mobile-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
     if (isDesktopEnd) {
-      overlays += '<div class="list-card-count-overlay desktop-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay desktop-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
-    const posterId = it.showId || it.imdbId || it.id;
+    const posterId = it.showId || it.imdbId || it.id || '';
     const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
@@ -33485,18 +37184,80 @@ function buildLocalListCardHtml(l) {
     } else if (l.slug === 'watch-history') {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
     }
-    const itemPoster = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
+    const itemPoster = resolveItemPoster(it);
+    const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
+    const isCwList = l.slug === 'continue-watching' || l.statusKey === 'continue-watching';
+    const showLocationBadges = typeof getBadgeSetting === 'function'
+      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : getBadgeSetting('showBadgesCatalogs')))
+      : true;
+    const showAirDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+    const showPremiere = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+    const showFinale = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+    const showFinaleDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+    const airingList = (isCwList && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    const airingMatch = airingList.find((a) => {
+      if (!a) return false;
+      const aShowId = String(a.showId || a.id || '').split(':')[0];
+      const itShowId = String(it.showId || it.id || posterId || '').split(':')[0];
+      if (a.showId && (a.showId === it.showId || a.showId === posterId || a.showId === it.id)) return true;
+      if (aShowId && itShowId && aShowId === itShowId) return true;
+      if (a.canonicalTmdbId && it.canonicalTmdbId && a.canonicalTmdbId === it.canonicalTmdbId) return true;
+      if (a.tmdbId && it.tmdbId && String(a.tmdbId) === String(it.tmdbId)) return true;
+      if (a.imdbId && it.imdbId && a.imdbId === it.imdbId) return true;
+      const aTitle = String(a.showTitle || a.title || a.name || '').toLowerCase().trim();
+      const itTitle = String(it.showTitle || it.title || it.name || '').toLowerCase().trim();
+      if (aTitle && itTitle && aTitle === itTitle) return true;
+      return false;
+    });
+    const itSeason = it.seasonNum != null ? it.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
+    const itEpisode = it.episodeNum != null ? it.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+    
+    // Check if this show is on an older past season (not the newest season)
+    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum < airingMatch.seasonNum);
+
     let dateBadge = '';
-    if (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate)) {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+    let bottomBadge = '';
+
+    if (showLocationBadges && !isOlderSeason) {
+      const isSameEpisode = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum) && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum));
+      const effectiveAirDate = it.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
+      const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
+      const isUnairedEp = effectiveAirDate ? !hasAired : !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+
+      if (showAirDate && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
+        const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
+        if (badgeText) {
+          dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
+        }
+      }
+
+      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+      const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
+      const isSeasonFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+      const seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
+      const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
+
+      if (showPremiere && isSeasonPremiere && isUnairedEp) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
+      } else if (showFinale && isSeasonFinale) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
+      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+        const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
+        if (finaleText) {
+          bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+        }
       }
     }
-    return '<div class="list-card-mini-poster-tile">' +
+
+    const posterEl = itemPoster
+      ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
       '<div class="list-card-mini-poster-img-wrap">' +
-        '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+        posterEl +
         dateBadge +
+        bottomBadge +
         removeBtn +
         overlays +
       '</div>' +
@@ -33506,7 +37267,7 @@ function buildLocalListCardHtml(l) {
     '</div>';
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
-  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : '');
+  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : '')));
   const isPublic = l.visibility === 'public';
   const shareUrl = l.url || ((typeof activeCreator !== 'undefined' && activeCreator)
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (l.slug || 'watchlist'))
@@ -33544,9 +37305,9 @@ function buildLocalListCardHtml(l) {
 
   return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
-      '<div class="list-card-body">' +
+      '<div class="list-card-body localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' +
         '<div class="list-card-title">' +
-          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          '<span class="drag-handle-list" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
           escapeHtml(l.name) +
         '</div>' +
         '<div class="list-card-meta">' +
@@ -33593,8 +37354,8 @@ function backfillAutoTrackedListSlugs(map) {
       type: 'mixed',
       isWatchlist: true,
       items: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: 0,
+      updatedAt: 0,
     };
     patched = true;
   }
@@ -33621,6 +37382,26 @@ function renderAutoTrackedListsHtml() {
 function renderLocalCustomListsDashboard(box, silent) {
   const map = loadLocalCustomLists();
   backfillAutoTrackedListSlugs(map);
+
+  // Sync items from any live DOM rows in Catalogs if the DOM row has more items
+  let hasLocalUpdates = false;
+  document.querySelectorAll('#lists .entry').forEach((entry) => {
+    const urlInput = entry.querySelector('.url');
+    if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+    try {
+      const rowPayload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+      const slug = rowPayload.localSlug || rowPayload.creatorSlug || rowPayload.listSlug;
+      if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
+      if (map[slug]) {
+        if (rowPayload.items.length > (map[slug].items || []).length) {
+          map[slug].items = rowPayload.items;
+          map[slug].updatedAt = Date.now();
+          hasLocalUpdates = true;
+        }
+      }
+    } catch (e) {}
+  });
+  if (hasLocalUpdates) saveLocalCustomListsMap(map);
 
   // Airing Next lives in this same map (getOrCreateAiringNextList uses the
   // same store) but needs its own render path (buildAiringNextCardHtml,
@@ -33716,35 +37497,47 @@ if (_creatorDashEl) {
   if (viewBtn) {
     const slug = viewBtn.dataset.slug;
     const pool = (viewBtn.classList.contains('localListViewBtn') || viewBtn.classList.contains('localListViewTrigger')) ? lastLocalCustomListsData : lastCreatorListsData;
-    const list = (pool || []).filter((l) => l.slug === slug)[0];
+    let list = (pool || []).find((l) => l && l.slug === slug);
+    if (!list) {
+      const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      list = (slug && localMap[slug]) || Object.values(localMap).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name)) || (typeof lastCreatorListsData !== 'undefined' && (lastCreatorListsData || []).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name))) || (typeof lastLocalCustomListsData !== 'undefined' && (lastLocalCustomListsData || []).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name)));
+    }
     const isCw = list && list.slug === 'continue-watching';
     const isWatchlist = list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'));
     const isHistory = list && (list.slug === 'watch-history' || (list.name && list.name.toLowerCase() === 'watch history'));
-    const sample = list ? (list.items || []).map((it) => {
+    const rawListItems = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(list.items || []) : (list.items || [])) : (list ? (list.items || []) : []);
+    const sample = rawListItems.map((it) => {
       const label = formatWatchItemLabel(it);
+      const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+      const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (list && list.type && list.type !== 'mixed' ? list.type : (viewBtn.dataset.type || 'movie'))));
+      const epId = String(it.id || '');
+      const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+      const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
       return {
-        // Watch History / Continue Watching items store the episode's own
-        // id, not the show's -- there's no per-episode details view, so
-        // point the poster at the show instead (same fallback used for the
-        // dashboard's own mini-poster thumbnails above).
-        id: it.showId || it.imdbId || it.id,
-        type: it.showId ? 'series' : (list.type || 'movie'),
-        name: label.title,
-        subtitle: label.subtitle,
-        poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+        id: showId,
+        showId: showId,
+        seasonNum: it.seasonNum,
+        episodeNum: it.episodeNum,
+        type: itemType,
+        name: label.title || it.title || it.name || 'Untitled',
+        subtitle: label.subtitle || '',
+        poster: showPoster,
         year: it.year,
         airDate: it.airDate,
         isUnaired: it.isUnaired,
+        seasonFinaleAirDate: it.seasonFinaleAirDate,
+        isSeasonPremiere: it.isSeasonPremiere,
+        isSeasonFinale: it.isSeasonFinale,
         removeShowId: isCw ? (it.showId || it.id) : null,
         removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
         removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
         removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? list.slug : null,
       };
-    }) : [];
-    const listSlug = (list && (list.slug || list.localSlug)) || (isCw ? 'continue-watching' : (isHistory ? 'watch-history' : (isWatchlist ? 'watchlist' : '')));
+    });
+    const listSlug = (list && (list.slug || list.localSlug)) || (isCw ? 'continue-watching' : (isHistory ? 'watch-history' : (isWatchlist ? 'watchlist' : slug)));
     const listUrl = listSlug ? ('custom:' + listSlug) : '';
     const listType = (viewBtn.dataset.type && viewBtn.dataset.type !== 'undefined') ? viewBtn.dataset.type : ((list && list.type) || (isCw ? 'series' : (isWatchlist ? 'mixed' : 'movie')));
-    openListDetailsPage(viewBtn.dataset.name, listType, listUrl, { sample: sample, maybeMore: false });
+    openListDetailsPage(viewBtn.dataset.name || (list && list.name) || 'Custom List', listType, listUrl, { sample: sample, count: sample.length, maybeMore: false });
     return;
   }
   const shareBtn = e.target.closest('.creatorListShareBtn');
@@ -33761,6 +37554,7 @@ if (_creatorDashEl) {
     const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
     confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", async () => {
       const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      recordCreatorListDeletion(slug);
       try {
         const res = await fetch(ORIGIN + '/api/creator/lists/delete', {
           method: 'POST',
@@ -33777,17 +37571,29 @@ if (_creatorDashEl) {
           return;
         }
         
+        // Remove from local storage map so it doesn't get resurrected
+        const map = loadLocalCustomLists();
+        delete map[slug];
+        Object.keys(map).forEach((k) => {
+          if (map[k] && (map[k].slug === slug || map[k].creatorSlug === slug || map[k].localSlug === slug || map[k].listSlug === slug)) {
+            delete map[k];
+          }
+        });
+        saveLocalCustomListsMap(map);
+        
         // Remove from main lists config if present
         document.querySelectorAll('#lists .url').forEach((urlInput) => {
           const rowPayload = parseCustomListPayloadClient(urlInput.value);
-          if (rowPayload && (rowPayload.creatorSlug === slug || rowPayload.slug === slug)) {
+          if (rowPayload && (rowPayload.creatorSlug === slug || rowPayload.slug === slug || rowPayload.localSlug === slug || rowPayload.listSlug === slug)) {
             const entry = urlInput.closest('.entry');
             if (entry) {
               entry.remove();
-              if (typeof saveState === 'function') saveState();
             }
           }
         });
+        if (typeof saveState === 'function') saveState();
+        if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+        if (typeof pushCreatorSync === 'function') pushCreatorSync();
         
         renderCreatorDashboard();
       } catch (err) {
@@ -33829,16 +37635,12 @@ if (_creatorDashEl) {
     } else {
       if (listMeta.type === 'mixed') {
         const items = listMeta.items || [];
-        const movies = items.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type)));
-        const series = items.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv'));
-        if (movies.length > 0) {
-          const payload = { listId: generateChannelId(), listSlug: slug, type: 'movie', items: movies, shuffle: false };
-          addRow(listMeta.name + (series.length > 0 ? ' (Movies)' : ''), 'customlist:v1:' + JSON.stringify(payload), 'movie', true, 'Custom Lists');
-        }
-        if (series.length > 0 || movies.length === 0) {
-          const payload = { listId: generateChannelId(), listSlug: slug, type: 'series', items: series, shuffle: false };
-          addRow(listMeta.name + (movies.length > 0 ? ' (Shows)' : ''), 'customlist:v1:' + JSON.stringify(payload), 'series', true, 'Custom Lists');
-        }
+        const movies = items.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        const series = items.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        const mPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'movie', items: movies, shuffle: false, publishedUrl: listMeta.url || undefined };
+        addRow(listMeta.name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+        const sPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'series', items: series, shuffle: false, publishedUrl: listMeta.url || undefined };
+        addRow(listMeta.name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
       } else {
         const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type, items: listMeta.items || [], shuffle: false };
         addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
@@ -33875,17 +37677,40 @@ if (_creatorDashEl) {
     confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", () => {
       const map = loadLocalCustomLists();
       delete map[slug];
+      Object.keys(map).forEach((k) => {
+        if (map[k] && (map[k].slug === slug || map[k].creatorSlug === slug || map[k].localSlug === slug || map[k].listSlug === slug)) {
+          delete map[k];
+        }
+      });
       saveLocalCustomListsMap(map);
+      
+      // If signed into creator, also delete from server if it exists
+      if (activeCreator) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        if (creatorKey) {
+          // Fire-and-forget: if this never lands the list survives on the
+          // account while being gone locally, which is precisely what the
+          // backfill must not undo.
+          recordCreatorListDeletion(slug);
+          fetch(ORIGIN + '/api/creator/lists/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, slug: slug }),
+          }).catch(() => {});
+        }
+      }
       
       // Remove from main lists config if present
       document.querySelectorAll('#lists .url').forEach((urlInput) => {
         const rowPayload = parseCustomListPayloadClient(urlInput.value);
-        if (rowPayload && rowPayload.localSlug === slug) {
+        if (rowPayload && (rowPayload.localSlug === slug || rowPayload.creatorSlug === slug || rowPayload.slug === slug || rowPayload.listSlug === slug)) {
           const entry = urlInput.closest('.entry');
           if (entry) entry.remove();
         }
       });
       if (typeof saveState === 'function') saveState();
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
       
       renderCreatorDashboard();
     }, true);
@@ -33952,7 +37777,7 @@ if (_creatorDashEl) {
       return;
     }
 
-    const items = listMeta.items || [];
+    const items = normalizeSnapshotItemsForCatalog(listMeta.items || []);
     
     if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching') {
       const movies = [];
@@ -33977,18 +37802,14 @@ if (_creatorDashEl) {
         }
       });
       
-      if (movies.length > 0) {
-        const url = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
-          ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
-          : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'movie', items: movies, shuffle: false });
-        addRow(listMeta.name + (series.length > 0 ? ' (Movies)' : ''), url, 'movie', true, 'My Lists');
-      }
-      if (series.length > 0 || movies.length === 0) {
-        const url = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
-          ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
-          : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, type: 'series', items: series, shuffle: false });
-        addRow(listMeta.name + (movies.length > 0 ? ' (Shows)' : ''), url, 'series', true, 'My Lists');
-      }
+      const movieUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+        ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: false });
+      addRow(listMeta.name + ' (Movies)', movieUrl, 'movie', true, 'My Lists');
+      const showUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+        ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: false });
+      addRow(listMeta.name + ' (Shows)', showUrl, 'series', true, 'My Lists');
     } else {
       const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type, items: items, shuffle: false };
       addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'My Lists');
@@ -34002,6 +37823,33 @@ if (_creatorDashEl) {
     showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
   }
 });
+}
+
+// A customlist:v1: snapshot is read back by fetchCustomListCatalog
+// (05_catalog-core.js), which drops any item without an imdbId. Ordinary
+// custom-list picks always have one. Auto-tracked and derived lists do
+// not: an Airing Next entry is keyed by showId, a Watch History episode
+// by its own episode id with the series in showId. Passing those through
+// untouched produced a snapshot every item of which was filtered out
+// server-side -- a row that embedded real data and still rendered "No
+// items found".
+//
+// This fills in the missing identifier without disturbing anything that
+// already has one, so a normal custom list round-trips byte-identically
+// (kind/type in particular are preserved -- fetchCustomListCatalog reads
+// them to decide whether an item belongs in a movie or a series row).
+function normalizeSnapshotItemsForCatalog(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((it) => {
+    if (!it || it.imdbId) return it;
+    const derivedId = it.showId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '');
+    if (!derivedId) return it;
+    return Object.assign({}, it, {
+      imdbId: derivedId,
+      title: it.title || it.showTitle || it.name || '',
+      poster: it.poster || it.showPoster || '',
+    });
+  });
 }
 
 function editCreatorList(slug) {
@@ -34296,15 +38144,33 @@ async function submitCreateListModal() {
           listName: name,
           publishedUrl: visibility === 'public' ? data.url : undefined,
           creatorSlug: data.slug,
+          listSlug: data.slug,
           creatorOwner: activeCreator.creatorName,
           visibility: visibility
         });
-        addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
+        if (type === 'mixed') {
+          const movies = initialItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = initialItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const mPayload = Object.assign({}, updatedPayload, { listId: generateChannelId(), type: 'movie', items: movies });
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+          const sPayload = Object.assign({}, updatedPayload, { listId: generateChannelId(), type: 'series', items: series });
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
+        } else {
+          addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
+        }
       } else {
-        const slug = payload.listId;
-        payload.localSlug = slug;
+        const base = slugify(name) || 'list';
+        let slug = base;
         const map = loadLocalCustomLists();
+        let n = 2;
+        while (map[slug]) {
+          slug = base + '-' + n;
+          n++;
+        }
+        payload.localSlug = slug;
+        payload.listSlug = slug;
         map[slug] = {
+          slug: slug,
           name: name,
           type: type,
           items: initialItems,
@@ -34312,7 +38178,16 @@ async function submitCreateListModal() {
           updatedAt: Date.now()
         };
         saveLocalCustomListsMap(map);
-        addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+        if (type === 'mixed') {
+          const movies = initialItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = initialItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const mPayload = Object.assign({}, payload, { listId: generateChannelId(), type: 'movie', items: movies });
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+          const sPayload = Object.assign({}, payload, { listId: generateChannelId(), type: 'series', items: series });
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
+        } else {
+          addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+        }
       }
     } else {
       // External Provider Creation (Trakt, TMDB, MDBList)
@@ -34541,7 +38416,11 @@ function removeWatchlistItemDirect(id, btn) {
   if (changed) {
     if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows('watchlist', (map['watchlist'] ? map['watchlist'].items : []), 'Watchlist', 'mixed');
+    }
     if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watchlist.');
   }
   if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
@@ -34550,6 +38429,9 @@ function removeWatchlistItemDirect(id, btn) {
       const initialLen = creatorWatchlist.items.length;
       creatorWatchlist.items = creatorWatchlist.items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
       if (creatorWatchlist.items.length !== initialLen) {
+        if (typeof syncCustomListToCatalogRows === 'function') {
+          syncCustomListToCatalogRows(creatorWatchlist.slug, creatorWatchlist.items, creatorWatchlist.name, creatorWatchlist.type || 'mixed');
+        }
         const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
         fetch(ORIGIN + '/api/creator/lists/save', {
           method: 'POST',
@@ -34565,6 +38447,7 @@ function removeWatchlistItemDirect(id, btn) {
           }),
         }).then(() => {
           if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+          if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watchlist.');
         }).catch(() => {});
       }
     }
@@ -34633,7 +38516,49 @@ function removeCustomListItemDirect(id, slug, btn) {
       if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
       if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof syncCustomListToCatalogRows === 'function') {
+        syncCustomListToCatalogRows(slug, map[slug].items, map[slug].name, map[slug].type);
+      }
       if (typeof showAddedToast === 'function') showAddedToast('Removed item from list.');
+    }
+  }
+  // Signed-in Creator Profile: this list may actually be server-hosted
+  // rather than (or in addition to) sitting in the local map above -- the
+  // See All view renders creator-owned and local-only lists through the
+  // exact same card/remove-button markup (see the shared click handler
+  // this function is called from), so a signed-in user's "xyz" custom
+  // list is often a lastCreatorListsData entry, not a loadLocalCustomLists()
+  // one. Without this block the tile still fades out (it's removed
+  // unconditionally above) but nothing is ever actually deleted server
+  // side, so the item is back the moment the list reloads -- same shape
+  // of fix as removeWatchlistItemDirect just above already has.
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    const creatorList = lastCreatorListsData.find(l => l && l.slug === slug);
+    if (creatorList && Array.isArray(creatorList.items)) {
+      const initialLen = creatorList.items.length;
+      creatorList.items = creatorList.items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      if (creatorList.items.length !== initialLen) {
+        if (typeof syncCustomListToCatalogRows === 'function') {
+          syncCustomListToCatalogRows(creatorList.slug, creatorList.items, creatorList.name, creatorList.type);
+        }
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slug: creatorList.slug,
+            name: creatorList.name,
+            type: creatorList.type,
+            items: creatorList.items,
+            visibility: creatorList.visibility || 'public',
+          }),
+        }).then(() => {
+          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+          if (typeof showAddedToast === 'function') showAddedToast('Removed item from list.');
+        }).catch(() => {});
+      }
     }
   }
 }
@@ -34683,7 +38608,148 @@ function clearWatchHistoryAll() {
   );
 }
 window.clearWatchHistoryAll = clearWatchHistoryAll;
-// Reordering & position management
+
+function clearContinueWatchingAll() {
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Clear Continue Watching',
+    'Are you sure you want to remove all items from Continue Watching? This will reset your in-progress movies and shows.',
+    'Clear All',
+    () => {
+      const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      if (map['continue-watching']) {
+        map['continue-watching'].items = [];
+        map['continue-watching'].updatedAt = Date.now();
+        if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      }
+      window._currentListDetailsAllItems = [];
+
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
+      if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
+
+      // Refresh list details view if currently visible
+      if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+        const params = window._currentListDetailsParams;
+        if (params && (params.name.toLowerCase().includes('continue watching') || params.listUrl === 'autotrack:continue-watching' || params.listUrl === 'custom:continue-watching' || (params.listUrl && params.listUrl.includes('continue-watching')))) {
+          const gridEl = document.getElementById('detailGrid');
+          const statusEl = document.getElementById('detailStatus');
+          const subEl = document.getElementById('detailSubtitle');
+          if (gridEl) gridEl.innerHTML = '';
+          if (statusEl) statusEl.innerHTML = '<small>No items in continue watching.</small>';
+          if (subEl) subEl.textContent = '0 items';
+          if (typeof _updateListDetailsItemCount === 'function') _updateListDetailsItemCount(0);
+        }
+      }
+
+      // Refresh dashboard if visible
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderLocalCustomListsDashboard === 'function') {
+        const box = document.getElementById('localCustomListsDashboard');
+        if (box) renderLocalCustomListsDashboard(box, true);
+      }
+
+      if (typeof showAddedToast === 'function') showAddedToast('Continue Watching cleared \u2713');
+    },
+    true
+  );
+}
+window.clearContinueWatchingAll = clearContinueWatchingAll;
+
+// --- Multi-Device Background Sync & Foreground Resume -----------------------
+let _lastForegroundSyncCheck = 0;
+const FOREGROUND_SYNC_COOLDOWN_MS = 5000; // 5 seconds cooldown
+let _foregroundSyncTimer = null;
+let _isSyncingForeground = false;
+
+async function handleForegroundResumeSync() {
+  if (typeof document !== 'undefined' && document.visibilityState && document.visibilityState !== 'visible') {
+    return;
+  }
+  const now = Date.now();
+  if (now - _lastForegroundSyncCheck < FOREGROUND_SYNC_COOLDOWN_MS || _isSyncingForeground) {
+    return;
+  }
+  _lastForegroundSyncCheck = now;
+
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+
+  // Defer slightly so tab switch and UI clicks are completely instant and smooth
+  if (_foregroundSyncTimer) clearTimeout(_foregroundSyncTimer);
+  _foregroundSyncTimer = setTimeout(async () => {
+    _isSyncingForeground = true;
+    try {
+      // Ask the cheap endpoint first. sync/load reads six KV keys and sends
+      // back the entire watchHistory -- which for an active account is
+      // megabytes, and on a poll like this one is almost always identical
+      // to what this browser already has. sync/meta answers the only
+      // question that matters here (has anything moved?) in a few dozen
+      // bytes, so the expensive call happens on real change instead of on
+      // a timer. See the endpoint's own comment,
+      // 26_api-creator-and-admin-routes.js.
+      let needsFullLoad = true;
+      const known = window._syncMetaStamps;
+      if (known) {
+        try {
+          const metaRes = await fetch(ORIGIN + '/api/creator/sync/meta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+          });
+          const meta = await metaRes.json();
+          if (meta && meta.ok) {
+            needsFullLoad =
+              (Number(meta.config) || 0) > (known.config || 0) ||
+              (Number(meta.tracking) || 0) > (known.tracking || 0) ||
+              (Number(meta.presets) || 0) > (known.presets || 0) ||
+              (Number(meta.channels) || 0) > (known.channels || 0);
+          }
+          // Anything other than a clean ok:true response leaves
+          // needsFullLoad true, so a failed or unrecognised meta check
+          // degrades into exactly the old behaviour rather than into a
+          // browser that quietly stops syncing.
+        } catch (e) {
+          needsFullLoad = true;
+        }
+      }
+      if (needsFullLoad && typeof loadCreatorSync === 'function') {
+        await loadCreatorSync({ background: true });
+      }
+    } catch (e) {
+      // Silent background sync
+    } finally {
+      _isSyncingForeground = false;
+    }
+  }, 250);
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      handleForegroundResumeSync();
+    }
+  });
+  // Periodic background check while the dashboard is open. This used to run
+  // every 15 seconds and call sync/load outright; it now runs a quarter as
+  // often and asks sync/meta first, so an idle open tab costs one tiny
+  // request a minute instead of four full state downloads. Returning to the
+  // tab still syncs immediately via the visibilitychange/focus handlers
+  // below, which is where responsiveness actually comes from.
+  setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      handleForegroundResumeSync();
+    }
+  }, 60000);
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('focus', () => {
+    handleForegroundResumeSync();
+  });
+  window.addEventListener('pageshow', () => {
+    handleForegroundResumeSync();
+  });
+}
 // Reordering & position management
 function moveRow(btn, dir) {
   const entry = btn.closest('.entry');
@@ -35266,6 +39332,19 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
+    showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
+    showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
+    showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
+    showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
+    showBadgesStremio: getBadgeSetting('showBadgesStremio'),
+    showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
+    showBadgeSeasonPremiere: getBadgeSetting('showBadgeSeasonPremiere'),
+    showBadgeSeasonFinale: getBadgeSetting('showBadgeSeasonFinale'),
+    showBadgeSeasonFinaleDate: getBadgeSetting('showBadgeSeasonFinaleDate'),
+    showBadgeRating: getBadgeSetting('showBadgeRating'),
+    showBadgeWatched: getBadgeSetting('showBadgeWatched'),
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     keys.creatorName = activeCreator.creatorName;
@@ -35277,6 +39356,74 @@ function collectKeys() {
   }
   return keys;
 }
+
+function getBadgeSetting(key) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+window.getBadgeSetting = getBadgeSetting;
+
+function applyBadgeBodyClasses() {
+  const b = document.body;
+  if (!b) return;
+  // Badge settings just changed, so the memoized copy the poster renderer
+  // holds is stale -- see getPosterBadgeSettings.
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  b.classList.toggle('hide-airing-next-badges', !getBadgeSetting('showBadgesAiringNext'));
+  b.classList.toggle('hide-continue-watching-badges', !getBadgeSetting('showBadgesContinueWatching'));
+  b.classList.toggle('hide-catalogs-badges', !getBadgeSetting('showBadgesCatalogs'));
+  b.classList.toggle('hide-badge-air-date', !getBadgeSetting('showBadgeAirDate'));
+  b.classList.toggle('hide-badge-season-premiere', !getBadgeSetting('showBadgeSeasonPremiere'));
+  b.classList.toggle('hide-badge-season-finale', !getBadgeSetting('showBadgeSeasonFinale'));
+  b.classList.toggle('hide-badge-season-finale-date', !getBadgeSetting('showBadgeSeasonFinaleDate'));
+  b.classList.toggle('hide-badge-rating', !getBadgeSetting('showBadgeRating'));
+  b.classList.toggle('hide-badge-watched', !getBadgeSetting('showBadgeWatched'));
+}
+window.applyBadgeBodyClasses = applyBadgeBodyClasses;
+
+function toggleBadgeSetting(key, isChecked) {
+  try {
+    localStorage.setItem('myListAddon:' + key, isChecked ? '1' : '0');
+  } catch (e) {}
+  applyBadgeBodyClasses();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+}
+window.toggleBadgeSetting = toggleBadgeSetting;
+
+function initBadgeSettingsUI() {
+  const badgeKeys = [
+    { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
+    { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+    { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
+    { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
+    { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
+    { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
+    { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
+    { key: 'showBadgeSeasonPremiere', id: 'badgeSeasonPremiereCheckbox' },
+    { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
+    { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
+    { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+    { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
+  ];
+  badgeKeys.forEach(({ key, id }) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.checked = getBadgeSetting(key);
+    }
+  });
+  applyBadgeBodyClasses();
+}
+window.initBadgeSettingsUI = initBadgeSettingsUI;
+document.addEventListener('DOMContentLoaded', () => {
+  initBadgeSettingsUI();
+});
 
 // --- Live Preview -----------------------------------------------------------
 //
@@ -35326,9 +39473,14 @@ async function renderLivePreview() {
   const skeletonsHtml = Array(visibleCount).fill(skeletonCardHtml).join('');
 
   // Pre-render shimmer skeletons and set status spinner on all enabled shelves
+  // (but don't wipe out existing posters if this is just a background refresh)
   enabledEntries.forEach((entryDOM) => {
     const postersContainer = entryDOM.querySelector('.live-preview-posters');
-    if (postersContainer) postersContainer.innerHTML = skeletonsHtml;
+    if (postersContainer) {
+      if (!postersContainer.innerHTML.trim() || postersContainer.innerHTML.includes('live-preview-skeleton-card')) {
+        postersContainer.innerHTML = skeletonsHtml;
+      }
+    }
     const statusEl = entryDOM.querySelector('.live-preview-shelf-status');
     if (statusEl) statusEl.innerHTML = '<span class="status-spin">&#x21BB;</span> <span>Loading&hellip;</span>';
   });
@@ -35345,11 +39497,20 @@ async function renderLivePreview() {
       const statusEl = entryDOM.querySelector('.live-preview-shelf-status');
       if (!postersContainer) continue;
       
+      const sUrl = (s.url || '').toLowerCase();
+      const sName = (s.name || '').toLowerCase();
+      const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
+      const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
       } else {
         postersContainer.classList.remove('is-watch-history-shelf');
       }
+      postersContainer.classList.toggle('is-continue-watching-shelf', isCwShelf);
+      postersContainer.classList.toggle('is-airing-next-shelf', isAiringShelf);
+      if (isCwShelf) entryDOM.dataset.listSlug = 'continue-watching';
+      if (isAiringShelf) entryDOM.dataset.listSlug = 'airing-next';
       
       const seeAllBtn = entryDOM.querySelector('.live-preview-shelf-title button');
       if (seeAllBtn) {
@@ -35387,7 +39548,9 @@ async function renderLivePreview() {
           continue;
         }
         livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore };
-        postersContainer.innerHTML = data.sample.slice(0, visibleCount).map(livePreviewPosterHtml).join('');
+        const sliced = data.sample.slice(0, visibleCount);
+        sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; });
+        postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
         if (seeAllBtn && data.sample.length > visibleCount) seeAllBtn.disabled = false;
       } catch (e) {
         if (statusEl) statusEl.innerHTML = '';
@@ -35402,16 +39565,246 @@ async function renderLivePreview() {
 
 function handlePosterImgError(img) {
   if (!img) return;
-  img.onerror = null;
-  const imdb = img.getAttribute('data-imdb') || '';
-  if (img.src.indexOf('images.metahub.space') === -1 && imdb && imdb.startsWith('tt')) {
-    img.src = 'https://images.metahub.space/poster/medium/' + imdb + '/img';
+  if (img.dataset.hasFailedFallback) {
+    img.style.display = 'none';
+    const ph = img.nextElementSibling;
+    if (ph) ph.style.display = 'flex';
+    return;
+  }
+  img.dataset.hasFailedFallback = '1';
+
+  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
+  let title = (card && (card.dataset.title || card.dataset.name)) || '';
+  const type = (card && (card.dataset.type || card.dataset.listType)) || 'movie';
+  const id = (card && (card.dataset.id || card.dataset.imdbId)) || '';
+
+  // Clean episode indicators from show title for fallback lookup, e.g. "Ted Lasso S03E01" -> "Ted Lasso"
+  const cleanTitle = title.replace(/\s+S\d+E\d+.*$/i, '').trim();
+
+  const tmdbId = id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : '');
+  const imdbId = id.startsWith('tt') ? id.split(':')[0] : '';
+
+  if (cleanTitle || tmdbId || imdbId) {
+    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(cleanTitle || title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.ok && data.poster) {
+          img.src = data.poster;
+          img.style.display = '';
+        } else {
+          img.style.display = 'none';
+          const ph = img.nextElementSibling;
+          if (ph) ph.style.display = 'flex';
+        }
+      })
+      .catch(() => {
+        img.style.display = 'none';
+        const ph = img.nextElementSibling;
+        if (ph) ph.style.display = 'flex';
+      });
   } else {
     img.style.display = 'none';
     const ph = img.nextElementSibling;
     if (ph) ph.style.display = 'flex';
   }
 }
+
+// --- Poster-render caches ----------------------------------------------------
+// livePreviewPosterHtml below is called once per card, and a Watch History
+// grid can be several thousand cards. Two things in it were priced as if it
+// ran a handful of times: four separate localStorage reads for badge
+// settings (so ~4,000 synchronous reads for a 1,000-item grid), and, for
+// every Continue Watching or Airing Next card, a fresh loadLocalCustomLists()
+// plus a linear scan of the whole airing-next list -- O(cards x airing
+// entries) on the main thread before a single pixel is painted.
+//
+// Both inputs are the same for every card in a render pass, so they are
+// computed once and reused. The TTL is short enough to be invisible to a
+// person toggling a setting (the settings UI re-renders well after it
+// lapses) and long enough to cover any single pass; invalidatePosterRender-
+// Caches is also called outright wherever badge settings change, so the TTL
+// is a backstop rather than the mechanism.
+var _posterBadgeCache = null;
+var _posterBadgeCacheAt = 0;
+var _airingIndexCache = null;
+var _airingIndexCacheAt = 0;
+var POSTER_RENDER_CACHE_MS = 250;
+
+function invalidatePosterRenderCaches() {
+  _posterBadgeCache = null;
+  _posterBadgeCacheAt = 0;
+  _airingIndexCache = null;
+  _airingIndexCacheAt = 0;
+}
+window.invalidatePosterRenderCaches = invalidatePosterRenderCaches;
+
+function getPosterBadgeSettings() {
+  var now = Date.now();
+  if (_posterBadgeCache && (now - _posterBadgeCacheAt) < POSTER_RENDER_CACHE_MS) {
+    return _posterBadgeCache;
+  }
+  var get = (typeof getBadgeSetting === 'function') ? getBadgeSetting : function() { return true; };
+  _posterBadgeCache = {
+    continueWatching: get('showBadgesContinueWatching'),
+    airingNext: get('showBadgesAiringNext'),
+    airDate: get('showBadgeAirDate'),
+    seasonPremiere: get('showBadgeSeasonPremiere'),
+    seasonFinale: get('showBadgeSeasonFinale'),
+    seasonFinaleDate: get('showBadgeSeasonFinaleDate'),
+  };
+  _posterBadgeCacheAt = now;
+  return _posterBadgeCache;
+}
+
+// Index of the Airing Next list by every identity the old linear scan used
+// to match on, so a lookup is a few Map hits instead of a walk of the whole
+// list per card.
+//
+// The subtlety worth stating plainly: the old code was
+// airingList.find(...), which walks the list IN ORDER and returns the first
+// entry matching ANY of its predicates. So when two different entries would
+// each match a card by different routes -- say entry 0 by title and entry 3
+// by showId -- the old code returns entry 0, because position wins over
+// which predicate fired. An index that simply checked showId before title
+// would return entry 3 instead, which is a real behaviour change and not a
+// theoretical one (it showed up immediately under randomised comparison
+// against the original predicate).
+//
+// So each key stores the entry's POSITION as well, and a lookup gathers
+// every candidate and keeps the earliest -- identical results to find(),
+// without the walk. Keys are inserted first-wins so a duplicate identity
+// within the list also resolves to its earliest occurrence.
+function getAiringNextIndex() {
+  var now = Date.now();
+  if (_airingIndexCache && (now - _airingIndexCacheAt) < POSTER_RENDER_CACHE_MS) {
+    return _airingIndexCache;
+  }
+  var byShowId = new Map();
+  var byBaseId = new Map();
+  var byTmdb = new Map();
+  var byImdb = new Map();
+  var byTitle = new Map();
+  var list = [];
+  try {
+    list = (typeof loadLocalCustomLists === 'function')
+      ? ((loadLocalCustomLists()['airing-next'] || {}).items || [])
+      : [];
+  } catch (e) {
+    list = [];
+  }
+  function put(map, key, entry, i) {
+    if (key && !map.has(key)) map.set(key, { entry: entry, i: i });
+  }
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i];
+    if (!a) continue;
+    put(byShowId, String(a.showId || ''), a, i);
+    put(byBaseId, String(a.showId || a.id || '').split(':')[0], a, i);
+    if (a.canonicalTmdbId != null) put(byTmdb, 'c' + String(a.canonicalTmdbId), a, i);
+    if (a.tmdbId != null) put(byTmdb, 't' + String(a.tmdbId), a, i);
+    if (a.imdbId) put(byImdb, String(a.imdbId), a, i);
+    put(byTitle, String(a.showTitle || a.title || a.name || '').toLowerCase().trim(), a, i);
+  }
+  _airingIndexCache = {
+    empty: list.length === 0,
+    byShowId: byShowId,
+    byBaseId: byBaseId,
+    byTmdb: byTmdb,
+    byImdb: byImdb,
+    byTitle: byTitle,
+  };
+  _airingIndexCacheAt = now;
+  return _airingIndexCache;
+}
+
+function findAiringMatchFor(m) {
+  var idx = getAiringNextIndex();
+  if (idx.empty) return null;
+  var best = null;
+  function consider(hit) {
+    if (hit && (best === null || hit.i < best.i)) best = hit;
+  }
+  // Predicate 1: an entry's showId against any of this card's identities.
+  if (m.id) consider(idx.byShowId.get(String(m.id)));
+  if (m.removeShowId) consider(idx.byShowId.get(String(m.removeShowId)));
+  if (m.showId) consider(idx.byShowId.get(String(m.showId)));
+  if (m.imdbId) consider(idx.byShowId.get(String(m.imdbId)));
+  // Predicate 2: base id (everything before the first colon) on both sides.
+  var mBase = String(m.showId || m.id || m.removeShowId || '').split(':')[0];
+  if (mBase) consider(idx.byBaseId.get(mBase));
+  // Predicates 3-5: canonical TMDB id, TMDB id, IMDb id.
+  if (m.canonicalTmdbId != null) consider(idx.byTmdb.get('c' + String(m.canonicalTmdbId)));
+  if (m.tmdbId != null) consider(idx.byTmdb.get('t' + String(m.tmdbId)));
+  if (m.imdbId) consider(idx.byImdb.get(String(m.imdbId)));
+  // Predicate 6: normalised title.
+  var mTitle = String(m.showTitle || m.title || m.name || '').toLowerCase().trim();
+  if (mTitle) consider(idx.byTitle.get(mTitle));
+  return best ? best.entry : null;
+}
+
+// --- Chunked poster-grid rendering -------------------------------------------
+// Building an entire grid in one assignment is fine for a 40-item chart and
+// punishing for a Watch History that has grown into the thousands: the map
+// runs to completion, a multi-megabyte HTML string is assembled, and the
+// browser then parses and lays out ~8 nodes and an <img> per card before
+// anything at all appears. Every filter pill and sort change paid it again.
+//
+// This paints the first screenful synchronously -- so the grid is visible
+// immediately regardless of list size -- then appends the rest in small
+// batches between frames, keeping the main thread free for scrolling and
+// taps in between. insertAdjacentHTML is used rather than rebuilding
+// innerHTML so earlier batches are never re-parsed.
+//
+// Each call takes a generation token: starting a new render invalidates any
+// batches still queued from the previous one, so rapidly toggling filters
+// can never interleave two lists into the same grid.
+var POSTER_GRID_FIRST_CHUNK = 60;
+var POSTER_GRID_BATCH = 60;
+var _posterGridGeneration = 0;
+
+function renderPosterGridChunked(gridEl, items, onComplete) {
+  if (!gridEl) return;
+  var generation = ++_posterGridGeneration;
+  gridEl.innerHTML = '';
+  if (!items || !items.length) {
+    if (typeof onComplete === 'function') onComplete(0);
+    return;
+  }
+
+  var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
+  gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+
+  if (items.length <= POSTER_GRID_FIRST_CHUNK) {
+    if (typeof onComplete === 'function') onComplete(items.length);
+    return;
+  }
+
+  var cursor = POSTER_GRID_FIRST_CHUNK;
+  var schedule = (typeof window !== 'undefined' && window.requestAnimationFrame)
+    ? function(fn) { window.requestAnimationFrame(fn); }
+    : function(fn) { setTimeout(fn, 16); };
+
+  function step() {
+    // A newer render started, or the grid was swapped out from under us --
+    // abandon this pass rather than appending into someone else's list.
+    if (generation !== _posterGridGeneration) return;
+    if (!gridEl.isConnected) return;
+    var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
+    if (!slice.length) {
+      if (typeof onComplete === 'function') onComplete(items.length);
+      return;
+    }
+    gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    cursor += slice.length;
+    if (cursor < items.length) {
+      schedule(step);
+    } else if (typeof onComplete === 'function') {
+      onComplete(items.length);
+    }
+  }
+  schedule(step);
+}
+window.renderPosterGridChunked = renderPosterGridChunked;
 
 function livePreviewPosterHtml(m) {
   const landscape = m.posterShape === 'landscape';
@@ -35433,21 +39826,82 @@ function livePreviewPosterHtml(m) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
   }
 
+  const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
+  const parentName = (m.listName || (window._currentListDetailsParams ? window._currentListDetailsParams.name : '') || '').toLowerCase();
+
+  let decodedSlug = '';
+  if (parentUrl.startsWith('customlist:v1:')) {
+    try {
+      const payload = JSON.parse(parentUrl.slice('customlist:v1:'.length));
+      decodedSlug = (payload.localSlug || payload.creatorSlug || payload.slug || payload.listSlug || '').toLowerCase();
+    } catch (e) {}
+  }
+
+  const isCwListContext = parentUrl.includes('continue-watching') || parentUrl.includes('continue_watching') || parentName.includes('continue watching') || decodedSlug === 'continue-watching';
+  const isAiringListContext = parentUrl.includes('airing-next') || parentUrl.includes('airing_next') || parentName.includes('airing next') || decodedSlug === 'airing-next';
+
+  const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext);
+  const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  
+  const badgeSettings = getPosterBadgeSettings();
+  const locationAllowed = isCwItem
+    ? badgeSettings.continueWatching
+    : (isAiringItem ? badgeSettings.airingNext : false);
+
+  const showAirDate = locationAllowed && badgeSettings.airDate;
+  const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
+  const showFinale = locationAllowed && badgeSettings.seasonFinale;
+  const showFinaleDate = locationAllowed && badgeSettings.seasonFinaleDate;
+
+  let airingMatch = null;
+  if (isCwItem || isAiringItem) {
+    airingMatch = findAiringMatchFor(m);
+  }
+  
+  const mSeason = m.seasonNum != null ? m.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
+  const mEpisode = m.episodeNum != null ? m.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+  
+  // Check if this show is on an older past season (not the newest season)
+  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && m.seasonNum != null && m.seasonNum < airingMatch.seasonNum);
+
   let dateBadge = '';
-  if (!m.hideDateBadge && m.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(m.airDate)) {
-    const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : '';
-    if (badgeText) {
-      dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+  let bottomBadge = '';
+
+  if (locationAllowed && !isOlderSeason) {
+    const isSameEpisode = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum) && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum));
+    const effectiveAirDate = m.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
+    const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
+    const isUnairedEp = effectiveAirDate ? !hasAired : !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+
+    if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
+      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
+      if (badgeText) {
+        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
+      }
+    }
+
+    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+    const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
+    const isSeasonFinale = !!(m.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+    const seasonFinaleAirDate = m.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
+    const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
+
+    if (showPremiere && isSeasonPremiere && isUnairedEp) {
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
+    } else if (showFinale && isSeasonFinale) {
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
+    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+      const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
+      if (finaleText) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+      }
     }
   }
-  const premiereBadge = (m.isSeasonPremiere)
-    ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(m.airDate || '') + '">Season Premiere</div>'
-    : '';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +
-      premiereBadge +
+      bottomBadge +
       removeBtn +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
@@ -35578,6 +40032,20 @@ window.renderWatchHistoryGrid = function() {
   const statusEl = document.getElementById('detailStatus');
   const subEl = document.getElementById('detailSubtitle');
   if (!gridEl) return;
+  
+  const detailTab = document.getElementById('content-list-details');
+  if (!detailTab || detailTab.hasAttribute('hidden')) return;
+  const p = window._currentListDetailsParams;
+  if (!p) return;
+  const isExtHist = !!(
+    (p.listUrl && (p.listUrl === 'trakt:history' || p.listUrl.startsWith('trakt:history') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/history')))) ||
+    (p.listUrl && (p.listUrl === 'mdblist:history' || p.listUrl.startsWith('mdblist:history') || p.listUrl.includes('mdblist.com/history') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/history')))) ||
+    (p.listUrl && p.listUrl.startsWith('simkl:user:') && p.listUrl.includes(':history'))
+  );
+  if (isExtHist) return;
+  const isLocalHist = (!p.listUrl && p.name && p.name.toLowerCase().includes('watch history')) || p.listUrl === 'watch-history' || p.listUrl === 'custom:watch-history' || p.listUrl === 'autotrack:watch-history';
+  if (!isLocalHist) return;
+
 
   const rawItems = window._rawWatchHistoryItems || [];
   if (!rawItems.length) {
@@ -35601,8 +40069,8 @@ window.renderWatchHistoryGrid = function() {
       if (isEp) {
         const showKey = String(it.showId || it.showTitle || it.id);
         const sId = it.showId || (String(it.id).startsWith('tt') ? it.id : null);
-        let showPosterUrl = it.showPoster || '';
-        if (!showPosterUrl && sId) {
+        let showPosterUrl = it.showPoster || it.poster || '';
+        if (!showPosterUrl && sId && sId.startsWith('tt')) {
           showPosterUrl = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(sId) + '/img';
         }
         if (!showMap.has(showKey)) {
@@ -35629,7 +40097,7 @@ window.renderWatchHistoryGrid = function() {
         }
       } else {
         let movPoster = it.poster || it.showPoster || '';
-        if (!movPoster && (it.imdbId || it.id)) {
+        if (!movPoster && (it.imdbId || it.id) && String(it.imdbId || it.id).startsWith('tt')) {
           movPoster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(it.imdbId || it.id) + '/img';
         }
         processed.push({
@@ -35646,7 +40114,7 @@ window.renderWatchHistoryGrid = function() {
     });
 
     showMap.forEach((entry) => {
-      if (!entry.poster && entry.id) {
+      if (!entry.poster && entry.id && String(entry.id).startsWith('tt')) {
         entry.poster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(entry.id) + '/img';
       }
       entry.subtitle = entry.watchedCount + ' episode' + (entry.watchedCount === 1 ? '' : 's') + ' watched';
@@ -35684,7 +40152,8 @@ window.renderWatchHistoryGrid = function() {
     processed.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
   }
 
-  gridEl.innerHTML = processed.map(livePreviewPosterHtml).join('');
+  processed.forEach(item => item.listUrl = 'watch-history');
+  renderPosterGridChunked(gridEl, processed);
   if (subEl) {
     subEl.textContent = processed.length + ' item' + (processed.length === 1 ? '' : 's');
   }
@@ -35748,8 +40217,15 @@ window.switchListDetailsType = function(newType) {
     isDualTypeChart = true;
   }
 
-  if (isDualTypeChart && (newType === 'movie' || newType === 'series') && (p.type !== newType || p.listUrl !== targetUrl)) {
-    openListDetailsPage(targetName, newType, targetUrl, null, {
+  const isExternalProviderList = !!(p.listUrl && (
+    p.listUrl === 'trakt:history' || p.listUrl.startsWith('trakt:history:') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/history')) ||
+    p.listUrl === 'trakt:watchlist' || p.listUrl.startsWith('trakt:watchlist:') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/watchlist')) ||
+    p.listUrl === 'mdblist:history' || p.listUrl.startsWith('mdblist:history:') || p.listUrl.includes('mdblist.com/history') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/history')) ||
+    p.listUrl === 'mdblist:watchlist' || p.listUrl.startsWith('mdblist:watchlist:') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/watchlist'))
+  ));
+
+  if ((isDualTypeChart || isExternalProviderList) && (newType === 'movie' || newType === 'series' || (newType === 'all' && isExternalProviderList)) && (p.type !== newType || p.listUrl !== targetUrl)) {
+    openListDetailsPage(targetName, newType === 'all' ? 'mixed' : newType, targetUrl, null, {
       preserveScroll: true
     });
     return;
@@ -35759,14 +40235,15 @@ window.switchListDetailsType = function(newType) {
   if (window._currentListDetailsAllItems && Array.isArray(window._currentListDetailsAllItems)) {
     let filtered = window._currentListDetailsAllItems;
     if (newType === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (newType === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
     const gridEl = document.getElementById('detailGrid');
     const statusEl = document.getElementById('detailStatus');
     if (gridEl) {
-      gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+      filtered.forEach(item => { item.listUrl = p.listUrl; item.listName = p.name; });
+      renderPosterGridChunked(gridEl, filtered);
     }
     if (statusEl) {
       statusEl.innerHTML = filtered.length ? '' : '<small>No matching items found.</small>';
@@ -35834,7 +40311,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._listPreloadedCache = window._listPreloadedCache || {};
   if (preloaded && preloaded.sample && preloaded.sample.length) {
     window._listPreloadedCache[cacheKey] = preloaded;
-  } else if (!preloaded) {
+  } else if (!preloaded || !preloaded.sample || !preloaded.sample.length) {
     if (window._listPreloadedCache[cacheKey]) {
       preloaded = window._listPreloadedCache[cacheKey];
     } else if (listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
@@ -35925,10 +40402,112 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const slug = parts[1];
       const kind = parts[2];
       const creator = parts[3];
-      if (typeof getAutoTrackChannelItems === 'function') {
-        const sample = getAutoTrackChannelItems(slug, kind, creator);
+      if (slug === 'continue-watching') {
+        const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const cwList = map['continue-watching'] || (typeof getOrCreateContinueWatchingList === 'function' ? getOrCreateContinueWatchingList() : null);
+        const rawItems = (cwList && Array.isArray(cwList.items)) ? cwList.items : [];
+        const deduped = (typeof dedupeContinueWatchingItems === 'function') ? dedupeContinueWatchingItems(rawItems) : rawItems;
+        const sample = deduped.map((it) => {
+          const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+          const epId = String(it.id || '');
+          const showId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)));
+          const showPoster = it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster);
+          return {
+            id: showId || it.id,
+            showId: showId || it.id,
+            showTitle: it.showTitle || it.title || it.name,
+            seasonNum: it.seasonNum,
+            episodeNum: it.episodeNum,
+            type: 'series',
+            name: label.title,
+            subtitle: label.subtitle,
+            poster: showPoster,
+            year: it.year,
+            airDate: it.airDate,
+            isUnaired: it.isUnaired,
+            seasonFinaleAirDate: it.seasonFinaleAirDate,
+            isSeasonPremiere: it.isSeasonPremiere,
+            isSeasonFinale: it.isSeasonFinale,
+            removeShowId: showId || it.id,
+          };
+        });
         preloaded = { sample: sample, count: sample.length, maybeMore: false };
+        window._listPreloadedCache[cacheKey] = preloaded;
+      } else if (slug === 'watch-history') {
+        const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const whList = map['watch-history'] || { items: [] };
+        const sample = (whList.items || []).map((it) => {
+          const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+          const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+          return {
+            id: it.showId || it.imdbId || it.id,
+            type: isShow ? 'series' : 'movie',
+            name: label.title,
+            subtitle: label.subtitle,
+            poster: it.poster || it.showPoster,
+            year: it.year,
+            airDate: it.airDate,
+            removeHistoryId: it.id || it.imdbId,
+          };
+        });
+        preloaded = { sample: sample, count: sample.length, maybeMore: false };
+        window._listPreloadedCache[cacheKey] = preloaded;
       }
+    } else if (listUrl && (listUrl.startsWith('custom:') || listUrl.startsWith('customlist:v1:') || listUrl.startsWith('/lists/custom/'))) {
+      try {
+        let slug = '';
+        let directItems = null;
+        if (listUrl.startsWith('custom:')) {
+          slug = listUrl.slice('custom:'.length);
+        } else if (listUrl.startsWith('/lists/custom/')) {
+          slug = listUrl.slice('/lists/custom/'.length);
+        } else if (listUrl.startsWith('customlist:v1:')) {
+          try {
+            const p = JSON.parse(listUrl.slice('customlist:v1:'.length));
+            slug = p.listSlug || p.localSlug || p.creatorSlug || '';
+            if (Array.isArray(p.items)) directItems = p.items;
+          } catch (e) {}
+        }
+        const match = (typeof findCustomListBySlugOrName === 'function') ? findCustomListBySlugOrName(slug, name) : null;
+        const rawItems = (match && Array.isArray(match.items) && match.items.length) ? match.items : (directItems || []);
+        if (rawItems.length) {
+          const isCw = (match && match.slug === 'continue-watching') || slug === 'continue-watching';
+          const isWatchlist = (match && (match.slug === 'watchlist' || match.isWatchlist)) || slug === 'watchlist';
+          const isHistory = (match && match.slug === 'watch-history') || slug === 'watch-history';
+          const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(rawItems) : rawItems) : rawItems;
+          const sample = itemsToProcess.map((it) => {
+            const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+            const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+            const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : ((match && match.type && match.type !== 'mixed') ? match.type : (type || 'movie'))));
+            const epId = String(it.id || '');
+            const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+            const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
+            return {
+              id: showId,
+              showId: showId,
+              showTitle: it.showTitle || it.title || it.name,
+              seasonNum: it.seasonNum,
+              episodeNum: it.episodeNum,
+              type: itemType,
+              name: label.title || it.title || it.name || 'Untitled',
+              subtitle: label.subtitle || '',
+              poster: showPoster,
+              year: it.year,
+              airDate: it.airDate,
+              isUnaired: it.isUnaired,
+              seasonFinaleAirDate: it.seasonFinaleAirDate,
+              isSeasonPremiere: it.isSeasonPremiere,
+              isSeasonFinale: it.isSeasonFinale,
+              removeShowId: isCw ? (it.showId || it.id) : null,
+              removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+              removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+              removeCustomListSlug: (!isCw && !isWatchlist && !isHistory && (match ? (match.slug || match.localSlug) : slug)) ? (match ? (match.slug || match.localSlug) : slug) : null,
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      } catch (e) {}
     } else if (!listUrl && name) {
       const isGenericChartName = nLower === 'popular' || nLower.startsWith('popular ') || nLower.startsWith('popular -') || nLower === 'trending' || nLower.startsWith('trending ') || nLower.startsWith('trending -') || nLower === 'new releases' || nLower.startsWith('new releases') || nLower === 'airing next';
       if (!isGenericChartName) {
@@ -35939,17 +40518,30 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const isCw = match.slug === 'continue-watching';
             const isWatchlist = match.slug === 'watchlist' || match.isWatchlist || (match.name && match.name.toLowerCase() === 'watchlist');
             const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
-            const sample = match.items.map((it) => {
+            const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(match.items) : match.items) : match.items;
+            const sample = itemsToProcess.map((it) => {
               const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+              const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+              const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (match && match.type && match.type !== 'mixed' ? match.type : 'movie')));
+              const epId = String(it.id || '');
+              const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+              const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
               return {
-                id: it.showId || it.imdbId || it.id,
-                type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
-                name: label.title,
-                subtitle: label.subtitle,
-                poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+                id: showId,
+                showId: showId,
+                showTitle: it.showTitle || it.title || it.name,
+                seasonNum: it.seasonNum,
+                episodeNum: it.episodeNum,
+                type: itemType,
+                name: label.title || it.title || it.name || 'Untitled',
+                subtitle: label.subtitle || '',
+                poster: showPoster,
                 year: it.year,
                 airDate: it.airDate,
                 isUnaired: it.isUnaired,
+                seasonFinaleAirDate: it.seasonFinaleAirDate,
+                isSeasonPremiere: it.isSeasonPremiere,
+                isSeasonFinale: it.isSeasonFinale,
                 removeShowId: isCw ? (it.showId || it.id) : null,
                 removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
                 removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
@@ -35969,11 +40561,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
             const sample = match.items.map((it) => {
               const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+              const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+              const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (match && match.type && match.type !== 'mixed' ? match.type : 'movie')));
               return {
-                id: it.showId || it.imdbId || it.id,
-                type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
-                name: label.title,
-                subtitle: label.subtitle,
+                id: it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null),
+                type: itemType,
+                name: label.title || it.title || it.name || 'Untitled',
+                subtitle: label.subtitle || '',
                 poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
                 year: it.year,
                 airDate: it.airDate,
@@ -36154,12 +40748,6 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
   updateDetailAddBtn();
 
-  window._currentListDetailsParams = { name, type, listUrl };
-  window._currentListDetailsFilter = (type === 'movie' || type === 'series') ? type : 'all';
-  window._currentListDetailsAllItems = [];
-  const filterBar = document.getElementById('detailFilterBar');
-  const isWatchHistory = (name && name.toLowerCase().includes('watch history')) || (listUrl === 'autotrack:watch-history' || listUrl === 'custom:watch-history');
-
   let isDualTypeChart = false;
   if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
     const match = CHART_SLUG_ENTRIES.find((e) => e.name === name || e.movieUrl === listUrl || e.showUrl === listUrl);
@@ -36171,14 +40759,37 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     isDualTypeChart = true;
   }
 
-  const isMixedList = type === 'mixed' || isDualTypeChart || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+  const isContinueWatching = (name && name.toLowerCase().includes('continue watching')) || (listUrl === 'autotrack:continue-watching' || listUrl === 'custom:continue-watching' || (listUrl && listUrl.includes('continue-watching')));
+  if (isContinueWatching) {
+    type = 'series';
+    isDualTypeChart = false;
+  }
+
+  window._currentListDetailsParams = { name, type, listUrl };
+  window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
+  window._currentListDetailsAllItems = [];
+  const filterBar = document.getElementById('detailFilterBar');
+  const isExternalHistory = !!(
+    (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
+    (listUrl && (listUrl === 'mdblist:history' || listUrl.startsWith('mdblist:history') || listUrl.includes('mdblist.com/history') || (listUrl.includes('mdblist.com/lists/') && listUrl.includes('/history')))) ||
+    (listUrl && listUrl.startsWith('simkl:user:') && listUrl.includes(':history'))
+  );
+  const isLocalWatchHistory = !isExternalHistory && (
+    (!listUrl && (nLower === 'watch history' || nLower.includes('watch history'))) ||
+    listUrl === 'autotrack:watch-history' ||
+    listUrl === 'custom:watch-history' ||
+    listUrl === 'watch-history'
+  );
+  const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
 
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
   const genericTypeControls = document.getElementById('genericTypeFilterControls');
+  const cwClearBtn = document.getElementById('cwClearHistoryBtn');
+  if (cwClearBtn) cwClearBtn.style.display = 'none';
 
   if (filterBar) {
-    if (isWatchHistory) {
+    if (isLocalWatchHistory) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'flex';
       if (whSortControls) whSortControls.style.display = 'flex';
@@ -36202,10 +40813,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (whSortControls) whSortControls.style.display = 'none';
       if (genericTypeControls) {
         genericTypeControls.style.display = 'flex';
+        if (cwClearBtn) {
+          cwClearBtn.style.display = isContinueWatching ? '' : 'none';
+        }
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
-        if (isDualTypeChart) {
+        const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
+        if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {
@@ -36238,7 +40853,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     }
   }
 
-  if (isWatchHistory) {
+  if (isLocalWatchHistory) {
     if (likeBtn) likeBtn.style.display = 'none';
     if (addBtn) addBtn.style.display = 'none';
     const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
@@ -36282,7 +40897,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         if (listUrl.startsWith('autotrack:')) slug = listUrl.split(':')[1] || '';
         else if (listUrl.startsWith('custom:') && !listUrl.startsWith('custom:curated:')) slug = listUrl.slice('custom:'.length);
       }
-      if (!slug && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
+      if (!slug && !listUrl && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
         slug = name.toLowerCase().replace(' ', '-');
       }
 
@@ -36458,11 +41073,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     const curFilter = window._currentListDetailsFilter || 'all';
     let filtered = window._currentListDetailsAllItems;
     if (curFilter === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (curFilter === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
-    gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+    filtered.forEach(item => { item.listUrl = listUrl; item.listName = name; });
+    // Chunked for the same reason the Watch History grid is -- this is the
+    // path a large Custom List, Watchlist or paginated chart takes, and it
+    // rebuilds the whole accumulated grid on every page that arrives.
+    renderPosterGridChunked(gridEl, filtered);
     loadedCount = window._currentListDetailsAllItems.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
@@ -36477,7 +41096,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 
   async function loadNextPage() {
     if (loading || done) return;
-    if (!listUrl || listUrl.startsWith('custom:')) {
+    if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
       statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
@@ -36571,26 +41190,202 @@ function openLivePreviewSeeAll(i) {
 // left as readable JSON in a textarea -- something to copy into a notes app
 // or another device, and paste back in later, without touching the actual
 // install link.
-function exportConfigJson() {
-  const entries = collectEntries();
-  if (!entries.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
-    else alert('Add at least one list first.');
-    return;
+// --- Payload references: the fix for backup/preset bloat ---------------------
+//
+// A catalog row's url is not a pointer, it is the data:
+//
+//   channel:v1:{"channelId":"chp3hsq9u1u5u6","name":"A&E","items":[ ...67KB... ]}
+//
+// which means one row can be 75KB, and the same items end up stored in
+// several places at once. Measured on a real 5.9MB backup: the list
+// "coming-of-age-movies" (462 items) appeared FIVE times -- in the
+// customLists map, in its catalog row's url, and in all three presets'
+// copies of that row. 87% of the entries block and 88% of the presets block
+// was duplicated item data. That is what pushed localStorage past its
+// ~5MB ceiling, and the overflow is what silently destroyed 24 of that
+// account's 51 custom lists.
+//
+// So for anything we STORE or EXPORT, rows carry a reference instead:
+//   channel:v1:{"channelId":"chp...","name":"A&E","itemsRef":"chp...","itemCount":812}
+// and the items are read back from the customLists / channels maps, which
+// are the actual source of truth and are already in the same backup file.
+//
+// Deliberately NOT applied to the live rows in the page. The url of a row
+// that is currently configured is what gets encoded into the install link
+// and sent to the Worker as the catalog config, and for a self-hosted
+// Worker with no KV binding that embedded copy IS the storage -- there is
+// nowhere else for it to live. Stripping it there would break catalogs for
+// exactly the people who have no server-side fallback. Dereferencing is
+// therefore confined to two places where a reference is unambiguously
+// better: the backup file, and presets in localStorage.
+const BACKUP_FORMAT_VERSION = '3.0';
+
+// The payload key that identifies which stored list/channel a row points at.
+function payloadRefKey(prefix, payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (prefix === 'channel:v1:') return String(payload.channelId || '');
+  return String(payload.localSlug || payload.creatorSlug || payload.listSlug || payload.listId || '');
+}
+
+function splitPayloadUrl(url) {
+  const s = String(url || '');
+  for (const prefix of ['customlist:v1:', 'channel:v1:']) {
+    if (s.startsWith(prefix)) {
+      try {
+        return { prefix: prefix, payload: JSON.parse(s.slice(prefix.length)) };
+      } catch (e) {
+        return null;   // unparseable -- leave the row exactly as it is
+      }
+    }
   }
-  const keys = collectKeys();
-  const payload = { entries };
+  return null;
+}
+
+// Replaces a row's embedded items with a reference -- but only when the copy
+// it is dropping is byte-identical to what would be read back. A row whose
+// items exist nowhere else, or differ from the stored list, keeps them.
+//
+// That last case is not hypothetical. A "mixed" list split across a movie row
+// and a series row gives each row a filtered SUBSET of the list: on the
+// account that prompted this work, one list of 190 items backed a movie row
+// of 163 and a series row of 27. Replacing either with a reference to the
+// full 190 would quietly change what those rows show. So the test is
+// equality, not merely "a list with this slug exists" -- which makes the
+// whole round-trip provably lossless rather than probably lossless.
+function sameItems(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;              // cheap reject first
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function dereferenceEntry(entry, customLists, channels) {
+  if (!entry || !entry.url) return entry;
+  const split = splitPayloadUrl(entry.url);
+  if (!split) return entry;
+  const items = split.payload.items;
+  if (!Array.isArray(items) || !items.length) return entry;
+  const ref = payloadRefKey(split.prefix, split.payload);
+  if (!ref) return entry;
+  const source = (split.prefix === 'channel:v1:') ? (channels || {}) : (customLists || {});
+  const stored = source[ref];
+  if (!stored || !sameItems(items, stored.items)) return entry;
+  // items is blanked in place rather than deleted, so rehydrating restores
+  // the payload with its keys in their original order. That is what makes a
+  // backup round-trip byte-identical instead of merely equivalent -- and
+  // byte-identical is what lets the test suite assert it.
+  const lean = {};
+  Object.keys(split.payload).forEach((k) => { lean[k] = (k === 'items') ? null : split.payload[k]; });
+  lean.itemsRef = ref;
+  lean.itemCount = items.length;
+  return Object.assign({}, entry, { url: split.prefix + JSON.stringify(lean) });
+}
+
+// Puts the items back. Falls back to whatever the row already carries, so a
+// v1/v2 file (embedded items, no reference) round-trips untouched.
+function rehydrateEntry(entry, customLists, channels) {
+  if (!entry || !entry.url) return entry;
+  const split = splitPayloadUrl(entry.url);
+  if (!split) return entry;
+  const p = split.payload;
+  if (Array.isArray(p.items) && p.items.length) return entry;   // already has data (v1/v2 row)
+  const ref = String(p.itemsRef || payloadRefKey(split.prefix, p) || '');
+  if (!ref) return entry;
+  const source = (split.prefix === 'channel:v1:') ? (channels || {}) : (customLists || {});
+  const stored = source[ref];
+  const items = stored && Array.isArray(stored.items) ? stored.items : null;
+  if (!items) return entry;   // unresolved -- reported to the user, not silently dropped
+  const full = {};
+  Object.keys(p).forEach((k) => {
+    if (k === 'itemsRef' || k === 'itemCount') return;
+    full[k] = (k === 'items') ? items : p[k];
+  });
+  if (!('items' in full)) full.items = items;
+  return Object.assign({}, entry, { url: split.prefix + JSON.stringify(full) });
+}
+
+function dereferenceEntries(entries, customLists, channels) {
+  return (entries || []).map((e) => dereferenceEntry(e, customLists, channels));
+}
+
+function rehydrateEntries(entries, customLists, channels) {
+  return (entries || []).map((e) => rehydrateEntry(e, customLists, channels));
+}
+
+// Rows whose reference could not be resolved. Used to tell the person which
+// rows came back empty instead of letting them find out by scrolling past a
+// blank shelf.
+function unresolvedEntryNames(entries) {
+  const out = [];
+  (entries || []).forEach((e) => {
+    const split = splitPayloadUrl(e && e.url);
+    if (!split) return;
+    const p = split.payload;
+    if (p.itemsRef && !(Array.isArray(p.items) && p.items.length)) out.push(e.name || p.itemsRef);
+  });
+  return out;
+}
+
+window.dereferenceEntries = dereferenceEntries;
+window.rehydrateEntries = rehydrateEntries;
+
+function buildFullBackupPayload() {
+  const entries = (typeof collectEntries === 'function') ? collectEntries() : [];
+  const keys = (typeof collectKeys === 'function') ? collectKeys() : {};
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  const channels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+  const mergedChannels = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+  const presets = (typeof loadPresetsMap === 'function') ? loadPresetsMap() : {};
+
+  const payload = {
+    // 3.0 differs from 2.0 only in that rows reference their items instead
+    // of embedding a second copy of them (see dereferenceEntries above).
+    // Everything else is byte-for-byte the same shape, and importing a 1.x
+    // or 2.0 file still works -- applyImportedConfig detects the format.
+    version: BACKUP_FORMAT_VERSION,
+    exportedAt: new Date().toISOString(),
+    entries: dereferenceEntries(entries, map, channels),
+    keys: keys,
+    customLists: map,
+    channels: channels,
+    mergedChannels: mergedChannels,
+    presets: dereferencePresetsMap(presets, map, channels),
+    settings: {
+      trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
+      removeWatchedFromWatchlist: localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0',
+      scrobbleFilterUsers: localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1',
+      scrobbleAllowedUsers: localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
+      scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
+      hideNonDigitalReleases: localStorage.getItem('myListAddon:hideNonDigitalReleases') === '1',
+      region: localStorage.getItem('myListAddon:region') || '',
+      dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
+      hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
+      hiddenMyListsSections: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch(e) { return []; } })(),
+      likedLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'); } catch(e) { return []; } })(),
+      fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
+      dismissedContinueWatching: window._dismissedContinueWatching || {},
+    }
+  };
+
+  // Top-level key fallbacks for backward compatibility
   if (keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
   if (keys.tmdbSessionId) payload.tmdbSessionId = keys.tmdbSessionId;
   if (keys.tmdbAccountId) payload.tmdbAccountId = keys.tmdbAccountId;
   if (keys.tmdbUsername) payload.tmdbUsername = keys.tmdbUsername;
   if (keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
+  if (keys.mdblistAccessToken) payload.mdblistAccessToken = keys.mdblistAccessToken;
+  if (keys.mdblistUsername) payload.mdblistUsername = keys.mdblistUsername;
   if (keys.traktKey) payload.traktKey = keys.traktKey;
   if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
   if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
   if (keys.simklKey) payload.simklKey = keys.simklKey;
   if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
   if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
+
+  return payload;
+}
+
+function exportConfigJson() {
+  const payload = buildFullBackupPayload();
   document.getElementById('configJsonBox').value = JSON.stringify(payload, null, 2);
 }
 
@@ -36613,61 +41408,380 @@ function importConfigJson() {
 }
 
 // Shared by importConfigJson (textarea) and uploadConfigFile (file upload) --
-// same validation and row-rebuilding either way, just a different source
-// for the raw JSON.
+// restores catalogs, API credentials, custom lists, watch history, continue watching,
+// watchlist, custom channels, presets, and user preferences.
+// --- Import validation and repair --------------------------------------------
+// Every check here exists because a real backup file failed it. Nothing is
+// rejected: a backup is often somebody's only copy, so the job is to repair
+// what can be repaired, report what cannot, and never fail silently -- which
+// is exactly how the account that prompted this work lost 24 lists without
+// anyone noticing until months later.
+function detectBackupFormat(data) {
+  const v = String((data && data.version) || '');
+  if (v.startsWith('3.')) return '3.0';
+  if (v.startsWith('2.')) return '2.0';
+  return '1.x';   // entries-only, no version field
+}
+
+function looksLikeTmdbKey(v) {
+  return /^[0-9a-f]{32}$/i.test(String(v || '').trim());
+}
+
+function validateAndRepairBackup(data) {
+  const notes = [];
+  const warnings = [];
+  const format = detectBackupFormat(data);
+  notes.push('Format detected: ' + format);
+
+  const entries = Array.isArray(data.entries) ? data.entries
+    : (Array.isArray(data.configuredCatalogs) ? data.configuredCatalogs : []);
+
+  // 1. name/url transposed. detectSource() falls back to treating an
+  //    unrecognised string as an MDBList url, so a row like
+  //    {name:"https://mdblist.com/...", url:"Coming Soon"} does not error --
+  //    it quietly fetches "Coming Soon" as a list and comes back empty.
+  let swapped = 0;
+  entries.forEach((e) => {
+    const url = String((e && e.url) || '');
+    const name = String((e && e.name) || '');
+    const urlLooksLikeUrl = /^(https?:|customlist:|channel:|autotrack:|custom:|tmdb:|trakt:|simkl:|curated:)/.test(url);
+    if (!urlLooksLikeUrl && /^https?:\\/\\//.test(name)) {
+      e.url = name;
+      e.name = url;
+      swapped++;
+    }
+  });
+  if (swapped) warnings.push('Fixed ' + swapped + ' row(s) that had their name and link swapped.');
+
+  // 2. API key fields holding something that is not a key. This matters more
+  //    than it looks: the Worker only falls back to the shared TMDB key when
+  //    the field is EMPTY, so a wrong key is worse than none -- it disables
+  //    the fallback and every poster click fails with "Not found or TMDB
+  //    error".
+  const keyHolders = [data, data.keys].filter((o) => o && typeof o === 'object');
+  let badKeys = 0;
+  keyHolders.forEach((h) => {
+    if (h.tmdbKey && !looksLikeTmdbKey(h.tmdbKey)) { h.tmdbKey = ''; badKeys++; }
+    if (h.mdblistKey && String(h.mdblistKey).trim().length < 20) { h.mdblistKey = ''; badKeys++; }
+  });
+  if (badKeys) warnings.push('Cleared an API key field that contained something other than a key (a username, most likely). The shared key will be used instead.');
+
+  // 3. Items with no usable id. These render a poster with an empty data-id,
+  //    so clicking one asks the server for details about nothing.
+  let fixedIds = 0;
+  let unfixableIds = 0;
+  const lists = (data.customLists && typeof data.customLists === 'object') ? data.customLists : {};
+  Object.keys(lists).forEach((slug) => {
+    const items = (lists[slug] && lists[slug].items) || [];
+    items.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      if (!it.id) {
+        const alt = it.imdbId || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '');
+        if (alt) { it.id = alt; fixedIds++; } else { unfixableIds++; }
+      }
+      // An episode keyed by a bare TMDB episode id cannot be resolved -- a
+      // TMDB episode id is not a title id. The show is identifiable though,
+      // so record a fallback the details view can fall back to.
+      if (!it.detailsFallbackId && /^\\d+$/.test(String(it.id || '')) && /^tt\\d+/.test(String(it.showId || ''))) {
+        it.detailsFallbackId = it.showId;
+      }
+    });
+  });
+  if (fixedIds) notes.push('Repaired ' + fixedIds + ' item(s) that had no id, using their IMDb/TMDB id.');
+  if (unfixableIds) warnings.push(unfixableIds + ' item(s) have no usable id and may not open. They were kept.');
+
+  // 4. The tell-tale sign of a backup taken while the browser was out of
+  //    storage: the dashboard order remembers lists the file does not
+  //    contain. This is the single most useful thing to say out loud -- it
+  //    explains a whole class of "half my lists vanished" reports.
+  const order = (data.settings && Array.isArray(data.settings.dashboardListOrder)) ? data.settings.dashboardListOrder : [];
+  const missingFromOrder = order.filter((s) => !(s in lists));
+  if (missingFromOrder.length) {
+    warnings.push('This backup refers to ' + missingFromOrder.length + ' list(s) it does not actually contain. It was most likely exported while the browser was out of storage. Those lists cannot be restored from this file' + (typeof activeCreator !== 'undefined' && activeCreator ? ', but they may still be on your account.' : '.'));
+  }
+
+  // 5. Rows pointing at a list that is not in the file and carrying no items
+  //    of their own -- they would restore as permanently empty shelves.
+  const emptyRows = [];
+  entries.forEach((e) => {
+    const split = splitPayloadUrl(e && e.url);
+    if (!split) return;
+    const ref = String(split.payload.itemsRef || payloadRefKey(split.prefix, split.payload) || '');
+    const embedded = Array.isArray(split.payload.items) ? split.payload.items.length : 0;
+    const source = (split.prefix === 'channel:v1:') ? (data.channels || {}) : lists;
+    if (ref && !(ref in source) && embedded === 0) emptyRows.push(e.name || ref);
+  });
+  if (emptyRows.length) {
+    warnings.push(emptyRows.length + ' row(s) have no items and nothing to load them from: ' + emptyRows.slice(0, 5).join(', ') + (emptyRows.length > 5 ? '...' : ''));
+  }
+
+  return { data: data, format: format, notes: notes, warnings: warnings };
+}
+
+function showImportReport(report) {
+  const lines = [].concat(report.notes, report.warnings);
+  if (!lines.length) return;
+  const title = report.warnings.length ? 'Restored with warnings' : 'Restored';
+  const body = lines.map((l) => '\\u2022 ' + l).join('\\n');
+  if (typeof showAppAlert === 'function') showAppAlert(title, body, false);
+  else alert(title + '\\n\\n' + body);
+}
+
 function applyImportedConfig(data) {
-  if (!data || !Array.isArray(data.entries)) {
-    if (typeof showAppAlert === 'function') showAppAlert('Invalid Config', 'That JSON does not look like a My Lists config -- expected an "entries" array.', false);
-    else alert('That JSON does not look like a My Lists config -- expected an "entries" array.');
+  if (!data || (!Array.isArray(data.entries) && !data.customLists && !data.configuredCatalogs)) {
+    if (typeof showAppAlert === 'function') showAppAlert('Invalid Config', 'That JSON does not look like a valid My Lists backup.', false);
+    else alert('That JSON does not look like a valid My Lists backup.');
     return;
   }
-  document.getElementById('lists').innerHTML = '';
-  data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
-  if (data.tmdbKey) {
+
+  // Check and repair before anything touches storage, so a damaged file is
+  // reported rather than absorbed.
+  let importReport = null;
+  try {
+    importReport = validateAndRepairBackup(data);
+  } catch (e) {
+    // A failure here must not block a restore -- carry on with the file as
+    // given, exactly as this did before the checks existed.
+    importReport = null;
+  }
+
+  // Restore Catalogs. In a 3.0 file the rows reference their items rather
+  // than embedding them, so put the items back from this same file's
+  // customLists/channels first. A 1.x or 2.0 file still embeds them, and
+  // rehydrateEntries leaves those untouched.
+  const rawEntries = Array.isArray(data.entries) ? data.entries : (Array.isArray(data.configuredCatalogs) ? data.configuredCatalogs : []);
+  const entries = rehydrateEntries(rawEntries, data.customLists || {}, data.channels || {});
+  if (entries.length) {
+    document.getElementById('lists').innerHTML = '';
+    entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  }
+
+  // Restore API keys and connected accounts
+  const keys = data.keys || {};
+  const tmdbKey = data.tmdbKey || keys.tmdbKey;
+  if (tmdbKey) {
     const el = document.getElementById('tmdbKeyInput');
-    if (el) el.value = data.tmdbKey;
-    try { localStorage.setItem('myListAddon:tmdbKey', data.tmdbKey); } catch (e) {}
+    if (el) el.value = tmdbKey;
+    try { localStorage.setItem('myListAddon:tmdbKey', tmdbKey); } catch (e) {}
   }
-  if (data.tmdbSessionId) {
-    tmdbSessionId = data.tmdbSessionId;
-    try { localStorage.setItem('myListAddon:tmdbSessionId', data.tmdbSessionId); } catch (e) {}
+  const tmdbSessionIdVal = data.tmdbSessionId || keys.tmdbSessionId;
+  if (tmdbSessionIdVal) {
+    tmdbSessionId = tmdbSessionIdVal;
+    window.tmdbSessionId = tmdbSessionIdVal;
+    try { localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionIdVal); } catch (e) {}
   }
-  if (data.tmdbAccountId) {
-    tmdbAccountId = data.tmdbAccountId;
-    try { localStorage.setItem('myListAddon:tmdbAccountId', data.tmdbAccountId); } catch (e) {}
+  const tmdbAccountIdVal = data.tmdbAccountId || keys.tmdbAccountId;
+  if (tmdbAccountIdVal) {
+    tmdbAccountId = tmdbAccountIdVal;
+    try { localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountIdVal); } catch (e) {}
   }
-  if (data.tmdbUsername) {
-    tmdbUsername = data.tmdbUsername;
-    try { localStorage.setItem('myListAddon:tmdbUsername', data.tmdbUsername); } catch (e) {}
+  const tmdbUsernameVal = data.tmdbUsername || keys.tmdbUsername;
+  if (tmdbUsernameVal) {
+    tmdbUsername = tmdbUsernameVal;
+    try { localStorage.setItem('myListAddon:tmdbUsername', tmdbUsernameVal); } catch (e) {}
   }
   if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
-  if (data.mdblistKey) document.getElementById('mdblistKeyInput').value = data.mdblistKey;
-  if (data.mdblistAccessToken) {
-    mdblistAccessToken = data.mdblistAccessToken;
+
+  const mdblistKey = data.mdblistKey || keys.mdblistKey;
+  if (mdblistKey) {
+    const el = document.getElementById('mdblistKeyInput');
+    if (el) el.value = mdblistKey;
+    try { localStorage.setItem('myListAddon:mdblistKey', mdblistKey); } catch (e) {}
+  }
+  const mdblistAccessTokenVal = data.mdblistAccessToken || keys.mdblistAccessToken;
+  if (mdblistAccessTokenVal) {
+    mdblistAccessToken = mdblistAccessTokenVal;
+    window.mdblistAccessToken = mdblistAccessTokenVal;
+    try { localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessTokenVal); } catch (e) {}
     if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
   }
-  if (data.traktKey) document.getElementById('traktKeyInput').value = data.traktKey;
-  if (data.traktUsername) document.getElementById('traktUsernameInput').value = data.traktUsername;
-  if (data.traktAccessToken) {
-    traktAccessToken = data.traktAccessToken;
-    renderTraktConnectStatus();
+  const mdblistUsernameVal = data.mdblistUsername || keys.mdblistUsername;
+  if (mdblistUsernameVal) {
+    mdblistUsername = mdblistUsernameVal;
+    window.mdblistUsername = mdblistUsernameVal;
+    try { localStorage.setItem('myListAddon:mdblistUsername', mdblistUsernameVal); } catch (e) {}
   }
-  if (data.simklKey) document.getElementById('simklKeyInput').value = data.simklKey;
-  if (data.simklAccessToken) {
-    simklAccessToken = data.simklAccessToken;
-    if (data.simklUsername) simklUsername = data.simklUsername;
+
+  const traktKey = data.traktKey || keys.traktKey;
+  if (traktKey) {
+    const el = document.getElementById('traktKeyInput');
+    if (el) el.value = traktKey;
+    try { localStorage.setItem('myListAddon:traktKey', traktKey); } catch (e) {}
+  }
+  const traktUsernameVal = data.traktUsername || keys.traktUsername;
+  if (traktUsernameVal) {
+    const el = document.getElementById('traktUsernameInput');
+    if (el) el.value = traktUsernameVal;
+    traktUsername = traktUsernameVal;
+    try { localStorage.setItem('myListAddon:traktUsername', traktUsernameVal); } catch (e) {}
+  }
+  const traktAccessTokenVal = data.traktAccessToken || keys.traktAccessToken;
+  if (traktAccessTokenVal) {
+    traktAccessToken = traktAccessTokenVal;
+    window.traktAccessToken = traktAccessTokenVal;
+    try { localStorage.setItem('myListAddon:traktAccessToken', traktAccessTokenVal); } catch (e) {}
+    if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+  }
+
+  const simklKey = data.simklKey || keys.simklKey;
+  if (simklKey) {
+    const el = document.getElementById('simklKeyInput');
+    if (el) el.value = simklKey;
+    try { localStorage.setItem('myListAddon:simklKey', simklKey); } catch (e) {}
+  }
+  const simklAccessTokenVal = data.simklAccessToken || keys.simklAccessToken;
+  if (simklAccessTokenVal) {
+    simklAccessToken = simklAccessTokenVal;
+    window.simklAccessToken = simklAccessTokenVal;
+    try { localStorage.setItem('myListAddon:simklAccessToken', simklAccessTokenVal); } catch (e) {}
+  }
+  const simklUsernameVal = data.simklUsername || keys.simklUsername;
+  if (simklUsernameVal) {
+    simklUsername = simklUsernameVal;
+    window.simklUsername = simklUsernameVal;
+    try { localStorage.setItem('myListAddon:simklUsername', simklUsernameVal); } catch (e) {}
     if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
   }
+
+  // Restore Custom Lists, Watchlist, Watch History, and Continue Watching
+  if (data.customLists && typeof data.customLists === 'object') {
+    const existingMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    let customListsMap = {};
+    if (Array.isArray(data.customLists)) {
+      data.customLists.forEach((l) => { if (l && l.slug) customListsMap[l.slug] = l; });
+    } else {
+      customListsMap = { ...data.customLists };
+    }
+    const mergedMap = { ...existingMap, ...customListsMap };
+    if (typeof backfillAutoTrackedListSlugs === 'function') backfillAutoTrackedListSlugs(mergedMap);
+    if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(mergedMap);
+  } else {
+    // If watchHistory / continueWatching are top-level arrays (e.g. from full library export)
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    let touchedLists = false;
+    if (Array.isArray(data.watchHistory) && data.watchHistory.length) {
+      if (typeof getOrCreateWatchHistoryList === 'function') {
+        const wh = getOrCreateWatchHistoryList();
+        wh.items = data.watchHistory;
+        map['watch-history'] = wh;
+        touchedLists = true;
+      }
+    }
+    if (Array.isArray(data.continueWatching) && data.continueWatching.length) {
+      if (typeof getOrCreateContinueWatchingList === 'function') {
+        const cw = getOrCreateContinueWatchingList();
+        cw.items = data.continueWatching;
+        map['continue-watching'] = cw;
+        touchedLists = true;
+      }
+    }
+    if (touchedLists && typeof saveLocalCustomListsMap === 'function') {
+      saveLocalCustomListsMap(map);
+    }
+  }
+
+  // Restore Channels
+  if (data.channels && typeof data.channels === 'object') {
+    if (typeof saveLocalChannelsMap === 'function') saveLocalChannelsMap(data.channels);
+  }
+  if (data.mergedChannels && typeof data.mergedChannels === 'object') {
+    if (typeof saveLocalMergedChannelsMap === 'function') saveLocalMergedChannelsMap(data.mergedChannels);
+  }
+
+  // Restore Presets, rehydrated against this file's own lists/channels for
+  // the same reason the rows above are.
+  if (data.presets && typeof data.presets === 'object') {
+    const hydratedPresets = (typeof rehydratePresetsMap === 'function')
+      ? rehydratePresetsMap(data.presets, data.customLists || {}, data.channels || {})
+      : data.presets;
+    if (typeof savePresetsMap === 'function') savePresetsMap(hydratedPresets);
+  }
+
+  // Restore Settings & Preferences
+  const s = data.settings || {};
+  if (typeof s.trackPlayback === 'boolean') {
+    try { localStorage.setItem('myListAddon:trackPlayback', s.trackPlayback ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.removeWatchedFromWatchlist === 'boolean') {
+    try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', s.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.scrobbleFilterUsers === 'boolean') {
+    try { localStorage.setItem('myListAddon:scrobbleFilterUsers', s.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.scrobbleAllowedUsers === 'string') {
+    try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', s.scrobbleAllowedUsers); } catch (e) {}
+  }
+  if (typeof s.scrobbleBlockAnonymous === 'boolean') {
+    try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', s.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.hideNonDigitalReleases === 'boolean') {
+    const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+    if (cb) cb.checked = s.hideNonDigitalReleases;
+    try { localStorage.setItem('myListAddon:hideNonDigitalReleases', s.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.region === 'string' && s.region) {
+    const el = document.getElementById('regionSelect');
+    if (el) el.value = s.region;
+    try { localStorage.setItem('myListAddon:region', s.region); } catch (e) {}
+  }
+  if (Array.isArray(s.dashboardListOrder) && s.dashboardListOrder.length) {
+    try { localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(s.dashboardListOrder)); } catch (e) {}
+  }
+  if (Array.isArray(s.hiddenLists)) {
+    try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(s.hiddenLists)); } catch (e) {}
+  }
+  if (Array.isArray(s.hiddenMyListsSections)) {
+    try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
+  }
+  if (Array.isArray(s.likedLists)) {
+    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+  }
+  if (Array.isArray(s.fullyWatchedShowIds)) {
+    window._fullyWatchedShowIds = new Set(s.fullyWatchedShowIds.map(String));
+    try { localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(s.fullyWatchedShowIds)); } catch (e) {}
+  }
+  if (s.dismissedContinueWatching && typeof s.dismissedContinueWatching === 'object') {
+    window._dismissedContinueWatching = s.dismissedContinueWatching;
+    try { localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(s.dismissedContinueWatching)); } catch (e) {}
+  }
+
+  // Refresh UI and local state
   renumber();
   checkAllDuplicateUrls();
   saveState();
-  renderChannelMergeList();
+  if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+  if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+  if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+  if (typeof renderChannelsList === 'function') renderChannelsList();
+  if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+  if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+  if (typeof renderPresetsList === 'function') renderPresetsList();
   if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
-  scheduleMyMdblistListsRefresh();
-  scheduleMyTraktListsRefresh();
+  if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
+  if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
   if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
-  if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s).', true);
-  else alert('Imported ' + data.entries.length + ' list(s).');
+
+  // If signed in as Creator, push restored data to cloud sync
+  if (typeof activeCreator !== 'undefined' && activeCreator) {
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    if (typeof pushPresetsDirectly === 'function' && data.presets) pushPresetsDirectly(data.presets);
+    if (typeof pushChannelsSync === 'function' && (data.channels || data.mergedChannels)) pushChannelsSync();
+    if (typeof pushTrackingSync === 'function') pushTrackingSync();
+  }
+
+  // A restore that quietly dropped rows or cleared a bad key should say so.
+  // The plain success dialog is kept for the case where nothing needed
+  // repairing, which is the normal one.
+  if (importReport && (importReport.warnings.length || importReport.format !== '3.0')) {
+    showImportReport(importReport);
+  } else if (typeof showAppAlert === 'function') {
+    showAppAlert('Restore Complete', 'Your setup, lists, watch history, channels, and settings have been restored successfully.', true);
+  }
+  else alert('Your setup, lists, watch history, channels, and settings have been restored successfully.');
 }
 
 // --- import from an existing link -------------------------------------------
@@ -36680,6 +41794,73 @@ function applyImportedConfig(data) {
 // Stremio add-on, or a screenshot of one, doesn't carry the original list
 // URLs anywhere recoverable, so there's no reliable way to reconstruct rows
 // from either of those; Bulk Add below is the practical fallback there.
+async function resolveInstallLinkData(raw) {
+  const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
+  const m = cleaned.match(/^(https?:\\/\\/[^/]+)?\\/([^/]+)\\/(?:manifest\\.json|configure)(?:[/?#]|$)/i);
+  let targetOrigin = null;
+  let config = null;
+  if (m) {
+    if (m[1]) targetOrigin = m[1];
+    config = m[2];
+  } else if (/^[A-Za-z0-9_-]{6,}$/.test(cleaned)) {
+    config = cleaned;
+  }
+  if (!config) {
+    return { ok: false, error: 'Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.' };
+  }
+
+  // 1. If the link came from a remote domain, fetch directly from the remote domain's /api/resolve
+  if (targetOrigin && targetOrigin.toLowerCase() !== ORIGIN.toLowerCase()) {
+    try {
+      const res = await fetch(targetOrigin + '/api/resolve?config=' + encodeURIComponent(config));
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.ok && Array.isArray(data.entries) && data.entries.length) {
+          return data;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 2. Try resolving with local worker /api/resolve (passing url for proxy fallback)
+  try {
+    const res = await fetch(ORIGIN + '/api/resolve?config=' + encodeURIComponent(config) + (targetOrigin ? '&url=' + encodeURIComponent(cleaned) : ''));
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.ok && Array.isArray(data.entries) && data.entries.length) {
+        return data;
+      }
+      if (data && data.ok === false && data.error) {
+        return data;
+      }
+    }
+  } catch (e) {}
+
+  // 3. Fallback: fetch manifest.json directly if targetOrigin is present
+  if (targetOrigin) {
+    try {
+      const manifestUrl = targetOrigin + '/' + encodeURIComponent(config) + '/manifest.json';
+      const mRes = await fetch(manifestUrl);
+      if (mRes.ok) {
+        const manifest = await mRes.json();
+        if (manifest && Array.isArray(manifest.catalogs) && manifest.catalogs.length) {
+          const fallbackEntries = manifest.catalogs.map((c) => ({
+            id: c.id,
+            name: c.name || 'Catalog',
+            type: c.type || 'movie',
+            enabled: true,
+            group: 'Imported',
+            url: c.id ? (c.id.startsWith('ch') ? 'channel:v1:' + JSON.stringify({ channelId: c.id, name: c.name }) : (c.id.startsWith('customlist:') ? 'customlist:v1:' + JSON.stringify({ listId: c.id, name: c.name }) : c.id)) : ''
+          }));
+          return { ok: true, entries: fallbackEntries };
+        }
+      }
+    } catch (e) {}
+  }
+
+  return { ok: false, error: 'That link has no lists in it.' };
+}
+
 async function importFromLink() {
   const raw = document.getElementById('importLinkInput').value.trim();
   if (!raw) {
@@ -36687,25 +41868,11 @@ async function importFromLink() {
     else alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
     return;
   }
-  const cleaned = raw.replace(/^(?:stremio|nuvio|wako):\\/\\//i, 'https://');
-  const m = cleaned.match(/\\/([^/]+)\\/(?:manifest\\.json|configure)(?:[/?#]|$)/);
-  let config = null;
-  if (m) {
-    config = m[1];
-  } else if (/^[A-Za-z0-9_-]{6,}$/.test(cleaned)) {
-    config = cleaned; // looks like a bare config id/token, pasted on its own
-  }
-  if (!config) {
-    if (typeof showAppAlert === 'function') showAppAlert('Invalid Link', 'Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.', false);
-    else alert('Could not find a config in that link -- paste the full install link (ending in /manifest.json) or a configure link.');
-    return;
-  }
   try {
-    const res = await fetch(ORIGIN + '/api/resolve?config=' + encodeURIComponent(config));
-    const data = await res.json();
-    if (!data.ok) {
-      if (typeof showAppAlert === 'function') showAppAlert('Link Error', 'Could not load that link: ' + (data.error || 'unknown error'), false);
-      else alert('Could not load that link: ' + (data.error || 'unknown error'));
+    const data = await resolveInstallLinkData(raw);
+    if (!data || !data.ok) {
+      if (typeof showAppAlert === 'function') showAppAlert('Link Error', 'Could not load that link: ' + ((data && data.error) || 'unknown error'), false);
+      else alert('Could not load that link: ' + ((data && data.error) || 'unknown error'));
       return;
     }
     data.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
@@ -36724,9 +41891,201 @@ async function importFromLink() {
     checkAllDuplicateUrls();
     saveState();
     renderChannelMergeList();
+
+    // Rebuild & restore custom lists and channels from the imported link
+    const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
+    const listSlugs = Object.keys(extractedLists);
+    const channelIds = Object.keys(extractedChannels);
+
+    let restoredListsCount = 0;
+    const restoredListNames = [];
+    let hasTrackingChanges = false;
+    if (listSlugs.length > 0) {
+      let localCustomListsMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      listSlugs.forEach((slug) => {
+        const rebuilt = extractedLists[slug];
+        if (!localCustomListsMap[slug]) {
+          localCustomListsMap[slug] = rebuilt;
+          restoredListsCount++;
+          restoredListNames.push(rebuilt.name || slug);
+          if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+            hasTrackingChanges = true;
+          }
+        } else {
+          const existing = localCustomListsMap[slug];
+          const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+          let addedItems = 0;
+          (rebuilt.items || []).forEach((it) => {
+            const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+            if (!seenKeys.has(key)) {
+              if (!existing.items) existing.items = [];
+              existing.items.push(it);
+              seenKeys.add(key);
+              addedItems++;
+            }
+          });
+          if (addedItems > 0) {
+            existing.updatedAt = Date.now();
+            restoredListsCount++;
+            restoredListNames.push((existing.name || slug) + ' (+' + addedItems + ' items)');
+            if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+              hasTrackingChanges = true;
+            }
+          }
+        }
+      });
+      if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(localCustomListsMap);
+      if (localCustomListsMap['watch-history'] && Array.isArray(localCustomListsMap['watch-history'].items)) {
+        window._rawWatchHistoryItems = localCustomListsMap['watch-history'].items;
+        window._watchedItemIds = new Set((window._rawWatchHistoryItems || []).map((it) => String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '') || '')));
+      }
+    }
+
+    if (channelIds.length > 0) {
+      let localChannelsMap = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+      channelIds.forEach((chId) => {
+        if (!localChannelsMap[chId]) localChannelsMap[chId] = extractedChannels[chId];
+      });
+      if (typeof saveLocalChannelsMap === 'function') saveLocalChannelsMap(localChannelsMap);
+    }
+
+    if (hasTrackingChanges) {
+      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+    }
+
+    if (listSlugs.length > 0 || channelIds.length > 0) {
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+      if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+      if (typeof renderChannelsList === 'function') renderChannelsList();
+      if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof activeCreator !== 'undefined' && activeCreator) {
+        if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+        if (typeof pushCreatorSync === 'function') pushCreatorSync();
+        if (typeof pushChannelsSync === 'function') pushChannelsSync();
+      }
+    }
+
     document.getElementById('importLinkInput').value = '';
-    if (typeof showAppAlert === 'function') showAppAlert('Import Complete', 'Imported ' + data.entries.length + ' list(s) from that link.', true);
-    else alert('Imported ' + data.entries.length + ' list(s) from that link.');
+    let msg = 'Imported ' + data.entries.length + ' list' + (data.entries.length === 1 ? '' : 's') + ' from that link.';
+    if (listSlugs.length > 0 || channelIds.length > 0) {
+      const parts = [];
+      if (listSlugs.length) parts.push(listSlugs.length + ' custom list' + (listSlugs.length === 1 ? '' : 's'));
+      if (channelIds.length) parts.push(channelIds.length + ' channel' + (channelIds.length === 1 ? '' : 's'));
+      msg += '\\n\\nRestored ' + parts.join(' and ') + ' to your My Lists tab.';
+      if (restoredListNames.length) msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (typeof showAppAlert === 'function') showAppAlert('Import Complete', msg, true);
+    else alert(msg);
+  } catch (e) {
+    if (typeof showAppAlert === 'function') showAppAlert('Network Error', 'Network error while resolving that link.', false);
+    else alert('Network error while resolving that link.');
+  }
+}
+
+async function restoreListsFromLink() {
+  const raw = document.getElementById('importLinkInput').value.trim();
+  if (!raw) {
+    if (typeof showAppAlert === 'function') showAppAlert('Link Required', 'Paste an install link, configure link, or stremio:// / wako:// link first.', false);
+    else alert('Paste an install link, configure link, or stremio://\\/wako:// link first.');
+    return;
+  }
+  try {
+    const data = await resolveInstallLinkData(raw);
+    if (!data || !data.ok) {
+      if (typeof showAppAlert === 'function') showAppAlert('Link Error', 'Could not load that link: ' + ((data && data.error) || 'unknown error'), false);
+      else alert('Could not load that link: ' + ((data && data.error) || 'unknown error'));
+      return;
+    }
+
+    const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
+    const listSlugs = Object.keys(extractedLists);
+    const channelIds = Object.keys(extractedChannels);
+
+    if (!listSlugs.length && !channelIds.length) {
+      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', 'That link does not contain any custom lists or custom channels.', false);
+      else alert('That link does not contain any custom lists or custom channels.');
+      return;
+    }
+
+    let localCustomListsMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    let restoredListsCount = 0;
+    const restoredListNames = [];
+    let hasTrackingChanges = false;
+    listSlugs.forEach((slug) => {
+      const rebuilt = extractedLists[slug];
+      if (!localCustomListsMap[slug]) {
+        localCustomListsMap[slug] = rebuilt;
+        restoredListsCount++;
+        restoredListNames.push(rebuilt.name || slug);
+        if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+          hasTrackingChanges = true;
+        }
+      } else {
+        const existing = localCustomListsMap[slug];
+        const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+        let addedItems = 0;
+        (rebuilt.items || []).forEach((it) => {
+          const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+          if (!seenKeys.has(key)) {
+            if (!existing.items) existing.items = [];
+            existing.items.push(it);
+            seenKeys.add(key);
+            addedItems++;
+          }
+        });
+        if (addedItems > 0) {
+          existing.updatedAt = Date.now();
+          restoredListsCount++;
+          restoredListNames.push((existing.name || slug) + ' (+' + addedItems + ' items)');
+          if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+            hasTrackingChanges = true;
+          }
+        }
+      }
+    });
+    if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(localCustomListsMap);
+    if (localCustomListsMap['watch-history'] && Array.isArray(localCustomListsMap['watch-history'].items)) {
+      window._rawWatchHistoryItems = localCustomListsMap['watch-history'].items;
+      window._watchedItemIds = new Set((window._rawWatchHistoryItems || []).map((it) => String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '') || '')));
+    }
+
+    if (channelIds.length > 0) {
+      let localChannelsMap = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+      channelIds.forEach((chId) => {
+        if (!localChannelsMap[chId]) localChannelsMap[chId] = extractedChannels[chId];
+      });
+      if (typeof saveLocalChannelsMap === 'function') saveLocalChannelsMap(localChannelsMap);
+    }
+
+    if (hasTrackingChanges) {
+      if (typeof pushTrackingSync === 'function') pushTrackingSync();
+      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+    }
+
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+    if (typeof renderChannelsList === 'function') renderChannelsList();
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+    if (typeof activeCreator !== 'undefined' && activeCreator) {
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
+      if (typeof pushChannelsSync === 'function') pushChannelsSync();
+    }
+
+    document.getElementById('importLinkInput').value = '';
+    let msg = 'Restored ' + listSlugs.length + ' custom list' + (listSlugs.length === 1 ? '' : 's');
+    if (channelIds.length) {
+      msg += ' and ' + channelIds.length + ' channel' + (channelIds.length === 1 ? '' : 's');
+    }
+    msg += ' from that link into your My Lists tab.';
+    if (restoredListNames.length) {
+      msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (typeof showAppAlert === 'function') showAppAlert('Custom Lists Rebuilt', msg, true);
+    else alert(msg);
   } catch (e) {
     if (typeof showAppAlert === 'function') showAppAlert('Network Error', 'Network error while resolving that link.', false);
     else alert('Network error while resolving that link.');
@@ -36753,35 +42112,164 @@ const PRESETS_KEY = 'myListAddon:presets';
 // after every sign-in.
 let cachedPresetsMap = null;
 
-function loadPresetsMap() {
-  if (cachedPresetsMap) return cachedPresetsMap;
-  try {
-    cachedPresetsMap = JSON.parse(localStorage.getItem(PRESETS_KEY) || '{}');
-  } catch (e) {
-    cachedPresetsMap = {};
+// loadPresetsMap falls back to this when storage has nothing, which is
+// exactly the state signing out leaves behind -- so without clearing it the
+// previous account's presets survived the sign-out that had just wiped
+// every key they came from.
+function resetPresetsCache() {
+  cachedPresetsMap = null;
+}
+window.resetPresetsCache = resetPresetsCache;
+
+function extractNormalizedPresetsMap(rawObj) {
+  if (!rawObj || typeof rawObj !== 'object') return {};
+  if (rawObj.presets && typeof rawObj.presets === 'object' && !Array.isArray(rawObj.presets)) {
+    return extractNormalizedPresetsMap(rawObj.presets);
   }
-  return cachedPresetsMap;
+  if (Array.isArray(rawObj)) {
+    const map = {};
+    rawObj.forEach((p) => {
+      if (p && p.name) map[p.name] = p;
+    });
+    return map;
+  }
+  const map = {};
+  Object.keys(rawObj).forEach((k) => {
+    if (k !== 'presetsB64' && k !== 'updatedAt' && rawObj[k] && typeof rawObj[k] === 'object') {
+      map[k] = rawObj[k];
+    }
+  });
+  return map;
+}
+window.extractNormalizedPresetsMap = extractNormalizedPresetsMap;
+
+// Presets are the worst offender for duplication: each one stores a full
+// copy of every configured row, embedded items and all. On the account that
+// prompted this work, three presets came to 2,063,754 bytes -- more than the
+// custom lists they were copying. Stored as references they are ~28KB.
+function dereferencePresetsMap(map, customLists, channels) {
+  const out = {};
+  Object.keys(map || {}).forEach((k) => {
+    const p = map[k];
+    const entries = Array.isArray(p) ? p : ((p && p.entries) || []);
+    const rest = (p && !Array.isArray(p)) ? Object.assign({}, p) : {};
+    delete rest.entries;
+    out[k] = Object.assign(rest, { entries: dereferenceEntries(entries, customLists, channels) });
+  });
+  return out;
 }
 
-function savePresetsMap(map) {
-  // Always updates the cache first, even if the localStorage write below
-  // fails -- this is what actually keeps a too-big-for-local-storage
-  // preset visible and usable for the rest of this page session, whether
-  // or not it also successfully persists to disk.
-  cachedPresetsMap = map;
+function rehydratePresetsMap(map, customLists, channels) {
+  const out = {};
+  Object.keys(map || {}).forEach((k) => {
+    const p = map[k];
+    const entries = Array.isArray(p) ? p : ((p && p.entries) || []);
+    const rest = (p && !Array.isArray(p)) ? Object.assign({}, p) : {};
+    delete rest.entries;
+    out[k] = Object.assign(rest, { entries: rehydrateEntries(entries, customLists, channels) });
+  });
+  return out;
+}
+window.dereferencePresetsMap = dereferencePresetsMap;
+window.rehydratePresetsMap = rehydratePresetsMap;
+
+// The maps a preset's references resolve against. Read lazily and
+// defensively -- a preset must still load if one of them is unavailable.
+function presetSourceMaps() {
+  let lists = {};
+  let chans = {};
+  try { if (typeof loadLocalCustomLists === 'function') lists = loadLocalCustomLists() || {}; } catch (e) {}
+  try { if (typeof loadLocalChannels === 'function') chans = loadLocalChannels() || {}; } catch (e) {}
+  return { lists: lists, chans: chans };
+}
+
+function loadPresetsMap() {
+  let map = {};
+  const keysToCheck = [PRESETS_KEY, 'presets', 'myListAddon:savedPresets', 'savedPresets'];
+  for (const k of keysToCheck) {
+    try {
+      const raw = localStorage.getItem(k);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const extracted = extractNormalizedPresetsMap(parsed);
+        if (Object.keys(extracted).length > 0) {
+          map = { ...map, ...extracted };
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Also check if presets were saved inside state or backup objects
   try {
-    localStorage.setItem(PRESETS_KEY, JSON.stringify(map));
+    const stateRaw = localStorage.getItem('myListAddon:state');
+    if (stateRaw) {
+      const parsedState = JSON.parse(stateRaw);
+      if (parsedState && parsedState.presets) {
+        const extracted = extractNormalizedPresetsMap(parsedState.presets);
+        if (Object.keys(extracted).length > 0) {
+          map = { ...map, ...extracted };
+        }
+      }
+    }
+  } catch (e) {}
+
+  try {
+    const backupRaw = localStorage.getItem('myListAddon:backup');
+    if (backupRaw) {
+      const parsedBackup = JSON.parse(backupRaw);
+      if (parsedBackup && parsedBackup.presets) {
+        const extracted = extractNormalizedPresetsMap(parsedBackup.presets);
+        if (Object.keys(extracted).length > 0) {
+          map = { ...map, ...extracted };
+        }
+      }
+    }
+  } catch (e) {}
+
+  if (map && Object.keys(map).length > 0) {
+    // Stored presets hold references; put the items back before anyone sees
+    // them. A preset written before this change still embeds its items, and
+    // rehydrateEntry leaves those exactly as they are -- so old and new
+    // presets both come out of here fully populated.
+    const src = presetSourceMaps();
+    map = rehydratePresetsMap(map, src.lists, src.chans);
+    cachedPresetsMap = map;
+    return map;
+  }
+  if (cachedPresetsMap && typeof cachedPresetsMap === 'object' && !Array.isArray(cachedPresetsMap) && Object.keys(cachedPresetsMap).length > 0) {
+    return cachedPresetsMap;
+  }
+  return {};
+}
+window.loadPresetsMap = loadPresetsMap;
+
+function savePresetsMap(map) {
+  cachedPresetsMap = map;
+  // Written as references. The in-memory copy above keeps its full items so
+  // nothing the caller holds changes underneath it; only what lands in
+  // localStorage (and, via pushPresetsDirectly, on the account) is lean.
+  const src = presetSourceMaps();
+  const leanRefs = dereferencePresetsMap(map, src.lists, src.chans);
+  try {
+    localStorage.setItem(PRESETS_KEY, JSON.stringify(leanRefs));
     return true;
   } catch (e) {
-    // Most likely a quota error -- a TV Channel with hundreds of episodes
-    // easily runs well past 100KB on its own, and localStorage's total
-    // quota is shared across every preset saved plus everything else this
-    // add-on keeps there. This used to fail completely silently, which
-    // looked exactly like "doesn't work" with no explanation at all --
-    // callers now get a false back and can say something useful instead.
-    return false;
+    try {
+      const leanMap = {};
+      Object.keys(map).forEach((k) => {
+        const p = map[k];
+        leanMap[k] = {
+          entries: Array.isArray(p) ? p : ((p && p.entries) || []),
+        };
+      });
+      localStorage.setItem(PRESETS_KEY, JSON.stringify(leanMap));
+      return true;
+    } catch (err2) {
+      return false;
+    }
   }
 }
+window.savePresetsMap = savePresetsMap;
 
 // Pushes a presets map straight to the account's dedicated presets record
 // (see /api/creator/sync/save-presets) -- the ONLY path presets travel to
@@ -36796,30 +42284,31 @@ function savePresetsMap(map) {
 // likedLists) -- see save-presets' own comment for why keeping this
 // request small is the actual point of the split.
 async function pushPresetsDirectly(presetsMap) {
+  // See the same guard in pushCreatorSync -- a reset in progress must not be
+  // undone by an in-flight preset save.
+  if (window._suppressCreatorSync) return { ok: false, error: null };
   if (!activeCreator) return { ok: false, error: null };
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return { ok: false, error: null };
   try {
-    const presetsB64 = await compressJsonToBase64(presetsMap);
+    // Sent as references too. The account's presets record was the other
+    // place the duplicated item data piled up, and it travels over the wire
+    // on every preset change.
+    const src = presetSourceMaps();
+    const leanPresets = dereferencePresetsMap(presetsMap, src.lists, src.chans);
+    const presetsB64 = await compressJsonToBase64(leanPresets);
     const res = await fetch(ORIGIN + '/api/creator/sync/save-presets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         creatorName: activeCreator.creatorName,
         creatorKey: creatorKey,
-        presets: presetsB64 ? undefined : presetsMap,
+        presets: presetsB64 ? undefined : leanPresets,
         presetsB64: presetsB64,
       }),
     });
     const data = await res.json().catch(() => null);
     if (!data || data.ok === false) {
-      // Logged (not just discarded) so a DevTools console check actually
-      // shows what went wrong -- an HTTP status with no JSON body at all
-      // usually means the request was killed outright (e.g. Cloudflare's
-      // free-plan 10ms CPU budget on this Worker) rather than anything
-      // this endpoint's own code returned. Should be rare now that this
-      // request no longer bundles config/watchHistory/etc alongside a
-      // large presets payload the way the old shared endpoint did.
       console.error('pushPresetsDirectly failed:', res.status, data);
       return { ok: false, error: (data && data.error) || null, status: res.status };
     }
@@ -36829,6 +42318,7 @@ async function pushPresetsDirectly(presetsMap) {
     return { ok: false, error: null };
   }
 }
+window.pushPresetsDirectly = pushPresetsDirectly;
 
 async function saveCurrentAsPreset() {
   const nameInput = document.getElementById('presetNameInput');
@@ -36844,25 +42334,50 @@ async function saveCurrentAsPreset() {
     else alert('Add at least one list first.');
     return;
   }
+  const customListsMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  const channelsMap = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+  const relevantCustomLists = {};
+  const relevantChannels = {};
+
+  entries.forEach((e) => {
+    if (!e || !e.url) return;
+    const urls = String(e.url).split('\\n');
+    urls.forEach((u) => {
+      if (u.startsWith('channel:v1:')) {
+        try {
+          const p = JSON.parse(u.slice('channel:v1:'.length));
+          if (p && p.channelId && channelsMap[p.channelId]) {
+            relevantChannels[p.channelId] = channelsMap[p.channelId];
+          }
+        } catch (err) {}
+      } else if (u.startsWith('customlist:v1:')) {
+        try {
+          const p = JSON.parse(u.slice('customlist:v1:'.length));
+          const slug = p.localSlug || p.slug;
+          if (slug && customListsMap[slug]) {
+            relevantCustomLists[slug] = customListsMap[slug];
+          }
+        } catch (err) {}
+      }
+    });
+  });
+
   const map = loadPresetsMap();
-  map[name] = { entries };
+  map[name] = {
+    entries: entries,
+    ...(Object.keys(relevantCustomLists).length ? { customLists: relevantCustomLists } : {}),
+    ...(Object.keys(relevantChannels).length ? { channels: relevantChannels } : {}),
+  };
   const localOk = savePresetsMap(map);
 
   if (!localOk) {
-    // Local storage is full -- if this account is signed in, push the
-    // in-memory map (not a re-read of the stale local copy) straight to
-    // the server instead of just failing the same way a local-only setup
-    // would. KV values go up to 25MB, comfortably clear of anything a
-    // Channel-heavy preset would realistically hit on its own -- though
-    // several such presets in the same account can still add up close to
-    // that limit (see the size guard on /api/creator/sync/save-presets).
     const pushResult = activeCreator ? await pushPresetsDirectly(map) : { ok: false, error: null };
     if (!pushResult.ok) {
       const errMsg = activeCreator
         ? (pushResult.error
             ? "Could not save this preset to your account: " + pushResult.error
             : "Could not save this preset to your account either — check your connection and try again. If this keeps happening, check the browser console (F12) for more detail.")
-        : "Could not save this preset — your browser's local storage is full. This usually happens when a TV Channel with a lot of episodes is included, since each preset stores a full copy of everything in it. Try removing a large Channel from this preset, deleting an older preset you no longer need, using Backup/Restore's 'Download as file' option instead (which isn't limited the same way), or creating a free account so this can be saved there instead of just this browser.";
+        : "Could not save this preset — your browser's local storage is full. Try removing an older preset or using Backup/Restore's 'Download as file' option.";
       if (typeof showAppAlert === 'function') {
         showAppAlert('Preset Save Error', errMsg, false);
       } else {
@@ -36875,26 +42390,299 @@ async function saveCurrentAsPreset() {
   nameInput.value = '';
   renderPresetsList();
   if (localOk) schedulePresetsSync();
+  if (typeof showAddedToast === 'function') {
+    showAddedToast('Saved preset "' + name + '" \u2713');
+  }
+}
+
+function extractCustomListsAndChannelsFromPreset(preset) {
+  const extractedLists = {};
+  const extractedChannels = {};
+
+  if (!preset) return { lists: extractedLists, channels: extractedChannels };
+
+  // 1. Direct customLists in preset
+  if (preset.customLists && typeof preset.customLists === 'object') {
+    if (Array.isArray(preset.customLists)) {
+      preset.customLists.forEach((l) => { if (l && l.slug) extractedLists[l.slug] = { ...l }; });
+    } else {
+      Object.keys(preset.customLists).forEach((slug) => {
+        if (preset.customLists[slug]) extractedLists[slug] = { ...preset.customLists[slug] };
+      });
+    }
+  }
+
+  // 2. Direct watchHistory / continueWatching / watchlist
+  const wh = preset.watchHistory || preset.watch_history;
+  if (Array.isArray(wh) && wh.length) {
+    if (!extractedLists['watch-history']) {
+      extractedLists['watch-history'] = { slug: 'watch-history', name: 'Watch History', type: 'mixed', items: [...wh], createdAt: Date.now(), updatedAt: Date.now() };
+    } else {
+      const existing = extractedLists['watch-history'];
+      const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+      wh.forEach((it) => {
+        const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+        if (!seenKeys.has(key)) {
+          if (!existing.items) existing.items = [];
+          existing.items.push(it);
+          seenKeys.add(key);
+        }
+      });
+    }
+  }
+
+  const cw = preset.continueWatching || preset.continue_watching;
+  if (Array.isArray(cw) && cw.length) {
+    if (!extractedLists['continue-watching']) {
+      extractedLists['continue-watching'] = { slug: 'continue-watching', name: 'Continue Watching', type: 'mixed', items: [...cw], createdAt: Date.now(), updatedAt: Date.now() };
+    } else {
+      const existing = extractedLists['continue-watching'];
+      const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+      cw.forEach((it) => {
+        const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+        if (!seenKeys.has(key)) {
+          if (!existing.items) existing.items = [];
+          existing.items.push(it);
+          seenKeys.add(key);
+        }
+      });
+    }
+  }
+
+  const wl = preset.watchlist;
+  if (Array.isArray(wl) && wl.length) {
+    if (!extractedLists['watchlist']) {
+      extractedLists['watchlist'] = { slug: 'watchlist', name: 'Watchlist', type: 'mixed', isWatchlist: true, items: [...wl], createdAt: Date.now(), updatedAt: Date.now() };
+    } else {
+      const existing = extractedLists['watchlist'];
+      const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+      wl.forEach((it) => {
+        const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+        if (!seenKeys.has(key)) {
+          if (!existing.items) existing.items = [];
+          existing.items.push(it);
+          seenKeys.add(key);
+        }
+      });
+    }
+  }
+
+  // 3. Direct channels in preset
+  if (preset.channels && typeof preset.channels === 'object') {
+    Object.keys(preset.channels).forEach((id) => {
+      if (preset.channels[id]) extractedChannels[id] = { ...preset.channels[id] };
+    });
+  }
+
+  // 4. Extract from preset.entries
+  const entries = Array.isArray(preset) ? preset : ((preset && Array.isArray(preset.entries)) ? preset.entries : []);
+  entries.forEach((e) => {
+    if (!e || !e.url) return;
+    const urls = String(e.url).split('\\n').map((s) => s.trim()).filter(Boolean);
+    urls.forEach((u) => {
+      if (u.startsWith('customlist:v1:')) {
+        try {
+          const payload = JSON.parse(u.slice('customlist:v1:'.length));
+          if (payload && Array.isArray(payload.items)) {
+            const cleanName = (e.name || payload.name || 'Custom List').replace(/\s*\((Movies|Shows)\)$/i, '').trim();
+            const slug = payload.localSlug || payload.listSlug || payload.creatorSlug || payload.slug || (typeof slugify === 'function' ? slugify(cleanName) : cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-')) || 'list';
+            const itemType = payload.type || e.type || 'movie';
+
+            if (extractedLists[slug]) {
+              const existing = extractedLists[slug];
+              const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+              payload.items.forEach((it) => {
+                const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+                if (!seenKeys.has(key)) {
+                  if (!existing.items) existing.items = [];
+                  existing.items.push(it);
+                  seenKeys.add(key);
+                }
+              });
+              if (existing.type !== itemType && existing.type !== 'mixed') {
+                existing.type = 'mixed';
+              }
+              if (!existing.name || existing.name.endsWith('(Movies)') || existing.name.endsWith('(Shows)')) {
+                existing.name = cleanName;
+              }
+            } else {
+              extractedLists[slug] = {
+                slug: slug,
+                name: cleanName,
+                type: itemType,
+                items: [...payload.items],
+                visibility: payload.visibility || 'public',
+                shuffle: !!payload.shuffle,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              };
+            }
+          }
+        } catch (err) {}
+      } else if (u.startsWith('channel:v1:')) {
+        try {
+          const payload = JSON.parse(u.slice('channel:v1:'.length));
+          if (payload && Array.isArray(payload.items)) {
+            const chId = payload.channelId || e.id || (typeof generateChannelId === 'function' ? generateChannelId() : ('ch' + Date.now()));
+            if (!payload.name) payload.name = e.name || 'Custom Channel';
+            if (!payload.channelId) payload.channelId = chId;
+            extractedChannels[chId] = payload;
+          }
+        } catch (err) {}
+      }
+    });
+  });
+
+  return { lists: extractedLists, channels: extractedChannels };
+}
+
+function rebuildCustomListsFromPreset(name, isSilent = false) {
+  const map = loadPresetsMap();
+  const preset = map[name];
+  if (!preset) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('Preset Not Found', 'Could not find preset "' + name + '".', false);
+      else alert('Could not find preset "' + name + '".');
+    }
+    return { restoredLists: 0, restoredChannels: 0, listNames: [] };
+  }
+
+  const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(preset);
+  const listSlugs = Object.keys(extractedLists);
+  const channelIds = Object.keys(extractedChannels);
+
+  if (!listSlugs.length && !channelIds.length) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', 'Preset "' + name + '" does not contain any custom lists or channels.', false);
+      else alert('Preset "' + name + '" does not contain any custom lists or channels.');
+    }
+    return { restoredLists: 0, restoredChannels: 0, listNames: [] };
+  }
+
+  // 1. Merge into local custom lists
+  let localCustomListsMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  let restoredListsCount = 0;
+  const restoredListNames = [];
+  let hasTrackingChanges = false;
+
+  listSlugs.forEach((slug) => {
+    const rebuilt = extractedLists[slug];
+    if (!localCustomListsMap[slug]) {
+      localCustomListsMap[slug] = rebuilt;
+      restoredListsCount++;
+      restoredListNames.push(rebuilt.name || slug);
+      if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+        hasTrackingChanges = true;
+      }
+    } else {
+      // Merge items into existing list
+      const existing = localCustomListsMap[slug];
+      const seenKeys = new Set((existing.items || []).map((it) => String(it.id || it.imdbId || it.tmdbId || it.title || '')));
+      let addedItems = 0;
+      (rebuilt.items || []).forEach((it) => {
+        const key = String(it.id || it.imdbId || it.tmdbId || it.title || '');
+        if (!seenKeys.has(key)) {
+          if (!existing.items) existing.items = [];
+          existing.items.push(it);
+          seenKeys.add(key);
+          addedItems++;
+        }
+      });
+      if (addedItems > 0) {
+        existing.updatedAt = Date.now();
+        restoredListsCount++;
+        restoredListNames.push((existing.name || slug) + ' (+' + addedItems + ' items)');
+        if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
+          hasTrackingChanges = true;
+        }
+      }
+    }
+  });
+
+  if (typeof saveLocalCustomListsMap === 'function') {
+    saveLocalCustomListsMap(localCustomListsMap);
+  }
+  if (localCustomListsMap['watch-history'] && Array.isArray(localCustomListsMap['watch-history'].items)) {
+    window._rawWatchHistoryItems = localCustomListsMap['watch-history'].items;
+    window._watchedItemIds = new Set((window._rawWatchHistoryItems || []).map((it) => String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '') || '')));
+  }
+
+  // 2. Merge into local channels
+  let localChannelsMap = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+  let restoredChannelsCount = 0;
+
+  channelIds.forEach((chId) => {
+    if (!localChannelsMap[chId]) {
+      localChannelsMap[chId] = extractedChannels[chId];
+      restoredChannelsCount++;
+    }
+  });
+
+  if (restoredChannelsCount > 0 && typeof saveLocalChannelsMap === 'function') {
+    saveLocalChannelsMap(localChannelsMap);
+  }
+
+  if (hasTrackingChanges) {
+    if (typeof pushTrackingSync === 'function') pushTrackingSync();
+    if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+  }
+
+  // 3. Refresh UI & State
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+  if (typeof renderChannelsList === 'function') renderChannelsList();
+  if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+  if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+
+  // 4. If signed in, push to sync
+  if (typeof activeCreator !== 'undefined' && activeCreator) {
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    if (typeof pushChannelsSync === 'function') pushChannelsSync();
+  }
+
+  if (!isSilent) {
+    let msg = 'Restored ' + listSlugs.length + ' custom list' + (listSlugs.length === 1 ? '' : 's');
+    if (channelIds.length) {
+      msg += ' and ' + channelIds.length + ' channel' + (channelIds.length === 1 ? '' : 's');
+    }
+    msg += ' from preset "' + name + '" to your My Lists tab.';
+    if (restoredListNames.length) {
+      msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Custom Lists Rebuilt', msg, true);
+    } else {
+      alert(msg);
+    }
+  }
+
+  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames };
 }
 
 function renderPresetsList() {
   const container = document.getElementById('presetsList');
+  if (!container) return;
   const badge = document.getElementById('presetsCountBadge');
   const map = loadPresetsMap();
   const names = Object.keys(map).sort();
   if (badge) badge.textContent = names.length ? '(' + names.length + ' saved)' : '';
   if (!names.length) {
-    container.innerHTML = '<p><small>No saved presets yet.</small></p>';
+    container.innerHTML = '<p style="color:var(--muted); font-size:0.85rem; margin:8px 0;"><small>No saved presets yet.</small></p>';
     return;
   }
   container.innerHTML = names.map((n) => {
-    const count = (map[n].entries || []).length;
+    const preset = map[n];
+    const entries = Array.isArray(preset) ? preset : ((preset && preset.entries) || []);
+    const count = entries.length;
     return '<div class="preset-card" data-preset="' + escapeAttr(n) + '">' +
       '<div class="preset-card-header">' +
         '<strong class="preset-card-title">' + escapeHtml(n) + '</strong> <small style="color:var(--muted);">(' + count + ' list' + (count === 1 ? '' : 's') + ')</small>' +
       '</div>' +
       '<div class="preset-actions-grid">' +
         '<button type="button" class="secondary lc-btn preset-load-btn">Load</button>' +
+        '<button type="button" class="secondary lc-btn preset-restore-lists-btn" title="Rebuild and restore custom lists &amp; channels from this preset into My Lists">Restore Lists</button>' +
         '<button type="button" class="secondary lc-btn preset-share-btn">Share</button>' +
         '<button type="button" class="secondary lc-btn preset-download-btn">Download</button>' +
         '<button type="button" class="secondary lc-btn preset-delete-btn">Delete</button>' +
@@ -36902,34 +42690,58 @@ function renderPresetsList() {
     '</div>';
   }).join('');
 }
+window.renderPresetsList = renderPresetsList;
 
-document.getElementById('presetsList').addEventListener('click', (e) => {
-  const row = e.target.closest('[data-preset]');
-  if (!row) return;
-  const name = row.getAttribute('data-preset');
-  if (e.target.classList.contains('preset-load-btn')) loadPreset(name);
-  else if (e.target.classList.contains('preset-share-btn')) sharePreset(name);
-  else if (e.target.classList.contains('preset-download-btn')) downloadPreset(name);
-  else if (e.target.classList.contains('preset-delete-btn')) deletePreset(name);
-});
+const presetsListEl = document.getElementById('presetsList');
+if (presetsListEl) {
+  presetsListEl.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-preset]');
+    if (!row) return;
+    const name = row.getAttribute('data-preset');
+    if (e.target.classList.contains('preset-load-btn')) loadPreset(name);
+    else if (e.target.classList.contains('preset-restore-lists-btn')) rebuildCustomListsFromPreset(name, false);
+    else if (e.target.classList.contains('preset-share-btn')) sharePreset(name);
+    else if (e.target.classList.contains('preset-download-btn')) downloadPreset(name);
+    else if (e.target.classList.contains('preset-delete-btn')) deletePreset(name);
+  });
+}
 
 function loadPreset(name) {
   const map = loadPresetsMap();
   const preset = map[name];
   if (!preset) return;
+  const entries = Array.isArray(preset) ? preset : ((preset && preset.entries) || []);
   document.getElementById('lists').innerHTML = '';
-  preset.entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+  entries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
   renumber();
   checkAllDuplicateUrls();
   saveState();
   renderChannelMergeList();
+
+  // Rebuild and restore custom lists & channels from this preset
+  const result = rebuildCustomListsFromPreset(name, true);
+  if (result.restoredLists > 0 || result.restoredChannels > 0) {
+    let msg = 'Preset "' + name + '" loaded';
+    const parts = [];
+    if (result.restoredLists) parts.push(result.restoredLists + ' custom list' + (result.restoredLists === 1 ? '' : 's'));
+    if (result.restoredChannels) parts.push(result.restoredChannels + ' channel' + (result.restoredChannels === 1 ? '' : 's'));
+    if (parts.length) msg += ' & ' + parts.join(', ') + ' restored to My Lists';
+    msg += ' \u2713';
+    showAddedToast(msg);
+  } else {
+    showAddedToast('Preset "' + name + '" loaded \u2713');
+  }
 }
 
 function sharePreset(name) {
   const map = loadPresetsMap();
   const preset = map[name];
   if (!preset) return;
-  const jsonStr = JSON.stringify({ entries: preset.entries }, null, 2);
+  const entries = Array.isArray(preset) ? preset : ((preset && preset.entries) || []);
+  const payload = { entries: entries };
+  if (preset.customLists) payload.customLists = preset.customLists;
+  if (preset.channels) payload.channels = preset.channels;
+  const jsonStr = JSON.stringify(payload, null, 2);
   navigator.clipboard.writeText(jsonStr).then(() => {
     if (typeof showAppAlert === 'function') {
       showAppAlert('Preset Copied', '"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.', true);
@@ -36967,11 +42779,6 @@ function deletePreset(name) {
 }
 
 // --- file download/upload (Backup/Restore and My Presets) -------------------
-//
-// Shared by both the whole-setup Backup/Restore panel and individual
-// presets -- same underlying JSON shape as exportConfigJson/importConfigJson,
-// just written to/read from an actual file instead of a textarea, for
-// people who'd rather drag a file into a folder than copy-paste text.
 function downloadJsonFile(filename, payload) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -36982,10 +42789,6 @@ function downloadJsonFile(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// Reads a chosen file as text and hands it to onParsed(jsonData); shared
-// error handling (bad file, invalid JSON) so each upload button only needs
-// to say what to do once parsing succeeds. Always clears the file input
-// afterward so choosing the same filename again still fires a change event.
 function readJsonFile(input, onParsed) {
   const file = input.files && input.files[0];
   if (!file) return;
@@ -37012,26 +42815,8 @@ function readJsonFile(input, onParsed) {
 }
 
 function downloadConfigJson() {
-  const entries = collectEntries();
-  if (!entries.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('Empty Catalogs', 'Add at least one list first.', false);
-    else alert('Add at least one list first.');
-    return;
-  }
-  const keys = collectKeys();
-  const payload = { entries };
-  if (keys.tmdbKey) payload.tmdbKey = keys.tmdbKey;
-  if (keys.tmdbSessionId) payload.tmdbSessionId = keys.tmdbSessionId;
-  if (keys.tmdbAccountId) payload.tmdbAccountId = keys.tmdbAccountId;
-  if (keys.tmdbUsername) payload.tmdbUsername = keys.tmdbUsername;
-  if (keys.mdblistKey) payload.mdblistKey = keys.mdblistKey;
-  if (keys.traktKey) payload.traktKey = keys.traktKey;
-  if (keys.traktUsername) payload.traktUsername = keys.traktUsername;
-  if (keys.traktAccessToken) payload.traktAccessToken = keys.traktAccessToken;
-  if (keys.simklKey) payload.simklKey = keys.simklKey;
-  if (keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
-  if (keys.simklUsername) payload.simklUsername = keys.simklUsername;
-  downloadJsonFile('my-lists-config.json', payload);
+  const payload = buildFullBackupPayload();
+  downloadJsonFile('my-lists-full-backup.json', payload);
 }
 
 function uploadConfigFile(input) {
@@ -37042,12 +42827,16 @@ function downloadPreset(name) {
   const map = loadPresetsMap();
   const preset = map[name];
   if (!preset) return;
-  downloadJsonFile((slugify(name) || 'preset') + '.json', { entries: preset.entries });
+  const entries = Array.isArray(preset) ? preset : ((preset && preset.entries) || []);
+  const payload = { entries: entries };
+  if (preset.customLists) payload.customLists = preset.customLists;
+  if (preset.channels) payload.channels = preset.channels;
+  downloadJsonFile((slugify(name) || 'preset') + '.json', payload);
 }
 
 function uploadPresetFile(input) {
   readJsonFile(input, (data, file) => {
-    if (!data || !Array.isArray(data.entries)) {
+    if (!data || (!Array.isArray(data.entries) && !Array.isArray(data))) {
       if (typeof showAppAlert === 'function') showAppAlert('Invalid Preset', 'That file does not look like a preset -- expected an "entries" array.', false);
       else alert('That file does not look like a preset -- expected an "entries" array.');
       return;
@@ -37055,11 +42844,22 @@ function uploadPresetFile(input) {
     const suggested = (file.name || 'Preset').replace(/\.json$/i, '');
     const name = (prompt('Save this preset as:', suggested) || '').trim();
     if (!name) return;
+    const entries = Array.isArray(data) ? data : (data.entries || []);
     const map = loadPresetsMap();
-    map[name] = { entries: data.entries };
+    map[name] = {
+      entries: entries,
+      ...(data.customLists ? { customLists: data.customLists } : {}),
+      ...(data.channels ? { channels: data.channels } : {}),
+    };
     savePresetsMap(map);
     renderPresetsList();
     schedulePresetsSync();
+    const res = rebuildCustomListsFromPreset(name, true);
+    if (res.restoredLists > 0 || res.restoredChannels > 0) {
+      showAddedToast('Uploaded preset "' + name + '" & restored custom lists \u2713');
+    } else {
+      showAddedToast('Uploaded preset "' + name + '" \u2713');
+    }
   });
 }
 
@@ -37503,15 +43303,20 @@ async function generate() {
 
 // pre-fill
 suppressSave = true;
-const serverEntries = (${initialEntriesJson});
-const serverEntriesAreDefaults = ${usingDefaultEntries ? 'true' : 'false'};
-const serverShuffleShelves = ${initialShuffleShelves ? 'true' : 'false'};
-const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
+// serverEntries / serverEntriesAreDefaults / serverShuffleShelves /
+// serverShuffleItems are declared in the per-request preamble at the top of
+// this script section (16_client-row-core.js). They are resolved from the
+// install or configure link, so they differ per request and cannot live in
+// the shared cacheable bundle. They are ordinary script-scoped bindings and
+// read here exactly as they did when declared on this line.
 if (serverEntries.length && !serverEntriesAreDefaults) {
   // Opened via a real install/configure link with actual resolved entries
   // -- this is the source of truth.
   serverEntries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
-  if (${isConfigureMode ? 'true' : 'false'}) {
+  // Was a second server-side injection of isConfigureMode. IS_CONFIGURE
+  // from the preamble is the same value, and using it keeps this file free
+  // of anything that varies per request.
+  if (IS_CONFIGURE) {
     setTimeout(() => { lastGeneratedConfigHash = computeConfigStateHash(); }, 0);
   }
   if (document.getElementById('shuffleShelvesCheckbox')) {
@@ -37558,9 +43363,9 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
   // browser's actual saved state above) only when there's truly nothing in
   // localStorage yet -- a genuinely first-time visitor.
   const saved = loadSavedState();
-  if (saved && Array.isArray(saved.entries) && saved.entries.length) {
+  if (saved && Array.isArray(saved.entries)) {
     saved.entries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
-  } else if (serverEntries.length) {
+  } else if (!saved && serverEntries.length) {
     serverEntries.forEach(e => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
   }
   if (saved && document.getElementById('shuffleShelvesCheckbox')) {
@@ -37830,11 +43635,29 @@ tryAutoRestoreCreatorProfile();
   const customMatch = path.match(new RegExp('^/lists/custom/([a-z0-9_-]+)', 'i'));
   if (customMatch) {
     const slug = customMatch[1].toLowerCase();
-    const map = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
-    const list = map[slug] || null;
+    const list = (typeof findCustomListBySlugOrName === 'function') ? findCustomListBySlugOrName(slug, typeof deslugify === 'function' ? deslugify(slug) : slug) : null;
     const name = list ? (list.name || (typeof deslugify === 'function' ? deslugify(slug) : slug)) : (typeof deslugify === 'function' ? deslugify(slug) : slug);
     const type = (list && list.type) ? list.type : 'movie';
-    openListDetailsPage(name, type, 'custom:' + slug, list ? { sample: list.items, maybeMore: false } : null, { skipPushState: true });
+    let sample = null;
+    if (list && Array.isArray(list.items) && list.items.length) {
+      sample = list.items.map((it) => {
+        const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+        const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+        const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (list && list.type && list.type !== 'mixed' ? list.type : type)));
+        return {
+          id: it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null),
+          type: itemType,
+          name: label.title || it.title || it.name || 'Untitled',
+          subtitle: label.subtitle || '',
+          poster: it.poster || it.showPoster || '',
+          year: it.year,
+          airDate: it.airDate,
+          isUnaired: it.isUnaired,
+          removeCustomListSlug: list.slug || list.localSlug || slug,
+        };
+      });
+    }
+    openListDetailsPage(name, type, 'custom:' + slug, sample ? { sample: sample, count: sample.length, maybeMore: false } : null, { skipPushState: true });
     return;
   }
 
@@ -37944,7 +43767,7 @@ window.addEventListener('popstate', (e) => {
     }
   }
 });
-</script>
+/*MYLISTS_APP_BUNDLE_END*/</script>
 
 </body>
 </html>`;
@@ -37970,16 +43793,16 @@ window.addEventListener('popstate', (e) => {
 // one -- this page has no per-user config in its URL at all, so it's
 // exactly the kind of URL meant to be crawled and indexed.
 function renderGuidePage(origin) {
-  const title = `${ADDON_NAME} — How to Turn MDBList, Trakt, TMDB & Simkl Lists Into Stremio Catalogs`;
+  const title = `My Lists Addon — Complete User Guide & How-To Documentation`;
   const description =
-    "Step-by-step guide to turning any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row -- plus why self-hosting on your own free Cloudflare account beats a hosted list addon, a provider comparison, and answers to common questions.";
+    "Comprehensive step-by-step guides for My Lists Addon (mylistsaddon.com). Learn how to turn MDBList, Trakt, TMDB, and Simkl lists into Stremio, Wako, and Nuvio catalogs, build 24/7 Channels and Storylines & Universes, import lists from other trackers, and sync across devices.";
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#F2F2F7">
+<meta name="theme-color" content="#000000">
 <title>${title}</title>
 <meta name="description" content="${description}">
 <link rel="canonical" href="${origin}/guide">
@@ -37989,7 +43812,7 @@ function renderGuidePage(origin) {
 <meta property="og:description" content="${description}">
 <meta property="og:url" content="${origin}/guide">
 <meta property="og:image" content="${origin}/icon.png">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${title}">
 <meta name="twitter:description" content="${description}">
 <link rel="icon" type="image/png" href="${origin}/icon.png">
@@ -37999,192 +43822,965 @@ function renderGuidePage(origin) {
     mainEntity: [
       {
         "@type": "Question",
-        name: "Is this add-on free?",
+        name: "How do I install My Lists Addon into Stremio, Wako, or Nuvio?",
         acceptedAnswer: {
           "@type": "Answer",
           text:
-            "Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier -- optional support is available via Buy Me a Coffee, but nothing is gated behind it.",
+            "Open mylistsaddon.com, add your desired lists or streaming shelves under the Catalogs tab, click Generate Install Link, and open the resulting link in Stremio, Wako, Nuvio, or any other app built on the Stremio addon protocol to confirm installation. No registration or account is required.",
         },
       },
       {
         "@type": "Question",
-        name: "Do I need to create an account to use it?",
+        name: "How do I import lists from Letterboxd, IMDb, or another tracker?",
         acceptedAnswer: {
           "@type": "Answer",
           text:
-            "No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.",
+            "Export your data as a CSV or JSON file from the other service, then go to Settings -> External Accounts & API Keys -> Import List on mylistsaddon.com. Choose the matching source (or leave it on Auto-detect), pick or name a destination list, and upload your file.",
         },
       },
       {
         "@type": "Question",
-        name: "Do I need API keys from MDBList, Trakt, TMDB, or Simkl?",
+        name: "What are Channels and how do they work?",
         acceptedAnswer: {
           "@type": "Answer",
           text:
-            "Not for public lists. Public mdblist.com list URLs work with no key at all. Trakt and TMDB require a key on every request even for public data, but the deployment already includes a shared key for that. You only need your own personal key for private lists, personal watchlists, or higher usage.",
+            "Channels turn one or more shows into a 24/7-style catalog row that plays episodes continuously in broadcast order or shuffle, similar to a live TV network. Build one from scratch, one-tap add a popular network, or import a show list URL as a channel.",
         },
       },
       {
         "@type": "Question",
-        name: "What's the difference between self-hosting this and using a hosted list addon?",
+        name: "Is My Lists Addon free?",
         acceptedAnswer: {
           "@type": "Answer",
           text:
-            "A hosted addon runs on someone else's server, under someone else's account, subject to someone else's uptime and rate limits. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, nothing runs unless you deployed it, and there's no third party in the middle of your Stremio catalog.",
+            "Yes, 100% free with no subscriptions, ads, or paywalls. Use the hosted instance at mylistsaddon.com, or self-host your own copy on a free Cloudflare Workers account -- optional support is available via Buy Me a Coffee.",
         },
       },
     ],
   })}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700;800&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #F2F2F7; --surface: #FFFFFF; --text: #1C1C1E; --text-2: #3A3A3C;
-    --muted: #8E8E93; --accent: #007AFF; --border: rgba(0,0,0,0.08);
-    --border-strong: rgba(0,0,0,0.13); --radius: 14px; --radius-sm: 10px;
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --bg: #000000;
+    --bg-surface: #1C1C1E;
+    --bg-card: #2C2C2E;
+    --bg-input: #3A3A3C;
+    --text: #FFFFFF;
+    --text-muted: #8E8E93;
+    --text-dim: #A1A1A6;
+    --border: rgba(255,255,255,0.12);
+    --border-strong: rgba(255,255,255,0.22);
+    --accent: #0A84FF;
+    --accent-hover: #0070E0;
+    --accent-bg: rgba(10, 132, 255, 0.15);
+    --success: #30D158;
+    --warning: #FFD60A;
+    --danger: #FF453A;
+    --radius-lg: 16px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 4px 20px rgba(0,0,0,0.5);
   }
-  * { box-sizing: border-box; }
+
+  :root.light-theme, .light-theme {
+    --bg: #F2F2F7;
+    --bg-surface: #FFFFFF;
+    --bg-card: #E5E5EA;
+    --bg-input: #D1D1D6;
+    --text: #1C1C1E;
+    --text-muted: #6C6C70;
+    --text-dim: #48484A;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.16);
+    --accent: #007AFF;
+    --accent-hover: #0062CC;
+    --accent-bg: rgba(0, 122, 255, 0.10);
+    --shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    background: var(--bg);
+    color: var(--text);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-    font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
-  a { color: var(--accent); }
-  .top-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
-  .top-nav .brand { font-weight: 800; font-size: 1.1rem; color: var(--text); text-decoration: none; }
-  .top-nav .back-link { font-size: 0.9rem; font-weight: 600; text-decoration: none; }
+
+  .guide-layout {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 24px 20px 80px;
+  }
+
+  /* Header */
+  .guide-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0 28px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+  .brand-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-decoration: none;
+    color: var(--text);
+  }
+  .brand-logo {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+  }
+  .brand-text {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 800;
+    font-size: 1.25rem;
+    letter-spacing: -0.02em;
+  }
+  .nav-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 16px;
+    border-radius: 999px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.15s ease;
+    cursor: pointer;
+    border: none;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #FFF;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary {
+    background: var(--bg-surface);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+  }
+  .btn-secondary:hover { border-color: var(--accent); }
+
+  /* Theme Toggle */
+  .theme-toggle-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+    color: var(--text);
+  }
+  .theme-icon {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s ease;
+  }
+  .icon-sun { opacity: 1; transform: translate(-50%, -50%) rotate(0deg) scale(1); left: 50%; top: 50%; }
+  .icon-moon { opacity: 0; transform: translate(-50%, -50%) rotate(-90deg) scale(0.4); left: 50%; top: 50%; }
+  :root.light-theme .icon-sun, .light-theme .icon-sun { opacity: 0; transform: translate(-50%, -50%) rotate(90deg) scale(0.4); }
+  :root.light-theme .icon-moon, .light-theme .icon-moon { opacity: 1; transform: translate(-50%, -50%) rotate(0deg) scale(1); }
+
+  /* Hero */
+  .hero-section {
+    text-align: center;
+    padding: 24px 0 40px;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  .hero-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: var(--accent-bg);
+    color: var(--accent);
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 16px;
+  }
   h1 {
-    font-family: 'Space Grotesk', 'Inter', sans-serif;
-    font-size: 2rem; font-weight: 700; letter-spacing: -0.02em;
-    margin: 0 0 10px; line-height: 1.2;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 2.5rem;
+    font-weight: 800;
+    line-height: 1.15;
+    letter-spacing: -0.03em;
+    margin-bottom: 16px;
   }
-  .lede { color: var(--text-2); font-size: 1.05rem; margin: 0 0 28px; }
+  .hero-sub {
+    font-size: 1.15rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+    margin-bottom: 28px;
+  }
+
+  /* Quick-Jump TOC Bar */
+  .toc-bar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 48px;
+  }
+  .toc-pill {
+    padding: 7px 14px;
+    border-radius: 999px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.15s ease;
+  }
+  .toc-pill:hover {
+    color: var(--text);
+    border-color: var(--accent);
+    background: var(--accent-bg);
+  }
+
+  /* Guide Content Blocks */
+  .guide-block {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 32px 28px;
+    margin-bottom: 32px;
+    box-shadow: var(--shadow);
+  }
+  .block-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .block-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: var(--accent-bg);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.25rem;
+    font-weight: 700;
+  }
   h2 {
-    font-family: 'Space Grotesk', 'Inter', sans-serif;
-    font-size: 1.35rem; font-weight: 700; margin: 40px 0 12px; letter-spacing: -0.01em;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
   }
-  h3 { font-size: 1.05rem; font-weight: 700; margin: 22px 0 6px; }
-  p { color: var(--text-2); margin: 0 0 14px; }
+  h3 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin: 24px 0 10px;
+    color: var(--text);
+  }
+  p { color: var(--text-dim); margin-bottom: 14px; }
+  ul, ol { color: var(--text-dim); padding-left: 24px; margin-bottom: 16px; }
+  li { margin-bottom: 8px; }
+  strong { color: var(--text); font-weight: 600; }
+
+  /* Steps List */
+  .steps-container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin: 20px 0;
+  }
+  .step-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 18px 20px;
+    display: flex;
+    gap: 16px;
+  }
+  .step-num {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #FFF;
+    font-weight: 800;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .step-body h4 {
+    font-size: 1rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+  .step-body p {
+    font-size: 0.92rem;
+    margin-bottom: 0;
+  }
+
+  /* Callout Tips */
+  .tip-box {
+    background: var(--accent-bg);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    padding: 14px 18px;
+    margin: 18px 0;
+    font-size: 0.92rem;
+    color: var(--text);
+  }
+  .tip-box strong { color: var(--accent); }
+
+  /* Code / Snippets */
   code {
-    background: rgba(0,0,0,0.05); border: 1px solid var(--border);
-    border-radius: 5px; padding: 1px 6px; font-size: 0.88em;
-    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 7px;
+    font-size: 0.88em;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
   }
-  .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 18px 20px; margin: 14px 0;
-    box-shadow: var(--shadow-sm);
+  .code-block {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88rem;
+    color: var(--text);
+    overflow-x: auto;
+    margin: 12px 0 18px;
+    word-break: break-all;
   }
-  table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 0.92rem; }
-  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
-  ol, ul { color: var(--text-2); padding-left: 22px; }
-  li { margin-bottom: 6px; }
-  .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 32px; }
-  .toc a {
-    font-size: 0.85rem; font-weight: 600; text-decoration: none;
-    background: var(--surface); border: 1px solid var(--border-strong);
-    border-radius: 999px; padding: 6px 13px; color: var(--text-2);
+
+  /* Comparison Grid */
+  .provider-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin: 20px 0;
   }
-  .cta {
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-    gap: 14px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 20px 22px; margin: 36px 0 8px;
+  .provider-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px;
   }
-  .cta-btn {
-    background: var(--accent); color: #fff; text-decoration: none;
-    font-weight: 700; font-size: 0.95rem; padding: 11px 22px;
-    border-radius: 999px; white-space: nowrap;
+  .provider-card h4 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: var(--text);
   }
-  .faq-q { font-weight: 700; margin: 18px 0 4px; }
-  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
-  :root.dark-theme, .dark-theme {
-    --bg: #000; --surface: #1C1C1E; --text: #FFF; --text-2: #EBEBF5;
-    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+  .provider-card p {
+    font-size: 0.86rem;
+    margin-bottom: 8px;
+  }
+  .provider-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--accent-bg);
+    color: var(--accent);
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+
+  /* FAQ Accordions */
+  .faq-item {
+    border-bottom: 1px solid var(--border);
+    padding: 18px 0;
+  }
+  .faq-item:last-child { border-bottom: none; }
+  .faq-q {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .faq-a {
+    font-size: 0.95rem;
+    color: var(--text-dim);
+  }
+
+  /* Footer CTA */
+  .footer-cta {
+    background: linear-gradient(135deg, var(--bg-surface) 0%, var(--bg-card) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 36px 32px;
+    text-align: center;
+    margin-top: 48px;
+  }
+  .footer-cta h3 {
+    font-size: 1.6rem;
+    margin-bottom: 8px;
+  }
+  .footer-cta p {
+    margin-bottom: 24px;
+    max-width: 540px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .footer-nav {
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .footer-nav a { color: var(--accent); text-decoration: none; }
+
+  @media (max-width: 640px) {
+    h1 { font-size: 1.85rem; }
+    .guide-block { padding: 24px 18px; }
+    .step-card { flex-direction: column; gap: 10px; }
   }
 </style>
 <script>
-  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-    document.documentElement.classList.add('dark-theme');
+  function applyTheme(t) {
+    if (t === 'light') {
+      document.documentElement.classList.add('light-theme');
+      document.documentElement.classList.remove('dark-theme');
+      document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#F2F2F7');
+    } else {
+      document.documentElement.classList.add('dark-theme');
+      document.documentElement.classList.remove('light-theme');
+      document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#000000');
+    }
+  }
+  const saved = localStorage.getItem('theme');
+  if (saved) {
+    applyTheme(saved);
+  } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+    applyTheme('light');
+  }
+  function toggleTheme() {
+    const isLight = document.documentElement.classList.contains('light-theme');
+    const next = isLight ? 'dark' : 'light';
+    localStorage.setItem('theme', next);
+    applyTheme(next);
   }
 </script>
 </head>
 <body>
-<div class="wrap">
-  <div class="top-nav">
-    <a class="brand" href="${origin}/">${ADDON_NAME}</a>
-    <a class="back-link" href="${origin}/">&larr; Back to the builder</a>
-  </div>
 
-  <h1>How to Turn MDBList, Trakt, TMDB &amp; Simkl Lists Into Stremio Catalogs</h1>
-  <p class="lede">A self-hosted way to get any list — public or your own — onto your Stremio or wako home screen as a real catalog row, running entirely on your own free Cloudflare account.</p>
-
-  <div class="toc">
-    <a href="#mdblist">MDBList</a>
-    <a href="#trakt">Trakt</a>
-    <a href="#tmdb">TMDB</a>
-    <a href="#simkl">Simkl</a>
-    <a href="#self-hosted">Why self-host</a>
-    <a href="#comparison">Which provider?</a>
-    <a href="#faq">FAQ</a>
-  </div>
-
-  <p>All four steps below start the same way: open <a href="${origin}/">${origin.replace("https://", "").replace("http://", "")}</a>, paste a list URL into the builder, and click install. What changes is where you get the URL from and what it unlocks.</p>
-
-  <h2 id="mdblist">MDBList lists</h2>
-  <p>Works with no API key at all for public lists. Go to <a href="https://mdblist.com" target="_blank" rel="noopener">mdblist.com</a>, open any public list (your own or someone else's), and copy its URL — it looks like <code>mdblist.com/lists/username/list-name</code>. Paste that straight into the builder and it becomes a catalog row.</p>
-  <p>Private MDBList lists and the "My Watchlist" quick-add need your own free MDBList API key, pasted into Settings once.</p>
-
-  <h2 id="trakt">Trakt lists</h2>
-  <p>Public Trakt lists work out of the box — no account needed. Copy a list URL in the form <code>trakt.tv/users/username/lists/list-slug</code> and paste it in. Trakt's own trending and popular charts are available as one-tap Quick Add shelves too.</p>
-  <p>To pull in your own private lists, liked lists, watchlist, or watch history, connect your Trakt account from Settings — this uses Trakt's own OAuth login, so your credentials never pass through anything but Trakt itself.</p>
-
-  <h2 id="tmdb">TMDB lists</h2>
-  <p>Paste any public <code>themoviedb.org/list/12345</code> URL to add it as a catalog. TMDB also powers this add-on's genre, network, streaming-provider, and keyword charts, plus episode/season data for Continue Watching.</p>
-
-  <h2 id="simkl">Simkl charts</h2>
-  <p>Simkl's trending charts (daily, weekly, monthly, across movies, TV, and anime) are available as one-tap Quick Add shelves. Connecting a Simkl account additionally unlocks importing your own lists and watch history.</p>
-
-  <h2 id="self-hosted">Why self-host instead of a hosted list addon?</h2>
-  <p>Most Stremio catalog add-ons in this space run as a hosted service — you're pointing your Stremio app at someone else's server, using someone else's account, subject to someone else's uptime, rate limits, and whatever happens to that service down the road.</p>
-  <p>This add-on is different: you deploy it to your own free Cloudflare Workers account in about five minutes, and from then on it's entirely yours. Your configuration lives in your install link or your own Cloudflare storage — never on a third party's server. Nothing runs unless you deployed it. There's no subscription because there's nothing to subscribe to; Cloudflare's free tier comfortably covers normal personal use.</p>
-  <p>The tradeoff is honest: self-hosting takes those five minutes of setup a hosted service skips. In exchange you get a catalog that's actually yours.</p>
-
-  <h2 id="comparison">MDBList vs. Trakt vs. TMDB vs. Simkl — which should I use?</h2>
-  <table>
-    <tr><th>Provider</th><th>Best for</th><th>Needs a key?</th></tr>
-    <tr><td><strong>MDBList</strong></td><td>Curated public lists, community charts, the simplest path with zero setup</td><td>No, for public lists</td></tr>
-    <tr><td><strong>Trakt</strong></td><td>Your own watch history, watchlist, and lists if you already use Trakt to track what you watch</td><td>Only for private/personal data</td></tr>
-    <tr><td><strong>TMDB</strong></td><td>Genre/network/streaming-provider charts, episode &amp; season metadata</td><td>No, for public lists and charts</td></tr>
-    <tr><td><strong>Simkl</strong></td><td>Trending charts, especially for anime</td><td>Only for personal data</td></tr>
-  </table>
-  <p>None of these are exclusive — most people mix all four on one home screen, since they're just different sources feeding into the same catalog builder.</p>
-
-  <h2 id="faq">Frequently asked questions</h2>
-  <div class="faq-q">Is this add-on free?</div>
-  <p>Yes. It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier.</p>
-  <div class="faq-q">Do I need to create an account to use it?</div>
-  <p>No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio or wako with zero signup. An optional free Creator Profile exists if you want your lists and watch history synced across multiple devices.</p>
-  <div class="faq-q">Do I need API keys from MDBList, Trakt, TMDB, or Simkl?</div>
-  <p>Not for public lists. You only need your own personal key for private lists, personal watchlists, or if you're doing enough browsing that you want your own dedicated rate limit instead of the shared one.</p>
-  <div class="faq-q">What's the difference between self-hosting this and using a hosted list addon?</div>
-  <p>A hosted addon runs on someone else's server under someone else's account. Self-hosting this on your own Cloudflare account means your configuration and watch data live in your own storage, and there's no third party in the middle of your Stremio catalog.</p>
-
-  <div class="cta">
-    <div>
-      <strong>Ready to build your own catalog?</strong>
-      <div style="color:var(--muted); font-size:0.88rem; margin-top:2px;">Takes about five minutes, no account required.</div>
+<div class="guide-layout">
+  <!-- Navigation Header -->
+  <header class="guide-nav">
+    <a href="${origin}/" class="brand-group">
+      <img src="${origin}/icon.png" alt="My Lists Icon" class="brand-logo">
+      <span class="brand-text">${ADDON_NAME}</span>
+    </a>
+    <div class="nav-actions">
+      <button type="button" class="theme-toggle-btn" onclick="toggleTheme()" aria-label="Toggle Dark/Light Mode">
+        <svg class="theme-icon icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5" fill="currentColor"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg class="theme-icon icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+      </button>
+      <a href="${origin}/" class="btn btn-primary">Go to mylistsaddon.com &rarr;</a>
     </div>
-    <a class="cta-btn" href="${origin}/">Open the builder &rarr;</a>
+  </header>
+
+  <!-- Hero Header -->
+  <div class="hero-section">
+    <div class="hero-badge">Documentation &amp; User Guides</div>
+    <h1>How to Use My Lists Addon</h1>
+    <p class="hero-sub">The complete guide to turning MDBList, Trakt, TMDB, and Simkl lists into dynamic Stremio, Wako, and Nuvio catalogs, building 24/7 Channels and Storylines &amp; Universes, importing lists from other trackers, and syncing across your devices.</p>
+
+    <!-- Table of Contents -->
+    <div class="toc-bar">
+      <a href="#quick-start" class="toc-pill">Quick Start</a>
+      <a href="#discover" class="toc-pill">Discover</a>
+      <a href="#catalogs" class="toc-pill">Catalogs</a>
+      <a href="#lists" class="toc-pill">Lists</a>
+      <a href="#channels" class="toc-pill">Channels</a>
+      <a href="#storylines" class="toc-pill">Storylines &amp; Universes</a>
+      <a href="#importing" class="toc-pill">Importing</a>
+      <a href="#settings" class="toc-pill">Settings</a>
+      <a href="#backups" class="toc-pill">Backups &amp; Presets</a>
+      <a href="#self-hosting" class="toc-pill">Self-Hosting</a>
+      <a href="#faq" class="toc-pill">FAQ</a>
+    </div>
   </div>
 
-  <footer>
-    ${ADDON_NAME} is free and open, self-hosted on Cloudflare Workers. <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener">Support the project</a>.
+  <!-- 1. Quick Start Guide -->
+  <section class="guide-block" id="quick-start">
+    <div class="block-header">
+      <div class="block-icon">1</div>
+      <div>
+        <h2>1. Quick Start</h2>
+        <p style="margin-bottom:0;">Get catalog rows running on Stremio, Wako, Nuvio, or any other app built on the Stremio addon protocol, with zero registration.</p>
+      </div>
+    </div>
+
+    <p>The fastest way to get started is to use the hosted instance directly at <a href="${origin}/"><strong>mylistsaddon.com</strong></a> &mdash; no account, no deployment, nothing to set up.</p>
+
+    <div class="steps-container">
+      <div class="step-card">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h4>Open mylistsaddon.com</h4>
+          <p>Visit <a href="${origin}/"><strong>mylistsaddon.com</strong></a> in any browser, on desktop or mobile.</p>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h4>Add Your Favorite Shelves</h4>
+          <p>Under the <strong>Catalogs</strong> tab, click <strong>+ New Catalog</strong> to paste any MDBList, Trakt, TMDB, or Simkl URL, or browse the <strong>Discover</strong> tab for one-tap shelves (Netflix, Disney+, Prime Video, genres, and more).</p>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <h4>Generate Your Install Link</h4>
+          <p>Click <strong>Generate Install Link</strong> on the Catalogs tab. Open the resulting link, or paste it into Stremio, Wako, Nuvio, or your app's "Install addon from URL" field, and confirm. You're done!</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="tip-box">
+      <strong>How it works:</strong> Your entire configuration is encoded into your install link. When you add or reorder catalogs later, click <strong>Update Link</strong> on the Catalogs tab and reinstall to push the changes.
+    </div>
+
+    <p>Prefer to run your own dedicated copy instead of the shared hosted instance? See <a href="#self-hosting">Self-Hosting</a> below.</p>
+  </section>
+
+  <!-- 2. Discover -->
+  <section class="guide-block" id="discover">
+    <div class="block-header">
+      <div class="block-icon">2</div>
+      <div>
+        <h2>2. Discover Tab</h2>
+        <p style="margin-bottom:0;">Browse everything available without typing a single URL.</p>
+      </div>
+    </div>
+
+    <p>The default landing tab. Filter pills across the top narrow the shelves shown: <strong>All, Movies, Shows, Popular Lists, Curated, Hidden Gems, Kids, Holidays, Genres</strong>.</p>
+
+    <h3>What's here:</h3>
+    <ul>
+      <li><strong>Combined Charts</strong> &mdash; Popular, Trending, Streaming Top 10, and Streaming (All Services), blending multiple sources into one row.</li>
+      <li><strong>TMDB Charts</strong> &mdash; New Releases, Trending, Popular, Top Rated, Now Playing, Upcoming.</li>
+      <li><strong>Trakt Charts</strong> &mdash; Trending, Popular, Most Played, Most Watched, Most Collected, Most Favorited, Most Anticipated, and Box Office.</li>
+      <li><strong>MDBList Official</strong> &mdash; Popular, US Daily Streaming Charts, Streaming Charts (Extended), IMDb MovieMeter.</li>
+      <li><strong>Simkl Anime &amp; Trending</strong> &mdash; Trending Today/Week/Month, plus Anime Trending.</li>
+      <li><strong>Streaming Top 10 &amp; Streaming Catalogs</strong> &mdash; per-service rows for Netflix, Disney+, HBO Max, Hulu, Prime Video, Apple TV+, Paramount+, Peacock, Discovery+.</li>
+      <li><strong>Hidden Gems, Kids, Holidays, Genres</strong> &mdash; curated thematic and seasonal shelves.</li>
+      <li><strong>Popular Community Lists</strong> and <strong>Curated For You</strong> &mdash; the latter personalized from your watch history.</li>
+    </ul>
+
+    <p>Each shelf has <strong>+ Movies</strong> / <strong>+ Shows</strong> buttons to add just that half of a chart, or <strong>+ Add all</strong> at the top of a section to add every shelf in it at once. Click <strong>See All &rsaquo;</strong> to preview a shelf's full contents first.</p>
+  </section>
+
+  <!-- 3. Catalogs -->
+  <section class="guide-block" id="catalogs">
+    <div class="block-header">
+      <div class="block-icon">3</div>
+      <div>
+        <h2>3. Catalogs Tab</h2>
+        <p style="margin-bottom:0;">Where you add, arrange, and finalize what appears on your home screen.</p>
+      </div>
+    </div>
+
+    <p>Three submenus: <strong>My Catalogs</strong>, <strong>Quick Add</strong>, and <strong>Bulk Add</strong>.</p>
+
+    <h3>My Catalogs &mdash; Live Preview &amp; Editor</h3>
+    <p>Shows every catalog row you've added, in the order it will display.</p>
+    <ul>
+      <li><strong>+ New Catalog</strong> &mdash; opens the Add Catalog modal to add a list by URL (see below).</li>
+      <li><strong>Edit</strong> &mdash; toggle edit mode to drag-reorder, rename, or remove rows.</li>
+      <li><strong>Refresh Preview</strong> &mdash; re-renders the live preview.</li>
+      <li>Filter by name and by group using the controls above the list.</li>
+      <li><strong>Daily Randomizer</strong> &mdash; two toggles: shuffle catalog row order every 24 hours, or shuffle items within each catalog every 24 hours.</li>
+      <li><strong>Generate Install Link</strong> &mdash; produces your install URL, ready for Stremio, Wako, Nuvio, or any other app built on the Stremio addon protocol.</li>
+    </ul>
+
+    <div class="provider-grid">
+      <div class="provider-card">
+        <h4>MDBList</h4>
+        <span class="provider-tag">No Key Required</span>
+        <p style="margin-top:8px;">Paste any public list URL like <code>mdblist.com/lists/username/list-name</code>. Connect an account or API key under Settings to unlock your personal Watchlist and private lists.</p>
+      </div>
+      <div class="provider-card">
+        <h4>Trakt.tv</h4>
+        <span class="provider-tag">OAuth &amp; Public</span>
+        <p style="margin-top:8px;">Add public lists (<code>trakt.tv/users/username/lists/list-slug</code>) or connect your account to sync your Watchlist and History.</p>
+      </div>
+      <div class="provider-card">
+        <h4>TheMovieDB (TMDB)</h4>
+        <span class="provider-tag">Lists &amp; Charts</span>
+        <p style="margin-top:8px;">Add public lists (<code>themoviedb.org/list/12345</code>), or browse automated genre, network, and streaming-provider charts.</p>
+      </div>
+      <div class="provider-card">
+        <h4>Simkl</h4>
+        <span class="provider-tag">Anime &amp; Trending</span>
+        <p style="margin-top:8px;">One-tap trending charts for Movies, Shows, and Anime. Connect an account to import personal lists and watch history.</p>
+      </div>
+    </div>
+
+    <h3>Adding a catalog by URL (the "+ New Catalog" modal):</h3>
+    <ol>
+      <li>Click <strong>+ New Catalog</strong>.</li>
+      <li>Enter a <strong>Catalog name</strong> &mdash; this becomes the row title on your home screen.</li>
+      <li>Paste a list <strong>URL</strong> from MDBList, Trakt, TMDB, or Simkl.</li>
+      <li>Optional: click <strong>+ Add another link</strong> to combine multiple list URLs into one blended row.</li>
+      <li>Choose the content type: <strong>Movies</strong> or <strong>Shows</strong>.</li>
+      <li>Click <strong>Add</strong>.</li>
+    </ol>
+
+    <h3>Quick Add &amp; Bulk Add</h3>
+    <p><strong>Quick Add</strong> is a one-tap shortcut to official charts without leaving this tab. <strong>Bulk Add</strong> lets you paste multiple list URLs at once, one per line, and click <strong>Add All Lines as Catalogs</strong> &mdash; each line is auto-detected and added as its own row.</p>
+
+    <div class="tip-box">
+      <strong>Combined Rows:</strong> Add multiple links to a single "+ New Catalog" entry to merge several lists into one unified catalog row.
+    </div>
+  </section>
+
+  <!-- 4. Lists -->
+  <section class="guide-block" id="lists">
+    <div class="block-header">
+      <div class="block-icon">4</div>
+      <div>
+        <h2>4. Lists Tab</h2>
+        <p style="margin-bottom:0;">Your personal, account-connected, and hand-built lists, separate from the catalog rows themselves.</p>
+      </div>
+    </div>
+
+    <p>Three submenus: <strong>My Lists</strong>, <strong>Liked</strong>, and <strong>Import</strong>.</p>
+
+    <h3>My Lists</h3>
+    <ul>
+      <li><strong>Your Custom Lists</strong> &mdash; hand-built lists. <strong>+ New List</strong> starts one from scratch.</li>
+      <li><strong>Your MDBList Lists</strong> &mdash; once you <strong>Connect MDBList</strong>, your Lists, Watchlist, and Watch History appear here.</li>
+      <li><strong>Your Trakt Lists</strong> &mdash; via <strong>Connect Trakt</strong> (OAuth, no password shared with the addon).</li>
+      <li><strong>Your TMDB Lists</strong> &mdash; via <strong>Connect TMDB</strong>, pulls your Lists, Watchlist, and Favorites.</li>
+      <li><strong>Your Simkl Lists</strong> &mdash; via <strong>Connect Simkl</strong>, pulls your Lists, Watchlist, and History.</li>
+    </ul>
+
+    <h3>Building a Custom List from Scratch:</h3>
+    <ol>
+      <li>Click <strong>+ New List</strong> and choose <strong>Destination: Custom List</strong>.</li>
+      <li>Give it a <strong>Name</strong> and optional <strong>Description</strong>.</li>
+      <li>Choose <strong>Content Type</strong>: Movies, Shows, or Mixed, and <strong>Visibility</strong>: Public or Private.</li>
+      <li>Click <strong>Create</strong>, then use Search/Discover/Charts to tap <strong>+</strong> on any title to add it to the list.</li>
+      <li>Reorder by dragging or typing a position number; remove with the <strong>&times;</strong> button.</li>
+      <li>Click <strong>Save</strong>. You can now add this list to your Catalogs like any other.</li>
+    </ol>
+
+    <h3>Liked</h3>
+    <p>Tap the heart (&hearts;) icon on any list anywhere in the app to save it here for quick access later.</p>
+
+    <div class="tip-box">
+      <strong>Import:</strong> The Import submenu lets you clone any MDBList, Trakt, or TMDB list URL directly into a Custom List, with an option to keep it synced to the source. See <a href="#importing">Importing</a> below for the full walkthrough, including bulk file imports from other trackers.
+    </div>
+  </section>
+
+  <!-- 5. Channels -->
+  <section class="guide-block" id="channels">
+    <div class="block-header">
+      <div class="block-icon">5</div>
+      <div>
+        <h2>5. Channels Tab</h2>
+        <p style="margin-bottom:0;">Turn any set of shows into a continuous 24/7-style catalog row, like flipping on a real network.</p>
+      </div>
+    </div>
+
+    <p>Four submenus: <strong>My Channels</strong>, <strong>Storylines &amp; Universes</strong>, <strong>Quick Add</strong>, and <strong>Import</strong>.</p>
+
+    <h3>My Channels</h3>
+    <p>Lists everything you've built. <strong>+ New Channel</strong> opens the channel builder. Below that, <strong>Merge Saved Channels into One Catalog</strong> lets you select multiple saved channels with checkboxes, name the merge, and click <strong>Merge into catalog</strong> to combine them into a single row.</p>
+
+    <h3>Building a Channel from Scratch:</h3>
+    <ol>
+      <li>Click <strong>+ New Channel</strong>.</li>
+      <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
+      <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
+      <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
+      <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
+      <li>Name the channel and click <strong>Save</strong>.</li>
+    </ol>
+
+    <h3>Quick Add Popular Networks</h3>
+    <p>One-click channels for major broadcast/cable networks &mdash; ABC, NBC, CBS, FOX, The CW, HBO, AMC, FX, Comedy Central, Nickelodeon, Cartoon Network, Adult Swim, Disney Channel, Discovery, History, HGTV, Food Network, TLC, MTV, Syfy, TBS, TNT, USA Network, BBC One, A&amp;E, Hallmark Channel, Ion Television, MeTV, and more &mdash; each with automatic daily episode rotation.</p>
+
+    <h3>Import channel from a link</h3>
+    <p>Paste any MDBList, Trakt, or TMDB <strong>show list</strong> URL, give it a channel name, and click <strong>Import channel</strong>. Every episode of every show on that list becomes the channel automatically.</p>
+  </section>
+
+  <!-- 6. Storylines & Universes -->
+  <section class="guide-block" id="storylines">
+    <div class="block-header">
+      <div class="block-icon">6</div>
+      <div>
+        <h2>6. Storylines, Sagas &amp; Universes</h2>
+        <p style="margin-bottom:0;">Found inside the Channels tab &mdash; complete franchise viewing orders, pre-built for you.</p>
+      </div>
+    </div>
+
+    <p>A curated library of movie trilogies and sagas (3+ films) and TV-to-movie/crossover universes in canon chronological watch order, so you don't have to research the "correct" order yourself.</p>
+
+    <p><strong>Filter categories:</strong> All Sagas, Movie Sagas (3+ Films), TV Universes &amp; Bridges, Sci-Fi &amp; Fantasy, Action &amp; Crime, Animation &amp; Anime.</p>
+
+    <p>Coverage includes large connected universes such as the Arrowverse, Grey's Anatomy/Station 19, the Law &amp; Order franchise, the FBI franchise, the One Chicago shows, the Cobra Kai/Miyagi-verse, and Downton Abbey, tracked at episode-accurate granularity.</p>
+
+    <div class="tip-box">
+      <strong>Two ways to use a saga:</strong> Add it directly to your Catalogs as a normal ordered row, or launch it as a continuous 24/7 channel with one click, using the same engine described above.
+    </div>
+  </section>
+
+  <!-- 7. Search -->
+  <section class="guide-block" id="search">
+    <div class="block-header">
+      <div class="block-icon">7</div>
+      <div>
+        <h2>7. Search Tab</h2>
+        <p style="margin-bottom:0;">A unified search across movies, shows, and lists.</p>
+      </div>
+    </div>
+
+    <ol>
+      <li>Type a title or list name into the search box.</li>
+      <li>Filter by type using the <strong>Movies / Shows / Lists</strong> pills.</li>
+      <li>Refine with <strong>Genre</strong>, <strong>Year</strong>, and <strong>Rating</strong> dropdowns.</li>
+      <li>Click <strong>Reset</strong> to clear filters.</li>
+    </ol>
+    <p>Results show a <strong>+ Add</strong> button on each poster to add it directly to a Custom List or the channel/catalog builder you launched Search from.</p>
+  </section>
+
+  <!-- 8. Importing -->
+  <section class="guide-block" id="importing">
+    <div class="block-header">
+      <div class="block-icon">8</div>
+      <div>
+        <h2>8. Importing Lists &amp; Data From Other Sites</h2>
+        <p style="margin-bottom:0;">Two kinds of import: a single list by URL, and bulk files from other trackers.</p>
+      </div>
+    </div>
+
+    <h3>Importing a single list by URL</h3>
+    <p>Available in the <strong>Lists tab &rarr; Import</strong> submenu (clones into a Custom List), <strong>Channels tab &rarr; Import</strong> submenu (clones into a Channel, shows only), or directly via <strong>Catalogs tab &rarr; + New Catalog</strong>.</p>
+    <ol>
+      <li>Copy the list's URL from MDBList (<code>mdblist.com/lists/username/list-name</code>), Trakt (<code>trakt.tv/users/username/lists/list-slug</code>), or TMDB (<code>themoviedb.org/list/12345</code>).</li>
+      <li>Paste it into the Import box and give it a name, or let it auto-detect one.</li>
+      <li>Optional: check <strong>"Keep custom list synced with external link"</strong> so your copy periodically refreshes to match the source.</li>
+      <li>Click <strong>Import list</strong> (or <strong>Import channel</strong>).</li>
+    </ol>
+
+    <h3>Bulk file import (CSV/JSON from other trackers)</h3>
+    <p>Go to <strong>Settings &rarr; External Accounts &amp; API Keys &rarr; Import List</strong>. Supported source formats: <strong>IMDb, Letterboxd, MovieLens, Trakt, Simkl, and TMDB</strong> exports, in CSV or JSON. You can select multiple files at once.</p>
+    <ol>
+      <li>Export your ratings/watchlist/history file from the other service (each site has its own "export my data" feature).</li>
+      <li>Set <strong>Source</strong> to the matching provider, or leave it on <strong>Auto-detect</strong>.</li>
+      <li>Choose <strong>Import to which list?</strong> &mdash; an existing list, or type a <strong>New List Name</strong>.</li>
+      <li>Optionally check <strong>"Also add watched items to Watch History"</strong>.</li>
+      <li>Click <strong>Select file(s)</strong>, choose your export file(s), then click <strong>Import</strong>.</li>
+    </ol>
+
+    <div class="tip-box">
+      <strong>Have a pile of list links instead?</strong> Use <strong>Catalogs &rarr; Bulk Add</strong> to paste one URL per line and add them all as catalogs at once.
+    </div>
+  </section>
+
+  <!-- 9. Settings -->
+  <section class="guide-block" id="settings">
+    <div class="block-header">
+      <div class="block-icon">9</div>
+      <div>
+        <h2>9. Settings Tab</h2>
+        <p style="margin-bottom:0;">Connected accounts, region, watch history, and support.</p>
+      </div>
+    </div>
+
+    <p>Four submenus: <strong>Account &amp; Sync</strong>, <strong>External Accounts &amp; API Keys</strong>, <strong>Presets &amp; Backup</strong>, <strong>Feedback and Support</strong>.</p>
+
+    <h3>Account &amp; Sync</h3>
+    <ul>
+      <li><strong>Watchlist Preferences</strong> &mdash; controls how watched titles are handled in your Watchlist.</li>
+      <li><strong>Hidden Lists</strong> &mdash; hide specific lists from My Lists, Airing Next, and Simkl Airing Next without un-tracking them; they keep updating and can be un-hidden anytime.</li>
+      <li><strong>Region</strong> &mdash; sets your country for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings.</li>
+      <li><strong>Trending &amp; Popular Catalogs</strong> &mdash; toggle "Hide items with no digital release" to skip still-in-theaters movies from Trending/Popular rows. Requires Save/Update to take effect.</li>
+      <li><strong>Watch History</strong> &mdash; clear/reset all recorded history.</li>
+      <li><strong>Auto-Track &amp; Media Server Scrobbling</strong> &mdash; automatically records watched movies/episodes from your streaming apps and home media servers (Plex, Jellyfin, Emby) into Watch History and Continue Watching.</li>
+    </ul>
+
+    <h3>External Accounts &amp; API Keys</h3>
+    <p>Connect MDBList, Trakt, TMDB, and Simkl. Each provider offers <strong>Connect Account</strong> (OAuth/PIN flow &mdash; for Trakt, enter a code at <code>trakt.tv/activate</code>, your password is never entered here), <strong>Disconnect</strong>, <strong>Sync Watch History</strong> (push watched items back to that provider), and an advanced custom API key/Client ID field:</p>
+    <ul>
+      <li>TMDB key: <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">themoviedb.org/settings/api</a></li>
+      <li>Trakt Client ID: <a href="https://trakt.tv/oauth/applications" target="_blank" rel="noopener">trakt.tv/oauth/applications</a></li>
+      <li>MDBList key: <a href="https://mdblist.com/preferences" target="_blank" rel="noopener">mdblist.com/preferences</a></li>
+      <li>Simkl Client ID: <a href="https://simkl.com/settings/developer/" target="_blank" rel="noopener">simkl.com/settings/developer/</a></li>
+    </ul>
+    <p>You only need any of this for private lists, personal watchlists/history, or your own dedicated rate limit &mdash; public lists and charts work with zero setup.</p>
+
+    <h3>Feedback and Support</h3>
+    <p>A built-in chat with the developer &mdash; pick a category (Bug Report, Improvement/Feature Request, Idea/Suggestion, General Question), write your message, and send. Use <strong>&#8635; Refresh</strong> to check for a reply.</p>
+  </section>
+
+  <!-- 10. Backups & Presets -->
+  <section class="guide-block" id="backups">
+    <div class="block-header">
+      <div class="block-icon">10</div>
+      <div>
+        <h2>10. Backups, Presets &amp; Data Export</h2>
+        <p style="margin-bottom:0;">Found under Settings &rarr; Presets &amp; Backup.</p>
+      </div>
+    </div>
+
+    <h3>Presets</h3>
+    <p>Save your entire current setup as a named preset to switch back to later, or download it as a file. Ideal for maintaining a few different "profiles" &mdash; e.g. a Kids setup vs. your main one.</p>
+    <ul>
+      <li><strong>Save preset</strong> &mdash; names and stores your current configuration.</li>
+      <li><strong>Upload preset file</strong> &mdash; restores a previously downloaded preset.</li>
+    </ul>
+
+    <h3>Backup &amp; Restore</h3>
+    <ul>
+      <li><strong>Export current</strong> &mdash; downloads your full setup as JSON.</li>
+      <li><strong>Import JSON &rarr; Upload file</strong> &mdash; restores from a downloaded backup.</li>
+      <li><strong>Import from Install/Configure Link</strong> &mdash; paste an existing install link (yours or shared with you) and click <strong>Import link</strong> to pull in that whole configuration.</li>
+    </ul>
+
+    <h3>Export Lists &amp; History</h3>
+    <p>Pulls your data <strong>out</strong> to portable formats for other apps:</p>
+    <ul>
+      <li><strong>Watch History</strong> &mdash; all watched movies, shows, and episodes with timestamps, as <strong>CSV (Trakt/Simkl)</strong>, <strong>CSV (Letterboxd)</strong>, or <strong>Universal CSV</strong>.</li>
+      <li><strong>All Custom Lists &amp; Watchlist</strong> &mdash; every list plus watchlist and continue-watching items, as <strong>Export All (CSV)</strong> or <strong>Full Library (JSON)</strong>.</li>
+    </ul>
+  </section>
+
+  <!-- 11. Self-Hosting Guide -->
+  <section class="guide-block" id="self-hosting">
+    <div class="block-header">
+      <div class="block-icon">11</div>
+      <div>
+        <h2>11. Self-Hosting on Cloudflare Workers</h2>
+        <p style="margin-bottom:0;">Deploy your own dedicated instance in about five minutes on Cloudflare's free tier.</p>
+      </div>
+    </div>
+
+    <p>Prefer a dedicated instance instead of the shared hosted one at <a href="${origin}/">mylistsaddon.com</a>? The full source is open on GitHub at <a href="https://github.com/Br0ck25/My-Lists" target="_blank" rel="noopener">github.com/Br0ck25/My-Lists</a> &mdash; deploy it to your own free Cloudflare account and it's entirely yours from then on.</p>
+
+    <div class="steps-container">
+      <div class="step-card">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h4>Create a Worker</h4>
+          <p>In the Cloudflare Dashboard, go to <strong>Workers &amp; Pages &rarr; Create &rarr; Create Worker</strong>, give it any name, and deploy the default template.</p>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h4>Paste the Code</h4>
+          <p>Open the Worker, click <strong>Edit code</strong>, delete the placeholder, paste in the full contents of <code>worker_entry_combined.js</code> from the <a href="https://github.com/Br0ck25/My-Lists" target="_blank" rel="noopener">GitHub repository</a>, and click <strong>Deploy</strong>.</p>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <h4>Open Your Worker's URL</h4>
+          <p>Your Worker now has a URL like <code>your-worker-name.your-subdomain.workers.dev</code> &mdash; open it to start building your catalog.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="tip-box">
+      <strong>Redeployed but nothing changed?</strong> Your install link is a snapshot of your configuration at the moment you generated it. Redeploying Worker code alone doesn't update an addon you've already installed &mdash; click <strong>Update Link</strong> on the Catalogs tab and reinstall.
+    </div>
+  </section>
+
+  <!-- 12. FAQ -->
+  <section class="guide-block" id="faq">
+    <div class="block-header">
+      <div class="block-icon">12</div>
+      <div>
+        <h2>12. Frequently Asked Questions</h2>
+        <p style="margin-bottom:0;">Quick answers to common questions and troubleshooting.</p>
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Is My Lists Addon completely free?</div>
+      <div class="faq-a">Yes! It runs on your own free Cloudflare Workers account, which comfortably covers normal personal use at no cost. There's no subscription, no ads, and no paid tier. Optional support is available via Buy Me a Coffee.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Do I need to sign up or create an account?</div>
+      <div class="faq-a">No. Your configuration is encoded directly into your install link, so you can build a catalog and install it in Stremio, Wako, Nuvio, or any other app built on the Stremio addon protocol with zero signup. An optional free Profile exists if you want your lists and watch history synced across multiple devices.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Do I need API keys from MDBList, Trakt, TMDB, or Simkl?</div>
+      <div class="faq-a">Not for public lists. You only need your own personal key for private lists, personal watchlists, or if you want your own dedicated rate limit instead of the shared one.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">How do I reorder catalogs on my home screen?</div>
+      <div class="faq-a">On the Catalogs tab, click <strong>Edit</strong> in the Live Preview &amp; Editor and drag rows into the order you want, then click <strong>Generate Install Link</strong> (or <strong>Update Link</strong>) and reinstall to apply it.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">I changed my catalogs but nothing updated on my home screen &mdash; why?</div>
+      <div class="faq-a">Your install link encodes your configuration at the time it was generated. Go to Catalogs and click <strong>Update Link</strong>, then reinstall using the new link. If you self-host, note that redeploying the Worker code alone doesn't update an addon you've already installed &mdash; you still need to update and reinstall the link.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">What's the difference between a Catalog, a List, and a Channel?</div>
+      <div class="faq-a">A <strong>Catalog</strong> is a row on your home screen in Stremio, Wako, Nuvio, or any other app built on the Stremio addon protocol &mdash; the end result. A <strong>List</strong> is a named, editable collection of titles that becomes a catalog row once added. A <strong>Channel</strong> is a special catalog that plays episodes continuously like a live TV network.</div>
+    </div>
+  </section>
+
+  <!-- Footer CTA -->
+  <div class="footer-cta">
+    <h3>Ready to Customize Your Home Screen?</h3>
+    <p>Build your dream Stremio, Wako, and Nuvio catalog setup in under a minute with zero account required.</p>
+    <a href="${origin}/" class="btn btn-primary" style="font-size:1.05rem; padding:12px 28px;">Go to mylistsaddon.com &rarr;</a>
+  </div>
+
+  <!-- Footer Navigation -->
+  <footer class="footer-nav">
+    <p>&copy; ${new Date().getFullYear()} ${ADDON_NAME} &bull; <a href="${origin}/">Web App</a> &bull; <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener">Support on Buy Me a Coffee</a></p>
   </footer>
 </div>
+
 </body>
 </html>`;
 }
@@ -38226,9 +44822,13 @@ async function handleFetch(request, env, ctx) {
 
     if (path === "/" || path === "") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
+      // Memoized per origin and answered with a 304 when the browser
+      // already holds this exact build -- see htmlPageResponse and
+      // renderBuilderCached (02_http-and-creator-utils.js). Previously this
+      // rebuilt and resent ~1.6MB on every navigation, with no validator at
+      // all, which also left the browser free to heuristically cache a copy
+      // it had no way to check.
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // add-on icon, served straight from this Worker
@@ -38266,18 +44866,145 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
+    if (path === "/api/poster-badge") {
+      const posterUrl = url.searchParams.get("poster") || "";
+      const rawAirDate = url.searchParams.get("airDate") || "";
+      const isAired = rawAirDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawAirDate);
+      const airDate = !isAired ? rawAirDate : "";
+      const isPremiere = !isAired && url.searchParams.get("premiere") === "1";
+      const isFinale = !isAired && url.searchParams.get("finale") === "1";
+      const rawFinaleDate = url.searchParams.get("finaleDate") || "";
+      const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
+      const finaleDate = !isFinaleAired ? rawFinaleDate : "";
+
+      if (!posterUrl) {
+        return new Response(null, { status: 404 });
+      }
+
+      // If no badges are requested or all dates have aired, redirect straight to the original poster
+      if (!airDate && !isPremiere && !isFinale && !finaleDate) {
+        return Response.redirect(posterUrl, 302);
+      }
+
+      let embeddedPosterDataUri = "";
+      try {
+        const imgRes = await fetch(posterUrl, {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        if (imgRes.ok) {
+          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+          const buffer = await imgRes.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = "";
+          const len = bytes.byteLength;
+          for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const base64 = btoa(binary);
+          embeddedPosterDataUri = `data:${contentType};base64,${base64}`;
+        }
+      } catch (e) {}
+
+      if (!embeddedPosterDataUri) {
+        // Fallback: If fetching/inlining image fails, redirect to original untouched poster
+        return Response.redirect(posterUrl, 302);
+      }
+
+      // Format air date tag text (e.g. WED, SEP 16)
+      let airDateText = "";
+      if (airDate && typeof formatAirDateBadge === "function") {
+        airDateText = formatAirDateBadge(airDate);
+      } else if (airDate) {
+        try {
+          const d = new Date(airDate + "T00:00:00Z");
+          const m = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" }).toUpperCase();
+          const day = d.getUTCDate();
+          airDateText = `${m} ${day}`;
+        } catch (e) {
+          airDateText = airDate;
+        }
+      }
+
+      // Format bottom badge text
+      let bottomText = "";
+      let bottomBg = "#30d158"; // Green for premiere
+      let bottomBorder = "rgba(48, 209, 88, 0.4)";
+      let bottomColor = "#ffffff";
+
+      if (isPremiere) {
+        bottomText = "Season Premiere";
+        bottomBg = "#28a745";
+        bottomBorder = "rgba(40, 167, 69, 0.6)";
+        bottomColor = "#ffffff";
+      } else if (isFinale) {
+        bottomText = "Season Finale";
+        bottomBg = "#ff9500";
+        bottomBorder = "rgba(255, 149, 0, 0.7)";
+        bottomColor = "#ffffff";
+      } else if (finaleDate) {
+        let fText = "";
+        if (typeof formatAirDateBadge === "function") {
+          fText = formatAirDateBadge(finaleDate);
+        } else {
+          try {
+            const d = new Date(finaleDate + "T00:00:00Z");
+            const m = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+            const day = d.getUTCDate();
+            fText = `${m} ${day}`;
+          } catch (e) {
+            fText = finaleDate;
+          }
+        }
+        bottomText = fText ? `Finale: ${fText}` : "Season Finale";
+        bottomBg = "rgba(18, 18, 24, 0.94)";
+        bottomBorder = "rgba(255, 159, 10, 0.75)";
+        bottomColor = "#ffd166";
+      }
+
+      const svg = generateBadgedPosterSvg({
+        posterUrl: embeddedPosterDataUri,
+        airDateText,
+        bottomText,
+        bottomBg,
+        bottomBorder,
+        bottomColor,
+      });
+
+      return new Response(svg, {
+        headers: {
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // /:config/configure  -> opened by wako itself when the user taps
     // "Configure" on the already-installed add-on
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
+      // The one page that still sends no-store (it renders the person's own
+      // API keys -- see the note on the headers below), but it should not
+      // also be re-sending the 1.3MB client bundle every time. The split
+      // separates the two concerns exactly: the small page that carries the
+      // keys stays uncacheable, while the bundle it references is the same
+      // shared, immutable /app.js everyone else already has.
       return new Response(
-        renderBuilder(url.origin, {
+        await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
           initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
           isConfigureMode: true,
-        }),
+        })),
+        // The one builder page that deliberately keeps no-store rather than
+        // moving to an ETag like the rest: this variant renders the user's
+        // own API keys (TMDB/MDBList/Trakt) straight into the HTML, and
+        // no-store is what keeps that out of the browser's on-disk cache
+        // and out of any intermediary. Saving a round trip is not worth
+        // writing somebody's keys to disk.
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
     }
@@ -38285,9 +45012,9 @@ async function handleFetch(request, env, ctx) {
     // bare /configure (no config yet) -> same builder, empty/default state
     if (path === "/configure") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
-        renderBuilder(url.origin, { isConfigureMode: true }),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        renderBuilderCached(url.origin, { isConfigureMode: true })
       );
     }
 
@@ -38361,9 +45088,9 @@ async function handleFetch(request, env, ctx) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
       const title = isShow ? "Recommended Shows" : "Recommended Movies";
-      return new Response(
-        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } }),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } })
       );
     }
 
@@ -38373,15 +45100,17 @@ async function handleFetch(request, env, ctx) {
       let chart = resolveChartSlug(m[1]);
       if (!chart) {
         const slugLower = m[1].toLowerCase();
-        if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching" };
-        if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history" };
-        if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist" };
-        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
-        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
+        if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching", type: "series" };
+        if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history", type: "movie" };
+        if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist", type: "mixed" };
+        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies", type: "movie" };
+        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows", type: "series" };
       }
-      return new Response(
-        renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: (chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie", url: chart.movieUrl } } : {}),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        chart
+          ? renderBuilder(url.origin, { deepLinkList: { name: chart.name, type: chart.type || ((chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie"), url: chart.movieUrl } })
+          : renderBuilderCached(url.origin, {})
       );
     }
 
@@ -38389,17 +45118,13 @@ async function handleFetch(request, env, ctx) {
     // Note: Creator/user public lists (/lists/:user/:slug) and .json endpoints pass through to creator routes.
     if (path.startsWith("/lists/") && !path.endsWith(".json") && (path.startsWith("/lists/mdblist/") || path.startsWith("/lists/trakt/") || path.startsWith("/lists/tmdb/") || path.startsWith("/lists/simkl/") || path.startsWith("/lists/custom/") || path.startsWith("/lists/curated/"))) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
-      });
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // Browser navigation for channels (/channels/:slug)
     if (path.startsWith("/channels/")) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
-      });
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // /:config/manifest.json
@@ -38526,13 +45251,106 @@ Sitemap: ${url.origin}/sitemap.xml`;
       });
     }
 
+    // /app.js?v=<hash> -> the client bundle lifted out of the builder page.
+    // See splitAppBundle (02_http-and-creator-utils.js) for what is in it
+    // and why it can be shared. The URL is content-hashed, so it is safe to
+    // tell the browser to keep it forever: a deploy that changes the bundle
+    // changes the hash, which changes the src in the page, which changes the
+    // page's own ETag -- so nobody can be left holding a stale one.
+    // /app.css?v=<hash> -> the stylesheet lifted out of the builder page.
+    // Same content-addressed, immutable contract as /app.js below.
+    if (path === "/app.css") {
+      const sheet = await getAppCss(url.origin);
+      if (!sheet) {
+        return new Response("/* app stylesheet unavailable */", {
+          status: 503,
+          headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+      const isCurrent = (url.searchParams.get("v") || "") === sheet.hash;
+      const etag = `"${sheet.hash}"`;
+      const inm = request.headers.get("If-None-Match") || "";
+      const headers = {
+        "Content-Type": "text/css; charset=utf-8",
+        "Cache-Control": isCurrent ? "public, max-age=31536000, immutable" : "no-cache",
+        "ETag": etag,
+      };
+      if (inm.split(",").some((s) => s.trim().replace(/^W\//, "") === etag)) {
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(sheet.css, { headers });
+    }
+
+    if (path === "/app.js") {
+      const bundle = await getAppBundle(url.origin);
+      if (!bundle) {
+        // Markers missing (should be impossible -- the verification suite
+        // asserts they render). 503 rather than an empty 200, so a broken
+        // deploy is loud instead of a silently dead page.
+        return new Response("/* app bundle unavailable */", {
+          status: 503,
+          headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+      const askedFor = url.searchParams.get("v") || "";
+      // Only the hash we are actually serving may be cached immutably. A
+      // request for some older hash still gets a working bundle -- better
+      // than a broken page -- but must not be allowed to pin today's bytes
+      // under yesterday's URL forever.
+      const isCurrent = askedFor === bundle.hash;
+      const etag = `"${bundle.hash}"`;
+      const inm = request.headers.get("If-None-Match") || "";
+      const headers = {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": isCurrent ? "public, max-age=31536000, immutable" : "no-cache",
+        "ETag": etag,
+      };
+      if (inm.split(",").some((s) => s.trim().replace(/^W\//, "") === etag)) {
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(bundle.js, { headers });
+    }
+
     if (path === "/sw.js") {
+      // The previous version of this worker was a no-op that still cost
+      // something: it intercepted every request, re-issued it, and on
+      // failure fell back to caches.match() -- against a cache nothing ever
+      // wrote to, so that fallback could never hit.
+      //
+      // It now does one useful thing and nothing else. /app.js?v=<hash> is
+      // content-addressed, so cache-first is safe by construction: a bundle
+      // that changes gets a different URL, and this cache is never consulted
+      // for it. Exactly one entry is kept, so old bundles cannot accumulate
+      // after repeated deploys. Every other request is passed straight
+      // through, untouched.
       const sw = `
+const APP_CACHE = 'mylists-app-v1';
 self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
-  // simple pass-through cache, nothing fancy
-  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+  const url = new URL(e.request.url);
+  const isBundle = e.request.method === 'GET'
+    && url.origin === self.location.origin
+    && url.pathname === '/app.js'
+    && url.searchParams.get('v');
+  if (!isBundle) return; // everything else: no interception at all
+  e.respondWith((async () => {
+    try {
+      const cache = await caches.open(APP_CACHE);
+      const hit = await cache.match(e.request.url);
+      if (hit) return hit;
+      const res = await fetch(e.request);
+      if (res && res.ok) {
+        // Keep one bundle only -- a new deploy means a new URL, and the
+        // previous entry is dead weight the moment it stops being requested.
+        for (const key of await cache.keys()) await cache.delete(key);
+        await cache.put(e.request.url, res.clone());
+      }
+      return res;
+    } catch (err) {
+      return fetch(e.request);
+    }
+  })());
 });
       `;
       return new Response(sw.trim(), {
@@ -38548,7 +45366,7 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
 
@@ -38566,7 +45384,7 @@ self.addEventListener('fetch', e => {
       const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -38710,6 +45528,7 @@ self.addEventListener('fetch', e => {
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -38734,10 +45553,10 @@ self.addEventListener('fetch', e => {
       } catch (err) {
         body = { ok: false, error: String(err.message || err) };
       }
+
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });
@@ -38814,7 +45633,7 @@ self.addEventListener('fetch', e => {
         try {
           const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
           const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey);
+          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return json({ meta: null });
           return json(
             { meta },
@@ -38950,7 +45769,7 @@ self.addEventListener('fetch', e => {
         
         if (!imdbId || !seasonNum) return json({ ok: false, error: "Missing imdbId or seasonNum" }, 400);
         
-        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId);
+        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId, env, ctx);
         if (!seasonData) return json({ ok: false, error: "Not found or TMDB error" }, 404);
         
         // A short max-age (not json()'s 3600s default) -- this response's
@@ -39176,6 +45995,24 @@ self.addEventListener('fetch', e => {
               (m) => m.name && m.name.toLowerCase() === title.toLowerCase() && m.poster
             );
             resolvedPoster = (exact && exact.poster) || (metas[0] && metas[0].poster) || null;
+          }
+        } catch {}
+      }
+
+      // 4. If still no poster, query TMDB search by title
+      if (!resolvedPoster && title) {
+        try {
+          const tmdbSearch = await fetch(`https://api.themoviedb.org/3/search/${tmdbKind}?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(title)}&page=1`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 86400, cacheEverything: true }
+          });
+          if (tmdbSearch.ok) {
+            const sd = await tmdbSearch.json();
+            if (sd.results && sd.results.length > 0) {
+              const first = sd.results[0];
+              if (first.poster_path) resolvedPoster = `https://image.tmdb.org/t/p/w500${first.poster_path}`;
+              else if (first.backdrop_path) resolvedPoster = `https://image.tmdb.org/t/p/w780${first.backdrop_path}`;
+            }
           }
         } catch {}
       }
@@ -39665,6 +46502,7 @@ self.addEventListener('fetch', e => {
             seenMovieIds.add(m.id);
             recMovies.push({
               id: "tmdb:" + m.id,
+              tmdbId: String(m.id),
               name: m.title || "Movie",
               poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
               year: (m.release_date || "").slice(0, 4),
@@ -39686,6 +46524,7 @@ self.addEventListener('fetch', e => {
               seenMovieIds.add(m.id);
               recMovies.push({
                 id: "tmdb:" + m.id,
+                tmdbId: String(m.id),
                 name: m.title || "Movie",
                 poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
                 year: (m.release_date || "").slice(0, 4),
@@ -39705,6 +46544,7 @@ self.addEventListener('fetch', e => {
             seenShowIds.add(s.id);
             recShows.push({
               id: "tmdb:" + s.id,
+              tmdbId: String(s.id),
               name: s.name || "Show",
               poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
               year: (s.first_air_date || "").slice(0, 4),
@@ -39726,6 +46566,7 @@ self.addEventListener('fetch', e => {
               seenShowIds.add(s.id);
               recShows.push({
                 id: "tmdb:" + s.id,
+                tmdbId: String(s.id),
                 name: s.name || "Show",
                 poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
                 year: (s.first_air_date || "").slice(0, 4),
@@ -39737,7 +46578,15 @@ self.addEventListener('fetch', e => {
         } catch {}
       }
 
-      return json({ ok: true, movies: recMovies.slice(0, 40), shows: recShows.slice(0, 40) });
+      // CURATED_RECOMMENDATION_LIMIT, not a literal -- fetchCuratedCatalog
+      // (05_catalog-core.js) serves the catalog row for this same list and
+      // has to cut it to exactly the same length, or the Discover card and
+      // the shelf it adds disagree about how many items the list has.
+      return json({
+        ok: true,
+        movies: recMovies.slice(0, CURATED_RECOMMENDATION_LIMIT),
+        shows: recShows.slice(0, CURATED_RECOMMENDATION_LIMIT),
+      });
     }
 
     // /api/tmdb-search-lists?q=...[&tmdbKey=...]
@@ -39750,6 +46599,7 @@ self.addEventListener('fetch', e => {
       if (!q || !tmdbKey) {
         return json({ ok: true, lists: [] });
       }
+
       try {
         if (!tmdbKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const qLower = q.toLowerCase();
@@ -39833,19 +46683,26 @@ self.addEventListener('fetch', e => {
           { name: "War Shows", url: "tmdb:genre:war", type: "series", tags: ["war", "military", "genre", "newest", "shows", "tv", "tmdb"] },
           { name: "Western Movies", url: "tmdb:genre:western", type: "movie", tags: ["western", "cowboy", "genre", "newest", "tmdb"] },
           { name: "Western Shows", url: "tmdb:genre:western", type: "series", tags: ["western", "cowboy", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Simkl Anime Trending", url: "simkl:anime:trending", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "trending", "animation", "japanese", "otaku", "charts"] },
+          { name: "Simkl Top 50 Anime", url: "simkl:anime:top", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "top", "best", "popular", "animation", "charts"] },
+          { name: "Simkl Airing Anime", url: "simkl:anime:airing", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "airing", "new", "season", "charts"] },
+          { name: "Simkl Trending Shows", url: "simkl:shows:trending", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "shows", "trending", "tv", "popular", "charts"] },
+          { name: "Simkl Trending Movies", url: "simkl:movies:trending", type: "movie", source: "Simkl", user: "Simkl Official", tags: ["simkl", "movies", "trending", "popular", "charts"] },
         ];
 
         for (const chart of builtinTmdbCharts) {
           const matchName = chart.name.toLowerCase().includes(qLower);
           const matchTag = chart.tags.some((t) => t.includes(qLower) || qLower.includes(t));
-          if (matchName || matchTag) {
+          const matchUser = chart.user && chart.user.toLowerCase().includes(qLower);
+          if (matchName || matchTag || matchUser) {
             results.push({
               name: chart.name,
-              user: "TMDB Official",
+              user: chart.user || "TMDB Official",
               url: chart.url,
               type: chart.type,
               items: "Chart",
               likes: 0,
+              source: chart.source || "TMDB",
             });
           }
         }
@@ -39863,11 +46720,9 @@ self.addEventListener('fetch', e => {
     if (path === "/api/trakt-search") {
       const q = url.searchParams.get("q") || "";
       const traktKey = url.searchParams.get("traktKey") || "";
+
       try {
         const lists = await searchTraktLists(q, traktKey);
-        // Always the shared key when traktKey wasn't supplied -- 1 search
-        // call plus 1 classify call per result (searchTraktLists's own
-        // internal mapWithConcurrency over the results it just got back).
         if (!traktKey) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + lists.length));
         return json({ ok: true, lists });
       } catch (err) {
@@ -42219,8 +49074,12 @@ self.addEventListener('fetch', e => {
 
         const result = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
+          kvKey: cacheKey,
+          env,
+          ctx,
           freshTtlSec: 60,
           staleTtlSec: 1800,
+          kvTtlSec: 1800,
           providerLabel: "Trakt Private Lists",
           fetchFn: async () => {
             const res = await fetchTraktWithRetry("https://api.trakt.tv/users/me/lists", {
@@ -42426,8 +49285,12 @@ self.addEventListener('fetch', e => {
 
         const historyResult = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
+          kvKey: cacheKey,
+          env,
+          ctx,
           freshTtlSec: 60,
           staleTtlSec: 1800,
+          kvTtlSec: 1800,
           providerLabel: "Trakt History Raw",
           fetchFn: async () => {
             ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
@@ -43062,11 +49925,40 @@ self.addEventListener('fetch', e => {
     // does.
     if (path === "/api/resolve") {
       const config = url.searchParams.get("config") || "";
+      const rawUrl = url.searchParams.get("url") || "";
       if (!config) return json({ ok: false, error: "Missing config." }, 400);
       try {
-        const { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken } = await resolveConfig(config, env);
-        if (!entries.length) return json({ ok: false, error: "That link has no lists in it." });
-        return json({ ok: true, entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken });
+        let resData = await resolveConfig(config, env);
+        let { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, watchHistory, continueWatching, watchlist, airingNext } = resData;
+        if (!entries || !entries.length) {
+          if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+            try {
+              const u = new URL(rawUrl);
+              const remoteResolveUrl = `${u.origin}/api/resolve?config=${encodeURIComponent(config)}`;
+              const remoteRes = await fetch(remoteResolveUrl);
+              if (remoteRes.ok) {
+                const remoteData = await remoteRes.json();
+                if (remoteData && remoteData.ok && Array.isArray(remoteData.entries) && remoteData.entries.length) {
+                  return json(remoteData);
+                }
+              }
+            } catch {}
+          }
+        }
+        if (!entries || !entries.length) return json({ ok: false, error: "That link has no lists in it." });
+        return json({
+          ok: true,
+          entries,
+          watchHistory: watchHistory || [],
+          continueWatching: continueWatching || [],
+          watchlist: watchlist || [],
+          airingNext: airingNext || [],
+          mdblistKey,
+          mdblistAccessToken,
+          traktKey,
+          traktUsername,
+          traktAccessToken
+        });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -43152,6 +50044,21 @@ self.addEventListener('fetch', e => {
       const likeSlug = String(likeBody.slug || "").toLowerCase().trim();
       const likeUnlike = likeBody.action === "unlike";
       if (!likeUser || !likeSlug) return json({ ok: false, error: "Missing list reference." }, 400);
+      
+      if (env.DB) {
+        try {
+          const listId = `${likeUser}:${likeSlug}`;
+          const increment = likeUnlike ? -1 : 1;
+          const { success, results } = await env.DB.prepare(
+            "UPDATE creator_lists SET likes = MAX(0, likes + ?) WHERE id = ? RETURNING likes"
+          ).bind(increment, listId).run();
+          
+          if (success && results.length > 0) {
+            return json({ ok: true, likes: results[0].likes });
+          }
+        } catch (dbErr) {}
+      }
+
       const likeCreatorKey = "creatorlist:" + likeUser + ":" + likeSlug;
       const likeAnonKey = "publishedlist:" + likeUser + ":" + likeSlug;
       let likeKey = null;
@@ -43195,6 +50102,72 @@ self.addEventListener('fetch', e => {
     }
 
 
+    // /api/details/batch  (POST)  { ids: [...], type?, tmdbKey?, region?, fresh? }
+    //   -> { ok, results: { <id>: details | null } }
+    // The plural sibling of /api/details below, for callers that already
+    // know they need many shows at once. Airing Next is the one that
+    // matters (refreshAiringNext, 21_client-custom-list-builder.js): it
+    // walks up to 60 shows per refresh, and was doing so as 60 separate
+    // round trips at a concurrency of 4 -- so fifteen sequential waves of
+    // request latency before the shelf could be rebuilt, per browser, per
+    // refresh.
+    //
+    // This is not a way to make MORE upstream calls in one go. Each id
+    // still goes through fetchTmdbItemDetails, which means the shared
+    // memory/KV/edge cache and, as of the same change, in-flight
+    // coalescing -- so ids already known cost nothing, ids being fetched
+    // concurrently by another request are joined rather than duplicated,
+    // and only genuine misses reach TMDB. The batch simply removes the
+    // round trips.
+    //
+    // Capped at 60 ids to bound the worst case for a single request, and
+    // resolved with a small worker pool rather than one Promise.all over
+    // every id, so a large batch of genuine misses cannot open sixty
+    // simultaneous TMDB connections. A failed id resolves to null rather
+    // than failing the batch -- the caller simply retries it next refresh,
+    // exactly as it did when each id was its own request.
+    if (path === "/api/details/batch" && request.method === "POST") {
+      let reqBody;
+      try {
+        reqBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawIds = Array.isArray(reqBody.ids) ? reqBody.ids : [];
+      // De-duplicated up front: the same show can legitimately appear under
+      // both an imdb and a tmdb-prefixed id in a Watch History, and there is
+      // no reason to resolve it twice.
+      const ids = [...new Set(rawIds.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 60);
+      if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
+
+      const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
+      if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+      const wantType = reqBody.type || "";
+      const region = reqBody.region || "";
+      const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true;
+
+      const results = {};
+      let cursor = 0;
+      async function worker() {
+        while (cursor < ids.length) {
+          const id = ids[cursor++];
+          try {
+            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx);
+          } catch {
+            results[id] = null;
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(6, ids.length) }, () => worker())
+      );
+
+      // Same short max-age as /api/details for the same reason -- this
+      // response's shape changes occasionally and an hour-old copy would
+      // strand anyone who had just opened it.
+      return json({ ok: true, results }, 200, { "Cache-Control": "max-age=60" });
+    }
+
     // /api/details (GET or POST) -> { ok: true, details: { title, overview, rating, releaseYear, poster, background } }
     if (path === "/api/details") {
       let reqBody;
@@ -43215,7 +50188,7 @@ self.addEventListener('fetch', e => {
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       
       const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true || (url && url.searchParams.get("fresh") === "1");
-      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region, isFreshReq);
+      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region, isFreshReq, env, ctx);
       if (!details) return json({ ok: false, error: "Not found or TMDB error" }, 404);
       
       // Short max-age -- same reasoning as /api/season's own comment: this
@@ -43241,7 +50214,7 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return { ok: false, error: "no-kv" };
       const v = validateCreatorUsername(creatorNameRaw);
       if (!v.ok) return { ok: false, error: "Username or Key is incorrect." };
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return { ok: false, error: "Username or Key is incorrect." };
       let profile;
       try {
@@ -43249,7 +50222,12 @@ self.addEventListener('fetch', e => {
       } catch {
         return { ok: false, error: "Username or Key is incorrect." };
       }
-      const valid = await verifyCreatorKey(creatorKey || "", profile.keyHash);
+      // Memoized only after a successful PBKDF2 verification, in this
+      // isolate's memory, for a few minutes -- see
+      // verifyCreatorKeyMemoized (02_http-and-creator-utils.js) for why
+      // that is not a weakening of the check. A wrong key still costs a
+      // full PBKDF2 run every single time.
+      const valid = await verifyCreatorKeyMemoized(creatorKey || "", profile.keyHash, v.normalized);
       if (!valid) return { ok: false, error: "Username or Key is incorrect." };
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
@@ -43341,7 +50319,7 @@ self.addEventListener('fetch', e => {
         await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
           lastPingAt: Date.now(),
           lastPingId: pingId,
-          matched: "error: this install's Creator Profile credentials no longer authenticate -- re-generate the install link from Settings.",
+          matched: "error: this install's Profile credentials no longer authenticate -- re-generate the install link from Settings.",
         }));
         return;
       }
@@ -43404,7 +50382,7 @@ self.addEventListener('fetch', e => {
           if (season == null || episode == null || !Number.isFinite(season) || !Number.isFinite(episode)) {
             matched = "no (unrecognized episode id format)";
           } else {
-            const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey);
+            const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey, null, env, ctx);
             let ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
             if (!ep && seasonData && Array.isArray(seasonData.episodes) && seasonData.episodes.length > 0) {
               ep = seasonData.episodes[episode - 1] || seasonData.episodes[0];
@@ -43412,7 +50390,7 @@ self.addEventListener('fetch', e => {
             if (!ep) {
               matched = "no (could not look up this episode on TMDB)";
             } else {
-              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series", "", false, env, ctx).catch(() => null);
               const showGenres = (showDetails && showDetails.genres) || [];
               const showYear = (showDetails && (showDetails.releaseYear || showDetails.year || (showDetails.releaseDate && showDetails.releaseDate.slice(0, 4)))) || null;
               ctx.waitUntil(recordPlaybackTelemetry(env, "episode", showGenres, showYear));
@@ -43427,7 +50405,7 @@ self.addEventListener('fetch', e => {
                   id: epIdStr,
                   type: "episode",
                   name: ep.name || ("Episode " + episode),
-                  poster: ep.still_path || (showDetails && showDetails.poster) || "",
+                  poster: ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : "https://image.tmdb.org/t/p/w500" + ep.still_path) : ((showDetails && showDetails.poster) || ""),
                   showId: imdbId,
                   showTitle: (showDetails && showDetails.title) || "",
                   showPoster: (showDetails && showDetails.poster) || "",
@@ -43438,7 +50416,7 @@ self.addEventListener('fetch', e => {
             }
           }
         } else if (stremioType === "movie") {
-          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie", "", false, env, ctx).catch(() => null);
           const movieGenres = (details && details.genres) || [];
           const movieYear = (details && (details.releaseYear || details.year || (details.releaseDate && details.releaseDate.slice(0, 4)))) || null;
           ctx.waitUntil(recordPlaybackTelemetry(env, "movie", movieGenres, movieYear));
@@ -43498,27 +50476,30 @@ self.addEventListener('fetch', e => {
 
             if (recordEpisode) {
               const { epIdStr, episodeEntry } = recordEpisode;
-              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
-              if (!alreadyWatched) {
-                blob.watchHistory.unshift(episodeEntry);
-              }
+              blob.watchHistory = blob.watchHistory.filter((it) => !(String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode)));
+              blob.watchHistory.unshift({ ...episodeEntry, watchedAt: Date.now() });
               // Recompute this show's Continue Watching the same way the
               // cron does (checkForNewEpisodes, 07_source-fetchers-tmdb-
               // simkl.js) -- if this ping's episode happens to be the
               // latest watched one, this naturally finds and queues
               // whatever airs next.
+              const oldCwItems = blob.continueWatching.filter((it) => it.showId === imdbId);
               blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== imdbId);
               const watchedEps = blob.watchHistory.filter((it) => it.type === "episode" && it.showId === imdbId && it.seasonNum != null && it.episodeNum != null);
               if (watchedEps.length) {
                 const latest = watchedEps.reduce((best, e) => {
-                  if (e.seasonNum > best.seasonNum) return e;
-                  if (e.seasonNum === best.seasonNum && e.episodeNum > best.episodeNum) return e;
+                  const eS = Number(e.seasonNum);
+                  const eE = Number(e.episodeNum);
+                  const bS = Number(best.seasonNum);
+                  const bE = Number(best.episodeNum);
+                  if (eS > bS) return e;
+                  if (eS === bS && eE > bE) return e;
                   return best;
                 }, watchedEps[0]);
                 const dismissed = blob.dismissedContinueWatching[imdbId];
                 const stillDismissed = !!(dismissed && dismissed.seasonNum === latest.seasonNum && dismissed.episodeNum === latest.episodeNum);
                 if (!stillDismissed) {
-                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey).catch(() => null);
+                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey, env).catch(() => null);
                   if (next) {
                     blob.continueWatching.unshift({
                       id: String(next.episode.id),
@@ -43535,16 +50516,22 @@ self.addEventListener('fetch', e => {
                     });
                     blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
                   } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
-                    blob.fullyWatchedShowIds.push(imdbId);
+                    // TMDB either had no next episode (show is finished) OR the fetch failed (rate limit/timeout).
+                    // If it was a network failure, we don't want to completely lose the show from Continue Watching,
+                    // so we restore the old state just in case. If it truly is finished, it will stay in the old state
+                    // (which is fine, the user can manually dismiss it) or they will naturally fall off.
+                    if (oldCwItems && oldCwItems.length > 0) {
+                      blob.continueWatching = [...oldCwItems, ...blob.continueWatching];
+                    } else {
+                      blob.fullyWatchedShowIds.push(imdbId);
+                    }
                   }
                 }
               }
             } else if (recordMovie) {
               const { movieId, movieEntry } = recordMovie;
-              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === movieId);
-              if (!alreadyWatched) {
-                blob.watchHistory.unshift(movieEntry);
-              }
+              blob.watchHistory = blob.watchHistory.filter((it) => String(it.id) !== movieId);
+              blob.watchHistory.unshift({ ...movieEntry, watchedAt: Date.now() });
             }
 
             if (blob.watchlist.length) {
@@ -43563,6 +50550,49 @@ self.addEventListener('fetch', e => {
               continue;
             }
             await env.CONFIGS.put(syncKey, serializedBlob);
+
+            // Also write a tiny dedicated scrobble-queue key.
+            // Cloudflare KV is eventually consistent -- a write from one edge
+            // location (where Nuvio's request lands) can take up to 60 seconds
+            // to be readable from another edge (where the browser's save-tracking
+            // or load request lands). By writing the just-scrobbled items to a
+            // second, separate small key, save-tracking and load can always merge
+            // from it as an independent read that's unaffected by the big blob's
+            // propagation lag. Keep only the most recent 20 items to stay tiny.
+            try {
+              const queueKey = `creatorscrobblequeue:${auth.username}`;
+              const queueRaw = await env.CONFIGS.get(queueKey);
+              let qObj = { watchHistory: [], continueWatching: [] };
+              if (queueRaw) {
+                try {
+                  const parsed = JSON.parse(queueRaw);
+                  if (Array.isArray(parsed)) {
+                    qObj.watchHistory = parsed;
+                  } else if (parsed && typeof parsed === "object") {
+                    qObj.watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+                    qObj.continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+                  }
+                } catch {}
+              }
+              if (recordEpisode) {
+                const { epIdStr, episodeEntry } = recordEpisode;
+                qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== epIdStr);
+                qObj.watchHistory.unshift({ ...episodeEntry, watchedAt: Date.now() });
+              } else if (recordMovie) {
+                const { movieId, movieEntry } = recordMovie;
+                qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== movieId);
+                qObj.watchHistory.unshift({ ...movieEntry, watchedAt: Date.now() });
+              }
+              if (blob.continueWatching && blob.continueWatching.length > 0) {
+                const latestCw = blob.continueWatching[0];
+                qObj.continueWatching = qObj.continueWatching.filter((it) => it && String(it.showId || it.id) !== String(latestCw.showId || latestCw.id));
+                qObj.continueWatching.unshift(latestCw);
+              }
+              qObj.watchHistory = qObj.watchHistory.slice(0, 20);
+              qObj.continueWatching = qObj.continueWatching.slice(0, 20);
+              await env.CONFIGS.put(queueKey, JSON.stringify(qObj));
+            } catch {}
+
             break;
           }
 
@@ -43643,6 +50673,22 @@ self.addEventListener('fetch', e => {
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      await ensureTrackingMigrated(env, authUser);
+
+      if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
+        try {
+          const rawSync = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          if (rawSync) {
+            const syncObj = JSON.parse(rawSync);
+            if (syncObj && syncObj.keys && syncObj.keys.tmdbKey) {
+              effectiveTmdbKey = String(syncObj.keys.tmdbKey).trim();
+            }
+          }
+        } catch {}
+      }
+      if (!effectiveTmdbKey) {
+        effectiveTmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY || "";
+      }
 
       // 2. Parse payload from Plex, Jellyfin, or Emby
       const contentType = request.headers.get("content-type") || "";
@@ -43675,6 +50721,7 @@ self.addEventListener('fetch', e => {
       let server = "Media Server";
       let eventType = "";
       let mediaType = "movie"; // "movie" or "series"
+      let mediaServerUser = ""; // username who triggered the event
       let imdbId = "";
       let tmdbId = "";
       let title = "";
@@ -43690,6 +50737,14 @@ self.addEventListener('fetch', e => {
         eventType = String(payload.event || "").toLowerCase();
         isPlayed = eventType === "media.scrobble" || eventType === "media.play" || eventType === "media.stop" || eventType === "media.resume";
         
+        let pUser = (payload.Account && (payload.Account.title || payload.Account.name || payload.Account.id)) ||
+                    (payload.User && (payload.User.title || payload.User.name || payload.User.Name)) ||
+                    payload.username || payload.user_name || payload.account || "";
+        if (typeof pUser !== "string" && typeof pUser !== "number") pUser = "";
+        pUser = String(pUser).trim();
+        if (pUser === "true" || pUser === "false" || pUser === "null" || pUser === "undefined") pUser = "";
+        mediaServerUser = pUser;
+
         const meta = payload.Metadata || {};
         mediaType = meta.type === "episode" ? "series" : "movie";
         title = meta.title || "";
@@ -43698,15 +50753,21 @@ self.addEventListener('fetch', e => {
         episode = meta.index != null ? Number(meta.index) : null;
         year = meta.year || null;
 
-        const guids = Array.isArray(meta.Guid) ? meta.Guid : (meta.guid ? [{ id: meta.guid }] : []);
+        const guids = [
+          ...(meta.grandparentGuid ? [{ id: meta.grandparentGuid }] : []),
+          ...(meta.parentGuid ? [{ id: meta.parentGuid }] : []),
+          ...(Array.isArray(meta.Guid) ? meta.Guid : (meta.guid ? [{ id: meta.guid }] : []))
+        ];
         for (const g of guids) {
           const gid = String(g.id || "");
           if (gid.includes("imdb://tt")) {
             const m = gid.match(/tt\d+/);
-            if (m) imdbId = m[0];
+            if (m && !imdbId) imdbId = m[0];
           } else if (gid.includes("tmdb://")) {
             const m = gid.match(/tmdb:\/\/(\d+)/);
-            if (m) tmdbId = m[1];
+            if (m && !tmdbId) tmdbId = m[1];
+          } else if (gid.startsWith("tt") && !imdbId) {
+            imdbId = gid;
           }
         }
       }
@@ -43716,6 +50777,12 @@ self.addEventListener('fetch', e => {
         eventType = String(payload.NotificationType || payload.Event || "").toLowerCase();
         isPlayed = eventType.includes("playback") || eventType.includes("userdata") || eventType.includes("scrobble") || payload.Played === true;
         
+        let jUser = payload.NotificationUsername || payload.UserName || payload.Username || (payload.User && (payload.User.Name || payload.User.name)) || payload.user || "";
+        if (typeof jUser !== "string" && typeof jUser !== "number") jUser = "";
+        jUser = String(jUser).trim();
+        if (jUser === "true" || jUser === "false" || jUser === "null" || jUser === "undefined") jUser = "";
+        mediaServerUser = jUser;
+        
         mediaType = (payload.ItemType === "Episode" || payload.SeriesName) ? "series" : "movie";
         title = payload.Name || payload.ItemName || "";
         showTitle = payload.SeriesName || "";
@@ -43723,15 +50790,22 @@ self.addEventListener('fetch', e => {
         episode = payload.EpisodeNumber != null ? Number(payload.EpisodeNumber) : null;
         year = payload.Year || null;
 
-        const pIds = payload.ProviderIds || {};
-        imdbId = pIds.Imdb || pIds.imdb || payload.Provider_imdb || "";
-        tmdbId = pIds.Tmdb || pIds.tmdb || payload.Provider_tmdb || "";
+        const sPIds = payload.SeriesProviderIds || (payload.Item && payload.Item.SeriesProviderIds) || {};
+        const pIds = payload.ProviderIds || (payload.Item && payload.Item.ProviderIds) || {};
+        imdbId = sPIds.Imdb || sPIds.imdb || payload.SeriesImdbId || pIds.Imdb || pIds.imdb || payload.Provider_imdb || "";
+        tmdbId = sPIds.Tmdb || sPIds.tmdb || payload.SeriesTmdbId || pIds.Tmdb || pIds.tmdb || payload.Provider_tmdb || "";
       }
       // C. Emby Webhook format
       else if (payload.Item || (payload.Event && String(payload.Event).startsWith("playback."))) {
         server = "Emby";
         eventType = String(payload.Event || "").toLowerCase();
         isPlayed = eventType.includes("scrobble") || eventType.includes("playback.start") || eventType.includes("playback.stop") || eventType.includes("markplayed");
+        
+        let eUser = (payload.User && (payload.User.Name || payload.User.name || payload.User.Id || payload.User.id)) || payload.UserName || payload.Username || payload.user || "";
+        if (typeof eUser !== "string" && typeof eUser !== "number") eUser = "";
+        eUser = String(eUser).trim();
+        if (eUser === "true" || eUser === "false" || eUser === "null" || eUser === "undefined") eUser = "";
+        mediaServerUser = eUser;
 
         const item = payload.Item || payload;
         mediaType = (item.Type === "Episode" || item.SeriesName) ? "series" : "movie";
@@ -43740,9 +50814,94 @@ self.addEventListener('fetch', e => {
         season = item.ParentIndexNumber != null ? Number(item.ParentIndexNumber) : null;
         episode = item.IndexNumber != null ? Number(item.IndexNumber) : null;
 
+        const sPIds = item.SeriesProviderIds || {};
         const pIds = item.ProviderIds || {};
-        imdbId = pIds.Imdb || pIds.imdb || "";
-        tmdbId = pIds.Tmdb || pIds.tmdb || "";
+        imdbId = sPIds.Imdb || sPIds.imdb || pIds.Imdb || pIds.imdb || "";
+        tmdbId = sPIds.Tmdb || sPIds.tmdb || pIds.Tmdb || pIds.tmdb || "";
+      }
+
+      // 4a. Record this username in the seen-users list
+      if (mediaServerUser) {
+        const recordUserTask = async () => {
+          try {
+            const seenKey = `scrobbleseenusers:${authUser}`;
+            const raw = await env.CONFIGS.get(seenKey);
+            const seen = raw ? JSON.parse(raw) : {};
+            seen[mediaServerUser] = { server, lastSeen: Date.now() };
+            // 90-day TTL — stale accounts from old servers quietly expire
+            await env.CONFIGS.put(seenKey, JSON.stringify(seen), { expirationTtl: 60 * 60 * 24 * 90 });
+          } catch {}
+        };
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(recordUserTask());
+        } else {
+          await recordUserTask();
+        }
+      }
+
+      // 4b. Apply user filter (URL param first, fallback to user's saved account settings in KV)
+      let filterEnabled = false;
+      let allowedUsersParam = (url.searchParams.get("allowedUsers") || "").trim();
+      let blockAnon = url.searchParams.get("blockAnon") === "1";
+
+      if (url.searchParams.has("filterUsers")) {
+        filterEnabled = url.searchParams.get("filterUsers") === "1";
+      } else if (allowedUsersParam) {
+        filterEnabled = true;
+      }
+
+      if (authUser) {
+        try {
+          let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
+          if (!trackingRaw) {
+            trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          }
+          if (trackingRaw) {
+            const trackingObj = JSON.parse(trackingRaw);
+            if (trackingObj.scrobbleFilterUsers === true || trackingObj.scrobbleFilterUsers === "1" || trackingObj.scrobbleFilterUsers === 1) {
+              filterEnabled = true;
+            } else if (trackingObj.scrobbleFilterUsers === false || trackingObj.scrobbleFilterUsers === "0" || trackingObj.scrobbleFilterUsers === 0) {
+              filterEnabled = false;
+            } else if (trackingObj.scrobbleAllowedUsers) {
+              filterEnabled = true;
+            }
+            if (trackingObj.scrobbleAllowedUsers !== undefined && !url.searchParams.has("allowedUsers")) {
+              allowedUsersParam = String(trackingObj.scrobbleAllowedUsers || "").trim();
+            }
+            if (trackingObj.scrobbleBlockAnonymous && !url.searchParams.has("blockAnon")) {
+              blockAnon = true;
+            }
+          }
+        } catch {}
+      }
+
+      if (filterEnabled) {
+        const allowed = allowedUsersParam.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+        if (!mediaServerUser) {
+          if (blockAnon || allowed.length > 0) {
+            const ignoredMsg = "No username in payload and user filtering is active.";
+            const diagnosticsKey = `creatortrack:${authUser}`;
+            await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+              lastPingAt: Date.now(),
+              lastPingId: pingId || "unknown",
+              lastServer: server,
+              lastUser: null,
+              matched: `ignored (${ignoredMsg})`,
+            }));
+            return json({ ok: true, ignored: ignoredMsg });
+          }
+        } else if (!allowed.includes(mediaServerUser.toLowerCase())) {
+          const ignoredMsg = `User '${mediaServerUser}' is not in the allowed list.`;
+          const diagnosticsKey = `creatortrack:${authUser}`;
+          await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+            lastPingAt: Date.now(),
+            lastPingId: pingId || mediaServerUser,
+            lastServer: server,
+            lastUser: mediaServerUser,
+            matched: `ignored (${ignoredMsg})`,
+          }));
+          return json({ ok: true, ignored: ignoredMsg });
+        }
       }
 
       if (!isPlayed) {
@@ -43761,9 +50920,19 @@ self.addEventListener('fetch', e => {
         } catch {}
       }
 
+      let searchFoundPoster = "";
       if (!imdbId && (showTitle || title)) {
         try {
-          const q = showTitle || title;
+          let q = showTitle || title;
+          if (mediaType === "series") {
+            q = String(q)
+              .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+              .replace(/[\s._-]+\d+x\d+.*$/i, "")
+              .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+              .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+              .replace(/\s*\(\d{4}\).*$/, "")
+              .trim();
+          }
           const searchType = mediaType === "series" ? "tv" : "movie";
           const searchRes = await fetch(`https://api.themoviedb.org/3/search/${searchType}?api_key=${effectiveTmdbKey}&query=${encodeURIComponent(q)}&page=1`);
           if (searchRes.ok) {
@@ -43771,6 +50940,9 @@ self.addEventListener('fetch', e => {
             if (sd.results && sd.results.length) {
               const first = sd.results[0];
               tmdbId = String(first.id);
+              if (first.poster_path) {
+                searchFoundPoster = `https://image.tmdb.org/t/p/w500${first.poster_path}`;
+              }
               const extRes = await fetch(`https://api.themoviedb.org/3/${searchType}/${first.id}?api_key=${effectiveTmdbKey}&append_to_response=external_ids`);
               if (extRes.ok) {
                 const ed = await extRes.json();
@@ -43786,7 +50958,6 @@ self.addEventListener('fetch', e => {
       // 5. Execute Watch Record
       let matched = "no";
       try {
-        await ensureTrackingMigrated(env, authUser);
         const syncKey = `creatorsynctracking:${authUser}`;
         const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
@@ -43810,55 +50981,101 @@ self.addEventListener('fetch', e => {
           let sTitle = showTitle || title;
           let sPoster = "";
 
-          if (imdbId) {
-            const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, effectiveTmdbKey).catch(() => null);
+          const cleanShowName = String(showTitle || title)
+            .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+            .replace(/[\s._-]+\d+x\d+.*$/i, "")
+            .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+            .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+            .replace(/\s*\(\d{4}\).*$/, "")
+            .trim();
+
+          const lookupShowId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || cleanShowName || showTitle || title;
+
+          let epIdStr = "";
+          if (lookupShowId) {
+            const seasonData = await fetchTmdbSeasonDetails(lookupShowId, seasonNum, effectiveTmdbKey, tmdbId, env, ctx).catch(() => null);
             const ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episodeNum) : null;
             if (ep) {
               epName = ep.name || title;
-              epPoster = ep.still_path || "";
+              epPoster = ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : `https://image.tmdb.org/t/p/w500${ep.still_path}`) : "";
+              if (ep.id) epIdStr = String(ep.id);
             }
-            const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+            const showDetails = await fetchTmdbItemDetails(lookupShowId, effectiveTmdbKey, "series", "", false, env, ctx).catch(() => null);
             if (showDetails) {
               sTitle = showDetails.title || sTitle;
-              sPoster = showDetails.poster || "";
+              sPoster = showDetails.poster || searchFoundPoster || "";
+              if (!imdbId && showDetails.id && showDetails.id.startsWith("tt")) {
+                imdbId = showDetails.id;
+              }
+              if (!tmdbId && showDetails.tmdbId) {
+                tmdbId = String(showDetails.tmdbId);
+              }
+            }
+            if (!sPoster && imdbId && imdbId.startsWith("tt")) {
+              sPoster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
             }
           }
 
-          const itemKey = `${imdbId || sTitle}:${seasonNum}:${episodeNum}`;
-          const alreadyWatched = blob.watchHistory.some((it) => (it.showId === imdbId || it.showTitle === sTitle) && it.seasonNum === seasonNum && it.episodeNum === episodeNum);
-          if (!alreadyWatched) {
-            blob.watchHistory.unshift({
-              id: itemKey,
-              type: "episode",
-              name: epName,
-              poster: epPoster || sPoster,
-              showId: imdbId || sTitle,
-              showTitle: sTitle,
-              showPoster: sPoster,
-              seasonNum: seasonNum,
-              episodeNum: episodeNum,
-            });
-          }
+          const resolvedShowId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || sTitle;
+          const itemKey = epIdStr || `${resolvedShowId}:${seasonNum}:${episodeNum}`;
+          const finalEpisodePoster = epPoster || sPoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "");
+          const finalShowPoster = sPoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "") || epPoster;
+          
+          // Re-watching or newly watching an episode always brings it to the top of Watch History
+          blob.watchHistory = blob.watchHistory.filter((it) => !((it.showId === resolvedShowId || it.showTitle === sTitle) && it.seasonNum === seasonNum && it.episodeNum === episodeNum));
+          blob.watchHistory.unshift({
+            id: itemKey,
+            type: "episode",
+            name: epName,
+            poster: finalEpisodePoster,
+            showId: resolvedShowId,
+            showTitle: sTitle,
+            showPoster: finalShowPoster,
+            seasonNum: seasonNum,
+            episodeNum: episodeNum,
+            watchedAt: Date.now(),
+          });
 
           // Recompute Continue Watching for this show
-          blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== (imdbId || sTitle));
-          if (imdbId) {
-            const next = await findNextAiredEpisodeForShow(imdbId, seasonNum, episodeNum, effectiveTmdbKey).catch(() => null);
+          const oldCwItems = blob.continueWatching.filter((it) => it.showId === resolvedShowId || (imdbId && it.showId === imdbId) || (sTitle && it.showId === sTitle));
+          blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== resolvedShowId && it.showId !== (imdbId || sTitle));
+          if (resolvedShowId) {
+            const watchedEps = blob.watchHistory.filter((it) => it.type === "episode" && (it.showId === resolvedShowId || (sTitle && it.showTitle === sTitle)) && it.seasonNum != null && it.episodeNum != null);
+            let latestSeason = seasonNum;
+            let latestEpisode = episodeNum;
+            if (watchedEps.length) {
+              const latest = watchedEps.reduce((best, e) => {
+                const eS = Number(e.seasonNum);
+                const eE = Number(e.episodeNum);
+                const bS = Number(best.seasonNum);
+                const bE = Number(best.episodeNum);
+                if (eS > bS) return e;
+                if (eS === bS && eE > bE) return e;
+                return best;
+              }, watchedEps[0]);
+              latestSeason = Number(latest.seasonNum);
+              latestEpisode = Number(latest.episodeNum);
+            }
+            const next = await findNextAiredEpisodeForShow(resolvedShowId, latestSeason, latestEpisode, effectiveTmdbKey, env, ctx).catch(() => null);
             if (next) {
               blob.continueWatching.unshift({
-                id: String(next.episode.id),
+                id: next.episode.id ? String(next.episode.id) : `${resolvedShowId}:${next.seasonNum}:${next.episode.episode_number}`,
                 type: "episode",
                 name: next.episode.name,
-                poster: sPoster || "",
-                showId: imdbId,
+                poster: finalShowPoster,
+                showId: resolvedShowId,
                 showTitle: sTitle,
-                showPoster: sPoster,
+                showPoster: finalShowPoster,
                 seasonNum: next.seasonNum,
                 episodeNum: next.episode.episode_number,
               });
-              blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
-            } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
-              blob.fullyWatchedShowIds.push(imdbId);
+              blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== resolvedShowId && s !== imdbId);
+            } else if (!blob.fullyWatchedShowIds.includes(resolvedShowId)) {
+              if (oldCwItems && oldCwItems.length > 0) {
+                blob.continueWatching = [...oldCwItems, ...blob.continueWatching];
+              } else {
+                blob.fullyWatchedShowIds.push(resolvedShowId);
+              }
             }
           }
           matched = `yes (${server}: ${sTitle} S${seasonNum}E${episodeNum})`;
@@ -43866,22 +51083,34 @@ self.addEventListener('fetch', e => {
           // Movie
           let movieTitle = title;
           let moviePoster = "";
-          if (imdbId) {
-            const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const lookupMovieId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || title;
+          if (lookupMovieId) {
+            const details = await fetchTmdbItemDetails(lookupMovieId, effectiveTmdbKey, "movie", "", false, env, ctx).catch(() => null);
             if (details) {
               movieTitle = details.title || movieTitle;
-              moviePoster = details.poster || "";
+              moviePoster = details.poster || searchFoundPoster || "";
+              if (!imdbId && details.id && details.id.startsWith("tt")) {
+                imdbId = details.id;
+              }
+              if (!tmdbId && details.tmdbId) {
+                tmdbId = String(details.tmdbId);
+              }
+            }
+            if (!moviePoster && imdbId && imdbId.startsWith("tt")) {
+              moviePoster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
             }
           }
-          const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === imdbId || it.name === movieTitle);
-          if (!alreadyWatched) {
-            blob.watchHistory.unshift({
-              id: imdbId || movieTitle,
-              type: "movie",
-              name: movieTitle,
-              poster: moviePoster,
-            });
-          }
+          const resolvedMovieId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || movieTitle;
+          const finalMoviePoster = moviePoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "");
+          
+          blob.watchHistory = blob.watchHistory.filter((it) => !(String(it.id) === resolvedMovieId || String(it.id) === imdbId || it.name === movieTitle));
+          blob.watchHistory.unshift({
+            id: resolvedMovieId,
+            type: "movie",
+            name: movieTitle,
+            poster: finalMoviePoster,
+            watchedAt: Date.now(),
+          });
           matched = `yes (${server}: ${movieTitle})`;
         }
 
@@ -43892,6 +51121,37 @@ self.addEventListener('fetch', e => {
 
         blob.updatedAt = Date.now();
         await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+
+        // Also write to creatorscrobblequeue to protect against KV propagation lag
+        try {
+          const queueKey = `creatorscrobblequeue:${authUser}`;
+          const queueRaw = await env.CONFIGS.get(queueKey);
+          let qObj = { watchHistory: [], continueWatching: [] };
+          if (queueRaw) {
+            try {
+              const parsed = JSON.parse(queueRaw);
+              if (Array.isArray(parsed)) {
+                qObj.watchHistory = parsed;
+              } else if (parsed && typeof parsed === "object") {
+                qObj.watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+                qObj.continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+              }
+            } catch {}
+          }
+          if (blob.watchHistory.length > 0) {
+            const latestItem = blob.watchHistory[0];
+            qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== String(latestItem.id));
+            qObj.watchHistory.unshift({ ...latestItem });
+          }
+          if (blob.continueWatching.length > 0) {
+            const latestCw = blob.continueWatching[0];
+            qObj.continueWatching = qObj.continueWatching.filter((it) => it && String(it.showId || it.id) !== String(latestCw.showId || latestCw.id));
+            qObj.continueWatching.unshift(latestCw);
+          }
+          qObj.watchHistory = qObj.watchHistory.slice(0, 20);
+          qObj.continueWatching = qObj.continueWatching.slice(0, 20);
+          await env.CONFIGS.put(queueKey, JSON.stringify(qObj));
+        } catch {}
       } catch (err) {
         matched = `error (${server}): ` + (err && err.message ? err.message : String(err));
       }
@@ -43902,12 +51162,14 @@ self.addEventListener('fetch', e => {
         lastPingAt: Date.now(),
         lastPingId: pingId,
         lastServer: server,
+        lastUser: mediaServerUser || null,
         matched: matched,
       }));
 
       return json({
         ok: true,
         server: server,
+        user: mediaServerUser || null,
         event: eventType,
         matched: matched,
       });
@@ -43932,7 +51194,7 @@ self.addEventListener('fetch', e => {
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       const raw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
-      let status = { lastPingAt: null, lastPingId: null, matched: null };
+      let status = { lastPingAt: null, lastPingId: null, lastServer: null, lastUser: null, matched: null };
       if (raw) {
         try {
           status = JSON.parse(raw);
@@ -43941,6 +51203,41 @@ self.addEventListener('fetch', e => {
         }
       }
       return json({ ok: true, ...status });
+    }
+
+    // /api/creator/scrobble-seen-users  (POST)  { creatorName, creatorKey } ->
+    // { ok, users: { "James": { server: "Plex", lastSeen: 1234567890 }, ... } }
+    // Returns all media server usernames ever seen in webhook events for this account.
+    // Populated automatically by handleMediaServerScrobble whenever a username is
+    // present in the incoming payload. Used by the settings page to show checkboxes
+    // for user filtering without requiring manual name entry.
+    if (path === "/api/creator/scrobble-seen-users" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const raw = await env.CONFIGS.get(`scrobbleseenusers:${auth.username}`);
+      let users = {};
+      if (raw) {
+        try { users = JSON.parse(raw); } catch {}
+      }
+      // If scrobbleseenusers is empty, check if creatortrack diagnostics has a lastUser
+      if (!Object.keys(users).length) {
+        try {
+          const diagRaw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
+          if (diagRaw) {
+            const diag = JSON.parse(diagRaw);
+            if (diag && diag.lastUser) {
+              users[diag.lastUser] = { server: diag.lastServer || "Media Server", lastSeen: diag.lastPingAt || Date.now() };
+            }
+          }
+        } catch {}
+      }
+      return json({ ok: true, users });
     }
 
     // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
@@ -43953,7 +51250,7 @@ self.addEventListener('fetch', e => {
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `ratelimit:creatorcreate:${ip}`;
       if (await env.CONFIGS.get(rateLimitKey)) {
-        return json({ ok: false, error: "Please wait a moment before creating another Creator Profile." }, 429);
+        return json({ ok: false, error: "Please wait a moment before creating another Profile." }, 429);
       }
       let body;
       try {
@@ -43969,7 +51266,7 @@ self.addEventListener('fetch', e => {
       // both pass the "is it taken" check before either has written
       // anything, and both succeed.
       await env.CONFIGS.put(rateLimitKey, "1", { expirationTtl: 60 });
-      const existing = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const existing = await getCreator(env, v.normalized);
       if (existing) {
         return json({ ok: false, error: "That username is already taken." });
       }
@@ -43985,10 +51282,32 @@ self.addEventListener('fetch', e => {
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ displayName, keyHash, recoveryAnswerHash, createdAt: Date.now() })
-      );
+      const nowMs = Date.now();
+      const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
+      
+      let wroteToKV = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?)"
+          ).bind(v.normalized, displayName, keyHash, recoveryAnswerHash, nowMs).run();
+        } catch (dbErr) {
+          console.error("D1 write error (creator create):", dbErr);
+          // If D1 fails, write to KV so they aren't totally broken
+          await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
+          wroteToKV = true;
+        }
+      } else {
+        await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
+        wroteToKV = true;
+      }
+      
+      try {
+        const countRaw = await env.CONFIGS.get("stats:creator_count");
+        const count = parseInt(countRaw || "0", 10) + 1;
+        await env.CONFIGS.put("stats:creator_count", String(count));
+      } catch (err) {}
+
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
@@ -44033,7 +51352,7 @@ self.addEventListener('fetch', e => {
       // exist and which have a recovery answer set at all.
       const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
       if (!v.ok || !answer) return json({ ok: false, error: genericError });
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return json({ ok: false, error: genericError });
       let profile;
       try {
@@ -44047,10 +51366,28 @@ self.addEventListener('fetch', e => {
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ ...profile, keyHash })
-      );
+      // The previous key must stop working on a warm isolate the instant
+      // it is rotated -- see invalidateCreatorAuthMemo's own comment.
+      invalidateCreatorAuthMemo();
+      
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "UPDATE creators SET key_hash = ? WHERE username = ?"
+          ).bind(keyHash, v.normalized).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creator reset):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creator:${v.normalized}`,
+          JSON.stringify({ ...profile, keyHash })
+        );
+      }
       return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
     }
 
@@ -44078,7 +51415,7 @@ self.addEventListener('fetch', e => {
       }
       const v = validateCreatorUsername(body.username);
       if (!v.ok) return json({ ok: false, error: "Unknown creator." });
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return json({ ok: false, error: "Unknown creator." });
       let profile;
       try {
@@ -44088,10 +51425,28 @@ self.addEventListener('fetch', e => {
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ ...profile, keyHash })
-      );
+      // The previous key must stop working on a warm isolate the instant
+      // it is rotated -- see invalidateCreatorAuthMemo's own comment.
+      invalidateCreatorAuthMemo();
+      
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "UPDATE creators SET key_hash = ? WHERE username = ?"
+          ).bind(keyHash, v.normalized).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (admin creator reset):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creator:${v.normalized}`,
+          JSON.stringify({ ...profile, keyHash })
+        );
+      }
       return json({ ok: true, creatorKey });
     }
 
@@ -44142,7 +51497,7 @@ self.addEventListener('fetch', e => {
       const lists = (
         await Promise.all(
           order.map(async (slug) => {
-            const raw = await env.CONFIGS.get(`creatorlist:${auth.username}:${slug}`);
+            const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
@@ -44162,7 +51517,84 @@ self.addEventListener('fetch', e => {
           })
         )
       ).filter(Boolean);
-      return json({ ok: true, displayName: auth.displayName, lists, order });
+
+      const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
+      if (!hasWatchlistInLists) {
+        const wlRaw = await getCreatorList(env, auth.username, "watchlist");
+        if (wlRaw) {
+          try {
+            const data = JSON.parse(wlRaw);
+            lists.unshift({
+              slug: "watchlist",
+              name: data.name || "Watchlist",
+              type: data.type || "mixed",
+              items: data.items || [],
+              itemCount: (data.items || []).length,
+              likes: data.likes || 0,
+              visibility: data.visibility === "private" ? "private" : "public",
+              url: `${url.origin}/lists/${auth.username}/watchlist`,
+            });
+          } catch {}
+        } else {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (trackingRaw) {
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
+                lists.unshift({
+                  slug: "watchlist",
+                  name: "Watchlist",
+                  type: "mixed",
+                  items: tb.watchlist,
+                  itemCount: tb.watchlist.length,
+                  likes: 0,
+                  visibility: "private",
+                  url: `${url.origin}/lists/${auth.username}/watchlist`,
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Content version + conditional response.
+      //
+      // This endpoint returns the FULL items array for every list the
+      // account owns, and renderCreatorDashboard calls it on every render --
+      // after a save, after a delete, on a tab switch, after a background
+      // sync adopts server state. For anyone with large Custom Lists that
+      // was megabytes down the wire and a megabytes-sized JSON.parse on the
+      // main thread, over and over, almost always producing exactly the
+      // data the browser already had.
+      //
+      // So the browser now sends back the version it last received, and
+      // when nothing has changed it gets a few dozen bytes instead of the
+      // whole payload and keeps using the copy it already holds.
+      //
+      // The version is a hash of the actual response body rather than a
+      // separately-maintained counter. That costs a hash of a string this
+      // endpoint had to build anyway, and in exchange it cannot drift: there
+      // is no bump-on-write to forget in some future list-mutating route,
+      // and any change to any list, its order, or the display name changes
+      // the version by construction. Note it deliberately does NOT save the
+      // KV reads above -- the lists still have to be read to know whether
+      // they changed. What it removes is the transfer and the parse, which
+      // is where the stall the person actually feels comes from.
+      const listsPayload = { ok: true, displayName: auth.displayName, lists, order };
+      let listsVersion = "";
+      try {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
+        listsVersion = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+      } catch {
+        // No digest available -- fall through with an empty version, which
+        // can never match what a client sends, so it always gets the full
+        // response. Degrades to the previous behaviour rather than to a
+        // browser that stops seeing its own list changes.
+      }
+      if (listsVersion && body.knownVersion && body.knownVersion === listsVersion) {
+        return json({ ok: true, unchanged: true, version: listsVersion });
+      }
+      return json({ ...listsPayload, version: listsVersion });
     }
 
     // /api/creator/lists/save  (POST)
@@ -44215,7 +51647,7 @@ self.addEventListener('fetch', e => {
       }
 
       const now = Date.now();
-      const existingRaw = editingSlug ? await env.CONFIGS.get(`creatorlist:${auth.username}:${slug}`) : null;
+      const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
       let likes = 0;
       if (existingRaw) {
@@ -44227,10 +51659,26 @@ self.addEventListener('fetch', e => {
           createdAt = now;
         }
       }
-      await env.CONFIGS.put(
-        `creatorlist:${auth.username}:${slug}`,
-        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
-      );
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          const listId = `${auth.username}:${slug}`;
+          const itemsJson = JSON.stringify(items || []);
+          await env.DB.prepare(
+            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+          ).bind(listId, auth.username, name, type, visibility, itemsJson, createdAt, now).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creatorlist put):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creatorlist:${auth.username}:${slug}`,
+          JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
+        );
+      }
       if (!order.includes(slug)) {
         order.push(slug);
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
@@ -44250,7 +51698,19 @@ self.addEventListener('fetch', e => {
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creatorlist delete):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      }
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -44276,6 +51736,104 @@ self.addEventListener('fetch', e => {
       const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
+    }
+
+    // /api/creator/account/reset  (POST)  { creatorName, creatorKey, confirm }
+    //   -> { ok, cleared: { lists, keys } }
+    // Empties an account back to how it looked the moment it was created,
+    // WITHOUT deleting the account itself: the creator record, its key hash
+    // and its recovery answer are all left alone, so the same Creator Name
+    // and Key keep working and the person stays signed in.
+    //
+    // Distinct from /api/creator/delete-account below, which removes the
+    // profile outright. Worth noting while looking at the two together: that
+    // one deletes `creatorprofile:`, `creatortrack:`, `creatorpresets:` and
+    // `creatorchannels:`, which are old key names this codebase no longer
+    // writes -- the live data is under `creator:`, `creatorsynctracking:`,
+    // `creatorsyncpresets:` and `creatorsyncchannels:`. So it currently
+    // leaves most of an account's data behind. Not changed here because
+    // deleting more on that path deserves its own decision, but this reset
+    // uses the names actually in use, plus the legacy ones for good measure.
+    if (path === "/api/creator/account/reset" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Database not configured." }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+
+      // A second, explicit confirmation carried in the request itself. The
+      // key alone is enough to authenticate, but this is irreversible and
+      // there is no undo, so it should not be reachable by a stray request.
+      if (String(body.confirm || "") !== "RESET") {
+        return json({ ok: false, error: "Missing confirmation." }, 400);
+      }
+
+      const u = auth.username;
+      let listsCleared = 0;
+      let keysCleared = 0;
+
+      // Custom lists are one key each, and list() pages -- keep going until
+      // the cursor is exhausted rather than assuming a single page covers an
+      // account that may have hundreds.
+      try {
+        let cursor;
+        for (let page = 0; page < 50; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+          for (const k of res.keys) {
+            await env.CONFIGS.delete(k.name);
+            listsCleared++;
+          }
+          if (res.list_complete || !res.cursor) break;
+          cursor = res.cursor;
+        }
+      } catch (e) {
+        console.error("account reset: list enumeration failed", e);
+      }
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+        } catch (dbErr) {
+          console.error("D1 write error (account reset):", dbErr);
+        }
+      }
+
+      // Everything else the account owns. The identity keys -- creator:<u>
+      // itself -- are deliberately absent from this list.
+      const dataKeys = [
+        `creatorsync:${u}`,
+        `creatorsynctracking:${u}`,
+        `creatorsyncpresets:${u}`,
+        `creatorsyncchannels:${u}`,
+        `creatorlistorder:${u}`,
+        `creatorscrobblequeue:${u}`,
+        `creatorlistlikes:${u}`,
+        `creatorlikes:${u}`,
+        // legacy names, harmless if absent
+        `creatortrack:${u}`,
+        `creatorpresets:${u}`,
+        `creatorchannels:${u}`,
+      ];
+      for (const key of dataKeys) {
+        try {
+          await env.CONFIGS.delete(key);
+          keysCleared++;
+        } catch (e) {
+          console.error("account reset: could not delete", key, e);
+        }
+      }
+
+      // Any verification memoized in this isolate refers to a profile that
+      // still exists and is unchanged, so it stays valid -- but the sync
+      // records it guarded are gone, and clearing is cheap insurance against
+      // a warm isolate answering from anything stale.
+      try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+      return json({ ok: true, cleared: { lists: listsCleared, keys: keysCleared } });
     }
 
     // /api/creator/delete-account  (POST)  { creatorName, creatorKey } -> { ok }
@@ -44457,35 +52015,170 @@ self.addEventListener('fetch', e => {
       // intentionalRemoval comment. That's the one case a stale client
       // snapshot can plausibly be missing something real; anything older
       // than that the client's own load would already have picked up.
-      const RESCUE_WINDOW_MS = 5 * 60 * 1000;
+      // Always merge server KV state with incoming client state to preserve
+      // any scrobbles written by handleSubtitlesTrack or handleMediaServerScrobble
+      // that landed between this browser's last load and this push.
+      //
+      // We cannot gate this on the diagnostic timestamp because handleSubtitlesTrack
+      // runs inside ctx.waitUntil (async after the response is sent), so the
+      // diagnostic write may arrive AFTER save-tracking has already run -- which
+      // was silently wiping every scrobble.
+      //
+      // Strategy: read KV directly, find any watchHistory items with a watchedAt
+      // timestamp newer than body.watchHistory's newest item (i.e. added by the
+      // server after the client's last load) and prepend them. Same for
+      // continueWatching: show IDs in KV but not in the incoming body are
+      // preserved at the front. Skip the merge only for intentionalRemoval.
       let rescuedCount = 0;
       if (!body.intentionalRemoval) {
         try {
-          const diagRaw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
-          if (diagRaw) {
-            const diag = JSON.parse(diagRaw);
-            if (diag && diag.lastPingAt && (Date.now() - diag.lastPingAt) < RESCUE_WINDOW_MS) {
-              const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-              if (existingRaw) {
-                const existingBlob = JSON.parse(existingRaw);
-                const incomingIds = new Set((Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id)));
-                const recentServerItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
-                  .filter((it) => it && !incomingIds.has(String(it.id)));
-                // Only rescue items the server itself added inside the
-                // recency window's ballpark -- everything currently in
-                // watchHistory server-side was either already known to
-                // this client (covered above) or was added since; there's
-                // no per-item timestamp to check more precisely than the
-                // diagnostics ping time already gates on above.
-                if (recentServerItems.length) {
-                  body.watchHistory = [...(Array.isArray(body.watchHistory) ? body.watchHistory : []), ...recentServerItems];
-                  rescuedCount = recentServerItems.length;
+          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (existingRaw) {
+            const existingBlob = JSON.parse(existingRaw);
+
+            // Watch History: find server items not present in the incoming payload
+            const incomingIds = new Set(
+              (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
+            );
+            const serverOnlyItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
+              .filter((it) => it && it.id && !incomingIds.has(String(it.id)));
+            if (serverOnlyItems.length) {
+              // Sort server-only items newest-first and prepend them
+              serverOnlyItems.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+              body.watchHistory = [...serverOnlyItems, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
+              rescuedCount = serverOnlyItems.length;
+            }
+
+            // Continue Watching: when scrobbles occur on the server (Nuvio / Plex),
+            // the server computes the next episode and updates existingBlob.continueWatching.
+            // If the server has a show in continueWatching, its version must take precedence
+            // over the client's stale incoming item for that same show!
+            const serverCwList = Array.isArray(existingBlob.continueWatching) ? existingBlob.continueWatching : [];
+            if (serverCwList.length) {
+              const incomingCwList = Array.isArray(body.continueWatching) ? body.continueWatching : [];
+              const mergedCw = [];
+              const handledShows = new Set();
+              
+              // Server's updated Continue Watching items come first
+              for (const sItem of serverCwList) {
+                if (sItem && (sItem.showId || sItem.id)) {
+                  const sKey = String(sItem.showId || sItem.id);
+                  mergedCw.push(sItem);
+                  handledShows.add(sKey);
+                }
+              }
+              // Add any client-only Continue Watching shows that aren't on the server
+              for (const cItem of incomingCwList) {
+                if (cItem && (cItem.showId || cItem.id)) {
+                  const cKey = String(cItem.showId || cItem.id);
+                  if (!handledShows.has(cKey)) {
+                    mergedCw.push(cItem);
+                    handledShows.add(cKey);
+                  }
+                }
+              }
+              body.continueWatching = mergedCw;
+            }
+
+            // Airing Next and the Discover recommendations are DERIVED
+            // lists: a browser only has them once it has computed them
+            // (refreshAiringNext, and opening the Discover tab). A browser
+            // that has not done that yet still pushes the full tracking
+            // payload on its first autosave, with those two fields empty
+            // -- and since this endpoint is "always the full current
+            // list", that empty array used to overwrite a perfectly good
+            // one another browser had already computed. The catalog row
+            // reading it (fetchAutoTrackedCatalog / fetchCuratedCatalog)
+            // then served nothing, which is what "No items found" in the
+            // Live Preview actually was.
+            //
+            // So: an empty incoming derived list never replaces a
+            // non-empty stored one. Deliberately shrinking one still
+            // works -- a real change sends a non-empty array, and an
+            // intentional clear (Clear Watch History) sets
+            // intentionalRemoval and skips this whole block.
+            if ((!Array.isArray(body.airingNext) || !body.airingNext.length) &&
+                Array.isArray(existingBlob.airingNext) && existingBlob.airingNext.length) {
+              body.airingNext = existingBlob.airingNext;
+            }
+            const incomingRecs = body.curatedRecommendations;
+            const incomingRecsEmpty = !incomingRecs || typeof incomingRecs !== "object" ||
+              ((!Array.isArray(incomingRecs.movies) || !incomingRecs.movies.length) &&
+               (!Array.isArray(incomingRecs.shows) || !incomingRecs.shows.length));
+            const storedRecs = existingBlob.curatedRecommendations;
+            const storedRecsPresent = storedRecs && typeof storedRecs === "object" &&
+              ((Array.isArray(storedRecs.movies) && storedRecs.movies.length) ||
+               (Array.isArray(storedRecs.shows) && storedRecs.shows.length));
+            if (incomingRecsEmpty && storedRecsPresent) {
+              body.curatedRecommendations = storedRecs;
+            }
+
+            // fullyWatchedShowIds: union
+            if (Array.isArray(existingBlob.fullyWatchedShowIds) && existingBlob.fullyWatchedShowIds.length) {
+              const incomingFW = new Set(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []);
+              for (const sid of existingBlob.fullyWatchedShowIds) {
+                if (!incomingFW.has(String(sid))) {
+                  body.fullyWatchedShowIds = body.fullyWatchedShowIds || [];
+                  body.fullyWatchedShowIds.push(sid);
                 }
               }
             }
           }
         } catch {
-          // Diagnostics/rescue is best-effort -- never block the save over it.
+          // Merge is best-effort -- never block the save over it.
+        }
+
+        // SECONDARY MERGE: always read the dedicated scrobble-queue key.
+        // This is written by handleSubtitlesTrack immediately after each
+        // scrobble and is tiny (≤20 items), so it propagates faster and
+        // independently from the large tracking blob. This catches the case
+        // where the large blob hasn't propagated across Cloudflare edges yet.
+        try {
+          const queueRaw = await env.CONFIGS.get(`creatorscrobblequeue:${auth.username}`);
+          if (queueRaw) {
+            const queue = JSON.parse(queueRaw);
+            let queueWh = [];
+            let queueCw = [];
+            if (Array.isArray(queue)) {
+              queueWh = queue;
+            } else if (queue && typeof queue === "object") {
+              queueWh = Array.isArray(queue.watchHistory) ? queue.watchHistory : [];
+              queueCw = Array.isArray(queue.continueWatching) ? queue.continueWatching : [];
+            }
+            if (queueWh.length) {
+              const currentIds = new Set(
+                (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
+              );
+              const queueOnly = queueWh.filter((it) => it && it.id && !currentIds.has(String(it.id)));
+              if (queueOnly.length) {
+                queueOnly.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+                body.watchHistory = [...queueOnly, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
+                rescuedCount += queueOnly.length;
+              }
+            }
+            if (queueCw.length) {
+              const mergedCw = [];
+              const handledShows = new Set();
+              for (const qItem of queueCw) {
+                if (qItem && (qItem.showId || qItem.id)) {
+                  mergedCw.push(qItem);
+                  handledShows.add(String(qItem.showId || qItem.id));
+                }
+              }
+              for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
+                if (bItem && (bItem.showId || bItem.id)) {
+                  const bKey = String(bItem.showId || bItem.id);
+                  if (!handledShows.has(bKey)) {
+                    mergedCw.push(bItem);
+                    handledShows.add(bKey);
+                  }
+                }
+              }
+              body.continueWatching = mergedCw;
+            }
+          }
+        } catch {
+          // Best-effort
         }
       }
 
@@ -44502,10 +52195,27 @@ self.addEventListener('fetch', e => {
         // it just starts empty on an account that hasn't pushed one yet,
         // same as a brand new field always would.
         airingNext: Array.isArray(body.airingNext) ? body.airingNext : [],
+        // The Discover tab's Recommended Movies/Shows lists, exactly as
+        // that tab rendered them. Pushed rather than recomputed for the
+        // same reason airingNext is: fetchCuratedCatalog
+        // (05_catalog-core.js) cannot see the browser-side inputs the
+        // card is built from, so the only way the catalog row and the
+        // card can hold the same items is for the browser to hand the
+        // server the list it actually showed.
+        curatedRecommendations: (body.curatedRecommendations && typeof body.curatedRecommendations === "object")
+          ? {
+              movies: Array.isArray(body.curatedRecommendations.movies) ? body.curatedRecommendations.movies : [],
+              shows: Array.isArray(body.curatedRecommendations.shows) ? body.curatedRecommendations.shows : [],
+              updatedAt: Number(body.curatedRecommendations.updatedAt) || Date.now(),
+            }
+          : null,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
+        scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
+        scrobbleAllowedUsers: typeof body.scrobbleAllowedUsers === "string" ? body.scrobbleAllowedUsers : "",
+        scrobbleBlockAnonymous: typeof body.scrobbleBlockAnonymous === "boolean" ? body.scrobbleBlockAnonymous : false,
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -44515,14 +52225,50 @@ self.addEventListener('fetch', e => {
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
         if (Array.isArray(body.watchlist)) {
-          const wlRaw = await env.CONFIGS.get(`creatorlist:${auth.username}:watchlist`);
+          const wlRaw = await getCreatorList(env, auth.username, "watchlist");
+          let wlObj = null;
           if (wlRaw) {
             try {
-              const wlObj = JSON.parse(wlRaw);
-              wlObj.items = body.watchlist;
-              wlObj.updatedAt = watchlistUpdatedAt;
-              await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
+              wlObj = JSON.parse(wlRaw);
             } catch {}
+          }
+          if (!wlObj) {
+            wlObj = {
+              name: "Watchlist",
+              slug: "watchlist",
+              type: "mixed",
+              isWatchlist: true,
+              visibility: "private",
+              createdAt: Date.now(),
+            };
+          }
+          wlObj.items = body.watchlist;
+          wlObj.updatedAt = watchlistUpdatedAt;
+          
+          let d1Success = false;
+          if (env.DB) {
+            try {
+              const listId = `${auth.username}:watchlist`;
+              const itemsJson = JSON.stringify(wlObj.items || []);
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.createdAt, wlObj.updatedAt).run();
+              d1Success = true;
+            } catch (dbErr) {
+              console.error("D1 write error (creatorlist watchlist):", dbErr);
+            }
+          }
+          
+          if (!d1Success) {
+            await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
+          }
+
+          const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+          let order = [];
+          try { order = orderRaw ? JSON.parse(orderRaw).order || [] : []; } catch {}
+          if (!order.includes("watchlist")) {
+            order.unshift("watchlist");
+            await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
           }
         }
       } catch (e) {
@@ -44562,6 +52308,7 @@ self.addEventListener('fetch', e => {
       const presetsBlob = {
         presets: body.presets && typeof body.presets === "object" ? body.presets : {},
         presetsB64: body.presetsB64 || null,
+        updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(presetsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -44602,6 +52349,81 @@ self.addEventListener('fetch', e => {
       return json({ ok: true });
     }
 
+    // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
+    //   -> { ok, config, tracking, presets, channels }
+    // A deliberately tiny sibling of /api/creator/sync/load below, holding
+    // nothing but the four updatedAt stamps that tell a browser whether
+    // anything it cares about has actually changed.
+    //
+    // It exists because the dashboard polls for multi-device changes on a
+    // timer while it is simply open (see handleForegroundResumeSync,
+    // 22_client-creator-profile.js), and that poll used to call sync/load
+    // itself -- which reads six KV keys, JSON-parses a watchHistory that
+    // can run to thousands of items, re-serializes all of it, and ships
+    // the whole thing back down the wire. For an active account that was
+    // megabytes of response, several times a minute, almost always to
+    // conclude that nothing had changed at all.
+    //
+    // Two things keep this cheap. The four reads run concurrently rather
+    // than one after another, and each updatedAt is pulled straight out of
+    // the raw stored string (see readUpdatedAtFromRaw) instead of parsing
+    // the blob -- so a 4MB tracking record costs a substring scan here,
+    // not a full parse. The response is a few dozen bytes either way.
+    //
+    // Deliberately derived from the same keys sync/load reads rather than
+    // from a separate "last changed" record: a dedicated key would have to
+    // be updated by every write path that touches any of these blobs, and
+    // a single missed write there would silently stop a device from ever
+    // syncing again. Reading the real thing cannot drift.
+    if (path === "/api/creator/sync/meta" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+
+      // Pulls "updatedAt": <number> out of a stored blob without parsing
+      // it. Every blob these keys hold writes updatedAt as a plain number
+      // at the top level, and lastIndexOf finds the last (top-level) one
+      // rather than any nested occurrence inside an item. A miss returns 0,
+      // which reads as "older than anything the client has" and simply
+      // causes a normal full load -- never a skipped one.
+      function readUpdatedAtFromRaw(raw) {
+        if (!raw) return 0;
+        const marker = '"updatedAt":';
+        const at = raw.lastIndexOf(marker);
+        if (at === -1) return 0;
+        const num = parseInt(raw.slice(at + marker.length, at + marker.length + 20).replace(/[^0-9].*$/, ""), 10);
+        return Number.isFinite(num) ? num : 0;
+      }
+
+      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null;
+      try {
+        [configRaw, trackingRaw, presetsRaw, channelsRaw] = await Promise.all([
+          env.CONFIGS.get(`creatorsync:${auth.username}`),
+          env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
+          env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
+          env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+        ]);
+      } catch {
+        // A read failure must not look like "nothing changed" -- returning
+        // ok:false makes the client fall back to a full sync/load.
+        return json({ ok: false, error: "Could not read sync state right now." }, 500);
+      }
+
+      return json({
+        ok: true,
+        exists: configRaw !== null || trackingRaw !== null,
+        config: readUpdatedAtFromRaw(configRaw),
+        tracking: readUpdatedAtFromRaw(trackingRaw),
+        presets: readUpdatedAtFromRaw(presetsRaw),
+        channels: readUpdatedAtFromRaw(channelsRaw),
+      });
+    }
+
     // /api/creator/sync/load -> { ok, data: blob | null }
     // null specifically (rather than an empty blob) distinguishes "this
     // account has never synced from any device" from "this account synced
@@ -44619,7 +52441,19 @@ self.addEventListener('fetch', e => {
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       await ensureTrackingMigrated(env, auth.username);
-      const raw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+      // These five reads are independent of one another, and were awaited
+      // one after the next -- so this endpoint paid five sequential KV
+      // round trips before it could start assembling anything. Issuing them
+      // together turns that into one. (ensureTrackingMigrated above still
+      // runs first on purpose: it can WRITE the tracking key, so reading it
+      // concurrently with that would be a race.)
+      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit] = await Promise.all([
+        env.CONFIGS.get(`creatorsync:${auth.username}`),
+        env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
+        env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+        env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
+        env.CONFIGS.get(`creatorlistorder:${auth.username}`),
+      ]);
       let data = null;
       if (raw) {
         try {
@@ -44632,30 +52466,71 @@ self.addEventListener('fetch', e => {
       // them back in here so the client's loadCreatorSync doesn't need to
       // know or care that this is two KV reads instead of one; it still
       // just reads data.presets/data.presetsB64 exactly like before.
-      const presetsRaw = await env.CONFIGS.get(`creatorsyncpresets:${auth.username}`);
+      let presetsRaw = presetsRawInit;
+      let presetsBlob = null;
       if (presetsRaw) {
-        let presetsBlob = null;
         try {
           presetsBlob = JSON.parse(presetsRaw);
         } catch {
           presetsBlob = null;
         }
-        if (presetsBlob) {
-          if (!data) {
-            // Presets exist but nothing else has ever synced for this
-            // account -- construct a minimal blob so the client still
-            // receives them, rather than treating "no main blob" as "no
-            // data at all" and having loadCreatorSync skip straight to
-            // pushCreatorSync (which would try to push this browser's
-            // state up and never even look at what's already saved).
-            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
-          }
-          data.presets = presetsBlob.presets || {};
-          data.presetsB64 = presetsBlob.presetsB64 || null;
-        }
       }
+
+      // Extract presets safely regardless of storage format
+      let dedicatedPresets = {};
+      let dedicatedPresetsB64 = null;
+      let dedicatedUpdatedAt = 0;
+
+      if (presetsBlob) {
+        if (presetsBlob.presetsB64 && typeof presetsBlob.presetsB64 === "string") {
+          dedicatedPresetsB64 = presetsBlob.presetsB64;
+        }
+        if (presetsBlob.presets && typeof presetsBlob.presets === "object" && !Array.isArray(presetsBlob.presets)) {
+          dedicatedPresets = { ...presetsBlob.presets };
+        } else if (typeof presetsBlob === "object" && !Array.isArray(presetsBlob)) {
+          Object.keys(presetsBlob).forEach((k) => {
+            if (k !== "presets" && k !== "presetsB64" && k !== "updatedAt" && presetsBlob[k] && typeof presetsBlob[k] === "object") {
+              dedicatedPresets[k] = presetsBlob[k];
+            }
+          });
+        } else if (Array.isArray(presetsBlob)) {
+          presetsBlob.forEach((p) => {
+            if (p && p.name) dedicatedPresets[p.name] = p;
+          });
+        }
+        if (presetsBlob.updatedAt) dedicatedUpdatedAt = presetsBlob.updatedAt;
+      }
+
+      const dedicatedHasPresets = !!(dedicatedPresetsB64 || Object.keys(dedicatedPresets).length > 0);
+      const mainHasPresets = !!(data && (data.presetsB64 || (data.presets && typeof data.presets === 'object' && Object.keys(data.presets).length > 0)));
+
+      if (!dedicatedHasPresets && mainHasPresets) {
+        let adoptedMap = {};
+        if (data.presets && typeof data.presets === "object" && !Array.isArray(data.presets)) {
+          adoptedMap = { ...data.presets };
+        } else if (Array.isArray(data.presets)) {
+          data.presets.forEach((p) => { if (p && p.name) adoptedMap[p.name] = p; });
+        }
+        dedicatedPresets = adoptedMap;
+        dedicatedPresetsB64 = data.presetsB64 || null;
+        dedicatedUpdatedAt = Date.now();
+        try {
+          await env.CONFIGS.put(`creatorsyncpresets:${auth.username}`, JSON.stringify({
+            presets: dedicatedPresets,
+            presetsB64: dedicatedPresetsB64,
+            updatedAt: dedicatedUpdatedAt,
+          }));
+        } catch {}
+      }
+
+      if (!data) {
+        data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+      }
+      data.presets = dedicatedPresets;
+      data.presetsB64 = dedicatedPresetsB64;
+      data.presetsUpdatedAt = dedicatedUpdatedAt;
       // Channels & merged channels live in their own key -- merge them back in for signed-in sync across browsers.
-      const channelsRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      const channelsRaw = channelsRawInit;
       if (channelsRaw) {
         let channelsBlob = null;
         try {
@@ -44669,6 +52544,7 @@ self.addEventListener('fetch', e => {
           }
           data.channels = channelsBlob.channels || {};
           data.mergedChannels = channelsBlob.mergedChannels || {};
+          data.channelsUpdatedAt = channelsBlob.updatedAt || 0;
         }
       }
       // Tracking data (Watch History/Continue Watching/etc) also lives in
@@ -44676,7 +52552,7 @@ self.addEventListener('fetch', e => {
       // Same merge pattern as presets: the client's loadCreatorSync still
       // just reads data.watchHistory/data.continueWatching/etc exactly
       // like before, unaware this is a third KV read.
-      const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+      const trackingRaw = trackingRawInit;
       if (trackingRaw) {
         let trackingBlob = null;
         try {
@@ -44692,13 +52568,77 @@ self.addEventListener('fetch', e => {
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
           data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
           data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
+          // Airing Next and the Discover recommendations were stored by
+          // save-tracking but never handed back here, so loadCreatorSync's
+          // own restore branches for them (22_client-creator-profile.js)
+          // could never fire. A browser that signed in fresh therefore had
+          // no copy of either, and its first autosave pushed empty arrays
+          // straight back over the account's real ones -- see
+          // save-tracking's derived-list guard above for the other half of
+          // this fix.
+          data.airingNext = Array.isArray(trackingBlob.airingNext) ? trackingBlob.airingNext : [];
+          data.curatedRecommendations = (trackingBlob.curatedRecommendations && typeof trackingBlob.curatedRecommendations === "object")
+            ? trackingBlob.curatedRecommendations
+            : null;
+          data.trackingUpdatedAt = trackingBlob.updatedAt || 0;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
           data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
+          data.scrobbleFilterUsers = typeof trackingBlob.scrobbleFilterUsers === "boolean" ? trackingBlob.scrobbleFilterUsers : false;
+          data.scrobbleAllowedUsers = typeof trackingBlob.scrobbleAllowedUsers === "string" ? trackingBlob.scrobbleAllowedUsers : "";
+          data.scrobbleBlockAnonymous = typeof trackingBlob.scrobbleBlockAnonymous === "boolean" ? trackingBlob.scrobbleBlockAnonymous : false;
         }
       }
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+      // Merge dedicated scrobble-queue key into watchHistory so that recent
+      // scrobbles are always visible even if the large tracking blob hasn't
+      // propagated across Cloudflare edges yet (KV eventual consistency).
+      try {
+        const sqRaw = await env.CONFIGS.get(`creatorscrobblequeue:${auth.username}`);
+        if (sqRaw) {
+          const sq = JSON.parse(sqRaw);
+          let queueWh = [];
+          let queueCw = [];
+          if (Array.isArray(sq)) {
+            queueWh = sq;
+          } else if (sq && typeof sq === "object") {
+            queueWh = Array.isArray(sq.watchHistory) ? sq.watchHistory : [];
+            queueCw = Array.isArray(sq.continueWatching) ? sq.continueWatching : [];
+          }
+          if (queueWh.length || queueCw.length) {
+            if (!data) data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+            if (queueWh.length) {
+              const existingWhIds = new Set((Array.isArray(data.watchHistory) ? data.watchHistory : []).map((it) => String(it && it.id)));
+              const queueWhOnly = queueWh.filter((it) => it && it.id && !existingWhIds.has(String(it.id)));
+              if (queueWhOnly.length) {
+                queueWhOnly.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+                data.watchHistory = [...queueWhOnly, ...(Array.isArray(data.watchHistory) ? data.watchHistory : [])];
+              }
+            }
+            if (queueCw.length) {
+              const mergedCw = [];
+              const handledShows = new Set();
+              for (const qItem of queueCw) {
+                if (qItem && (qItem.showId || qItem.id)) {
+                  mergedCw.push(qItem);
+                  handledShows.add(String(qItem.showId || qItem.id));
+                }
+              }
+              for (const dItem of (Array.isArray(data.continueWatching) ? data.continueWatching : [])) {
+                if (dItem && (dItem.showId || dItem.id)) {
+                  const dKey = String(dItem.showId || dItem.id);
+                  if (!handledShows.has(dKey)) {
+                    mergedCw.push(dItem);
+                    handledShows.add(dKey);
+                  }
+                }
+              }
+              data.continueWatching = mergedCw;
+            }
+          }
+        }
+      } catch {}
+      const orderRaw = orderRawInit;
       if (orderRaw) {
         try {
           const orderBlob = JSON.parse(orderRaw);
@@ -44770,7 +52710,7 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true, lists: [] });
       const rawQ = url.searchParams.get("q") || "";
       const q = rawQ.toLowerCase().trim();
-      
+
       // Check if query is targeting My Lists platform lists and extract any username/term
       const isMyListsSentinel = (q === "my lists" || q === "mylists" || q === "my list" || q === "mylist" || q.includes("my list") || q.includes("mylist"));
       const userTerm = q
@@ -44830,7 +52770,7 @@ self.addEventListener('fetch', e => {
               const listSlug = rest.slice(sep + 1);
               let creatorName = username;
               try {
-                const profileRaw = await env.CONFIGS.get(`creator:${username}`);
+                const profileRaw = await getCreator(env, username);
                 if (profileRaw) creatorName = JSON.parse(profileRaw).displayName || username;
               } catch {
                 // fall back to the raw username slug
@@ -44850,17 +52790,17 @@ self.addEventListener('fetch', e => {
           })
         );
         const targetFilter = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+        const tokens = targetFilter.split(/\s+/).filter(Boolean);
         const matches = [...anonCandidates, ...creatorCandidates]
           .filter(Boolean)
           .filter((l) => (l.items || 0) > 0)
           .filter((l) => {
-            if (!targetFilter) return true;
-            const nameMatch = l.name && l.name.toLowerCase().includes(targetFilter);
-            const creatorMatch = l.creatorName && l.creatorName.toLowerCase().includes(targetFilter);
-            const usernameMatch = l.username && l.username.toLowerCase().includes(targetFilter);
-            const urlMatch = l.url && l.url.toLowerCase().includes(targetFilter);
-            return nameMatch || creatorMatch || usernameMatch || urlMatch;
+            if (!targetFilter || !tokens.length) return true;
+            const fullText = `${l.name || ""} ${l.creatorName || ""} ${l.username || ""} ${l.url || ""}`.toLowerCase();
+            if (fullText.includes(targetFilter)) return true;
+            return tokens.every((tok) => fullText.includes(tok));
           })
+          .map((l) => ({ ...l, source: "My Lists Addon" }))
           .sort((a, b) => {
             const likesDiff = (b.likes || 0) - (a.likes || 0);
             if (likesDiff !== 0) return likesDiff;
@@ -44888,7 +52828,14 @@ self.addEventListener('fetch', e => {
       const mdblistSlug = m[2];
       const targetUrl = `https://mdblist.com/lists/${mdblistUser}/${mdblistSlug}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: deslugifyServer(mdblistSlug),
@@ -44898,13 +52845,7 @@ self.addEventListener('fetch', e => {
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -44914,7 +52855,14 @@ self.addEventListener('fetch', e => {
       const traktSlug = m[2];
       const targetUrl = `https://trakt.tv/users/${traktUser}/lists/${traktSlug}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: deslugifyServer(traktSlug),
@@ -44924,13 +52872,7 @@ self.addEventListener('fetch', e => {
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -44940,7 +52882,14 @@ self.addEventListener('fetch', e => {
       const targetUrl = `https://www.themoviedb.org/collection/${tmdbId}`;
       const name = m[2] ? deslugifyServer(m[2]) : `TMDB Collection ${tmdbId}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name,
@@ -44950,13 +52899,7 @@ self.addEventListener('fetch', e => {
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -44966,7 +52909,14 @@ self.addEventListener('fetch', e => {
       const targetUrl = `https://www.themoviedb.org/list/${tmdbId}`;
       const name = m[2] ? deslugifyServer(m[2]) : `TMDB List ${tmdbId}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name,
@@ -44976,13 +52926,7 @@ self.addEventListener('fetch', e => {
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -45053,7 +52997,7 @@ self.addEventListener('fetch', e => {
       if (isCreatorList) {
         creatorDisplayName = username;
         try {
-          const profileRaw = await env.CONFIGS.get(`creator:${username}`);
+          const profileRaw = await getCreator(env, username);
           if (profileRaw) creatorDisplayName = JSON.parse(profileRaw).displayName || username;
         } catch {
           // fall back to the raw username slug
@@ -45110,7 +53054,14 @@ self.addEventListener('fetch', e => {
       }
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: listData.name,
@@ -45135,13 +53086,7 @@ self.addEventListener('fetch', e => {
             maybeMore: false,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -45292,6 +53237,76 @@ self.addEventListener('fetch', e => {
       }
 
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
+    }
+
+    // /admin/api/migrate-d1 (POST) -> { ok, results }
+    // Backfills creators, creator_lists, and source_groups from KV to D1.
+    if (path === "/admin/api/migrate-d1" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
+      
+      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+
+      // 1. Creators
+      const cKeys = await listAllKeys(env.CONFIGS, "creator:");
+      for (const k of cKeys.keys) {
+        const username = k.name.slice("creator:".length);
+        const raw = await env.CONFIGS.get(k.name);
+        if (raw) {
+          try {
+            const data = JSON.parse(raw);
+            await env.DB.prepare(
+              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0).run();
+            results.creators++;
+          } catch (e) {
+            results.errors.push(`Creator ${username}: ` + e.message);
+          }
+        }
+      }
+
+      // 2. Creator Lists
+      const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+      for (const k of lKeys.keys) {
+        const [, , u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
+        if (u && slug) {
+          const raw = await env.CONFIGS.get(k.name);
+          if (raw) {
+            try {
+              const data = JSON.parse(raw);
+              const listId = `${u}:${slug}`;
+              const itemsJson = JSON.stringify(data.items || []);
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, data.createdAt || 0, data.updatedAt || 0).run();
+              results.lists++;
+            } catch (e) {
+              results.errors.push(`List ${u}:${slug}: ` + e.message);
+            }
+          }
+        }
+      }
+
+      // 3. Source Groups
+      const sKeys = await listAllKeys(env.CONFIGS, "stats:sourcegroup:");
+      for (const k of sKeys.keys) {
+        if (k.name.endsWith(":total")) {
+          const groupName = k.name.slice("stats:sourcegroup:".length, -":total".length);
+          const raw = await env.CONFIGS.get(k.name);
+          const count = parseInt(raw || "0", 10);
+          try {
+            await env.DB.prepare(
+              "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
+            ).bind(groupName, groupName, count).run();
+            results.sourcegroups++;
+          } catch (e) {
+            results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
+          }
+        }
+      }
+
+      return json({ ok: true, results });
     }
 
     // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }

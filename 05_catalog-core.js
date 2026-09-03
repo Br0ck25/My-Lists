@@ -106,8 +106,8 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "mdblist-history") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistHistory(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
     else if (source === "mdblist-airing-next") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistAiringNext(entry, skip, mdblistKey, keys.mdblistAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
     else if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
-    else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || ""); }
-    else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || ""); }
+    else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
+    else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "trakt-airing-next") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktAiringNext(entry, skip, traktKey, keys.traktAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
     else if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdb(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-chart") {
@@ -124,7 +124,7 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length), keys.region); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length), keys.env, keys.ctx); }
-    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey); }
+    else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey, keys.env, keys.ctx); }
     else if (source === "channel") result = fetchChannelCatalog(entry, keys.origin);
     else if (source === "custom-list") result = await fetchCustomListCatalog(entry, skip, keys);
     else if (source === "autotrack") result = await fetchAutoTrackedCatalog(entry, keys.env, keys);
@@ -141,6 +141,27 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     result = deterministicDailyShuffle(result, `items:${entry.id || entry.name}:${keys.configParam || ''}`);
     result.totalItems = tot;
   }
+
+  if (keys.isStremioCatalog === true && keys.origin && Array.isArray(result) && result.length > 0) {
+    const entryUrl = String(entry.url || '');
+    const entryName = String(entry.name || '').toLowerCase();
+    const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
+    const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+
+    let allowBadges = false;
+    if (isAiringNext) {
+      allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
+    } else if (isContinueWatching) {
+      allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else {
+      allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
+    }
+
+    if (allowBadges) {
+      result = applyBadgedPostersToMetas(result, keys.origin);
+    }
+  }
+
   return result || [];
 }
 
@@ -464,6 +485,10 @@ function getChannelBackdropUrl(payload) {
       if (it.thumbnail && it.thumbnail.startsWith("http") && !it.thumbnail.includes("/api/channel-")) return it.thumbnail;
     }
   }
+  // If a custom URL poster was set but no separate backdrop was saved, use the poster URL as the backdrop too
+  if (payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-")) {
+    return payload.poster;
+  }
   return "";
 }
 
@@ -529,6 +554,88 @@ function getPremadeChannelLogo(payload, origin, isLandscape = false) {
   return `/api/channel-logo?${params.toString()}`;
 }
 
+function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg, bottomBorder, bottomColor }) {
+  const safePoster = escapeXml(posterUrl || '');
+  const safeAirDate = escapeXml(airDateText || '');
+  const safeBottom = escapeXml(bottomText || '');
+
+  // Top Air Date pill: Extra-large 36px font, 72px height, generous padding
+  const topPillWidth = Math.max(160, (safeAirDate.length * 26) + 56);
+
+  // Bottom Badge pill: Extra-large 38px font, 84px height, centered
+  const bottomPillWidth = Math.max(380, (safeBottom.length * 24) + 64);
+
+  const topBadgeSvg = safeAirDate ? `
+    <g transform="translate(24, 24)">
+      <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
+      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+    </g>` : '';
+
+  const bottomBadgeSvg = safeBottom ? `
+    <g transform="translate(250, 715)">
+      <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
+      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+    </g>` : '';
+
+  const topGradient = safeAirDate ? `
+    <rect x="0" y="0" width="500" height="220" fill="url(#topScrim)" opacity="0.85"/>` : '';
+
+  const bottomGradient = safeBottom ? `
+    <rect x="0" y="420" width="500" height="330" fill="url(#bottomScrim)" opacity="0.95"/>` : '';
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="500" height="750" viewBox="0 0 500 750">
+  <defs>
+    <linearGradient id="topScrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bottomScrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.98"/>
+    </linearGradient>
+  </defs>
+  <rect width="500" height="750" fill="#151722"/>
+  ${safePoster ? `<image href="${safePoster}" xlink:href="${safePoster}" x="0" y="0" width="500" height="750" preserveAspectRatio="xMidYMid slice"/>` : ''}
+  ${topGradient}
+  ${bottomGradient}
+  ${topBadgeSvg}
+  ${bottomBadgeSvg}
+</svg>`;
+}
+
+function applyBadgedPostersToMetas(metas, origin) {
+  if (!Array.isArray(metas) || !metas.length || !origin) return metas;
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge")) return m;
+    const isPremiereEp = m.episodeNumber === 1 || m.episodeNum === 1 || (m.episodeNum == null && m.episodeNumber == null);
+    const hasAired = m.airDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.airDate) : false;
+    const hasPremiere = !!(m.isSeasonPremiere && isPremiereEp && !hasAired);
+    const hasFinale = !!(m.isSeasonFinale && !hasAired);
+    const finaleAired = m.seasonFinaleAirDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.seasonFinaleAirDate) : false;
+    const hasFinaleDate = !!(m.seasonFinaleAirDate && !finaleAired);
+    const hasAirDate = !!(m.airDate && !m.hideDateBadge && !hasAired);
+    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate) return m;
+
+    const params = new URLSearchParams();
+    params.set("poster", m.poster);
+    params.set("v", "5");
+    if (m.id) params.set("id", m.id);
+    if (hasAirDate) params.set("airDate", m.airDate);
+    if (hasPremiere) params.set("premiere", "1");
+    if (hasFinale) params.set("finale", "1");
+    if (hasFinaleDate) params.set("finaleDate", m.seasonFinaleAirDate);
+
+    const badgedUrl = `${origin.replace(/\/+$/, "")}/api/poster-badge?${params.toString()}`;
+    return {
+      ...m,
+      poster: badgedUrl,
+    };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
 function fetchChannelCatalog(entry, origin) {
   const rawUrls = String(entry.url || "").split(/[\r\n]+/).map((u) => u.trim()).filter(Boolean);
   const metas = [];
@@ -578,6 +685,32 @@ function fetchChannelCatalog(entry, origin) {
 // A hand-picked list of movies, shows, or mixed items built by search-and-pick
 // in the builder. When served in a catalog shelf, items are automatically filtered
 // to match the shelf type (entry.type).
+//
+// A Custom List someone built lives one of two places: purely in this
+// browser's localStorage (no Creator Profile), or on this Worker's own KV
+// under creatorlist:{username}:{slug} (signed in, saved via
+// /api/creator/lists/save -- see 26_api-creator-and-admin-routes.js). Either
+// way, adding it to Catalogs used to bake a one-time snapshot of `items`
+// straight into this URL, so an edit made afterward (add/remove/reorder a
+// pick) never reached a catalog shelf that already existed -- the shelf,
+// and the Live Preview reading the same source, both kept serving whatever
+// was true at the moment "+ Add to Catalogs" was clicked. For a
+// Creator-hosted list this function now re-reads creatorlist:{owner}:{slug}
+// fresh on every catalog request instead, the same live-by-identity
+// approach fetchPublishedListCatalog already uses for the separate
+// publishedlist: URL scheme just above. A local-only list has no
+// server-reachable copy to re-read (localStorage never leaves the browser),
+// so those stay snapshot-based -- there's no way around that without also
+// giving local lists a KV-backed presence, a much bigger change than this.
+// The embedded snapshot is kept as a fallback in all cases: if this isn't a
+// creatorSlug row at all, or the owner can't be determined (see liveOwner
+// below -- an older saved row's payload may only have creatorSlug, from
+// before creatorOwner started getting stamped in; keys.trackCreatorName/
+// keys.creatorName cover that using the request's own signed-in account),
+// or the KV lookup comes back empty (list since deleted, KV hiccup, made
+// private -- fetchLiveCreatorListItems only returns public lists' items),
+// this drops straight back to the old behavior rather than serving an
+// empty shelf.
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -590,9 +723,45 @@ function parseCustomListPayload(rawUrl) {
   }
 }
 
-function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
+// Re-reads a Creator-hosted list's current items straight from this
+// Worker's own KV, the same key shape /api/creator/lists/save writes to
+// and the /lists/:username/:slug viewer route already reads from. Returns
+// null (never []) on anything short of a confirmed, parseable, public hit,
+// so callers can tell "list has zero items right now" apart from "couldn't
+// resolve this live, fall back to the snapshot".
+async function fetchLiveCreatorListItems(owner, slug, env) {
+  if (!owner || !slug || !env || !env.CONFIGS) return null;
+  const ownerLower = String(owner).toLowerCase();
+  const slugLower = String(slug).toLowerCase();
+  const keysToTry = [
+    `creatorlist:${ownerLower}:${slugLower}`,
+    `creatorlist:${owner}:${slug}`,
+  ];
+  for (const k of keysToTry) {
+    const raw = await env.CONFIGS.get(k);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.items) && parsed.visibility !== "private") {
+        return parsed.items;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   const payload = parseCustomListPayload(entry.url);
-  if (!payload || !payload.items || !payload.items.length) {
+  if (!payload) return [];
+
+  let sourceItems = payload.items;
+  const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
+  if (payload.creatorSlug && liveOwner) {
+    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env);
+    if (liveItems) sourceItems = liveItems;
+  }
+
+  if (!sourceItems || !sourceItems.length) {
     if (payload && (
       (payload.listSlug && (payload.listSlug.startsWith('custom:curated:') || payload.listSlug.startsWith('curated:'))) ||
       (payload.name && (payload.name.toLowerCase().includes('recommended movies') || payload.name.toLowerCase().includes('recommended shows') || payload.name.toLowerCase().trim() === 'recommended'))
@@ -602,8 +771,8 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
     return [];
   }
   const items = payload.shuffle
-    ? seededShuffle(payload.items, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
-    : payload.items;
+    ? seededShuffle(sourceItems, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
+    : sourceItems;
   return items
     .filter((it) => {
       if (!it || !it.imdbId) return false;
@@ -624,10 +793,55 @@ function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
     }));
 }
 
+// Turns one stored recommendation entry (the exact shape the Discover
+// card renders -- see /api/recommendations, 25_api-catalog-routes.js, and
+// the snapshot the client pushes with its tracking data) into a catalog
+// meta. The only thing that has to be looked up is the IMDb id: the card
+// only ever needs TMDB's own id, but a Stremio/wako catalog row has to
+// carry an id stream add-ons can resolve, so each entry costs one
+// external_ids call. Those are edge-cached for a day, and the list is
+// capped at CURATED_RECOMMENDATION_LIMIT, so this is a bounded, mostly
+// cache-served fan-out rather than the up-to-PAGE_SIZE one this replaced.
+async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
+  if (!it) return null;
+  const tmdbId = String(it.tmdbId || String(it.id || '').replace(/^tmdb:/, '') || '').trim();
+  const name = it.name || it.title || 'Untitled';
+  const poster = it.poster || undefined;
+  const releaseInfo = it.year || it.releaseInfo || undefined;
+  let resolvedId = '';
+  if (tmdbId) {
+    try {
+      const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${encodeURIComponent(tmdbId)}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
+        cf: { cacheTtl: 86400, cacheEverything: true }
+      });
+      const detailData = await detailRes.json();
+      if (detailData && detailData.imdb_id) resolvedId = detailData.imdb_id;
+    } catch {}
+    if (!resolvedId) resolvedId = `tmdb:${tmdbId}`;
+  }
+  if (!resolvedId) return null;
+  return {
+    id: resolvedId,
+    type: isSeries ? 'series' : 'movie',
+    name: name,
+    poster: poster,
+    releaseInfo: releaseInfo,
+  };
+}
+
 async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
   const isSeries = entry.type === 'series' || (entry.url && entry.url.includes('shows'));
   const tmdbKey = keys.tmdbKey || TMDB_API_KEY;
   let sampleIds = [];
+  // The exact list the Discover tab last showed for this account, pushed
+  // up alongside Watch History/Continue Watching/Airing Next by
+  // pushTrackingSync (22_client-creator-profile.js). Preferred over
+  // re-deriving below because re-deriving cannot reproduce it: the card's
+  // seeds come from the browser's full picture (Continue Watching + Watch
+  // History + Watchlist + every other custom list), while this function
+  // can only see what tracking data made it to the server. Same reason
+  // Airing Next is served from a pushed snapshot rather than recomputed.
+  let storedRecs = null;
 
   if (keys.env && keys.env.CONFIGS) {
     let username = keys.username || keys.creatorName || '';
@@ -642,6 +856,11 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
         const trackingRaw = await keys.env.CONFIGS.get(`creatorsynctracking:${username}`);
         if (trackingRaw) {
           const tracking = JSON.parse(trackingRaw);
+          const recBlob = tracking.curatedRecommendations;
+          if (recBlob && typeof recBlob === 'object') {
+            const candidate = isSeries ? recBlob.shows : recBlob.movies;
+            if (Array.isArray(candidate) && candidate.length) storedRecs = candidate;
+          }
           if (isSeries) {
             const list = Array.isArray(tracking.continueWatching) && tracking.continueWatching.length
               ? tracking.continueWatching
@@ -653,6 +872,26 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
           }
         }
       } catch {}
+    }
+  }
+
+  // The snapshot path. Serves exactly the items the Discover card last
+  // showed, in exactly that order, cut to exactly the same length -- so
+  // "40 items" on the card and 40 items in the shelf are the same 40.
+  if (storedRecs) {
+    const capped = storedRecs.slice(0, CURATED_RECOMMENDATION_LIMIT);
+    if (skip >= capped.length) return [];
+    const mapped = await Promise.all(
+      capped.slice(skip, skip + PAGE_SIZE).map((it) => mapStoredRecommendationToMeta(it, isSeries, tmdbKey).catch(() => null))
+    );
+    const out = mapped.filter(Boolean);
+    // Only trust the snapshot if it actually resolved to something. An
+    // empty result here (every external_ids call failed, say) falls
+    // through to the live derivation below rather than serving an empty
+    // shelf, the same fallback shape fetchCustomListCatalog already uses.
+    if (out.length) {
+      out.totalItems = capped.length;
+      return out;
     }
   }
 
@@ -705,10 +944,16 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
       });
 
       if (combined.length > 0) {
-        if (skip >= combined.length) {
+        // CURATED_RECOMMENDATION_LIMIT, not PAGE_SIZE: this list is the
+        // same list the Discover card shows, and that card is built from
+        // a response cut to exactly this many items. Cutting the pool
+        // first (rather than the page) also means paging stops where the
+        // card says the list ends instead of running on to 100.
+        const capped = combined.slice(0, CURATED_RECOMMENDATION_LIMIT);
+        if (skip >= capped.length) {
           return [];
         }
-        const mapped = await Promise.all(combined.slice(skip, skip + PAGE_SIZE).map(async (it) => {
+        const mapped = await Promise.all(capped.slice(skip, skip + PAGE_SIZE).map(async (it) => {
           try {
             let imdbId = '';
             const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${it.id}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
@@ -729,7 +974,9 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
             return null;
           }
         }));
-        return mapped.filter(Boolean);
+        const derived = mapped.filter(Boolean);
+        derived.totalItems = capped.length;
+        return derived;
       }
     } catch {}
   }
@@ -852,6 +1099,10 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
            it.poster);
       const mapped = {
         id: isMovie ? (it.imdbId || it.id) : (showId || it.id),
+        showId: showId || undefined,
+        showTitle: isMovie ? undefined : (it.showTitle || it.title || it.name),
+        seasonNum: it.seasonNum != null ? it.seasonNum : undefined,
+        episodeNum: it.episodeNum != null ? it.episodeNum : undefined,
         type: targetType,
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
         poster: showPoster,
@@ -859,6 +1110,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         airDate: it.airDate || undefined,
         isUnaired: it.isUnaired ? true : undefined,
         isSeasonPremiere: it.isSeasonPremiere ? true : undefined,
+        isSeasonFinale: it.isSeasonFinale ? true : undefined,
+        seasonFinaleAirDate: it.seasonFinaleAirDate || undefined,
+        seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber || undefined,
       };
       
       if (!mapped.id) return;

@@ -1,3 +1,25 @@
+<!--
+  Two script elements follow, and the split between them is deliberate.
+
+  The client bundle is around 1.3MB, and it used to be inlined into this
+  page in full. That is fine for the home page, which is byte-identical for
+  everyone and now answers a repeat visit with a 304 -- but it is not fine
+  for the pages people actually share. Every distinct shared list URL, every
+  configure link and every deep link produces different HTML, so each one
+  re-sent the entire bundle, and the browser re-parsed it from scratch every
+  time because inline script gets no code cache.
+
+  So everything that varies per request lives in the small inline preamble
+  below, and everything that does not lives in a separate script served from
+  a content-hashed URL with immutable caching. The bundle is then fetched
+  once and reused across every page of the site, and a deploy changes the
+  hash so nobody is ever served a stale one.
+
+  Both are plain classic scripts with no defer/async, so they still execute
+  in order, and the preamble's const/let bindings are script-scoped globals
+  that the bundle reads and assigns exactly as it did when the two were one
+  element.
+-->
 <script>
 const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
@@ -10,11 +32,38 @@ const IS_CONFIGURE = ${isConfigureMode};
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
 const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+// The signed-in person's OAuth tokens. These are the reason the preamble
+// exists at all: they are specific to one page load and must never end up
+// in the shared bundle below, which is cached publicly under a URL that is
+// identical for every visitor.
+let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
+let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
+let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
+let simklUsername = ${JSON.stringify(initialSimklUsername)};
+// Resolved from an install/configure link by the route that rendered this
+// page. Previously declared far down in 24_client-backup-restore-presets.js;
+// hoisted here because they differ per config. Moving a const declaration
+// earlier is always safe -- anything that read it before would have been a
+// temporal-dead-zone error, so nothing could have been relying on the old
+// position.
+const serverEntries = (${initialEntriesJson});
+const serverEntriesAreDefaults = ${usingDefaultEntries ? 'true' : 'false'};
+const serverShuffleShelves = ${initialShuffleShelves ? 'true' : 'false'};
+const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
+</script>
+<script>/*MYLISTS_APP_BUNDLE_START*/
 // Every native/official chart's (slug, name, movieUrl, showUrl) -- lets
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+function escapeAttr(s) { return escapeHtml(s); }
 
 (function earlySubmenuSync() {
   try {
@@ -285,7 +334,7 @@ function isListAddedToConfig(url, type, slug) {
       targetSlug = url.slice('custom:'.length);
     } else if (url.startsWith('customlist:v1:')) {
       const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
-      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+      if (p) targetSlug = p.localSlug || p.listSlug || p.creatorSlug || p.slug || '';
     }
   }
 
@@ -306,7 +355,7 @@ function isListAddedToConfig(url, type, slug) {
         if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) return true;
         if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) return true;
         const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
-        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) return true;
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.creatorSlug === targetSlug || payload.slug === targetSlug)) return true;
       }
     }
     if (targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
@@ -329,7 +378,7 @@ function removeListFromConfig(url, type, slug) {
       targetSlug = url.slice('custom:'.length);
     } else if (url.startsWith('customlist:v1:')) {
       const p = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(url) : null;
-      if (p) targetSlug = p.localSlug || p.listSlug || p.slug || '';
+      if (p) targetSlug = p.localSlug || p.listSlug || p.creatorSlug || p.slug || '';
     }
   }
 
@@ -352,7 +401,7 @@ function removeListFromConfig(url, type, slug) {
         if (u.startsWith('autotrack:' + targetSlug + ':') || u.startsWith('autotrack:' + targetSlug)) { match = true; break; }
         if (u.startsWith('/lists/') && u.endsWith('/' + targetSlug)) { match = true; break; }
         const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(u) : null;
-        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
+        if (payload && (payload.localSlug === targetSlug || payload.listSlug === targetSlug || payload.creatorSlug === targetSlug || payload.slug === targetSlug)) { match = true; break; }
       }
     }
     if (!match && targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
@@ -515,10 +564,13 @@ var livePreviewShelfData = [];
 // via the Connect Trakt button/OAuth flow, not typed in, so it lives as
 // its own piece of state instead of being read from a DOM field.
 var activeTraktToken = null;
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+// traktAccessToken / mdblistAccessToken / simklAccessToken / simklUsername
+// are declared in the small per-request preamble at the top of this script
+// section, not here. They carry the signed-in person's OAuth tokens, so
+// they must stay in the inline page, out of the shared, cacheable bundle
+// below -- see the preamble's own comment. They are still ordinary
+// script-scoped bindings, so every assignment and read in this file works
+// exactly as before.
 
 async function compressJsonToBase64(obj) {
   try {
@@ -586,15 +638,23 @@ function switchTab(name) {
     document.documentElement.removeAttribute('data-initial-tab');
   } catch (e) {}
 
-  document.querySelectorAll('.tab-panel').forEach(function(p) {
+  // Instant DOM tab switching
+  const panels = document.querySelectorAll('.tab-panel');
+  for (let i = 0; i < panels.length; i++) {
+    const p = panels[i];
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
-  });
-  document.querySelectorAll('.tab-btn').forEach(function(b) {
+  }
+  const tabBtns = document.querySelectorAll('.tab-btn');
+  for (let i = 0; i < tabBtns.length; i++) {
+    const b = tabBtns[i];
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
-  });
-  document.querySelectorAll('.bottom-nav-item').forEach(function(b) {
+  }
+  const navItems = document.querySelectorAll('.bottom-nav-item');
+  for (let i = 0; i < navItems.length; i++) {
+    const b = navItems[i];
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
-  });
+  }
+
   if (name !== 'list-details' && name !== 'item-details') {
     window._originTab = name;
     window._previousTab = name;
@@ -682,25 +742,6 @@ function switchTab(name) {
   if (name === 'catalogs') {
     if (!window._catalogsInitializedOnce) {
       window._catalogsInitializedOnce = true;
-      // Rows are added by the page's own init sequence (addRow calls in
-      // 24_client-backup-restore-presets.js, driven by either the install
-      // link's serverEntries or a restored localStorage save) earlier in
-      // the same script, and restoreActiveTab (which reaches this via
-      // switchTab) runs after that block finishes -- so #lists should
-      // already be populated by the time this fires. But this is the
-      // first tab-switch of the page's life, run from the very tail of a
-      // long synchronous init script, and depends on that whole prior
-      // sequence having actually completed rather than merely being
-      // *scheduled* -- if anything upstream ever ends up deferring its
-      // own addRow calls (e.g. a slow-loading dependency, a future
-      // refactor), calling renderLivePreview against an empty #lists here
-      // finds zero enabled shelves and silently no-ops (see its own early
-      // return), permanently leaving every row on its "Click Refresh
-      // Preview" placeholder with nothing left to ever retry it. Guarding
-      // on an actual entry existing (rather than trusting a fixed delay,
-      // which either races on a slow device or wastes time on a fast one)
-      // makes this immune to exactly how long that upstream sequence
-      // takes, including if it ever changes.
       const triggerLivePreview = () => {
         const hasRows = document.getElementById('lists') && document.getElementById('lists').querySelector('.entry');
         if (hasRows) {
@@ -882,6 +923,22 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
 }
 
 function restoreActiveTab() {
+  const p = (typeof location !== 'undefined' && location.pathname) ? location.pathname : '';
+  const h = (typeof location !== 'undefined' && location.hash) ? location.hash : '';
+  const isDeep = (typeof SERVER_DEEP_LINK_LIST !== 'undefined' && SERVER_DEEP_LINK_LIST) ||
+    (p.startsWith('/lists/') && p !== '/lists') ||
+    p.startsWith('/channels/') ||
+    h.startsWith('#/list?') ||
+    h.startsWith('#/item?');
+
+  if (isDeep) {
+    try {
+      window._originTab = localStorage.getItem('myListAddon:activeTab') || 'discover';
+      window._previousTab = window._originTab;
+    } catch (e) {}
+    return;
+  }
+
   let tab = 'discover';
   try {
     tab = localStorage.getItem('myListAddon:activeTab') || 'discover';
@@ -984,6 +1041,9 @@ function switchSettingsSubmenu(name, btn) {
   const activeId = subpanels[name] || 'settingsSubAccount';
   const activeEl = document.getElementById(activeId);
   if (activeEl) activeEl.style.display = 'block';
+  if (name === 'backup' && typeof renderPresetsList === 'function') {
+    renderPresetsList();
+  }
   if (name === 'external' && typeof populateImportTargetLists === 'function') {
     populateImportTargetLists();
   }
@@ -1693,11 +1753,70 @@ function parseCustomListPayloadClient(u) {
     if (!raw.startsWith('customlist:v1:')) return null;
     const data = JSON.parse(raw.slice('customlist:v1:'.length));
     if (!data || !Array.isArray(data.items)) return null;
-    if (data.type !== 'movie' && data.type !== 'series') return null;
+    if (data.type && data.type !== 'movie' && data.type !== 'series' && data.type !== 'mixed') return null;
     return data;
   } catch (e) {
     return null;
   }
+}
+
+function findCustomListBySlugOrName(slug, name) {
+  if (!slug && !name) return null;
+  const sLower = String(slug || '').toLowerCase().trim();
+  const nLower = String(name || '').toLowerCase().trim();
+  const slugifiedName = (typeof slugify === 'function' && name) ? slugify(name).toLowerCase() : '';
+  const deslugified = (typeof deslugify === 'function' && slug) ? deslugify(slug).toLowerCase() : '';
+
+  function matches(l) {
+    if (!l) return false;
+    const lSlug = String(l.slug || l.localSlug || l.creatorSlug || l.listSlug || '').toLowerCase();
+    const lName = String(l.name || '').toLowerCase();
+    const lNameSlug = (typeof slugify === 'function' && l.name) ? slugify(l.name).toLowerCase() : '';
+    if (sLower && (lSlug === sLower || lName === sLower || lNameSlug === sLower || (deslugified && lName === deslugified))) return true;
+    if (nLower && (lName === nLower || lSlug === nLower || lNameSlug === nLower || (slugifiedName && (lSlug === slugifiedName || lNameSlug === slugifiedName)))) return true;
+    return false;
+  }
+
+  // 1. Check loadLocalCustomLists()
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    if (sLower && map[sLower]) return map[sLower];
+    const found = Object.values(map).find(matches);
+    if (found) return found;
+  } catch (e) {}
+
+  // 2. Check DOM entries (#lists .entry)
+  try {
+    const entries = document.querySelectorAll('#lists .entry');
+    for (const entry of entries) {
+      const urlInput = entry.querySelector('.url');
+      if (!urlInput || !urlInput.value) continue;
+      const payload = (typeof parseCustomListPayloadClient === 'function') ? parseCustomListPayloadClient(urlInput.value) : null;
+      if (payload && matches(payload)) return payload;
+    }
+  } catch (e) {}
+
+  // 3. Check lastCreatorListsData
+  if (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData)) {
+    const found = lastCreatorListsData.find(matches);
+    if (found) return found;
+  }
+
+  // 4. Check lastLocalCustomListsData
+  if (typeof lastLocalCustomListsData !== 'undefined' && Array.isArray(lastLocalCustomListsData)) {
+    const found = lastLocalCustomListsData.find(matches);
+    if (found) return found;
+  }
+
+  // 5. Check livePreviewShelfData
+  if (typeof livePreviewShelfData !== 'undefined' && Array.isArray(livePreviewShelfData)) {
+    const shelf = livePreviewShelfData.find(s => s && matches(s));
+    if (shelf && Array.isArray(shelf.sample) && shelf.sample.length) {
+      return { name: shelf.name, type: shelf.type, items: shelf.sample, slug: slug || shelf.slug };
+    }
+  }
+
+  return null;
 }
 
 function customListSourceRowHtml(u) {
@@ -1720,6 +1839,73 @@ function customListSourceRowHtml(u) {
     publishedLinkHtml +
     '<input type="hidden" class="url" value="' + escapeAttr(u) + '">' +
     '</div>';
+}
+
+function syncCustomListToCatalogRows(slug, items, name, type) {
+  if (!slug || !Array.isArray(items)) return;
+  let updatedAny = false;
+
+  document.querySelectorAll('#lists .entry').forEach((entry) => {
+    const sourceRows = entry.querySelectorAll('.source-row');
+    sourceRows.forEach((sourceRow) => {
+      const urlInput = sourceRow.querySelector('.url');
+      if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+      try {
+        const payload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+        const matchesSlug = payload.localSlug === slug || payload.listSlug === slug || payload.creatorSlug === slug || payload.slug === slug || (slug && payload.listId === slug);
+        if (!matchesSlug) return;
+
+        const shelfType = payload.type || type || 'movie';
+        let shelfItems = items;
+        if (shelfType === 'movie' && (type === 'mixed' || !type || items.some((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId)))) {
+          shelfItems = items.filter((it) => it && (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        } else if (shelfType === 'series' && (type === 'mixed' || !type || items.some((it) => it && (it.kind === 'movie' || it.type === 'movie')))) {
+          shelfItems = items.filter((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        }
+
+        payload.items = shelfItems;
+        if (name && payload.name) payload.name = name;
+
+        const newUrl = 'customlist:v1:' + JSON.stringify(payload);
+        if (typeof customListSourceRowHtml === 'function') {
+          const temp = document.createElement('div');
+          temp.innerHTML = customListSourceRowHtml(newUrl);
+          if (temp.firstElementChild) {
+            sourceRow.replaceWith(temp.firstElementChild);
+          } else {
+            urlInput.value = newUrl;
+          }
+        } else {
+          urlInput.value = newUrl;
+        }
+
+        if (name && entry.querySelectorAll('.url').length === 1) {
+          const rowNameInput = entry.querySelector('.name');
+          if (rowNameInput) {
+            const isMixed = type === 'mixed' || (!type && items.some((it) => it && (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId)) && items.some((it) => it && (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId))));
+            if (isMixed) {
+              if (payload.type === 'movie' && !name.toLowerCase().includes('(movies)')) {
+                rowNameInput.value = name + ' (Movies)';
+              } else if (payload.type === 'series' && !name.toLowerCase().includes('(shows)')) {
+                rowNameInput.value = name + ' (Shows)';
+              } else {
+                rowNameInput.value = name;
+              }
+            } else {
+              rowNameInput.value = name;
+            }
+          }
+        }
+
+        updatedAny = true;
+      } catch (e) {}
+    });
+  });
+
+  if (updatedAny) {
+    if (typeof saveState === 'function') saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
+  }
 }
 
 // A short, stable random id for a Channel row -- generated once when the

@@ -13,7 +13,7 @@
       if (!env || !env.CONFIGS) return { ok: false, error: "no-kv" };
       const v = validateCreatorUsername(creatorNameRaw);
       if (!v.ok) return { ok: false, error: "Username or Key is incorrect." };
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return { ok: false, error: "Username or Key is incorrect." };
       let profile;
       try {
@@ -21,7 +21,12 @@
       } catch {
         return { ok: false, error: "Username or Key is incorrect." };
       }
-      const valid = await verifyCreatorKey(creatorKey || "", profile.keyHash);
+      // Memoized only after a successful PBKDF2 verification, in this
+      // isolate's memory, for a few minutes -- see
+      // verifyCreatorKeyMemoized (02_http-and-creator-utils.js) for why
+      // that is not a weakening of the check. A wrong key still costs a
+      // full PBKDF2 run every single time.
+      const valid = await verifyCreatorKeyMemoized(creatorKey || "", profile.keyHash, v.normalized);
       if (!valid) return { ok: false, error: "Username or Key is incorrect." };
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
@@ -113,7 +118,7 @@
         await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
           lastPingAt: Date.now(),
           lastPingId: pingId,
-          matched: "error: this install's Creator Profile credentials no longer authenticate -- re-generate the install link from Settings.",
+          matched: "error: this install's Profile credentials no longer authenticate -- re-generate the install link from Settings.",
         }));
         return;
       }
@@ -176,7 +181,7 @@
           if (season == null || episode == null || !Number.isFinite(season) || !Number.isFinite(episode)) {
             matched = "no (unrecognized episode id format)";
           } else {
-            const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey);
+            const seasonData = await fetchTmdbSeasonDetails(imdbId, season, effectiveTmdbKey, null, env, ctx);
             let ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episode) : null;
             if (!ep && seasonData && Array.isArray(seasonData.episodes) && seasonData.episodes.length > 0) {
               ep = seasonData.episodes[episode - 1] || seasonData.episodes[0];
@@ -184,7 +189,7 @@
             if (!ep) {
               matched = "no (could not look up this episode on TMDB)";
             } else {
-              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series", "", false, env, ctx).catch(() => null);
               const showGenres = (showDetails && showDetails.genres) || [];
               const showYear = (showDetails && (showDetails.releaseYear || showDetails.year || (showDetails.releaseDate && showDetails.releaseDate.slice(0, 4)))) || null;
               ctx.waitUntil(recordPlaybackTelemetry(env, "episode", showGenres, showYear));
@@ -199,7 +204,7 @@
                   id: epIdStr,
                   type: "episode",
                   name: ep.name || ("Episode " + episode),
-                  poster: ep.still_path || (showDetails && showDetails.poster) || "",
+                  poster: ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : "https://image.tmdb.org/t/p/w500" + ep.still_path) : ((showDetails && showDetails.poster) || ""),
                   showId: imdbId,
                   showTitle: (showDetails && showDetails.title) || "",
                   showPoster: (showDetails && showDetails.poster) || "",
@@ -210,7 +215,7 @@
             }
           }
         } else if (stremioType === "movie") {
-          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie", "", false, env, ctx).catch(() => null);
           const movieGenres = (details && details.genres) || [];
           const movieYear = (details && (details.releaseYear || details.year || (details.releaseDate && details.releaseDate.slice(0, 4)))) || null;
           ctx.waitUntil(recordPlaybackTelemetry(env, "movie", movieGenres, movieYear));
@@ -270,27 +275,30 @@
 
             if (recordEpisode) {
               const { epIdStr, episodeEntry } = recordEpisode;
-              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode));
-              if (!alreadyWatched) {
-                blob.watchHistory.unshift(episodeEntry);
-              }
+              blob.watchHistory = blob.watchHistory.filter((it) => !(String(it.id) === epIdStr || (it.showId === imdbId && it.seasonNum === season && it.episodeNum === episode)));
+              blob.watchHistory.unshift({ ...episodeEntry, watchedAt: Date.now() });
               // Recompute this show's Continue Watching the same way the
               // cron does (checkForNewEpisodes, 07_source-fetchers-tmdb-
               // simkl.js) -- if this ping's episode happens to be the
               // latest watched one, this naturally finds and queues
               // whatever airs next.
+              const oldCwItems = blob.continueWatching.filter((it) => it.showId === imdbId);
               blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== imdbId);
               const watchedEps = blob.watchHistory.filter((it) => it.type === "episode" && it.showId === imdbId && it.seasonNum != null && it.episodeNum != null);
               if (watchedEps.length) {
                 const latest = watchedEps.reduce((best, e) => {
-                  if (e.seasonNum > best.seasonNum) return e;
-                  if (e.seasonNum === best.seasonNum && e.episodeNum > best.episodeNum) return e;
+                  const eS = Number(e.seasonNum);
+                  const eE = Number(e.episodeNum);
+                  const bS = Number(best.seasonNum);
+                  const bE = Number(best.episodeNum);
+                  if (eS > bS) return e;
+                  if (eS === bS && eE > bE) return e;
                   return best;
                 }, watchedEps[0]);
                 const dismissed = blob.dismissedContinueWatching[imdbId];
                 const stillDismissed = !!(dismissed && dismissed.seasonNum === latest.seasonNum && dismissed.episodeNum === latest.episodeNum);
                 if (!stillDismissed) {
-                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey).catch(() => null);
+                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey, env).catch(() => null);
                   if (next) {
                     blob.continueWatching.unshift({
                       id: String(next.episode.id),
@@ -307,16 +315,22 @@
                     });
                     blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
                   } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
-                    blob.fullyWatchedShowIds.push(imdbId);
+                    // TMDB either had no next episode (show is finished) OR the fetch failed (rate limit/timeout).
+                    // If it was a network failure, we don't want to completely lose the show from Continue Watching,
+                    // so we restore the old state just in case. If it truly is finished, it will stay in the old state
+                    // (which is fine, the user can manually dismiss it) or they will naturally fall off.
+                    if (oldCwItems && oldCwItems.length > 0) {
+                      blob.continueWatching = [...oldCwItems, ...blob.continueWatching];
+                    } else {
+                      blob.fullyWatchedShowIds.push(imdbId);
+                    }
                   }
                 }
               }
             } else if (recordMovie) {
               const { movieId, movieEntry } = recordMovie;
-              alreadyWatched = blob.watchHistory.some((it) => String(it.id) === movieId);
-              if (!alreadyWatched) {
-                blob.watchHistory.unshift(movieEntry);
-              }
+              blob.watchHistory = blob.watchHistory.filter((it) => String(it.id) !== movieId);
+              blob.watchHistory.unshift({ ...movieEntry, watchedAt: Date.now() });
             }
 
             if (blob.watchlist.length) {
@@ -335,6 +349,49 @@
               continue;
             }
             await env.CONFIGS.put(syncKey, serializedBlob);
+
+            // Also write a tiny dedicated scrobble-queue key.
+            // Cloudflare KV is eventually consistent -- a write from one edge
+            // location (where Nuvio's request lands) can take up to 60 seconds
+            // to be readable from another edge (where the browser's save-tracking
+            // or load request lands). By writing the just-scrobbled items to a
+            // second, separate small key, save-tracking and load can always merge
+            // from it as an independent read that's unaffected by the big blob's
+            // propagation lag. Keep only the most recent 20 items to stay tiny.
+            try {
+              const queueKey = `creatorscrobblequeue:${auth.username}`;
+              const queueRaw = await env.CONFIGS.get(queueKey);
+              let qObj = { watchHistory: [], continueWatching: [] };
+              if (queueRaw) {
+                try {
+                  const parsed = JSON.parse(queueRaw);
+                  if (Array.isArray(parsed)) {
+                    qObj.watchHistory = parsed;
+                  } else if (parsed && typeof parsed === "object") {
+                    qObj.watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+                    qObj.continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+                  }
+                } catch {}
+              }
+              if (recordEpisode) {
+                const { epIdStr, episodeEntry } = recordEpisode;
+                qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== epIdStr);
+                qObj.watchHistory.unshift({ ...episodeEntry, watchedAt: Date.now() });
+              } else if (recordMovie) {
+                const { movieId, movieEntry } = recordMovie;
+                qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== movieId);
+                qObj.watchHistory.unshift({ ...movieEntry, watchedAt: Date.now() });
+              }
+              if (blob.continueWatching && blob.continueWatching.length > 0) {
+                const latestCw = blob.continueWatching[0];
+                qObj.continueWatching = qObj.continueWatching.filter((it) => it && String(it.showId || it.id) !== String(latestCw.showId || latestCw.id));
+                qObj.continueWatching.unshift(latestCw);
+              }
+              qObj.watchHistory = qObj.watchHistory.slice(0, 20);
+              qObj.continueWatching = qObj.continueWatching.slice(0, 20);
+              await env.CONFIGS.put(queueKey, JSON.stringify(qObj));
+            } catch {}
+
             break;
           }
 
@@ -415,6 +472,22 @@
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      await ensureTrackingMigrated(env, authUser);
+
+      if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
+        try {
+          const rawSync = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          if (rawSync) {
+            const syncObj = JSON.parse(rawSync);
+            if (syncObj && syncObj.keys && syncObj.keys.tmdbKey) {
+              effectiveTmdbKey = String(syncObj.keys.tmdbKey).trim();
+            }
+          }
+        } catch {}
+      }
+      if (!effectiveTmdbKey) {
+        effectiveTmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY || "";
+      }
 
       // 2. Parse payload from Plex, Jellyfin, or Emby
       const contentType = request.headers.get("content-type") || "";
@@ -447,6 +520,7 @@
       let server = "Media Server";
       let eventType = "";
       let mediaType = "movie"; // "movie" or "series"
+      let mediaServerUser = ""; // username who triggered the event
       let imdbId = "";
       let tmdbId = "";
       let title = "";
@@ -462,6 +536,14 @@
         eventType = String(payload.event || "").toLowerCase();
         isPlayed = eventType === "media.scrobble" || eventType === "media.play" || eventType === "media.stop" || eventType === "media.resume";
         
+        let pUser = (payload.Account && (payload.Account.title || payload.Account.name || payload.Account.id)) ||
+                    (payload.User && (payload.User.title || payload.User.name || payload.User.Name)) ||
+                    payload.username || payload.user_name || payload.account || "";
+        if (typeof pUser !== "string" && typeof pUser !== "number") pUser = "";
+        pUser = String(pUser).trim();
+        if (pUser === "true" || pUser === "false" || pUser === "null" || pUser === "undefined") pUser = "";
+        mediaServerUser = pUser;
+
         const meta = payload.Metadata || {};
         mediaType = meta.type === "episode" ? "series" : "movie";
         title = meta.title || "";
@@ -470,15 +552,21 @@
         episode = meta.index != null ? Number(meta.index) : null;
         year = meta.year || null;
 
-        const guids = Array.isArray(meta.Guid) ? meta.Guid : (meta.guid ? [{ id: meta.guid }] : []);
+        const guids = [
+          ...(meta.grandparentGuid ? [{ id: meta.grandparentGuid }] : []),
+          ...(meta.parentGuid ? [{ id: meta.parentGuid }] : []),
+          ...(Array.isArray(meta.Guid) ? meta.Guid : (meta.guid ? [{ id: meta.guid }] : []))
+        ];
         for (const g of guids) {
           const gid = String(g.id || "");
           if (gid.includes("imdb://tt")) {
             const m = gid.match(/tt\d+/);
-            if (m) imdbId = m[0];
+            if (m && !imdbId) imdbId = m[0];
           } else if (gid.includes("tmdb://")) {
             const m = gid.match(/tmdb:\/\/(\d+)/);
-            if (m) tmdbId = m[1];
+            if (m && !tmdbId) tmdbId = m[1];
+          } else if (gid.startsWith("tt") && !imdbId) {
+            imdbId = gid;
           }
         }
       }
@@ -488,6 +576,12 @@
         eventType = String(payload.NotificationType || payload.Event || "").toLowerCase();
         isPlayed = eventType.includes("playback") || eventType.includes("userdata") || eventType.includes("scrobble") || payload.Played === true;
         
+        let jUser = payload.NotificationUsername || payload.UserName || payload.Username || (payload.User && (payload.User.Name || payload.User.name)) || payload.user || "";
+        if (typeof jUser !== "string" && typeof jUser !== "number") jUser = "";
+        jUser = String(jUser).trim();
+        if (jUser === "true" || jUser === "false" || jUser === "null" || jUser === "undefined") jUser = "";
+        mediaServerUser = jUser;
+        
         mediaType = (payload.ItemType === "Episode" || payload.SeriesName) ? "series" : "movie";
         title = payload.Name || payload.ItemName || "";
         showTitle = payload.SeriesName || "";
@@ -495,15 +589,22 @@
         episode = payload.EpisodeNumber != null ? Number(payload.EpisodeNumber) : null;
         year = payload.Year || null;
 
-        const pIds = payload.ProviderIds || {};
-        imdbId = pIds.Imdb || pIds.imdb || payload.Provider_imdb || "";
-        tmdbId = pIds.Tmdb || pIds.tmdb || payload.Provider_tmdb || "";
+        const sPIds = payload.SeriesProviderIds || (payload.Item && payload.Item.SeriesProviderIds) || {};
+        const pIds = payload.ProviderIds || (payload.Item && payload.Item.ProviderIds) || {};
+        imdbId = sPIds.Imdb || sPIds.imdb || payload.SeriesImdbId || pIds.Imdb || pIds.imdb || payload.Provider_imdb || "";
+        tmdbId = sPIds.Tmdb || sPIds.tmdb || payload.SeriesTmdbId || pIds.Tmdb || pIds.tmdb || payload.Provider_tmdb || "";
       }
       // C. Emby Webhook format
       else if (payload.Item || (payload.Event && String(payload.Event).startsWith("playback."))) {
         server = "Emby";
         eventType = String(payload.Event || "").toLowerCase();
         isPlayed = eventType.includes("scrobble") || eventType.includes("playback.start") || eventType.includes("playback.stop") || eventType.includes("markplayed");
+        
+        let eUser = (payload.User && (payload.User.Name || payload.User.name || payload.User.Id || payload.User.id)) || payload.UserName || payload.Username || payload.user || "";
+        if (typeof eUser !== "string" && typeof eUser !== "number") eUser = "";
+        eUser = String(eUser).trim();
+        if (eUser === "true" || eUser === "false" || eUser === "null" || eUser === "undefined") eUser = "";
+        mediaServerUser = eUser;
 
         const item = payload.Item || payload;
         mediaType = (item.Type === "Episode" || item.SeriesName) ? "series" : "movie";
@@ -512,9 +613,94 @@
         season = item.ParentIndexNumber != null ? Number(item.ParentIndexNumber) : null;
         episode = item.IndexNumber != null ? Number(item.IndexNumber) : null;
 
+        const sPIds = item.SeriesProviderIds || {};
         const pIds = item.ProviderIds || {};
-        imdbId = pIds.Imdb || pIds.imdb || "";
-        tmdbId = pIds.Tmdb || pIds.tmdb || "";
+        imdbId = sPIds.Imdb || sPIds.imdb || pIds.Imdb || pIds.imdb || "";
+        tmdbId = sPIds.Tmdb || sPIds.tmdb || pIds.Tmdb || pIds.tmdb || "";
+      }
+
+      // 4a. Record this username in the seen-users list
+      if (mediaServerUser) {
+        const recordUserTask = async () => {
+          try {
+            const seenKey = `scrobbleseenusers:${authUser}`;
+            const raw = await env.CONFIGS.get(seenKey);
+            const seen = raw ? JSON.parse(raw) : {};
+            seen[mediaServerUser] = { server, lastSeen: Date.now() };
+            // 90-day TTL — stale accounts from old servers quietly expire
+            await env.CONFIGS.put(seenKey, JSON.stringify(seen), { expirationTtl: 60 * 60 * 24 * 90 });
+          } catch {}
+        };
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(recordUserTask());
+        } else {
+          await recordUserTask();
+        }
+      }
+
+      // 4b. Apply user filter (URL param first, fallback to user's saved account settings in KV)
+      let filterEnabled = false;
+      let allowedUsersParam = (url.searchParams.get("allowedUsers") || "").trim();
+      let blockAnon = url.searchParams.get("blockAnon") === "1";
+
+      if (url.searchParams.has("filterUsers")) {
+        filterEnabled = url.searchParams.get("filterUsers") === "1";
+      } else if (allowedUsersParam) {
+        filterEnabled = true;
+      }
+
+      if (authUser) {
+        try {
+          let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
+          if (!trackingRaw) {
+            trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          }
+          if (trackingRaw) {
+            const trackingObj = JSON.parse(trackingRaw);
+            if (trackingObj.scrobbleFilterUsers === true || trackingObj.scrobbleFilterUsers === "1" || trackingObj.scrobbleFilterUsers === 1) {
+              filterEnabled = true;
+            } else if (trackingObj.scrobbleFilterUsers === false || trackingObj.scrobbleFilterUsers === "0" || trackingObj.scrobbleFilterUsers === 0) {
+              filterEnabled = false;
+            } else if (trackingObj.scrobbleAllowedUsers) {
+              filterEnabled = true;
+            }
+            if (trackingObj.scrobbleAllowedUsers !== undefined && !url.searchParams.has("allowedUsers")) {
+              allowedUsersParam = String(trackingObj.scrobbleAllowedUsers || "").trim();
+            }
+            if (trackingObj.scrobbleBlockAnonymous && !url.searchParams.has("blockAnon")) {
+              blockAnon = true;
+            }
+          }
+        } catch {}
+      }
+
+      if (filterEnabled) {
+        const allowed = allowedUsersParam.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+        if (!mediaServerUser) {
+          if (blockAnon || allowed.length > 0) {
+            const ignoredMsg = "No username in payload and user filtering is active.";
+            const diagnosticsKey = `creatortrack:${authUser}`;
+            await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+              lastPingAt: Date.now(),
+              lastPingId: pingId || "unknown",
+              lastServer: server,
+              lastUser: null,
+              matched: `ignored (${ignoredMsg})`,
+            }));
+            return json({ ok: true, ignored: ignoredMsg });
+          }
+        } else if (!allowed.includes(mediaServerUser.toLowerCase())) {
+          const ignoredMsg = `User '${mediaServerUser}' is not in the allowed list.`;
+          const diagnosticsKey = `creatortrack:${authUser}`;
+          await env.CONFIGS.put(diagnosticsKey, JSON.stringify({
+            lastPingAt: Date.now(),
+            lastPingId: pingId || mediaServerUser,
+            lastServer: server,
+            lastUser: mediaServerUser,
+            matched: `ignored (${ignoredMsg})`,
+          }));
+          return json({ ok: true, ignored: ignoredMsg });
+        }
       }
 
       if (!isPlayed) {
@@ -533,9 +719,19 @@
         } catch {}
       }
 
+      let searchFoundPoster = "";
       if (!imdbId && (showTitle || title)) {
         try {
-          const q = showTitle || title;
+          let q = showTitle || title;
+          if (mediaType === "series") {
+            q = String(q)
+              .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+              .replace(/[\s._-]+\d+x\d+.*$/i, "")
+              .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+              .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+              .replace(/\s*\(\d{4}\).*$/, "")
+              .trim();
+          }
           const searchType = mediaType === "series" ? "tv" : "movie";
           const searchRes = await fetch(`https://api.themoviedb.org/3/search/${searchType}?api_key=${effectiveTmdbKey}&query=${encodeURIComponent(q)}&page=1`);
           if (searchRes.ok) {
@@ -543,6 +739,9 @@
             if (sd.results && sd.results.length) {
               const first = sd.results[0];
               tmdbId = String(first.id);
+              if (first.poster_path) {
+                searchFoundPoster = `https://image.tmdb.org/t/p/w500${first.poster_path}`;
+              }
               const extRes = await fetch(`https://api.themoviedb.org/3/${searchType}/${first.id}?api_key=${effectiveTmdbKey}&append_to_response=external_ids`);
               if (extRes.ok) {
                 const ed = await extRes.json();
@@ -558,7 +757,6 @@
       // 5. Execute Watch Record
       let matched = "no";
       try {
-        await ensureTrackingMigrated(env, authUser);
         const syncKey = `creatorsynctracking:${authUser}`;
         const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
@@ -582,55 +780,101 @@
           let sTitle = showTitle || title;
           let sPoster = "";
 
-          if (imdbId) {
-            const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, effectiveTmdbKey).catch(() => null);
+          const cleanShowName = String(showTitle || title)
+            .replace(/[\s._-]+[sS]\d+[\s._-]*[eE]\d+.*$/i, "")
+            .replace(/[\s._-]+\d+x\d+.*$/i, "")
+            .replace(/[\s._-]+season[\s._-]*\d+.*$/i, "")
+            .replace(/[\s._-]+episode[\s._-]*\d+.*$/i, "")
+            .replace(/\s*\(\d{4}\).*$/, "")
+            .trim();
+
+          const lookupShowId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || cleanShowName || showTitle || title;
+
+          let epIdStr = "";
+          if (lookupShowId) {
+            const seasonData = await fetchTmdbSeasonDetails(lookupShowId, seasonNum, effectiveTmdbKey, tmdbId, env, ctx).catch(() => null);
             const ep = seasonData && seasonData.episodes ? seasonData.episodes.find((e) => e.episode_number === episodeNum) : null;
             if (ep) {
               epName = ep.name || title;
-              epPoster = ep.still_path || "";
+              epPoster = ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : `https://image.tmdb.org/t/p/w500${ep.still_path}`) : "";
+              if (ep.id) epIdStr = String(ep.id);
             }
-            const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+            const showDetails = await fetchTmdbItemDetails(lookupShowId, effectiveTmdbKey, "series", "", false, env, ctx).catch(() => null);
             if (showDetails) {
               sTitle = showDetails.title || sTitle;
-              sPoster = showDetails.poster || "";
+              sPoster = showDetails.poster || searchFoundPoster || "";
+              if (!imdbId && showDetails.id && showDetails.id.startsWith("tt")) {
+                imdbId = showDetails.id;
+              }
+              if (!tmdbId && showDetails.tmdbId) {
+                tmdbId = String(showDetails.tmdbId);
+              }
+            }
+            if (!sPoster && imdbId && imdbId.startsWith("tt")) {
+              sPoster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
             }
           }
 
-          const itemKey = `${imdbId || sTitle}:${seasonNum}:${episodeNum}`;
-          const alreadyWatched = blob.watchHistory.some((it) => (it.showId === imdbId || it.showTitle === sTitle) && it.seasonNum === seasonNum && it.episodeNum === episodeNum);
-          if (!alreadyWatched) {
-            blob.watchHistory.unshift({
-              id: itemKey,
-              type: "episode",
-              name: epName,
-              poster: epPoster || sPoster,
-              showId: imdbId || sTitle,
-              showTitle: sTitle,
-              showPoster: sPoster,
-              seasonNum: seasonNum,
-              episodeNum: episodeNum,
-            });
-          }
+          const resolvedShowId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || sTitle;
+          const itemKey = epIdStr || `${resolvedShowId}:${seasonNum}:${episodeNum}`;
+          const finalEpisodePoster = epPoster || sPoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "");
+          const finalShowPoster = sPoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "") || epPoster;
+          
+          // Re-watching or newly watching an episode always brings it to the top of Watch History
+          blob.watchHistory = blob.watchHistory.filter((it) => !((it.showId === resolvedShowId || it.showTitle === sTitle) && it.seasonNum === seasonNum && it.episodeNum === episodeNum));
+          blob.watchHistory.unshift({
+            id: itemKey,
+            type: "episode",
+            name: epName,
+            poster: finalEpisodePoster,
+            showId: resolvedShowId,
+            showTitle: sTitle,
+            showPoster: finalShowPoster,
+            seasonNum: seasonNum,
+            episodeNum: episodeNum,
+            watchedAt: Date.now(),
+          });
 
           // Recompute Continue Watching for this show
-          blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== (imdbId || sTitle));
-          if (imdbId) {
-            const next = await findNextAiredEpisodeForShow(imdbId, seasonNum, episodeNum, effectiveTmdbKey).catch(() => null);
+          const oldCwItems = blob.continueWatching.filter((it) => it.showId === resolvedShowId || (imdbId && it.showId === imdbId) || (sTitle && it.showId === sTitle));
+          blob.continueWatching = blob.continueWatching.filter((it) => it.showId !== resolvedShowId && it.showId !== (imdbId || sTitle));
+          if (resolvedShowId) {
+            const watchedEps = blob.watchHistory.filter((it) => it.type === "episode" && (it.showId === resolvedShowId || (sTitle && it.showTitle === sTitle)) && it.seasonNum != null && it.episodeNum != null);
+            let latestSeason = seasonNum;
+            let latestEpisode = episodeNum;
+            if (watchedEps.length) {
+              const latest = watchedEps.reduce((best, e) => {
+                const eS = Number(e.seasonNum);
+                const eE = Number(e.episodeNum);
+                const bS = Number(best.seasonNum);
+                const bE = Number(best.episodeNum);
+                if (eS > bS) return e;
+                if (eS === bS && eE > bE) return e;
+                return best;
+              }, watchedEps[0]);
+              latestSeason = Number(latest.seasonNum);
+              latestEpisode = Number(latest.episodeNum);
+            }
+            const next = await findNextAiredEpisodeForShow(resolvedShowId, latestSeason, latestEpisode, effectiveTmdbKey, env, ctx).catch(() => null);
             if (next) {
               blob.continueWatching.unshift({
-                id: String(next.episode.id),
+                id: next.episode.id ? String(next.episode.id) : `${resolvedShowId}:${next.seasonNum}:${next.episode.episode_number}`,
                 type: "episode",
                 name: next.episode.name,
-                poster: sPoster || "",
-                showId: imdbId,
+                poster: finalShowPoster,
+                showId: resolvedShowId,
                 showTitle: sTitle,
-                showPoster: sPoster,
+                showPoster: finalShowPoster,
                 seasonNum: next.seasonNum,
                 episodeNum: next.episode.episode_number,
               });
-              blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
-            } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
-              blob.fullyWatchedShowIds.push(imdbId);
+              blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== resolvedShowId && s !== imdbId);
+            } else if (!blob.fullyWatchedShowIds.includes(resolvedShowId)) {
+              if (oldCwItems && oldCwItems.length > 0) {
+                blob.continueWatching = [...oldCwItems, ...blob.continueWatching];
+              } else {
+                blob.fullyWatchedShowIds.push(resolvedShowId);
+              }
             }
           }
           matched = `yes (${server}: ${sTitle} S${seasonNum}E${episodeNum})`;
@@ -638,22 +882,34 @@
           // Movie
           let movieTitle = title;
           let moviePoster = "";
-          if (imdbId) {
-            const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+          const lookupMovieId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || title;
+          if (lookupMovieId) {
+            const details = await fetchTmdbItemDetails(lookupMovieId, effectiveTmdbKey, "movie", "", false, env, ctx).catch(() => null);
             if (details) {
               movieTitle = details.title || movieTitle;
-              moviePoster = details.poster || "";
+              moviePoster = details.poster || searchFoundPoster || "";
+              if (!imdbId && details.id && details.id.startsWith("tt")) {
+                imdbId = details.id;
+              }
+              if (!tmdbId && details.tmdbId) {
+                tmdbId = String(details.tmdbId);
+              }
+            }
+            if (!moviePoster && imdbId && imdbId.startsWith("tt")) {
+              moviePoster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
             }
           }
-          const alreadyWatched = blob.watchHistory.some((it) => String(it.id) === imdbId || it.name === movieTitle);
-          if (!alreadyWatched) {
-            blob.watchHistory.unshift({
-              id: imdbId || movieTitle,
-              type: "movie",
-              name: movieTitle,
-              poster: moviePoster,
-            });
-          }
+          const resolvedMovieId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : "") || movieTitle;
+          const finalMoviePoster = moviePoster || (imdbId && imdbId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${imdbId}/img` : "");
+          
+          blob.watchHistory = blob.watchHistory.filter((it) => !(String(it.id) === resolvedMovieId || String(it.id) === imdbId || it.name === movieTitle));
+          blob.watchHistory.unshift({
+            id: resolvedMovieId,
+            type: "movie",
+            name: movieTitle,
+            poster: finalMoviePoster,
+            watchedAt: Date.now(),
+          });
           matched = `yes (${server}: ${movieTitle})`;
         }
 
@@ -664,6 +920,37 @@
 
         blob.updatedAt = Date.now();
         await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+
+        // Also write to creatorscrobblequeue to protect against KV propagation lag
+        try {
+          const queueKey = `creatorscrobblequeue:${authUser}`;
+          const queueRaw = await env.CONFIGS.get(queueKey);
+          let qObj = { watchHistory: [], continueWatching: [] };
+          if (queueRaw) {
+            try {
+              const parsed = JSON.parse(queueRaw);
+              if (Array.isArray(parsed)) {
+                qObj.watchHistory = parsed;
+              } else if (parsed && typeof parsed === "object") {
+                qObj.watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+                qObj.continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+              }
+            } catch {}
+          }
+          if (blob.watchHistory.length > 0) {
+            const latestItem = blob.watchHistory[0];
+            qObj.watchHistory = qObj.watchHistory.filter((it) => it && String(it.id) !== String(latestItem.id));
+            qObj.watchHistory.unshift({ ...latestItem });
+          }
+          if (blob.continueWatching.length > 0) {
+            const latestCw = blob.continueWatching[0];
+            qObj.continueWatching = qObj.continueWatching.filter((it) => it && String(it.showId || it.id) !== String(latestCw.showId || latestCw.id));
+            qObj.continueWatching.unshift(latestCw);
+          }
+          qObj.watchHistory = qObj.watchHistory.slice(0, 20);
+          qObj.continueWatching = qObj.continueWatching.slice(0, 20);
+          await env.CONFIGS.put(queueKey, JSON.stringify(qObj));
+        } catch {}
       } catch (err) {
         matched = `error (${server}): ` + (err && err.message ? err.message : String(err));
       }
@@ -674,12 +961,14 @@
         lastPingAt: Date.now(),
         lastPingId: pingId,
         lastServer: server,
+        lastUser: mediaServerUser || null,
         matched: matched,
       }));
 
       return json({
         ok: true,
         server: server,
+        user: mediaServerUser || null,
         event: eventType,
         matched: matched,
       });
@@ -704,7 +993,7 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       const raw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
-      let status = { lastPingAt: null, lastPingId: null, matched: null };
+      let status = { lastPingAt: null, lastPingId: null, lastServer: null, lastUser: null, matched: null };
       if (raw) {
         try {
           status = JSON.parse(raw);
@@ -713,6 +1002,41 @@
         }
       }
       return json({ ok: true, ...status });
+    }
+
+    // /api/creator/scrobble-seen-users  (POST)  { creatorName, creatorKey } ->
+    // { ok, users: { "James": { server: "Plex", lastSeen: 1234567890 }, ... } }
+    // Returns all media server usernames ever seen in webhook events for this account.
+    // Populated automatically by handleMediaServerScrobble whenever a username is
+    // present in the incoming payload. Used by the settings page to show checkboxes
+    // for user filtering without requiring manual name entry.
+    if (path === "/api/creator/scrobble-seen-users" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      const raw = await env.CONFIGS.get(`scrobbleseenusers:${auth.username}`);
+      let users = {};
+      if (raw) {
+        try { users = JSON.parse(raw); } catch {}
+      }
+      // If scrobbleseenusers is empty, check if creatortrack diagnostics has a lastUser
+      if (!Object.keys(users).length) {
+        try {
+          const diagRaw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
+          if (diagRaw) {
+            const diag = JSON.parse(diagRaw);
+            if (diag && diag.lastUser) {
+              users[diag.lastUser] = { server: diag.lastServer || "Media Server", lastSeen: diag.lastPingAt || Date.now() };
+            }
+          }
+        } catch {}
+      }
+      return json({ ok: true, users });
     }
 
     // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
@@ -725,7 +1049,7 @@
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rateLimitKey = `ratelimit:creatorcreate:${ip}`;
       if (await env.CONFIGS.get(rateLimitKey)) {
-        return json({ ok: false, error: "Please wait a moment before creating another Creator Profile." }, 429);
+        return json({ ok: false, error: "Please wait a moment before creating another Profile." }, 429);
       }
       let body;
       try {
@@ -741,7 +1065,7 @@
       // both pass the "is it taken" check before either has written
       // anything, and both succeed.
       await env.CONFIGS.put(rateLimitKey, "1", { expirationTtl: 60 });
-      const existing = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const existing = await getCreator(env, v.normalized);
       if (existing) {
         return json({ ok: false, error: "That username is already taken." });
       }
@@ -757,10 +1081,32 @@
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ displayName, keyHash, recoveryAnswerHash, createdAt: Date.now() })
-      );
+      const nowMs = Date.now();
+      const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
+      
+      let wroteToKV = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?)"
+          ).bind(v.normalized, displayName, keyHash, recoveryAnswerHash, nowMs).run();
+        } catch (dbErr) {
+          console.error("D1 write error (creator create):", dbErr);
+          // If D1 fails, write to KV so they aren't totally broken
+          await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
+          wroteToKV = true;
+        }
+      } else {
+        await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
+        wroteToKV = true;
+      }
+      
+      try {
+        const countRaw = await env.CONFIGS.get("stats:creator_count");
+        const count = parseInt(countRaw || "0", 10) + 1;
+        await env.CONFIGS.put("stats:creator_count", String(count));
+      } catch (err) {}
+
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
@@ -805,7 +1151,7 @@
       // exist and which have a recovery answer set at all.
       const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
       if (!v.ok || !answer) return json({ ok: false, error: genericError });
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return json({ ok: false, error: genericError });
       let profile;
       try {
@@ -819,10 +1165,28 @@
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ ...profile, keyHash })
-      );
+      // The previous key must stop working on a warm isolate the instant
+      // it is rotated -- see invalidateCreatorAuthMemo's own comment.
+      invalidateCreatorAuthMemo();
+      
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "UPDATE creators SET key_hash = ? WHERE username = ?"
+          ).bind(keyHash, v.normalized).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creator reset):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creator:${v.normalized}`,
+          JSON.stringify({ ...profile, keyHash })
+        );
+      }
       return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
     }
 
@@ -850,7 +1214,7 @@
       }
       const v = validateCreatorUsername(body.username);
       if (!v.ok) return json({ ok: false, error: "Unknown creator." });
-      const raw = await env.CONFIGS.get(`creator:${v.normalized}`);
+      const raw = await getCreator(env, v.normalized);
       if (!raw) return json({ ok: false, error: "Unknown creator." });
       let profile;
       try {
@@ -860,10 +1224,28 @@
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
-      await env.CONFIGS.put(
-        `creator:${v.normalized}`,
-        JSON.stringify({ ...profile, keyHash })
-      );
+      // The previous key must stop working on a warm isolate the instant
+      // it is rotated -- see invalidateCreatorAuthMemo's own comment.
+      invalidateCreatorAuthMemo();
+      
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "UPDATE creators SET key_hash = ? WHERE username = ?"
+          ).bind(keyHash, v.normalized).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (admin creator reset):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creator:${v.normalized}`,
+          JSON.stringify({ ...profile, keyHash })
+        );
+      }
       return json({ ok: true, creatorKey });
     }
 
@@ -914,7 +1296,7 @@
       const lists = (
         await Promise.all(
           order.map(async (slug) => {
-            const raw = await env.CONFIGS.get(`creatorlist:${auth.username}:${slug}`);
+            const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
@@ -934,7 +1316,84 @@
           })
         )
       ).filter(Boolean);
-      return json({ ok: true, displayName: auth.displayName, lists, order });
+
+      const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
+      if (!hasWatchlistInLists) {
+        const wlRaw = await getCreatorList(env, auth.username, "watchlist");
+        if (wlRaw) {
+          try {
+            const data = JSON.parse(wlRaw);
+            lists.unshift({
+              slug: "watchlist",
+              name: data.name || "Watchlist",
+              type: data.type || "mixed",
+              items: data.items || [],
+              itemCount: (data.items || []).length,
+              likes: data.likes || 0,
+              visibility: data.visibility === "private" ? "private" : "public",
+              url: `${url.origin}/lists/${auth.username}/watchlist`,
+            });
+          } catch {}
+        } else {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (trackingRaw) {
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
+                lists.unshift({
+                  slug: "watchlist",
+                  name: "Watchlist",
+                  type: "mixed",
+                  items: tb.watchlist,
+                  itemCount: tb.watchlist.length,
+                  likes: 0,
+                  visibility: "private",
+                  url: `${url.origin}/lists/${auth.username}/watchlist`,
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Content version + conditional response.
+      //
+      // This endpoint returns the FULL items array for every list the
+      // account owns, and renderCreatorDashboard calls it on every render --
+      // after a save, after a delete, on a tab switch, after a background
+      // sync adopts server state. For anyone with large Custom Lists that
+      // was megabytes down the wire and a megabytes-sized JSON.parse on the
+      // main thread, over and over, almost always producing exactly the
+      // data the browser already had.
+      //
+      // So the browser now sends back the version it last received, and
+      // when nothing has changed it gets a few dozen bytes instead of the
+      // whole payload and keeps using the copy it already holds.
+      //
+      // The version is a hash of the actual response body rather than a
+      // separately-maintained counter. That costs a hash of a string this
+      // endpoint had to build anyway, and in exchange it cannot drift: there
+      // is no bump-on-write to forget in some future list-mutating route,
+      // and any change to any list, its order, or the display name changes
+      // the version by construction. Note it deliberately does NOT save the
+      // KV reads above -- the lists still have to be read to know whether
+      // they changed. What it removes is the transfer and the parse, which
+      // is where the stall the person actually feels comes from.
+      const listsPayload = { ok: true, displayName: auth.displayName, lists, order };
+      let listsVersion = "";
+      try {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
+        listsVersion = [...new Uint8Array(digest)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
+      } catch {
+        // No digest available -- fall through with an empty version, which
+        // can never match what a client sends, so it always gets the full
+        // response. Degrades to the previous behaviour rather than to a
+        // browser that stops seeing its own list changes.
+      }
+      if (listsVersion && body.knownVersion && body.knownVersion === listsVersion) {
+        return json({ ok: true, unchanged: true, version: listsVersion });
+      }
+      return json({ ...listsPayload, version: listsVersion });
     }
 
     // /api/creator/lists/save  (POST)
@@ -987,7 +1446,7 @@
       }
 
       const now = Date.now();
-      const existingRaw = editingSlug ? await env.CONFIGS.get(`creatorlist:${auth.username}:${slug}`) : null;
+      const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
       let likes = 0;
       if (existingRaw) {
@@ -999,10 +1458,26 @@
           createdAt = now;
         }
       }
-      await env.CONFIGS.put(
-        `creatorlist:${auth.username}:${slug}`,
-        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
-      );
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          const listId = `${auth.username}:${slug}`;
+          const itemsJson = JSON.stringify(items || []);
+          await env.DB.prepare(
+            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+          ).bind(listId, auth.username, name, type, visibility, itemsJson, createdAt, now).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creatorlist put):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.put(
+          `creatorlist:${auth.username}:${slug}`,
+          JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
+        );
+      }
       if (!order.includes(slug)) {
         order.push(slug);
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
@@ -1022,7 +1497,19 @@
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      let d1Success = false;
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
+          d1Success = true;
+        } catch (dbErr) {
+          console.error("D1 write error (creatorlist delete):", dbErr);
+        }
+      }
+      
+      if (!d1Success) {
+        await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      }
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -1048,6 +1535,104 @@
       const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
+    }
+
+    // /api/creator/account/reset  (POST)  { creatorName, creatorKey, confirm }
+    //   -> { ok, cleared: { lists, keys } }
+    // Empties an account back to how it looked the moment it was created,
+    // WITHOUT deleting the account itself: the creator record, its key hash
+    // and its recovery answer are all left alone, so the same Creator Name
+    // and Key keep working and the person stays signed in.
+    //
+    // Distinct from /api/creator/delete-account below, which removes the
+    // profile outright. Worth noting while looking at the two together: that
+    // one deletes `creatorprofile:`, `creatortrack:`, `creatorpresets:` and
+    // `creatorchannels:`, which are old key names this codebase no longer
+    // writes -- the live data is under `creator:`, `creatorsynctracking:`,
+    // `creatorsyncpresets:` and `creatorsyncchannels:`. So it currently
+    // leaves most of an account's data behind. Not changed here because
+    // deleting more on that path deserves its own decision, but this reset
+    // uses the names actually in use, plus the legacy ones for good measure.
+    if (path === "/api/creator/account/reset" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Database not configured." }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+
+      // A second, explicit confirmation carried in the request itself. The
+      // key alone is enough to authenticate, but this is irreversible and
+      // there is no undo, so it should not be reachable by a stray request.
+      if (String(body.confirm || "") !== "RESET") {
+        return json({ ok: false, error: "Missing confirmation." }, 400);
+      }
+
+      const u = auth.username;
+      let listsCleared = 0;
+      let keysCleared = 0;
+
+      // Custom lists are one key each, and list() pages -- keep going until
+      // the cursor is exhausted rather than assuming a single page covers an
+      // account that may have hundreds.
+      try {
+        let cursor;
+        for (let page = 0; page < 50; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+          for (const k of res.keys) {
+            await env.CONFIGS.delete(k.name);
+            listsCleared++;
+          }
+          if (res.list_complete || !res.cursor) break;
+          cursor = res.cursor;
+        }
+      } catch (e) {
+        console.error("account reset: list enumeration failed", e);
+      }
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+        } catch (dbErr) {
+          console.error("D1 write error (account reset):", dbErr);
+        }
+      }
+
+      // Everything else the account owns. The identity keys -- creator:<u>
+      // itself -- are deliberately absent from this list.
+      const dataKeys = [
+        `creatorsync:${u}`,
+        `creatorsynctracking:${u}`,
+        `creatorsyncpresets:${u}`,
+        `creatorsyncchannels:${u}`,
+        `creatorlistorder:${u}`,
+        `creatorscrobblequeue:${u}`,
+        `creatorlistlikes:${u}`,
+        `creatorlikes:${u}`,
+        // legacy names, harmless if absent
+        `creatortrack:${u}`,
+        `creatorpresets:${u}`,
+        `creatorchannels:${u}`,
+      ];
+      for (const key of dataKeys) {
+        try {
+          await env.CONFIGS.delete(key);
+          keysCleared++;
+        } catch (e) {
+          console.error("account reset: could not delete", key, e);
+        }
+      }
+
+      // Any verification memoized in this isolate refers to a profile that
+      // still exists and is unchanged, so it stays valid -- but the sync
+      // records it guarded are gone, and clearing is cheap insurance against
+      // a warm isolate answering from anything stale.
+      try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+      return json({ ok: true, cleared: { lists: listsCleared, keys: keysCleared } });
     }
 
     // /api/creator/delete-account  (POST)  { creatorName, creatorKey } -> { ok }
@@ -1229,35 +1814,170 @@
       // intentionalRemoval comment. That's the one case a stale client
       // snapshot can plausibly be missing something real; anything older
       // than that the client's own load would already have picked up.
-      const RESCUE_WINDOW_MS = 5 * 60 * 1000;
+      // Always merge server KV state with incoming client state to preserve
+      // any scrobbles written by handleSubtitlesTrack or handleMediaServerScrobble
+      // that landed between this browser's last load and this push.
+      //
+      // We cannot gate this on the diagnostic timestamp because handleSubtitlesTrack
+      // runs inside ctx.waitUntil (async after the response is sent), so the
+      // diagnostic write may arrive AFTER save-tracking has already run -- which
+      // was silently wiping every scrobble.
+      //
+      // Strategy: read KV directly, find any watchHistory items with a watchedAt
+      // timestamp newer than body.watchHistory's newest item (i.e. added by the
+      // server after the client's last load) and prepend them. Same for
+      // continueWatching: show IDs in KV but not in the incoming body are
+      // preserved at the front. Skip the merge only for intentionalRemoval.
       let rescuedCount = 0;
       if (!body.intentionalRemoval) {
         try {
-          const diagRaw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
-          if (diagRaw) {
-            const diag = JSON.parse(diagRaw);
-            if (diag && diag.lastPingAt && (Date.now() - diag.lastPingAt) < RESCUE_WINDOW_MS) {
-              const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-              if (existingRaw) {
-                const existingBlob = JSON.parse(existingRaw);
-                const incomingIds = new Set((Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id)));
-                const recentServerItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
-                  .filter((it) => it && !incomingIds.has(String(it.id)));
-                // Only rescue items the server itself added inside the
-                // recency window's ballpark -- everything currently in
-                // watchHistory server-side was either already known to
-                // this client (covered above) or was added since; there's
-                // no per-item timestamp to check more precisely than the
-                // diagnostics ping time already gates on above.
-                if (recentServerItems.length) {
-                  body.watchHistory = [...(Array.isArray(body.watchHistory) ? body.watchHistory : []), ...recentServerItems];
-                  rescuedCount = recentServerItems.length;
+          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (existingRaw) {
+            const existingBlob = JSON.parse(existingRaw);
+
+            // Watch History: find server items not present in the incoming payload
+            const incomingIds = new Set(
+              (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
+            );
+            const serverOnlyItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
+              .filter((it) => it && it.id && !incomingIds.has(String(it.id)));
+            if (serverOnlyItems.length) {
+              // Sort server-only items newest-first and prepend them
+              serverOnlyItems.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+              body.watchHistory = [...serverOnlyItems, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
+              rescuedCount = serverOnlyItems.length;
+            }
+
+            // Continue Watching: when scrobbles occur on the server (Nuvio / Plex),
+            // the server computes the next episode and updates existingBlob.continueWatching.
+            // If the server has a show in continueWatching, its version must take precedence
+            // over the client's stale incoming item for that same show!
+            const serverCwList = Array.isArray(existingBlob.continueWatching) ? existingBlob.continueWatching : [];
+            if (serverCwList.length) {
+              const incomingCwList = Array.isArray(body.continueWatching) ? body.continueWatching : [];
+              const mergedCw = [];
+              const handledShows = new Set();
+              
+              // Server's updated Continue Watching items come first
+              for (const sItem of serverCwList) {
+                if (sItem && (sItem.showId || sItem.id)) {
+                  const sKey = String(sItem.showId || sItem.id);
+                  mergedCw.push(sItem);
+                  handledShows.add(sKey);
+                }
+              }
+              // Add any client-only Continue Watching shows that aren't on the server
+              for (const cItem of incomingCwList) {
+                if (cItem && (cItem.showId || cItem.id)) {
+                  const cKey = String(cItem.showId || cItem.id);
+                  if (!handledShows.has(cKey)) {
+                    mergedCw.push(cItem);
+                    handledShows.add(cKey);
+                  }
+                }
+              }
+              body.continueWatching = mergedCw;
+            }
+
+            // Airing Next and the Discover recommendations are DERIVED
+            // lists: a browser only has them once it has computed them
+            // (refreshAiringNext, and opening the Discover tab). A browser
+            // that has not done that yet still pushes the full tracking
+            // payload on its first autosave, with those two fields empty
+            // -- and since this endpoint is "always the full current
+            // list", that empty array used to overwrite a perfectly good
+            // one another browser had already computed. The catalog row
+            // reading it (fetchAutoTrackedCatalog / fetchCuratedCatalog)
+            // then served nothing, which is what "No items found" in the
+            // Live Preview actually was.
+            //
+            // So: an empty incoming derived list never replaces a
+            // non-empty stored one. Deliberately shrinking one still
+            // works -- a real change sends a non-empty array, and an
+            // intentional clear (Clear Watch History) sets
+            // intentionalRemoval and skips this whole block.
+            if ((!Array.isArray(body.airingNext) || !body.airingNext.length) &&
+                Array.isArray(existingBlob.airingNext) && existingBlob.airingNext.length) {
+              body.airingNext = existingBlob.airingNext;
+            }
+            const incomingRecs = body.curatedRecommendations;
+            const incomingRecsEmpty = !incomingRecs || typeof incomingRecs !== "object" ||
+              ((!Array.isArray(incomingRecs.movies) || !incomingRecs.movies.length) &&
+               (!Array.isArray(incomingRecs.shows) || !incomingRecs.shows.length));
+            const storedRecs = existingBlob.curatedRecommendations;
+            const storedRecsPresent = storedRecs && typeof storedRecs === "object" &&
+              ((Array.isArray(storedRecs.movies) && storedRecs.movies.length) ||
+               (Array.isArray(storedRecs.shows) && storedRecs.shows.length));
+            if (incomingRecsEmpty && storedRecsPresent) {
+              body.curatedRecommendations = storedRecs;
+            }
+
+            // fullyWatchedShowIds: union
+            if (Array.isArray(existingBlob.fullyWatchedShowIds) && existingBlob.fullyWatchedShowIds.length) {
+              const incomingFW = new Set(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []);
+              for (const sid of existingBlob.fullyWatchedShowIds) {
+                if (!incomingFW.has(String(sid))) {
+                  body.fullyWatchedShowIds = body.fullyWatchedShowIds || [];
+                  body.fullyWatchedShowIds.push(sid);
                 }
               }
             }
           }
         } catch {
-          // Diagnostics/rescue is best-effort -- never block the save over it.
+          // Merge is best-effort -- never block the save over it.
+        }
+
+        // SECONDARY MERGE: always read the dedicated scrobble-queue key.
+        // This is written by handleSubtitlesTrack immediately after each
+        // scrobble and is tiny (≤20 items), so it propagates faster and
+        // independently from the large tracking blob. This catches the case
+        // where the large blob hasn't propagated across Cloudflare edges yet.
+        try {
+          const queueRaw = await env.CONFIGS.get(`creatorscrobblequeue:${auth.username}`);
+          if (queueRaw) {
+            const queue = JSON.parse(queueRaw);
+            let queueWh = [];
+            let queueCw = [];
+            if (Array.isArray(queue)) {
+              queueWh = queue;
+            } else if (queue && typeof queue === "object") {
+              queueWh = Array.isArray(queue.watchHistory) ? queue.watchHistory : [];
+              queueCw = Array.isArray(queue.continueWatching) ? queue.continueWatching : [];
+            }
+            if (queueWh.length) {
+              const currentIds = new Set(
+                (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
+              );
+              const queueOnly = queueWh.filter((it) => it && it.id && !currentIds.has(String(it.id)));
+              if (queueOnly.length) {
+                queueOnly.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+                body.watchHistory = [...queueOnly, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
+                rescuedCount += queueOnly.length;
+              }
+            }
+            if (queueCw.length) {
+              const mergedCw = [];
+              const handledShows = new Set();
+              for (const qItem of queueCw) {
+                if (qItem && (qItem.showId || qItem.id)) {
+                  mergedCw.push(qItem);
+                  handledShows.add(String(qItem.showId || qItem.id));
+                }
+              }
+              for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
+                if (bItem && (bItem.showId || bItem.id)) {
+                  const bKey = String(bItem.showId || bItem.id);
+                  if (!handledShows.has(bKey)) {
+                    mergedCw.push(bItem);
+                    handledShows.add(bKey);
+                  }
+                }
+              }
+              body.continueWatching = mergedCw;
+            }
+          }
+        } catch {
+          // Best-effort
         }
       }
 
@@ -1274,10 +1994,27 @@
         // it just starts empty on an account that hasn't pushed one yet,
         // same as a brand new field always would.
         airingNext: Array.isArray(body.airingNext) ? body.airingNext : [],
+        // The Discover tab's Recommended Movies/Shows lists, exactly as
+        // that tab rendered them. Pushed rather than recomputed for the
+        // same reason airingNext is: fetchCuratedCatalog
+        // (05_catalog-core.js) cannot see the browser-side inputs the
+        // card is built from, so the only way the catalog row and the
+        // card can hold the same items is for the browser to hand the
+        // server the list it actually showed.
+        curatedRecommendations: (body.curatedRecommendations && typeof body.curatedRecommendations === "object")
+          ? {
+              movies: Array.isArray(body.curatedRecommendations.movies) ? body.curatedRecommendations.movies : [],
+              shows: Array.isArray(body.curatedRecommendations.shows) ? body.curatedRecommendations.shows : [],
+              updatedAt: Number(body.curatedRecommendations.updatedAt) || Date.now(),
+            }
+          : null,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
+        scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
+        scrobbleAllowedUsers: typeof body.scrobbleAllowedUsers === "string" ? body.scrobbleAllowedUsers : "",
+        scrobbleBlockAnonymous: typeof body.scrobbleBlockAnonymous === "boolean" ? body.scrobbleBlockAnonymous : false,
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -1287,14 +2024,50 @@
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
         if (Array.isArray(body.watchlist)) {
-          const wlRaw = await env.CONFIGS.get(`creatorlist:${auth.username}:watchlist`);
+          const wlRaw = await getCreatorList(env, auth.username, "watchlist");
+          let wlObj = null;
           if (wlRaw) {
             try {
-              const wlObj = JSON.parse(wlRaw);
-              wlObj.items = body.watchlist;
-              wlObj.updatedAt = watchlistUpdatedAt;
-              await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
+              wlObj = JSON.parse(wlRaw);
             } catch {}
+          }
+          if (!wlObj) {
+            wlObj = {
+              name: "Watchlist",
+              slug: "watchlist",
+              type: "mixed",
+              isWatchlist: true,
+              visibility: "private",
+              createdAt: Date.now(),
+            };
+          }
+          wlObj.items = body.watchlist;
+          wlObj.updatedAt = watchlistUpdatedAt;
+          
+          let d1Success = false;
+          if (env.DB) {
+            try {
+              const listId = `${auth.username}:watchlist`;
+              const itemsJson = JSON.stringify(wlObj.items || []);
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.createdAt, wlObj.updatedAt).run();
+              d1Success = true;
+            } catch (dbErr) {
+              console.error("D1 write error (creatorlist watchlist):", dbErr);
+            }
+          }
+          
+          if (!d1Success) {
+            await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
+          }
+
+          const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+          let order = [];
+          try { order = orderRaw ? JSON.parse(orderRaw).order || [] : []; } catch {}
+          if (!order.includes("watchlist")) {
+            order.unshift("watchlist");
+            await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
           }
         }
       } catch (e) {
@@ -1334,6 +2107,7 @@
       const presetsBlob = {
         presets: body.presets && typeof body.presets === "object" ? body.presets : {},
         presetsB64: body.presetsB64 || null,
+        updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(presetsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -1374,6 +2148,81 @@
       return json({ ok: true });
     }
 
+    // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
+    //   -> { ok, config, tracking, presets, channels }
+    // A deliberately tiny sibling of /api/creator/sync/load below, holding
+    // nothing but the four updatedAt stamps that tell a browser whether
+    // anything it cares about has actually changed.
+    //
+    // It exists because the dashboard polls for multi-device changes on a
+    // timer while it is simply open (see handleForegroundResumeSync,
+    // 22_client-creator-profile.js), and that poll used to call sync/load
+    // itself -- which reads six KV keys, JSON-parses a watchHistory that
+    // can run to thousands of items, re-serializes all of it, and ships
+    // the whole thing back down the wire. For an active account that was
+    // megabytes of response, several times a minute, almost always to
+    // conclude that nothing had changed at all.
+    //
+    // Two things keep this cheap. The four reads run concurrently rather
+    // than one after another, and each updatedAt is pulled straight out of
+    // the raw stored string (see readUpdatedAtFromRaw) instead of parsing
+    // the blob -- so a 4MB tracking record costs a substring scan here,
+    // not a full parse. The response is a few dozen bytes either way.
+    //
+    // Deliberately derived from the same keys sync/load reads rather than
+    // from a separate "last changed" record: a dedicated key would have to
+    // be updated by every write path that touches any of these blobs, and
+    // a single missed write there would silently stop a device from ever
+    // syncing again. Reading the real thing cannot drift.
+    if (path === "/api/creator/sync/meta" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+
+      // Pulls "updatedAt": <number> out of a stored blob without parsing
+      // it. Every blob these keys hold writes updatedAt as a plain number
+      // at the top level, and lastIndexOf finds the last (top-level) one
+      // rather than any nested occurrence inside an item. A miss returns 0,
+      // which reads as "older than anything the client has" and simply
+      // causes a normal full load -- never a skipped one.
+      function readUpdatedAtFromRaw(raw) {
+        if (!raw) return 0;
+        const marker = '"updatedAt":';
+        const at = raw.lastIndexOf(marker);
+        if (at === -1) return 0;
+        const num = parseInt(raw.slice(at + marker.length, at + marker.length + 20).replace(/[^0-9].*$/, ""), 10);
+        return Number.isFinite(num) ? num : 0;
+      }
+
+      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null;
+      try {
+        [configRaw, trackingRaw, presetsRaw, channelsRaw] = await Promise.all([
+          env.CONFIGS.get(`creatorsync:${auth.username}`),
+          env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
+          env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
+          env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+        ]);
+      } catch {
+        // A read failure must not look like "nothing changed" -- returning
+        // ok:false makes the client fall back to a full sync/load.
+        return json({ ok: false, error: "Could not read sync state right now." }, 500);
+      }
+
+      return json({
+        ok: true,
+        exists: configRaw !== null || trackingRaw !== null,
+        config: readUpdatedAtFromRaw(configRaw),
+        tracking: readUpdatedAtFromRaw(trackingRaw),
+        presets: readUpdatedAtFromRaw(presetsRaw),
+        channels: readUpdatedAtFromRaw(channelsRaw),
+      });
+    }
+
     // /api/creator/sync/load -> { ok, data: blob | null }
     // null specifically (rather than an empty blob) distinguishes "this
     // account has never synced from any device" from "this account synced
@@ -1391,7 +2240,19 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
       await ensureTrackingMigrated(env, auth.username);
-      const raw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+      // These five reads are independent of one another, and were awaited
+      // one after the next -- so this endpoint paid five sequential KV
+      // round trips before it could start assembling anything. Issuing them
+      // together turns that into one. (ensureTrackingMigrated above still
+      // runs first on purpose: it can WRITE the tracking key, so reading it
+      // concurrently with that would be a race.)
+      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit] = await Promise.all([
+        env.CONFIGS.get(`creatorsync:${auth.username}`),
+        env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
+        env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+        env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
+        env.CONFIGS.get(`creatorlistorder:${auth.username}`),
+      ]);
       let data = null;
       if (raw) {
         try {
@@ -1404,30 +2265,71 @@
       // them back in here so the client's loadCreatorSync doesn't need to
       // know or care that this is two KV reads instead of one; it still
       // just reads data.presets/data.presetsB64 exactly like before.
-      const presetsRaw = await env.CONFIGS.get(`creatorsyncpresets:${auth.username}`);
+      let presetsRaw = presetsRawInit;
+      let presetsBlob = null;
       if (presetsRaw) {
-        let presetsBlob = null;
         try {
           presetsBlob = JSON.parse(presetsRaw);
         } catch {
           presetsBlob = null;
         }
-        if (presetsBlob) {
-          if (!data) {
-            // Presets exist but nothing else has ever synced for this
-            // account -- construct a minimal blob so the client still
-            // receives them, rather than treating "no main blob" as "no
-            // data at all" and having loadCreatorSync skip straight to
-            // pushCreatorSync (which would try to push this browser's
-            // state up and never even look at what's already saved).
-            data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
-          }
-          data.presets = presetsBlob.presets || {};
-          data.presetsB64 = presetsBlob.presetsB64 || null;
-        }
       }
+
+      // Extract presets safely regardless of storage format
+      let dedicatedPresets = {};
+      let dedicatedPresetsB64 = null;
+      let dedicatedUpdatedAt = 0;
+
+      if (presetsBlob) {
+        if (presetsBlob.presetsB64 && typeof presetsBlob.presetsB64 === "string") {
+          dedicatedPresetsB64 = presetsBlob.presetsB64;
+        }
+        if (presetsBlob.presets && typeof presetsBlob.presets === "object" && !Array.isArray(presetsBlob.presets)) {
+          dedicatedPresets = { ...presetsBlob.presets };
+        } else if (typeof presetsBlob === "object" && !Array.isArray(presetsBlob)) {
+          Object.keys(presetsBlob).forEach((k) => {
+            if (k !== "presets" && k !== "presetsB64" && k !== "updatedAt" && presetsBlob[k] && typeof presetsBlob[k] === "object") {
+              dedicatedPresets[k] = presetsBlob[k];
+            }
+          });
+        } else if (Array.isArray(presetsBlob)) {
+          presetsBlob.forEach((p) => {
+            if (p && p.name) dedicatedPresets[p.name] = p;
+          });
+        }
+        if (presetsBlob.updatedAt) dedicatedUpdatedAt = presetsBlob.updatedAt;
+      }
+
+      const dedicatedHasPresets = !!(dedicatedPresetsB64 || Object.keys(dedicatedPresets).length > 0);
+      const mainHasPresets = !!(data && (data.presetsB64 || (data.presets && typeof data.presets === 'object' && Object.keys(data.presets).length > 0)));
+
+      if (!dedicatedHasPresets && mainHasPresets) {
+        let adoptedMap = {};
+        if (data.presets && typeof data.presets === "object" && !Array.isArray(data.presets)) {
+          adoptedMap = { ...data.presets };
+        } else if (Array.isArray(data.presets)) {
+          data.presets.forEach((p) => { if (p && p.name) adoptedMap[p.name] = p; });
+        }
+        dedicatedPresets = adoptedMap;
+        dedicatedPresetsB64 = data.presetsB64 || null;
+        dedicatedUpdatedAt = Date.now();
+        try {
+          await env.CONFIGS.put(`creatorsyncpresets:${auth.username}`, JSON.stringify({
+            presets: dedicatedPresets,
+            presetsB64: dedicatedPresetsB64,
+            updatedAt: dedicatedUpdatedAt,
+          }));
+        } catch {}
+      }
+
+      if (!data) {
+        data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+      }
+      data.presets = dedicatedPresets;
+      data.presetsB64 = dedicatedPresetsB64;
+      data.presetsUpdatedAt = dedicatedUpdatedAt;
       // Channels & merged channels live in their own key -- merge them back in for signed-in sync across browsers.
-      const channelsRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      const channelsRaw = channelsRawInit;
       if (channelsRaw) {
         let channelsBlob = null;
         try {
@@ -1441,6 +2343,7 @@
           }
           data.channels = channelsBlob.channels || {};
           data.mergedChannels = channelsBlob.mergedChannels || {};
+          data.channelsUpdatedAt = channelsBlob.updatedAt || 0;
         }
       }
       // Tracking data (Watch History/Continue Watching/etc) also lives in
@@ -1448,7 +2351,7 @@
       // Same merge pattern as presets: the client's loadCreatorSync still
       // just reads data.watchHistory/data.continueWatching/etc exactly
       // like before, unaware this is a third KV read.
-      const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+      const trackingRaw = trackingRawInit;
       if (trackingRaw) {
         let trackingBlob = null;
         try {
@@ -1464,13 +2367,77 @@
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
           data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
           data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
+          // Airing Next and the Discover recommendations were stored by
+          // save-tracking but never handed back here, so loadCreatorSync's
+          // own restore branches for them (22_client-creator-profile.js)
+          // could never fire. A browser that signed in fresh therefore had
+          // no copy of either, and its first autosave pushed empty arrays
+          // straight back over the account's real ones -- see
+          // save-tracking's derived-list guard above for the other half of
+          // this fix.
+          data.airingNext = Array.isArray(trackingBlob.airingNext) ? trackingBlob.airingNext : [];
+          data.curatedRecommendations = (trackingBlob.curatedRecommendations && typeof trackingBlob.curatedRecommendations === "object")
+            ? trackingBlob.curatedRecommendations
+            : null;
+          data.trackingUpdatedAt = trackingBlob.updatedAt || 0;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
           data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
+          data.scrobbleFilterUsers = typeof trackingBlob.scrobbleFilterUsers === "boolean" ? trackingBlob.scrobbleFilterUsers : false;
+          data.scrobbleAllowedUsers = typeof trackingBlob.scrobbleAllowedUsers === "string" ? trackingBlob.scrobbleAllowedUsers : "";
+          data.scrobbleBlockAnonymous = typeof trackingBlob.scrobbleBlockAnonymous === "boolean" ? trackingBlob.scrobbleBlockAnonymous : false;
         }
       }
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+      // Merge dedicated scrobble-queue key into watchHistory so that recent
+      // scrobbles are always visible even if the large tracking blob hasn't
+      // propagated across Cloudflare edges yet (KV eventual consistency).
+      try {
+        const sqRaw = await env.CONFIGS.get(`creatorscrobblequeue:${auth.username}`);
+        if (sqRaw) {
+          const sq = JSON.parse(sqRaw);
+          let queueWh = [];
+          let queueCw = [];
+          if (Array.isArray(sq)) {
+            queueWh = sq;
+          } else if (sq && typeof sq === "object") {
+            queueWh = Array.isArray(sq.watchHistory) ? sq.watchHistory : [];
+            queueCw = Array.isArray(sq.continueWatching) ? sq.continueWatching : [];
+          }
+          if (queueWh.length || queueCw.length) {
+            if (!data) data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+            if (queueWh.length) {
+              const existingWhIds = new Set((Array.isArray(data.watchHistory) ? data.watchHistory : []).map((it) => String(it && it.id)));
+              const queueWhOnly = queueWh.filter((it) => it && it.id && !existingWhIds.has(String(it.id)));
+              if (queueWhOnly.length) {
+                queueWhOnly.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+                data.watchHistory = [...queueWhOnly, ...(Array.isArray(data.watchHistory) ? data.watchHistory : [])];
+              }
+            }
+            if (queueCw.length) {
+              const mergedCw = [];
+              const handledShows = new Set();
+              for (const qItem of queueCw) {
+                if (qItem && (qItem.showId || qItem.id)) {
+                  mergedCw.push(qItem);
+                  handledShows.add(String(qItem.showId || qItem.id));
+                }
+              }
+              for (const dItem of (Array.isArray(data.continueWatching) ? data.continueWatching : [])) {
+                if (dItem && (dItem.showId || dItem.id)) {
+                  const dKey = String(dItem.showId || dItem.id);
+                  if (!handledShows.has(dKey)) {
+                    mergedCw.push(dItem);
+                    handledShows.add(dKey);
+                  }
+                }
+              }
+              data.continueWatching = mergedCw;
+            }
+          }
+        }
+      } catch {}
+      const orderRaw = orderRawInit;
       if (orderRaw) {
         try {
           const orderBlob = JSON.parse(orderRaw);
@@ -1542,7 +2509,7 @@
       if (!env || !env.CONFIGS) return json({ ok: true, lists: [] });
       const rawQ = url.searchParams.get("q") || "";
       const q = rawQ.toLowerCase().trim();
-      
+
       // Check if query is targeting My Lists platform lists and extract any username/term
       const isMyListsSentinel = (q === "my lists" || q === "mylists" || q === "my list" || q === "mylist" || q.includes("my list") || q.includes("mylist"));
       const userTerm = q
@@ -1602,7 +2569,7 @@
               const listSlug = rest.slice(sep + 1);
               let creatorName = username;
               try {
-                const profileRaw = await env.CONFIGS.get(`creator:${username}`);
+                const profileRaw = await getCreator(env, username);
                 if (profileRaw) creatorName = JSON.parse(profileRaw).displayName || username;
               } catch {
                 // fall back to the raw username slug
@@ -1622,17 +2589,17 @@
           })
         );
         const targetFilter = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+        const tokens = targetFilter.split(/\s+/).filter(Boolean);
         const matches = [...anonCandidates, ...creatorCandidates]
           .filter(Boolean)
           .filter((l) => (l.items || 0) > 0)
           .filter((l) => {
-            if (!targetFilter) return true;
-            const nameMatch = l.name && l.name.toLowerCase().includes(targetFilter);
-            const creatorMatch = l.creatorName && l.creatorName.toLowerCase().includes(targetFilter);
-            const usernameMatch = l.username && l.username.toLowerCase().includes(targetFilter);
-            const urlMatch = l.url && l.url.toLowerCase().includes(targetFilter);
-            return nameMatch || creatorMatch || usernameMatch || urlMatch;
+            if (!targetFilter || !tokens.length) return true;
+            const fullText = `${l.name || ""} ${l.creatorName || ""} ${l.username || ""} ${l.url || ""}`.toLowerCase();
+            if (fullText.includes(targetFilter)) return true;
+            return tokens.every((tok) => fullText.includes(tok));
           })
+          .map((l) => ({ ...l, source: "My Lists Addon" }))
           .sort((a, b) => {
             const likesDiff = (b.likes || 0) - (a.likes || 0);
             if (likesDiff !== 0) return likesDiff;
@@ -1660,7 +2627,14 @@
       const mdblistSlug = m[2];
       const targetUrl = `https://mdblist.com/lists/${mdblistUser}/${mdblistSlug}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: deslugifyServer(mdblistSlug),
@@ -1670,13 +2644,7 @@
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -1686,7 +2654,14 @@
       const traktSlug = m[2];
       const targetUrl = `https://trakt.tv/users/${traktUser}/lists/${traktSlug}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: deslugifyServer(traktSlug),
@@ -1696,13 +2671,7 @@
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -1712,7 +2681,14 @@
       const targetUrl = `https://www.themoviedb.org/collection/${tmdbId}`;
       const name = m[2] ? deslugifyServer(m[2]) : `TMDB Collection ${tmdbId}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name,
@@ -1722,13 +2698,7 @@
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -1738,7 +2708,14 @@
       const targetUrl = `https://www.themoviedb.org/list/${tmdbId}`;
       const name = m[2] ? deslugifyServer(m[2]) : `TMDB List ${tmdbId}`;
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name,
@@ -1748,13 +2725,7 @@
             maybeMore: true,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -1825,7 +2796,7 @@
       if (isCreatorList) {
         creatorDisplayName = username;
         try {
-          const profileRaw = await env.CONFIGS.get(`creator:${username}`);
+          const profileRaw = await getCreator(env, username);
           if (profileRaw) creatorDisplayName = JSON.parse(profileRaw).displayName || username;
         } catch {
           // fall back to the raw username slug
@@ -1882,7 +2853,14 @@
       }
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const shareUrl = `${url.origin}/lists/${username}/${listName}`;
-      return new Response(
+      // Validator-based caching instead of no-store -- see
+      // htmlPageResponse (02_http-and-creator-utils.js). These shared list
+      // pages are the ones people follow links to and press back from, and
+      // each was resending ~1.6MB every time with nothing for the browser to
+      // revalidate against. The ETag hashes the exact bytes returned, so a
+      // 304 can only happen when the browser already holds this list.
+      return await htmlPageResponse(
+        request,
         renderBuilder(url.origin, {
           deepLinkList: {
             name: listData.name,
@@ -1907,13 +2885,7 @@
             maybeMore: false,
           },
         }),
-        {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            ...corsHeaders(),
-          },
-        }
+        { ...corsHeaders() }
       );
     }
 
@@ -2064,6 +3036,76 @@
       }
 
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
+    }
+
+    // /admin/api/migrate-d1 (POST) -> { ok, results }
+    // Backfills creators, creator_lists, and source_groups from KV to D1.
+    if (path === "/admin/api/migrate-d1" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
+      
+      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+
+      // 1. Creators
+      const cKeys = await listAllKeys(env.CONFIGS, "creator:");
+      for (const k of cKeys.keys) {
+        const username = k.name.slice("creator:".length);
+        const raw = await env.CONFIGS.get(k.name);
+        if (raw) {
+          try {
+            const data = JSON.parse(raw);
+            await env.DB.prepare(
+              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0).run();
+            results.creators++;
+          } catch (e) {
+            results.errors.push(`Creator ${username}: ` + e.message);
+          }
+        }
+      }
+
+      // 2. Creator Lists
+      const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+      for (const k of lKeys.keys) {
+        const [, , u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
+        if (u && slug) {
+          const raw = await env.CONFIGS.get(k.name);
+          if (raw) {
+            try {
+              const data = JSON.parse(raw);
+              const listId = `${u}:${slug}`;
+              const itemsJson = JSON.stringify(data.items || []);
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, data.createdAt || 0, data.updatedAt || 0).run();
+              results.lists++;
+            } catch (e) {
+              results.errors.push(`List ${u}:${slug}: ` + e.message);
+            }
+          }
+        }
+      }
+
+      // 3. Source Groups
+      const sKeys = await listAllKeys(env.CONFIGS, "stats:sourcegroup:");
+      for (const k of sKeys.keys) {
+        if (k.name.endsWith(":total")) {
+          const groupName = k.name.slice("stats:sourcegroup:".length, -":total".length);
+          const raw = await env.CONFIGS.get(k.name);
+          const count = parseInt(raw || "0", 10);
+          try {
+            await env.DB.prepare(
+              "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
+            ).bind(groupName, groupName, count).run();
+            results.sourcegroups++;
+          } catch (e) {
+            results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
+          }
+        }
+      }
+
+      return json({ ok: true, results });
     }
 
     // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }

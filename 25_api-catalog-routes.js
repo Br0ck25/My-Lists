@@ -35,9 +35,13 @@ async function handleFetch(request, env, ctx) {
 
     if (path === "/" || path === "") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
+      // Memoized per origin and answered with a 304 when the browser
+      // already holds this exact build -- see htmlPageResponse and
+      // renderBuilderCached (02_http-and-creator-utils.js). Previously this
+      // rebuilt and resent ~1.6MB on every navigation, with no validator at
+      // all, which also left the browser free to heuristically cache a copy
+      // it had no way to check.
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // add-on icon, served straight from this Worker
@@ -75,18 +79,145 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
+    if (path === "/api/poster-badge") {
+      const posterUrl = url.searchParams.get("poster") || "";
+      const rawAirDate = url.searchParams.get("airDate") || "";
+      const isAired = rawAirDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawAirDate);
+      const airDate = !isAired ? rawAirDate : "";
+      const isPremiere = !isAired && url.searchParams.get("premiere") === "1";
+      const isFinale = !isAired && url.searchParams.get("finale") === "1";
+      const rawFinaleDate = url.searchParams.get("finaleDate") || "";
+      const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
+      const finaleDate = !isFinaleAired ? rawFinaleDate : "";
+
+      if (!posterUrl) {
+        return new Response(null, { status: 404 });
+      }
+
+      // If no badges are requested or all dates have aired, redirect straight to the original poster
+      if (!airDate && !isPremiere && !isFinale && !finaleDate) {
+        return Response.redirect(posterUrl, 302);
+      }
+
+      let embeddedPosterDataUri = "";
+      try {
+        const imgRes = await fetch(posterUrl, {
+          headers: { "User-Agent": "my-list-addon/1.14" },
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        if (imgRes.ok) {
+          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+          const buffer = await imgRes.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = "";
+          const len = bytes.byteLength;
+          for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const base64 = btoa(binary);
+          embeddedPosterDataUri = `data:${contentType};base64,${base64}`;
+        }
+      } catch (e) {}
+
+      if (!embeddedPosterDataUri) {
+        // Fallback: If fetching/inlining image fails, redirect to original untouched poster
+        return Response.redirect(posterUrl, 302);
+      }
+
+      // Format air date tag text (e.g. WED, SEP 16)
+      let airDateText = "";
+      if (airDate && typeof formatAirDateBadge === "function") {
+        airDateText = formatAirDateBadge(airDate);
+      } else if (airDate) {
+        try {
+          const d = new Date(airDate + "T00:00:00Z");
+          const m = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" }).toUpperCase();
+          const day = d.getUTCDate();
+          airDateText = `${m} ${day}`;
+        } catch (e) {
+          airDateText = airDate;
+        }
+      }
+
+      // Format bottom badge text
+      let bottomText = "";
+      let bottomBg = "#30d158"; // Green for premiere
+      let bottomBorder = "rgba(48, 209, 88, 0.4)";
+      let bottomColor = "#ffffff";
+
+      if (isPremiere) {
+        bottomText = "Season Premiere";
+        bottomBg = "#28a745";
+        bottomBorder = "rgba(40, 167, 69, 0.6)";
+        bottomColor = "#ffffff";
+      } else if (isFinale) {
+        bottomText = "Season Finale";
+        bottomBg = "#ff9500";
+        bottomBorder = "rgba(255, 149, 0, 0.7)";
+        bottomColor = "#ffffff";
+      } else if (finaleDate) {
+        let fText = "";
+        if (typeof formatAirDateBadge === "function") {
+          fText = formatAirDateBadge(finaleDate);
+        } else {
+          try {
+            const d = new Date(finaleDate + "T00:00:00Z");
+            const m = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+            const day = d.getUTCDate();
+            fText = `${m} ${day}`;
+          } catch (e) {
+            fText = finaleDate;
+          }
+        }
+        bottomText = fText ? `Finale: ${fText}` : "Season Finale";
+        bottomBg = "rgba(18, 18, 24, 0.94)";
+        bottomBorder = "rgba(255, 159, 10, 0.75)";
+        bottomColor = "#ffd166";
+      }
+
+      const svg = generateBadgedPosterSvg({
+        posterUrl: embeddedPosterDataUri,
+        airDateText,
+        bottomText,
+        bottomBg,
+        bottomBorder,
+        bottomColor,
+      });
+
+      return new Response(svg, {
+        headers: {
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // /:config/configure  -> opened by wako itself when the user taps
     // "Configure" on the already-installed add-on
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
+      // The one page that still sends no-store (it renders the person's own
+      // API keys -- see the note on the headers below), but it should not
+      // also be re-sending the 1.3MB client bundle every time. The split
+      // separates the two concerns exactly: the small page that carries the
+      // keys stays uncacheable, while the bundle it references is the same
+      // shared, immutable /app.js everyone else already has.
       return new Response(
-        renderBuilder(url.origin, {
+        await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
           initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
           isConfigureMode: true,
-        }),
+        })),
+        // The one builder page that deliberately keeps no-store rather than
+        // moving to an ETag like the rest: this variant renders the user's
+        // own API keys (TMDB/MDBList/Trakt) straight into the HTML, and
+        // no-store is what keeps that out of the browser's on-disk cache
+        // and out of any intermediary. Saving a round trip is not worth
+        // writing somebody's keys to disk.
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
     }
@@ -94,9 +225,9 @@ async function handleFetch(request, env, ctx) {
     // bare /configure (no config yet) -> same builder, empty/default state
     if (path === "/configure") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(
-        renderBuilder(url.origin, { isConfigureMode: true }),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        renderBuilderCached(url.origin, { isConfigureMode: true })
       );
     }
 
@@ -170,9 +301,9 @@ async function handleFetch(request, env, ctx) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
       const title = isShow ? "Recommended Shows" : "Recommended Movies";
-      return new Response(
-        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } }),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } })
       );
     }
 
@@ -182,15 +313,17 @@ async function handleFetch(request, env, ctx) {
       let chart = resolveChartSlug(m[1]);
       if (!chart) {
         const slugLower = m[1].toLowerCase();
-        if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching" };
-        if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history" };
-        if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist" };
-        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies" };
-        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows" };
+        if (slugLower === "continue-watching" || slugLower === "continue_watching") chart = { name: "Continue Watching", movieUrl: "autotrack:continue-watching", showUrl: "autotrack:continue-watching", type: "series" };
+        if (slugLower === "watch-history" || slugLower === "watch_history") chart = { name: "Watch History", movieUrl: "autotrack:watch-history", showUrl: "autotrack:watch-history", type: "movie" };
+        if (slugLower === "watchlist") chart = { name: "Watchlist", movieUrl: "autotrack:watchlist", showUrl: "autotrack:watchlist", type: "mixed" };
+        if (slugLower === "new-movies") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_movies", showUrl: "tmdb:chart:new_movies", type: "movie" };
+        if (slugLower === "new-shows") chart = { name: "New Releases", movieUrl: "tmdb:chart:new_shows", showUrl: "tmdb:chart:new_shows", type: "series" };
       }
-      return new Response(
-        renderBuilder(url.origin, chart ? { deepLinkList: { name: chart.name, type: (chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie", url: chart.movieUrl } } : {}),
-        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      return await htmlPageResponse(
+        request,
+        chart
+          ? renderBuilder(url.origin, { deepLinkList: { name: chart.name, type: chart.type || ((chart.showUrl && chart.showUrl.includes('shows')) ? "series" : "movie"), url: chart.movieUrl } })
+          : renderBuilderCached(url.origin, {})
       );
     }
 
@@ -198,17 +331,13 @@ async function handleFetch(request, env, ctx) {
     // Note: Creator/user public lists (/lists/:user/:slug) and .json endpoints pass through to creator routes.
     if (path.startsWith("/lists/") && !path.endsWith(".json") && (path.startsWith("/lists/mdblist/") || path.startsWith("/lists/trakt/") || path.startsWith("/lists/tmdb/") || path.startsWith("/lists/simkl/") || path.startsWith("/lists/custom/") || path.startsWith("/lists/curated/"))) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
-      });
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // Browser navigation for channels (/channels/:slug)
     if (path.startsWith("/channels/")) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      return new Response(renderBuilder(url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
-      });
+      return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
     // /:config/manifest.json
@@ -335,13 +464,106 @@ Sitemap: ${url.origin}/sitemap.xml`;
       });
     }
 
+    // /app.js?v=<hash> -> the client bundle lifted out of the builder page.
+    // See splitAppBundle (02_http-and-creator-utils.js) for what is in it
+    // and why it can be shared. The URL is content-hashed, so it is safe to
+    // tell the browser to keep it forever: a deploy that changes the bundle
+    // changes the hash, which changes the src in the page, which changes the
+    // page's own ETag -- so nobody can be left holding a stale one.
+    // /app.css?v=<hash> -> the stylesheet lifted out of the builder page.
+    // Same content-addressed, immutable contract as /app.js below.
+    if (path === "/app.css") {
+      const sheet = await getAppCss(url.origin);
+      if (!sheet) {
+        return new Response("/* app stylesheet unavailable */", {
+          status: 503,
+          headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+      const isCurrent = (url.searchParams.get("v") || "") === sheet.hash;
+      const etag = `"${sheet.hash}"`;
+      const inm = request.headers.get("If-None-Match") || "";
+      const headers = {
+        "Content-Type": "text/css; charset=utf-8",
+        "Cache-Control": isCurrent ? "public, max-age=31536000, immutable" : "no-cache",
+        "ETag": etag,
+      };
+      if (inm.split(",").some((s) => s.trim().replace(/^W\//, "") === etag)) {
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(sheet.css, { headers });
+    }
+
+    if (path === "/app.js") {
+      const bundle = await getAppBundle(url.origin);
+      if (!bundle) {
+        // Markers missing (should be impossible -- the verification suite
+        // asserts they render). 503 rather than an empty 200, so a broken
+        // deploy is loud instead of a silently dead page.
+        return new Response("/* app bundle unavailable */", {
+          status: 503,
+          headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+      const askedFor = url.searchParams.get("v") || "";
+      // Only the hash we are actually serving may be cached immutably. A
+      // request for some older hash still gets a working bundle -- better
+      // than a broken page -- but must not be allowed to pin today's bytes
+      // under yesterday's URL forever.
+      const isCurrent = askedFor === bundle.hash;
+      const etag = `"${bundle.hash}"`;
+      const inm = request.headers.get("If-None-Match") || "";
+      const headers = {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": isCurrent ? "public, max-age=31536000, immutable" : "no-cache",
+        "ETag": etag,
+      };
+      if (inm.split(",").some((s) => s.trim().replace(/^W\//, "") === etag)) {
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(bundle.js, { headers });
+    }
+
     if (path === "/sw.js") {
+      // The previous version of this worker was a no-op that still cost
+      // something: it intercepted every request, re-issued it, and on
+      // failure fell back to caches.match() -- against a cache nothing ever
+      // wrote to, so that fallback could never hit.
+      //
+      // It now does one useful thing and nothing else. /app.js?v=<hash> is
+      // content-addressed, so cache-first is safe by construction: a bundle
+      // that changes gets a different URL, and this cache is never consulted
+      // for it. Exactly one entry is kept, so old bundles cannot accumulate
+      // after repeated deploys. Every other request is passed straight
+      // through, untouched.
       const sw = `
+const APP_CACHE = 'mylists-app-v1';
 self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
-  // simple pass-through cache, nothing fancy
-  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+  const url = new URL(e.request.url);
+  const isBundle = e.request.method === 'GET'
+    && url.origin === self.location.origin
+    && url.pathname === '/app.js'
+    && url.searchParams.get('v');
+  if (!isBundle) return; // everything else: no interception at all
+  e.respondWith((async () => {
+    try {
+      const cache = await caches.open(APP_CACHE);
+      const hit = await cache.match(e.request.url);
+      if (hit) return hit;
+      const res = await fetch(e.request);
+      if (res && res.ok) {
+        // Keep one bundle only -- a new deploy means a new URL, and the
+        // previous entry is dead weight the moment it stops being requested.
+        for (const key of await cache.keys()) await cache.delete(key);
+        await cache.put(e.request.url, res.clone());
+      }
+      return res;
+    } catch (err) {
+      return fetch(e.request);
+    }
+  })());
 });
       `;
       return new Response(sw.trim(), {
@@ -357,7 +579,7 @@ self.addEventListener('fetch', e => {
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return json({ metas: [] });
 
@@ -375,7 +597,7 @@ self.addEventListener('fetch', e => {
       const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -519,6 +741,7 @@ self.addEventListener('fetch', e => {
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -543,10 +766,10 @@ self.addEventListener('fetch', e => {
       } catch (err) {
         body = { ok: false, error: String(err.message || err) };
       }
+
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });
@@ -623,7 +846,7 @@ self.addEventListener('fetch', e => {
         try {
           const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
           const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey);
+          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return json({ meta: null });
           return json(
             { meta },
@@ -759,7 +982,7 @@ self.addEventListener('fetch', e => {
         
         if (!imdbId || !seasonNum) return json({ ok: false, error: "Missing imdbId or seasonNum" }, 400);
         
-        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId);
+        const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId, env, ctx);
         if (!seasonData) return json({ ok: false, error: "Not found or TMDB error" }, 404);
         
         // A short max-age (not json()'s 3600s default) -- this response's
@@ -985,6 +1208,24 @@ self.addEventListener('fetch', e => {
               (m) => m.name && m.name.toLowerCase() === title.toLowerCase() && m.poster
             );
             resolvedPoster = (exact && exact.poster) || (metas[0] && metas[0].poster) || null;
+          }
+        } catch {}
+      }
+
+      // 4. If still no poster, query TMDB search by title
+      if (!resolvedPoster && title) {
+        try {
+          const tmdbSearch = await fetch(`https://api.themoviedb.org/3/search/${tmdbKind}?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(title)}&page=1`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 86400, cacheEverything: true }
+          });
+          if (tmdbSearch.ok) {
+            const sd = await tmdbSearch.json();
+            if (sd.results && sd.results.length > 0) {
+              const first = sd.results[0];
+              if (first.poster_path) resolvedPoster = `https://image.tmdb.org/t/p/w500${first.poster_path}`;
+              else if (first.backdrop_path) resolvedPoster = `https://image.tmdb.org/t/p/w780${first.backdrop_path}`;
+            }
           }
         } catch {}
       }
@@ -1474,6 +1715,7 @@ self.addEventListener('fetch', e => {
             seenMovieIds.add(m.id);
             recMovies.push({
               id: "tmdb:" + m.id,
+              tmdbId: String(m.id),
               name: m.title || "Movie",
               poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
               year: (m.release_date || "").slice(0, 4),
@@ -1495,6 +1737,7 @@ self.addEventListener('fetch', e => {
               seenMovieIds.add(m.id);
               recMovies.push({
                 id: "tmdb:" + m.id,
+                tmdbId: String(m.id),
                 name: m.title || "Movie",
                 poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
                 year: (m.release_date || "").slice(0, 4),
@@ -1514,6 +1757,7 @@ self.addEventListener('fetch', e => {
             seenShowIds.add(s.id);
             recShows.push({
               id: "tmdb:" + s.id,
+              tmdbId: String(s.id),
               name: s.name || "Show",
               poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
               year: (s.first_air_date || "").slice(0, 4),
@@ -1535,6 +1779,7 @@ self.addEventListener('fetch', e => {
               seenShowIds.add(s.id);
               recShows.push({
                 id: "tmdb:" + s.id,
+                tmdbId: String(s.id),
                 name: s.name || "Show",
                 poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
                 year: (s.first_air_date || "").slice(0, 4),
@@ -1546,7 +1791,15 @@ self.addEventListener('fetch', e => {
         } catch {}
       }
 
-      return json({ ok: true, movies: recMovies.slice(0, 40), shows: recShows.slice(0, 40) });
+      // CURATED_RECOMMENDATION_LIMIT, not a literal -- fetchCuratedCatalog
+      // (05_catalog-core.js) serves the catalog row for this same list and
+      // has to cut it to exactly the same length, or the Discover card and
+      // the shelf it adds disagree about how many items the list has.
+      return json({
+        ok: true,
+        movies: recMovies.slice(0, CURATED_RECOMMENDATION_LIMIT),
+        shows: recShows.slice(0, CURATED_RECOMMENDATION_LIMIT),
+      });
     }
 
     // /api/tmdb-search-lists?q=...[&tmdbKey=...]
@@ -1559,6 +1812,7 @@ self.addEventListener('fetch', e => {
       if (!q || !tmdbKey) {
         return json({ ok: true, lists: [] });
       }
+
       try {
         if (!tmdbKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const qLower = q.toLowerCase();
@@ -1642,19 +1896,26 @@ self.addEventListener('fetch', e => {
           { name: "War Shows", url: "tmdb:genre:war", type: "series", tags: ["war", "military", "genre", "newest", "shows", "tv", "tmdb"] },
           { name: "Western Movies", url: "tmdb:genre:western", type: "movie", tags: ["western", "cowboy", "genre", "newest", "tmdb"] },
           { name: "Western Shows", url: "tmdb:genre:western", type: "series", tags: ["western", "cowboy", "genre", "newest", "shows", "tv", "tmdb"] },
+          { name: "Simkl Anime Trending", url: "simkl:anime:trending", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "trending", "animation", "japanese", "otaku", "charts"] },
+          { name: "Simkl Top 50 Anime", url: "simkl:anime:top", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "top", "best", "popular", "animation", "charts"] },
+          { name: "Simkl Airing Anime", url: "simkl:anime:airing", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "anime", "airing", "new", "season", "charts"] },
+          { name: "Simkl Trending Shows", url: "simkl:shows:trending", type: "series", source: "Simkl", user: "Simkl Official", tags: ["simkl", "shows", "trending", "tv", "popular", "charts"] },
+          { name: "Simkl Trending Movies", url: "simkl:movies:trending", type: "movie", source: "Simkl", user: "Simkl Official", tags: ["simkl", "movies", "trending", "popular", "charts"] },
         ];
 
         for (const chart of builtinTmdbCharts) {
           const matchName = chart.name.toLowerCase().includes(qLower);
           const matchTag = chart.tags.some((t) => t.includes(qLower) || qLower.includes(t));
-          if (matchName || matchTag) {
+          const matchUser = chart.user && chart.user.toLowerCase().includes(qLower);
+          if (matchName || matchTag || matchUser) {
             results.push({
               name: chart.name,
-              user: "TMDB Official",
+              user: chart.user || "TMDB Official",
               url: chart.url,
               type: chart.type,
               items: "Chart",
               likes: 0,
+              source: chart.source || "TMDB",
             });
           }
         }
@@ -1672,11 +1933,9 @@ self.addEventListener('fetch', e => {
     if (path === "/api/trakt-search") {
       const q = url.searchParams.get("q") || "";
       const traktKey = url.searchParams.get("traktKey") || "";
+
       try {
         const lists = await searchTraktLists(q, traktKey);
-        // Always the shared key when traktKey wasn't supplied -- 1 search
-        // call plus 1 classify call per result (searchTraktLists's own
-        // internal mapWithConcurrency over the results it just got back).
         if (!traktKey) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + lists.length));
         return json({ ok: true, lists });
       } catch (err) {
@@ -4028,8 +4287,12 @@ self.addEventListener('fetch', e => {
 
         const result = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
+          kvKey: cacheKey,
+          env,
+          ctx,
           freshTtlSec: 60,
           staleTtlSec: 1800,
+          kvTtlSec: 1800,
           providerLabel: "Trakt Private Lists",
           fetchFn: async () => {
             const res = await fetchTraktWithRetry("https://api.trakt.tv/users/me/lists", {
@@ -4235,8 +4498,12 @@ self.addEventListener('fetch', e => {
 
         const historyResult = await fetchWithPerUserCacheAndCircuitBreaker({
           cacheKey,
+          kvKey: cacheKey,
+          env,
+          ctx,
           freshTtlSec: 60,
           staleTtlSec: 1800,
+          kvTtlSec: 1800,
           providerLabel: "Trakt History Raw",
           fetchFn: async () => {
             ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
@@ -4871,11 +5138,40 @@ self.addEventListener('fetch', e => {
     // does.
     if (path === "/api/resolve") {
       const config = url.searchParams.get("config") || "";
+      const rawUrl = url.searchParams.get("url") || "";
       if (!config) return json({ ok: false, error: "Missing config." }, 400);
       try {
-        const { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken } = await resolveConfig(config, env);
-        if (!entries.length) return json({ ok: false, error: "That link has no lists in it." });
-        return json({ ok: true, entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken });
+        let resData = await resolveConfig(config, env);
+        let { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, watchHistory, continueWatching, watchlist, airingNext } = resData;
+        if (!entries || !entries.length) {
+          if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+            try {
+              const u = new URL(rawUrl);
+              const remoteResolveUrl = `${u.origin}/api/resolve?config=${encodeURIComponent(config)}`;
+              const remoteRes = await fetch(remoteResolveUrl);
+              if (remoteRes.ok) {
+                const remoteData = await remoteRes.json();
+                if (remoteData && remoteData.ok && Array.isArray(remoteData.entries) && remoteData.entries.length) {
+                  return json(remoteData);
+                }
+              }
+            } catch {}
+          }
+        }
+        if (!entries || !entries.length) return json({ ok: false, error: "That link has no lists in it." });
+        return json({
+          ok: true,
+          entries,
+          watchHistory: watchHistory || [],
+          continueWatching: continueWatching || [],
+          watchlist: watchlist || [],
+          airingNext: airingNext || [],
+          mdblistKey,
+          mdblistAccessToken,
+          traktKey,
+          traktUsername,
+          traktAccessToken
+        });
       } catch (err) {
         return json({ ok: false, error: String(err.message || err) });
       }
@@ -4961,6 +5257,21 @@ self.addEventListener('fetch', e => {
       const likeSlug = String(likeBody.slug || "").toLowerCase().trim();
       const likeUnlike = likeBody.action === "unlike";
       if (!likeUser || !likeSlug) return json({ ok: false, error: "Missing list reference." }, 400);
+      
+      if (env.DB) {
+        try {
+          const listId = `${likeUser}:${likeSlug}`;
+          const increment = likeUnlike ? -1 : 1;
+          const { success, results } = await env.DB.prepare(
+            "UPDATE creator_lists SET likes = MAX(0, likes + ?) WHERE id = ? RETURNING likes"
+          ).bind(increment, listId).run();
+          
+          if (success && results.length > 0) {
+            return json({ ok: true, likes: results[0].likes });
+          }
+        } catch (dbErr) {}
+      }
+
       const likeCreatorKey = "creatorlist:" + likeUser + ":" + likeSlug;
       const likeAnonKey = "publishedlist:" + likeUser + ":" + likeSlug;
       let likeKey = null;
@@ -5004,6 +5315,72 @@ self.addEventListener('fetch', e => {
     }
 
 
+    // /api/details/batch  (POST)  { ids: [...], type?, tmdbKey?, region?, fresh? }
+    //   -> { ok, results: { <id>: details | null } }
+    // The plural sibling of /api/details below, for callers that already
+    // know they need many shows at once. Airing Next is the one that
+    // matters (refreshAiringNext, 21_client-custom-list-builder.js): it
+    // walks up to 60 shows per refresh, and was doing so as 60 separate
+    // round trips at a concurrency of 4 -- so fifteen sequential waves of
+    // request latency before the shelf could be rebuilt, per browser, per
+    // refresh.
+    //
+    // This is not a way to make MORE upstream calls in one go. Each id
+    // still goes through fetchTmdbItemDetails, which means the shared
+    // memory/KV/edge cache and, as of the same change, in-flight
+    // coalescing -- so ids already known cost nothing, ids being fetched
+    // concurrently by another request are joined rather than duplicated,
+    // and only genuine misses reach TMDB. The batch simply removes the
+    // round trips.
+    //
+    // Capped at 60 ids to bound the worst case for a single request, and
+    // resolved with a small worker pool rather than one Promise.all over
+    // every id, so a large batch of genuine misses cannot open sixty
+    // simultaneous TMDB connections. A failed id resolves to null rather
+    // than failing the batch -- the caller simply retries it next refresh,
+    // exactly as it did when each id was its own request.
+    if (path === "/api/details/batch" && request.method === "POST") {
+      let reqBody;
+      try {
+        reqBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawIds = Array.isArray(reqBody.ids) ? reqBody.ids : [];
+      // De-duplicated up front: the same show can legitimately appear under
+      // both an imdb and a tmdb-prefixed id in a Watch History, and there is
+      // no reason to resolve it twice.
+      const ids = [...new Set(rawIds.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 60);
+      if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
+
+      const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
+      if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+      const wantType = reqBody.type || "";
+      const region = reqBody.region || "";
+      const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true;
+
+      const results = {};
+      let cursor = 0;
+      async function worker() {
+        while (cursor < ids.length) {
+          const id = ids[cursor++];
+          try {
+            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx);
+          } catch {
+            results[id] = null;
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(6, ids.length) }, () => worker())
+      );
+
+      // Same short max-age as /api/details for the same reason -- this
+      // response's shape changes occasionally and an hour-old copy would
+      // strand anyone who had just opened it.
+      return json({ ok: true, results }, 200, { "Cache-Control": "max-age=60" });
+    }
+
     // /api/details (GET or POST) -> { ok: true, details: { title, overview, rating, releaseYear, poster, background } }
     if (path === "/api/details") {
       let reqBody;
@@ -5024,7 +5401,7 @@ self.addEventListener('fetch', e => {
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       
       const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true || (url && url.searchParams.get("fresh") === "1");
-      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region, isFreshReq);
+      const details = await fetchTmdbItemDetails(imdbId, tmdbKey, reqBody.type, reqBody.region, isFreshReq, env, ctx);
       if (!details) return json({ ok: false, error: "Not found or TMDB error" }, 404);
       
       // Short max-age -- same reasoning as /api/season's own comment: this

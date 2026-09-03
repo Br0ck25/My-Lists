@@ -27,7 +27,7 @@
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Backup &amp; Restore</h2>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Export your complete setup as JSON or import an existing configuration.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Export a complete backup snapshot of your catalogs, custom lists, watchlist, watch history, continue watching, channels, presets, and settings &mdash; or restore from a previous JSON backup.</p>
       <textarea id="configJsonBox" rows="5" style="width:100%;font-family:monospace;font-size:14px;" placeholder="Paste config JSON here to restore..."></textarea>
       <div class="backup-actions-grid" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="exportConfigJson()">Export current</button>
@@ -42,6 +42,7 @@
         <div class="row">
           <input type="text" id="importLinkInput" placeholder="Paste an install or configure link here">
           <button type="button" class="secondary lc-btn" onclick="importFromLink()">Import link</button>
+          <button type="button" class="secondary lc-btn" onclick="restoreListsFromLink()" title="Rebuild and restore custom lists &amp; channels from this link into My Lists without altering your catalog shelves">Restore Lists</button>
         </div>
       </div>
     </div>

@@ -580,6 +580,19 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
+    showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
+    showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
+    showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
+    showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
+    showBadgesStremio: getBadgeSetting('showBadgesStremio'),
+    showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
+    showBadgeSeasonPremiere: getBadgeSetting('showBadgeSeasonPremiere'),
+    showBadgeSeasonFinale: getBadgeSetting('showBadgeSeasonFinale'),
+    showBadgeSeasonFinaleDate: getBadgeSetting('showBadgeSeasonFinaleDate'),
+    showBadgeRating: getBadgeSetting('showBadgeRating'),
+    showBadgeWatched: getBadgeSetting('showBadgeWatched'),
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     keys.creatorName = activeCreator.creatorName;
@@ -591,6 +604,74 @@ function collectKeys() {
   }
   return keys;
 }
+
+function getBadgeSetting(key) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+window.getBadgeSetting = getBadgeSetting;
+
+function applyBadgeBodyClasses() {
+  const b = document.body;
+  if (!b) return;
+  // Badge settings just changed, so the memoized copy the poster renderer
+  // holds is stale -- see getPosterBadgeSettings.
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  b.classList.toggle('hide-airing-next-badges', !getBadgeSetting('showBadgesAiringNext'));
+  b.classList.toggle('hide-continue-watching-badges', !getBadgeSetting('showBadgesContinueWatching'));
+  b.classList.toggle('hide-catalogs-badges', !getBadgeSetting('showBadgesCatalogs'));
+  b.classList.toggle('hide-badge-air-date', !getBadgeSetting('showBadgeAirDate'));
+  b.classList.toggle('hide-badge-season-premiere', !getBadgeSetting('showBadgeSeasonPremiere'));
+  b.classList.toggle('hide-badge-season-finale', !getBadgeSetting('showBadgeSeasonFinale'));
+  b.classList.toggle('hide-badge-season-finale-date', !getBadgeSetting('showBadgeSeasonFinaleDate'));
+  b.classList.toggle('hide-badge-rating', !getBadgeSetting('showBadgeRating'));
+  b.classList.toggle('hide-badge-watched', !getBadgeSetting('showBadgeWatched'));
+}
+window.applyBadgeBodyClasses = applyBadgeBodyClasses;
+
+function toggleBadgeSetting(key, isChecked) {
+  try {
+    localStorage.setItem('myListAddon:' + key, isChecked ? '1' : '0');
+  } catch (e) {}
+  applyBadgeBodyClasses();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+}
+window.toggleBadgeSetting = toggleBadgeSetting;
+
+function initBadgeSettingsUI() {
+  const badgeKeys = [
+    { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
+    { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+    { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
+    { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
+    { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
+    { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
+    { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
+    { key: 'showBadgeSeasonPremiere', id: 'badgeSeasonPremiereCheckbox' },
+    { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
+    { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
+    { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+    { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
+  ];
+  badgeKeys.forEach(({ key, id }) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.checked = getBadgeSetting(key);
+    }
+  });
+  applyBadgeBodyClasses();
+}
+window.initBadgeSettingsUI = initBadgeSettingsUI;
+document.addEventListener('DOMContentLoaded', () => {
+  initBadgeSettingsUI();
+});
 
 // --- Live Preview -----------------------------------------------------------
 //
@@ -640,9 +721,14 @@ async function renderLivePreview() {
   const skeletonsHtml = Array(visibleCount).fill(skeletonCardHtml).join('');
 
   // Pre-render shimmer skeletons and set status spinner on all enabled shelves
+  // (but don't wipe out existing posters if this is just a background refresh)
   enabledEntries.forEach((entryDOM) => {
     const postersContainer = entryDOM.querySelector('.live-preview-posters');
-    if (postersContainer) postersContainer.innerHTML = skeletonsHtml;
+    if (postersContainer) {
+      if (!postersContainer.innerHTML.trim() || postersContainer.innerHTML.includes('live-preview-skeleton-card')) {
+        postersContainer.innerHTML = skeletonsHtml;
+      }
+    }
     const statusEl = entryDOM.querySelector('.live-preview-shelf-status');
     if (statusEl) statusEl.innerHTML = '<span class="status-spin">&#x21BB;</span> <span>Loading&hellip;</span>';
   });
@@ -659,11 +745,20 @@ async function renderLivePreview() {
       const statusEl = entryDOM.querySelector('.live-preview-shelf-status');
       if (!postersContainer) continue;
       
+      const sUrl = (s.url || '').toLowerCase();
+      const sName = (s.name || '').toLowerCase();
+      const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
+      const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
       } else {
         postersContainer.classList.remove('is-watch-history-shelf');
       }
+      postersContainer.classList.toggle('is-continue-watching-shelf', isCwShelf);
+      postersContainer.classList.toggle('is-airing-next-shelf', isAiringShelf);
+      if (isCwShelf) entryDOM.dataset.listSlug = 'continue-watching';
+      if (isAiringShelf) entryDOM.dataset.listSlug = 'airing-next';
       
       const seeAllBtn = entryDOM.querySelector('.live-preview-shelf-title button');
       if (seeAllBtn) {
@@ -701,7 +796,9 @@ async function renderLivePreview() {
           continue;
         }
         livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore };
-        postersContainer.innerHTML = data.sample.slice(0, visibleCount).map(livePreviewPosterHtml).join('');
+        const sliced = data.sample.slice(0, visibleCount);
+        sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; });
+        postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
         if (seeAllBtn && data.sample.length > visibleCount) seeAllBtn.disabled = false;
       } catch (e) {
         if (statusEl) statusEl.innerHTML = '';
@@ -716,16 +813,246 @@ async function renderLivePreview() {
 
 function handlePosterImgError(img) {
   if (!img) return;
-  img.onerror = null;
-  const imdb = img.getAttribute('data-imdb') || '';
-  if (img.src.indexOf('images.metahub.space') === -1 && imdb && imdb.startsWith('tt')) {
-    img.src = 'https://images.metahub.space/poster/medium/' + imdb + '/img';
+  if (img.dataset.hasFailedFallback) {
+    img.style.display = 'none';
+    const ph = img.nextElementSibling;
+    if (ph) ph.style.display = 'flex';
+    return;
+  }
+  img.dataset.hasFailedFallback = '1';
+
+  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
+  let title = (card && (card.dataset.title || card.dataset.name)) || '';
+  const type = (card && (card.dataset.type || card.dataset.listType)) || 'movie';
+  const id = (card && (card.dataset.id || card.dataset.imdbId)) || '';
+
+  // Clean episode indicators from show title for fallback lookup, e.g. "Ted Lasso S03E01" -> "Ted Lasso"
+  const cleanTitle = title.replace(/\s+S\d+E\d+.*$/i, '').trim();
+
+  const tmdbId = id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : '');
+  const imdbId = id.startsWith('tt') ? id.split(':')[0] : '';
+
+  if (cleanTitle || tmdbId || imdbId) {
+    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(cleanTitle || title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.ok && data.poster) {
+          img.src = data.poster;
+          img.style.display = '';
+        } else {
+          img.style.display = 'none';
+          const ph = img.nextElementSibling;
+          if (ph) ph.style.display = 'flex';
+        }
+      })
+      .catch(() => {
+        img.style.display = 'none';
+        const ph = img.nextElementSibling;
+        if (ph) ph.style.display = 'flex';
+      });
   } else {
     img.style.display = 'none';
     const ph = img.nextElementSibling;
     if (ph) ph.style.display = 'flex';
   }
 }
+
+// --- Poster-render caches ----------------------------------------------------
+// livePreviewPosterHtml below is called once per card, and a Watch History
+// grid can be several thousand cards. Two things in it were priced as if it
+// ran a handful of times: four separate localStorage reads for badge
+// settings (so ~4,000 synchronous reads for a 1,000-item grid), and, for
+// every Continue Watching or Airing Next card, a fresh loadLocalCustomLists()
+// plus a linear scan of the whole airing-next list -- O(cards x airing
+// entries) on the main thread before a single pixel is painted.
+//
+// Both inputs are the same for every card in a render pass, so they are
+// computed once and reused. The TTL is short enough to be invisible to a
+// person toggling a setting (the settings UI re-renders well after it
+// lapses) and long enough to cover any single pass; invalidatePosterRender-
+// Caches is also called outright wherever badge settings change, so the TTL
+// is a backstop rather than the mechanism.
+var _posterBadgeCache = null;
+var _posterBadgeCacheAt = 0;
+var _airingIndexCache = null;
+var _airingIndexCacheAt = 0;
+var POSTER_RENDER_CACHE_MS = 250;
+
+function invalidatePosterRenderCaches() {
+  _posterBadgeCache = null;
+  _posterBadgeCacheAt = 0;
+  _airingIndexCache = null;
+  _airingIndexCacheAt = 0;
+}
+window.invalidatePosterRenderCaches = invalidatePosterRenderCaches;
+
+function getPosterBadgeSettings() {
+  var now = Date.now();
+  if (_posterBadgeCache && (now - _posterBadgeCacheAt) < POSTER_RENDER_CACHE_MS) {
+    return _posterBadgeCache;
+  }
+  var get = (typeof getBadgeSetting === 'function') ? getBadgeSetting : function() { return true; };
+  _posterBadgeCache = {
+    continueWatching: get('showBadgesContinueWatching'),
+    airingNext: get('showBadgesAiringNext'),
+    airDate: get('showBadgeAirDate'),
+    seasonPremiere: get('showBadgeSeasonPremiere'),
+    seasonFinale: get('showBadgeSeasonFinale'),
+    seasonFinaleDate: get('showBadgeSeasonFinaleDate'),
+  };
+  _posterBadgeCacheAt = now;
+  return _posterBadgeCache;
+}
+
+// Index of the Airing Next list by every identity the old linear scan used
+// to match on, so a lookup is a few Map hits instead of a walk of the whole
+// list per card.
+//
+// The subtlety worth stating plainly: the old code was
+// airingList.find(...), which walks the list IN ORDER and returns the first
+// entry matching ANY of its predicates. So when two different entries would
+// each match a card by different routes -- say entry 0 by title and entry 3
+// by showId -- the old code returns entry 0, because position wins over
+// which predicate fired. An index that simply checked showId before title
+// would return entry 3 instead, which is a real behaviour change and not a
+// theoretical one (it showed up immediately under randomised comparison
+// against the original predicate).
+//
+// So each key stores the entry's POSITION as well, and a lookup gathers
+// every candidate and keeps the earliest -- identical results to find(),
+// without the walk. Keys are inserted first-wins so a duplicate identity
+// within the list also resolves to its earliest occurrence.
+function getAiringNextIndex() {
+  var now = Date.now();
+  if (_airingIndexCache && (now - _airingIndexCacheAt) < POSTER_RENDER_CACHE_MS) {
+    return _airingIndexCache;
+  }
+  var byShowId = new Map();
+  var byBaseId = new Map();
+  var byTmdb = new Map();
+  var byImdb = new Map();
+  var byTitle = new Map();
+  var list = [];
+  try {
+    list = (typeof loadLocalCustomLists === 'function')
+      ? ((loadLocalCustomLists()['airing-next'] || {}).items || [])
+      : [];
+  } catch (e) {
+    list = [];
+  }
+  function put(map, key, entry, i) {
+    if (key && !map.has(key)) map.set(key, { entry: entry, i: i });
+  }
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i];
+    if (!a) continue;
+    put(byShowId, String(a.showId || ''), a, i);
+    put(byBaseId, String(a.showId || a.id || '').split(':')[0], a, i);
+    if (a.canonicalTmdbId != null) put(byTmdb, 'c' + String(a.canonicalTmdbId), a, i);
+    if (a.tmdbId != null) put(byTmdb, 't' + String(a.tmdbId), a, i);
+    if (a.imdbId) put(byImdb, String(a.imdbId), a, i);
+    put(byTitle, String(a.showTitle || a.title || a.name || '').toLowerCase().trim(), a, i);
+  }
+  _airingIndexCache = {
+    empty: list.length === 0,
+    byShowId: byShowId,
+    byBaseId: byBaseId,
+    byTmdb: byTmdb,
+    byImdb: byImdb,
+    byTitle: byTitle,
+  };
+  _airingIndexCacheAt = now;
+  return _airingIndexCache;
+}
+
+function findAiringMatchFor(m) {
+  var idx = getAiringNextIndex();
+  if (idx.empty) return null;
+  var best = null;
+  function consider(hit) {
+    if (hit && (best === null || hit.i < best.i)) best = hit;
+  }
+  // Predicate 1: an entry's showId against any of this card's identities.
+  if (m.id) consider(idx.byShowId.get(String(m.id)));
+  if (m.removeShowId) consider(idx.byShowId.get(String(m.removeShowId)));
+  if (m.showId) consider(idx.byShowId.get(String(m.showId)));
+  if (m.imdbId) consider(idx.byShowId.get(String(m.imdbId)));
+  // Predicate 2: base id (everything before the first colon) on both sides.
+  var mBase = String(m.showId || m.id || m.removeShowId || '').split(':')[0];
+  if (mBase) consider(idx.byBaseId.get(mBase));
+  // Predicates 3-5: canonical TMDB id, TMDB id, IMDb id.
+  if (m.canonicalTmdbId != null) consider(idx.byTmdb.get('c' + String(m.canonicalTmdbId)));
+  if (m.tmdbId != null) consider(idx.byTmdb.get('t' + String(m.tmdbId)));
+  if (m.imdbId) consider(idx.byImdb.get(String(m.imdbId)));
+  // Predicate 6: normalised title.
+  var mTitle = String(m.showTitle || m.title || m.name || '').toLowerCase().trim();
+  if (mTitle) consider(idx.byTitle.get(mTitle));
+  return best ? best.entry : null;
+}
+
+// --- Chunked poster-grid rendering -------------------------------------------
+// Building an entire grid in one assignment is fine for a 40-item chart and
+// punishing for a Watch History that has grown into the thousands: the map
+// runs to completion, a multi-megabyte HTML string is assembled, and the
+// browser then parses and lays out ~8 nodes and an <img> per card before
+// anything at all appears. Every filter pill and sort change paid it again.
+//
+// This paints the first screenful synchronously -- so the grid is visible
+// immediately regardless of list size -- then appends the rest in small
+// batches between frames, keeping the main thread free for scrolling and
+// taps in between. insertAdjacentHTML is used rather than rebuilding
+// innerHTML so earlier batches are never re-parsed.
+//
+// Each call takes a generation token: starting a new render invalidates any
+// batches still queued from the previous one, so rapidly toggling filters
+// can never interleave two lists into the same grid.
+var POSTER_GRID_FIRST_CHUNK = 60;
+var POSTER_GRID_BATCH = 60;
+var _posterGridGeneration = 0;
+
+function renderPosterGridChunked(gridEl, items, onComplete) {
+  if (!gridEl) return;
+  var generation = ++_posterGridGeneration;
+  gridEl.innerHTML = '';
+  if (!items || !items.length) {
+    if (typeof onComplete === 'function') onComplete(0);
+    return;
+  }
+
+  var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
+  gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+
+  if (items.length <= POSTER_GRID_FIRST_CHUNK) {
+    if (typeof onComplete === 'function') onComplete(items.length);
+    return;
+  }
+
+  var cursor = POSTER_GRID_FIRST_CHUNK;
+  var schedule = (typeof window !== 'undefined' && window.requestAnimationFrame)
+    ? function(fn) { window.requestAnimationFrame(fn); }
+    : function(fn) { setTimeout(fn, 16); };
+
+  function step() {
+    // A newer render started, or the grid was swapped out from under us --
+    // abandon this pass rather than appending into someone else's list.
+    if (generation !== _posterGridGeneration) return;
+    if (!gridEl.isConnected) return;
+    var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
+    if (!slice.length) {
+      if (typeof onComplete === 'function') onComplete(items.length);
+      return;
+    }
+    gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    cursor += slice.length;
+    if (cursor < items.length) {
+      schedule(step);
+    } else if (typeof onComplete === 'function') {
+      onComplete(items.length);
+    }
+  }
+  schedule(step);
+}
+window.renderPosterGridChunked = renderPosterGridChunked;
 
 function livePreviewPosterHtml(m) {
   const landscape = m.posterShape === 'landscape';
@@ -747,21 +1074,82 @@ function livePreviewPosterHtml(m) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
   }
 
+  const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
+  const parentName = (m.listName || (window._currentListDetailsParams ? window._currentListDetailsParams.name : '') || '').toLowerCase();
+
+  let decodedSlug = '';
+  if (parentUrl.startsWith('customlist:v1:')) {
+    try {
+      const payload = JSON.parse(parentUrl.slice('customlist:v1:'.length));
+      decodedSlug = (payload.localSlug || payload.creatorSlug || payload.slug || payload.listSlug || '').toLowerCase();
+    } catch (e) {}
+  }
+
+  const isCwListContext = parentUrl.includes('continue-watching') || parentUrl.includes('continue_watching') || parentName.includes('continue watching') || decodedSlug === 'continue-watching';
+  const isAiringListContext = parentUrl.includes('airing-next') || parentUrl.includes('airing_next') || parentName.includes('airing next') || decodedSlug === 'airing-next';
+
+  const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext);
+  const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  
+  const badgeSettings = getPosterBadgeSettings();
+  const locationAllowed = isCwItem
+    ? badgeSettings.continueWatching
+    : (isAiringItem ? badgeSettings.airingNext : false);
+
+  const showAirDate = locationAllowed && badgeSettings.airDate;
+  const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
+  const showFinale = locationAllowed && badgeSettings.seasonFinale;
+  const showFinaleDate = locationAllowed && badgeSettings.seasonFinaleDate;
+
+  let airingMatch = null;
+  if (isCwItem || isAiringItem) {
+    airingMatch = findAiringMatchFor(m);
+  }
+  
+  const mSeason = m.seasonNum != null ? m.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
+  const mEpisode = m.episodeNum != null ? m.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+  
+  // Check if this show is on an older past season (not the newest season)
+  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && m.seasonNum != null && m.seasonNum < airingMatch.seasonNum);
+
   let dateBadge = '';
-  if (!m.hideDateBadge && m.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(m.airDate)) {
-    const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(m.airDate) : '';
-    if (badgeText) {
-      dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(m.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+  let bottomBadge = '';
+
+  if (locationAllowed && !isOlderSeason) {
+    const isSameEpisode = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum) && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum));
+    const effectiveAirDate = m.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
+    const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
+    const isUnairedEp = effectiveAirDate ? !hasAired : !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+
+    if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
+      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
+      if (badgeText) {
+        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
+      }
+    }
+
+    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+    const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
+    const isSeasonFinale = !!(m.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+    const seasonFinaleAirDate = m.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
+    const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
+
+    if (showPremiere && isSeasonPremiere && isUnairedEp) {
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
+    } else if (showFinale && isSeasonFinale) {
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
+    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+      const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
+      if (finaleText) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+      }
     }
   }
-  const premiereBadge = (m.isSeasonPremiere)
-    ? '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(m.airDate || '') + '">Season Premiere</div>'
-    : '';
   return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +
-      premiereBadge +
+      bottomBadge +
       removeBtn +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
@@ -892,6 +1280,20 @@ window.renderWatchHistoryGrid = function() {
   const statusEl = document.getElementById('detailStatus');
   const subEl = document.getElementById('detailSubtitle');
   if (!gridEl) return;
+  
+  const detailTab = document.getElementById('content-list-details');
+  if (!detailTab || detailTab.hasAttribute('hidden')) return;
+  const p = window._currentListDetailsParams;
+  if (!p) return;
+  const isExtHist = !!(
+    (p.listUrl && (p.listUrl === 'trakt:history' || p.listUrl.startsWith('trakt:history') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/history')))) ||
+    (p.listUrl && (p.listUrl === 'mdblist:history' || p.listUrl.startsWith('mdblist:history') || p.listUrl.includes('mdblist.com/history') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/history')))) ||
+    (p.listUrl && p.listUrl.startsWith('simkl:user:') && p.listUrl.includes(':history'))
+  );
+  if (isExtHist) return;
+  const isLocalHist = (!p.listUrl && p.name && p.name.toLowerCase().includes('watch history')) || p.listUrl === 'watch-history' || p.listUrl === 'custom:watch-history' || p.listUrl === 'autotrack:watch-history';
+  if (!isLocalHist) return;
+
 
   const rawItems = window._rawWatchHistoryItems || [];
   if (!rawItems.length) {
@@ -915,8 +1317,8 @@ window.renderWatchHistoryGrid = function() {
       if (isEp) {
         const showKey = String(it.showId || it.showTitle || it.id);
         const sId = it.showId || (String(it.id).startsWith('tt') ? it.id : null);
-        let showPosterUrl = it.showPoster || '';
-        if (!showPosterUrl && sId) {
+        let showPosterUrl = it.showPoster || it.poster || '';
+        if (!showPosterUrl && sId && sId.startsWith('tt')) {
           showPosterUrl = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(sId) + '/img';
         }
         if (!showMap.has(showKey)) {
@@ -943,7 +1345,7 @@ window.renderWatchHistoryGrid = function() {
         }
       } else {
         let movPoster = it.poster || it.showPoster || '';
-        if (!movPoster && (it.imdbId || it.id)) {
+        if (!movPoster && (it.imdbId || it.id) && String(it.imdbId || it.id).startsWith('tt')) {
           movPoster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(it.imdbId || it.id) + '/img';
         }
         processed.push({
@@ -960,7 +1362,7 @@ window.renderWatchHistoryGrid = function() {
     });
 
     showMap.forEach((entry) => {
-      if (!entry.poster && entry.id) {
+      if (!entry.poster && entry.id && String(entry.id).startsWith('tt')) {
         entry.poster = 'https://images.metahub.space/poster/medium/' + encodeURIComponent(entry.id) + '/img';
       }
       entry.subtitle = entry.watchedCount + ' episode' + (entry.watchedCount === 1 ? '' : 's') + ' watched';
@@ -998,7 +1400,8 @@ window.renderWatchHistoryGrid = function() {
     processed.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
   }
 
-  gridEl.innerHTML = processed.map(livePreviewPosterHtml).join('');
+  processed.forEach(item => item.listUrl = 'watch-history');
+  renderPosterGridChunked(gridEl, processed);
   if (subEl) {
     subEl.textContent = processed.length + ' item' + (processed.length === 1 ? '' : 's');
   }
@@ -1062,8 +1465,15 @@ window.switchListDetailsType = function(newType) {
     isDualTypeChart = true;
   }
 
-  if (isDualTypeChart && (newType === 'movie' || newType === 'series') && (p.type !== newType || p.listUrl !== targetUrl)) {
-    openListDetailsPage(targetName, newType, targetUrl, null, {
+  const isExternalProviderList = !!(p.listUrl && (
+    p.listUrl === 'trakt:history' || p.listUrl.startsWith('trakt:history:') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/history')) ||
+    p.listUrl === 'trakt:watchlist' || p.listUrl.startsWith('trakt:watchlist:') || (p.listUrl.includes('trakt.tv/users/') && p.listUrl.includes('/watchlist')) ||
+    p.listUrl === 'mdblist:history' || p.listUrl.startsWith('mdblist:history:') || p.listUrl.includes('mdblist.com/history') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/history')) ||
+    p.listUrl === 'mdblist:watchlist' || p.listUrl.startsWith('mdblist:watchlist:') || (p.listUrl.includes('mdblist.com/lists/') && p.listUrl.includes('/watchlist'))
+  ));
+
+  if ((isDualTypeChart || isExternalProviderList) && (newType === 'movie' || newType === 'series' || (newType === 'all' && isExternalProviderList)) && (p.type !== newType || p.listUrl !== targetUrl)) {
+    openListDetailsPage(targetName, newType === 'all' ? 'mixed' : newType, targetUrl, null, {
       preserveScroll: true
     });
     return;
@@ -1073,14 +1483,15 @@ window.switchListDetailsType = function(newType) {
   if (window._currentListDetailsAllItems && Array.isArray(window._currentListDetailsAllItems)) {
     let filtered = window._currentListDetailsAllItems;
     if (newType === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (newType === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
     const gridEl = document.getElementById('detailGrid');
     const statusEl = document.getElementById('detailStatus');
     if (gridEl) {
-      gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+      filtered.forEach(item => { item.listUrl = p.listUrl; item.listName = p.name; });
+      renderPosterGridChunked(gridEl, filtered);
     }
     if (statusEl) {
       statusEl.innerHTML = filtered.length ? '' : '<small>No matching items found.</small>';
@@ -1148,7 +1559,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._listPreloadedCache = window._listPreloadedCache || {};
   if (preloaded && preloaded.sample && preloaded.sample.length) {
     window._listPreloadedCache[cacheKey] = preloaded;
-  } else if (!preloaded) {
+  } else if (!preloaded || !preloaded.sample || !preloaded.sample.length) {
     if (window._listPreloadedCache[cacheKey]) {
       preloaded = window._listPreloadedCache[cacheKey];
     } else if (listUrl && window._curatedRecs && window._curatedRecs[listUrl]) {
@@ -1239,10 +1650,112 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const slug = parts[1];
       const kind = parts[2];
       const creator = parts[3];
-      if (typeof getAutoTrackChannelItems === 'function') {
-        const sample = getAutoTrackChannelItems(slug, kind, creator);
+      if (slug === 'continue-watching') {
+        const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const cwList = map['continue-watching'] || (typeof getOrCreateContinueWatchingList === 'function' ? getOrCreateContinueWatchingList() : null);
+        const rawItems = (cwList && Array.isArray(cwList.items)) ? cwList.items : [];
+        const deduped = (typeof dedupeContinueWatchingItems === 'function') ? dedupeContinueWatchingItems(rawItems) : rawItems;
+        const sample = deduped.map((it) => {
+          const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+          const epId = String(it.id || '');
+          const showId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)));
+          const showPoster = it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster);
+          return {
+            id: showId || it.id,
+            showId: showId || it.id,
+            showTitle: it.showTitle || it.title || it.name,
+            seasonNum: it.seasonNum,
+            episodeNum: it.episodeNum,
+            type: 'series',
+            name: label.title,
+            subtitle: label.subtitle,
+            poster: showPoster,
+            year: it.year,
+            airDate: it.airDate,
+            isUnaired: it.isUnaired,
+            seasonFinaleAirDate: it.seasonFinaleAirDate,
+            isSeasonPremiere: it.isSeasonPremiere,
+            isSeasonFinale: it.isSeasonFinale,
+            removeShowId: showId || it.id,
+          };
+        });
         preloaded = { sample: sample, count: sample.length, maybeMore: false };
+        window._listPreloadedCache[cacheKey] = preloaded;
+      } else if (slug === 'watch-history') {
+        const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+        const whList = map['watch-history'] || { items: [] };
+        const sample = (whList.items || []).map((it) => {
+          const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+          const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+          return {
+            id: it.showId || it.imdbId || it.id,
+            type: isShow ? 'series' : 'movie',
+            name: label.title,
+            subtitle: label.subtitle,
+            poster: it.poster || it.showPoster,
+            year: it.year,
+            airDate: it.airDate,
+            removeHistoryId: it.id || it.imdbId,
+          };
+        });
+        preloaded = { sample: sample, count: sample.length, maybeMore: false };
+        window._listPreloadedCache[cacheKey] = preloaded;
       }
+    } else if (listUrl && (listUrl.startsWith('custom:') || listUrl.startsWith('customlist:v1:') || listUrl.startsWith('/lists/custom/'))) {
+      try {
+        let slug = '';
+        let directItems = null;
+        if (listUrl.startsWith('custom:')) {
+          slug = listUrl.slice('custom:'.length);
+        } else if (listUrl.startsWith('/lists/custom/')) {
+          slug = listUrl.slice('/lists/custom/'.length);
+        } else if (listUrl.startsWith('customlist:v1:')) {
+          try {
+            const p = JSON.parse(listUrl.slice('customlist:v1:'.length));
+            slug = p.listSlug || p.localSlug || p.creatorSlug || '';
+            if (Array.isArray(p.items)) directItems = p.items;
+          } catch (e) {}
+        }
+        const match = (typeof findCustomListBySlugOrName === 'function') ? findCustomListBySlugOrName(slug, name) : null;
+        const rawItems = (match && Array.isArray(match.items) && match.items.length) ? match.items : (directItems || []);
+        if (rawItems.length) {
+          const isCw = (match && match.slug === 'continue-watching') || slug === 'continue-watching';
+          const isWatchlist = (match && (match.slug === 'watchlist' || match.isWatchlist)) || slug === 'watchlist';
+          const isHistory = (match && match.slug === 'watch-history') || slug === 'watch-history';
+          const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(rawItems) : rawItems) : rawItems;
+          const sample = itemsToProcess.map((it) => {
+            const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+            const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+            const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : ((match && match.type && match.type !== 'mixed') ? match.type : (type || 'movie'))));
+            const epId = String(it.id || '');
+            const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+            const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
+            return {
+              id: showId,
+              showId: showId,
+              showTitle: it.showTitle || it.title || it.name,
+              seasonNum: it.seasonNum,
+              episodeNum: it.episodeNum,
+              type: itemType,
+              name: label.title || it.title || it.name || 'Untitled',
+              subtitle: label.subtitle || '',
+              poster: showPoster,
+              year: it.year,
+              airDate: it.airDate,
+              isUnaired: it.isUnaired,
+              seasonFinaleAirDate: it.seasonFinaleAirDate,
+              isSeasonPremiere: it.isSeasonPremiere,
+              isSeasonFinale: it.isSeasonFinale,
+              removeShowId: isCw ? (it.showId || it.id) : null,
+              removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+              removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+              removeCustomListSlug: (!isCw && !isWatchlist && !isHistory && (match ? (match.slug || match.localSlug) : slug)) ? (match ? (match.slug || match.localSlug) : slug) : null,
+            };
+          });
+          preloaded = { sample: sample, count: sample.length, maybeMore: false };
+          window._listPreloadedCache[cacheKey] = preloaded;
+        }
+      } catch (e) {}
     } else if (!listUrl && name) {
       const isGenericChartName = nLower === 'popular' || nLower.startsWith('popular ') || nLower.startsWith('popular -') || nLower === 'trending' || nLower.startsWith('trending ') || nLower.startsWith('trending -') || nLower === 'new releases' || nLower.startsWith('new releases') || nLower === 'airing next';
       if (!isGenericChartName) {
@@ -1253,17 +1766,30 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const isCw = match.slug === 'continue-watching';
             const isWatchlist = match.slug === 'watchlist' || match.isWatchlist || (match.name && match.name.toLowerCase() === 'watchlist');
             const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
-            const sample = match.items.map((it) => {
+            const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(match.items) : match.items) : match.items;
+            const sample = itemsToProcess.map((it) => {
               const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+              const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+              const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (match && match.type && match.type !== 'mixed' ? match.type : 'movie')));
+              const epId = String(it.id || '');
+              const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+              const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
               return {
-                id: it.showId || it.imdbId || it.id,
-                type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
-                name: label.title,
-                subtitle: label.subtitle,
-                poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
+                id: showId,
+                showId: showId,
+                showTitle: it.showTitle || it.title || it.name,
+                seasonNum: it.seasonNum,
+                episodeNum: it.episodeNum,
+                type: itemType,
+                name: label.title || it.title || it.name || 'Untitled',
+                subtitle: label.subtitle || '',
+                poster: showPoster,
                 year: it.year,
                 airDate: it.airDate,
                 isUnaired: it.isUnaired,
+                seasonFinaleAirDate: it.seasonFinaleAirDate,
+                isSeasonPremiere: it.isSeasonPremiere,
+                isSeasonFinale: it.isSeasonFinale,
                 removeShowId: isCw ? (it.showId || it.id) : null,
                 removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
                 removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
@@ -1283,11 +1809,13 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const isHistory = match.slug === 'watch-history' || (match.name && match.name.toLowerCase() === 'watch history');
             const sample = match.items.map((it) => {
               const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
+              const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+              const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (match && match.type && match.type !== 'mixed' ? match.type : 'movie')));
               return {
-                id: it.showId || it.imdbId || it.id,
-                type: it.showId ? 'series' : (it.type || it.kind || (match.type === 'mixed' ? 'movie' : (match.type || 'movie'))),
-                name: label.title,
-                subtitle: label.subtitle,
+                id: it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null),
+                type: itemType,
+                name: label.title || it.title || it.name || 'Untitled',
+                subtitle: label.subtitle || '',
                 poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
                 year: it.year,
                 airDate: it.airDate,
@@ -1468,12 +1996,6 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
   updateDetailAddBtn();
 
-  window._currentListDetailsParams = { name, type, listUrl };
-  window._currentListDetailsFilter = (type === 'movie' || type === 'series') ? type : 'all';
-  window._currentListDetailsAllItems = [];
-  const filterBar = document.getElementById('detailFilterBar');
-  const isWatchHistory = (name && name.toLowerCase().includes('watch history')) || (listUrl === 'autotrack:watch-history' || listUrl === 'custom:watch-history');
-
   let isDualTypeChart = false;
   if (typeof CHART_SLUG_ENTRIES !== 'undefined' && Array.isArray(CHART_SLUG_ENTRIES)) {
     const match = CHART_SLUG_ENTRIES.find((e) => e.name === name || e.movieUrl === listUrl || e.showUrl === listUrl);
@@ -1485,14 +2007,37 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     isDualTypeChart = true;
   }
 
-  const isMixedList = type === 'mixed' || isDualTypeChart || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+  const isContinueWatching = (name && name.toLowerCase().includes('continue watching')) || (listUrl === 'autotrack:continue-watching' || listUrl === 'custom:continue-watching' || (listUrl && listUrl.includes('continue-watching')));
+  if (isContinueWatching) {
+    type = 'series';
+    isDualTypeChart = false;
+  }
+
+  window._currentListDetailsParams = { name, type, listUrl };
+  window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
+  window._currentListDetailsAllItems = [];
+  const filterBar = document.getElementById('detailFilterBar');
+  const isExternalHistory = !!(
+    (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
+    (listUrl && (listUrl === 'mdblist:history' || listUrl.startsWith('mdblist:history') || listUrl.includes('mdblist.com/history') || (listUrl.includes('mdblist.com/lists/') && listUrl.includes('/history')))) ||
+    (listUrl && listUrl.startsWith('simkl:user:') && listUrl.includes(':history'))
+  );
+  const isLocalWatchHistory = !isExternalHistory && (
+    (!listUrl && (nLower === 'watch history' || nLower.includes('watch history'))) ||
+    listUrl === 'autotrack:watch-history' ||
+    listUrl === 'custom:watch-history' ||
+    listUrl === 'watch-history'
+  );
+  const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
 
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
   const genericTypeControls = document.getElementById('genericTypeFilterControls');
+  const cwClearBtn = document.getElementById('cwClearHistoryBtn');
+  if (cwClearBtn) cwClearBtn.style.display = 'none';
 
   if (filterBar) {
-    if (isWatchHistory) {
+    if (isLocalWatchHistory) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'flex';
       if (whSortControls) whSortControls.style.display = 'flex';
@@ -1516,10 +2061,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (whSortControls) whSortControls.style.display = 'none';
       if (genericTypeControls) {
         genericTypeControls.style.display = 'flex';
+        if (cwClearBtn) {
+          cwClearBtn.style.display = isContinueWatching ? '' : 'none';
+        }
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
-        if (isDualTypeChart) {
+        const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
+        if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {
@@ -1552,7 +2101,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     }
   }
 
-  if (isWatchHistory) {
+  if (isLocalWatchHistory) {
     if (likeBtn) likeBtn.style.display = 'none';
     if (addBtn) addBtn.style.display = 'none';
     const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
@@ -1596,7 +2145,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         if (listUrl.startsWith('autotrack:')) slug = listUrl.split(':')[1] || '';
         else if (listUrl.startsWith('custom:') && !listUrl.startsWith('custom:curated:')) slug = listUrl.slice('custom:'.length);
       }
-      if (!slug && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
+      if (!slug && !listUrl && (name && (name.toLowerCase() === 'continue watching' || name.toLowerCase() === 'watch history' || name.toLowerCase() === 'watchlist'))) {
         slug = name.toLowerCase().replace(' ', '-');
       }
 
@@ -1772,11 +2321,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     const curFilter = window._currentListDetailsFilter || 'all';
     let filtered = window._currentListDetailsAllItems;
     if (curFilter === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'));
+      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (curFilter === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'episode' || !!it.showId || it.seasonNum != null);
+      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
-    gridEl.innerHTML = filtered.map(livePreviewPosterHtml).join('');
+    filtered.forEach(item => { item.listUrl = listUrl; item.listName = name; });
+    // Chunked for the same reason the Watch History grid is -- this is the
+    // path a large Custom List, Watchlist or paginated chart takes, and it
+    // rebuilds the whole accumulated grid on every page that arrives.
+    renderPosterGridChunked(gridEl, filtered);
     loadedCount = window._currentListDetailsAllItems.length;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
@@ -1791,7 +2344,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 
   async function loadNextPage() {
     if (loading || done) return;
-    if (!listUrl || listUrl.startsWith('custom:')) {
+    if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
       statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
