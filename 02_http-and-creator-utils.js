@@ -945,25 +945,147 @@ async function listAllKeys(namespace, prefix) {
   return { keys, list_complete: true };
 }
 
+// --- Account data purge (shared by reset and delete) -------------------------
+//
+// /api/creator/account/reset and /api/creator/delete-account are the same
+// sweep apart from one thing: whether the identity itself (`creator:{u}`
+// plus the D1 `creators` row) goes too. They used to be written out
+// separately, and drifted -- delete-account was still naming
+// `creatorprofile:`/`creatorpresets:`/`creatorchannels:`, key names this
+// codebase has not written in a long time, while missing every key it
+// actually does write (`creatorsync:`, `creatorsynctracking:`,
+// `creatorsyncpresets:`, `creatorsyncchannels:`, ...). The result was a
+// "delete my account" that returned ok:true while leaving the account
+// fully intact and still able to authenticate. One function so that
+// cannot happen again: anything added to the account's key set gets
+// cleaned up by both callers automatically.
+async function purgeCreatorData(env, username, options = {}) {
+  const deleteIdentity = options.deleteIdentity === true;
+  const u = username;
+  let listsCleared = 0;
+  let keysCleared = 0;
+
+  // Custom lists are one key each and list() pages -- keep going until the
+  // cursor is exhausted rather than assuming a single page covers an
+  // account that may have hundreds.
+  try {
+    let cursor;
+    for (let page = 0; page < 50; page++) {
+      const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+      for (const k of res.keys) {
+        await env.CONFIGS.delete(k.name);
+        listsCleared++;
+      }
+      if (res.list_complete || !res.cursor) break;
+      cursor = res.cursor;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: list enumeration failed", e);
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+    } catch (dbErr) {
+      console.error("D1 write error (purgeCreatorData lists):", dbErr);
+    }
+  }
+
+  // Everything else the account owns, under the key names actually in use
+  // today, plus the legacy ones (harmless if absent) so an old account
+  // still gets fully cleaned.
+  const dataKeys = [
+    `creatorsync:${u}`,
+    `creatorsynctracking:${u}`,
+    `creatorsyncpresets:${u}`,
+    `creatorsyncchannels:${u}`,
+    `creatorlistorder:${u}`,
+    `creatorscrobblequeue:${u}`,
+    `creatorlistlikes:${u}`,
+    `creatorlikes:${u}`,
+    `creatorshare:${u}`,
+    // legacy names, harmless if absent
+    `creatortrack:${u}`,
+    `creatorpresets:${u}`,
+    `creatorchannels:${u}`,
+    `creatorprofile:${u}`,
+  ];
+  for (const key of dataKeys) {
+    try {
+      await env.CONFIGS.delete(key);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete", key, e);
+    }
+  }
+
+  if (deleteIdentity) {
+    // Last, and only for delete-account: the identity itself. Done after
+    // the data sweep so that a failure partway through leaves an account
+    // that can still sign in and retry, rather than orphaned data with no
+    // owner and a username nobody can ever reclaim.
+    try {
+      await env.CONFIGS.delete(`creator:${u}`);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete identity", e);
+    }
+    try {
+      await env.CONFIGS.delete(`creatorlastseen:${u}`);
+      keysCleared++;
+    } catch (e) {}
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
+      } catch (dbErr) {
+        console.error("D1 write error (purgeCreatorData identity):", dbErr);
+      }
+    }
+  }
+
+  // Any verification memoized in a warm isolate must stop being honoured
+  // the instant the account it refers to is reset or removed.
+  try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+  return { listsCleared, keysCleared };
+}
+
+// D1 is an optional accelerator in front of KV, never a replacement for it
+// -- KV remains the store every account is guaranteed to exist in (see the
+// unconditional KV writes in the create/rotate paths).
+//
+// This used to `return null` when D1 was bound and the row was absent,
+// instead of falling through to KV. That is only correct if every account
+// is guaranteed present in D1, which is exactly what is NOT true: D1 is
+// populated lazily by /admin/api/migrate-d1, so every account created
+// before that endpoint was first run has no D1 row. Binding DB therefore
+// locked all of those users out of their own accounts completely -- the
+// key was fine, the data was fine, the lookup just said "no such creator"
+// and every endpoint returned the generic "Username or Key is incorrect."
+// A missing row means "not migrated yet", not "does not exist".
 async function getCreator(env, username) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreator), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creator:${username}`);
 }
 
+// Same lazy-migration hazard as getCreator above: a list absent from D1
+// must fall through to KV rather than being reported as nonexistent.
 async function getCreatorList(env, username, slug) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ 
           slug: row.id.split(':')[1] || slug, 
@@ -976,8 +1098,10 @@ async function getCreatorList(env, username, slug) {
           likes: row.likes || 0
         });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
 }

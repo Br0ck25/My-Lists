@@ -4630,17 +4630,45 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
       let threadIds = [];
       let creatorName = null;
+      let creatorKey = null;
       if (request.method === "POST") {
         try {
           const body = await request.json();
           if (Array.isArray(body.threadIds)) threadIds = body.threadIds.map((t) => String(t).trim()).filter(Boolean);
           if (body.creatorName) creatorName = String(body.creatorName).trim().toLowerCase();
+          if (body.creatorKey) creatorKey = String(body.creatorKey);
         } catch {}
       } else {
         const pIds = url.searchParams.get("threadIds");
         if (pIds) threadIds = pIds.split(",").map((s) => s.trim()).filter(Boolean);
         const pCreator = url.searchParams.get("creatorName");
         if (pCreator) creatorName = pCreator.trim().toLowerCase();
+        const pKey = url.searchParams.get("creatorKey");
+        if (pKey) creatorKey = pKey;
+      }
+
+      // Looking a creator up BY NAME returns their whole support history --
+      // free-text messages plus the optional `contact` field the feedback
+      // form explicitly asks for. That used to require nothing but the
+      // username, which /lists/public.json publishes for everyone who has
+      // ever shared a list, so anyone could harvest every user's
+      // correspondence and contact details by iterating the directory.
+      //
+      // The name-based scan below now requires the account's own key. The
+      // threadIds path is deliberately left unauthenticated: a thread id
+      // is a capability (it is only ever shown to the person who filed the
+      // report), and anonymous users with no account at all rely on it to
+      // follow up on what they submitted.
+      // authenticateCreator is declared further down in
+      // 26_api-creator-and-admin-routes.js, which is the same function
+      // body as this file after the build concatenates them -- a hoisted
+      // function declaration, so it is in scope here.
+      if (creatorName) {
+        const auth = await authenticateCreator(creatorName, creatorKey);
+        if (!auth.ok) {
+          return json({ ok: false, error: "Username or Key is incorrect." }, 401, { "Cache-Control": "no-store" });
+        }
+        creatorName = auth.username;
       }
 
       const threadsMap = new Map();
