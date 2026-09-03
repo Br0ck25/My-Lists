@@ -438,6 +438,24 @@ function validateCreatorUsername(raw) {
   return { ok: true, normalized };
 }
 
+// Display names used to be silently overwritten with the validated username
+// (`const displayName = String(body.creatorName || "").trim()`), which was
+// load-bearing as a security control: admin/client HTML never saw interesting
+// input. Accepting a real display name therefore has to ship with length and
+// control-character validation, plus escaping at every render site.
+const CREATOR_DISPLAY_NAME_MAX = 40;
+
+function normalizeCreatorDisplayName(raw, fallbackUsername) {
+  let s = String(raw == null ? "" : raw).replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (!s) s = String(fallbackUsername || "").trim();
+  if (!s) return { ok: false, error: "Display name can't be empty." };
+  if (s.length > CREATOR_DISPLAY_NAME_MAX) {
+    return { ok: false, error: "Display name must be 40 characters or fewer." };
+  }
+  return { ok: true, displayName: s };
+}
+
 // Server-side counterpart to the client-side slugify() inside the builder
 // page's own script (that one only runs in the browser) -- used for
 // turning a publish-a-list list-name into the URL-safe slug segment

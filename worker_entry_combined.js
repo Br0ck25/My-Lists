@@ -1959,6 +1959,24 @@ function validateCreatorUsername(raw) {
   return { ok: true, normalized };
 }
 
+// Display names used to be silently overwritten with the validated username
+// (`const displayName = String(body.creatorName || "").trim()`), which was
+// load-bearing as a security control: admin/client HTML never saw interesting
+// input. Accepting a real display name therefore has to ship with length and
+// control-character validation, plus escaping at every render site.
+const CREATOR_DISPLAY_NAME_MAX = 40;
+
+function normalizeCreatorDisplayName(raw, fallbackUsername) {
+  let s = String(raw == null ? "" : raw).replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (!s) s = String(fallbackUsername || "").trim();
+  if (!s) return { ok: false, error: "Display name can't be empty." };
+  if (s.length > CREATOR_DISPLAY_NAME_MAX) {
+    return { ok: false, error: "Display name must be 40 characters or fewer." };
+  }
+  return { ok: true, displayName: s };
+}
+
 // Server-side counterpart to the client-side slugify() inside the builder
 // page's own script (that one only runs in the browser) -- used for
 // turning a publish-a-list list-name into the URL-safe slug segment
@@ -14000,7 +14018,7 @@ ${seoHeadHtml}
         var cBar = document.getElementById('creatorProfileBar');
         if (cBar) {
           if (cName && cKey) {
-            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + (cDisp || cName) + '</button></div>';
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + String(cDisp || cName || '').replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}) + '</button></div>';
           } else {
             cBar.innerHTML = '<div style="display:flex; align-items:center; gap:6px;"><button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button></div>';
           }
@@ -37297,7 +37315,8 @@ function openCreateProfileModal() {
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
-    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username"></div>' +
+    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
@@ -37310,6 +37329,8 @@ function openCreateProfileModal() {
 
 async function submitCreateProfile() {
   const name = document.getElementById('createProfileNameInput').value.trim();
+  const displayInput = document.getElementById('createProfileDisplayInput');
+  const displayName = displayInput ? displayInput.value.trim() : '';
   const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
   const errBox = document.getElementById('createProfileError');
   if (!name) {
@@ -37320,7 +37341,7 @@ async function submitCreateProfile() {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: name, recoveryAnswer: recoveryAnswer || undefined }),
+      body: JSON.stringify({ creatorName: name, displayName: displayName || undefined, recoveryAnswer: recoveryAnswer || undefined }),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -52296,7 +52317,8 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, users });
     }
 
-    // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
+    // /api/creator/create  (POST)  { creatorName, displayName?, recoveryAnswer? }
+    //   -> { ok, creatorName, displayName, creatorKey }
     // Rate limited to one new profile per minute per IP, tracked via a
     // short-lived KV key rather than anything more elaborate -- this add-on
     // has no user-identity system to rate-limit against besides the
@@ -52317,7 +52339,9 @@ self.addEventListener('fetch', e => {
       }
       const v = validateCreatorUsername(body.creatorName);
       if (!v.ok) return json({ ok: false, error: v.error });
-      const displayName = String(body.creatorName || "").trim();
+      const dn = normalizeCreatorDisplayName(body.displayName, v.normalized);
+      if (!dn.ok) return json({ ok: false, error: dn.error }, 400);
+      const displayName = dn.displayName;
       // Reserve the rate-limit slot before the uniqueness check, not after
       // -- otherwise two requests landing at nearly the same instant could
       // both pass the "is it taken" check before either has written

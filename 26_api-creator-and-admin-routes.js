@@ -1039,7 +1039,8 @@
       return json({ ok: true, users });
     }
 
-    // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
+    // /api/creator/create  (POST)  { creatorName, displayName?, recoveryAnswer? }
+    //   -> { ok, creatorName, displayName, creatorKey }
     // Rate limited to one new profile per minute per IP, tracked via a
     // short-lived KV key rather than anything more elaborate -- this add-on
     // has no user-identity system to rate-limit against besides the
@@ -1060,7 +1061,9 @@
       }
       const v = validateCreatorUsername(body.creatorName);
       if (!v.ok) return json({ ok: false, error: v.error });
-      const displayName = String(body.creatorName || "").trim();
+      const dn = normalizeCreatorDisplayName(body.displayName, v.normalized);
+      if (!dn.ok) return json({ ok: false, error: dn.error }, 400);
+      const displayName = dn.displayName;
       // Reserve the rate-limit slot before the uniqueness check, not after
       // -- otherwise two requests landing at nearly the same instant could
       // both pass the "is it taken" check before either has written

@@ -2340,7 +2340,8 @@ function openCreateProfileModal() {
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
-    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username"></div>' +
+    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
@@ -2353,6 +2354,8 @@ function openCreateProfileModal() {
 
 async function submitCreateProfile() {
   const name = document.getElementById('createProfileNameInput').value.trim();
+  const displayInput = document.getElementById('createProfileDisplayInput');
+  const displayName = displayInput ? displayInput.value.trim() : '';
   const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
   const errBox = document.getElementById('createProfileError');
   if (!name) {
@@ -2363,7 +2366,7 @@ async function submitCreateProfile() {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: name, recoveryAnswer: recoveryAnswer || undefined }),
+      body: JSON.stringify({ creatorName: name, displayName: displayName || undefined, recoveryAnswer: recoveryAnswer || undefined }),
     });
     const data = await res.json();
     if (!data.ok) {
