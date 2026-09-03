@@ -428,6 +428,57 @@ function slugifyServer(s) {
     .slice(0, 60);
 }
 
+// --- List visibility (public / private) --------------------------------------
+//
+// Public exposure used to be `visibility !== "private"`: a missing field,
+// empty string, typo, or garbage value all counted as public. Writes
+// mirrored that (`=== "private" ? "private" : "public"`), so an old client
+// that omitted the field published by default. That is the wrong default
+// for a privacy flag -- only an explicit `"public"` should ever expose a
+// list.
+//
+// Writes now fail closed (`normalizeListVisibility`). Reads now fail closed
+// too (`isPublicListVisibility` === `"public"`). Legacy records that have
+// no enum value were served as public under the old rule, so a one-off
+// backfill stamps those `"public"` before the inverted reads would hide
+// them. `stampListVisibilityIfNeeded` is that backfill, applied lazily on
+// public read/rebuild paths and eagerly from /admin/api/migrate-d1.
+function normalizeListVisibility(raw) {
+  return raw === "public" ? "public" : "private";
+}
+
+function isPublicListVisibility(visibility) {
+  return visibility === "public";
+}
+
+function needsListVisibilityBackfill(visibility) {
+  return visibility !== "public" && visibility !== "private";
+}
+
+function backfillListVisibilityValue(visibility) {
+  // Old rule: anything other than the exact string "private" was public.
+  return visibility === "private" ? "private" : "public";
+}
+
+function effectiveListVisibility(visibility) {
+  if (visibility === "public" || visibility === "private") return visibility;
+  return backfillListVisibilityValue(visibility);
+}
+
+async function stampListVisibilityIfNeeded(env, key, data) {
+  if (!data || typeof data !== "object") return false;
+  if (!needsListVisibilityBackfill(data.visibility)) return false;
+  data.visibility = backfillListVisibilityValue(data.visibility);
+  if (env && env.CONFIGS && key) {
+    try {
+      await env.CONFIGS.put(key, JSON.stringify(data));
+    } catch {
+      // Best-effort: the in-memory value is still stamped for this request.
+    }
+  }
+  return true;
+}
+
 function deslugifyServer(s) {
   return String(s || "")
     .split("-")
@@ -1156,7 +1207,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `c:${username}:${slug}`;
       if (seen.has(id)) continue;
@@ -1185,7 +1237,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `a:${slug}`;
       if (seen.has(id)) continue;

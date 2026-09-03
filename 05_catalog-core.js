@@ -742,8 +742,11 @@ async function fetchLiveCreatorListItems(owner, slug, env) {
     if (!raw) continue;
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.items) && parsed.visibility !== "private") {
-        return parsed.items;
+      if (parsed && Array.isArray(parsed.items)) {
+        await stampListVisibilityIfNeeded(env, k, parsed);
+        if (isPublicListVisibility(parsed.visibility)) {
+          return parsed.items;
+        }
       }
     } catch {}
   }
@@ -1174,7 +1177,10 @@ async function fetchPublishedListCatalog(entry, env) {
     if (raw) {
       try {
         const data = JSON.parse(raw);
-        if (data && data.visibility !== "private") payload = data;
+        if (data) {
+          await stampListVisibilityIfNeeded(env, k, data);
+          if (isPublicListVisibility(data.visibility)) payload = data;
+        }
       } catch {}
     }
   }

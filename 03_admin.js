@@ -790,7 +790,7 @@ async function computeCatalogAndCommunityLeaderboards(env) {
     // the old read of `creatorlistlikes:{slug}` -- a key no code path
     // writes, so the column used to show 0 for every list.
     const { results } = await env.DB.prepare(
-      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility != 'private' ORDER BY likes DESC, updated_at DESC LIMIT ?"
+      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility = 'public' ORDER BY likes DESC, updated_at DESC LIMIT ?"
     ).bind(COMMUNITY_CAP).all();
     communityListsRaw = (results || []).map((row) => ({
       slug: row.id.split(':')[1] || row.id,
@@ -811,7 +811,7 @@ async function computeCatalogAndCommunityLeaderboards(env) {
         if (!raw) return null;
         let data;
         try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || data.visibility === 'private') return null;
+        if (!data || !isPublicListVisibility(data.visibility)) return null;
         if (!data.slug || !data.creatorName) return null;
         return {
           slug: data.slug,

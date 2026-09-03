@@ -295,7 +295,8 @@ async function handleFetch(request, env, ctx) {
         if (!raw) return null;
         try {
           const l = JSON.parse(raw);
-          if (l.visibility === "private") return null;
+          await stampListVisibilityIfNeeded(env, key, l);
+          if (!isPublicListVisibility(l.visibility)) return null;
           let username = "Anonymous";
           let slug = l.slug || "";
           if (isCreator) {
@@ -5305,11 +5306,11 @@ self.addEventListener('fetch', e => {
         listSlug = baseSlug + "-" + attempt;
         plKey = "publishedlist:user:" + listSlug;
       }
-      const plVisibility = plBody.visibility === "private" ? "private" : "public";
+      const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
       // Anonymous publishes belong in the directory index too.
-      if (plVisibility !== "private") {
+      if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
           isCreator: false,
           username: "user",
@@ -5344,6 +5345,7 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+      await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
@@ -5374,7 +5376,7 @@ self.addEventListener('fetch', e => {
         // `c:<user>:<slug>` -- using the wrong prefix here would append a
         // duplicate entry instead of updating the existing one.
         const likeIsCreator = likeKey === likeCreatorKey;
-        if (likeData.visibility !== "private") {
+        if (isPublicListVisibility(likeData.visibility)) {
           ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
             isCreator: likeIsCreator,
             username: likeIsCreator ? likeUser : "user",

@@ -1949,6 +1949,57 @@ function slugifyServer(s) {
     .slice(0, 60);
 }
 
+// --- List visibility (public / private) --------------------------------------
+//
+// Public exposure used to be `visibility !== "private"`: a missing field,
+// empty string, typo, or garbage value all counted as public. Writes
+// mirrored that (`=== "private" ? "private" : "public"`), so an old client
+// that omitted the field published by default. That is the wrong default
+// for a privacy flag -- only an explicit `"public"` should ever expose a
+// list.
+//
+// Writes now fail closed (`normalizeListVisibility`). Reads now fail closed
+// too (`isPublicListVisibility` === `"public"`). Legacy records that have
+// no enum value were served as public under the old rule, so a one-off
+// backfill stamps those `"public"` before the inverted reads would hide
+// them. `stampListVisibilityIfNeeded` is that backfill, applied lazily on
+// public read/rebuild paths and eagerly from /admin/api/migrate-d1.
+function normalizeListVisibility(raw) {
+  return raw === "public" ? "public" : "private";
+}
+
+function isPublicListVisibility(visibility) {
+  return visibility === "public";
+}
+
+function needsListVisibilityBackfill(visibility) {
+  return visibility !== "public" && visibility !== "private";
+}
+
+function backfillListVisibilityValue(visibility) {
+  // Old rule: anything other than the exact string "private" was public.
+  return visibility === "private" ? "private" : "public";
+}
+
+function effectiveListVisibility(visibility) {
+  if (visibility === "public" || visibility === "private") return visibility;
+  return backfillListVisibilityValue(visibility);
+}
+
+async function stampListVisibilityIfNeeded(env, key, data) {
+  if (!data || typeof data !== "object") return false;
+  if (!needsListVisibilityBackfill(data.visibility)) return false;
+  data.visibility = backfillListVisibilityValue(data.visibility);
+  if (env && env.CONFIGS && key) {
+    try {
+      await env.CONFIGS.put(key, JSON.stringify(data));
+    } catch {
+      // Best-effort: the in-memory value is still stamped for this request.
+    }
+  }
+  return true;
+}
+
 function deslugifyServer(s) {
   return String(s || "")
     .split("-")
@@ -2677,7 +2728,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `c:${username}:${slug}`;
       if (seen.has(id)) continue;
@@ -2706,7 +2758,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `a:${slug}`;
       if (seen.has(id)) continue;
@@ -3800,7 +3853,7 @@ async function computeCatalogAndCommunityLeaderboards(env) {
     // the old read of `creatorlistlikes:{slug}` -- a key no code path
     // writes, so the column used to show 0 for every list.
     const { results } = await env.DB.prepare(
-      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility != 'private' ORDER BY likes DESC, updated_at DESC LIMIT ?"
+      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility = 'public' ORDER BY likes DESC, updated_at DESC LIMIT ?"
     ).bind(COMMUNITY_CAP).all();
     communityListsRaw = (results || []).map((row) => ({
       slug: row.id.split(':')[1] || row.id,
@@ -3821,7 +3874,7 @@ async function computeCatalogAndCommunityLeaderboards(env) {
         if (!raw) return null;
         let data;
         try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || data.visibility === 'private') return null;
+        if (!data || !isPublicListVisibility(data.visibility)) return null;
         if (!data.slug || !data.creatorName) return null;
         return {
           slug: data.slug,
@@ -6701,8 +6754,11 @@ async function fetchLiveCreatorListItems(owner, slug, env) {
     if (!raw) continue;
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.items) && parsed.visibility !== "private") {
-        return parsed.items;
+      if (parsed && Array.isArray(parsed.items)) {
+        await stampListVisibilityIfNeeded(env, k, parsed);
+        if (isPublicListVisibility(parsed.visibility)) {
+          return parsed.items;
+        }
       }
     } catch {}
   }
@@ -7133,7 +7189,10 @@ async function fetchPublishedListCatalog(entry, env) {
     if (raw) {
       try {
         const data = JSON.parse(raw);
-        if (data && data.visibility !== "private") payload = data;
+        if (data) {
+          await stampListVisibilityIfNeeded(env, k, data);
+          if (isPublicListVisibility(data.visibility)) payload = data;
+        }
       } catch {}
     }
   }
@@ -45765,7 +45824,8 @@ async function handleFetch(request, env, ctx) {
         if (!raw) return null;
         try {
           const l = JSON.parse(raw);
-          if (l.visibility === "private") return null;
+          await stampListVisibilityIfNeeded(env, key, l);
+          if (!isPublicListVisibility(l.visibility)) return null;
           let username = "Anonymous";
           let slug = l.slug || "";
           if (isCreator) {
@@ -50775,11 +50835,11 @@ self.addEventListener('fetch', e => {
         listSlug = baseSlug + "-" + attempt;
         plKey = "publishedlist:user:" + listSlug;
       }
-      const plVisibility = plBody.visibility === "private" ? "private" : "public";
+      const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
       // Anonymous publishes belong in the directory index too.
-      if (plVisibility !== "private") {
+      if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
           isCreator: false,
           username: "user",
@@ -50814,6 +50874,7 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+      await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
@@ -50844,7 +50905,7 @@ self.addEventListener('fetch', e => {
         // `c:<user>:<slug>` -- using the wrong prefix here would append a
         // duplicate entry instead of updating the existing one.
         const likeIsCreator = likeKey === likeCreatorKey;
-        if (likeData.visibility !== "private") {
+        if (isPublicListVisibility(likeData.visibility)) {
           ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
             isCreator: likeIsCreator,
             username: likeIsCreator ? likeUser : "user",
@@ -52373,7 +52434,7 @@ self.addEventListener('fetch', e => {
                 items: data.items || [],
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
-                visibility: data.visibility === "private" ? "private" : "public",
+                visibility: effectiveListVisibility(data.visibility),
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {
@@ -52396,7 +52457,7 @@ self.addEventListener('fetch', e => {
               items: data.items || [],
               itemCount: (data.items || []).length,
               likes: data.likes || 0,
-              visibility: data.visibility === "private" ? "private" : "public",
+              visibility: effectiveListVisibility(data.visibility),
               url: `${url.origin}/lists/${auth.username}/watchlist`,
             });
           } catch {}
@@ -52478,7 +52539,7 @@ self.addEventListener('fetch', e => {
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
-      const visibility = body.visibility === "private" ? "private" : "public";
+      const visibility = normalizeListVisibility(body.visibility);
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
@@ -52554,7 +52615,7 @@ self.addEventListener('fetch', e => {
       ctx.waitUntil(updatePublicListIndex(
         env,
         `c:${auth.username}:${slug}`,
-        visibility === "private" ? null : {
+        isPublicListVisibility(visibility) ? {
           isCreator: true,
           username: auth.username,
           creatorName: auth.displayName || auth.username,
@@ -52564,7 +52625,7 @@ self.addEventListener('fetch', e => {
           itemCount: Array.isArray(items) ? items.length : 0,
           likes: likes || 0,
           updatedAt: now,
-        }
+        } : null
       ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
@@ -53664,7 +53725,8 @@ self.addEventListener('fetch', e => {
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const listSlug = k.name.slice("publishedlist:user:".length);
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
@@ -53688,7 +53750,8 @@ self.addEventListener('fetch', e => {
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
               // key shape is creatorlist:{username}:{slug}
@@ -53888,9 +53951,12 @@ self.addEventListener('fetch', e => {
         if (raw) {
           try {
             const parsed = JSON.parse(raw);
-            if (parsed && parsed.visibility !== "private") {
-              listData = parsed;
-              isCreatorList = k.startsWith("creatorlist:");
+            if (parsed) {
+              await stampListVisibilityIfNeeded(env, k, parsed);
+              if (isPublicListVisibility(parsed.visibility)) {
+                listData = parsed;
+                isCreatorList = k.startsWith("creatorlist:");
+              }
             }
           } catch {}
         }
@@ -54243,19 +54309,38 @@ self.addEventListener('fetch', e => {
           if (raw) {
             try {
               const data = JSON.parse(raw);
+              await stampListVisibilityIfNeeded(env, k.name, data);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
               // `likes` is carried across too. KV holds the authoritative
               // count, so a migration that omitted it would silently reset
-              // every list to zero in D1.
+              // every list to zero in D1. Visibility is rewritten as well
+              // so the fail-closed public index doesn't hide legacy lists
+              // that were served as public because they had no enum value.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);
             }
           }
+        }
+      }
+
+      // 2b. Anonymous published lists live only in KV. Stamp missing /
+      // garbage visibility the same way as creator lists so the inverted
+      // public-read checks don't hide currently-served lists.
+      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+      for (const k of pKeys.keys) {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw);
+          await stampListVisibilityIfNeeded(env, k.name, data);
+        } catch (e) {
+          results.errors.push(`Published ${k.name}: ` + e.message);
         }
       }
 

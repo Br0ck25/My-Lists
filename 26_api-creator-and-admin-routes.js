@@ -1351,7 +1351,7 @@
                 items: data.items || [],
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
-                visibility: data.visibility === "private" ? "private" : "public",
+                visibility: effectiveListVisibility(data.visibility),
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {
@@ -1374,7 +1374,7 @@
               items: data.items || [],
               itemCount: (data.items || []).length,
               likes: data.likes || 0,
-              visibility: data.visibility === "private" ? "private" : "public",
+              visibility: effectiveListVisibility(data.visibility),
               url: `${url.origin}/lists/${auth.username}/watchlist`,
             });
           } catch {}
@@ -1456,7 +1456,7 @@
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
-      const visibility = body.visibility === "private" ? "private" : "public";
+      const visibility = normalizeListVisibility(body.visibility);
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
@@ -1532,7 +1532,7 @@
       ctx.waitUntil(updatePublicListIndex(
         env,
         `c:${auth.username}:${slug}`,
-        visibility === "private" ? null : {
+        isPublicListVisibility(visibility) ? {
           isCreator: true,
           username: auth.username,
           creatorName: auth.displayName || auth.username,
@@ -1542,7 +1542,7 @@
           itemCount: Array.isArray(items) ? items.length : 0,
           likes: likes || 0,
           updatedAt: now,
-        }
+        } : null
       ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
@@ -2642,7 +2642,8 @@
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const listSlug = k.name.slice("publishedlist:user:".length);
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
@@ -2666,7 +2667,8 @@
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
               // key shape is creatorlist:{username}:{slug}
@@ -2866,9 +2868,12 @@
         if (raw) {
           try {
             const parsed = JSON.parse(raw);
-            if (parsed && parsed.visibility !== "private") {
-              listData = parsed;
-              isCreatorList = k.startsWith("creatorlist:");
+            if (parsed) {
+              await stampListVisibilityIfNeeded(env, k, parsed);
+              if (isPublicListVisibility(parsed.visibility)) {
+                listData = parsed;
+                isCreatorList = k.startsWith("creatorlist:");
+              }
             }
           } catch {}
         }
@@ -3221,19 +3226,38 @@
           if (raw) {
             try {
               const data = JSON.parse(raw);
+              await stampListVisibilityIfNeeded(env, k.name, data);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
               // `likes` is carried across too. KV holds the authoritative
               // count, so a migration that omitted it would silently reset
-              // every list to zero in D1.
+              // every list to zero in D1. Visibility is rewritten as well
+              // so the fail-closed public index doesn't hide legacy lists
+              // that were served as public because they had no enum value.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);
             }
           }
+        }
+      }
+
+      // 2b. Anonymous published lists live only in KV. Stamp missing /
+      // garbage visibility the same way as creator lists so the inverted
+      // public-read checks don't hide currently-served lists.
+      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+      for (const k of pKeys.keys) {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw);
+          await stampListVisibilityIfNeeded(env, k.name, data);
+        } catch (e) {
+          results.errors.push(`Published ${k.name}: ` + e.message);
         }
       }
 
