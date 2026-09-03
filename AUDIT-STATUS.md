@@ -47,22 +47,24 @@ degrades quality at growth rather than leaking data today.
 `npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql`
 once, then POST `/admin/api/migrate-d1` to copy existing KV counts into D1.
 
+### Round 4 — this commit
+
+| # | Severity | Issue | Verified by |
+|---|---|---|---|
+| A | 🟠 | **Directory and search silently truncated at 150 keys.** Both did `list({prefix,limit:150})` with no cursor then `.slice(0,100)`; KV returns keys lexicographically, so past ~150 lists only the earliest-sorting usernames were ever visible — everyone else vanished with no error. Replaced with a maintained `index:publiclists` blob (one KV read, no per-list gets), rebuilt automatically when absent and updated incrementally on publish/save/unpublish/delete/like. Added `?limit`/`?offset` paging and a `total`. | Live w/ 400 lists: old logic surfaced only `list-0001..0100`; new returns **all 400**, `total:400`. Incremental index **byte-identical** to a forced full rebuild (402 entries) |
+| 13 | 🟡 | Directory `.slice(0,100)` ran **before** the private-list filter, so private lists consumed public slots and the page could return fewer than 100 for no visible reason. Index only ever contains public lists. | Live: flipping a list to private removes it; count stays correct |
+| 14 | 🟡 | Directory had **no sort at all** — order was whatever KV returned. Index is sorted by likes, then recency, so truncation drops the least popular rather than an arbitrary slice. | Live: 4 likes moved a list to position 1 |
+| 15 | 🟡 | Search did a `getCreator` **per result**, so its subrequest count scaled with result size. Display name is denormalised into the index (cached per creator during rebuild). | Live: search returns from one KV read |
+
+**Directory cost: ~102 KV subrequests/page-view → 1.** 402 lists serve in ~3 ms.
+
+Cold-start is handled: the first request after the index is lost takes a 60 s
+lock, rebuilds in the background via `waitUntil`, and serves the legacy scan
+meanwhile. 20 concurrent cold requests → all HTTP 200, exactly one rebuild.
+
 ---
 
 ## 🔜 Remaining — in priority order
-
-### 🟠 A. Community directory truncates at 150 keys — *silent wrong results*
-`/lists/public.json` (25_) and `/api/search-published-lists` (26_) both call
-`list({prefix:"creatorlist:", limit:150})` with **no cursor**, then `.slice(0,100)`.
-KV returns keys in lexicographic order, so only usernames sorting earliest are
-ever visible. **Already broken at ~a few hundred lists** — users publish lists
-that silently never appear, with no error anywhere.
-
-Not a one-line fix: naive pagination means reading *every* list on every
-directory load (10k lists = 10k KV reads/page view, far past the 1,000
-subrequest cap). Correct fix is a maintained `index:publiclists` blob updated
-on publish/unpublish → directory costs **one** read.
-**Needs a design decision before implementing.**
 
 ### 🟠 B. Admin dashboard / leaderboard subrequest wall — *hard failure at scale*
 `renderAdminDashboard` does 6 × `listAllKeys` + 2 KV gets per list + 1 per

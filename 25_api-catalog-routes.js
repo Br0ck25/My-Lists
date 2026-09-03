@@ -245,6 +245,39 @@ async function handleFetch(request, env, ctx) {
       if (!env || !env.CONFIGS) {
         return json({ ok: true, lists: [] }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
       }
+      // Preferred path: one KV read of the maintained index, no per-list
+      // gets, no truncation at 150 keys. Falls back to the legacy bounded
+      // scan below only while the index is being built for the first time.
+      const indexEntries = await getPublicListIndex(env, ctx);
+      if (indexEntries) {
+        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        // Default page stays 100 to match the previous response size;
+        // callers can page through the rest instead of silently losing it.
+        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+        const page = indexEntries.slice(offset, offset + pageSize);
+        const lists = page.map((e) => {
+          const cleanSlug = e.slug || slugifyServer(e.name) || "list";
+          const username = e.isCreator ? e.username : "user";
+          return {
+            name: e.name,
+            slug: cleanSlug,
+            creator: e.isCreator ? e.username : "Anonymous",
+            type: e.type || "mixed",
+            itemCount: e.itemCount || 0,
+            likes: e.likes || 0,
+            updatedAt: e.updatedAt || null,
+            url: `${url.origin}/lists/${username}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+          };
+        });
+        return json(
+          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          200,
+          { "Cache-Control": "public, max-age=120", ...corsHeaders() }
+        );
+      }
+
       const fetchLimit = 150;
       const [pubRes, creatorRes] = await Promise.all([
         env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
@@ -5273,7 +5306,21 @@ self.addEventListener('fetch', e => {
         plKey = "publishedlist:user:" + listSlug;
       }
       const plVisibility = plBody.visibility === "private" ? "private" : "public";
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: Date.now() }));
+      const plNow = Date.now();
+      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      // Anonymous publishes belong in the directory index too.
+      if (plVisibility !== "private") {
+        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
+          isCreator: false,
+          username: "user",
+          slug: listSlug,
+          name: plBody.name || baseSlug,
+          type: plType,
+          itemCount: plItems.length,
+          likes: 0,
+          updatedAt: plNow,
+        }));
+      }
       return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
     }
 
@@ -5320,6 +5367,25 @@ self.addEventListener('fetch', e => {
       if ((likeData.likes || 0) !== count) {
         likeData.likes = count;
         await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
+        // The directory ranks by likes, so the index has to see this or the
+        // ordering freezes at whatever it was when the index was built.
+        // Only on an actual change -- a repeated like writes nothing.
+        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+        // `c:<user>:<slug>` -- using the wrong prefix here would append a
+        // duplicate entry instead of updating the existing one.
+        const likeIsCreator = likeKey === likeCreatorKey;
+        if (likeData.visibility !== "private") {
+          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+            isCreator: likeIsCreator,
+            username: likeIsCreator ? likeUser : "user",
+            slug: likeSlug,
+            name: likeData.name || "List",
+            type: likeData.type || "mixed",
+            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
+            likes: count,
+            updatedAt: likeData.updatedAt || likeData.createdAt || null,
+          }));
+        }
       }
 
       if (env.DB) {

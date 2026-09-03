@@ -2558,6 +2558,215 @@ function normalizeExternalListUrl(rawUrl) {
   return `https://${bareHost}${path}`;
 }
 
+// ---------------------------------------------------------------------------
+// Public list directory index
+// ---------------------------------------------------------------------------
+// The directory and search used to do list({prefix:"creatorlist:", limit:150})
+// with no cursor and then slice(0,100). KV returns keys in lexicographic
+// order, so past ~150 lists only usernames sorting earliest were ever visible
+// -- everyone else silently vanished from the directory with no error.
+//
+// Paginating that properly is worse, not better: it means reading EVERY list
+// on every directory load (10k lists = 10k KV reads per page view, well past
+// the 1,000 subrequest/invocation cap). So the directory reads a single
+// maintained index blob instead, updated on publish/unpublish. Directory cost
+// is now ONE KV read regardless of how many lists exist.
+//
+// The index stores the display fields the directory needs (name, creator,
+// counts, likes) so no per-list get is required. It is a derived cache: if it
+// is missing or stale, rebuildPublicListIndex() regenerates it from the
+// authoritative creatorlist:/publishedlist: keys. Never treat it as the
+// source of truth.
+const PUBLIC_INDEX_KEY = "index:publiclists";
+// 25 MiB is the KV value ceiling. At ~200 bytes/entry, 20k entries is ~4 MB --
+// comfortably inside it while still bounding worst-case memory and response
+// size. Beyond this the tail is dropped (least-liked first).
+const PUBLIC_INDEX_MAX = 20000;
+
+async function readPublicListIndex(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Sorted by likes so that if anything downstream truncates, it drops the
+// least popular rather than an arbitrary lexicographic slice.
+function sortPublicIndexEntries(entries) {
+  return entries.sort(
+    (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
+  );
+}
+
+async function writePublicListIndex(env, entries) {
+  const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_KEY,
+    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  );
+  return trimmed;
+}
+
+// Incremental update for one list. `entry` null => remove (unpublished,
+// deleted, or made private).
+//
+// This is a read-modify-write on a single key, so concurrent publishes can
+// lose an update. That is acceptable here in a way it was NOT for like counts:
+// the index is a rebuildable cache, a lost entry costs one list's directory
+// visibility until its next save or the next rebuild, and publishes are rare
+// and self-correcting. Like counts had no such backstop.
+async function updatePublicListIndex(env, id, entry) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    // No index yet: don't build one from a single entry, or the directory
+    // would show exactly one list. Leave it absent so the read path falls
+    // back to a scan and rebuilds the whole thing.
+    if (!idx) return;
+    const prev = idx.entries.find((e) => e && e.id === id);
+    const entries = idx.entries.filter((e) => e && e.id !== id);
+    // Merge onto the previous entry rather than replacing it: callers that
+    // only know part of the record (the like route has no displayName, for
+    // instance) must not blank out fields they never loaded.
+    if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    await writePublicListIndex(env, entries);
+  } catch (err) {
+    // Non-fatal: the list itself is already saved. Worst case the directory
+    // is stale until the next rebuild.
+    console.error("public list index update failed:", err);
+  }
+}
+
+// Full scan -> index. Expensive (one KV get per list), so it runs only when
+// the index is missing, and only one caller at a time via a short lock.
+async function rebuildPublicListIndex(env) {
+  const entries = [];
+  const seen = new Set();
+
+  // Search matches against the creator's display name too, so the index has
+  // to carry it. Cached per username: creators are far fewer than lists, and
+  // without this the rebuild would do a second get for every list.
+  const displayNameCache = new Map();
+  async function resolveDisplayName(username) {
+    if (displayNameCache.has(username)) return displayNameCache.get(username);
+    let name = username;
+    try {
+      const profileRaw = await getCreator(env, username);
+      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+    } catch {
+      // fall back to the raw username slug
+    }
+    displayNameCache.set(username, name);
+    return name;
+  }
+
+  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+  for (const k of creatorKeys.keys) {
+    const rest = k.name.slice("creatorlist:".length);
+    const sep = rest.indexOf(":");
+    if (sep === -1) continue;
+    const username = rest.slice(0, sep);
+    const slug = rest.slice(sep + 1);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `c:${username}:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: true,
+        username,
+        creatorName: await resolveDisplayName(username),
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+  for (const k of anonKeys.keys) {
+    const slug = k.name.slice("publishedlist:user:".length);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `a:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: false,
+        username: "user",
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  return await writePublicListIndex(env, entries);
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+
+  // Rebuilding is a full scan; a burst of traffic against a cold index must
+  // not start one per request. First caller takes a 60s lock and rebuilds,
+  // the rest fall through to the bounded legacy scan for this one request.
+  let gotLock = false;
+  try {
+    const lock = await env.CONFIGS.get("lock:publiclistindex");
+    if (!lock) {
+      await env.CONFIGS.put("lock:publiclistindex", "1", { expirationTtl: 60 });
+      gotLock = true;
+    }
+  } catch {
+    // If the lock read fails, fall through to the scan rather than risking
+    // a rebuild stampede.
+  }
+  if (!gotLock) return null;
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    // Rebuild in the background; serve this request from the legacy scan.
+    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
+      console.error("public list index rebuild failed:", err);
+    }));
+    return null;
+  }
+  try {
+    return await rebuildPublicListIndex(env);
+  } catch (err) {
+    console.error("public list index rebuild failed:", err);
+    return null;
+  }
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;
@@ -2594,6 +2803,7 @@ async function purgeCreatorData(env, username, options = {}) {
   const deleteIdentity = options.deleteIdentity === true;
   const u = username;
   let listsCleared = 0;
+  const purgedListIds = [];
   let keysCleared = 0;
 
   // Custom lists are one key each and list() pages -- keep going until the
@@ -2605,6 +2815,9 @@ async function purgeCreatorData(env, username, options = {}) {
       const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
       for (const k of res.keys) {
         await env.CONFIGS.delete(k.name);
+        // Drop it from the directory index too, or a deleted account's
+        // lists keep appearing publicly until the next full rebuild.
+        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
         listsCleared++;
       }
       if (res.list_complete || !res.cursor) break;
@@ -2619,6 +2832,21 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
+    }
+  }
+
+  // One index write for the whole account rather than one per list --
+  // deleting an account with 200 lists should not be 200 read-modify-writes
+  // against the same key (KV allows 1 write/sec/key).
+  if (purgedListIds.length) {
+    try {
+      const idx = await readPublicListIndex(env);
+      if (idx) {
+        const gone = new Set(purgedListIds);
+        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+      }
+    } catch (e) {
+      console.error("purgeCreatorData: index cleanup failed", e);
     }
   }
 
@@ -45286,6 +45514,39 @@ async function handleFetch(request, env, ctx) {
       if (!env || !env.CONFIGS) {
         return json({ ok: true, lists: [] }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
       }
+      // Preferred path: one KV read of the maintained index, no per-list
+      // gets, no truncation at 150 keys. Falls back to the legacy bounded
+      // scan below only while the index is being built for the first time.
+      const indexEntries = await getPublicListIndex(env, ctx);
+      if (indexEntries) {
+        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        // Default page stays 100 to match the previous response size;
+        // callers can page through the rest instead of silently losing it.
+        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+        const page = indexEntries.slice(offset, offset + pageSize);
+        const lists = page.map((e) => {
+          const cleanSlug = e.slug || slugifyServer(e.name) || "list";
+          const username = e.isCreator ? e.username : "user";
+          return {
+            name: e.name,
+            slug: cleanSlug,
+            creator: e.isCreator ? e.username : "Anonymous",
+            type: e.type || "mixed",
+            itemCount: e.itemCount || 0,
+            likes: e.likes || 0,
+            updatedAt: e.updatedAt || null,
+            url: `${url.origin}/lists/${username}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+          };
+        });
+        return json(
+          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          200,
+          { "Cache-Control": "public, max-age=120", ...corsHeaders() }
+        );
+      }
+
       const fetchLimit = 150;
       const [pubRes, creatorRes] = await Promise.all([
         env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
@@ -50314,7 +50575,21 @@ self.addEventListener('fetch', e => {
         plKey = "publishedlist:user:" + listSlug;
       }
       const plVisibility = plBody.visibility === "private" ? "private" : "public";
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: Date.now() }));
+      const plNow = Date.now();
+      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      // Anonymous publishes belong in the directory index too.
+      if (plVisibility !== "private") {
+        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
+          isCreator: false,
+          username: "user",
+          slug: listSlug,
+          name: plBody.name || baseSlug,
+          type: plType,
+          itemCount: plItems.length,
+          likes: 0,
+          updatedAt: plNow,
+        }));
+      }
       return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
     }
 
@@ -50361,6 +50636,25 @@ self.addEventListener('fetch', e => {
       if ((likeData.likes || 0) !== count) {
         likeData.likes = count;
         await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
+        // The directory ranks by likes, so the index has to see this or the
+        // ordering freezes at whatever it was when the index was built.
+        // Only on an actual change -- a repeated like writes nothing.
+        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+        // `c:<user>:<slug>` -- using the wrong prefix here would append a
+        // duplicate entry instead of updating the existing one.
+        const likeIsCreator = likeKey === likeCreatorKey;
+        if (likeData.visibility !== "private") {
+          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+            isCreator: likeIsCreator,
+            username: likeIsCreator ? likeUser : "user",
+            slug: likeSlug,
+            name: likeData.name || "List",
+            type: likeData.type || "mixed",
+            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
+            likes: count,
+            updatedAt: likeData.updatedAt || likeData.createdAt || null,
+          }));
+        }
       }
 
       if (env.DB) {
@@ -52052,6 +52346,25 @@ self.addEventListener('fetch', e => {
         order.push(slug);
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
+
+      // Keep the directory index in step with this save. A list turned
+      // private is removed rather than updated, otherwise unpublishing would
+      // leave it listed publicly.
+      ctx.waitUntil(updatePublicListIndex(
+        env,
+        `c:${auth.username}:${slug}`,
+        visibility === "private" ? null : {
+          isCreator: true,
+          username: auth.username,
+          creatorName: auth.displayName || auth.username,
+          slug,
+          name,
+          type: type || "mixed",
+          itemCount: Array.isArray(items) ? items.length : 0,
+          likes: likes || 0,
+          updatedAt: now,
+        }
+      ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
@@ -52080,6 +52393,7 @@ self.addEventListener('fetch', e => {
       // delete on that basis left the list live in KV -- a delete that
       // reported ok:true and deleted nothing.
       await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -53100,6 +53414,44 @@ self.addEventListener('fetch', e => {
       const isMyListsSearch = isMyListsSentinel || !userTerm;
 
       try {
+        // Same index as /lists/public.json: searching used to scan at most
+        // 80-250 keys, so lists outside that lexicographic window were
+        // unfindable no matter what the user typed. The index also carries
+        // the display fields, which removes the per-list getCreator lookup
+        // that made this route's subrequest count scale with result size.
+        const searchIndex = await getPublicListIndex(env, ctx);
+        if (searchIndex) {
+          const targetFilterIdx = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+          const tokensIdx = targetFilterIdx.split(/\s+/).filter(Boolean);
+          const matchesIdx = searchIndex
+            .filter((e) => (e.itemCount || 0) > 0)
+            .filter((e) => {
+              if (!targetFilterIdx || !tokensIdx.length) return true;
+              const fullText = `${e.name || ""} ${e.creatorName || ""} ${e.username || ""}`.toLowerCase();
+              if (fullText.includes(targetFilterIdx)) return true;
+              return tokensIdx.every((tok) => fullText.includes(tok));
+            })
+            .map((e) => ({
+              name: e.name,
+              type: e.type,
+              items: e.itemCount || 0,
+              likes: e.likes || 0,
+              creatorName: e.isCreator ? (e.creatorName || e.username) : "Anonymous",
+              username: e.isCreator ? e.username : "user",
+              url: `${url.origin}/lists/${e.isCreator ? e.username : "user"}/${e.slug}`,
+              source: "My Lists Addon",
+            }))
+            .sort((a, b) => {
+              const likesDiff = (b.likes || 0) - (a.likes || 0);
+              if (likesDiff !== 0) return likesDiff;
+              return (b.items || 0) - (a.items || 0);
+            });
+          // Response shape is identical to the scan path below: key is
+          // `lists`, entries carry `source`, and only the non-"my lists"
+          // search is capped at 50.
+          return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) });
+        }
+
         const fetchLimit = isMyListsSearch ? 250 : 80;
         const [anonResult, creatorResult] = await Promise.all([
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),

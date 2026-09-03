@@ -1525,6 +1525,25 @@
         order.push(slug);
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
+
+      // Keep the directory index in step with this save. A list turned
+      // private is removed rather than updated, otherwise unpublishing would
+      // leave it listed publicly.
+      ctx.waitUntil(updatePublicListIndex(
+        env,
+        `c:${auth.username}:${slug}`,
+        visibility === "private" ? null : {
+          isCreator: true,
+          username: auth.username,
+          creatorName: auth.displayName || auth.username,
+          slug,
+          name,
+          type: type || "mixed",
+          itemCount: Array.isArray(items) ? items.length : 0,
+          likes: likes || 0,
+          updatedAt: now,
+        }
+      ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
@@ -1553,6 +1572,7 @@
       // delete on that basis left the list live in KV -- a delete that
       // reported ok:true and deleted nothing.
       await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -2573,6 +2593,44 @@
       const isMyListsSearch = isMyListsSentinel || !userTerm;
 
       try {
+        // Same index as /lists/public.json: searching used to scan at most
+        // 80-250 keys, so lists outside that lexicographic window were
+        // unfindable no matter what the user typed. The index also carries
+        // the display fields, which removes the per-list getCreator lookup
+        // that made this route's subrequest count scale with result size.
+        const searchIndex = await getPublicListIndex(env, ctx);
+        if (searchIndex) {
+          const targetFilterIdx = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+          const tokensIdx = targetFilterIdx.split(/\s+/).filter(Boolean);
+          const matchesIdx = searchIndex
+            .filter((e) => (e.itemCount || 0) > 0)
+            .filter((e) => {
+              if (!targetFilterIdx || !tokensIdx.length) return true;
+              const fullText = `${e.name || ""} ${e.creatorName || ""} ${e.username || ""}`.toLowerCase();
+              if (fullText.includes(targetFilterIdx)) return true;
+              return tokensIdx.every((tok) => fullText.includes(tok));
+            })
+            .map((e) => ({
+              name: e.name,
+              type: e.type,
+              items: e.itemCount || 0,
+              likes: e.likes || 0,
+              creatorName: e.isCreator ? (e.creatorName || e.username) : "Anonymous",
+              username: e.isCreator ? e.username : "user",
+              url: `${url.origin}/lists/${e.isCreator ? e.username : "user"}/${e.slug}`,
+              source: "My Lists Addon",
+            }))
+            .sort((a, b) => {
+              const likesDiff = (b.likes || 0) - (a.likes || 0);
+              if (likesDiff !== 0) return likesDiff;
+              return (b.items || 0) - (a.items || 0);
+            });
+          // Response shape is identical to the scan path below: key is
+          // `lists`, entries carry `source`, and only the non-"my lists"
+          // search is capped at 50.
+          return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) });
+        }
+
         const fetchLimit = isMyListsSearch ? 250 : 80;
         const [anonResult, creatorResult] = await Promise.all([
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),

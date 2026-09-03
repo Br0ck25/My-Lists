@@ -1037,6 +1037,215 @@ function normalizeExternalListUrl(rawUrl) {
   return `https://${bareHost}${path}`;
 }
 
+// ---------------------------------------------------------------------------
+// Public list directory index
+// ---------------------------------------------------------------------------
+// The directory and search used to do list({prefix:"creatorlist:", limit:150})
+// with no cursor and then slice(0,100). KV returns keys in lexicographic
+// order, so past ~150 lists only usernames sorting earliest were ever visible
+// -- everyone else silently vanished from the directory with no error.
+//
+// Paginating that properly is worse, not better: it means reading EVERY list
+// on every directory load (10k lists = 10k KV reads per page view, well past
+// the 1,000 subrequest/invocation cap). So the directory reads a single
+// maintained index blob instead, updated on publish/unpublish. Directory cost
+// is now ONE KV read regardless of how many lists exist.
+//
+// The index stores the display fields the directory needs (name, creator,
+// counts, likes) so no per-list get is required. It is a derived cache: if it
+// is missing or stale, rebuildPublicListIndex() regenerates it from the
+// authoritative creatorlist:/publishedlist: keys. Never treat it as the
+// source of truth.
+const PUBLIC_INDEX_KEY = "index:publiclists";
+// 25 MiB is the KV value ceiling. At ~200 bytes/entry, 20k entries is ~4 MB --
+// comfortably inside it while still bounding worst-case memory and response
+// size. Beyond this the tail is dropped (least-liked first).
+const PUBLIC_INDEX_MAX = 20000;
+
+async function readPublicListIndex(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Sorted by likes so that if anything downstream truncates, it drops the
+// least popular rather than an arbitrary lexicographic slice.
+function sortPublicIndexEntries(entries) {
+  return entries.sort(
+    (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
+  );
+}
+
+async function writePublicListIndex(env, entries) {
+  const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_KEY,
+    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  );
+  return trimmed;
+}
+
+// Incremental update for one list. `entry` null => remove (unpublished,
+// deleted, or made private).
+//
+// This is a read-modify-write on a single key, so concurrent publishes can
+// lose an update. That is acceptable here in a way it was NOT for like counts:
+// the index is a rebuildable cache, a lost entry costs one list's directory
+// visibility until its next save or the next rebuild, and publishes are rare
+// and self-correcting. Like counts had no such backstop.
+async function updatePublicListIndex(env, id, entry) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    // No index yet: don't build one from a single entry, or the directory
+    // would show exactly one list. Leave it absent so the read path falls
+    // back to a scan and rebuilds the whole thing.
+    if (!idx) return;
+    const prev = idx.entries.find((e) => e && e.id === id);
+    const entries = idx.entries.filter((e) => e && e.id !== id);
+    // Merge onto the previous entry rather than replacing it: callers that
+    // only know part of the record (the like route has no displayName, for
+    // instance) must not blank out fields they never loaded.
+    if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    await writePublicListIndex(env, entries);
+  } catch (err) {
+    // Non-fatal: the list itself is already saved. Worst case the directory
+    // is stale until the next rebuild.
+    console.error("public list index update failed:", err);
+  }
+}
+
+// Full scan -> index. Expensive (one KV get per list), so it runs only when
+// the index is missing, and only one caller at a time via a short lock.
+async function rebuildPublicListIndex(env) {
+  const entries = [];
+  const seen = new Set();
+
+  // Search matches against the creator's display name too, so the index has
+  // to carry it. Cached per username: creators are far fewer than lists, and
+  // without this the rebuild would do a second get for every list.
+  const displayNameCache = new Map();
+  async function resolveDisplayName(username) {
+    if (displayNameCache.has(username)) return displayNameCache.get(username);
+    let name = username;
+    try {
+      const profileRaw = await getCreator(env, username);
+      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+    } catch {
+      // fall back to the raw username slug
+    }
+    displayNameCache.set(username, name);
+    return name;
+  }
+
+  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+  for (const k of creatorKeys.keys) {
+    const rest = k.name.slice("creatorlist:".length);
+    const sep = rest.indexOf(":");
+    if (sep === -1) continue;
+    const username = rest.slice(0, sep);
+    const slug = rest.slice(sep + 1);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `c:${username}:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: true,
+        username,
+        creatorName: await resolveDisplayName(username),
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+  for (const k of anonKeys.keys) {
+    const slug = k.name.slice("publishedlist:user:".length);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `a:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: false,
+        username: "user",
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  return await writePublicListIndex(env, entries);
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+
+  // Rebuilding is a full scan; a burst of traffic against a cold index must
+  // not start one per request. First caller takes a 60s lock and rebuilds,
+  // the rest fall through to the bounded legacy scan for this one request.
+  let gotLock = false;
+  try {
+    const lock = await env.CONFIGS.get("lock:publiclistindex");
+    if (!lock) {
+      await env.CONFIGS.put("lock:publiclistindex", "1", { expirationTtl: 60 });
+      gotLock = true;
+    }
+  } catch {
+    // If the lock read fails, fall through to the scan rather than risking
+    // a rebuild stampede.
+  }
+  if (!gotLock) return null;
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    // Rebuild in the background; serve this request from the legacy scan.
+    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
+      console.error("public list index rebuild failed:", err);
+    }));
+    return null;
+  }
+  try {
+    return await rebuildPublicListIndex(env);
+  } catch (err) {
+    console.error("public list index rebuild failed:", err);
+    return null;
+  }
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;
@@ -1073,6 +1282,7 @@ async function purgeCreatorData(env, username, options = {}) {
   const deleteIdentity = options.deleteIdentity === true;
   const u = username;
   let listsCleared = 0;
+  const purgedListIds = [];
   let keysCleared = 0;
 
   // Custom lists are one key each and list() pages -- keep going until the
@@ -1084,6 +1294,9 @@ async function purgeCreatorData(env, username, options = {}) {
       const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
       for (const k of res.keys) {
         await env.CONFIGS.delete(k.name);
+        // Drop it from the directory index too, or a deleted account's
+        // lists keep appearing publicly until the next full rebuild.
+        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
         listsCleared++;
       }
       if (res.list_complete || !res.cursor) break;
@@ -1098,6 +1311,21 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
+    }
+  }
+
+  // One index write for the whole account rather than one per list --
+  // deleting an account with 200 lists should not be 200 read-modify-writes
+  // against the same key (KV allows 1 write/sec/key).
+  if (purgedListIds.length) {
+    try {
+      const idx = await readPublicListIndex(env);
+      if (idx) {
+        const gone = new Set(purgedListIds);
+        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+      }
+    } catch (e) {
+      console.error("purgeCreatorData: index cleanup failed", e);
     }
   }
 
