@@ -779,6 +779,25 @@ self.addEventListener('fetch', e => {
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
+      // Unauthenticated and heavyweight: each call can fan out to TMDB /
+      // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
+      // -- 80/minute is enough for Live Preview paging a shelf, not enough
+      // to use this as a free outbound scanner.
+      if (env && env.CONFIGS) {
+        const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+        const rateKey = `ratelimit:preview:${ip}`;
+        const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
+        if (n >= 80) {
+          return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
+        }
+        ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
+      }
+
+      const sourceUrls = previewSourceUrls(testUrl);
+      if (!sourceUrls.length || !sourceUrls.every(isAllowedCatalogSourceUrl)) {
+        return json({ ok: false, error: "That URL isn't a supported list source." }, 400, { "Cache-Control": "no-store" });
+      }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -801,12 +820,14 @@ self.addEventListener('fetch', e => {
           })),
         };
       } catch (err) {
-        body = { ok: false, error: String(err.message || err) };
+        console.error("preview failed:", err);
+        body = { ok: false, error: "Couldn't load that list." };
       }
 
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });

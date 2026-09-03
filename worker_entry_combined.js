@@ -5832,6 +5832,73 @@ function detectSource(input) {
   return "mdblist"; // default / backwards-compatible with existing configs
 }
 
+// /api/preview takes a caller-supplied url and feeds it to fetchCatalog.
+// detectSource used to default unknown strings to "mdblist", and the
+// preview handler echoed the raw fetch error, so an unauthenticated
+// client could probe hosts by the distinct failure strings even though
+// Workers block RFC1918. Gate first: only the sentinels fetchCatalog
+// actually dispatches on, plus https URLs on the provider hosts those
+// fetchers talk to. Published-list URLs are KV-only (no outbound fetch)
+// so any https host with that path shape is fine. Failures after this
+// check still collapse to one generic message at the route.
+function isAllowedCatalogSourceUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return false;
+  if (
+    s.startsWith("mdblist:") ||
+    s.startsWith("trakt:") ||
+    s.startsWith("tmdb:") ||
+    s.startsWith("simkl:") ||
+    s.startsWith("channel:v1:") ||
+    s.startsWith("customlist:v1:") ||
+    s.startsWith("autotrack:") ||
+    s.startsWith("custom:") ||
+    s.startsWith("curated:")
+  ) {
+    return true;
+  }
+  // Bare "user/listname" -- mdblistJsonUrl accepts this and always fetches
+  // mdblist.com, never the string as a URL.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) {
+    const parts = s.split("/").filter(Boolean);
+    return parts.length >= 2 && parts.length <= 8 && parts.every((p) => /^[A-Za-z0-9._-]+$/.test(p));
+  }
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase();
+  if (
+    host === "mdblist.com" || host === "www.mdblist.com" ||
+    host === "trakt.tv" || host === "www.trakt.tv" || host === "app.trakt.tv" ||
+    host === "themoviedb.org" || host === "www.themoviedb.org" ||
+    host === "simkl.com" || host === "www.simkl.com" ||
+    host === "letterboxd.com" || host === "www.letterboxd.com"
+  ) {
+    return true;
+  }
+  // Own published lists -- resolved from KV, never fetched. Any https host
+  // with /lists/{user}/{slug} is the share URL shape parsePublishedListUrl
+  // already accepts (including a sibling workers.dev deployment).
+  if (typeof parsePublishedListUrl === "function" && parsePublishedListUrl(s)) return true;
+  return false;
+}
+
+function previewSourceUrls(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  // channel:v1: / customlist:v1: payloads are JSON that may contain
+  // newlines. Those are not merge separators -- fetchCatalog only splits
+  // the whole url when it is several sources stacked, not a single
+  // sentinel blob. Treat the payload as one URL so a Live Preview of a
+  // Channel still works.
+  if (s.startsWith("channel:v1:") || s.startsWith("customlist:v1:")) return [s];
+  return s.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
 // Parses a pasted trakt.tv list URL into the { user, list } pair the Trakt
 // API needs. Accepts the standard public-list URL shape:
 //   https://trakt.tv/users/USERNAME/lists/LIST-SLUG-OR-ID
@@ -46332,6 +46399,25 @@ self.addEventListener('fetch', e => {
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
+      // Unauthenticated and heavyweight: each call can fan out to TMDB /
+      // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
+      // -- 80/minute is enough for Live Preview paging a shelf, not enough
+      // to use this as a free outbound scanner.
+      if (env && env.CONFIGS) {
+        const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+        const rateKey = `ratelimit:preview:${ip}`;
+        const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
+        if (n >= 80) {
+          return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
+        }
+        ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
+      }
+
+      const sourceUrls = previewSourceUrls(testUrl);
+      if (!sourceUrls.length || !sourceUrls.every(isAllowedCatalogSourceUrl)) {
+        return json({ ok: false, error: "That URL isn't a supported list source." }, 400, { "Cache-Control": "no-store" });
+      }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -46354,12 +46440,14 @@ self.addEventListener('fetch', e => {
           })),
         };
       } catch (err) {
-        body = { ok: false, error: String(err.message || err) };
+        console.error("preview failed:", err);
+        body = { ok: false, error: "Couldn't load that list." };
       }
 
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });
