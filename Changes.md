@@ -1,5 +1,52 @@
 # Changes Log
 
+## 2026-09-03d - Airing Next: legacy entries mislabelled type "movie" were filtered out of the series row
+
+### Files Changed
+`05_catalog-core.js`, `21_client-custom-list-builder.js`, `worker_entry_combined.js`, `tests/curated-recs-and-derived-lists.js`
+
+### Root Cause
+Diagnosed from live data rather than inference. The account's stored `airingNext` held both items correctly, the row's URL was correct (`autotrack:airing-next:series:james`), and `watch-history` / `continue-watching` previews returned 3 items each - but `airing-next` returned 0. The stored entries looked like this:
+
+    { "id": "tt26545992", "type": "movie", "name": "The Weenie",
+      "showId": "tt26545992", "showTitle": "Lanterns",
+      "seasonNum": 1, "episodeNum": 4, "airDate": "2026-09-06", ... }
+
+`fetchAutoTrackedCatalog` computed `isMovie` purely from the type string and dropped every one of them from a `:series:` row - while three lines later reading `showId`/`showTitle` to build a *series* meta from the same item. The type string and the structure of the item contradicted each other, and the weaker signal won.
+
+The bad `type` came from an older client build. These entries are missing `canonicalTmdbId`, `episodeTitle`, `isSeasonPremiere` and `seasonFinaleEpisodeNumber` - all fields the current `airingEntryFrom` sets - so they predate it and had been carried in localStorage ever since. Nothing rebuilt them: `refreshAiringNext` short-circuits for six hours at a time, and its `needsEnrichment` escape hatch only fires on a missing `name`, which these have. So they survived indefinitely and were pushed to the account verbatim.
+
+This is why the three previous fixes did not help - each addressed a real defect on the path between the browser and the account, but the data was arriving intact and being discarded at the last step.
+
+### What Changed
+- **`05`**: `fetchAutoTrackedCatalog` now decides movie-vs-series on structure first. An entry carrying `showId`, `showTitle`, `seasonNum` or `episodeNum` is a TV episode whatever its type string says; an entry with none of those still falls through to the original `kind`/`type` check, so real movie rows are unaffected. This is the same `isShow` heuristic the client's own list renderers already use - the two sides now agree about the same item.
+- **`21`**: `airingEntryFrom` stamps `type: 'series'` explicitly instead of omitting it and letting each consumer apply its own default.
+- **`21`**: `needsEnrichment` now also treats an entry whose `type` is anything other than `series` as stale-shaped, forcing exactly one rebuild for anyone still carrying legacy entries.
+
+The server change alone fixes existing accounts without waiting for a client rebuild; the two client changes stop it recurring.
+
+### Verification
+Full pipeline: byte-consistency 27/27, `node --check`, sandboxed `renderBuilder()`, inner script (7 blocks), CSS balance (460 pairs), backtick counts in files 09-24 byte-identical to the project copies. All 21 suites pass. `curated-recs-and-derived-lists.js` gained 5 checks built from the actual failing production payload: the mislabelled entries serve in a series row and map with the show title, they do not leak into a movie row, and a genuine movie (no series fields) still sorts into the movie row and stays out of the series row - so the structural override cannot swallow real movie catalogs.
+
+## 2026-09-03c - Airing Next catalog URLs never self-healed
+
+### Files Changed
+`23_client-list-management.js`, `worker_entry_combined.js`, `tests/airing-next-reaches-account.js`
+
+### Root Cause
+`repairAutotrackUrl` (called from `collectEntries`, so it runs on every Live Preview refresh and every autosave) rewrites the username segment of an `autotrack:` URL whenever it does not match the currently signed-in account. That covers a URL generated before `activeCreator` was threaded through - the old bug that baked the literal string `undefined` into that segment - and a URL left behind after switching Creator Profiles.
+
+Its regex named only two slugs: `watch-history|continue-watching`. An `autotrack:airing-next:...` row was never matched, so it was the one autotrack row that could not correct itself. It kept resolving `creatorsynctracking:<wrong-username>`, missing, and returning an empty array - "No items found" indefinitely - while every other autotrack row on the same page silently repaired itself on the next `collectEntries()` and worked fine. That asymmetry is exactly the reported symptom: the dashboard card renders from localStorage and looked correct, the signed-out preview embeds a `customlist:v1:` snapshot of those same local items and worked, and only the signed-in row went through the URL that never got repaired.
+
+### What Changed
+- The slug is now matched generically (`[a-z0-9-]+`) rather than as a hardcoded pair, and the type segment accepts `mixed` alongside `movie`/`series`. Every autotrack slug reads the same per-account tracking record, so every one of them wants the same repair - and enumerating them individually meant each slug added later inherited the bug again. `watchlist` was silently in the same position and is now covered too.
+
+### Verification
+Full pipeline: byte-consistency 27/27, `node --check`, sandboxed `renderBuilder()`, inner script (7 blocks), CSS balance (460 pairs). Backtick counts in files 09-24 verified byte-identical to the pristine project copies (the earlier "hazard scan" figures were line counts, not occurrence counts - no backticks were introduced in any change this session). All 21 behavioural suites pass; `airing-next-reaches-account.js` gained 10 checks driving the real `repairAutotrackUrl` sliced out of the bundle, including that the two previously-covered slugs behave exactly as before and that a signed-out browser still leaves URLs alone.
+
+### Note
+The affected row repairs itself on the next Live Preview refresh once this is deployed - no need to remove and re-add it.
+
 ## 2026-09-03b - Airing Next never reached the account when signed in
 
 ### Files Changed

@@ -429,9 +429,20 @@ function buildConfig(entries, keys) {
 // anything else, including when nobody's signed in right now -- there's
 // no correct username to repair it with yet, so it's left alone until
 // there is.
+//
+// The slug is matched generically rather than as a fixed list. It used to
+// name only watch-history and continue-watching, which meant an Airing
+// Next row pointing at the wrong username was the one autotrack row that
+// never self-healed: every other kind silently corrected itself on the
+// next collectEntries() while that one kept resolving
+// creatorsynctracking:<wrong-name>, missing, and rendering "No items
+// found" indefinitely. Every autotrack slug reads the same per-account
+// tracking record, so every one of them wants the same repair -- and
+// spelling them out individually means each slug added later inherits
+// the bug again.
 function repairAutotrackUrl(url) {
   if (!activeCreator || !activeCreator.creatorName) return url;
-  const m = /^autotrack:(watch-history|continue-watching):(movie|series):(.*)$/.exec(url);
+  const m = /^autotrack:([a-z0-9-]+):(movie|series|mixed):(.*)$/.exec(url);
   if (!m || m[3] === activeCreator.creatorName) return url;
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
 }

@@ -2383,7 +2383,17 @@ function syncAiringNextWatchState() {
 async function refreshAiringNext(force) {
   const existing = getOrCreateAiringNextList();
   const hasExpiredItems = Array.isArray(existing.items) && existing.items.some(it => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
-  const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it => it && !it.name && !it.episodeTitle);
+  // An entry is stale-shaped if it predates the current airingEntryFrom:
+  // either it never got a name/episodeTitle, or it carries a type this
+  // list can never legitimately contain (every entry here is a TV
+  // episode). The second case is what let entries written by an older
+  // client survive indefinitely -- they have a name, so the original
+  // check passed them, and the freshness window below then short-
+  // circuited every refresh for six hours at a time, so nothing ever
+  // rebuilt them. Detecting the shape forces exactly one rebuild.
+  const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it =>
+    it && ((!it.name && !it.episodeTitle) || (it.type && it.type !== 'series'))
+  );
   if (!force && Array.isArray(existing.items) && existing.items.length > 0 && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
     // Reconciled with the account even though nothing was recomputed.
     // The push at the bottom of this function is otherwise the only one
@@ -2428,6 +2438,12 @@ async function refreshAiringNext(force) {
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
     return {
       id: showId,
+      // Stamped explicitly. These entries are always TV episodes, but the
+      // field used to be left off, which let whatever consumed the list
+      // fall back to its own default -- and a stale one reached the
+      // server saying "movie", where the catalog filter dropped it from a
+      // series row. Saying so outright removes the guess.
+      type: 'series',
       showId: showId,
       canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
       showTitle: (known && known.title) || d.title || '',

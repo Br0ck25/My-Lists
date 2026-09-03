@@ -1085,7 +1085,23 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const mappedItems = [];
     
     items.forEach(it => {
-      const isMovie = it.kind === 'movie' || it.type === 'movie';
+      // Structure wins over the type string. An entry carrying showId /
+      // showTitle / seasonNum / episodeNum is a TV episode whatever its
+      // "type" field happens to say -- and it can say the wrong thing:
+      // these lists are written by the browser and persist in
+      // localStorage across releases, so an entry built by an older
+      // version of the client outlives the code that produced it.
+      // Trusting a stale type string over the fields three lines below
+      // (which read showId/showTitle to build the series meta) meant this
+      // function could simultaneously decide an item was a movie and then
+      // map it as a show. The client's own list renderers already resolve
+      // this the same way -- see the isShow checks in the dashboard and
+      // list-details mappers -- so this makes the two sides agree.
+      //
+      // A real movie entry has none of these fields, so it still falls
+      // through to the type/kind check exactly as before.
+      const hasSeriesShape = !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
+      const isMovie = !hasSeriesShape && (it.kind === 'movie' || it.type === 'movie');
       
       // Filter out types we don't want in this catalog
       if (targetType === 'movie' && !isMovie) return;

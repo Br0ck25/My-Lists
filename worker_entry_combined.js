@@ -6419,7 +6419,23 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const mappedItems = [];
     
     items.forEach(it => {
-      const isMovie = it.kind === 'movie' || it.type === 'movie';
+      // Structure wins over the type string. An entry carrying showId /
+      // showTitle / seasonNum / episodeNum is a TV episode whatever its
+      // "type" field happens to say -- and it can say the wrong thing:
+      // these lists are written by the browser and persist in
+      // localStorage across releases, so an entry built by an older
+      // version of the client outlives the code that produced it.
+      // Trusting a stale type string over the fields three lines below
+      // (which read showId/showTitle to build the series meta) meant this
+      // function could simultaneously decide an item was a movie and then
+      // map it as a show. The client's own list renderers already resolve
+      // this the same way -- see the isShow checks in the dashboard and
+      // list-details mappers -- so this makes the two sides agree.
+      //
+      // A real movie entry has none of these fields, so it still falls
+      // through to the type/kind check exactly as before.
+      const hasSeriesShape = !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
+      const isMovie = !hasSeriesShape && (it.kind === 'movie' || it.type === 'movie');
       
       // Filter out types we don't want in this catalog
       if (targetType === 'movie' && !isMovie) return;
@@ -33518,7 +33534,17 @@ function syncAiringNextWatchState() {
 async function refreshAiringNext(force) {
   const existing = getOrCreateAiringNextList();
   const hasExpiredItems = Array.isArray(existing.items) && existing.items.some(it => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
-  const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it => it && !it.name && !it.episodeTitle);
+  // An entry is stale-shaped if it predates the current airingEntryFrom:
+  // either it never got a name/episodeTitle, or it carries a type this
+  // list can never legitimately contain (every entry here is a TV
+  // episode). The second case is what let entries written by an older
+  // client survive indefinitely -- they have a name, so the original
+  // check passed them, and the freshness window below then short-
+  // circuited every refresh for six hours at a time, so nothing ever
+  // rebuilt them. Detecting the shape forces exactly one rebuild.
+  const needsEnrichment = Array.isArray(existing.items) && existing.items.length > 0 && existing.items.some(it =>
+    it && ((!it.name && !it.episodeTitle) || (it.type && it.type !== 'series'))
+  );
   if (!force && Array.isArray(existing.items) && existing.items.length > 0 && !needsEnrichment && !hasExpiredItems && existing.updatedAt && (Date.now() - existing.updatedAt) < AIRING_NEXT_REFRESH_MS) {
     // Reconciled with the account even though nothing was recomputed.
     // The push at the bottom of this function is otherwise the only one
@@ -33563,6 +33589,12 @@ async function refreshAiringNext(force) {
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
     return {
       id: showId,
+      // Stamped explicitly. These entries are always TV episodes, but the
+      // field used to be left off, which let whatever consumed the list
+      // fall back to its own default -- and a stale one reached the
+      // server saying "movie", where the catalog filter dropped it from a
+      // series row. Saying so outright removes the guess.
+      type: 'series',
       showId: showId,
       canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
       showTitle: (known && known.title) || d.title || '',
@@ -39181,9 +39213,20 @@ function buildConfig(entries, keys) {
 // anything else, including when nobody's signed in right now -- there's
 // no correct username to repair it with yet, so it's left alone until
 // there is.
+//
+// The slug is matched generically rather than as a fixed list. It used to
+// name only watch-history and continue-watching, which meant an Airing
+// Next row pointing at the wrong username was the one autotrack row that
+// never self-healed: every other kind silently corrected itself on the
+// next collectEntries() while that one kept resolving
+// creatorsynctracking:<wrong-name>, missing, and rendering "No items
+// found" indefinitely. Every autotrack slug reads the same per-account
+// tracking record, so every one of them wants the same repair -- and
+// spelling them out individually means each slug added later inherits
+// the bug again.
 function repairAutotrackUrl(url) {
   if (!activeCreator || !activeCreator.creatorName) return url;
-  const m = /^autotrack:(watch-history|continue-watching):(movie|series):(.*)$/.exec(url);
+  const m = /^autotrack:([a-z0-9-]+):(movie|series|mixed):(.*)$/.exec(url);
   if (!m || m[3] === activeCreator.creatorName) return url;
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
 }

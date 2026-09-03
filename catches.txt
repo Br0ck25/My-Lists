@@ -1,0 +1,1707 @@
+02_http-and-creator-utils.js:227:  } catch {
+02_http-and-creator-utils.js:301:  } catch {
+02_http-and-creator-utils.js:486:    } catch {}
+02_http-and-creator-utils.js:501:        ).catch(() => {});
+02_http-and-creator-utils.js:508:  } catch (err) {
+02_http-and-creator-utils.js:570:    } catch(e) {}
+02_http-and-creator-utils.js:593:    } catch(e) {}
+03_admin.js:39:  } catch (e) {
+03_admin.js:68:  } catch (e) {
+03_admin.js:100:      } catch {
+03_admin.js:109:  } catch (e) {
+03_admin.js:146:    } catch {
+03_admin.js:152:    } catch {
+03_admin.js:185:  } catch (e) {
+03_admin.js:211:  } catch (e) {
+03_admin.js:257:    } catch {
+03_admin.js:270:    } catch {
+03_admin.js:284:  } catch (e) {
+03_admin.js:324:        } catch {
+03_admin.js:340:              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+03_admin.js:345:                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+03_admin.js:349:          } catch {}
+03_admin.js:371:    } catch {
+03_admin.js:389:      } catch {
+03_admin.js:402:      } catch {
+03_admin.js:429:            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+03_admin.js:434:                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+03_admin.js:438:        } catch {}
+03_admin.js:471:  } catch (e) {
+03_admin.js:502:    } catch {
+03_admin.js:515:    } catch {
+03_admin.js:525:  } catch (e) {}
+03_admin.js:562:  // prefix scan would catch that the index doesn't already have.
+03_admin.js:569:    } catch {}
+03_admin.js:583:      } catch {
+03_admin.js:632:  } catch (e) {}
+03_admin.js:685:        try { data = JSON.parse(raw); } catch { return null; }
+03_admin.js:743:  } catch {
+03_admin.js:754:  } catch {
+03_admin.js:845:      } catch {
+03_admin.js:1028:      } catch {}
+03_admin.js:1050:        } catch {}
+03_admin.js:1055:        } catch {}
+03_admin.js:1516:      } catch (e) {}
+03_admin.js:1524:      } catch (e) {}
+03_admin.js:1560:        } catch (e) {}
+03_admin.js:1603:      } catch (e) {
+03_admin.js:1639:      } catch (e) {
+03_admin.js:1672:      } catch (e) {
+03_admin.js:1713:      } catch (e) {
+03_admin.js:1739:      } catch (e) {
+03_admin.js:1773:      } catch (e) {
+03_admin.js:1805:      } catch (e) {
+03_admin.js:1832:      } catch (e) {
+03_admin.js:1873:      } catch (e) {
+03_admin.js:1912:      } catch (e) {
+03_admin.js:1939:      } catch (e) {
+03_admin.js:2082:        const data = await res.json().catch(() => null);
+03_admin.js:2093:      } catch (e) {
+03_admin.js:2149:        const data = await res.json().catch(() => null);
+03_admin.js:2169:      } catch (e) {
+03_admin.js:2254:        const data = await res.json().catch(() => null);
+03_admin.js:2265:      } catch (e) {
+03_admin.js:2307:        const data = await res.json().catch(() => null);
+03_admin.js:2321:      } catch (err) {
+03_admin.js:2347:      } catch (e) {
+03_admin.js:2366:          const data = await res.json().catch(() => null);
+03_admin.js:2373:        } catch (err) {
+04_config-resolution.js:43:            } catch {}
+04_config-resolution.js:76:      } catch {
+04_config-resolution.js:141:  } catch {}
+04_config-resolution.js:327:  } catch {
+05_catalog-core.js:80:// Usage tab, which is meant to catch a shared key creeping toward its
+05_catalog-core.js:184:    urls.map((u) => fetchCatalog({ url: u, type }, skip, keys).catch(() => []))
+05_catalog-core.js:228:  } catch (e) {
+05_catalog-core.js:529:    } catch (e) {
+05_catalog-core.js:721:  } catch (e) {
+05_catalog-core.js:748:    } catch {}
+05_catalog-core.js:807:      } catch {}
+05_catalog-core.js:824:      } catch {}
+05_catalog-core.js:860:        } catch {
+05_catalog-core.js:897:          } catch {
+05_catalog-core.js:903:    } catch {}
+05_catalog-core.js:946:  } catch {
+05_catalog-core.js:972:    } catch {}
+05_catalog-core.js:1052:  } catch (e) {
+05_catalog-core.js:1084:      } catch {}
+06_source-fetchers-mdblist-trakt.js:208:        const d = await res.json().catch(() => null);
+06_source-fetchers-mdblist-trakt.js:214:              const itemsRes = await fetch(`https://api.mdblist.com/lists/${encodeURIComponent(wlList.id)}/items${authQuery}`, { headers }).catch(() => null);
+06_source-fetchers-mdblist-trakt.js:216:                rawData = await itemsRes.json().catch(() => null);
+06_source-fetchers-mdblist-trakt.js:231:    } catch (e) {}
+06_source-fetchers-mdblist-trakt.js:282:    } catch {}
+06_source-fetchers-mdblist-trakt.js:312:    } catch {}
+06_source-fetchers-mdblist-trakt.js:604:        }).catch(() => null),
+06_source-fetchers-mdblist-trakt.js:608:        }).catch(() => null),
+06_source-fetchers-mdblist-trakt.js:616:        } catch {}
+06_source-fetchers-mdblist-trakt.js:622:        } catch {}
+06_source-fetchers-mdblist-trakt.js:678:        } catch {}
+06_source-fetchers-mdblist-trakt.js:714:        }).catch(() => null),
+06_source-fetchers-mdblist-trakt.js:718:        }).catch(() => null),
+06_source-fetchers-mdblist-trakt.js:722:        }).catch(() => null),
+06_source-fetchers-mdblist-trakt.js:732:        } catch {}
+06_source-fetchers-mdblist-trakt.js:740:        } catch {}
+06_source-fetchers-mdblist-trakt.js:748:        } catch {}
+06_source-fetchers-mdblist-trakt.js:796:        } catch {}
+07_source-fetchers-tmdb-simkl.js:180:      } catch {}
+07_source-fetchers-tmdb-simkl.js:373:  } catch {
+07_source-fetchers-tmdb-simkl.js:420:    } catch {}
+07_source-fetchers-tmdb-simkl.js:461:      env.CONFIGS.put(`tmdbdetail:${kind}:${cleanTmdbId}`, JSON.stringify(result), { expirationTtl: 2592000 }).catch(() => {});
+07_source-fetchers-tmdb-simkl.js:462:    } catch {}
+07_source-fetchers-tmdb-simkl.js:1019:    } catch (e) {}
+07_source-fetchers-tmdb-simkl.js:1222:      } catch {}
+07_source-fetchers-tmdb-simkl.js:1330:    } catch {}
+07_source-fetchers-tmdb-simkl.js:1373:      } catch {}
+07_source-fetchers-tmdb-simkl.js:1433:      } catch {}
+07_source-fetchers-tmdb-simkl.js:1531:      } catch {}
+07_source-fetchers-tmdb-simkl.js:1595:        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId).catch(() => null)
+07_source-fetchers-tmdb-simkl.js:1726:    } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1763:      } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1842:      } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1880:      } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1901:      } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1919:        } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1936:        } catch (e) {
+07_source-fetchers-tmdb-simkl.js:1941:  } catch (e) {
+09_page-shell.js:123:    } catch (e) {}
+09_page-shell.js:131:    } catch (e) {}
+09_page-shell.js:144:      } catch (e) {}
+09_page-shell.js:159:    } catch (e) {}
+09_page-shell.js:3068:      } catch (e) {}
+09_page-shell.js:3273:  navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
+15_tab-settings-html.js:173:            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+15_tab-settings-html.js:203:              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+15_tab-settings-html.js:206:              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+15_tab-settings-html.js:235:            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+15_tab-settings-html.js:263:            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+16_client-row-core.js:121:  } catch (e) {}
+16_client-row-core.js:160:    } catch (e) {}
+16_client-row-core.js:486:      } catch (e) {}
+16_client-row-core.js:517:  } catch (e) {}
+16_client-row-core.js:541:  } catch (e) {
+16_client-row-core.js:555:  } catch (e) {
+16_client-row-core.js:594:  } catch (e) {}
+16_client-row-core.js:610:    } catch (e) {}
+16_client-row-core.js:619:    } catch (e) {}
+16_client-row-core.js:626:    } catch (e) {}
+16_client-row-core.js:637:      } catch (e) {}
+16_client-row-core.js:655:      } catch (e) {}
+16_client-row-core.js:673:      } catch (e) {}
+16_client-row-core.js:728:      } catch (e) {}
+16_client-row-core.js:796:      .catch(() => {});
+16_client-row-core.js:825:      .catch(() => {});
+16_client-row-core.js:895:  } catch (e) {}
+16_client-row-core.js:904:  } catch (e) {}
+16_client-row-core.js:970:  } catch (e) {}
+16_client-row-core.js:1014:  } catch (e) {
+16_client-row-core.js:1027:  } catch (e) {}
+16_client-row-core.js:1043:    const data = await res.json().catch(() => null);
+16_client-row-core.js:1051:  } catch (e) {}
+16_client-row-core.js:1178:    const data = await res.json().catch(() => null);
+16_client-row-core.js:1192:  } catch (e) {
+16_client-row-core.js:1221:    const data = await res.json().catch(() => null);
+16_client-row-core.js:1237:  } catch (e) {
+16_client-row-core.js:1264:    }).catch(() => {});
+16_client-row-core.js:1265:  } catch (e) {
+16_client-row-core.js:1273:  } catch (e) {}
+16_client-row-core.js:1277:  } catch (e) {}
+16_client-row-core.js:1288:    } catch (e) {}
+16_client-row-core.js:1473:  } catch (e) {}
+16_client-row-core.js:1477:  } catch (e) {}
+16_client-row-core.js:1483:    } catch (e) {}
+16_client-row-core.js:1664:  } catch (e) {
+16_client-row-core.js:1708:  } catch (e) {
+16_client-row-core.js:1792:      } catch (e) {}
+16_client-row-core.js:2125:// one source field anywhere in the builder -- catches an accidental double
+17_client-my-lists-and-trakt-oauth.js:47:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:52:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:97:        } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:106:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:198:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:203:      enrichMdblistAiringNextDates(airingNextList).catch(() => {});
+17_client-my-lists-and-trakt-oauth.js:393:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:424:  try { localStorage.removeItem('myListAddon:mdblistDisconnected'); } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:432:  try { window.mdblistAccessToken = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:438:  } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:512:    } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:518:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:522:    } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:568:  try { localStorage.removeItem('myListAddon:traktDisconnected'); } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:578:  try { window.traktAccessToken = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:585:  } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:664:    } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:670:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:791:          } catch(e) {}
+17_client-my-lists-and-trakt-oauth.js:795:            } catch(e) {}
+17_client-my-lists-and-trakt-oauth.js:816:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:819:  } catch (err) {
+17_client-my-lists-and-trakt-oauth.js:856:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:862:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:907:        } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:916:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1013:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1018:      enrichTraktAiringNextDates(airingNextList).catch(() => {});
+17_client-my-lists-and-trakt-oauth.js:1221:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:1227:  try { localStorage.removeItem('myListAddon:tmdbDisconnected'); } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1245:  try { window.tmdbSessionId = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1247:  try { window.tmdbAccountId = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1249:  try { window.tmdbUsername = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1256:  } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1279:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1375:    } catch {
+17_client-my-lists-and-trakt-oauth.js:1391:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1395:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:1520:  try { localStorage.removeItem('myListAddon:simklDisconnected'); } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1528:  try { window.simklAccessToken = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1530:  try { window.simklUsername = ''; } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1537:  } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1562:    } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1568:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1687:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1691:  } catch (e) {
+17_client-my-lists-and-trakt-oauth.js:1739:        } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1748:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1839:      } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:1844:      enrichSimklAiringNextDates(airingNextList).catch(() => {});
+17_client-my-lists-and-trakt-oauth.js:2016:  } catch (e) {}
+17_client-my-lists-and-trakt-oauth.js:2066:    const data = await res.json().catch(() => ({}));
+17_client-my-lists-and-trakt-oauth.js:2081:  } catch (err) {
+17_client-my-lists-and-trakt-oauth.js:2159:      }).catch(() => {})
+17_client-my-lists-and-trakt-oauth.js:2182:      }).catch(() => {})
+17_client-my-lists-and-trakt-oauth.js:2205:      }).catch(() => {})
+18_client-copy-and-trakt-export.js:81:    } catch (e) {
+18_client-copy-and-trakt-export.js:139:    } catch (e) {
+18_client-copy-and-trakt-export.js:219:    } catch (e) {}
+18_client-copy-and-trakt-export.js:276:      } catch (e) {
+18_client-copy-and-trakt-export.js:495:    } catch (e) {
+18_client-copy-and-trakt-export.js:656:  } catch (err) {
+18_client-copy-and-trakt-export.js:723:    } catch (e) {
+18_client-copy-and-trakt-export.js:745:  } catch (err) {
+18_client-copy-and-trakt-export.js:781:      '<div><label><input type="checkbox" class="traktExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
+18_client-copy-and-trakt-export.js:883:  const catChecked = new Set(Array.from(document.querySelectorAll('.traktExportCatCheck:checked')).map((c) => c.value));
+18_client-copy-and-trakt-export.js:893:  const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
+18_client-copy-and-trakt-export.js:910:    if (catChecked.has(catKey)) {
+18_client-copy-and-trakt-export.js:1072:    } catch (e) {
+18_client-copy-and-trakt-export.js:1091:  } catch (err) {
+18_client-copy-and-trakt-export.js:1114:      '<div><label><input type="checkbox" class="letterboxdExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
+18_client-copy-and-trakt-export.js:1135:  const catChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportCatCheck:checked')).map((c) => c.value));
+18_client-copy-and-trakt-export.js:1140:  const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
+18_client-copy-and-trakt-export.js:1187:    } catch (err) {
+18_client-copy-and-trakt-export.js:1198:    if (catChecked.has(cat.key)) {
+18_client-copy-and-trakt-export.js:1325:          '<input type="checkbox" class="importCatCheck" data-cat-index="' + idx + '" checked> ' +
+18_client-copy-and-trakt-export.js:1505:      } catch (err) {
+18_client-copy-and-trakt-export.js:1530:      } catch (err) {}
+18_client-copy-and-trakt-export.js:1655:    } catch (e) {}
+18_client-copy-and-trakt-export.js:1728:  const checkedCatCards = Array.from(document.querySelectorAll('.importCatCheck:checked'));
+18_client-copy-and-trakt-export.js:1792:      } catch (e) {}
+19_client-search-and-likes.js:33:  } catch (e) {
+19_client-search-and-likes.js:55:    } catch (e) {
+19_client-search-and-likes.js:64:  } catch (e) {
+19_client-search-and-likes.js:114:  } catch (e) {
+19_client-search-and-likes.js:134:  } catch (e) {}
+19_client-search-and-likes.js:160:    }).catch(() => {});
+19_client-search-and-likes.js:161:  } catch (e) {}
+19_client-search-and-likes.js:172:      .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
+19_client-search-and-likes.js:175:      .catch(() => ({ ok: false, lists: [] })),
+19_client-search-and-likes.js:178:      .catch(() => ({ ok: false, lists: [] })),
+19_client-search-and-likes.js:340:    } catch (e) {}
+19_client-search-and-likes.js:437:      fetchPreviewOnce(listUrl, 'movie').catch(() => null),
+19_client-search-and-likes.js:438:      fetchPreviewOnce(listUrl, 'series').catch(() => null),
+19_client-search-and-likes.js:530:      } catch (e) {
+19_client-search-and-likes.js:541:  } catch (e) {
+19_client-search-and-likes.js:551:  } catch (e) {}
+19_client-search-and-likes.js:559:  } catch (e) {}
+19_client-search-and-likes.js:709:        }).catch(() => {});
+19_client-search-and-likes.js:711:    } catch (err) {
+19_client-search-and-likes.js:776:        }).catch(() => {});
+19_client-search-and-likes.js:778:    } catch (err) {
+19_client-search-and-likes.js:808:  } catch (e) {
+19_client-search-and-likes.js:880:  } catch (e) {}
+19_client-search-and-likes.js:905:    } catch (e) {}
+19_client-search-and-likes.js:923:      } catch (e) {}
+19_client-search-and-likes.js:989:      }).catch(() => ({ ok: false })),
+19_client-search-and-likes.js:990:      ensureMdblistPopularLoaded().catch(() => []),
+19_client-search-and-likes.js:991:      ensureTraktPopularLoaded().catch(() => [])
+19_client-search-and-likes.js:1139:  } catch (err) {
+19_client-search-and-likes.js:1186:  } catch (e) {
+19_client-search-and-likes.js:1402:  } catch (e) {
+19_client-search-and-likes.js:1493:  } catch (err) {
+19_client-search-and-likes.js:1524:  } catch (e) {}
+19_client-search-and-likes.js:1530:  } catch (e) {}
+19_client-search-and-likes.js:1575:      const errText = await res.text().catch(() => '');
+19_client-search-and-likes.js:1577:      try { parsed = JSON.parse(errText); } catch(e) {}
+19_client-search-and-likes.js:1602:      } catch(e) {}
+19_client-search-and-likes.js:1689:  } catch (err) {
+19_client-search-and-likes.js:1740:  } catch (err) {
+19_client-search-and-likes.js:1748:  } catch(e) {
+19_client-search-and-likes.js:1763:  } catch(e) {}
+19_client-search-and-likes.js:1854:  } catch(e) {}
+19_client-search-and-likes.js:1917:      } catch(e) {}
+19_client-search-and-likes.js:1936:  } catch(e) {}
+19_client-search-and-likes.js:1991:      } catch(e) {}
+19_client-search-and-likes.js:2211:    }).catch(() => {});
+19_client-search-and-likes.js:2241:    }).catch(() => {});
+19_client-search-and-likes.js:2274:    }).catch(() => {});
+19_client-search-and-likes.js:2304:    }).catch(() => {});
+19_client-search-and-likes.js:2335:    } catch(e) {
+19_client-search-and-likes.js:2499:  } catch (err) {
+19_client-search-and-likes.js:2572:      } catch(e) {}
+19_client-search-and-likes.js:2786:    } catch (e) {
+19_client-search-and-likes.js:2802:  } catch (e) {
+19_client-search-and-likes.js:2822:    }).catch(() => {});
+19_client-search-and-likes.js:2823:  } catch (e) {}
+19_client-search-and-likes.js:2835:          .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
+19_client-search-and-likes.js:2838:          .catch(() => ({ ok: false, lists: [] })),
+19_client-search-and-likes.js:2841:          .catch(() => ({ ok: false, lists: [] })),
+19_client-search-and-likes.js:2853:    } catch (e) {
+19_client-search-and-likes.js:2874:  } catch (e) {
+20_client-channel-builder.js:61:  } catch (e) {
+20_client-channel-builder.js:165:  } catch (e) {
+20_client-channel-builder.js:210:  } catch (e) {
+20_client-channel-builder.js:259:        .catch(() => ({ season: parseInt(season, 10), episodes: [] }))
+20_client-channel-builder.js:296:  } catch (e) {
+20_client-channel-builder.js:342:  } catch (e) {
+20_client-channel-builder.js:361:    } catch (e) {
+20_client-channel-builder.js:399:  } catch (e) {
+20_client-channel-builder.js:426:  } catch (e) {
+20_client-channel-builder.js:447:    } catch (err2) {
+20_client-channel-builder.js:491:          } catch (e) {}
+20_client-channel-builder.js:842:  } catch (_) {
+20_client-channel-builder.js:1852:        "title": "The Hunger Games: Catching Fire",
+20_client-channel-builder.js:4795:    "description": "A serial killer sabotages his own prisoner transport flight from New York to Miami, escapes, and goes on a killing spree -- pulling New York's Mac Taylor down to Miami, then Miami's Horatio Caine up to New York, to catch him.",
+20_client-channel-builder.js:5119:  } catch (err) {
+20_client-channel-builder.js:5213:      try { navigator.vibrate(30); } catch (err) {}
+20_client-channel-builder.js:5566:      const data = await res.json().catch(() => null);
+20_client-channel-builder.js:5573:      const data = await res.json().catch(() => null);
+20_client-channel-builder.js:5579:  } catch (e) {
+20_client-channel-builder.js:5713:        const res = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5714:        const data = res ? await res.json().catch(() => null) : null;
+20_client-channel-builder.js:5721:        const searchRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.title) + '&type=movie', { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5723:          const sData = await searchRes.json().catch(() => null);
+20_client-channel-builder.js:5757:        const sRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5758:        const sData = sRes ? await sRes.json().catch(() => null) : null;
+20_client-channel-builder.js:5771:      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5773:        const siData = await seasonsInfoRes.json().catch(() => null);
+20_client-channel-builder.js:5789:        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5791:          const sData = await showDetailsRes.json().catch(() => null);
+20_client-channel-builder.js:5806:          .catch(() => ({ season: sNum, episodes: [] }))
+20_client-channel-builder.js:5850:      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+20_client-channel-builder.js:5852:        const siData = await seasonsInfoRes.json().catch(() => null);
+20_client-channel-builder.js:5986:  } catch (err) {
+20_client-channel-builder.js:6039:  } catch (err) {
+20_client-channel-builder.js:6053:  } catch (e) {}
+20_client-channel-builder.js:6080:  } catch (e) {}
+20_client-channel-builder.js:6202:        } catch (e) {}
+20_client-channel-builder.js:6611:            .catch(() => ({ season: s.season, episodes: [] }))
+20_client-channel-builder.js:6646:      } catch (e) {
+20_client-channel-builder.js:6665:  } catch (e) {
+20_client-channel-builder.js:6720:  } catch (e) {
+20_client-channel-builder.js:6730:  } catch (e) {
+21_client-custom-list-builder.js:47:    }).catch(() => {});
+21_client-custom-list-builder.js:48:  } catch (e) {}
+21_client-custom-list-builder.js:57:  } catch (e) {
+21_client-custom-list-builder.js:134:  } catch (e) {
+21_client-custom-list-builder.js:243:      try { navigator.vibrate(30); } catch (err) {}
+21_client-custom-list-builder.js:509:      }).catch(() => {
+21_client-custom-list-builder.js:622:  } catch (e) {
+21_client-custom-list-builder.js:685:      } catch (e) {}
+21_client-custom-list-builder.js:921:  } catch (e) {}
+21_client-custom-list-builder.js:925:  } catch (e) {
+21_client-custom-list-builder.js:935:  } catch (e) {
+21_client-custom-list-builder.js:961:  try { cleanWatchedFromWatchlists(); } catch (e) {}
+21_client-custom-list-builder.js:1012:    } catch (e) {
+21_client-custom-list-builder.js:1052:    catch (e) { return true; }
+21_client-custom-list-builder.js:1119:        } catch {
+21_client-custom-list-builder.js:1133:        } catch {}
+21_client-custom-list-builder.js:1189:        }).catch(() => {});
+21_client-custom-list-builder.js:1204:    catch (e) { return true; }
+21_client-custom-list-builder.js:1351:    if (d && d.id) updateContinueWatching(d.id).catch(() => {});
+21_client-custom-list-builder.js:1446:  updateContinueWatchingForBatch(items).catch(() => {});
+21_client-custom-list-builder.js:1527:        } catch (e) {
+21_client-custom-list-builder.js:1654:    } catch (e) { return new Set(); }
+21_client-custom-list-builder.js:1850:  } catch (e) {
+21_client-custom-list-builder.js:1898:      } catch (e) {
+21_client-custom-list-builder.js:1900:        // try/catch), but guard anyway so one unexpected error can't abort
+21_client-custom-list-builder.js:1949:  } catch (e) {
+21_client-custom-list-builder.js:2058:    refreshAiringNext(true).catch(() => {});
+21_client-custom-list-builder.js:2147:      } catch (e) {
+21_client-custom-list-builder.js:2195:setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
+21_client-custom-list-builder.js:2347:  } catch (e) {
+21_client-custom-list-builder.js:2372:  } catch (e) {
+21_client-custom-list-builder.js:2408:  } catch (e) {
+21_client-custom-list-builder.js:2440:  } catch (e) {
+22_client-creator-profile.js:37:  } catch (e) {
+22_client-creator-profile.js:48:  } catch (e) {
+22_client-creator-profile.js:162:    } catch (e) {
+22_client-creator-profile.js:288:    const data = await res.json().catch(() => null);
+22_client-creator-profile.js:297:  } catch (err) {
+22_client-creator-profile.js:330:    }).catch(() => {
+22_client-creator-profile.js:372:  } catch (e) {}
+22_client-creator-profile.js:386:  } catch (e) {}
+22_client-creator-profile.js:438:  } catch (e) {}
+22_client-creator-profile.js:539:  try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+22_client-creator-profile.js:550:  } catch (e) {}
+22_client-creator-profile.js:632:  try { localStorage.setItem('myListAddon:scrobbleFilterUsers', cb.checked ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:652:  } catch (e) {}
+22_client-creator-profile.js:658:  try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', cb.checked ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:701:  } catch (e) {}
+22_client-creator-profile.js:750:  } catch (err) {
+22_client-creator-profile.js:762:  }).catch(() => {
+22_client-creator-profile.js:768:  try { localStorage.setItem('myListAddon:syncMediaServerHistory', enabled ? 'true' : 'false'); } catch (e) {}
+22_client-creator-profile.js:773:  try { localStorage.setItem('myListAddon:forwardScrobbleToProviders', enabled ? 'true' : 'false'); } catch (e) {}
+22_client-creator-profile.js:778:  try { localStorage.setItem('myListAddon:trackPlayback', cb.checked ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:817:  } catch (e) {
+22_client-creator-profile.js:828:  }).catch(() => {
+22_client-creator-profile.js:891:  } catch (e) {}
+22_client-creator-profile.js:1003:  } catch (e) {
+22_client-creator-profile.js:1062:  } catch (e) {
+22_client-creator-profile.js:1091:  } catch (e) {
+22_client-creator-profile.js:1185:  } catch (e) {
+22_client-creator-profile.js:1236:          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch (e) { return []; }
+22_client-creator-profile.js:1239:          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
+22_client-creator-profile.js:1244:  } catch (e) {
+22_client-creator-profile.js:1296:  } catch (e) {
+22_client-creator-profile.js:1367:      try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(synced.hiddenLists)); } catch (e) {}
+22_client-creator-profile.js:1370:      try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
+22_client-creator-profile.js:1400:      }).catch(() => {});
+22_client-creator-profile.js:1425:      try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1429:      try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', synced.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1433:      try { localStorage.setItem('myListAddon:scrobbleFilterUsers', synced.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1436:      try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', synced.scrobbleAllowedUsers); } catch (e) {}
+22_client-creator-profile.js:1439:      try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', synced.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1447:      } catch (e) {
+22_client-creator-profile.js:1638:      } catch (e) {}
+22_client-creator-profile.js:1648:        try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1661:        try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
+22_client-creator-profile.js:1680:          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+22_client-creator-profile.js:1768:        } catch (e) {}
+22_client-creator-profile.js:1774:        } catch (e) {}
+22_client-creator-profile.js:1779:        } catch (e) {}
+22_client-creator-profile.js:1789:    try { if (typeof cleanWatchedFromWatchlists === 'function') cleanWatchedFromWatchlists(); } catch (e) {}
+22_client-creator-profile.js:1792:  } catch (e) {
+22_client-creator-profile.js:1886:  } catch (e) {
+22_client-creator-profile.js:1918:    navigator.clipboard.writeText(text).then(() => alert('Copied.')).catch(() => prompt('Copy this key:', text));
+22_client-creator-profile.js:1997:    }).catch(() => {
+22_client-creator-profile.js:2048:  } catch (e) {
+22_client-creator-profile.js:2139:          }).catch(() => {});
+22_client-creator-profile.js:2146:      } catch (e) {}
+22_client-creator-profile.js:2169:        } catch (e) {}
+22_client-creator-profile.js:2271:          }).catch(() => {});
+22_client-creator-profile.js:2298:      } catch (e) {}
+22_client-creator-profile.js:2302:      } catch (e) {}
+22_client-creator-profile.js:2329:  } catch (e) {
+22_client-creator-profile.js:2602:    } catch (e) {}
+22_client-creator-profile.js:2623:  } catch (e) {}
+22_client-creator-profile.js:2798:      } catch (err) {
+22_client-creator-profile.js:2894:          }).catch(() => {});
+22_client-creator-profile.js:3108:  } catch (e) {}
+22_client-creator-profile.js:3117:    } catch (e) {
+22_client-creator-profile.js:3148:    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+22_client-creator-profile.js:3267:        } catch(e) {}
+22_client-creator-profile.js:3276:          } catch(e) {}
+22_client-creator-profile.js:3439:        }).catch(() => {});
+22_client-creator-profile.js:3460:  } catch (err) {
+22_client-creator-profile.js:3548:      } catch (err) {
+22_client-creator-profile.js:3619:        }).catch(() => {});
+22_client-creator-profile.js:3728:        }).catch(() => {});
+22_client-creator-profile.js:3752:      } catch (e) {}
+22_client-creator-profile.js:3854:    } catch (e) {
+23_client-list-management.js:122:    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+23_client-list-management.js:337:  } catch (e) {
+23_client-list-management.js:490:  try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+23_client-list-management.js:500:    try { tmdbKey = localStorage.getItem('myListAddon:tmdbKey') || ''; } catch (e) {}
+23_client-list-management.js:504:    try { tmdbSession = localStorage.getItem('myListAddon:tmdbSessionId') || ''; } catch (e) {}
+23_client-list-management.js:508:    try { tmdbAcc = localStorage.getItem('myListAddon:tmdbAccountId') || ''; } catch (e) {}
+23_client-list-management.js:512:    try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
+23_client-list-management.js:518:    try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
+23_client-list-management.js:522:    try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+23_client-list-management.js:526:    try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
+23_client-list-management.js:532:    try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
+23_client-list-management.js:537:    try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
+23_client-list-management.js:541:    try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+23_client-list-management.js:547:    try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
+23_client-list-management.js:551:    try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+23_client-list-management.js:555:    try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
+23_client-list-management.js:577:      try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
+23_client-list-management.js:611:  } catch (e) {
+23_client-list-management.js:635:  } catch (e) {}
+23_client-list-management.js:800:      } catch (e) {
+23_client-list-management.js:845:      .catch(() => {
+23_client-list-management.js:885:    } catch (e) {}
+23_client-list-management.js:1066:    }).catch(() => {});
+23_client-list-management.js:1339:    } catch (e) {}
+23_client-list-management.js:1354:    } catch (e) {}
+23_client-list-management.js:1388:          } catch (e) {}
+23_client-list-management.js:1447:      } catch (e) {}
+23_client-list-management.js:1515:          } catch (e) {}
+23_client-list-management.js:1560:      } catch (e) {}
+23_client-list-management.js:1604:        } catch (e) {}
+23_client-list-management.js:2168:    } catch (e) {
+24_client-backup-restore-presets.js:33:      dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
+24_client-backup-restore-presets.js:34:      hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
+24_client-backup-restore-presets.js:35:      hiddenMyListsSections: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch(e) { return []; } })(),
+24_client-backup-restore-presets.js:36:      likedLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'); } catch(e) { return []; } })(),
+24_client-backup-restore-presets.js:75:  } catch (e) {
+24_client-backup-restore-presets.js:106:    try { localStorage.setItem('myListAddon:tmdbKey', tmdbKey); } catch (e) {}
+24_client-backup-restore-presets.js:112:    try { localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionIdVal); } catch (e) {}
+24_client-backup-restore-presets.js:117:    try { localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountIdVal); } catch (e) {}
+24_client-backup-restore-presets.js:122:    try { localStorage.setItem('myListAddon:tmdbUsername', tmdbUsernameVal); } catch (e) {}
+24_client-backup-restore-presets.js:130:    try { localStorage.setItem('myListAddon:mdblistKey', mdblistKey); } catch (e) {}
+24_client-backup-restore-presets.js:136:    try { localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessTokenVal); } catch (e) {}
+24_client-backup-restore-presets.js:143:    try { localStorage.setItem('myListAddon:mdblistUsername', mdblistUsernameVal); } catch (e) {}
+24_client-backup-restore-presets.js:150:    try { localStorage.setItem('myListAddon:traktKey', traktKey); } catch (e) {}
+24_client-backup-restore-presets.js:157:    try { localStorage.setItem('myListAddon:traktUsername', traktUsernameVal); } catch (e) {}
+24_client-backup-restore-presets.js:163:    try { localStorage.setItem('myListAddon:traktAccessToken', traktAccessTokenVal); } catch (e) {}
+24_client-backup-restore-presets.js:171:    try { localStorage.setItem('myListAddon:simklKey', simklKey); } catch (e) {}
+24_client-backup-restore-presets.js:177:    try { localStorage.setItem('myListAddon:simklAccessToken', simklAccessTokenVal); } catch (e) {}
+24_client-backup-restore-presets.js:183:    try { localStorage.setItem('myListAddon:simklUsername', simklUsernameVal); } catch (e) {}
+24_client-backup-restore-presets.js:240:    try { localStorage.setItem('myListAddon:trackPlayback', s.trackPlayback ? '1' : '0'); } catch (e) {}
+24_client-backup-restore-presets.js:243:    try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', s.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+24_client-backup-restore-presets.js:246:    try { localStorage.setItem('myListAddon:scrobbleFilterUsers', s.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+24_client-backup-restore-presets.js:249:    try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', s.scrobbleAllowedUsers); } catch (e) {}
+24_client-backup-restore-presets.js:252:    try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', s.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+24_client-backup-restore-presets.js:257:    try { localStorage.setItem('myListAddon:hideNonDigitalReleases', s.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+24_client-backup-restore-presets.js:262:    try { localStorage.setItem('myListAddon:region', s.region); } catch (e) {}
+24_client-backup-restore-presets.js:265:    try { localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(s.dashboardListOrder)); } catch (e) {}
+24_client-backup-restore-presets.js:268:    try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(s.hiddenLists)); } catch (e) {}
+24_client-backup-restore-presets.js:271:    try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
+24_client-backup-restore-presets.js:274:    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+24_client-backup-restore-presets.js:278:    try { localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(s.fullyWatchedShowIds)); } catch (e) {}
+24_client-backup-restore-presets.js:282:    try { localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(s.dismissedContinueWatching)); } catch (e) {}
+24_client-backup-restore-presets.js:352:    } catch (e) {}
+24_client-backup-restore-presets.js:367:  } catch (e) {}
+24_client-backup-restore-presets.js:388:    } catch (e) {}
+24_client-backup-restore-presets.js:511:  } catch (e) {
+24_client-backup-restore-presets.js:619:  } catch (e) {
+24_client-backup-restore-presets.js:680:    } catch (e) {}
+24_client-backup-restore-presets.js:695:  } catch (e) {}
+24_client-backup-restore-presets.js:708:  } catch (e) {}
+24_client-backup-restore-presets.js:726:  } catch (e) {
+24_client-backup-restore-presets.js:737:    } catch (err2) {
+24_client-backup-restore-presets.js:772:    const data = await res.json().catch(() => null);
+24_client-backup-restore-presets.js:778:  } catch (e) {
+24_client-backup-restore-presets.js:814:        } catch (err) {}
+24_client-backup-restore-presets.js:822:        } catch (err) {}
+24_client-backup-restore-presets.js:983:        } catch (err) {}
+24_client-backup-restore-presets.js:993:        } catch (err) {}
+24_client-backup-restore-presets.js:1213:  }).catch(() => {
+24_client-backup-restore-presets.js:1262:    } catch (e) {
+24_client-backup-restore-presets.js:1381:    } catch (e) {}
+24_client-backup-restore-presets.js:1539:  } catch (e) {
+24_client-backup-restore-presets.js:1583:  } catch (e) {
+24_client-backup-restore-presets.js:1604:  } catch (e) {
+24_client-backup-restore-presets.js:1625:  }).catch(() => {
+24_client-backup-restore-presets.js:1640:    navigator.clipboard.writeText(installUrl).catch(() => {});
+24_client-backup-restore-presets.js:1684:  } catch (e) {
+24_client-backup-restore-presets.js:1717:  }).catch(() => {});
+24_client-backup-restore-presets.js:1798:    try { return localStorage.getItem('myListAddon:region'); } catch (e) { return null; }
+24_client-backup-restore-presets.js:1809:    try { return localStorage.getItem('myListAddon:hideNonDigitalReleases'); } catch (e) { return null; }
+24_client-backup-restore-presets.js:1886:  try { window.mdblistAccessToken = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1894:    try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+24_client-backup-restore-presets.js:1900:  try { window.traktAccessToken = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1911:    try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+24_client-backup-restore-presets.js:1917:  try { window.simklAccessToken = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1919:  try { window.simklUsername = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1927:    try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+24_client-backup-restore-presets.js:1933:  try { window.tmdbSessionId = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1935:  try { window.tmdbAccountId = ''; } catch (e) {}
+24_client-backup-restore-presets.js:1937:  try { window.tmdbUsername = ''; } catch (e) {}
+25_api-catalog-routes.js:117:      } catch (e) {}
+25_api-catalog-routes.js:134:        } catch (e) {
+25_api-catalog-routes.js:165:          } catch (e) {
+25_api-catalog-routes.js:271:        } catch {
+25_api-catalog-routes.js:312:    // Catch-all for browser navigation on provider/custom list paths (e.g. /lists/mdblist/..., /lists/trakt/..., /lists/tmdb/..., /lists/simkl/..., /lists/custom/...)
+25_api-catalog-routes.js:459:  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+25_api-catalog-routes.js:504:      } catch (err) {
+25_api-catalog-routes.js:521:          } catch {
+25_api-catalog-routes.js:571:      } catch {
+25_api-catalog-routes.js:605:        } catch {
+25_api-catalog-routes.js:658:      } catch (err) {
+25_api-catalog-routes.js:731:        } catch (err) {
+25_api-catalog-routes.js:748:        } catch (err) {
+25_api-catalog-routes.js:832:      } catch (err) {
+25_api-catalog-routes.js:850:      } catch (err) {
+25_api-catalog-routes.js:960:              } catch {
+25_api-catalog-routes.js:1004:                } catch {}
+25_api-catalog-routes.js:1022:      } catch (err) {
+25_api-catalog-routes.js:1042:        } catch {}
+25_api-catalog-routes.js:1070:        } catch {}
+25_api-catalog-routes.js:1083:        } catch {}
+25_api-catalog-routes.js:1104:        } catch {}
+25_api-catalog-routes.js:1122:        } catch {}
+25_api-catalog-routes.js:1167:      } catch (err) {
+25_api-catalog-routes.js:1198:      } catch (err) {
+25_api-catalog-routes.js:1231:      } catch (e) {}
+25_api-catalog-routes.js:1264:        } catch (e) {}
+25_api-catalog-routes.js:1314:            } catch (e) {}
+25_api-catalog-routes.js:1347:      } catch (err) {
+25_api-catalog-routes.js:1414:          } catch {
+25_api-catalog-routes.js:1447:        } catch (err) {
+25_api-catalog-routes.js:1471:          } catch {
+25_api-catalog-routes.js:1480:      } catch (err) {
+25_api-catalog-routes.js:1495:      } catch (err) {
+25_api-catalog-routes.js:1511:      } catch (err) {
+25_api-catalog-routes.js:1522:      } catch {
+25_api-catalog-routes.js:1561:          } catch {
+25_api-catalog-routes.js:1596:          } catch {
+25_api-catalog-routes.js:1639:        } catch {}
+25_api-catalog-routes.js:1679:        } catch {}
+25_api-catalog-routes.js:1796:      } catch (err) {
+25_api-catalog-routes.js:1815:      } catch (err) {
+25_api-catalog-routes.js:1874:      } catch (err) {
+25_api-catalog-routes.js:1947:            }).catch(() => null),
+25_api-catalog-routes.js:1951:            }).catch(() => null),
+25_api-catalog-routes.js:1955:            }).catch(() => null),
+25_api-catalog-routes.js:1964:            const wData = await wShowsRes.json().catch(() => []);
+25_api-catalog-routes.js:1968:            const wlData = await wlShowsRes.json().catch(() => []);
+25_api-catalog-routes.js:1994:        } catch {}
+25_api-catalog-routes.js:2030:      } catch (err) {
+25_api-catalog-routes.js:2071:      // comparison) instead of needing to catch a fleeting 302 in devtools.
+25_api-catalog-routes.js:2157:          } catch {}
+25_api-catalog-routes.js:2171:              } catch {
+25_api-catalog-routes.js:2175:          } catch {}
+25_api-catalog-routes.js:2195:        } catch {}
+25_api-catalog-routes.js:2203:      } catch {
+25_api-catalog-routes.js:2211:      try { body = await request.json(); } catch {}
+25_api-catalog-routes.js:2243:        const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:2249:      } catch (err) {
+25_api-catalog-routes.js:2257:      try { body = await request.json(); } catch {}
+25_api-catalog-routes.js:2300:        const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:2320:        } catch {}
+25_api-catalog-routes.js:2323:      } catch (err) {
+25_api-catalog-routes.js:2439:            } catch {
+25_api-catalog-routes.js:2442:          } catch {}
+25_api-catalog-routes.js:2460:          } catch {}
+25_api-catalog-routes.js:2469:      } catch (err) {
+25_api-catalog-routes.js:2550:            } catch {
+25_api-catalog-routes.js:2553:          } catch {}
+25_api-catalog-routes.js:2575:        } catch {}
+25_api-catalog-routes.js:2584:      } catch (err) {
+25_api-catalog-routes.js:2598:        } catch {}
+25_api-catalog-routes.js:2751:        } catch {}
+25_api-catalog-routes.js:2754:      } catch (err) {
+25_api-catalog-routes.js:2764:      } catch {
+25_api-catalog-routes.js:2809:        } catch {}
+25_api-catalog-routes.js:2819:        } catch {}
+25_api-catalog-routes.js:2875:          const tData = await tRes.json().catch(() => ({}));
+25_api-catalog-routes.js:2881:        } catch (err) {
+25_api-catalog-routes.js:2956:          const sData = await sRes.json().catch(() => ({}));
+25_api-catalog-routes.js:2962:        } catch (err) {
+25_api-catalog-routes.js:2992:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+25_api-catalog-routes.js:2998:          } catch (err) {
+25_api-catalog-routes.js:3015:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3021:          } catch (err) {
+25_api-catalog-routes.js:3038:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3044:          } catch (err) {
+25_api-catalog-routes.js:3105:              mData = await mRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3112:            } catch (err) {
+25_api-catalog-routes.js:3133:            const mData = await mRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3141:              const fbData = await fbRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3148:          } catch (err) {
+25_api-catalog-routes.js:3176:              mData = await mRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3183:            } catch (err) {
+25_api-catalog-routes.js:3203:      } catch {
+25_api-catalog-routes.js:3251:          } catch {}
+25_api-catalog-routes.js:3335:          const tData = await tRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3341:        } catch (err) {
+25_api-catalog-routes.js:3414:          const sData = await sRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3420:        } catch (err) {
+25_api-catalog-routes.js:3475:          const mData = await mRes.json().catch(() => ({}));
+25_api-catalog-routes.js:3494:              } catch {}
+25_api-catalog-routes.js:3504:        } catch (err) {
+25_api-catalog-routes.js:3517:      } catch {
+25_api-catalog-routes.js:3558:          const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3578:        } catch (err) {
+25_api-catalog-routes.js:3603:          const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3620:        } catch (err) {
+25_api-catalog-routes.js:3647:          const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3666:        } catch (err) {
+25_api-catalog-routes.js:3701:      } catch {
+25_api-catalog-routes.js:3729:            const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3734:        } catch (err) {
+25_api-catalog-routes.js:3753:          const data = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3759:        } catch (err) {
+25_api-catalog-routes.js:3814:            } catch {}
+25_api-catalog-routes.js:3818:            const errData = await res.json().catch(() => ({}));
+25_api-catalog-routes.js:3825:        } catch (err) {
+25_api-catalog-routes.js:3857:      } catch (err) {
+25_api-catalog-routes.js:3916:      } catch (err) {
+25_api-catalog-routes.js:3933:        } catch {}
+25_api-catalog-routes.js:3967:        } catch {}
+25_api-catalog-routes.js:4003:              } catch {}
+25_api-catalog-routes.js:4135:      } catch (err) {
+25_api-catalog-routes.js:4153:      } catch {
+25_api-catalog-routes.js:4228:            } catch {}
+25_api-catalog-routes.js:4254:            } catch {}
+25_api-catalog-routes.js:4277:                }).catch(() => null),
+25_api-catalog-routes.js:4287:                }).catch(() => null),
+25_api-catalog-routes.js:4322:            } catch {}
+25_api-catalog-routes.js:4346:      } catch (err) {
+25_api-catalog-routes.js:4357:      } catch {
+25_api-catalog-routes.js:4397:      } catch (err) {
+25_api-catalog-routes.js:4409:      } catch {
+25_api-catalog-routes.js:4462:        } catch (e) {}
+25_api-catalog-routes.js:4487:      } catch (e) {
+25_api-catalog-routes.js:4504:        } catch {}
+25_api-catalog-routes.js:4532:          } catch {}
+25_api-catalog-routes.js:4562:            } catch {}
+25_api-catalog-routes.js:4565:        } catch {}
+25_api-catalog-routes.js:4582:      try { body = await request.json(); } catch { return json({ ok: true }); }
+25_api-catalog-routes.js:4598:      } catch {
+25_api-catalog-routes.js:4682:          } catch {}
+25_api-catalog-routes.js:4712:            }).catch(() => null),
+25_api-catalog-routes.js:4716:            }).catch(() => null),
+25_api-catalog-routes.js:4720:            }).catch(() => null),
+25_api-catalog-routes.js:4724:            }).catch(() => null),
+25_api-catalog-routes.js:4728:            }).catch(() => null),
+25_api-catalog-routes.js:4733:            const d = await showsRes.json().catch(() => []);
+25_api-catalog-routes.js:4739:            const d = await epsRes.json().catch(() => []);
+25_api-catalog-routes.js:4749:              const d = await r.json().catch(() => null);
+25_api-catalog-routes.js:4776:              const customWlRes = await fetch(`https://api.mdblist.com/lists/${encodeURIComponent(wlListObj.id)}/items${authQuery}`, { headers }).catch(() => null);
+25_api-catalog-routes.js:4778:                const customWlData = await customWlRes.json().catch(() => null);
+25_api-catalog-routes.js:4818:        } catch {}
+25_api-catalog-routes.js:4854:      } catch (err) {
+25_api-catalog-routes.js:4862:      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+25_api-catalog-routes.js:4885:          } catch {}
+25_api-catalog-routes.js:4913:              try { parsed = JSON.parse(text); } catch {}
+25_api-catalog-routes.js:4936:            } catch (e) {
+25_api-catalog-routes.js:4961:              try { parsed = JSON.parse(text); } catch {}
+25_api-catalog-routes.js:4984:            } catch (e) {
+25_api-catalog-routes.js:4992:      } catch (err) {
+25_api-catalog-routes.js:5024:            } catch {}
+25_api-catalog-routes.js:5041:      } catch (err) {
+25_api-catalog-routes.js:5059:      } catch {
+25_api-catalog-routes.js:5099:      try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+25_api-catalog-routes.js:5121:      try { likeBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+25_api-catalog-routes.js:5138:        } catch (dbErr) {}
+25_api-catalog-routes.js:5148:      try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+25_api-catalog-routes.js:5159:      } catch {
+25_api-catalog-routes.js:5172:        } catch {
+25_api-catalog-routes.js:5190:        } catch {
+26_api-creator-and-admin-routes.js:21:      } catch {
+26_api-creator-and-admin-routes.js:89:      } catch {
+26_api-creator-and-admin-routes.js:187:              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+26_api-creator-and-admin-routes.js:213:          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+26_api-creator-and-admin-routes.js:256:              } catch {
+26_api-creator-and-admin-routes.js:291:                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey).catch(() => null);
+26_api-creator-and-admin-routes.js:348:                try { queue = JSON.parse(queueRaw); } catch { queue = []; }
+26_api-creator-and-admin-routes.js:362:            } catch {}
+26_api-creator-and-admin-routes.js:394:        } catch {}
+26_api-creator-and-admin-routes.js:395:      } catch (err) {
+26_api-creator-and-admin-routes.js:433:        } catch {}
+26_api-creator-and-admin-routes.js:458:        } catch {}
+26_api-creator-and-admin-routes.js:462:        } catch {
+26_api-creator-and-admin-routes.js:466:          } catch {}
+26_api-creator-and-admin-routes.js:587:          } catch {}
+26_api-creator-and-admin-routes.js:629:        } catch {}
+26_api-creator-and-admin-routes.js:674:        } catch {}
+26_api-creator-and-admin-routes.js:707:        } catch {}
+26_api-creator-and-admin-routes.js:719:          try { blob = JSON.parse(raw); } catch {}
+26_api-creator-and-admin-routes.js:749:            const seasonData = await fetchTmdbSeasonDetails(lookupShowId, seasonNum, effectiveTmdbKey, tmdbId).catch(() => null);
+26_api-creator-and-admin-routes.js:755:            const showDetails = await fetchTmdbItemDetails(lookupShowId, effectiveTmdbKey, "series").catch(() => null);
+26_api-creator-and-admin-routes.js:793:            const next = await findNextAiredEpisodeForShow(resolvedShowId, seasonNum, episodeNum, effectiveTmdbKey).catch(() => null);
+26_api-creator-and-admin-routes.js:818:            const details = await fetchTmdbItemDetails(lookupMovieId, effectiveTmdbKey, "movie").catch(() => null);
+26_api-creator-and-admin-routes.js:854:      } catch (err) {
+26_api-creator-and-admin-routes.js:890:      } catch {
+26_api-creator-and-admin-routes.js:900:        } catch {
+26_api-creator-and-admin-routes.js:917:      } catch {
+26_api-creator-and-admin-routes.js:925:        try { users = JSON.parse(raw); } catch {}
+26_api-creator-and-admin-routes.js:937:        } catch {}
+26_api-creator-and-admin-routes.js:957:      } catch {
+26_api-creator-and-admin-routes.js:993:        } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1008:      } catch (err) {}
+26_api-creator-and-admin-routes.js:1034:      } catch {
+26_api-creator-and-admin-routes.js:1059:      } catch {
+26_api-creator-and-admin-routes.js:1076:        } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1109:      } catch {
+26_api-creator-and-admin-routes.js:1119:      } catch {
+26_api-creator-and-admin-routes.js:1132:        } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1162:      } catch {
+26_api-creator-and-admin-routes.js:1178:      } catch {
+26_api-creator-and-admin-routes.js:1187:      } catch {
+26_api-creator-and-admin-routes.js:1207:            } catch {
+26_api-creator-and-admin-routes.js:1230:          } catch {}
+26_api-creator-and-admin-routes.js:1248:            } catch {}
+26_api-creator-and-admin-routes.js:1264:      } catch {
+26_api-creator-and-admin-routes.js:1281:      } catch {
+26_api-creator-and-admin-routes.js:1314:        } catch {
+26_api-creator-and-admin-routes.js:1327:        } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1350:      } catch {
+26_api-creator-and-admin-routes.js:1362:        } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1374:      } catch {
+26_api-creator-and-admin-routes.js:1387:      } catch {
+26_api-creator-and-admin-routes.js:1404:      } catch {
+26_api-creator-and-admin-routes.js:1415:      } catch {}
+26_api-creator-and-admin-routes.js:1423:      } catch {}
+26_api-creator-and-admin-routes.js:1449:      } catch {
+26_api-creator-and-admin-routes.js:1489:          } catch {
+26_api-creator-and-admin-routes.js:1515:      } catch (e) {
+26_api-creator-and-admin-routes.js:1549:      } catch {
+26_api-creator-and-admin-routes.js:1631:        } catch {
+26_api-creator-and-admin-routes.js:1638:        // independently from the large tracking blob. This catches the case
+26_api-creator-and-admin-routes.js:1656:        } catch {
+26_api-creator-and-admin-routes.js:1695:            } catch {}
+26_api-creator-and-admin-routes.js:1719:            } catch (dbErr) {
+26_api-creator-and-admin-routes.js:1730:          try { order = orderRaw ? JSON.parse(orderRaw).order || [] : []; } catch {}
+26_api-creator-and-admin-routes.js:1736:      } catch (e) {
+26_api-creator-and-admin-routes.js:1765:      } catch {
+26_api-creator-and-admin-routes.js:1781:      } catch (e) {
+26_api-creator-and-admin-routes.js:1792:      } catch {
+26_api-creator-and-admin-routes.js:1808:      } catch (e) {
+26_api-creator-and-admin-routes.js:1825:      } catch {
+26_api-creator-and-admin-routes.js:1836:        } catch {
+26_api-creator-and-admin-routes.js:1849:        } catch {
+26_api-creator-and-admin-routes.js:1898:        } catch {}
+26_api-creator-and-admin-routes.js:1913:        } catch {
+26_api-creator-and-admin-routes.js:1935:        } catch {
+26_api-creator-and-admin-routes.js:1973:      } catch {}
+26_api-creator-and-admin-routes.js:1982:        } catch {}
+26_api-creator-and-admin-routes.js:2005:      } catch {
+26_api-creator-and-admin-routes.js:2018:        } catch {
+26_api-creator-and-admin-routes.js:2084:            } catch {
+26_api-creator-and-admin-routes.js:2108:              } catch {
+26_api-creator-and-admin-routes.js:2120:            } catch {
+26_api-creator-and-admin-routes.js:2143:      } catch (err) {
+26_api-creator-and-admin-routes.js:2271:      } catch {}
+26_api-creator-and-admin-routes.js:2295:          } catch {}
+26_api-creator-and-admin-routes.js:2319:          } catch {}
+26_api-creator-and-admin-routes.js:2331:        } catch {
+26_api-creator-and-admin-routes.js:2531:      } catch (e) {
+26_api-creator-and-admin-routes.js:2563:      } catch (e) {
+26_api-creator-and-admin-routes.js:2591:          } catch (e) {
+26_api-creator-and-admin-routes.js:2612:            } catch (e) {
+26_api-creator-and-admin-routes.js:2631:          } catch (e) {
+26_api-creator-and-admin-routes.js:2668:      } catch {
+26_api-creator-and-admin-routes.js:2715:          } catch {
+26_api-creator-and-admin-routes.js:2783:          } catch {
+26_api-creator-and-admin-routes.js:2800:      } catch {
+26_api-creator-and-admin-routes.js:2814:      } catch {
+26_api-creator-and-admin-routes.js:2848:      } catch (e) {
+26_api-creator-and-admin-routes.js:2866:      } catch {
+26_api-creator-and-admin-routes.js:2877:      } catch {
+26_api-creator-and-admin-routes.js:2883:      } catch (e) {
+26_api-creator-and-admin-routes.js:2898:      } catch {
+26_api-creator-and-admin-routes.js:2909:      } catch {
+26_api-creator-and-admin-routes.js:2936:      } catch (e) {
+26_api-creator-and-admin-routes.js:2950:      } catch {
+26_api-creator-and-admin-routes.js:2959:      } catch (e) {
+26_api-creator-and-admin-routes.js:3076:      } catch (err) {
+26_api-creator-and-admin-routes.js:3126:      } catch (err) {
+26_api-creator-and-admin-routes.js:3142:      } catch {
+26_api-creator-and-admin-routes.js:3244:      } catch (e) {
+scratch.js:102:  } catch (err) {
+test_inner.js:7:    } catch (e) {}
+test_inner.js:15:    } catch (e) {}
+test_inner.js:28:      } catch (e) {}
+test_inner.js:43:    } catch (e) {}
+worker_entry_combined.js:1732:  } catch {
+worker_entry_combined.js:1806:  } catch {
+worker_entry_combined.js:1991:    } catch {}
+worker_entry_combined.js:2006:        ).catch(() => {});
+worker_entry_combined.js:2013:  } catch (err) {
+worker_entry_combined.js:2075:    } catch(e) {}
+worker_entry_combined.js:2098:    } catch(e) {}
+worker_entry_combined.js:2184:  } catch (e) {
+worker_entry_combined.js:2213:  } catch (e) {
+worker_entry_combined.js:2245:      } catch {
+worker_entry_combined.js:2254:  } catch (e) {
+worker_entry_combined.js:2291:    } catch {
+worker_entry_combined.js:2297:    } catch {
+worker_entry_combined.js:2330:  } catch (e) {
+worker_entry_combined.js:2356:  } catch (e) {
+worker_entry_combined.js:2402:    } catch {
+worker_entry_combined.js:2415:    } catch {
+worker_entry_combined.js:2429:  } catch (e) {
+worker_entry_combined.js:2469:        } catch {
+worker_entry_combined.js:2485:              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+worker_entry_combined.js:2490:                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+worker_entry_combined.js:2494:          } catch {}
+worker_entry_combined.js:2516:    } catch {
+worker_entry_combined.js:2534:      } catch {
+worker_entry_combined.js:2547:      } catch {
+worker_entry_combined.js:2574:            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType).catch(() => null);
+worker_entry_combined.js:2579:                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+worker_entry_combined.js:2583:        } catch {}
+worker_entry_combined.js:2616:  } catch (e) {
+worker_entry_combined.js:2647:    } catch {
+worker_entry_combined.js:2660:    } catch {
+worker_entry_combined.js:2670:  } catch (e) {}
+worker_entry_combined.js:2707:  // prefix scan would catch that the index doesn't already have.
+worker_entry_combined.js:2714:    } catch {}
+worker_entry_combined.js:2728:      } catch {
+worker_entry_combined.js:2777:  } catch (e) {}
+worker_entry_combined.js:2830:        try { data = JSON.parse(raw); } catch { return null; }
+worker_entry_combined.js:2888:  } catch {
+worker_entry_combined.js:2899:  } catch {
+worker_entry_combined.js:2990:      } catch {
+worker_entry_combined.js:3173:      } catch {}
+worker_entry_combined.js:3195:        } catch {}
+worker_entry_combined.js:3200:        } catch {}
+worker_entry_combined.js:3661:      } catch (e) {}
+worker_entry_combined.js:3669:      } catch (e) {}
+worker_entry_combined.js:3705:        } catch (e) {}
+worker_entry_combined.js:3748:      } catch (e) {
+worker_entry_combined.js:3784:      } catch (e) {
+worker_entry_combined.js:3817:      } catch (e) {
+worker_entry_combined.js:3858:      } catch (e) {
+worker_entry_combined.js:3884:      } catch (e) {
+worker_entry_combined.js:3918:      } catch (e) {
+worker_entry_combined.js:3950:      } catch (e) {
+worker_entry_combined.js:3977:      } catch (e) {
+worker_entry_combined.js:4018:      } catch (e) {
+worker_entry_combined.js:4057:      } catch (e) {
+worker_entry_combined.js:4084:      } catch (e) {
+worker_entry_combined.js:4227:        const data = await res.json().catch(() => null);
+worker_entry_combined.js:4238:      } catch (e) {
+worker_entry_combined.js:4294:        const data = await res.json().catch(() => null);
+worker_entry_combined.js:4314:      } catch (e) {
+worker_entry_combined.js:4399:        const data = await res.json().catch(() => null);
+worker_entry_combined.js:4410:      } catch (e) {
+worker_entry_combined.js:4452:        const data = await res.json().catch(() => null);
+worker_entry_combined.js:4466:      } catch (err) {
+worker_entry_combined.js:4492:      } catch (e) {
+worker_entry_combined.js:4511:          const data = await res.json().catch(() => null);
+worker_entry_combined.js:4518:        } catch (err) {
+worker_entry_combined.js:4575:            } catch {}
+worker_entry_combined.js:4608:      } catch {
+worker_entry_combined.js:4673:  } catch {}
+worker_entry_combined.js:4859:  } catch {
+worker_entry_combined.js:5000:// Usage tab, which is meant to catch a shared key creeping toward its
+worker_entry_combined.js:5104:    urls.map((u) => fetchCatalog({ url: u, type }, skip, keys).catch(() => []))
+worker_entry_combined.js:5148:  } catch (e) {
+worker_entry_combined.js:5449:    } catch (e) {
+worker_entry_combined.js:5641:  } catch (e) {
+worker_entry_combined.js:5668:    } catch {}
+worker_entry_combined.js:5727:      } catch {}
+worker_entry_combined.js:5744:      } catch {}
+worker_entry_combined.js:5780:        } catch {
+worker_entry_combined.js:5817:          } catch {
+worker_entry_combined.js:5823:    } catch {}
+worker_entry_combined.js:5866:  } catch {
+worker_entry_combined.js:5892:    } catch {}
+worker_entry_combined.js:5972:  } catch (e) {
+worker_entry_combined.js:6004:      } catch {}
+worker_entry_combined.js:6407:        const d = await res.json().catch(() => null);
+worker_entry_combined.js:6413:              const itemsRes = await fetch(`https://api.mdblist.com/lists/${encodeURIComponent(wlList.id)}/items${authQuery}`, { headers }).catch(() => null);
+worker_entry_combined.js:6415:                rawData = await itemsRes.json().catch(() => null);
+worker_entry_combined.js:6430:    } catch (e) {}
+worker_entry_combined.js:6481:    } catch {}
+worker_entry_combined.js:6511:    } catch {}
+worker_entry_combined.js:6803:        }).catch(() => null),
+worker_entry_combined.js:6807:        }).catch(() => null),
+worker_entry_combined.js:6815:        } catch {}
+worker_entry_combined.js:6821:        } catch {}
+worker_entry_combined.js:6877:        } catch {}
+worker_entry_combined.js:6913:        }).catch(() => null),
+worker_entry_combined.js:6917:        }).catch(() => null),
+worker_entry_combined.js:6921:        }).catch(() => null),
+worker_entry_combined.js:6931:        } catch {}
+worker_entry_combined.js:6939:        } catch {}
+worker_entry_combined.js:6947:        } catch {}
+worker_entry_combined.js:6995:        } catch {}
+worker_entry_combined.js:7183:      } catch {}
+worker_entry_combined.js:7376:  } catch {
+worker_entry_combined.js:7423:    } catch {}
+worker_entry_combined.js:7464:      env.CONFIGS.put(`tmdbdetail:${kind}:${cleanTmdbId}`, JSON.stringify(result), { expirationTtl: 2592000 }).catch(() => {});
+worker_entry_combined.js:7465:    } catch {}
+worker_entry_combined.js:8022:    } catch (e) {}
+worker_entry_combined.js:8225:      } catch {}
+worker_entry_combined.js:8333:    } catch {}
+worker_entry_combined.js:8376:      } catch {}
+worker_entry_combined.js:8436:      } catch {}
+worker_entry_combined.js:8534:      } catch {}
+worker_entry_combined.js:8598:        fetchTmdbSeasonDetails(details.id, s.season_number, apiKey, details.tmdbId).catch(() => null)
+worker_entry_combined.js:8729:    } catch (e) {
+worker_entry_combined.js:8766:      } catch (e) {
+worker_entry_combined.js:8845:      } catch (e) {
+worker_entry_combined.js:8883:      } catch (e) {
+worker_entry_combined.js:8904:      } catch (e) {
+worker_entry_combined.js:8922:        } catch (e) {
+worker_entry_combined.js:8939:        } catch (e) {
+worker_entry_combined.js:8944:  } catch (e) {
+worker_entry_combined.js:9614:    } catch (e) {}
+worker_entry_combined.js:9622:    } catch (e) {}
+worker_entry_combined.js:9635:      } catch (e) {}
+worker_entry_combined.js:9650:    } catch (e) {}
+worker_entry_combined.js:12559:      } catch (e) {}
+worker_entry_combined.js:12764:  navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
+worker_entry_combined.js:13675:            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+worker_entry_combined.js:13705:              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+worker_entry_combined.js:13708:              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+worker_entry_combined.js:13737:            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+worker_entry_combined.js:13765:            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+worker_entry_combined.js:14022:  } catch (e) {}
+worker_entry_combined.js:14061:    } catch (e) {}
+worker_entry_combined.js:14387:      } catch (e) {}
+worker_entry_combined.js:14418:  } catch (e) {}
+worker_entry_combined.js:14442:  } catch (e) {
+worker_entry_combined.js:14456:  } catch (e) {
+worker_entry_combined.js:14495:  } catch (e) {}
+worker_entry_combined.js:14511:    } catch (e) {}
+worker_entry_combined.js:14520:    } catch (e) {}
+worker_entry_combined.js:14527:    } catch (e) {}
+worker_entry_combined.js:14538:      } catch (e) {}
+worker_entry_combined.js:14556:      } catch (e) {}
+worker_entry_combined.js:14574:      } catch (e) {}
+worker_entry_combined.js:14629:      } catch (e) {}
+worker_entry_combined.js:14697:      .catch(() => {});
+worker_entry_combined.js:14726:      .catch(() => {});
+worker_entry_combined.js:14796:  } catch (e) {}
+worker_entry_combined.js:14805:  } catch (e) {}
+worker_entry_combined.js:14871:  } catch (e) {}
+worker_entry_combined.js:14915:  } catch (e) {
+worker_entry_combined.js:14928:  } catch (e) {}
+worker_entry_combined.js:14944:    const data = await res.json().catch(() => null);
+worker_entry_combined.js:14952:  } catch (e) {}
+worker_entry_combined.js:15079:    const data = await res.json().catch(() => null);
+worker_entry_combined.js:15093:  } catch (e) {
+worker_entry_combined.js:15122:    const data = await res.json().catch(() => null);
+worker_entry_combined.js:15138:  } catch (e) {
+worker_entry_combined.js:15165:    }).catch(() => {});
+worker_entry_combined.js:15166:  } catch (e) {
+worker_entry_combined.js:15174:  } catch (e) {}
+worker_entry_combined.js:15178:  } catch (e) {}
+worker_entry_combined.js:15189:    } catch (e) {}
+worker_entry_combined.js:15374:  } catch (e) {}
+worker_entry_combined.js:15378:  } catch (e) {}
+worker_entry_combined.js:15384:    } catch (e) {}
+worker_entry_combined.js:15565:  } catch (e) {
+worker_entry_combined.js:15609:  } catch (e) {
+worker_entry_combined.js:15693:      } catch (e) {}
+worker_entry_combined.js:16026:// one source field anywhere in the builder -- catches an accidental double
+worker_entry_combined.js:16124:      } catch (e) {}
+worker_entry_combined.js:16129:  } catch (e) {
+worker_entry_combined.js:16174:        } catch (e) {}
+worker_entry_combined.js:16183:      } catch (e) {}
+worker_entry_combined.js:16275:      } catch (e) {}
+worker_entry_combined.js:16280:      enrichMdblistAiringNextDates(airingNextList).catch(() => {});
+worker_entry_combined.js:16470:  } catch (e) {
+worker_entry_combined.js:16501:  try { localStorage.removeItem('myListAddon:mdblistDisconnected'); } catch (e) {}
+worker_entry_combined.js:16509:  try { window.mdblistAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:16515:  } catch (e) {}
+worker_entry_combined.js:16589:    } catch (e) {}
+worker_entry_combined.js:16595:      } catch (e) {}
+worker_entry_combined.js:16599:    } catch (e) {}
+worker_entry_combined.js:16645:  try { localStorage.removeItem('myListAddon:traktDisconnected'); } catch (e) {}
+worker_entry_combined.js:16655:  try { window.traktAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:16662:  } catch (e) {}
+worker_entry_combined.js:16741:    } catch (e) {}
+worker_entry_combined.js:16747:      } catch (e) {}
+worker_entry_combined.js:16868:          } catch(e) {}
+worker_entry_combined.js:16872:            } catch(e) {}
+worker_entry_combined.js:16893:      } catch (e) {}
+worker_entry_combined.js:16896:  } catch (err) {
+worker_entry_combined.js:16933:      } catch (e) {}
+worker_entry_combined.js:16939:  } catch (e) {
+worker_entry_combined.js:16984:        } catch (e) {}
+worker_entry_combined.js:16993:      } catch (e) {}
+worker_entry_combined.js:17090:      } catch (e) {}
+worker_entry_combined.js:17095:      enrichTraktAiringNextDates(airingNextList).catch(() => {});
+worker_entry_combined.js:17298:  } catch (e) {
+worker_entry_combined.js:17304:  try { localStorage.removeItem('myListAddon:tmdbDisconnected'); } catch (e) {}
+worker_entry_combined.js:17322:  try { window.tmdbSessionId = ''; } catch (e) {}
+worker_entry_combined.js:17324:  try { window.tmdbAccountId = ''; } catch (e) {}
+worker_entry_combined.js:17326:  try { window.tmdbUsername = ''; } catch (e) {}
+worker_entry_combined.js:17333:  } catch (e) {}
+worker_entry_combined.js:17356:      } catch (e) {}
+worker_entry_combined.js:17452:    } catch {
+worker_entry_combined.js:17468:      } catch (e) {}
+worker_entry_combined.js:17472:  } catch (e) {
+worker_entry_combined.js:17597:  try { localStorage.removeItem('myListAddon:simklDisconnected'); } catch (e) {}
+worker_entry_combined.js:17605:  try { window.simklAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:17607:  try { window.simklUsername = ''; } catch (e) {}
+worker_entry_combined.js:17614:  } catch (e) {}
+worker_entry_combined.js:17639:    } catch (e) {}
+worker_entry_combined.js:17645:      } catch (e) {}
+worker_entry_combined.js:17764:      } catch (e) {}
+worker_entry_combined.js:17768:  } catch (e) {
+worker_entry_combined.js:17816:        } catch (e) {}
+worker_entry_combined.js:17825:      } catch (e) {}
+worker_entry_combined.js:17916:      } catch (e) {}
+worker_entry_combined.js:17921:      enrichSimklAiringNextDates(airingNextList).catch(() => {});
+worker_entry_combined.js:18093:  } catch (e) {}
+worker_entry_combined.js:18143:    const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:18158:  } catch (err) {
+worker_entry_combined.js:18236:      }).catch(() => {})
+worker_entry_combined.js:18259:      }).catch(() => {})
+worker_entry_combined.js:18282:      }).catch(() => {})
+worker_entry_combined.js:18373:    } catch (e) {
+worker_entry_combined.js:18431:    } catch (e) {
+worker_entry_combined.js:18511:    } catch (e) {}
+worker_entry_combined.js:18568:      } catch (e) {
+worker_entry_combined.js:18787:    } catch (e) {
+worker_entry_combined.js:18948:  } catch (err) {
+worker_entry_combined.js:19015:    } catch (e) {
+worker_entry_combined.js:19037:  } catch (err) {
+worker_entry_combined.js:19073:      '<div><label><input type="checkbox" class="traktExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
+worker_entry_combined.js:19175:  const catChecked = new Set(Array.from(document.querySelectorAll('.traktExportCatCheck:checked')).map((c) => c.value));
+worker_entry_combined.js:19185:  const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
+worker_entry_combined.js:19202:    if (catChecked.has(catKey)) {
+worker_entry_combined.js:19364:    } catch (e) {
+worker_entry_combined.js:19383:  } catch (err) {
+worker_entry_combined.js:19406:      '<div><label><input type="checkbox" class="letterboxdExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
+worker_entry_combined.js:19427:  const catChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportCatCheck:checked')).map((c) => c.value));
+worker_entry_combined.js:19432:  const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
+worker_entry_combined.js:19479:    } catch (err) {
+worker_entry_combined.js:19490:    if (catChecked.has(cat.key)) {
+worker_entry_combined.js:19617:          '<input type="checkbox" class="importCatCheck" data-cat-index="' + idx + '" checked> ' +
+worker_entry_combined.js:19797:      } catch (err) {
+worker_entry_combined.js:19822:      } catch (err) {}
+worker_entry_combined.js:19947:    } catch (e) {}
+worker_entry_combined.js:20020:  const checkedCatCards = Array.from(document.querySelectorAll('.importCatCheck:checked'));
+worker_entry_combined.js:20084:      } catch (e) {}
+worker_entry_combined.js:20229:  } catch (e) {
+worker_entry_combined.js:20251:    } catch (e) {
+worker_entry_combined.js:20260:  } catch (e) {
+worker_entry_combined.js:20310:  } catch (e) {
+worker_entry_combined.js:20330:  } catch (e) {}
+worker_entry_combined.js:20356:    }).catch(() => {});
+worker_entry_combined.js:20357:  } catch (e) {}
+worker_entry_combined.js:20368:      .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
+worker_entry_combined.js:20371:      .catch(() => ({ ok: false, lists: [] })),
+worker_entry_combined.js:20374:      .catch(() => ({ ok: false, lists: [] })),
+worker_entry_combined.js:20536:    } catch (e) {}
+worker_entry_combined.js:20633:      fetchPreviewOnce(listUrl, 'movie').catch(() => null),
+worker_entry_combined.js:20634:      fetchPreviewOnce(listUrl, 'series').catch(() => null),
+worker_entry_combined.js:20726:      } catch (e) {
+worker_entry_combined.js:20737:  } catch (e) {
+worker_entry_combined.js:20747:  } catch (e) {}
+worker_entry_combined.js:20755:  } catch (e) {}
+worker_entry_combined.js:20905:        }).catch(() => {});
+worker_entry_combined.js:20907:    } catch (err) {
+worker_entry_combined.js:20972:        }).catch(() => {});
+worker_entry_combined.js:20974:    } catch (err) {
+worker_entry_combined.js:21004:  } catch (e) {
+worker_entry_combined.js:21076:  } catch (e) {}
+worker_entry_combined.js:21101:    } catch (e) {}
+worker_entry_combined.js:21119:      } catch (e) {}
+worker_entry_combined.js:21185:      }).catch(() => ({ ok: false })),
+worker_entry_combined.js:21186:      ensureMdblistPopularLoaded().catch(() => []),
+worker_entry_combined.js:21187:      ensureTraktPopularLoaded().catch(() => [])
+worker_entry_combined.js:21335:  } catch (err) {
+worker_entry_combined.js:21382:  } catch (e) {
+worker_entry_combined.js:21598:  } catch (e) {
+worker_entry_combined.js:21689:  } catch (err) {
+worker_entry_combined.js:21720:  } catch (e) {}
+worker_entry_combined.js:21726:  } catch (e) {}
+worker_entry_combined.js:21771:      const errText = await res.text().catch(() => '');
+worker_entry_combined.js:21773:      try { parsed = JSON.parse(errText); } catch(e) {}
+worker_entry_combined.js:21798:      } catch(e) {}
+worker_entry_combined.js:21885:  } catch (err) {
+worker_entry_combined.js:21936:  } catch (err) {
+worker_entry_combined.js:21944:  } catch(e) {
+worker_entry_combined.js:21959:  } catch(e) {}
+worker_entry_combined.js:22050:  } catch(e) {}
+worker_entry_combined.js:22113:      } catch(e) {}
+worker_entry_combined.js:22132:  } catch(e) {}
+worker_entry_combined.js:22187:      } catch(e) {}
+worker_entry_combined.js:22407:    }).catch(() => {});
+worker_entry_combined.js:22437:    }).catch(() => {});
+worker_entry_combined.js:22470:    }).catch(() => {});
+worker_entry_combined.js:22500:    }).catch(() => {});
+worker_entry_combined.js:22531:    } catch(e) {
+worker_entry_combined.js:22695:  } catch (err) {
+worker_entry_combined.js:22768:      } catch(e) {}
+worker_entry_combined.js:22982:    } catch (e) {
+worker_entry_combined.js:22998:  } catch (e) {
+worker_entry_combined.js:23018:    }).catch(() => {});
+worker_entry_combined.js:23019:  } catch (e) {}
+worker_entry_combined.js:23031:          .catch(() => ({ ok: false, error: 'Network error searching trakt.tv.' })),
+worker_entry_combined.js:23034:          .catch(() => ({ ok: false, lists: [] })),
+worker_entry_combined.js:23037:          .catch(() => ({ ok: false, lists: [] })),
+worker_entry_combined.js:23049:    } catch (e) {
+worker_entry_combined.js:23070:  } catch (e) {
+worker_entry_combined.js:23140:  } catch (e) {
+worker_entry_combined.js:23244:  } catch (e) {
+worker_entry_combined.js:23289:  } catch (e) {
+worker_entry_combined.js:23338:        .catch(() => ({ season: parseInt(season, 10), episodes: [] }))
+worker_entry_combined.js:23375:  } catch (e) {
+worker_entry_combined.js:23421:  } catch (e) {
+worker_entry_combined.js:23440:    } catch (e) {
+worker_entry_combined.js:23478:  } catch (e) {
+worker_entry_combined.js:23505:  } catch (e) {
+worker_entry_combined.js:23526:    } catch (err2) {
+worker_entry_combined.js:23570:          } catch (e) {}
+worker_entry_combined.js:23921:  } catch (_) {
+worker_entry_combined.js:24931:        "title": "The Hunger Games: Catching Fire",
+worker_entry_combined.js:27874:    "description": "A serial killer sabotages his own prisoner transport flight from New York to Miami, escapes, and goes on a killing spree -- pulling New York's Mac Taylor down to Miami, then Miami's Horatio Caine up to New York, to catch him.",
+worker_entry_combined.js:28198:  } catch (err) {
+worker_entry_combined.js:28292:      try { navigator.vibrate(30); } catch (err) {}
+worker_entry_combined.js:28645:      const data = await res.json().catch(() => null);
+worker_entry_combined.js:28652:      const data = await res.json().catch(() => null);
+worker_entry_combined.js:28658:  } catch (e) {
+worker_entry_combined.js:28792:        const res = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28793:        const data = res ? await res.json().catch(() => null) : null;
+worker_entry_combined.js:28800:        const searchRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.title) + '&type=movie', { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28802:          const sData = await searchRes.json().catch(() => null);
+worker_entry_combined.js:28836:        const sRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28837:        const sData = sRes ? await sRes.json().catch(() => null) : null;
+worker_entry_combined.js:28850:      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28852:        const siData = await seasonsInfoRes.json().catch(() => null);
+worker_entry_combined.js:28868:        const showDetailsRes = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(ep.showName) + '&type=tv', { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28870:          const sData = await showDetailsRes.json().catch(() => null);
+worker_entry_combined.js:28885:          .catch(() => ({ season: sNum, episodes: [] }))
+worker_entry_combined.js:28929:      const seasonsInfoRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(ep.tmdbId), { cache: 'no-store' }).catch(() => null);
+worker_entry_combined.js:28931:        const siData = await seasonsInfoRes.json().catch(() => null);
+worker_entry_combined.js:29065:  } catch (err) {
+worker_entry_combined.js:29118:  } catch (err) {
+worker_entry_combined.js:29132:  } catch (e) {}
+worker_entry_combined.js:29159:  } catch (e) {}
+worker_entry_combined.js:29281:        } catch (e) {}
+worker_entry_combined.js:29690:            .catch(() => ({ season: s.season, episodes: [] }))
+worker_entry_combined.js:29725:      } catch (e) {
+worker_entry_combined.js:29744:  } catch (e) {
+worker_entry_combined.js:29799:  } catch (e) {
+worker_entry_combined.js:29809:  } catch (e) {
+worker_entry_combined.js:30212:    }).catch(() => {});
+worker_entry_combined.js:30213:  } catch (e) {}
+worker_entry_combined.js:30222:  } catch (e) {
+worker_entry_combined.js:30299:  } catch (e) {
+worker_entry_combined.js:30408:      try { navigator.vibrate(30); } catch (err) {}
+worker_entry_combined.js:30674:      }).catch(() => {
+worker_entry_combined.js:30787:  } catch (e) {
+worker_entry_combined.js:30850:      } catch (e) {}
+worker_entry_combined.js:31086:  } catch (e) {}
+worker_entry_combined.js:31090:  } catch (e) {
+worker_entry_combined.js:31100:  } catch (e) {
+worker_entry_combined.js:31126:  try { cleanWatchedFromWatchlists(); } catch (e) {}
+worker_entry_combined.js:31177:    } catch (e) {
+worker_entry_combined.js:31217:    catch (e) { return true; }
+worker_entry_combined.js:31284:        } catch {
+worker_entry_combined.js:31298:        } catch {}
+worker_entry_combined.js:31354:        }).catch(() => {});
+worker_entry_combined.js:31369:    catch (e) { return true; }
+worker_entry_combined.js:31516:    if (d && d.id) updateContinueWatching(d.id).catch(() => {});
+worker_entry_combined.js:31611:  updateContinueWatchingForBatch(items).catch(() => {});
+worker_entry_combined.js:31692:        } catch (e) {
+worker_entry_combined.js:31819:    } catch (e) { return new Set(); }
+worker_entry_combined.js:32015:  } catch (e) {
+worker_entry_combined.js:32063:      } catch (e) {
+worker_entry_combined.js:32065:        // try/catch), but guard anyway so one unexpected error can't abort
+worker_entry_combined.js:32114:  } catch (e) {
+worker_entry_combined.js:32223:    refreshAiringNext(true).catch(() => {});
+worker_entry_combined.js:32312:      } catch (e) {
+worker_entry_combined.js:32360:setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
+worker_entry_combined.js:32512:  } catch (e) {
+worker_entry_combined.js:32537:  } catch (e) {
+worker_entry_combined.js:32573:  } catch (e) {
+worker_entry_combined.js:32605:  } catch (e) {
+worker_entry_combined.js:32658:  } catch (e) {
+worker_entry_combined.js:32669:  } catch (e) {
+worker_entry_combined.js:32783:    } catch (e) {
+worker_entry_combined.js:32909:    const data = await res.json().catch(() => null);
+worker_entry_combined.js:32918:  } catch (err) {
+worker_entry_combined.js:32951:    }).catch(() => {
+worker_entry_combined.js:32993:  } catch (e) {}
+worker_entry_combined.js:33007:  } catch (e) {}
+worker_entry_combined.js:33059:  } catch (e) {}
+worker_entry_combined.js:33160:  try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+worker_entry_combined.js:33171:  } catch (e) {}
+worker_entry_combined.js:33253:  try { localStorage.setItem('myListAddon:scrobbleFilterUsers', cb.checked ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:33273:  } catch (e) {}
+worker_entry_combined.js:33279:  try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', cb.checked ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:33322:  } catch (e) {}
+worker_entry_combined.js:33371:  } catch (err) {
+worker_entry_combined.js:33383:  }).catch(() => {
+worker_entry_combined.js:33389:  try { localStorage.setItem('myListAddon:syncMediaServerHistory', enabled ? 'true' : 'false'); } catch (e) {}
+worker_entry_combined.js:33394:  try { localStorage.setItem('myListAddon:forwardScrobbleToProviders', enabled ? 'true' : 'false'); } catch (e) {}
+worker_entry_combined.js:33399:  try { localStorage.setItem('myListAddon:trackPlayback', cb.checked ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:33438:  } catch (e) {
+worker_entry_combined.js:33449:  }).catch(() => {
+worker_entry_combined.js:33512:  } catch (e) {}
+worker_entry_combined.js:33624:  } catch (e) {
+worker_entry_combined.js:33683:  } catch (e) {
+worker_entry_combined.js:33712:  } catch (e) {
+worker_entry_combined.js:33806:  } catch (e) {
+worker_entry_combined.js:33857:          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch (e) { return []; }
+worker_entry_combined.js:33860:          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
+worker_entry_combined.js:33865:  } catch (e) {
+worker_entry_combined.js:33917:  } catch (e) {
+worker_entry_combined.js:33988:      try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(synced.hiddenLists)); } catch (e) {}
+worker_entry_combined.js:33991:      try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
+worker_entry_combined.js:34021:      }).catch(() => {});
+worker_entry_combined.js:34046:      try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34050:      try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', synced.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34054:      try { localStorage.setItem('myListAddon:scrobbleFilterUsers', synced.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34057:      try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', synced.scrobbleAllowedUsers); } catch (e) {}
+worker_entry_combined.js:34060:      try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', synced.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34068:      } catch (e) {
+worker_entry_combined.js:34259:      } catch (e) {}
+worker_entry_combined.js:34269:        try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34282:        try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
+worker_entry_combined.js:34301:          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:34389:        } catch (e) {}
+worker_entry_combined.js:34395:        } catch (e) {}
+worker_entry_combined.js:34400:        } catch (e) {}
+worker_entry_combined.js:34410:    try { if (typeof cleanWatchedFromWatchlists === 'function') cleanWatchedFromWatchlists(); } catch (e) {}
+worker_entry_combined.js:34413:  } catch (e) {
+worker_entry_combined.js:34507:  } catch (e) {
+worker_entry_combined.js:34539:    navigator.clipboard.writeText(text).then(() => alert('Copied.')).catch(() => prompt('Copy this key:', text));
+worker_entry_combined.js:34618:    }).catch(() => {
+worker_entry_combined.js:34669:  } catch (e) {
+worker_entry_combined.js:34760:          }).catch(() => {});
+worker_entry_combined.js:34767:      } catch (e) {}
+worker_entry_combined.js:34790:        } catch (e) {}
+worker_entry_combined.js:34892:          }).catch(() => {});
+worker_entry_combined.js:34919:      } catch (e) {}
+worker_entry_combined.js:34923:      } catch (e) {}
+worker_entry_combined.js:34950:  } catch (e) {
+worker_entry_combined.js:35223:    } catch (e) {}
+worker_entry_combined.js:35244:  } catch (e) {}
+worker_entry_combined.js:35419:      } catch (err) {
+worker_entry_combined.js:35515:          }).catch(() => {});
+worker_entry_combined.js:35729:  } catch (e) {}
+worker_entry_combined.js:35738:    } catch (e) {
+worker_entry_combined.js:35769:    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+worker_entry_combined.js:35888:        } catch(e) {}
+worker_entry_combined.js:35897:          } catch(e) {}
+worker_entry_combined.js:36060:        }).catch(() => {});
+worker_entry_combined.js:36081:  } catch (err) {
+worker_entry_combined.js:36169:      } catch (err) {
+worker_entry_combined.js:36240:        }).catch(() => {});
+worker_entry_combined.js:36349:        }).catch(() => {});
+worker_entry_combined.js:36373:      } catch (e) {}
+worker_entry_combined.js:36475:    } catch (e) {
+worker_entry_combined.js:36625:    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+worker_entry_combined.js:36840:  } catch (e) {
+worker_entry_combined.js:36993:  try { track = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+worker_entry_combined.js:37003:    try { tmdbKey = localStorage.getItem('myListAddon:tmdbKey') || ''; } catch (e) {}
+worker_entry_combined.js:37007:    try { tmdbSession = localStorage.getItem('myListAddon:tmdbSessionId') || ''; } catch (e) {}
+worker_entry_combined.js:37011:    try { tmdbAcc = localStorage.getItem('myListAddon:tmdbAccountId') || ''; } catch (e) {}
+worker_entry_combined.js:37015:    try { tmdbUser = localStorage.getItem('myListAddon:tmdbUsername') || ''; } catch (e) {}
+worker_entry_combined.js:37021:    try { mdblistKey = localStorage.getItem('myListAddon:mdblistKey') || ''; } catch (e) {}
+worker_entry_combined.js:37025:    try { mdblistToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:37029:    try { mdblistUser = localStorage.getItem('myListAddon:mdblistUsername') || ''; } catch (e) {}
+worker_entry_combined.js:37035:    try { traktKey = localStorage.getItem('myListAddon:traktKey') || ''; } catch (e) {}
+worker_entry_combined.js:37040:    try { traktUser = localStorage.getItem('myListAddon:traktUsername') || ''; } catch (e) {}
+worker_entry_combined.js:37044:    try { traktToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:37050:    try { simklKey = localStorage.getItem('myListAddon:simklKey') || ''; } catch (e) {}
+worker_entry_combined.js:37054:    try { simklToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:37058:    try { simklUser = localStorage.getItem('myListAddon:simklUsername') || ''; } catch (e) {}
+worker_entry_combined.js:37080:      try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
+worker_entry_combined.js:37114:  } catch (e) {
+worker_entry_combined.js:37138:  } catch (e) {}
+worker_entry_combined.js:37303:      } catch (e) {
+worker_entry_combined.js:37348:      .catch(() => {
+worker_entry_combined.js:37388:    } catch (e) {}
+worker_entry_combined.js:37569:    }).catch(() => {});
+worker_entry_combined.js:37842:    } catch (e) {}
+worker_entry_combined.js:37857:    } catch (e) {}
+worker_entry_combined.js:37891:          } catch (e) {}
+worker_entry_combined.js:37950:      } catch (e) {}
+worker_entry_combined.js:38018:          } catch (e) {}
+worker_entry_combined.js:38063:      } catch (e) {}
+worker_entry_combined.js:38107:        } catch (e) {}
+worker_entry_combined.js:38671:    } catch (e) {
+worker_entry_combined.js:38753:      dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
+worker_entry_combined.js:38754:      hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
+worker_entry_combined.js:38755:      hiddenMyListsSections: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch(e) { return []; } })(),
+worker_entry_combined.js:38756:      likedLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'); } catch(e) { return []; } })(),
+worker_entry_combined.js:38795:  } catch (e) {
+worker_entry_combined.js:38826:    try { localStorage.setItem('myListAddon:tmdbKey', tmdbKey); } catch (e) {}
+worker_entry_combined.js:38832:    try { localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionIdVal); } catch (e) {}
+worker_entry_combined.js:38837:    try { localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountIdVal); } catch (e) {}
+worker_entry_combined.js:38842:    try { localStorage.setItem('myListAddon:tmdbUsername', tmdbUsernameVal); } catch (e) {}
+worker_entry_combined.js:38850:    try { localStorage.setItem('myListAddon:mdblistKey', mdblistKey); } catch (e) {}
+worker_entry_combined.js:38856:    try { localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessTokenVal); } catch (e) {}
+worker_entry_combined.js:38863:    try { localStorage.setItem('myListAddon:mdblistUsername', mdblistUsernameVal); } catch (e) {}
+worker_entry_combined.js:38870:    try { localStorage.setItem('myListAddon:traktKey', traktKey); } catch (e) {}
+worker_entry_combined.js:38877:    try { localStorage.setItem('myListAddon:traktUsername', traktUsernameVal); } catch (e) {}
+worker_entry_combined.js:38883:    try { localStorage.setItem('myListAddon:traktAccessToken', traktAccessTokenVal); } catch (e) {}
+worker_entry_combined.js:38891:    try { localStorage.setItem('myListAddon:simklKey', simklKey); } catch (e) {}
+worker_entry_combined.js:38897:    try { localStorage.setItem('myListAddon:simklAccessToken', simklAccessTokenVal); } catch (e) {}
+worker_entry_combined.js:38903:    try { localStorage.setItem('myListAddon:simklUsername', simklUsernameVal); } catch (e) {}
+worker_entry_combined.js:38960:    try { localStorage.setItem('myListAddon:trackPlayback', s.trackPlayback ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:38963:    try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', s.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:38966:    try { localStorage.setItem('myListAddon:scrobbleFilterUsers', s.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:38969:    try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', s.scrobbleAllowedUsers); } catch (e) {}
+worker_entry_combined.js:38972:    try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', s.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:38977:    try { localStorage.setItem('myListAddon:hideNonDigitalReleases', s.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+worker_entry_combined.js:38982:    try { localStorage.setItem('myListAddon:region', s.region); } catch (e) {}
+worker_entry_combined.js:38985:    try { localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(s.dashboardListOrder)); } catch (e) {}
+worker_entry_combined.js:38988:    try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(s.hiddenLists)); } catch (e) {}
+worker_entry_combined.js:38991:    try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
+worker_entry_combined.js:38994:    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+worker_entry_combined.js:38998:    try { localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(s.fullyWatchedShowIds)); } catch (e) {}
+worker_entry_combined.js:39002:    try { localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(s.dismissedContinueWatching)); } catch (e) {}
+worker_entry_combined.js:39072:    } catch (e) {}
+worker_entry_combined.js:39087:  } catch (e) {}
+worker_entry_combined.js:39108:    } catch (e) {}
+worker_entry_combined.js:39231:  } catch (e) {
+worker_entry_combined.js:39339:  } catch (e) {
+worker_entry_combined.js:39400:    } catch (e) {}
+worker_entry_combined.js:39415:  } catch (e) {}
+worker_entry_combined.js:39428:  } catch (e) {}
+worker_entry_combined.js:39446:  } catch (e) {
+worker_entry_combined.js:39457:    } catch (err2) {
+worker_entry_combined.js:39492:    const data = await res.json().catch(() => null);
+worker_entry_combined.js:39498:  } catch (e) {
+worker_entry_combined.js:39534:        } catch (err) {}
+worker_entry_combined.js:39542:        } catch (err) {}
+worker_entry_combined.js:39703:        } catch (err) {}
+worker_entry_combined.js:39713:        } catch (err) {}
+worker_entry_combined.js:39933:  }).catch(() => {
+worker_entry_combined.js:39982:    } catch (e) {
+worker_entry_combined.js:40101:    } catch (e) {}
+worker_entry_combined.js:40259:  } catch (e) {
+worker_entry_combined.js:40303:  } catch (e) {
+worker_entry_combined.js:40324:  } catch (e) {
+worker_entry_combined.js:40345:  }).catch(() => {
+worker_entry_combined.js:40360:    navigator.clipboard.writeText(installUrl).catch(() => {});
+worker_entry_combined.js:40404:  } catch (e) {
+worker_entry_combined.js:40437:  }).catch(() => {});
+worker_entry_combined.js:40518:    try { return localStorage.getItem('myListAddon:region'); } catch (e) { return null; }
+worker_entry_combined.js:40529:    try { return localStorage.getItem('myListAddon:hideNonDigitalReleases'); } catch (e) { return null; }
+worker_entry_combined.js:40606:  try { window.mdblistAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:40614:    try { mdblistAccessToken = localStorage.getItem('myListAddon:mdblistAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:40620:  try { window.traktAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:40631:    try { traktAccessToken = localStorage.getItem('myListAddon:traktAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:40637:  try { window.simklAccessToken = ''; } catch (e) {}
+worker_entry_combined.js:40639:  try { window.simklUsername = ''; } catch (e) {}
+worker_entry_combined.js:40647:    try { simklAccessToken = localStorage.getItem('myListAddon:simklAccessToken') || ''; } catch (e) {}
+worker_entry_combined.js:40653:  try { window.tmdbSessionId = ''; } catch (e) {}
+worker_entry_combined.js:40655:  try { window.tmdbAccountId = ''; } catch (e) {}
+worker_entry_combined.js:40657:  try { window.tmdbUsername = ''; } catch (e) {}
+worker_entry_combined.js:42085:      } catch (e) {}
+worker_entry_combined.js:42102:        } catch (e) {
+worker_entry_combined.js:42133:          } catch (e) {
+worker_entry_combined.js:42239:        } catch {
+worker_entry_combined.js:42280:    // Catch-all for browser navigation on provider/custom list paths (e.g. /lists/mdblist/..., /lists/trakt/..., /lists/tmdb/..., /lists/simkl/..., /lists/custom/...)
+worker_entry_combined.js:42427:  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+worker_entry_combined.js:42472:      } catch (err) {
+worker_entry_combined.js:42489:          } catch {
+worker_entry_combined.js:42539:      } catch {
+worker_entry_combined.js:42573:        } catch {
+worker_entry_combined.js:42626:      } catch (err) {
+worker_entry_combined.js:42699:        } catch (err) {
+worker_entry_combined.js:42716:        } catch (err) {
+worker_entry_combined.js:42800:      } catch (err) {
+worker_entry_combined.js:42818:      } catch (err) {
+worker_entry_combined.js:42928:              } catch {
+worker_entry_combined.js:42972:                } catch {}
+worker_entry_combined.js:42990:      } catch (err) {
+worker_entry_combined.js:43010:        } catch {}
+worker_entry_combined.js:43038:        } catch {}
+worker_entry_combined.js:43051:        } catch {}
+worker_entry_combined.js:43072:        } catch {}
+worker_entry_combined.js:43090:        } catch {}
+worker_entry_combined.js:43135:      } catch (err) {
+worker_entry_combined.js:43166:      } catch (err) {
+worker_entry_combined.js:43199:      } catch (e) {}
+worker_entry_combined.js:43232:        } catch (e) {}
+worker_entry_combined.js:43282:            } catch (e) {}
+worker_entry_combined.js:43315:      } catch (err) {
+worker_entry_combined.js:43382:          } catch {
+worker_entry_combined.js:43415:        } catch (err) {
+worker_entry_combined.js:43439:          } catch {
+worker_entry_combined.js:43448:      } catch (err) {
+worker_entry_combined.js:43463:      } catch (err) {
+worker_entry_combined.js:43479:      } catch (err) {
+worker_entry_combined.js:43490:      } catch {
+worker_entry_combined.js:43529:          } catch {
+worker_entry_combined.js:43564:          } catch {
+worker_entry_combined.js:43607:        } catch {}
+worker_entry_combined.js:43647:        } catch {}
+worker_entry_combined.js:43764:      } catch (err) {
+worker_entry_combined.js:43783:      } catch (err) {
+worker_entry_combined.js:43842:      } catch (err) {
+worker_entry_combined.js:43915:            }).catch(() => null),
+worker_entry_combined.js:43919:            }).catch(() => null),
+worker_entry_combined.js:43923:            }).catch(() => null),
+worker_entry_combined.js:43932:            const wData = await wShowsRes.json().catch(() => []);
+worker_entry_combined.js:43936:            const wlData = await wlShowsRes.json().catch(() => []);
+worker_entry_combined.js:43962:        } catch {}
+worker_entry_combined.js:43998:      } catch (err) {
+worker_entry_combined.js:44039:      // comparison) instead of needing to catch a fleeting 302 in devtools.
+worker_entry_combined.js:44125:          } catch {}
+worker_entry_combined.js:44139:              } catch {
+worker_entry_combined.js:44143:          } catch {}
+worker_entry_combined.js:44163:        } catch {}
+worker_entry_combined.js:44171:      } catch {
+worker_entry_combined.js:44179:      try { body = await request.json(); } catch {}
+worker_entry_combined.js:44211:        const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:44217:      } catch (err) {
+worker_entry_combined.js:44225:      try { body = await request.json(); } catch {}
+worker_entry_combined.js:44268:        const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:44288:        } catch {}
+worker_entry_combined.js:44291:      } catch (err) {
+worker_entry_combined.js:44407:            } catch {
+worker_entry_combined.js:44410:          } catch {}
+worker_entry_combined.js:44428:          } catch {}
+worker_entry_combined.js:44437:      } catch (err) {
+worker_entry_combined.js:44518:            } catch {
+worker_entry_combined.js:44521:          } catch {}
+worker_entry_combined.js:44543:        } catch {}
+worker_entry_combined.js:44552:      } catch (err) {
+worker_entry_combined.js:44566:        } catch {}
+worker_entry_combined.js:44719:        } catch {}
+worker_entry_combined.js:44722:      } catch (err) {
+worker_entry_combined.js:44732:      } catch {
+worker_entry_combined.js:44777:        } catch {}
+worker_entry_combined.js:44787:        } catch {}
+worker_entry_combined.js:44843:          const tData = await tRes.json().catch(() => ({}));
+worker_entry_combined.js:44849:        } catch (err) {
+worker_entry_combined.js:44924:          const sData = await sRes.json().catch(() => ({}));
+worker_entry_combined.js:44930:        } catch (err) {
+worker_entry_combined.js:44960:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+worker_entry_combined.js:44966:          } catch (err) {
+worker_entry_combined.js:44983:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+worker_entry_combined.js:44989:          } catch (err) {
+worker_entry_combined.js:45006:            const tmdbData = await tmdbRes.json().catch(() => ({}));
+worker_entry_combined.js:45012:          } catch (err) {
+worker_entry_combined.js:45073:              mData = await mRes.json().catch(() => ({}));
+worker_entry_combined.js:45080:            } catch (err) {
+worker_entry_combined.js:45101:            const mData = await mRes.json().catch(() => ({}));
+worker_entry_combined.js:45109:              const fbData = await fbRes.json().catch(() => ({}));
+worker_entry_combined.js:45116:          } catch (err) {
+worker_entry_combined.js:45144:              mData = await mRes.json().catch(() => ({}));
+worker_entry_combined.js:45151:            } catch (err) {
+worker_entry_combined.js:45171:      } catch {
+worker_entry_combined.js:45219:          } catch {}
+worker_entry_combined.js:45303:          const tData = await tRes.json().catch(() => ({}));
+worker_entry_combined.js:45309:        } catch (err) {
+worker_entry_combined.js:45382:          const sData = await sRes.json().catch(() => ({}));
+worker_entry_combined.js:45388:        } catch (err) {
+worker_entry_combined.js:45443:          const mData = await mRes.json().catch(() => ({}));
+worker_entry_combined.js:45462:              } catch {}
+worker_entry_combined.js:45472:        } catch (err) {
+worker_entry_combined.js:45485:      } catch {
+worker_entry_combined.js:45526:          const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:45546:        } catch (err) {
+worker_entry_combined.js:45571:          const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:45588:        } catch (err) {
+worker_entry_combined.js:45615:          const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:45634:        } catch (err) {
+worker_entry_combined.js:45669:      } catch {
+worker_entry_combined.js:45697:            const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:45702:        } catch (err) {
+worker_entry_combined.js:45721:          const data = await res.json().catch(() => ({}));
+worker_entry_combined.js:45727:        } catch (err) {
+worker_entry_combined.js:45782:            } catch {}
+worker_entry_combined.js:45786:            const errData = await res.json().catch(() => ({}));
+worker_entry_combined.js:45793:        } catch (err) {
+worker_entry_combined.js:45825:      } catch (err) {
+worker_entry_combined.js:45884:      } catch (err) {
+worker_entry_combined.js:45901:        } catch {}
+worker_entry_combined.js:45935:        } catch {}
+worker_entry_combined.js:45971:              } catch {}
+worker_entry_combined.js:46103:      } catch (err) {
+worker_entry_combined.js:46121:      } catch {
+worker_entry_combined.js:46196:            } catch {}
+worker_entry_combined.js:46222:            } catch {}
+worker_entry_combined.js:46245:                }).catch(() => null),
+worker_entry_combined.js:46255:                }).catch(() => null),
+worker_entry_combined.js:46290:            } catch {}
+worker_entry_combined.js:46314:      } catch (err) {
+worker_entry_combined.js:46325:      } catch {
+worker_entry_combined.js:46365:      } catch (err) {
+worker_entry_combined.js:46377:      } catch {
+worker_entry_combined.js:46430:        } catch (e) {}
+worker_entry_combined.js:46455:      } catch (e) {
+worker_entry_combined.js:46472:        } catch {}
+worker_entry_combined.js:46500:          } catch {}
+worker_entry_combined.js:46530:            } catch {}
+worker_entry_combined.js:46533:        } catch {}
+worker_entry_combined.js:46550:      try { body = await request.json(); } catch { return json({ ok: true }); }
+worker_entry_combined.js:46566:      } catch {
+worker_entry_combined.js:46650:          } catch {}
+worker_entry_combined.js:46680:            }).catch(() => null),
+worker_entry_combined.js:46684:            }).catch(() => null),
+worker_entry_combined.js:46688:            }).catch(() => null),
+worker_entry_combined.js:46692:            }).catch(() => null),
+worker_entry_combined.js:46696:            }).catch(() => null),
+worker_entry_combined.js:46701:            const d = await showsRes.json().catch(() => []);
+worker_entry_combined.js:46707:            const d = await epsRes.json().catch(() => []);
+worker_entry_combined.js:46717:              const d = await r.json().catch(() => null);
+worker_entry_combined.js:46744:              const customWlRes = await fetch(`https://api.mdblist.com/lists/${encodeURIComponent(wlListObj.id)}/items${authQuery}`, { headers }).catch(() => null);
+worker_entry_combined.js:46746:                const customWlData = await customWlRes.json().catch(() => null);
+worker_entry_combined.js:46786:        } catch {}
+worker_entry_combined.js:46822:      } catch (err) {
+worker_entry_combined.js:46830:      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+worker_entry_combined.js:46853:          } catch {}
+worker_entry_combined.js:46881:              try { parsed = JSON.parse(text); } catch {}
+worker_entry_combined.js:46904:            } catch (e) {
+worker_entry_combined.js:46929:              try { parsed = JSON.parse(text); } catch {}
+worker_entry_combined.js:46952:            } catch (e) {
+worker_entry_combined.js:46960:      } catch (err) {
+worker_entry_combined.js:46992:            } catch {}
+worker_entry_combined.js:47009:      } catch (err) {
+worker_entry_combined.js:47027:      } catch {
+worker_entry_combined.js:47067:      try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+worker_entry_combined.js:47089:      try { likeBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
+worker_entry_combined.js:47106:        } catch (dbErr) {}
+worker_entry_combined.js:47116:      try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+worker_entry_combined.js:47127:      } catch {
+worker_entry_combined.js:47140:        } catch {
+worker_entry_combined.js:47158:        } catch {
+worker_entry_combined.js:47203:      } catch {
+worker_entry_combined.js:47271:      } catch {
+worker_entry_combined.js:47369:              const showDetails = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "series").catch(() => null);
+worker_entry_combined.js:47395:          const details = await fetchTmdbItemDetails(imdbId, effectiveTmdbKey, "movie").catch(() => null);
+worker_entry_combined.js:47438:              } catch {
+worker_entry_combined.js:47473:                  const next = await findNextAiredEpisodeForShow(imdbId, latest.seasonNum, latest.episodeNum, effectiveTmdbKey).catch(() => null);
+worker_entry_combined.js:47530:                try { queue = JSON.parse(queueRaw); } catch { queue = []; }
+worker_entry_combined.js:47544:            } catch {}
+worker_entry_combined.js:47576:        } catch {}
+worker_entry_combined.js:47577:      } catch (err) {
+worker_entry_combined.js:47615:        } catch {}
+worker_entry_combined.js:47640:        } catch {}
+worker_entry_combined.js:47644:        } catch {
+worker_entry_combined.js:47648:          } catch {}
+worker_entry_combined.js:47769:          } catch {}
+worker_entry_combined.js:47811:        } catch {}
+worker_entry_combined.js:47856:        } catch {}
+worker_entry_combined.js:47889:        } catch {}
+worker_entry_combined.js:47901:          try { blob = JSON.parse(raw); } catch {}
+worker_entry_combined.js:47931:            const seasonData = await fetchTmdbSeasonDetails(lookupShowId, seasonNum, effectiveTmdbKey, tmdbId).catch(() => null);
+worker_entry_combined.js:47937:            const showDetails = await fetchTmdbItemDetails(lookupShowId, effectiveTmdbKey, "series").catch(() => null);
+worker_entry_combined.js:47975:            const next = await findNextAiredEpisodeForShow(resolvedShowId, seasonNum, episodeNum, effectiveTmdbKey).catch(() => null);
+worker_entry_combined.js:48000:            const details = await fetchTmdbItemDetails(lookupMovieId, effectiveTmdbKey, "movie").catch(() => null);
+worker_entry_combined.js:48036:      } catch (err) {
+worker_entry_combined.js:48072:      } catch {
+worker_entry_combined.js:48082:        } catch {
+worker_entry_combined.js:48099:      } catch {
+worker_entry_combined.js:48107:        try { users = JSON.parse(raw); } catch {}
+worker_entry_combined.js:48119:        } catch {}
+worker_entry_combined.js:48139:      } catch {
+worker_entry_combined.js:48175:        } catch (dbErr) {
+worker_entry_combined.js:48190:      } catch (err) {}
+worker_entry_combined.js:48216:      } catch {
+worker_entry_combined.js:48241:      } catch {
+worker_entry_combined.js:48258:        } catch (dbErr) {
+worker_entry_combined.js:48291:      } catch {
+worker_entry_combined.js:48301:      } catch {
+worker_entry_combined.js:48314:        } catch (dbErr) {
+worker_entry_combined.js:48344:      } catch {
+worker_entry_combined.js:48360:      } catch {
+worker_entry_combined.js:48369:      } catch {
+worker_entry_combined.js:48389:            } catch {
+worker_entry_combined.js:48412:          } catch {}
+worker_entry_combined.js:48430:            } catch {}
+worker_entry_combined.js:48446:      } catch {
+worker_entry_combined.js:48463:      } catch {
+worker_entry_combined.js:48496:        } catch {
+worker_entry_combined.js:48509:        } catch (dbErr) {
+worker_entry_combined.js:48532:      } catch {
+worker_entry_combined.js:48544:        } catch (dbErr) {
+worker_entry_combined.js:48556:      } catch {
+worker_entry_combined.js:48569:      } catch {
+worker_entry_combined.js:48586:      } catch {
+worker_entry_combined.js:48597:      } catch {}
+worker_entry_combined.js:48605:      } catch {}
+worker_entry_combined.js:48631:      } catch {
+worker_entry_combined.js:48671:          } catch {
+worker_entry_combined.js:48697:      } catch (e) {
+worker_entry_combined.js:48731:      } catch {
+worker_entry_combined.js:48813:        } catch {
+worker_entry_combined.js:48820:        // independently from the large tracking blob. This catches the case
+worker_entry_combined.js:48838:        } catch {
+worker_entry_combined.js:48877:            } catch {}
+worker_entry_combined.js:48901:            } catch (dbErr) {
+worker_entry_combined.js:48912:          try { order = orderRaw ? JSON.parse(orderRaw).order || [] : []; } catch {}
+worker_entry_combined.js:48918:      } catch (e) {
+worker_entry_combined.js:48947:      } catch {
+worker_entry_combined.js:48963:      } catch (e) {
+worker_entry_combined.js:48974:      } catch {
+worker_entry_combined.js:48990:      } catch (e) {
+worker_entry_combined.js:49007:      } catch {
+worker_entry_combined.js:49018:        } catch {
+worker_entry_combined.js:49031:        } catch {
+worker_entry_combined.js:49080:        } catch {}
+worker_entry_combined.js:49095:        } catch {
+worker_entry_combined.js:49117:        } catch {
+worker_entry_combined.js:49155:      } catch {}
+worker_entry_combined.js:49164:        } catch {}
+worker_entry_combined.js:49187:      } catch {
+worker_entry_combined.js:49200:        } catch {
+worker_entry_combined.js:49266:            } catch {
+worker_entry_combined.js:49290:              } catch {
+worker_entry_combined.js:49302:            } catch {
+worker_entry_combined.js:49325:      } catch (err) {
+worker_entry_combined.js:49453:      } catch {}
+worker_entry_combined.js:49477:          } catch {}
+worker_entry_combined.js:49501:          } catch {}
+worker_entry_combined.js:49513:        } catch {
+worker_entry_combined.js:49713:      } catch (e) {
+worker_entry_combined.js:49745:      } catch (e) {
+worker_entry_combined.js:49773:          } catch (e) {
+worker_entry_combined.js:49794:            } catch (e) {
+worker_entry_combined.js:49813:          } catch (e) {
+worker_entry_combined.js:49850:      } catch {
+worker_entry_combined.js:49897:          } catch {
+worker_entry_combined.js:49965:          } catch {
+worker_entry_combined.js:49982:      } catch {
+worker_entry_combined.js:49996:      } catch {
+worker_entry_combined.js:50030:      } catch (e) {
+worker_entry_combined.js:50048:      } catch {
+worker_entry_combined.js:50059:      } catch {
+worker_entry_combined.js:50065:      } catch (e) {
+worker_entry_combined.js:50080:      } catch {
+worker_entry_combined.js:50091:      } catch {
+worker_entry_combined.js:50118:      } catch (e) {
+worker_entry_combined.js:50132:      } catch {
+worker_entry_combined.js:50141:      } catch (e) {
+worker_entry_combined.js:50258:      } catch (err) {
+worker_entry_combined.js:50308:      } catch (err) {
+worker_entry_combined.js:50324:      } catch {
+worker_entry_combined.js:50426:      } catch (e) {
