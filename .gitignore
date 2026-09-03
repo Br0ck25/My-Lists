@@ -1,0 +1,6 @@
+node_modules/
+package.json
+package-lock.json
+.wrangler/
+wrangler.local.toml
+wrangler.d1test.toml

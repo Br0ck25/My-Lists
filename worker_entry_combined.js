@@ -39,8 +39,13 @@
  *                                        builder page can offer them as one-click adds
  *  - GET /icon.png                    -> add-on icon, served from this Worker
  *
- * Deploy with `wrangler deploy` or paste directly into the Cloudflare dashboard.
- * No environment variables or bindings required.
+ * Deploy with `wrangler deploy`.
+ *
+ * REQUIRES a CONFIGS KV namespace binding and (for /admin) an ADMIN_KEY
+ * secret; a cron trigger drives Continue Watching. See wrangler.toml for
+ * the full list of bindings, secrets, and the cron schedule. Without the
+ * KV binding every stateful feature silently degrades to a no-op rather
+ * than failing loudly.
  */
 
 const ADDON_ID = "app.my-list";
@@ -2443,6 +2448,325 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 }
 
 
+// --- Like voter ledger -------------------------------------------------------
+//
+// Likes used to be a bare read-modify-write counter on an unauthenticated
+// endpoint: every POST did `likes = likes + 1` with nothing recording WHO
+// voted. A trivial curl loop took a list from 0 to 11 in one second, and
+// `action:"unlike"` decremented just as freely, so a competing list could
+// be driven to zero as easily as your own could be inflated. Since the
+// community directory sorts and surfaces by likes, that made the ranking
+// meaningless.
+//
+// Instead of a counter, each likeable thing now keeps a small ledger of
+// distinct voter ids. Liking is idempotent set-insertion and unliking is
+// set-removal, so replaying the same request any number of times converges
+// on the same state rather than accumulating. The displayed count is
+// derived from the ledger size, never incremented directly.
+//
+// Voter identity, best available:
+//   * signed-in creator  -> "u:<username>"  (stable across devices)
+//   * anonymous          -> "a:<hash of IP + list id>"
+// The anonymous id is salted with the list id specifically so the same
+// ledger cannot be used to correlate one IP's activity across lists.
+//
+// This is deliberately NOT full authentication -- likes stay available to
+// signed-out visitors, which is the existing product behaviour. It raises
+// ballot-stuffing from "one curl loop" to "one vote per IP per list",
+// which is the appropriate bar for a non-critical popularity signal.
+const LIKE_VOTER_CAP = 5000;
+
+async function likeVoterId(request, env, creatorUsername, scopeId) {
+  if (creatorUsername) return `u:${creatorUsername}`;
+  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const hash = await hashStringForKey(`${ip}|${scopeId}`);
+  return `a:${hash}`;
+}
+
+// Applies one vote to a ledger key and returns the resulting count.
+// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
+// be a new voter -- the caller keeps the existing count rather than
+// silently discarding the vote or growing the key without bound.
+async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  let voters = [];
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) voters = parsed;
+      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+    }
+  } catch {
+    voters = [];
+  }
+  const set = new Set(voters);
+  const had = set.has(voterId);
+  if (liked) {
+    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+    set.add(voterId);
+  } else {
+    set.delete(voterId);
+  }
+  // No write at all when nothing changed -- KV allows one write per second
+  // per key, and a double-tap on a busy list should not burn that budget
+  // or race with a genuine vote.
+  if (set.size !== voters.length || had !== set.has(voterId)) {
+    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+  }
+  return { count: set.size, capped: false };
+}
+
+// --- External list URL validation --------------------------------------------
+//
+// /api/lists/like-external hashes a caller-supplied URL into a KV key. With
+// no validation that was an unbounded, attacker-controlled key-space write
+// primitive: any string at all minted a brand-new permanent KV key, which
+// is a storage and billing denial-of-service and pollutes the external
+// likes dataset with garbage nobody can ever clean up.
+//
+// Only list URLs from the providers this add-on actually integrates with
+// are likeable, which is the only thing the feature was ever for.
+const EXTERNAL_LIKE_HOSTS = new Set([
+  "mdblist.com", "www.mdblist.com",
+  "trakt.tv", "www.trakt.tv",
+  "themoviedb.org", "www.themoviedb.org",
+  "simkl.com", "www.simkl.com",
+  "letterboxd.com", "www.letterboxd.com",
+]);
+
+function normalizeExternalListUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s || s.length > 300) return null;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  // Blocks javascript:, data:, file:, and anything else non-web outright.
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  const host = u.hostname.toLowerCase();
+  if (!EXTERNAL_LIKE_HOSTS.has(host)) return null;
+  // Normalized so the same list liked via http/https, with or without a
+  // "www." prefix, with a trailing slash, or with tracking query params
+  // all land on ONE ledger instead of fragmenting the count across
+  // near-duplicate keys. The "www." strip matters most: trakt.tv and
+  // www.trakt.tv are the same list to a human, and were otherwise counted
+  // separately.
+  const bareHost = host.replace(/^www\./, "");
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  return `https://${bareHost}${path}`;
+}
+
+// ---------------------------------------------------------------------------
+// Public list directory index
+// ---------------------------------------------------------------------------
+// The directory and search used to do list({prefix:"creatorlist:", limit:150})
+// with no cursor and then slice(0,100). KV returns keys in lexicographic
+// order, so past ~150 lists only usernames sorting earliest were ever visible
+// -- everyone else silently vanished from the directory with no error.
+//
+// Paginating that properly is worse, not better: it means reading EVERY list
+// on every directory load (10k lists = 10k KV reads per page view, well past
+// the 1,000 subrequest/invocation cap). So the directory reads a single
+// maintained index blob instead, updated on publish/unpublish. Directory cost
+// is now ONE KV read regardless of how many lists exist.
+//
+// The index stores the display fields the directory needs (name, creator,
+// counts, likes) so no per-list get is required. It is a derived cache: if it
+// is missing or stale, rebuildPublicListIndex() regenerates it from the
+// authoritative creatorlist:/publishedlist: keys. Never treat it as the
+// source of truth.
+const PUBLIC_INDEX_KEY = "index:publiclists";
+// 25 MiB is the KV value ceiling. At ~200 bytes/entry, 20k entries is ~4 MB --
+// comfortably inside it while still bounding worst-case memory and response
+// size. Beyond this the tail is dropped (least-liked first).
+const PUBLIC_INDEX_MAX = 20000;
+
+async function readPublicListIndex(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Sorted by likes so that if anything downstream truncates, it drops the
+// least popular rather than an arbitrary lexicographic slice.
+function sortPublicIndexEntries(entries) {
+  return entries.sort(
+    (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
+  );
+}
+
+async function writePublicListIndex(env, entries) {
+  const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_KEY,
+    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  );
+  return trimmed;
+}
+
+// Incremental update for one list. `entry` null => remove (unpublished,
+// deleted, or made private).
+//
+// This is a read-modify-write on a single key, so concurrent publishes can
+// lose an update. That is acceptable here in a way it was NOT for like counts:
+// the index is a rebuildable cache, a lost entry costs one list's directory
+// visibility until its next save or the next rebuild, and publishes are rare
+// and self-correcting. Like counts had no such backstop.
+async function updatePublicListIndex(env, id, entry) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    // No index yet: don't build one from a single entry, or the directory
+    // would show exactly one list. Leave it absent so the read path falls
+    // back to a scan and rebuilds the whole thing.
+    if (!idx) return;
+    const prev = idx.entries.find((e) => e && e.id === id);
+    const entries = idx.entries.filter((e) => e && e.id !== id);
+    // Merge onto the previous entry rather than replacing it: callers that
+    // only know part of the record (the like route has no displayName, for
+    // instance) must not blank out fields they never loaded.
+    if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    await writePublicListIndex(env, entries);
+  } catch (err) {
+    // Non-fatal: the list itself is already saved. Worst case the directory
+    // is stale until the next rebuild.
+    console.error("public list index update failed:", err);
+  }
+}
+
+// Full scan -> index. Expensive (one KV get per list), so it runs only when
+// the index is missing, and only one caller at a time via a short lock.
+async function rebuildPublicListIndex(env) {
+  const entries = [];
+  const seen = new Set();
+
+  // Search matches against the creator's display name too, so the index has
+  // to carry it. Cached per username: creators are far fewer than lists, and
+  // without this the rebuild would do a second get for every list.
+  const displayNameCache = new Map();
+  async function resolveDisplayName(username) {
+    if (displayNameCache.has(username)) return displayNameCache.get(username);
+    let name = username;
+    try {
+      const profileRaw = await getCreator(env, username);
+      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+    } catch {
+      // fall back to the raw username slug
+    }
+    displayNameCache.set(username, name);
+    return name;
+  }
+
+  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+  for (const k of creatorKeys.keys) {
+    const rest = k.name.slice("creatorlist:".length);
+    const sep = rest.indexOf(":");
+    if (sep === -1) continue;
+    const username = rest.slice(0, sep);
+    const slug = rest.slice(sep + 1);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `c:${username}:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: true,
+        username,
+        creatorName: await resolveDisplayName(username),
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+  for (const k of anonKeys.keys) {
+    const slug = k.name.slice("publishedlist:user:".length);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `a:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: false,
+        username: "user",
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  return await writePublicListIndex(env, entries);
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+
+  // Rebuilding is a full scan; a burst of traffic against a cold index must
+  // not start one per request. First caller takes a 60s lock and rebuilds,
+  // the rest fall through to the bounded legacy scan for this one request.
+  let gotLock = false;
+  try {
+    const lock = await env.CONFIGS.get("lock:publiclistindex");
+    if (!lock) {
+      await env.CONFIGS.put("lock:publiclistindex", "1", { expirationTtl: 60 });
+      gotLock = true;
+    }
+  } catch {
+    // If the lock read fails, fall through to the scan rather than risking
+    // a rebuild stampede.
+  }
+  if (!gotLock) return null;
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    // Rebuild in the background; serve this request from the legacy scan.
+    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
+      console.error("public list index rebuild failed:", err);
+    }));
+    return null;
+  }
+  try {
+    return await rebuildPublicListIndex(env);
+  } catch (err) {
+    console.error("public list index rebuild failed:", err);
+    return null;
+  }
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;
@@ -2461,25 +2785,166 @@ async function listAllKeys(namespace, prefix) {
   return { keys, list_complete: true };
 }
 
+// --- Account data purge (shared by reset and delete) -------------------------
+//
+// /api/creator/account/reset and /api/creator/delete-account are the same
+// sweep apart from one thing: whether the identity itself (`creator:{u}`
+// plus the D1 `creators` row) goes too. They used to be written out
+// separately, and drifted -- delete-account was still naming
+// `creatorprofile:`/`creatorpresets:`/`creatorchannels:`, key names this
+// codebase has not written in a long time, while missing every key it
+// actually does write (`creatorsync:`, `creatorsynctracking:`,
+// `creatorsyncpresets:`, `creatorsyncchannels:`, ...). The result was a
+// "delete my account" that returned ok:true while leaving the account
+// fully intact and still able to authenticate. One function so that
+// cannot happen again: anything added to the account's key set gets
+// cleaned up by both callers automatically.
+async function purgeCreatorData(env, username, options = {}) {
+  const deleteIdentity = options.deleteIdentity === true;
+  const u = username;
+  let listsCleared = 0;
+  const purgedListIds = [];
+  let keysCleared = 0;
+
+  // Custom lists are one key each and list() pages -- keep going until the
+  // cursor is exhausted rather than assuming a single page covers an
+  // account that may have hundreds.
+  try {
+    let cursor;
+    for (let page = 0; page < 50; page++) {
+      const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+      for (const k of res.keys) {
+        await env.CONFIGS.delete(k.name);
+        // Drop it from the directory index too, or a deleted account's
+        // lists keep appearing publicly until the next full rebuild.
+        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
+        listsCleared++;
+      }
+      if (res.list_complete || !res.cursor) break;
+      cursor = res.cursor;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: list enumeration failed", e);
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+    } catch (dbErr) {
+      console.error("D1 write error (purgeCreatorData lists):", dbErr);
+    }
+  }
+
+  // One index write for the whole account rather than one per list --
+  // deleting an account with 200 lists should not be 200 read-modify-writes
+  // against the same key (KV allows 1 write/sec/key).
+  if (purgedListIds.length) {
+    try {
+      const idx = await readPublicListIndex(env);
+      if (idx) {
+        const gone = new Set(purgedListIds);
+        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+      }
+    } catch (e) {
+      console.error("purgeCreatorData: index cleanup failed", e);
+    }
+  }
+
+  // Everything else the account owns, under the key names actually in use
+  // today, plus the legacy ones (harmless if absent) so an old account
+  // still gets fully cleaned.
+  const dataKeys = [
+    `creatorsync:${u}`,
+    `creatorsynctracking:${u}`,
+    `creatorsyncpresets:${u}`,
+    `creatorsyncchannels:${u}`,
+    `creatorlistorder:${u}`,
+    `creatorscrobblequeue:${u}`,
+    `creatorlistlikes:${u}`,
+    `creatorlikes:${u}`,
+    `creatorshare:${u}`,
+    // legacy names, harmless if absent
+    `creatortrack:${u}`,
+    `creatorpresets:${u}`,
+    `creatorchannels:${u}`,
+    `creatorprofile:${u}`,
+  ];
+  for (const key of dataKeys) {
+    try {
+      await env.CONFIGS.delete(key);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete", key, e);
+    }
+  }
+
+  if (deleteIdentity) {
+    // Last, and only for delete-account: the identity itself. Done after
+    // the data sweep so that a failure partway through leaves an account
+    // that can still sign in and retry, rather than orphaned data with no
+    // owner and a username nobody can ever reclaim.
+    try {
+      await env.CONFIGS.delete(`creator:${u}`);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete identity", e);
+    }
+    try {
+      await env.CONFIGS.delete(`creatorlastseen:${u}`);
+      keysCleared++;
+    } catch (e) {}
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
+      } catch (dbErr) {
+        console.error("D1 write error (purgeCreatorData identity):", dbErr);
+      }
+    }
+  }
+
+  // Any verification memoized in a warm isolate must stop being honoured
+  // the instant the account it refers to is reset or removed.
+  try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+  return { listsCleared, keysCleared };
+}
+
+// D1 is an optional accelerator in front of KV, never a replacement for it
+// -- KV remains the store every account is guaranteed to exist in (see the
+// unconditional KV writes in the create/rotate paths).
+//
+// This used to `return null` when D1 was bound and the row was absent,
+// instead of falling through to KV. That is only correct if every account
+// is guaranteed present in D1, which is exactly what is NOT true: D1 is
+// populated lazily by /admin/api/migrate-d1, so every account created
+// before that endpoint was first run has no D1 row. Binding DB therefore
+// locked all of those users out of their own accounts completely -- the
+// key was fine, the data was fine, the lookup just said "no such creator"
+// and every endpoint returned the generic "Username or Key is incorrect."
+// A missing row means "not migrated yet", not "does not exist".
 async function getCreator(env, username) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreator), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creator:${username}`);
 }
 
+// Same lazy-migration hazard as getCreator above: a list absent from D1
+// must fall through to KV rather than being reported as nonexistent.
 async function getCreatorList(env, username, slug) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ 
           slug: row.id.split(':')[1] || slug, 
@@ -2492,8 +2957,10 @@ async function getCreatorList(env, username, slug) {
           likes: row.likes || 0
         });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
 }
@@ -21793,7 +22260,17 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: parts[0], slug: parts[1], action: wasLiked ? 'unlike' : 'like' }),
+        // Creator credentials ride along when signed in so the vote is
+        // recorded against the account (one like per account across every
+        // device) rather than against this browser's IP. Optional --
+        // signed-out liking still works, it just votes per-IP.
+        body: JSON.stringify({
+          username: parts[0],
+          slug: parts[1],
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -21852,7 +22329,12 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like-external', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: listUrl, action: wasLiked ? 'unlike' : 'like' }),
+        body: JSON.stringify({
+          url: listUrl,
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -45075,6 +45557,39 @@ async function handleFetch(request, env, ctx) {
       if (!env || !env.CONFIGS) {
         return json({ ok: true, lists: [] }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
       }
+      // Preferred path: one KV read of the maintained index, no per-list
+      // gets, no truncation at 150 keys. Falls back to the legacy bounded
+      // scan below only while the index is being built for the first time.
+      const indexEntries = await getPublicListIndex(env, ctx);
+      if (indexEntries) {
+        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        // Default page stays 100 to match the previous response size;
+        // callers can page through the rest instead of silently losing it.
+        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+        const page = indexEntries.slice(offset, offset + pageSize);
+        const lists = page.map((e) => {
+          const cleanSlug = e.slug || slugifyServer(e.name) || "list";
+          const username = e.isCreator ? e.username : "user";
+          return {
+            name: e.name,
+            slug: cleanSlug,
+            creator: e.isCreator ? e.username : "Anonymous",
+            type: e.type || "mixed",
+            itemCount: e.itemCount || 0,
+            likes: e.likes || 0,
+            updatedAt: e.updatedAt || null,
+            url: `${url.origin}/lists/${username}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+          };
+        });
+        return json(
+          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          200,
+          { "Cache-Control": "public, max-age=120", ...corsHeaders() }
+        );
+      }
+
       const fetchLimit = 150;
       const [pubRes, creatorRes] = await Promise.all([
         env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
@@ -49460,17 +49975,45 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
       let threadIds = [];
       let creatorName = null;
+      let creatorKey = null;
       if (request.method === "POST") {
         try {
           const body = await request.json();
           if (Array.isArray(body.threadIds)) threadIds = body.threadIds.map((t) => String(t).trim()).filter(Boolean);
           if (body.creatorName) creatorName = String(body.creatorName).trim().toLowerCase();
+          if (body.creatorKey) creatorKey = String(body.creatorKey);
         } catch {}
       } else {
         const pIds = url.searchParams.get("threadIds");
         if (pIds) threadIds = pIds.split(",").map((s) => s.trim()).filter(Boolean);
         const pCreator = url.searchParams.get("creatorName");
         if (pCreator) creatorName = pCreator.trim().toLowerCase();
+        const pKey = url.searchParams.get("creatorKey");
+        if (pKey) creatorKey = pKey;
+      }
+
+      // Looking a creator up BY NAME returns their whole support history --
+      // free-text messages plus the optional `contact` field the feedback
+      // form explicitly asks for. That used to require nothing but the
+      // username, which /lists/public.json publishes for everyone who has
+      // ever shared a list, so anyone could harvest every user's
+      // correspondence and contact details by iterating the directory.
+      //
+      // The name-based scan below now requires the account's own key. The
+      // threadIds path is deliberately left unauthenticated: a thread id
+      // is a capability (it is only ever shown to the person who filed the
+      // report), and anonymous users with no account at all rely on it to
+      // follow up on what they submitted.
+      // authenticateCreator is declared further down in
+      // 26_api-creator-and-admin-routes.js, which is the same function
+      // body as this file after the build concatenates them -- a hoisted
+      // function declaration, so it is in scope here.
+      if (creatorName) {
+        const auth = await authenticateCreator(creatorName, creatorKey);
+        if (!auth.ok) {
+          return json({ ok: false, error: "Username or Key is incorrect." }, 401, { "Cache-Control": "no-store" });
+        }
+        creatorName = auth.username;
       }
 
       const threadsMap = new Map();
@@ -50075,7 +50618,21 @@ self.addEventListener('fetch', e => {
         plKey = "publishedlist:user:" + listSlug;
       }
       const plVisibility = plBody.visibility === "private" ? "private" : "public";
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: Date.now() }));
+      const plNow = Date.now();
+      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      // Anonymous publishes belong in the directory index too.
+      if (plVisibility !== "private") {
+        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
+          isCreator: false,
+          username: "user",
+          slug: listSlug,
+          name: plBody.name || baseSlug,
+          type: plType,
+          itemCount: plItems.length,
+          likes: 0,
+          updatedAt: plNow,
+        }));
+      }
       return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
     }
 
@@ -50087,21 +50644,10 @@ self.addEventListener('fetch', e => {
       const likeSlug = String(likeBody.slug || "").toLowerCase().trim();
       const likeUnlike = likeBody.action === "unlike";
       if (!likeUser || !likeSlug) return json({ ok: false, error: "Missing list reference." }, 400);
-      
-      if (env.DB) {
-        try {
-          const listId = `${likeUser}:${likeSlug}`;
-          const increment = likeUnlike ? -1 : 1;
-          const { success, results } = await env.DB.prepare(
-            "UPDATE creator_lists SET likes = MAX(0, likes + ?) WHERE id = ? RETURNING likes"
-          ).bind(increment, listId).run();
-          
-          if (success && results.length > 0) {
-            return json({ ok: true, likes: results[0].likes });
-          }
-        } catch (dbErr) {}
-      }
 
+      // The list must actually exist before any vote is recorded --
+      // otherwise a ledger (and a permanent KV key) could be created for
+      // any username/slug pair someone cared to invent.
       const likeCreatorKey = "creatorlist:" + likeUser + ":" + likeSlug;
       const likeAnonKey = "publishedlist:" + likeUser + ":" + likeSlug;
       let likeKey = null;
@@ -50110,9 +50656,62 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
-      likeData.likes = Math.max(0, (likeData.likes || 0) + (likeUnlike ? -1 : 1));
-      await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
-      return json({ ok: true, likes: likeData.likes });
+
+      // Signed-in visitors vote as themselves; everyone else votes as a
+      // per-list hash of their IP. Either way one identity is worth exactly
+      // one like, no matter how many times it POSTs. A creatorKey is
+      // verified when supplied, but is NOT required -- signed-out liking
+      // is existing behaviour and stays working.
+      let likeVoterName = "";
+      if (likeBody.creatorName && likeBody.creatorKey) {
+        const likeAuth = await authenticateCreator(likeBody.creatorName, likeBody.creatorKey);
+        if (likeAuth.ok) likeVoterName = likeAuth.username;
+      }
+      const listScopeId = `${likeUser}:${likeSlug}`;
+      const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      const ledgerKey = `listlikevoters:${listScopeId}`;
+      const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
+
+      // The count lives on the list record too, because the directory,
+      // search, and the admin dashboard all read it from there and none of
+      // them should have to open a ledger per list. Derived from the
+      // ledger, never incremented, so it cannot drift upward on its own.
+      if ((likeData.likes || 0) !== count) {
+        likeData.likes = count;
+        await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
+        // The directory ranks by likes, so the index has to see this or the
+        // ordering freezes at whatever it was when the index was built.
+        // Only on an actual change -- a repeated like writes nothing.
+        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+        // `c:<user>:<slug>` -- using the wrong prefix here would append a
+        // duplicate entry instead of updating the existing one.
+        const likeIsCreator = likeKey === likeCreatorKey;
+        if (likeData.visibility !== "private") {
+          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+            isCreator: likeIsCreator,
+            username: likeIsCreator ? likeUser : "user",
+            slug: likeSlug,
+            name: likeData.name || "List",
+            type: likeData.type || "mixed",
+            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
+            likes: count,
+            updatedAt: likeData.updatedAt || likeData.createdAt || null,
+          }));
+        }
+      }
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
+        } catch (dbErr) {
+          // Non-fatal: KV above holds the authoritative count, so a like is
+          // never lost by D1 being unavailable. Requires the `likes` column
+          // from migrations/0001; without it this throws on every like.
+          console.error("D1 write error (list likes):", dbErr);
+        }
+      }
+
+      return json({ ok: true, likes: count, liked: !likeUnlike, capped: capped || undefined });
     }
 
     if (path === "/api/lists/like-external" && request.method === "POST") {
@@ -50125,23 +50724,44 @@ self.addEventListener('fetch', e => {
       }
       const rawUrl = String(body.url || "").trim();
       if (!rawUrl) return json({ ok: false, error: "Missing list URL." }, 400);
+      // Validated and normalized before it is allowed anywhere near a KV
+      // key -- see normalizeExternalListUrl. Rejects non-http(s) schemes,
+      // over-long strings, and any host that isn't a provider this add-on
+      // integrates with, which is what stops this endpoint being an
+      // unbounded attacker-controlled keyspace.
+      const normalizedUrl = normalizeExternalListUrl(rawUrl);
+      if (!normalizedUrl) {
+        return json({ ok: false, error: "That URL can't be liked -- only MDBList, Trakt, TMDB, Simkl, and Letterboxd list links are supported." }, 400);
+      }
       const unlike = body.action === "unlike";
-      const hash = await hashStringForKey(rawUrl.toLowerCase());
+
+      let extVoterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const extAuth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (extAuth.ok) extVoterName = extAuth.username;
+      }
+
+      const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
+      const voterId = await likeVoterId(request, env, extVoterName, hash);
+      const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
+
       const raw = await env.CONFIGS.get(key);
-      let data = { url: rawUrl, likes: 0 };
+      let data = { url: normalizedUrl, likes: 0 };
       if (raw) {
         try {
           data = JSON.parse(raw);
         } catch {
-          data = { url: rawUrl, likes: 0 };
+          data = { url: normalizedUrl, likes: 0 };
         }
       }
-      data.likes = Math.max(0, (data.likes || 0) + (unlike ? -1 : 1));
-      data.url = rawUrl;
-      data.updatedAt = Date.now();
-      await env.CONFIGS.put(key, JSON.stringify(data));
-      return json({ ok: true, likes: data.likes });
+      if (data.likes !== count || data.url !== normalizedUrl) {
+        data.likes = count;
+        data.url = normalizedUrl;
+        data.updatedAt = Date.now();
+        await env.CONFIGS.put(key, JSON.stringify(data));
+      }
+      return json({ ok: true, likes: count, liked: !unlike, capped: capped || undefined });
     }
 
 
@@ -51235,7 +51855,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const raw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
       let status = { lastPingAt: null, lastPingId: null, lastServer: null, lastUser: null, matched: null };
       if (raw) {
@@ -51262,7 +51882,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const raw = await env.CONFIGS.get(`scrobbleseenusers:${auth.username}`);
       let users = {};
       if (raw) {
@@ -51328,21 +51948,31 @@ self.addEventListener('fetch', e => {
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
       
-      let wroteToKV = false;
+      // KV is written ALWAYS, D1 only additionally. This used to write to
+      // D1 *instead of* KV whenever DB was bound, which made the single
+      // D1 row the only copy of the account in existence -- if that row
+      // was ever lost, or the D1 binding was removed, or a query failed
+      // after creation, the account was unrecoverable: the key hash lived
+      // nowhere else. It also meant KV and D1 disagreed about which
+      // accounts exist, which is what the read-side fallbacks in
+      // getCreator/getCreatorList have to cope with.
+      //
+      // KV is the store every other creator key path already writes
+      // unconditionally, so making creation match keeps one consistent
+      // source of truth and lets D1 stay a pure accelerator that can be
+      // added, removed, or rebuilt at any time without data loss.
+      await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
       if (env.DB) {
         try {
           await env.DB.prepare(
             "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?)"
           ).bind(v.normalized, displayName, keyHash, recoveryAnswerHash, nowMs).run();
         } catch (dbErr) {
-          console.error("D1 write error (creator create):", dbErr);
-          // If D1 fails, write to KV so they aren't totally broken
-          await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
-          wroteToKV = true;
+          // Non-fatal: KV above already holds the authoritative record, so
+          // the account is fully usable. D1 will pick it up on the next
+          // /admin/api/migrate-d1 run.
+          console.error("D1 write error (creator create), KV holds the record:", dbErr);
         }
-      } else {
-        await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
-        wroteToKV = true;
       }
       
       try {
@@ -51413,24 +52043,41 @@ self.addEventListener('fetch', e => {
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
       
-      let d1Success = false;
       if (env.DB) {
         try {
-          await env.DB.prepare(
+          // meta.changes, not merely "did not throw". A D1 UPDATE that
+          // matches ZERO rows succeeds -- so for any account that exists
+          // in KV but was never migrated into D1 (i.e. every account
+          // created before /admin/api/migrate-d1 was first run), this used
+          // to report success, skip the KV write below, and rotate
+          // nothing at all: the caller got a brand-new key that would
+          // never work while the OLD key kept working forever. Exactly
+          // backwards for a credential rotation someone is performing
+          // because their key leaked.
+          const d1Res = await env.DB.prepare(
             "UPDATE creators SET key_hash = ? WHERE username = ?"
           ).bind(keyHash, v.normalized).run();
-          d1Success = true;
+          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
+            // Row absent from D1 (never migrated). Not an error -- the
+            // unconditional KV write below is the source of truth here --
+            // but worth surfacing, because it means this account is not
+            // in D1 and /admin/api/migrate-d1 has not been run for it.
+            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
+          }
         } catch (dbErr) {
           console.error("D1 write error (creator reset):", dbErr);
         }
       }
-      
-      if (!d1Success) {
-        await env.CONFIGS.put(
-          `creator:${v.normalized}`,
-          JSON.stringify({ ...profile, keyHash })
-        );
-      }
+
+      // Written unconditionally, not only when D1 missed. getCreator()
+      // prefers D1 and falls back to KV, so leaving KV holding an older
+      // key_hash than D1 means two different valid passwords for one
+      // account depending on which store answers. Both stores always get
+      // the same hash.
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
       return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
     }
 
@@ -51472,24 +52119,41 @@ self.addEventListener('fetch', e => {
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
       
-      let d1Success = false;
       if (env.DB) {
         try {
-          await env.DB.prepare(
+          // meta.changes, not merely "did not throw". A D1 UPDATE that
+          // matches ZERO rows succeeds -- so for any account that exists
+          // in KV but was never migrated into D1 (i.e. every account
+          // created before /admin/api/migrate-d1 was first run), this used
+          // to report success, skip the KV write below, and rotate
+          // nothing at all: the caller got a brand-new key that would
+          // never work while the OLD key kept working forever. Exactly
+          // backwards for a credential rotation someone is performing
+          // because their key leaked.
+          const d1Res = await env.DB.prepare(
             "UPDATE creators SET key_hash = ? WHERE username = ?"
           ).bind(keyHash, v.normalized).run();
-          d1Success = true;
+          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
+            // Row absent from D1 (never migrated). Not an error -- the
+            // unconditional KV write below is the source of truth here --
+            // but worth surfacing, because it means this account is not
+            // in D1 and /admin/api/migrate-d1 has not been run for it.
+            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
+          }
         } catch (dbErr) {
           console.error("D1 write error (admin creator reset):", dbErr);
         }
       }
-      
-      if (!d1Success) {
-        await env.CONFIGS.put(
-          `creator:${v.normalized}`,
-          JSON.stringify({ ...profile, keyHash })
-        );
-      }
+
+      // Written unconditionally, not only when D1 missed. getCreator()
+      // prefers D1 and falls back to KV, so leaving KV holding an older
+      // key_hash than D1 means two different valid passwords for one
+      // account depending on which store answers. Both stores always get
+      // the same hash.
+      await env.CONFIGS.put(
+        `creator:${v.normalized}`,
+        JSON.stringify({ ...profile, keyHash })
+      );
       return json({ ok: true, creatorKey });
     }
 
@@ -51513,7 +52177,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       return json({ ok: true, creatorName: auth.username, displayName: auth.displayName });
     }
 
@@ -51529,7 +52193,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -51652,7 +52316,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
@@ -51702,7 +52366,6 @@ self.addEventListener('fetch', e => {
           createdAt = now;
         }
       }
-      let d1Success = false;
       if (env.DB) {
         try {
           const listId = `${auth.username}:${slug}`;
@@ -51710,22 +52373,41 @@ self.addEventListener('fetch', e => {
           await env.DB.prepare(
             "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
           ).bind(listId, auth.username, name, type, visibility, itemsJson, createdAt, now).run();
-          d1Success = true;
         } catch (dbErr) {
           console.error("D1 write error (creatorlist put):", dbErr);
         }
       }
       
-      if (!d1Success) {
-        await env.CONFIGS.put(
-          `creatorlist:${auth.username}:${slug}`,
-          JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
-        );
-      }
+      // Unconditional -- KV must not be allowed to hold a stale copy of a
+      // list that D1 has since updated, because the public read paths
+      // (/lists/:user/:slug, the directory, search) all read KV.
+      await env.CONFIGS.put(
+        `creatorlist:${auth.username}:${slug}`,
+        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
+      );
       if (!order.includes(slug)) {
         order.push(slug);
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
+
+      // Keep the directory index in step with this save. A list turned
+      // private is removed rather than updated, otherwise unpublishing would
+      // leave it listed publicly.
+      ctx.waitUntil(updatePublicListIndex(
+        env,
+        `c:${auth.username}:${slug}`,
+        visibility === "private" ? null : {
+          isCreator: true,
+          username: auth.username,
+          creatorName: auth.displayName || auth.username,
+          slug,
+          name,
+          type: type || "mixed",
+          itemCount: Array.isArray(items) ? items.length : 0,
+          likes: likes || 0,
+          updatedAt: now,
+        }
+      ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
@@ -51738,22 +52420,23 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      let d1Success = false;
       if (env.DB) {
         try {
           await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
-          d1Success = true;
         } catch (dbErr) {
           console.error("D1 write error (creatorlist delete):", dbErr);
         }
       }
-      
-      if (!d1Success) {
-        await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
-      }
+
+      // Unconditional, for the same reason as the key rotation above: a
+      // DELETE matching zero D1 rows still "succeeds", and skipping the KV
+      // delete on that basis left the list live in KV -- a delete that
+      // reported ok:true and deleted nothing.
+      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
+      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -51775,7 +52458,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
@@ -51815,68 +52498,13 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Missing confirmation." }, 400);
       }
 
-      const u = auth.username;
-      let listsCleared = 0;
-      let keysCleared = 0;
+      // Same sweep as delete-account, minus the identity -- see
+      // purgeCreatorData (02_http-and-creator-utils.js). Keeping both
+      // callers on one function is what stops the two from drifting apart
+      // again the way they had.
+      const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: false });
 
-      // Custom lists are one key each, and list() pages -- keep going until
-      // the cursor is exhausted rather than assuming a single page covers an
-      // account that may have hundreds.
-      try {
-        let cursor;
-        for (let page = 0; page < 50; page++) {
-          const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
-          for (const k of res.keys) {
-            await env.CONFIGS.delete(k.name);
-            listsCleared++;
-          }
-          if (res.list_complete || !res.cursor) break;
-          cursor = res.cursor;
-        }
-      } catch (e) {
-        console.error("account reset: list enumeration failed", e);
-      }
-
-      if (env.DB) {
-        try {
-          await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
-        } catch (dbErr) {
-          console.error("D1 write error (account reset):", dbErr);
-        }
-      }
-
-      // Everything else the account owns. The identity keys -- creator:<u>
-      // itself -- are deliberately absent from this list.
-      const dataKeys = [
-        `creatorsync:${u}`,
-        `creatorsynctracking:${u}`,
-        `creatorsyncpresets:${u}`,
-        `creatorsyncchannels:${u}`,
-        `creatorlistorder:${u}`,
-        `creatorscrobblequeue:${u}`,
-        `creatorlistlikes:${u}`,
-        `creatorlikes:${u}`,
-        // legacy names, harmless if absent
-        `creatortrack:${u}`,
-        `creatorpresets:${u}`,
-        `creatorchannels:${u}`,
-      ];
-      for (const key of dataKeys) {
-        try {
-          await env.CONFIGS.delete(key);
-          keysCleared++;
-        } catch (e) {
-          console.error("account reset: could not delete", key, e);
-        }
-      }
-
-      // Any verification memoized in this isolate refers to a profile that
-      // still exists and is unchanged, so it stays valid -- but the sync
-      // records it guarded are gone, and clearing is cheap insurance against
-      // a warm isolate answering from anything stale.
-      try { invalidateCreatorAuthMemo(); } catch (e) {}
-
-      return json({ ok: true, cleared: { lists: listsCleared, keys: keysCleared } });
+      return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
 
     // /api/creator/delete-account  (POST)  { creatorName, creatorKey } -> { ok }
@@ -51891,22 +52519,20 @@ self.addEventListener('fetch', e => {
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
-      const u = auth.username;
-      try {
-        const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${u}:` });
-        for (const k of listKeys.keys) {
-          await env.CONFIGS.delete(k.name);
-        }
-      } catch {}
-      try {
-        await env.CONFIGS.delete(`creatorprofile:${u}`);
-        await env.CONFIGS.delete(`creatorlistorder:${u}`);
-        await env.CONFIGS.delete(`creatortrack:${u}`);
-        await env.CONFIGS.delete(`creatorpresets:${u}`);
-        await env.CONFIGS.delete(`creatorlikes:${u}`);
-        await env.CONFIGS.delete(`creatorchannels:${u}`);
-      } catch {}
-      return json({ ok: true });
+
+      // A second, explicit confirmation carried in the request itself,
+      // matching /api/creator/account/reset. The key alone authenticates,
+      // but this is irreversible and there is no undo, so it must not be
+      // reachable by a stray or replayed request.
+      if (String(body.confirm || "") !== "DELETE") {
+        return json({ ok: false, error: "Missing confirmation." }, 400);
+      }
+
+      // deleteIdentity: true is the whole difference from account/reset --
+      // the profile, the D1 row, and the last-seen marker go too, so the
+      // key stops authenticating and the username becomes reclaimable.
+      const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: true });
+      return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
 
     // --- Site-wide account sync ---------------------------------------------
@@ -51935,7 +52561,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
 
       // Same one-time forward migration, this time for tracking data
       // (watchHistory/continueWatching/fullyWatchedShowIds/
@@ -52035,7 +52661,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
 
       // Guard against a narrow but real race: handleSubtitlesTrack and
@@ -52288,7 +52914,6 @@ self.addEventListener('fetch', e => {
           wlObj.items = body.watchlist;
           wlObj.updatedAt = watchlistUpdatedAt;
           
-          let d1Success = false;
           if (env.DB) {
             try {
               const listId = `${auth.username}:watchlist`;
@@ -52296,15 +52921,13 @@ self.addEventListener('fetch', e => {
               await env.DB.prepare(
                 "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
               ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.createdAt, wlObj.updatedAt).run();
-              d1Success = true;
             } catch (dbErr) {
               console.error("D1 write error (creatorlist watchlist):", dbErr);
             }
           }
           
-          if (!d1Success) {
-            await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
-          }
+          // Unconditional -- see the creatorlist put above.
+          await env.CONFIGS.put(`creatorlist:${auth.username}:watchlist`, JSON.stringify(wlObj));
 
           const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
           let order = [];
@@ -52347,7 +52970,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const presetsBlob = {
         presets: body.presets && typeof body.presets === "object" ? body.presets : {},
         presetsB64: body.presetsB64 || null,
@@ -52374,7 +52997,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const channelsBlob = {
         channels: body.channels && typeof body.channels === "object" ? body.channels : {},
         mergedChannels: body.mergedChannels && typeof body.mergedChannels === "object" ? body.mergedChannels : {},
@@ -52426,7 +53049,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
 
       // Pulls "updatedAt": <number> out of a stored blob without parsing
       // it. Every blob these keys hold writes updatedAt as a plain number
@@ -52482,7 +53105,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       await ensureTrackingMigrated(env, auth.username);
       // These five reads are independent of one another, and were awaited
       // one after the next -- so this endpoint paid five sequential KV
@@ -52716,7 +53339,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." });
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const usernameSlug = String(body.usernameSlug || "").trim();
       if (!usernameSlug) return json({ ok: false, error: "Missing list reference." }, 400);
       const key = `creatorsync:${auth.username}`;
@@ -52736,6 +53359,73 @@ self.addEventListener('fetch', e => {
       blob.updatedAt = Date.now();
       await env.CONFIGS.put(key, JSON.stringify(blob));
       return json({ ok: true });
+    }
+
+    // /api/creator/sync/share-tracking  (POST)
+    //   { creatorName, creatorKey, slug, shared } -> { ok, shared: {...} }
+    //   { creatorName, creatorKey } (no slug)     -> { ok, shared: {...} }  (read current state)
+    //
+    // Owner-controlled opt-in for exposing Watchlist / Watch History /
+    // Continue Watching at the public /lists/:username/:slug address.
+    // Those three come out of the private `creatorsynctracking:` blob,
+    // so they are NOT public by default and there is no way to make them
+    // public except by an authenticated call here (see the gate in the
+    // /lists/:username/:listname handler). Stored as its own small key
+    // rather than inside the tracking blob itself, so that the frequent,
+    // high-churn tracking writes (playback pings, scrobbles, the cron)
+    // can never accidentally clobber a privacy setting in a
+    // read-modify-write race.
+    if (path === "/api/creator/sync/share-tracking" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+
+      const shareKey = `creatorshare:${auth.username}`;
+      let shared = {};
+      try {
+        const raw = await env.CONFIGS.get(shareKey);
+        if (raw) shared = JSON.parse(raw) || {};
+      } catch {
+        shared = {};
+      }
+
+      // No slug -> read-only query of the current settings.
+      const slug = String(body.slug || "").trim().toLowerCase();
+      if (!slug) {
+        return json({
+          ok: true,
+          shared: {
+            "watchlist": shared["watchlist"] === true,
+            "watch-history": shared["watch-history"] === true,
+            "continue-watching": shared["continue-watching"] === true,
+          },
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      const ALLOWED_SHARE_SLUGS = new Set(["watchlist", "watch-history", "continue-watching"]);
+      if (!ALLOWED_SHARE_SLUGS.has(slug)) {
+        return json({ ok: false, error: "That list cannot be shared this way." }, 400);
+      }
+
+      // Coerced to a real boolean -- the read side checks === true, so
+      // anything else stored here would silently mean "not shared".
+      shared[slug] = body.shared === true;
+      await env.CONFIGS.put(shareKey, JSON.stringify(shared));
+
+      return json({
+        ok: true,
+        shared: {
+          "watchlist": shared["watchlist"] === true,
+          "watch-history": shared["watch-history"] === true,
+          "continue-watching": shared["continue-watching"] === true,
+        },
+      }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/search-published-lists?q=...
@@ -52767,6 +53457,44 @@ self.addEventListener('fetch', e => {
       const isMyListsSearch = isMyListsSentinel || !userTerm;
 
       try {
+        // Same index as /lists/public.json: searching used to scan at most
+        // 80-250 keys, so lists outside that lexicographic window were
+        // unfindable no matter what the user typed. The index also carries
+        // the display fields, which removes the per-list getCreator lookup
+        // that made this route's subrequest count scale with result size.
+        const searchIndex = await getPublicListIndex(env, ctx);
+        if (searchIndex) {
+          const targetFilterIdx = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+          const tokensIdx = targetFilterIdx.split(/\s+/).filter(Boolean);
+          const matchesIdx = searchIndex
+            .filter((e) => (e.itemCount || 0) > 0)
+            .filter((e) => {
+              if (!targetFilterIdx || !tokensIdx.length) return true;
+              const fullText = `${e.name || ""} ${e.creatorName || ""} ${e.username || ""}`.toLowerCase();
+              if (fullText.includes(targetFilterIdx)) return true;
+              return tokensIdx.every((tok) => fullText.includes(tok));
+            })
+            .map((e) => ({
+              name: e.name,
+              type: e.type,
+              items: e.itemCount || 0,
+              likes: e.likes || 0,
+              creatorName: e.isCreator ? (e.creatorName || e.username) : "Anonymous",
+              username: e.isCreator ? e.username : "user",
+              url: `${url.origin}/lists/${e.isCreator ? e.username : "user"}/${e.slug}`,
+              source: "My Lists Addon",
+            }))
+            .sort((a, b) => {
+              const likesDiff = (b.likes || 0) - (a.likes || 0);
+              if (likesDiff !== 0) return likesDiff;
+              return (b.items || 0) - (a.items || 0);
+            });
+          // Response shape is identical to the scan path below: key is
+          // `lists`, entries carry `source`, and only the non-"my lists"
+          // search is capped at 50.
+          return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) });
+        }
+
         const fetchLimit = isMyListsSearch ? 250 : 80;
         const [anonResult, creatorResult] = await Promise.all([
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
@@ -53009,28 +53737,63 @@ self.addEventListener('fetch', e => {
           } catch {}
         }
       }
+      // Watchlist / Watch History / Continue Watching are NOT ordinary
+      // published lists -- they live in `creatorsynctracking:{username}`,
+      // which is the account's PRIVATE sync blob, written only by the
+      // authenticated /api/creator/sync/save-tracking. This route has no
+      // authentication at all (it's the public share-a-list page), so
+      // reading that blob here used to hand any anonymous caller the
+      // complete viewing history of any account whose username they knew
+      // -- and usernames are published by /lists/public.json for every
+      // shared list, so they didn't even need guessing.
+      //
+      // The blob has no `visibility` field to check (it isn't a list), so
+      // there is nothing here that could have failed closed on its own.
+      // Sharing is now strictly opt-in per slug, recorded in
+      // `creatorshare:{username}` by the owner via
+      // /api/creator/sync/share-tracking. Absent key, unparseable key, or
+      // a slug not explicitly set to boolean true => not shared, and this
+      // block does nothing at all (the request then 404s below exactly as
+      // it does for any other unknown list).
       if (listName === "watchlist" || listName === "watch-history" || listName === "continue-watching") {
-        const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
-        if (trackingRaw) {
-          try {
-            const tracking = JSON.parse(trackingRaw);
-            const items = tracking[listName === "watch-history" ? "watchHistory" : (listName === "continue-watching" ? "continueWatching" : "watchlist")] || [];
-            if (Array.isArray(items)) {
-              if (!listData && items.length > 0) {
-                listData = {
-                  name: listName === "watch-history" ? "Watch History" : (listName === "continue-watching" ? "Continue Watching" : "Watchlist"),
-                  slug: listName,
-                  type: "mixed",
-                  visibility: "public",
-                  items: items,
-                  updatedAt: tracking.updatedAt || Date.now()
-                };
-                isCreatorList = true;
-              } else if (listData && Array.isArray(items) && items.length > 0 && (!listData.items || listData.items.length === 0)) {
-                listData.items = items;
+        let sharedSlugs = {};
+        try {
+          const shareRaw = await env.CONFIGS.get(`creatorshare:${username}`);
+          if (shareRaw) sharedSlugs = JSON.parse(shareRaw) || {};
+        } catch {
+          sharedSlugs = {};
+        }
+        // Strict === true: a truthy string/number from a hand-edited or
+        // legacy value must not be enough to expose someone's history.
+        if (sharedSlugs[listName] === true) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+          if (trackingRaw) {
+            try {
+              const tracking = JSON.parse(trackingRaw);
+              const items = tracking[listName === "watch-history" ? "watchHistory" : (listName === "continue-watching" ? "continueWatching" : "watchlist")] || [];
+              if (Array.isArray(items)) {
+                if (!listData && items.length > 0) {
+                  listData = {
+                    name: listName === "watch-history" ? "Watch History" : (listName === "continue-watching" ? "Continue Watching" : "Watchlist"),
+                    slug: listName,
+                    type: "mixed",
+                    visibility: "public",
+                    items: items,
+                    updatedAt: tracking.updatedAt || Date.now()
+                  };
+                  isCreatorList = true;
+                } else if (listData && Array.isArray(items) && items.length > 0 && (!listData.items || listData.items.length === 0)) {
+                  // A genuine published Custom List that happens to be
+                  // named "Watchlist" and is currently empty gets its
+                  // items filled in from tracking. Also gated -- this
+                  // path copies the same private data into a public
+                  // response, so it cannot be allowed without opt-in
+                  // either.
+                  listData.items = items;
+                }
               }
-            }
-          } catch {}
+            } catch {}
+          }
         }
       }
       if (!listData) {
@@ -53312,7 +54075,11 @@ self.addEventListener('fetch', e => {
       // 2. Creator Lists
       const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
       for (const k of lKeys.keys) {
-        const [, , u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
+        // Two capture groups, so they are match[1] and match[2]. The old
+        // `[, , u, slug]` skipped one element too many: slug came out
+        // undefined, the `if (u && slug)` guard below rejected every key,
+        // and the migration silently reported "lists: 0" while claiming ok.
+        const [, u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
         if (u && slug) {
           const raw = await env.CONFIGS.get(k.name);
           if (raw) {
@@ -53320,9 +54087,12 @@ self.addEventListener('fetch', e => {
               const data = JSON.parse(raw);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              // `likes` is carried across too. KV holds the authoritative
+              // count, so a migration that omitted it would silently reset
+              // every list to zero in D1.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);
@@ -53900,8 +54670,21 @@ self.addEventListener('fetch', e => {
     // Resolves an array of {title, year} objects to TMDB/IMDB IDs
     // Used by the Letterboxd CSV import
     if (path === "/api/bulk-resolve" && request.method === "POST") {
+      // Parsed separately from the work below so a malformed body returns
+      // the same 400 + generic message every other route uses, instead of
+      // falling into the catch and echoing the raw SyntaxError (which
+      // included the caller's own payload) back at HTTP 500.
+      let bulkBody;
       try {
-        const body = await request.json();
+        bulkBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      if (!bulkBody || !Array.isArray(bulkBody.items)) {
+        return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      try {
+        const body = bulkBody;
         const items = body.items || [];
         const resolved = [];
         // Always the shared TMDB_API_KEY -- no per-user override on this
@@ -53957,7 +54740,10 @@ self.addEventListener('fetch', e => {
         if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
         return json({ ok: true, resolved });
       } catch (e) {
-        return json({ ok: false, error: String(e) }, 500);
+        // Logged, not returned -- the message can carry upstream URLs and
+        // internal detail that the caller has no business seeing.
+        console.error("bulk-resolve failed:", e);
+        return json({ ok: false, error: "Could not resolve those titles." }, 500);
       }
     }
 

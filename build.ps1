@@ -46,8 +46,13 @@ $header = @'
  *                                        builder page can offer them as one-click adds
  *  - GET /icon.png                    -> add-on icon, served from this Worker
  *
- * Deploy with `wrangler deploy` or paste directly into the Cloudflare dashboard.
- * No environment variables or bindings required.
+ * Deploy with `wrangler deploy`.
+ *
+ * REQUIRES a CONFIGS KV namespace binding and (for /admin) an ADMIN_KEY
+ * secret; a cron trigger drives Continue Watching. See wrangler.toml for
+ * the full list of bindings, secrets, and the cron schedule. Without the
+ * KV binding every stateful feature silently degrades to a no-op rather
+ * than failing loudly.
  */
 
 '@

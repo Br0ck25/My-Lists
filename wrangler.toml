@@ -2,13 +2,69 @@ name = "my-lists-addon"
 main = "worker_entry_combined.js"
 compatibility_date = "2024-01-01"
 
-# Bind your KV namespace (replace with your actual KV ID)
-# [[kv_namespaces]]
-# binding = "CONFIGS"
-# id = "YOUR_KV_NAMESPACE_ID"
+# --- KV (REQUIRED) -----------------------------------------------------------
+# Every stateful feature depends on this binding: Creator Profiles, cloud
+# sync, published lists, likes, feedback, analytics, and all catalog
+# caching. Without it the Worker still boots and serves pages, but each of
+# those silently degrades to a no-op -- it does NOT fail loudly, so a
+# missing binding is easy to miss.
+#
+# Create one and paste the id it prints:
+#   npx wrangler kv namespace create CONFIGS
+[[kv_namespaces]]
+binding = "CONFIGS"
+id = "YOUR_KV_NAMESPACE_ID"
 
-# Bind the D1 Database we just created
-[[d1_databases]]
-binding = "DB"
-database_name = "my-lists-db"
-database_id = "YOUR_DATABASE_ID" # You can get this by running `npx wrangler d1 info my-lists-db`
+# --- D1 (optional) -----------------------------------------------------------
+# Optional. Every accessor tries D1 first and falls back to KV, so the app
+# is fully functional with this block commented out. If you do enable it,
+# run schema.sql first and then POST /admin/api/migrate-d1 to backfill
+# existing KV accounts -- an account present in KV but missing from D1 will
+# otherwise not be updated correctly by the key-rotation endpoints.
+#   npx wrangler d1 create my-lists-db
+#   npx wrangler d1 execute my-lists-db --file=./schema.sql
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "my-lists-db"
+# database_id = "YOUR_DATABASE_ID"
+
+# --- Cron trigger (REQUIRED for Continue Watching) ---------------------------
+# Drives the scheduled() export at the bottom of
+# 26_api-creator-and-admin-routes.js: checkForNewEpisodes() sweeps creator
+# accounts for newly-aired episodes and pushes them into Continue Watching,
+# and prewarmSharedCatalogs() refreshes the shared Trakt/TMDB/Simkl/MDBList
+# charts into KV.
+#
+# Without this block scheduled() never runs at all -- Continue Watching
+# never picks up new episodes and the shared charts are never pre-warmed,
+# with no error anywhere to indicate why.
+#
+# "*/6 * * * *" is every 6 MINUTES, which matches the README's setup step
+# and is driven by prewarmSharedCatalogs: keeping the shared Trakt / TMDB /
+# Simkl / MDBList charts hot in KV is what keeps catalog loads fast for
+# every visitor and keeps the Worker off those providers' rate limits.
+# checkForNewEpisodes rides along on the same tick but is internally
+# cursor-paginated (one slice of accounts per run), so the per-account
+# episode sweep does NOT actually run 240x/day per account.
+#
+# If you do not use Continue Watching and want to minimise invocations,
+# "0 */6 * * *" (every 6 hours) is a reasonable alternative -- but expect
+# colder catalogs and more upstream API calls.
+[triggers]
+crons = ["*/6 * * * *"]
+
+# --- Secrets (set these with `wrangler secret put`, never in this file) ------
+#
+# Required for the admin dashboard at /admin:
+#   npx wrangler secret put ADMIN_KEY
+#
+# Provider API keys. All optional -- each feature gated on one degrades to
+# a clear in-app message when its key is absent, rather than crashing:
+#   npx wrangler secret put TMDB_API_KEY            # themoviedb.org/settings/api
+#   npx wrangler secret put TRAKT_CLIENT_ID         # trakt.tv/oauth/applications
+#   npx wrangler secret put TRAKT_CLIENT_SECRET     # required only for Trakt OAuth login
+#   npx wrangler secret put MDBLIST_API_KEY         # mdblist.com/preferences
+#   npx wrangler secret put MDBLIST_POPULAR_KEY     # optional, for the Toplists proxy
+#   npx wrangler secret put MDBLIST_CLIENT_ID       # required only for MDBList OAuth
+#   npx wrangler secret put SIMKL_CLIENT_ID         # simkl.com/settings/developer/
+#   npx wrangler secret put SIMKL_CLIENT_SECRET     # required only for Simkl OAuth

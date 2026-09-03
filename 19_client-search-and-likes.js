@@ -857,7 +857,17 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: parts[0], slug: parts[1], action: wasLiked ? 'unlike' : 'like' }),
+        // Creator credentials ride along when signed in so the vote is
+        // recorded against the account (one like per account across every
+        // device) rather than against this browser's IP. Optional --
+        // signed-out liking still works, it just votes per-IP.
+        body: JSON.stringify({
+          username: parts[0],
+          slug: parts[1],
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -916,7 +926,12 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like-external', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: listUrl, action: wasLiked ? 'unlike' : 'like' }),
+        body: JSON.stringify({
+          url: listUrl,
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {

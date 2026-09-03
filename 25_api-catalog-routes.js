@@ -245,6 +245,39 @@ async function handleFetch(request, env, ctx) {
       if (!env || !env.CONFIGS) {
         return json({ ok: true, lists: [] }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
       }
+      // Preferred path: one KV read of the maintained index, no per-list
+      // gets, no truncation at 150 keys. Falls back to the legacy bounded
+      // scan below only while the index is being built for the first time.
+      const indexEntries = await getPublicListIndex(env, ctx);
+      if (indexEntries) {
+        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+        // Default page stays 100 to match the previous response size;
+        // callers can page through the rest instead of silently losing it.
+        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+        const page = indexEntries.slice(offset, offset + pageSize);
+        const lists = page.map((e) => {
+          const cleanSlug = e.slug || slugifyServer(e.name) || "list";
+          const username = e.isCreator ? e.username : "user";
+          return {
+            name: e.name,
+            slug: cleanSlug,
+            creator: e.isCreator ? e.username : "Anonymous",
+            type: e.type || "mixed",
+            itemCount: e.itemCount || 0,
+            likes: e.likes || 0,
+            updatedAt: e.updatedAt || null,
+            url: `${url.origin}/lists/${username}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+          };
+        });
+        return json(
+          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          200,
+          { "Cache-Control": "public, max-age=120", ...corsHeaders() }
+        );
+      }
+
       const fetchLimit = 150;
       const [pubRes, creatorRes] = await Promise.all([
         env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
@@ -4630,17 +4663,45 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
       let threadIds = [];
       let creatorName = null;
+      let creatorKey = null;
       if (request.method === "POST") {
         try {
           const body = await request.json();
           if (Array.isArray(body.threadIds)) threadIds = body.threadIds.map((t) => String(t).trim()).filter(Boolean);
           if (body.creatorName) creatorName = String(body.creatorName).trim().toLowerCase();
+          if (body.creatorKey) creatorKey = String(body.creatorKey);
         } catch {}
       } else {
         const pIds = url.searchParams.get("threadIds");
         if (pIds) threadIds = pIds.split(",").map((s) => s.trim()).filter(Boolean);
         const pCreator = url.searchParams.get("creatorName");
         if (pCreator) creatorName = pCreator.trim().toLowerCase();
+        const pKey = url.searchParams.get("creatorKey");
+        if (pKey) creatorKey = pKey;
+      }
+
+      // Looking a creator up BY NAME returns their whole support history --
+      // free-text messages plus the optional `contact` field the feedback
+      // form explicitly asks for. That used to require nothing but the
+      // username, which /lists/public.json publishes for everyone who has
+      // ever shared a list, so anyone could harvest every user's
+      // correspondence and contact details by iterating the directory.
+      //
+      // The name-based scan below now requires the account's own key. The
+      // threadIds path is deliberately left unauthenticated: a thread id
+      // is a capability (it is only ever shown to the person who filed the
+      // report), and anonymous users with no account at all rely on it to
+      // follow up on what they submitted.
+      // authenticateCreator is declared further down in
+      // 26_api-creator-and-admin-routes.js, which is the same function
+      // body as this file after the build concatenates them -- a hoisted
+      // function declaration, so it is in scope here.
+      if (creatorName) {
+        const auth = await authenticateCreator(creatorName, creatorKey);
+        if (!auth.ok) {
+          return json({ ok: false, error: "Username or Key is incorrect." }, 401, { "Cache-Control": "no-store" });
+        }
+        creatorName = auth.username;
       }
 
       const threadsMap = new Map();
@@ -5245,7 +5306,21 @@ self.addEventListener('fetch', e => {
         plKey = "publishedlist:user:" + listSlug;
       }
       const plVisibility = plBody.visibility === "private" ? "private" : "public";
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: Date.now() }));
+      const plNow = Date.now();
+      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      // Anonymous publishes belong in the directory index too.
+      if (plVisibility !== "private") {
+        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
+          isCreator: false,
+          username: "user",
+          slug: listSlug,
+          name: plBody.name || baseSlug,
+          type: plType,
+          itemCount: plItems.length,
+          likes: 0,
+          updatedAt: plNow,
+        }));
+      }
       return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
     }
 
@@ -5257,21 +5332,10 @@ self.addEventListener('fetch', e => {
       const likeSlug = String(likeBody.slug || "").toLowerCase().trim();
       const likeUnlike = likeBody.action === "unlike";
       if (!likeUser || !likeSlug) return json({ ok: false, error: "Missing list reference." }, 400);
-      
-      if (env.DB) {
-        try {
-          const listId = `${likeUser}:${likeSlug}`;
-          const increment = likeUnlike ? -1 : 1;
-          const { success, results } = await env.DB.prepare(
-            "UPDATE creator_lists SET likes = MAX(0, likes + ?) WHERE id = ? RETURNING likes"
-          ).bind(increment, listId).run();
-          
-          if (success && results.length > 0) {
-            return json({ ok: true, likes: results[0].likes });
-          }
-        } catch (dbErr) {}
-      }
 
+      // The list must actually exist before any vote is recorded --
+      // otherwise a ledger (and a permanent KV key) could be created for
+      // any username/slug pair someone cared to invent.
       const likeCreatorKey = "creatorlist:" + likeUser + ":" + likeSlug;
       const likeAnonKey = "publishedlist:" + likeUser + ":" + likeSlug;
       let likeKey = null;
@@ -5280,9 +5344,62 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
-      likeData.likes = Math.max(0, (likeData.likes || 0) + (likeUnlike ? -1 : 1));
-      await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
-      return json({ ok: true, likes: likeData.likes });
+
+      // Signed-in visitors vote as themselves; everyone else votes as a
+      // per-list hash of their IP. Either way one identity is worth exactly
+      // one like, no matter how many times it POSTs. A creatorKey is
+      // verified when supplied, but is NOT required -- signed-out liking
+      // is existing behaviour and stays working.
+      let likeVoterName = "";
+      if (likeBody.creatorName && likeBody.creatorKey) {
+        const likeAuth = await authenticateCreator(likeBody.creatorName, likeBody.creatorKey);
+        if (likeAuth.ok) likeVoterName = likeAuth.username;
+      }
+      const listScopeId = `${likeUser}:${likeSlug}`;
+      const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      const ledgerKey = `listlikevoters:${listScopeId}`;
+      const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
+
+      // The count lives on the list record too, because the directory,
+      // search, and the admin dashboard all read it from there and none of
+      // them should have to open a ledger per list. Derived from the
+      // ledger, never incremented, so it cannot drift upward on its own.
+      if ((likeData.likes || 0) !== count) {
+        likeData.likes = count;
+        await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
+        // The directory ranks by likes, so the index has to see this or the
+        // ordering freezes at whatever it was when the index was built.
+        // Only on an actual change -- a repeated like writes nothing.
+        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+        // `c:<user>:<slug>` -- using the wrong prefix here would append a
+        // duplicate entry instead of updating the existing one.
+        const likeIsCreator = likeKey === likeCreatorKey;
+        if (likeData.visibility !== "private") {
+          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+            isCreator: likeIsCreator,
+            username: likeIsCreator ? likeUser : "user",
+            slug: likeSlug,
+            name: likeData.name || "List",
+            type: likeData.type || "mixed",
+            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
+            likes: count,
+            updatedAt: likeData.updatedAt || likeData.createdAt || null,
+          }));
+        }
+      }
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
+        } catch (dbErr) {
+          // Non-fatal: KV above holds the authoritative count, so a like is
+          // never lost by D1 being unavailable. Requires the `likes` column
+          // from migrations/0001; without it this throws on every like.
+          console.error("D1 write error (list likes):", dbErr);
+        }
+      }
+
+      return json({ ok: true, likes: count, liked: !likeUnlike, capped: capped || undefined });
     }
 
     if (path === "/api/lists/like-external" && request.method === "POST") {
@@ -5295,23 +5412,44 @@ self.addEventListener('fetch', e => {
       }
       const rawUrl = String(body.url || "").trim();
       if (!rawUrl) return json({ ok: false, error: "Missing list URL." }, 400);
+      // Validated and normalized before it is allowed anywhere near a KV
+      // key -- see normalizeExternalListUrl. Rejects non-http(s) schemes,
+      // over-long strings, and any host that isn't a provider this add-on
+      // integrates with, which is what stops this endpoint being an
+      // unbounded attacker-controlled keyspace.
+      const normalizedUrl = normalizeExternalListUrl(rawUrl);
+      if (!normalizedUrl) {
+        return json({ ok: false, error: "That URL can't be liked -- only MDBList, Trakt, TMDB, Simkl, and Letterboxd list links are supported." }, 400);
+      }
       const unlike = body.action === "unlike";
-      const hash = await hashStringForKey(rawUrl.toLowerCase());
+
+      let extVoterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const extAuth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (extAuth.ok) extVoterName = extAuth.username;
+      }
+
+      const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
+      const voterId = await likeVoterId(request, env, extVoterName, hash);
+      const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
+
       const raw = await env.CONFIGS.get(key);
-      let data = { url: rawUrl, likes: 0 };
+      let data = { url: normalizedUrl, likes: 0 };
       if (raw) {
         try {
           data = JSON.parse(raw);
         } catch {
-          data = { url: rawUrl, likes: 0 };
+          data = { url: normalizedUrl, likes: 0 };
         }
       }
-      data.likes = Math.max(0, (data.likes || 0) + (unlike ? -1 : 1));
-      data.url = rawUrl;
-      data.updatedAt = Date.now();
-      await env.CONFIGS.put(key, JSON.stringify(data));
-      return json({ ok: true, likes: data.likes });
+      if (data.likes !== count || data.url !== normalizedUrl) {
+        data.likes = count;
+        data.url = normalizedUrl;
+        data.updatedAt = Date.now();
+        await env.CONFIGS.put(key, JSON.stringify(data));
+      }
+      return json({ ok: true, likes: count, liked: !unlike, capped: capped || undefined });
     }
 
 

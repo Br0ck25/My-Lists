@@ -927,6 +927,325 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 }
 
 
+// --- Like voter ledger -------------------------------------------------------
+//
+// Likes used to be a bare read-modify-write counter on an unauthenticated
+// endpoint: every POST did `likes = likes + 1` with nothing recording WHO
+// voted. A trivial curl loop took a list from 0 to 11 in one second, and
+// `action:"unlike"` decremented just as freely, so a competing list could
+// be driven to zero as easily as your own could be inflated. Since the
+// community directory sorts and surfaces by likes, that made the ranking
+// meaningless.
+//
+// Instead of a counter, each likeable thing now keeps a small ledger of
+// distinct voter ids. Liking is idempotent set-insertion and unliking is
+// set-removal, so replaying the same request any number of times converges
+// on the same state rather than accumulating. The displayed count is
+// derived from the ledger size, never incremented directly.
+//
+// Voter identity, best available:
+//   * signed-in creator  -> "u:<username>"  (stable across devices)
+//   * anonymous          -> "a:<hash of IP + list id>"
+// The anonymous id is salted with the list id specifically so the same
+// ledger cannot be used to correlate one IP's activity across lists.
+//
+// This is deliberately NOT full authentication -- likes stay available to
+// signed-out visitors, which is the existing product behaviour. It raises
+// ballot-stuffing from "one curl loop" to "one vote per IP per list",
+// which is the appropriate bar for a non-critical popularity signal.
+const LIKE_VOTER_CAP = 5000;
+
+async function likeVoterId(request, env, creatorUsername, scopeId) {
+  if (creatorUsername) return `u:${creatorUsername}`;
+  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const hash = await hashStringForKey(`${ip}|${scopeId}`);
+  return `a:${hash}`;
+}
+
+// Applies one vote to a ledger key and returns the resulting count.
+// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
+// be a new voter -- the caller keeps the existing count rather than
+// silently discarding the vote or growing the key without bound.
+async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  let voters = [];
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) voters = parsed;
+      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+    }
+  } catch {
+    voters = [];
+  }
+  const set = new Set(voters);
+  const had = set.has(voterId);
+  if (liked) {
+    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+    set.add(voterId);
+  } else {
+    set.delete(voterId);
+  }
+  // No write at all when nothing changed -- KV allows one write per second
+  // per key, and a double-tap on a busy list should not burn that budget
+  // or race with a genuine vote.
+  if (set.size !== voters.length || had !== set.has(voterId)) {
+    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+  }
+  return { count: set.size, capped: false };
+}
+
+// --- External list URL validation --------------------------------------------
+//
+// /api/lists/like-external hashes a caller-supplied URL into a KV key. With
+// no validation that was an unbounded, attacker-controlled key-space write
+// primitive: any string at all minted a brand-new permanent KV key, which
+// is a storage and billing denial-of-service and pollutes the external
+// likes dataset with garbage nobody can ever clean up.
+//
+// Only list URLs from the providers this add-on actually integrates with
+// are likeable, which is the only thing the feature was ever for.
+const EXTERNAL_LIKE_HOSTS = new Set([
+  "mdblist.com", "www.mdblist.com",
+  "trakt.tv", "www.trakt.tv",
+  "themoviedb.org", "www.themoviedb.org",
+  "simkl.com", "www.simkl.com",
+  "letterboxd.com", "www.letterboxd.com",
+]);
+
+function normalizeExternalListUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s || s.length > 300) return null;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  // Blocks javascript:, data:, file:, and anything else non-web outright.
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  const host = u.hostname.toLowerCase();
+  if (!EXTERNAL_LIKE_HOSTS.has(host)) return null;
+  // Normalized so the same list liked via http/https, with or without a
+  // "www." prefix, with a trailing slash, or with tracking query params
+  // all land on ONE ledger instead of fragmenting the count across
+  // near-duplicate keys. The "www." strip matters most: trakt.tv and
+  // www.trakt.tv are the same list to a human, and were otherwise counted
+  // separately.
+  const bareHost = host.replace(/^www\./, "");
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  return `https://${bareHost}${path}`;
+}
+
+// ---------------------------------------------------------------------------
+// Public list directory index
+// ---------------------------------------------------------------------------
+// The directory and search used to do list({prefix:"creatorlist:", limit:150})
+// with no cursor and then slice(0,100). KV returns keys in lexicographic
+// order, so past ~150 lists only usernames sorting earliest were ever visible
+// -- everyone else silently vanished from the directory with no error.
+//
+// Paginating that properly is worse, not better: it means reading EVERY list
+// on every directory load (10k lists = 10k KV reads per page view, well past
+// the 1,000 subrequest/invocation cap). So the directory reads a single
+// maintained index blob instead, updated on publish/unpublish. Directory cost
+// is now ONE KV read regardless of how many lists exist.
+//
+// The index stores the display fields the directory needs (name, creator,
+// counts, likes) so no per-list get is required. It is a derived cache: if it
+// is missing or stale, rebuildPublicListIndex() regenerates it from the
+// authoritative creatorlist:/publishedlist: keys. Never treat it as the
+// source of truth.
+const PUBLIC_INDEX_KEY = "index:publiclists";
+// 25 MiB is the KV value ceiling. At ~200 bytes/entry, 20k entries is ~4 MB --
+// comfortably inside it while still bounding worst-case memory and response
+// size. Beyond this the tail is dropped (least-liked first).
+const PUBLIC_INDEX_MAX = 20000;
+
+async function readPublicListIndex(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Sorted by likes so that if anything downstream truncates, it drops the
+// least popular rather than an arbitrary lexicographic slice.
+function sortPublicIndexEntries(entries) {
+  return entries.sort(
+    (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
+  );
+}
+
+async function writePublicListIndex(env, entries) {
+  const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_KEY,
+    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  );
+  return trimmed;
+}
+
+// Incremental update for one list. `entry` null => remove (unpublished,
+// deleted, or made private).
+//
+// This is a read-modify-write on a single key, so concurrent publishes can
+// lose an update. That is acceptable here in a way it was NOT for like counts:
+// the index is a rebuildable cache, a lost entry costs one list's directory
+// visibility until its next save or the next rebuild, and publishes are rare
+// and self-correcting. Like counts had no such backstop.
+async function updatePublicListIndex(env, id, entry) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    // No index yet: don't build one from a single entry, or the directory
+    // would show exactly one list. Leave it absent so the read path falls
+    // back to a scan and rebuilds the whole thing.
+    if (!idx) return;
+    const prev = idx.entries.find((e) => e && e.id === id);
+    const entries = idx.entries.filter((e) => e && e.id !== id);
+    // Merge onto the previous entry rather than replacing it: callers that
+    // only know part of the record (the like route has no displayName, for
+    // instance) must not blank out fields they never loaded.
+    if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    await writePublicListIndex(env, entries);
+  } catch (err) {
+    // Non-fatal: the list itself is already saved. Worst case the directory
+    // is stale until the next rebuild.
+    console.error("public list index update failed:", err);
+  }
+}
+
+// Full scan -> index. Expensive (one KV get per list), so it runs only when
+// the index is missing, and only one caller at a time via a short lock.
+async function rebuildPublicListIndex(env) {
+  const entries = [];
+  const seen = new Set();
+
+  // Search matches against the creator's display name too, so the index has
+  // to carry it. Cached per username: creators are far fewer than lists, and
+  // without this the rebuild would do a second get for every list.
+  const displayNameCache = new Map();
+  async function resolveDisplayName(username) {
+    if (displayNameCache.has(username)) return displayNameCache.get(username);
+    let name = username;
+    try {
+      const profileRaw = await getCreator(env, username);
+      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+    } catch {
+      // fall back to the raw username slug
+    }
+    displayNameCache.set(username, name);
+    return name;
+  }
+
+  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
+  for (const k of creatorKeys.keys) {
+    const rest = k.name.slice("creatorlist:".length);
+    const sep = rest.indexOf(":");
+    if (sep === -1) continue;
+    const username = rest.slice(0, sep);
+    const slug = rest.slice(sep + 1);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `c:${username}:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: true,
+        username,
+        creatorName: await resolveDisplayName(username),
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+  for (const k of anonKeys.keys) {
+    const slug = k.name.slice("publishedlist:user:".length);
+    const raw = await env.CONFIGS.get(k.name);
+    if (!raw) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (data.visibility === "private") continue;
+      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
+      const id = `a:${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({
+        id,
+        isCreator: false,
+        username: "user",
+        slug,
+        name: data.name || "List",
+        type: data.type || "mixed",
+        itemCount,
+        likes: data.likes || 0,
+        updatedAt: data.updatedAt || data.createdAt || null,
+      });
+    } catch {
+      // skip unparseable record
+    }
+  }
+
+  return await writePublicListIndex(env, entries);
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+
+  // Rebuilding is a full scan; a burst of traffic against a cold index must
+  // not start one per request. First caller takes a 60s lock and rebuilds,
+  // the rest fall through to the bounded legacy scan for this one request.
+  let gotLock = false;
+  try {
+    const lock = await env.CONFIGS.get("lock:publiclistindex");
+    if (!lock) {
+      await env.CONFIGS.put("lock:publiclistindex", "1", { expirationTtl: 60 });
+      gotLock = true;
+    }
+  } catch {
+    // If the lock read fails, fall through to the scan rather than risking
+    // a rebuild stampede.
+  }
+  if (!gotLock) return null;
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    // Rebuild in the background; serve this request from the legacy scan.
+    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
+      console.error("public list index rebuild failed:", err);
+    }));
+    return null;
+  }
+  try {
+    return await rebuildPublicListIndex(env);
+  } catch (err) {
+    console.error("public list index rebuild failed:", err);
+    return null;
+  }
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;
@@ -945,25 +1264,166 @@ async function listAllKeys(namespace, prefix) {
   return { keys, list_complete: true };
 }
 
+// --- Account data purge (shared by reset and delete) -------------------------
+//
+// /api/creator/account/reset and /api/creator/delete-account are the same
+// sweep apart from one thing: whether the identity itself (`creator:{u}`
+// plus the D1 `creators` row) goes too. They used to be written out
+// separately, and drifted -- delete-account was still naming
+// `creatorprofile:`/`creatorpresets:`/`creatorchannels:`, key names this
+// codebase has not written in a long time, while missing every key it
+// actually does write (`creatorsync:`, `creatorsynctracking:`,
+// `creatorsyncpresets:`, `creatorsyncchannels:`, ...). The result was a
+// "delete my account" that returned ok:true while leaving the account
+// fully intact and still able to authenticate. One function so that
+// cannot happen again: anything added to the account's key set gets
+// cleaned up by both callers automatically.
+async function purgeCreatorData(env, username, options = {}) {
+  const deleteIdentity = options.deleteIdentity === true;
+  const u = username;
+  let listsCleared = 0;
+  const purgedListIds = [];
+  let keysCleared = 0;
+
+  // Custom lists are one key each and list() pages -- keep going until the
+  // cursor is exhausted rather than assuming a single page covers an
+  // account that may have hundreds.
+  try {
+    let cursor;
+    for (let page = 0; page < 50; page++) {
+      const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+      for (const k of res.keys) {
+        await env.CONFIGS.delete(k.name);
+        // Drop it from the directory index too, or a deleted account's
+        // lists keep appearing publicly until the next full rebuild.
+        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
+        listsCleared++;
+      }
+      if (res.list_complete || !res.cursor) break;
+      cursor = res.cursor;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: list enumeration failed", e);
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+    } catch (dbErr) {
+      console.error("D1 write error (purgeCreatorData lists):", dbErr);
+    }
+  }
+
+  // One index write for the whole account rather than one per list --
+  // deleting an account with 200 lists should not be 200 read-modify-writes
+  // against the same key (KV allows 1 write/sec/key).
+  if (purgedListIds.length) {
+    try {
+      const idx = await readPublicListIndex(env);
+      if (idx) {
+        const gone = new Set(purgedListIds);
+        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+      }
+    } catch (e) {
+      console.error("purgeCreatorData: index cleanup failed", e);
+    }
+  }
+
+  // Everything else the account owns, under the key names actually in use
+  // today, plus the legacy ones (harmless if absent) so an old account
+  // still gets fully cleaned.
+  const dataKeys = [
+    `creatorsync:${u}`,
+    `creatorsynctracking:${u}`,
+    `creatorsyncpresets:${u}`,
+    `creatorsyncchannels:${u}`,
+    `creatorlistorder:${u}`,
+    `creatorscrobblequeue:${u}`,
+    `creatorlistlikes:${u}`,
+    `creatorlikes:${u}`,
+    `creatorshare:${u}`,
+    // legacy names, harmless if absent
+    `creatortrack:${u}`,
+    `creatorpresets:${u}`,
+    `creatorchannels:${u}`,
+    `creatorprofile:${u}`,
+  ];
+  for (const key of dataKeys) {
+    try {
+      await env.CONFIGS.delete(key);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete", key, e);
+    }
+  }
+
+  if (deleteIdentity) {
+    // Last, and only for delete-account: the identity itself. Done after
+    // the data sweep so that a failure partway through leaves an account
+    // that can still sign in and retry, rather than orphaned data with no
+    // owner and a username nobody can ever reclaim.
+    try {
+      await env.CONFIGS.delete(`creator:${u}`);
+      keysCleared++;
+    } catch (e) {
+      console.error("purgeCreatorData: could not delete identity", e);
+    }
+    try {
+      await env.CONFIGS.delete(`creatorlastseen:${u}`);
+      keysCleared++;
+    } catch (e) {}
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
+      } catch (dbErr) {
+        console.error("D1 write error (purgeCreatorData identity):", dbErr);
+      }
+    }
+  }
+
+  // Any verification memoized in a warm isolate must stop being honoured
+  // the instant the account it refers to is reset or removed.
+  try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+  return { listsCleared, keysCleared };
+}
+
+// D1 is an optional accelerator in front of KV, never a replacement for it
+// -- KV remains the store every account is guaranteed to exist in (see the
+// unconditional KV writes in the create/rotate paths).
+//
+// This used to `return null` when D1 was bound and the row was absent,
+// instead of falling through to KV. That is only correct if every account
+// is guaranteed present in D1, which is exactly what is NOT true: D1 is
+// populated lazily by /admin/api/migrate-d1, so every account created
+// before that endpoint was first run has no D1 row. Binding DB therefore
+// locked all of those users out of their own accounts completely -- the
+// key was fine, the data was fine, the lookup just said "no such creator"
+// and every endpoint returned the generic "Username or Key is incorrect."
+// A missing row means "not migrated yet", not "does not exist".
 async function getCreator(env, username) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreator), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creator:${username}`);
 }
 
+// Same lazy-migration hazard as getCreator above: a list absent from D1
+// must fall through to KV rather than being reported as nonexistent.
 async function getCreatorList(env, username, slug) {
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
-      if (results.length > 0) {
+      if (results && results.length > 0) {
         const row = results[0];
         return JSON.stringify({ 
           slug: row.id.split(':')[1] || slug, 
@@ -976,8 +1436,10 @@ async function getCreatorList(env, username, slug) {
           likes: row.likes || 0
         });
       }
-      return null;
-    } catch(e) {}
+      // fall through to KV -- not migrated (or D1 is behind)
+    } catch(e) {
+      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+    }
   }
   return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
 }
