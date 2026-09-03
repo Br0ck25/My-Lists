@@ -3907,7 +3907,7 @@
       }
     }
 
-    return new Response("Not found", { status: 404, headers: corsHeaders() });
+    return new Response("Not found", { status: 404 });
 }
 
 // The actual Worker export. Delegates to handleFetch (25_api-catalog-

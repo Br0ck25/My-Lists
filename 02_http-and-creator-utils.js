@@ -6,6 +6,26 @@ function corsHeaders() {
   };
 }
 
+// Stremio / wako fetch catalog, manifest, meta, and public-list JSON from
+// other origins, so those routes still advertise `Access-Control-Allow-Origin:
+// *`. Creator and like endpoints must not: `json()` used to spread
+// corsHeaders() onto every JSON response, including POSTs, and a simple
+// cross-origin POST (text/plain) is not preflighted -- that is how
+// unauthenticated writes (likes) became callable from any page.
+function isPublicCorsPath(path) {
+  const p = String(path || "");
+  if (p === "/manifest.json" || p.endsWith("/manifest.json")) return true;
+  if (p.includes("/catalog/") && p.endsWith(".json")) return true;
+  if (p.includes("/subtitles/") && p.endsWith(".json")) return true;
+  if ((p.includes("/meta/") || p.startsWith("/meta/")) && p.endsWith(".json")) return true;
+  if (p === "/lists/public.json" || p === "/api/public-lists.json") return true;
+  if (/^\/lists\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.json$/.test(p)) return true;
+  if (p === "/icon.png" || p === "/unavailable-poster.svg") return true;
+  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo") return true;
+  if (p.startsWith("/api/scrobble")) return true;
+  return false;
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -100,14 +120,18 @@ function json(data, status = 200, extraHeaders = {}) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "max-age=3600",
-      ...corsHeaders(),
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin
       // call site needing to keep repeating the default just to get it.
+      // CORS is NOT included by default -- see jsonPublic / corsHeaders.
       ...extraHeaders,
     },
   });
+}
+
+function jsonPublic(data, status = 200, extraHeaders = {}) {
+  return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
 // Detect whether a request is a top-level browser page load (someone tapping

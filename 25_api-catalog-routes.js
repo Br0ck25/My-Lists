@@ -30,7 +30,10 @@ async function handleFetch(request, env, ctx) {
     const path = url.pathname;
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      if (isPublicCorsPath(path)) {
+        return new Response(null, { headers: corsHeaders() });
+      }
+      return new Response(null, { status: 204 });
     }
 
     if (path === "/" || path === "") {
@@ -384,7 +387,7 @@ async function handleFetch(request, env, ctx) {
         return Response.redirect(`${url.origin}/${m[1]}/configure`, 302);
       }
       const { entries, track, shuffleShelves } = await resolveConfig(m[1], env);
-      return json(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
+      return jsonPublic(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
     }
 
     // bare manifest.json with no config
@@ -392,7 +395,7 @@ async function handleFetch(request, env, ctx) {
       if (isBrowserNavigation(request)) {
         return Response.redirect(`${url.origin}/configure`, 302);
       }
-      return json(buildManifest([], url.origin));
+      return jsonPublic(buildManifest([], url.origin));
     }
 
     // /:config/subtitles/:type/:id.json -- see buildManifest's comment
@@ -417,7 +420,7 @@ async function handleFetch(request, env, ctx) {
       // shouldn't hold up how fast this responds. ctx.waitUntil lets it
       // keep running after the response is already on its way.
       ctx.waitUntil(handleSubtitlesTrack(configParam, stremioType, decodeURIComponent(rawId), env, request));
-      return json({ subtitles: [] });
+      return jsonPublic({ subtitles: [] });
     }
 
     if (path === "/app.webmanifest") {
@@ -615,7 +618,7 @@ self.addEventListener('fetch', e => {
 
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
-      if (!entry || entry.enabled === false) return json({ metas: [] });
+      if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
       const source = detectSource(entry.url);
       const isAutoTrack = source === "autotrack";
@@ -639,14 +642,14 @@ self.addEventListener('fetch', e => {
           );
         }
         if (isUserPersonal) {
-          return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
-        return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
         if (isUserPersonal) {
           console.error("User personal catalog fetch error:", errMsg);
-          return json({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
 
         if (skip === 0 && staleKey) {
@@ -657,7 +660,7 @@ self.addEventListener('fetch', e => {
               // exactly like a normal successful load. `stale` is
               // informational only (visible when debugging via curl), not
               // read by wako/Stremio itself.
-              return json({ metas: JSON.parse(stale), stale: true, error: errMsg });
+              return jsonPublic({ metas: JSON.parse(stale), stale: true, error: errMsg });
             }
           } catch {
             // KV read/parse failed -- fall through to the placeholder below.
@@ -667,7 +670,7 @@ self.addEventListener('fetch', e => {
           // tile so the row still appears instead of silently disappearing.
           // Uses a dummy "tt"-prefixed id since the manifest declares
           // idPrefixes: ["tt", ...] and some clients filter out anything else.
-          return json({
+          return jsonPublic({
             metas: [
               {
                 id: "tt0000000",
@@ -683,7 +686,7 @@ self.addEventListener('fetch', e => {
         // Metas stays empty so wako/Stremio just shows an empty row instead
         // of erroring out, but the reason is still visible if you curl this
         // URL directly while debugging.
-        return json({ metas: [], error: errMsg }, 200);
+        return jsonPublic({ metas: [], error: errMsg }, 200);
       }
     }
 
@@ -849,7 +852,7 @@ self.addEventListener('fetch', e => {
 
       // 1. Synthetic meta for Channels
       if (id.startsWith("channel_")) {
-        if (metaType !== "series") return json({ meta: null });
+        if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
           const { entries } = await resolveConfig(config, env);
@@ -867,11 +870,11 @@ self.addEventListener('fetch', e => {
             }
             if (matchedEntry) break;
           }
-          if (!matchedEntry) return json({ meta: null });
+          if (!matchedEntry) return jsonPublic({ meta: null });
           const meta = buildChannelMeta(matchedEntry, url.origin);
-          return json({ meta: meta || null });
+          return jsonPublic({ meta: meta || null });
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
@@ -881,18 +884,18 @@ self.addEventListener('fetch', e => {
           const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
           const effectiveKey = tmdbKey || TMDB_API_KEY;
           const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
-          if (!meta) return json({ meta: null });
-          return json(
+          if (!meta) return jsonPublic({ meta: null });
+          return jsonPublic(
             { meta },
             200,
             { "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800" }
           );
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
-      return json({ meta: null });
+      return jsonPublic({ meta: null });
     }
 
     // /api/channel-logo?path=...[&format=landscape]
