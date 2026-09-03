@@ -1,5 +1,10 @@
 -- schema.sql
 -- Run this with: npx wrangler d1 execute my-lists-db --file=./schema.sql
+--
+-- WARNING: this file DROPs every table before creating it. It provisions a
+-- BLANK database and will destroy all existing data. Do NOT run it against a
+-- database that is already live. To change the shape of a deployed database,
+-- add a file under migrations/ instead.
 
 DROP TABLE IF EXISTS creators;
 CREATE TABLE creators (
@@ -19,6 +24,7 @@ CREATE TABLE creator_lists (
     type TEXT NOT NULL,
     visibility TEXT NOT NULL DEFAULT 'private',
     items_json TEXT NOT NULL DEFAULT '[]',
+    likes INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE

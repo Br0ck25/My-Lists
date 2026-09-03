@@ -5326,9 +5326,10 @@ self.addEventListener('fetch', e => {
         try {
           await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
         } catch (dbErr) {
-          // Non-fatal: KV above holds the authoritative count. Note the
-          // deployed schema may not even have a `likes` column -- see
-          // AUDIT-STATUS.md item D.
+          // Non-fatal: KV above holds the authoritative count, so a like is
+          // never lost by D1 being unavailable. Requires the `likes` column
+          // from migrations/0001; without it this throws on every like.
+          console.error("D1 write error (list likes):", dbErr);
         }
       }
 

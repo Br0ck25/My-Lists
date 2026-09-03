@@ -50367,9 +50367,10 @@ self.addEventListener('fetch', e => {
         try {
           await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
         } catch (dbErr) {
-          // Non-fatal: KV above holds the authoritative count. Note the
-          // deployed schema may not even have a `likes` column -- see
-          // AUDIT-STATUS.md item D.
+          // Non-fatal: KV above holds the authoritative count, so a like is
+          // never lost by D1 being unavailable. Requires the `likes` column
+          // from migrations/0001; without it this throws on every like.
+          console.error("D1 write error (list likes):", dbErr);
         }
       }
 
@@ -53679,7 +53680,11 @@ self.addEventListener('fetch', e => {
       // 2. Creator Lists
       const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
       for (const k of lKeys.keys) {
-        const [, , u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
+        // Two capture groups, so they are match[1] and match[2]. The old
+        // `[, , u, slug]` skipped one element too many: slug came out
+        // undefined, the `if (u && slug)` guard below rejected every key,
+        // and the migration silently reported "lists: 0" while claiming ok.
+        const [, u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
         if (u && slug) {
           const raw = await env.CONFIGS.get(k.name);
           if (raw) {
@@ -53687,9 +53692,12 @@ self.addEventListener('fetch', e => {
               const data = JSON.parse(raw);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              // `likes` is carried across too. KV holds the authoritative
+              // count, so a migration that omitted it would silently reset
+              // every list to zero in D1.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);

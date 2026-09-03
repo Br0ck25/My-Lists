@@ -35,6 +35,18 @@ degrades quality at growth rather than leaking data today.
 | 9 | 🟠 | **`like-external` was an unbounded attacker-controlled KV keyspace.** Any string minted a new permanent key (storage/billing DoS). Now requires a well-formed `http(s)` URL, ≤ 300 chars, host on the known-provider allowlist, and normalizes before hashing. | Live: `evil.example` → 400; `javascript:` → 400; 2 KB URL → 400; trakt.tv → 200 |
 | 10 | 🟡 | **`/api/bulk-resolve` leaked raw `SyntaxError` text** with the caller's malformed body at HTTP 500. Now the standard `{"ok":false,"error":"Invalid JSON body."}` + 400 used everywhere else. | Live: malformed body → 400, no internal detail |
 
+### Round 3 — this commit
+
+| # | Severity | Issue | Verified by |
+|---|---|---|---|
+| D | 🟠 | **`likes` column never existed, so likes were silently KV-only.** `UPDATE creator_lists SET likes = ?` threw on *every* like and the error was swallowed by a bare `catch {}` — a D1 restore would have lost every count. Added the column to `schema.sql` **and** a non-destructive `migrations/0001` for the already-deployed DB (`schema.sql` DROPs everything, so it can never be run against live data). Added an index for popularity sort. The swallowing catch now `console.error`s. | Live w/ D1: 3 likes → `likes=3` in D1; unlike → `2`; **editing a list keeps likes at 2** |
+| 11 | 🔴 | **KV→D1 migration never migrated a single list** *(found while verifying D)*. `const [, , u, slug] = k.name.match(...)` skipped one capture group too many, so `slug` was always `undefined`, the `if (u && slug)` guard rejected every key, and the endpoint reported `{"ok":true, lists:0}` — a **silent** no-op that would look like a successful migration. | Live: before `lists: 0` → after `lists: 3`, likes carried across |
+| 12 | 🟡 | Migration dropped like counts: `ON CONFLICT DO NOTHING` + no `likes` in the insert would have reset every list to 0 in D1. Now inserts `likes` and repairs it on re-run (`DO UPDATE SET likes=excluded.likes`), leaving all other columns untouched. | Live: wiped D1 rows, re-ran migrate → counts restored from KV |
+
+**Action required on deploy:** run
+`npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql`
+once, then POST `/admin/api/migrate-d1` to copy existing KV counts into D1.
+
 ---
 
 ## 🔜 Remaining — in priority order
@@ -67,11 +79,6 @@ stores whatever string arrives. Missing/typo'd field ⇒ treated as **public**.
 Fix: normalize to a two-value enum on write, then invert reads to
 `=== "public"`. **Compat impact:** existing lists with no `visibility` flip
 public→private, so backfill first.
-
-### 🟡 D. `schema.sql` drift — likes are silently KV-only
-Schema declares no `likes` column, but code runs `UPDATE creator_lists SET
-likes = …` and reads `row.likes`. That statement throws every time, is
-swallowed, and falls through to KV. Verify against the deployed DB.
 
 ### 🟡 E. CORS `*` on state-changing endpoints
 Bounded (credentials are in the body, not cookies; admin is `SameSite=Strict`),
