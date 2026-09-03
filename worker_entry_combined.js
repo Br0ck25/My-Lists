@@ -2448,6 +2448,116 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 }
 
 
+// --- Like voter ledger -------------------------------------------------------
+//
+// Likes used to be a bare read-modify-write counter on an unauthenticated
+// endpoint: every POST did `likes = likes + 1` with nothing recording WHO
+// voted. A trivial curl loop took a list from 0 to 11 in one second, and
+// `action:"unlike"` decremented just as freely, so a competing list could
+// be driven to zero as easily as your own could be inflated. Since the
+// community directory sorts and surfaces by likes, that made the ranking
+// meaningless.
+//
+// Instead of a counter, each likeable thing now keeps a small ledger of
+// distinct voter ids. Liking is idempotent set-insertion and unliking is
+// set-removal, so replaying the same request any number of times converges
+// on the same state rather than accumulating. The displayed count is
+// derived from the ledger size, never incremented directly.
+//
+// Voter identity, best available:
+//   * signed-in creator  -> "u:<username>"  (stable across devices)
+//   * anonymous          -> "a:<hash of IP + list id>"
+// The anonymous id is salted with the list id specifically so the same
+// ledger cannot be used to correlate one IP's activity across lists.
+//
+// This is deliberately NOT full authentication -- likes stay available to
+// signed-out visitors, which is the existing product behaviour. It raises
+// ballot-stuffing from "one curl loop" to "one vote per IP per list",
+// which is the appropriate bar for a non-critical popularity signal.
+const LIKE_VOTER_CAP = 5000;
+
+async function likeVoterId(request, env, creatorUsername, scopeId) {
+  if (creatorUsername) return `u:${creatorUsername}`;
+  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const hash = await hashStringForKey(`${ip}|${scopeId}`);
+  return `a:${hash}`;
+}
+
+// Applies one vote to a ledger key and returns the resulting count.
+// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
+// be a new voter -- the caller keeps the existing count rather than
+// silently discarding the vote or growing the key without bound.
+async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  let voters = [];
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) voters = parsed;
+      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+    }
+  } catch {
+    voters = [];
+  }
+  const set = new Set(voters);
+  const had = set.has(voterId);
+  if (liked) {
+    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+    set.add(voterId);
+  } else {
+    set.delete(voterId);
+  }
+  // No write at all when nothing changed -- KV allows one write per second
+  // per key, and a double-tap on a busy list should not burn that budget
+  // or race with a genuine vote.
+  if (set.size !== voters.length || had !== set.has(voterId)) {
+    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+  }
+  return { count: set.size, capped: false };
+}
+
+// --- External list URL validation --------------------------------------------
+//
+// /api/lists/like-external hashes a caller-supplied URL into a KV key. With
+// no validation that was an unbounded, attacker-controlled key-space write
+// primitive: any string at all minted a brand-new permanent KV key, which
+// is a storage and billing denial-of-service and pollutes the external
+// likes dataset with garbage nobody can ever clean up.
+//
+// Only list URLs from the providers this add-on actually integrates with
+// are likeable, which is the only thing the feature was ever for.
+const EXTERNAL_LIKE_HOSTS = new Set([
+  "mdblist.com", "www.mdblist.com",
+  "trakt.tv", "www.trakt.tv",
+  "themoviedb.org", "www.themoviedb.org",
+  "simkl.com", "www.simkl.com",
+  "letterboxd.com", "www.letterboxd.com",
+]);
+
+function normalizeExternalListUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s || s.length > 300) return null;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  // Blocks javascript:, data:, file:, and anything else non-web outright.
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  const host = u.hostname.toLowerCase();
+  if (!EXTERNAL_LIKE_HOSTS.has(host)) return null;
+  // Normalized so the same list liked via http/https, with or without a
+  // "www." prefix, with a trailing slash, or with tracking query params
+  // all land on ONE ledger instead of fragmenting the count across
+  // near-duplicate keys. The "www." strip matters most: trakt.tv and
+  // www.trakt.tv are the same list to a human, and were otherwise counted
+  // separately.
+  const bareHost = host.replace(/^www\./, "");
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  return `https://${bareHost}${path}`;
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;
@@ -21906,7 +22016,17 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: parts[0], slug: parts[1], action: wasLiked ? 'unlike' : 'like' }),
+        // Creator credentials ride along when signed in so the vote is
+        // recorded against the account (one like per account across every
+        // device) rather than against this browser's IP. Optional --
+        // signed-out liking still works, it just votes per-IP.
+        body: JSON.stringify({
+          username: parts[0],
+          slug: parts[1],
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -21965,7 +22085,12 @@ document.addEventListener('click', async (e) => {
       const res = await fetch(ORIGIN + '/api/lists/like-external', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: listUrl, action: wasLiked ? 'unlike' : 'like' }),
+        body: JSON.stringify({
+          url: listUrl,
+          action: wasLiked ? 'unlike' : 'like',
+          creatorName: activeCreator ? activeCreator.creatorName : undefined,
+          creatorKey: activeCreator ? (localStorage.getItem('myListAddon:creatorKey') || undefined) : undefined,
+        }),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -50201,21 +50326,10 @@ self.addEventListener('fetch', e => {
       const likeSlug = String(likeBody.slug || "").toLowerCase().trim();
       const likeUnlike = likeBody.action === "unlike";
       if (!likeUser || !likeSlug) return json({ ok: false, error: "Missing list reference." }, 400);
-      
-      if (env.DB) {
-        try {
-          const listId = `${likeUser}:${likeSlug}`;
-          const increment = likeUnlike ? -1 : 1;
-          const { success, results } = await env.DB.prepare(
-            "UPDATE creator_lists SET likes = MAX(0, likes + ?) WHERE id = ? RETURNING likes"
-          ).bind(increment, listId).run();
-          
-          if (success && results.length > 0) {
-            return json({ ok: true, likes: results[0].likes });
-          }
-        } catch (dbErr) {}
-      }
 
+      // The list must actually exist before any vote is recorded --
+      // otherwise a ledger (and a permanent KV key) could be created for
+      // any username/slug pair someone cared to invent.
       const likeCreatorKey = "creatorlist:" + likeUser + ":" + likeSlug;
       const likeAnonKey = "publishedlist:" + likeUser + ":" + likeSlug;
       let likeKey = null;
@@ -50224,9 +50338,42 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
-      likeData.likes = Math.max(0, (likeData.likes || 0) + (likeUnlike ? -1 : 1));
-      await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
-      return json({ ok: true, likes: likeData.likes });
+
+      // Signed-in visitors vote as themselves; everyone else votes as a
+      // per-list hash of their IP. Either way one identity is worth exactly
+      // one like, no matter how many times it POSTs. A creatorKey is
+      // verified when supplied, but is NOT required -- signed-out liking
+      // is existing behaviour and stays working.
+      let likeVoterName = "";
+      if (likeBody.creatorName && likeBody.creatorKey) {
+        const likeAuth = await authenticateCreator(likeBody.creatorName, likeBody.creatorKey);
+        if (likeAuth.ok) likeVoterName = likeAuth.username;
+      }
+      const listScopeId = `${likeUser}:${likeSlug}`;
+      const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      const ledgerKey = `listlikevoters:${listScopeId}`;
+      const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
+
+      // The count lives on the list record too, because the directory,
+      // search, and the admin dashboard all read it from there and none of
+      // them should have to open a ledger per list. Derived from the
+      // ledger, never incremented, so it cannot drift upward on its own.
+      if ((likeData.likes || 0) !== count) {
+        likeData.likes = count;
+        await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
+      }
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
+        } catch (dbErr) {
+          // Non-fatal: KV above holds the authoritative count. Note the
+          // deployed schema may not even have a `likes` column -- see
+          // AUDIT-STATUS.md item D.
+        }
+      }
+
+      return json({ ok: true, likes: count, liked: !likeUnlike, capped: capped || undefined });
     }
 
     if (path === "/api/lists/like-external" && request.method === "POST") {
@@ -50239,23 +50386,44 @@ self.addEventListener('fetch', e => {
       }
       const rawUrl = String(body.url || "").trim();
       if (!rawUrl) return json({ ok: false, error: "Missing list URL." }, 400);
+      // Validated and normalized before it is allowed anywhere near a KV
+      // key -- see normalizeExternalListUrl. Rejects non-http(s) schemes,
+      // over-long strings, and any host that isn't a provider this add-on
+      // integrates with, which is what stops this endpoint being an
+      // unbounded attacker-controlled keyspace.
+      const normalizedUrl = normalizeExternalListUrl(rawUrl);
+      if (!normalizedUrl) {
+        return json({ ok: false, error: "That URL can't be liked -- only MDBList, Trakt, TMDB, Simkl, and Letterboxd list links are supported." }, 400);
+      }
       const unlike = body.action === "unlike";
-      const hash = await hashStringForKey(rawUrl.toLowerCase());
+
+      let extVoterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const extAuth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (extAuth.ok) extVoterName = extAuth.username;
+      }
+
+      const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
+      const voterId = await likeVoterId(request, env, extVoterName, hash);
+      const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
+
       const raw = await env.CONFIGS.get(key);
-      let data = { url: rawUrl, likes: 0 };
+      let data = { url: normalizedUrl, likes: 0 };
       if (raw) {
         try {
           data = JSON.parse(raw);
         } catch {
-          data = { url: rawUrl, likes: 0 };
+          data = { url: normalizedUrl, likes: 0 };
         }
       }
-      data.likes = Math.max(0, (data.likes || 0) + (unlike ? -1 : 1));
-      data.url = rawUrl;
-      data.updatedAt = Date.now();
-      await env.CONFIGS.put(key, JSON.stringify(data));
-      return json({ ok: true, likes: data.likes });
+      if (data.likes !== count || data.url !== normalizedUrl) {
+        data.likes = count;
+        data.url = normalizedUrl;
+        data.updatedAt = Date.now();
+        await env.CONFIGS.put(key, JSON.stringify(data));
+      }
+      return json({ ok: true, likes: count, liked: !unlike, capped: capped || undefined });
     }
 
 
@@ -54099,8 +54267,21 @@ self.addEventListener('fetch', e => {
     // Resolves an array of {title, year} objects to TMDB/IMDB IDs
     // Used by the Letterboxd CSV import
     if (path === "/api/bulk-resolve" && request.method === "POST") {
+      // Parsed separately from the work below so a malformed body returns
+      // the same 400 + generic message every other route uses, instead of
+      // falling into the catch and echoing the raw SyntaxError (which
+      // included the caller's own payload) back at HTTP 500.
+      let bulkBody;
       try {
-        const body = await request.json();
+        bulkBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      if (!bulkBody || !Array.isArray(bulkBody.items)) {
+        return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      try {
+        const body = bulkBody;
         const items = body.items || [];
         const resolved = [];
         // Always the shared TMDB_API_KEY -- no per-user override on this
@@ -54156,7 +54337,10 @@ self.addEventListener('fetch', e => {
         if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
         return json({ ok: true, resolved });
       } catch (e) {
-        return json({ ok: false, error: String(e) }, 500);
+        // Logged, not returned -- the message can carry upstream URLs and
+        // internal detail that the caller has no business seeing.
+        console.error("bulk-resolve failed:", e);
+        return json({ ok: false, error: "Could not resolve those titles." }, 500);
       }
     }
 

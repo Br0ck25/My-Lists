@@ -927,6 +927,116 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 }
 
 
+// --- Like voter ledger -------------------------------------------------------
+//
+// Likes used to be a bare read-modify-write counter on an unauthenticated
+// endpoint: every POST did `likes = likes + 1` with nothing recording WHO
+// voted. A trivial curl loop took a list from 0 to 11 in one second, and
+// `action:"unlike"` decremented just as freely, so a competing list could
+// be driven to zero as easily as your own could be inflated. Since the
+// community directory sorts and surfaces by likes, that made the ranking
+// meaningless.
+//
+// Instead of a counter, each likeable thing now keeps a small ledger of
+// distinct voter ids. Liking is idempotent set-insertion and unliking is
+// set-removal, so replaying the same request any number of times converges
+// on the same state rather than accumulating. The displayed count is
+// derived from the ledger size, never incremented directly.
+//
+// Voter identity, best available:
+//   * signed-in creator  -> "u:<username>"  (stable across devices)
+//   * anonymous          -> "a:<hash of IP + list id>"
+// The anonymous id is salted with the list id specifically so the same
+// ledger cannot be used to correlate one IP's activity across lists.
+//
+// This is deliberately NOT full authentication -- likes stay available to
+// signed-out visitors, which is the existing product behaviour. It raises
+// ballot-stuffing from "one curl loop" to "one vote per IP per list",
+// which is the appropriate bar for a non-critical popularity signal.
+const LIKE_VOTER_CAP = 5000;
+
+async function likeVoterId(request, env, creatorUsername, scopeId) {
+  if (creatorUsername) return `u:${creatorUsername}`;
+  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const hash = await hashStringForKey(`${ip}|${scopeId}`);
+  return `a:${hash}`;
+}
+
+// Applies one vote to a ledger key and returns the resulting count.
+// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
+// be a new voter -- the caller keeps the existing count rather than
+// silently discarding the vote or growing the key without bound.
+async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  let voters = [];
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) voters = parsed;
+      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+    }
+  } catch {
+    voters = [];
+  }
+  const set = new Set(voters);
+  const had = set.has(voterId);
+  if (liked) {
+    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+    set.add(voterId);
+  } else {
+    set.delete(voterId);
+  }
+  // No write at all when nothing changed -- KV allows one write per second
+  // per key, and a double-tap on a busy list should not burn that budget
+  // or race with a genuine vote.
+  if (set.size !== voters.length || had !== set.has(voterId)) {
+    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+  }
+  return { count: set.size, capped: false };
+}
+
+// --- External list URL validation --------------------------------------------
+//
+// /api/lists/like-external hashes a caller-supplied URL into a KV key. With
+// no validation that was an unbounded, attacker-controlled key-space write
+// primitive: any string at all minted a brand-new permanent KV key, which
+// is a storage and billing denial-of-service and pollutes the external
+// likes dataset with garbage nobody can ever clean up.
+//
+// Only list URLs from the providers this add-on actually integrates with
+// are likeable, which is the only thing the feature was ever for.
+const EXTERNAL_LIKE_HOSTS = new Set([
+  "mdblist.com", "www.mdblist.com",
+  "trakt.tv", "www.trakt.tv",
+  "themoviedb.org", "www.themoviedb.org",
+  "simkl.com", "www.simkl.com",
+  "letterboxd.com", "www.letterboxd.com",
+]);
+
+function normalizeExternalListUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s || s.length > 300) return null;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  // Blocks javascript:, data:, file:, and anything else non-web outright.
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  const host = u.hostname.toLowerCase();
+  if (!EXTERNAL_LIKE_HOSTS.has(host)) return null;
+  // Normalized so the same list liked via http/https, with or without a
+  // "www." prefix, with a trailing slash, or with tracking query params
+  // all land on ONE ledger instead of fragmenting the count across
+  // near-duplicate keys. The "www." strip matters most: trakt.tv and
+  // www.trakt.tv are the same list to a human, and were otherwise counted
+  // separately.
+  const bareHost = host.replace(/^www\./, "");
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  return `https://${bareHost}${path}`;
+}
+
 async function listAllKeys(namespace, prefix) {
   const keys = [];
   let cursor;

@@ -3741,8 +3741,21 @@
     // Resolves an array of {title, year} objects to TMDB/IMDB IDs
     // Used by the Letterboxd CSV import
     if (path === "/api/bulk-resolve" && request.method === "POST") {
+      // Parsed separately from the work below so a malformed body returns
+      // the same 400 + generic message every other route uses, instead of
+      // falling into the catch and echoing the raw SyntaxError (which
+      // included the caller's own payload) back at HTTP 500.
+      let bulkBody;
       try {
-        const body = await request.json();
+        bulkBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      if (!bulkBody || !Array.isArray(bulkBody.items)) {
+        return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      try {
+        const body = bulkBody;
         const items = body.items || [];
         const resolved = [];
         // Always the shared TMDB_API_KEY -- no per-user override on this
@@ -3798,7 +3811,10 @@
         if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
         return json({ ok: true, resolved });
       } catch (e) {
-        return json({ ok: false, error: String(e) }, 500);
+        // Logged, not returned -- the message can carry upstream URLs and
+        // internal detail that the caller has no business seeing.
+        console.error("bulk-resolve failed:", e);
+        return json({ ok: false, error: "Could not resolve those titles." }, 500);
       }
     }
 
