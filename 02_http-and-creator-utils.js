@@ -1030,9 +1030,60 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 // which is the appropriate bar for a non-critical popularity signal.
 const LIKE_VOTER_CAP = 5000;
 
+// Rate limits (and anonymous like votes) key on CF-Connecting-IP, which
+// Cloudflare's edge sets and a client cannot spoof. The old
+// `|| "unknown"` fallback meant every request missing the header shared
+// one global bucket -- a single header-less client could lock everyone
+// else out of signup, and any non-Cloudflare path had no real per-client
+// limit. Fail closed: empty/missing header returns null and the caller
+// rejects. IPv6 is collapsed to a /64 so one subscriber is one bucket
+// rather than 2^64 addresses.
+function expandIpv6Hextets(ip) {
+  const raw = String(ip || "").trim().replace(/^\[/, "").replace(/\]$/, "").split("%")[0];
+  if (!raw || !raw.includes(":")) return null;
+  if (!/^[0-9a-fA-F:]+$/.test(raw)) return null;
+  const sides = raw.split("::");
+  if (sides.length > 2) return null;
+  const parseSide = (s) => (s ? s.split(":") : []);
+  let head = parseSide(sides[0]);
+  let tail = sides.length === 2 ? parseSide(sides[1]) : [];
+  if (head.length === 1 && head[0] === "") head = [];
+  if (tail.length === 1 && tail[0] === "") tail = [];
+  if (sides.length === 1) {
+    if (head.length !== 8) return null;
+  } else if (8 - head.length - tail.length < 0) {
+    return null;
+  }
+  const mid = sides.length === 2 ? Array(8 - head.length - tail.length).fill("0") : [];
+  const all = [...head, ...mid, ...tail];
+  if (all.length !== 8) return null;
+  for (let i = 0; i < 8; i++) {
+    const h = all[i] || "0";
+    if (h.length > 4 || !/^[0-9a-fA-F]+$/.test(h)) return null;
+    all[i] = h.toLowerCase();
+  }
+  return all;
+}
+
+function clientIpKey(request) {
+  const raw = request && request.headers ? request.headers.get("CF-Connecting-IP") : "";
+  const ip = String(raw || "").trim();
+  if (!ip) return null;
+  const v4mapped = ip.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (v4mapped) return v4mapped[1];
+  if (ip.includes(".") && !ip.includes(":")) return ip;
+  const hextets = expandIpv6Hextets(ip);
+  if (hextets) {
+    const prefix = hextets.slice(0, 4).map((h) => h.replace(/^0+(?=[0-9a-f])/, "") || "0");
+    return prefix.join(":") + "::/64";
+  }
+  return ip.toLowerCase();
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
-  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const ip = clientIpKey(request);
+  if (!ip) return null;
   const hash = await hashStringForKey(`${ip}|${scopeId}`);
   return `a:${hash}`;
 }

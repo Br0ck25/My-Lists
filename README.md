@@ -72,6 +72,8 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 
 This section is only needed if you want to run your own dedicated copy instead of using the shared hosted instance at [mylistsaddon.com](https://mylistsaddon.com). Most people don't need this section at all.
 
+Self-hosting is expected on Cloudflare Workers. Account creation, restore, key reset, feedback, list preview, and anonymous likes are rate-limited (or identified) using Cloudflare's `CF-Connecting-IP` header — IPv6 is counted per `/64`. That header is set by the Cloudflare edge and cannot be spoofed there. If the header is missing, those endpoints reject the request rather than sharing one global bucket. Running this Worker outside Cloudflare therefore has **no real per-client rate limit** on those paths: they fail closed instead of pretending to throttle everyone together.
+
 ### Step 1 — Create the Cloudflare Worker
 
 1. Log into your [Cloudflare Dashboard](https://dash.cloudflare.com).

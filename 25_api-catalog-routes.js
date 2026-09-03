@@ -783,8 +783,9 @@ self.addEventListener('fetch', e => {
       // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
       // -- 80/minute is enough for Live Preview paging a shelf, not enough
       // to use this as a free outbound scanner.
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Couldn't load that list." }, 400, { "Cache-Control": "no-store" });
       if (env && env.CONFIGS) {
-        const ip = request.headers.get("CF-Connecting-IP") || "unknown";
         const rateKey = `ratelimit:preview:${ip}`;
         const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
         if (n >= 80) {
@@ -4611,12 +4612,17 @@ self.addEventListener('fetch', e => {
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-      const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
-      const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
-      const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (!isAdmin && rateCount >= 20) {
-        return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+      let rateLimitKey = null;
+      let rateCount = 0;
+      if (!isAdmin) {
+        const ip = clientIpKey(request);
+        if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
+        rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
+        const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+        rateCount = parseInt(rateCountRaw, 10) || 0;
+        if (rateCount >= 20) {
+          return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+        }
       }
 
       // If replying to an existing thread
@@ -5383,6 +5389,7 @@ self.addEventListener('fetch', e => {
       }
       const listScopeId = `${likeUser}:${likeSlug}`;
       const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const ledgerKey = `listlikevoters:${listScopeId}`;
       const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
 
@@ -5458,6 +5465,7 @@ self.addEventListener('fetch', e => {
       const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
       const voterId = await likeVoterId(request, env, extVoterName, hash);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
 
       const raw = await env.CONFIGS.get(key);

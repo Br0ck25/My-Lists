@@ -1046,7 +1046,8 @@
     // requester's own IP.
     if (path === "/api/creator/create" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorcreate:${ip}`;
       if (await env.CONFIGS.get(rateLimitKey)) {
         return json({ ok: false, error: "Please wait a moment before creating another Profile." }, 429);
@@ -1144,7 +1145,8 @@
       } catch {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `resetkeyrate:${ip}:${statsToday()}`;
       const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
@@ -1296,7 +1298,8 @@
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
     if (path === "/api/creator/restore" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorrestore:${ip}`;
       const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
       // More generous than profile creation (this is a normal, repeatable
