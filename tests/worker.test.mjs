@@ -578,6 +578,26 @@ describe("admin login", () => {
     const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "wrong-key" } });
     assert.equal(r.status, 401);
   });
+
+  it("renders the Maintenance tab with dashboard-clickable D1/index tools", async () => {
+    const env = makeEnv();
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin", { method: "GET", cookie });
+    assert.equal(r.status, 200);
+    assert.match(r.text, /id="migrateD1Btn"/);
+    assert.match(r.text, /id="rebuildIndexBtn"/);
+    // No env.DB bound in this test env -- the D1 action should render
+    // visibly disabled rather than silently doing nothing if clicked.
+    assert.match(r.text, /id="migrateD1Btn"[^>]*disabled/);
+  });
+
+  it("enables the D1 migration button once a D1 database is actually bound", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin", { method: "GET", cookie });
+    assert.equal(r.status, 200);
+    assert.doesNotMatch(r.text, /id="migrateD1Btn"[^>]*disabled/);
+  });
 });
 
 describe("sync conflict guard", () => {

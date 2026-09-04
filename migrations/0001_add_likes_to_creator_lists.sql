@@ -12,12 +12,16 @@
 -- -- re-running errors with "duplicate column name: likes", which is
 -- harmless but means you should only apply it once.
 --
--- Run with:
---   npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: open this database's Console tab and paste/run the two
+--   statements below (skip these comment lines).
+--   Wrangler:  npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql
 --
 -- Existing counts live in KV and are the source of truth. After migrating,
--- POST /admin/api/migrate-d1 to copy them across; until then the column
--- reads 0 for lists that have not been liked again since.
+-- use the "Migrate KV -> D1" button under /admin's Management & Tools ->
+-- Maintenance tab (or POST /admin/api/migrate-d1 directly) to copy them
+-- across; until then the column reads 0 for lists that have not been
+-- liked again since.
 
 ALTER TABLE creator_lists ADD COLUMN likes INTEGER NOT NULL DEFAULT 0;
 
