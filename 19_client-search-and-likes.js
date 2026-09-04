@@ -25,11 +25,22 @@ function setListSearchFilter(filter, btn) {
 
 function guessNameFromUrl(u) {
   try {
-    const parts = String(u).split('/').filter(Boolean);
-    let last = parts[parts.length - 1] || u;
+    // Query string and fragment stripped first -- otherwise a URL copied
+    // while some filter/view toggle on the source site is active (e.g.
+    // "?Mode=Show") either becomes the entire guessed name (if there's a
+    // trailing slash before the "?", so it lands in its own "/"-separated
+    // segment) or gets appended to the end of it. Neither is a real list
+    // name; only the path is.
+    const noQuery = String(u).split(/[?#]/)[0];
+    const parts = noQuery.split('/').filter(Boolean);
+    let last = parts[parts.length - 1] || noQuery || u;
     last = last.replace(/[-_]+/g, ' ').trim();
     if (!last) return 'List';
-    return last.replace(/\\b\\w/g, (c) => c.toUpperCase());
+    // Title-case each word. (Previously /\\b\\w/g -- a double-escaped
+    // regex that matches the literal 4-character text "\b\w", not a word
+    // boundary + word character, so this never actually matched anything
+    // and every guessed name silently kept its original casing.)
+    return last.replace(/\b\w/g, (c) => c.toUpperCase());
   } catch (e) {
     return 'List';
   }

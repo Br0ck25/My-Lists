@@ -2231,6 +2231,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   let loadedCount = 0;
   let pagesLoaded = 0;
   const MAX_PAGES = 20;
+  // A source that doesn't actually honor skip (a malformed/misdetected
+  // URL, or a provider whose pagination silently ignores an out-of-range
+  // offset) can keep answering maybeMore:true with the exact same items
+  // every time. Trusting that alone means this loop only stops at
+  // MAX_PAGES * one page's worth of items (up to 2,000) of pure repeats of
+  // a list that might only have a few hundred real items. Tracked
+  // independent of the type-tab filter in appendItems below, by id, so a
+  // page that comes back with zero items this loop hasn't already seen
+  // stops pagination even if the server insists there's more.
+  const seenItemIds = new Set();
 
   const isSimklUserList = listUrl && listUrl.startsWith('simkl:user:');
   const simklStatusMatch = isSimklUserList ? (listUrl.split(':')[3] || 'plantowatch') : '';
@@ -2326,7 +2336,22 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     return it;
   }
 
+  // Returns how many of the passed-in items weren't already in this
+  // list-details view (by id) before appending -- loadNextPage uses this
+  // to tell a genuine next page apart from a source repeating itself.
+  // Preloaded/local sources (custom lists, autotrack, etc.) never call
+  // loadNextPage at all (see its own early-return), so this only ever
+  // runs against real paginated /api/preview results, which always carry
+  // a stable id.
   function appendItems(items) {
+    let newCount = 0;
+    items.forEach((it) => {
+      const key = it && (it.id != null ? String(it.id) : null);
+      if (key === null || !seenItemIds.has(key)) {
+        newCount++;
+        if (key !== null) seenItemIds.add(key);
+      }
+    });
     const annotated = items.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
@@ -2342,6 +2367,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // rebuilds the whole accumulated grid on every page that arrives.
     renderPosterGridChunked(gridEl, filtered);
     loadedCount = window._currentListDetailsAllItems.length;
+    return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
     subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
@@ -2388,10 +2414,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         knownTotalItems = data.totalItems;
       }
       const items = data.sample || [];
-      appendItems(items);
+      const newCount = appendItems(items);
       skip += items.length;
       pagesLoaded++;
-      updateStatusAfterPage(data.maybeMore, items.length);
+      // A page that came back non-empty but contributed nothing new (every
+      // id was already in this view) means the source isn't actually
+      // advancing with skip -- treat it as "no more", the same as an
+      // empty page, rather than trusting maybeMore into fetching the same
+      // content again up to MAX_PAGES.
+      updateStatusAfterPage(data.maybeMore, newCount);
     } catch (e) {
       console.error('List preview fetch error:', e);
       statusEl.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(e && e.message ? e.message : 'Network error loading this list.') + '</p>';

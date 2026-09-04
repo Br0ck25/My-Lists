@@ -88,6 +88,15 @@ async function resolveConfig(configParam, env) {
 // in) — public lists work fine with no key.
 function mdblistJsonUrl(input, apikey) {
   let s = input.trim();
+  // Query string / fragment stripped before anything else. Without this,
+  // a URL copied while some filter/view toggle on mdblist's own site is
+  // active (e.g. "?sort=rank", or a trailing "/?Mode=Show"-shaped param)
+  // becomes part of the list slug below -- either glued onto the last
+  // segment, or its own segment entirely if there's a trailing slash
+  // before the "?". Either way the constructed JSON-feed URL points at a
+  // list that doesn't exist, and mdblist 404s (or returns something
+  // unrelated) instead of the real list.
+  s = s.split(/[?#]/)[0];
   s = s.replace(/^https?:\/\/(www\.)?mdblist\.com\/lists\//i, "");
   s = s.replace(/\/(json\/?)?$/i, "");
   const parts = s.split("/").filter(Boolean);
@@ -177,8 +186,17 @@ function detectSource(input) {
   if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
   if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
   if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
-  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?$/i.test(s)) return "trakt-watchlist";
-  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/history\/?$/i.test(s)) return "trakt-history";
+  // (www.|app.) and a trailing "?query" or "#hash" both tolerated here --
+  // matching every other trakt.tv regex in this function -- because a
+  // fully $-anchored .../watchlist$ / .../history$ (this used to require
+  // the URL end exactly there) silently failed to recognize a URL copied
+  // while some filter/view toggle on trakt.tv's own site was active (e.g.
+  // a trailing "?something=x"), or one copied from app.trakt.tv. It still
+  // fell through to the generic "trakt" case below rather than erroring,
+  // but generic handling expects a /lists/ path a watchlist/history URL
+  // doesn't have, so the list failed to resolve at all.
+  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?(?:[?#].*)?$/i.test(s)) return "trakt-watchlist";
+  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/history\/?(?:[?#].*)?$/i.test(s)) return "trakt-history";
   if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
