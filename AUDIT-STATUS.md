@@ -1,14 +1,15 @@
 # AUDIT REMEDIATION STATUS
 
 Live tracker for the findings in [`AUDIT-2026-09.md`](./AUDIT-2026-09.md).
-Baseline commit: `e3293d6a`. Branch: `arena/01a068d9-my-lists`.
+Baseline commit: `e3293d6a`. Branch: `arena/01a06973-my-lists` (PR #3 → `main`).
 
-**Rating movement:** `NOT READY` → **`READY WITH FIXES`** (as of round 2)
+**Rating movement:** `NOT READY` → `READY WITH FIXES` (round 2) → **`READY`** (code; as of item J)
 
 The three unauthenticated data-exposure paths and the non-functional account
-deletion — the four things that made this unsafe for a second user — are all
-closed and verified. What remains is scale and abuse-resistance work, which
-degrades quality at growth rather than leaking data today.
+deletion — the four things that made this unsafe for a second user — were
+closed in rounds 1–2. Scale, fail-closed privacy, CORS, preview, IP limits,
+display names, KV TTLs, and an authorization test suite with CI are now in
+too. What remains is **production deploy work**, not more code.
 
 ---
 
@@ -62,57 +63,36 @@ Cold-start is handled: the first request after the index is lost takes a 60 s
 lock, rebuilds in the background via `waitUntil`, and serves the legacy scan
 meanwhile. 20 concurrent cold requests → all HTTP 200, exactly one rebuild.
 
+### Round 5 — PR #3 (`arena/01a06973-my-lists`)
+
+Stacked onto the open PR so later items would not strand off `main`. Head at
+merge: `605993c` plus this status update.
+
+| # | Severity | Issue | Verified by |
+|---|---|---|---|
+| B | 🟠 | **Admin dashboard / leaderboard subrequest wall.** Creator Accounts did one KV `get` per account for `creatorlastseen:` (D1 only replaced enumeration). Past ~1,000 creators that exceeds Cloudflare's 1,000-subrequest cap and `/admin` stops loading. All-time Trending read count+meta for every tracked title. Community Lists read a likes key nothing writes, and `SELECT *` including `items_json` just for `.length`. | Seeded 1,200 creators: 1,215 subrequests → 115 mid-backfill, 14 steady-state. `last_active` mirrored on the 30-min throttle; lazy repair ≤100/load. Leaderboard candidate pool 400 (search all-time 1,000). Likes from D1 / list record; `json_array_length()` + `ORDER BY likes LIMIT 100`; copy counts from one bounded `stats:list_copy:` scan. Commit `84e8661` |
+| C | 🟡 | **`visibility` fail-open.** Public exposure was `visibility !== "private"`, so a missing field or typo published a list. Writes now store only an explicit `"public"`; reads require `=== "public"`. Legacy unstamped lists that were already served as public are stamped on index rebuild, public GET, and migrate-d1 so inverted reads do not hide them. | Node tests + stamp on public GET/rebuild. Commit `1931939` |
+| E | 🟡 | **CORS `*` on state-changing JSON.** `json()` spread `Access-Control-Allow-Origin: *` onto every JSON response, including POSTs. Simple cross-origin POST (`text/plain`) is not preflighted. `json()` is now CORS-free; catalog/manifest/meta/subtitles/public-list JSON still advertise `*` via `jsonPublic()` / `corsHeaders()`. OPTIONS limited to those public paths. | Commit `d4a232b` |
+| F | 🟡 | **`/api/preview` SSRF-adjacent scan oracle.** Unauthenticated fetch of an attacker-named URL. Scheme + provider-host allowlist before `fetchCatalog`; one generic load error; IP rate-limit. | Tests: non-allowlisted URL → 400, no fetch. Commit `33fc481` |
+| G | 🟡 | **Rate limits fail open on missing `CF-Connecting-IP`.** Shared `"unknown"` bucket + per-address IPv6. Reject rather than share a bucket; fold IPv6 to `/64`; README notes self-hosting outside Cloudflare has no real per-client limit. | Tests: create/restore/reset-key/feedback without the header fail closed. Commit `4534724` |
+| H | 🟡 | **`displayName` silently discarded.** Create overwrote it with the username. Accept `body.displayName`, cap 40, strip controls, fall back to username; escape the early profile-bar render. | Tests: submitted display name stored when valid. Commit `b42f660` |
+| I | 🔵 | **Unbounded KV growth.** `feedback:`, `evtcount:`, `searchquery:` never expired. Threads TTL 180 days from last write; day-scoped telemetry 120 days, all-time 400; unique search queries capped per day; admin inbox GETs newest 300 threads. | Commit `d52db9f` |
+| J | 🔵 | **No tests, no CI.** Zero test files. Now: Node `node:test` harness vs combined Worker with in-memory KV/D1 — auth matrix, tracking IDOR, feedback threads, isolation, delete-account, key rotation w/ and w/o a D1 row, directory past the old 150-key cap, helper units. GitHub Actions rebuilds from source and fails on `worker_entry_combined.js` drift. `bash verify.sh` runs the same locally. | `node --test tests/*.test.mjs` — 21 pass, 0 fail. Commit `605993c` |
+
 ---
 
-## 🔜 Remaining — in priority order
+## 🔜 Remaining — production only
 
-### 🟠 B. Admin dashboard / leaderboard subrequest wall — *hard failure at scale*
-`renderAdminDashboard` does 6 × `listAllKeys` + 2 KV gets per list + 1 per
-creator. At ~1,000 creators that exceeds Cloudflare's 1,000-subrequest limit
-and the page stops loading entirely. `computeLeaderboard("alltime")` has the
-same shape (2 gets per title). Fix: server-side pagination, or render from a
-cron-built snapshot.
-*Note: when `DB` is bound the dashboard uses `SELECT * FROM creators`, which
-sidesteps this for the creators half — this is the real argument for D1.*
+No further code items from the original remaining list.
 
-### 🟡 C. `visibility` fail-open
-Public exposure is decided by `visibility !== "private"` everywhere, and save
-stores whatever string arrives. Missing/typo'd field ⇒ treated as **public**.
-Fix: normalize to a two-value enum on write, then invert reads to
-`=== "public"`. **Compat impact:** existing lists with no `visibility` flip
-public→private, so backfill first.
+1. **Deploy D1 likes column** (once, against live DB — do **not** run `schema.sql`, it DROPs):
+   `npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql`
+2. **POST `/admin/api/migrate-d1`** so existing KV lists/counts land in D1 (also stamps visibility).
+3. **Close empty PR #2** (`arena/01a068d9-my-lists` @ `3a8e7fe`) if it is still open.
 
-### 🟡 E. CORS `*` on state-changing endpoints
-Bounded (credentials are in the body, not cookies; admin is `SameSite=Strict`),
-but it lets any page on the internet call the public write endpoints from every
-visitor's browser. Drop CORS from creator/like routes; keep on catalog/manifest.
-
-### 🟡 F. `/api/preview` SSRF-adjacent scan oracle
-Unauthenticated, fetches an attacker-named URL. Workers' runtime blocks
-RFC1918/metadata (probes to `127.0.0.1` and `169.254.169.254` both failed —
-**no internal read demonstrated**), but distinct error strings make it a host
-scanner and free outbound proxy. Fix: scheme + provider-host allowlist before
-dispatch, single generic error.
-
-### 🟡 G. Rate limits fail *open* on missing header
-`CF-Connecting-IP || "unknown"` — unspoofable at the real CF edge, so **not
-exploitable in production today**, but every header-less client shares one
-global bucket, and IPv6 is per-address. Fix: reject rather than share a
-bucket; normalize IPv6 to /64.
-
-### 🟡 H. `displayName` silently discarded
-`create` reads `body.creatorName` into `displayName`. Currently *load-bearing*:
-it forces display names to the validated `[a-z0-9_-]` charset. **Fix the bug and
-an XSS surface opens** — must ship with length/control-char validation and an
-escaping audit of every render site.
-
-### 🔵 I. Unbounded KV growth
-`feedback:`, `evtcount:`, `searchquery:` have no TTL and nothing prunes them.
-
-### 🔵 J. No tests, no CI
-Zero test files. Highest value: an authorization matrix (would have caught
-findings 1, 3, 6 mechanically), data-isolation, account lifecycle, key
-rotation w/ and w/o D1, KV pagination, and a build-drift check.
+Out of scope for this tracker (named in the original report, not scheduled):
+`creatorsynctracking:` optimistic concurrency, provider `AbortSignal.timeout`,
+and distinguishing empty catalogs from upstream failure.
 
 ---
 
