@@ -1488,13 +1488,22 @@ async function onUnifiedImportFilesSelected(input) {
             isWatchCategory = true;
           } else if (lowerName.includes('lists/') || lowerClean.startsWith('lists-')) {
             const listName = cleanBase.replace(/^lists-?/, '').replace(/[-_]/g, ' ').trim();
-            const titleCase = listName.replace(/\b\w/g, c => c.toUpperCase());
+            // Doubled backslashes (\\b\\w) required here -- see
+            // guessNameFromUrl's own comment in 19_client-search-and-likes.js
+            // for why: this file's text passes through the outer template
+            // literal's own backslash-escape processing before the browser
+            // parses it, so a single \b\w here would reach the browser as a
+            // regex matching a literal backspace byte + "w" (matches
+            // nothing) instead of word-boundary + word-character.
+            const titleCase = listName.replace(/\\b\\w/g, c => c.toUpperCase());
             catKey = 'list_' + lowerClean;
             catLabel = 'List: ' + titleCase;
             defaultTarget = 'new';
             defaultNewName = titleCase;
           } else {
-            const humanName = cleanBase.replace(/[-_]/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+            // Doubled backslashes required -- see the titleCase comment
+            // just above.
+            const humanName = cleanBase.replace(/[-_]/g, ' ').trim().replace(/\\b\\w/g, c => c.toUpperCase());
             catKey = lowerClean;
             catLabel = humanName;
             defaultTarget = (lowerClean.includes('watchlist') ? 'watchlist' : (lowerClean.includes('history') || lowerClean.includes('watched') ? 'watch-history' : 'new'));
