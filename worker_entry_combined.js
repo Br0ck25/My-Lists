@@ -3455,6 +3455,24 @@ async function backfillCreatorLastActive(env, accounts) {
 // checking every title that's ever been tracked. KV has no atomic
 // increment (same tradeoff as bumpStat above), so this is a reasonable
 // running total, not an exact ledger.
+// Telemetry keys used to live forever. `evtcount:` / `evtmeta:` grow one
+// pair per title ever watched; `searchquery:` is worse -- the query string
+// is the key, so an unauthenticated `/api/track-search` loop mints unbounded
+// KV. Day-scoped blobs and indexes expire after 120 days (wider than the
+// 90-day dashboard window). All-time counters expire 400 days after the
+// last increment, so dormant titles/queries drop and active ones refresh.
+const TELEMETRY_DAY_TTL_SEC = 120 * 24 * 60 * 60;
+const TELEMETRY_ALLTIME_TTL_SEC = 400 * 24 * 60 * 60;
+const EVT_DAY_INDEX_CAP = 1000;
+const SEARCH_DAY_INDEX_CAP = 400;
+// Support threads: 180 days from last write (create/reply/edit refreshes).
+const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
+const FEEDBACK_ADMIN_GET_CAP = 300;
+
+async function putFeedbackThread(env, key, entry) {
+  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
@@ -3500,16 +3518,16 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     } catch {
       index = [];
     }
-    if (!index.includes(id)) index.push(id);
+    if (!index.includes(id) && index.length < EVT_DAY_INDEX_CAP) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       // Overwritten every time rather than only on first sight -- keeps
       // title/mediaType current if either ever changes upstream, and
       // lastSeen doubles as a cheap staleness signal in the dashboard.
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
   } catch (e) {
     // best-effort -- never breaks the actual watch/list action riding along
@@ -3582,7 +3600,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
                 if (env && env.CONFIGS) {
-                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
                 }
               }
             }
@@ -3671,7 +3689,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
               if (env && env.CONFIGS) {
-                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
             }
           }
@@ -3704,8 +3722,8 @@ async function backfillTitleCount(env, eventType, id, title, mediaType, incremen
     const totalRaw = await env.CONFIGS.get(totalKey);
     const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
     await Promise.all([
-      env.CONFIGS.put(totalKey, String(total)),
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
     return true;
   } catch (e) {
@@ -3755,12 +3773,20 @@ async function recordSearchQuery(env, query) {
     } catch {
       index = [];
     }
-    if (!index.includes(q)) index.push(q);
+    let listed = index.includes(q);
+    if (!listed && index.length < SEARCH_DAY_INDEX_CAP) {
+      index.push(q);
+      listed = true;
+    }
+    // Day index full of other queries: still bump counters for a query
+    // that already has keys, but do not mint a brand-new unique-query
+    // pair -- that is the unbounded, user-controlled keyspace.
+    if (!listed && !daysRaw && !totalRaw) return;
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
     ]);
   } catch (e) {}
 }
@@ -50345,7 +50371,7 @@ self.addEventListener('fetch', e => {
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
-            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
@@ -50372,7 +50398,7 @@ self.addEventListener('fetch', e => {
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
-        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
@@ -54656,7 +54682,7 @@ self.addEventListener('fetch', e => {
           if (dayKeysSorted.length > 95) {
             dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
           }
-          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob), { expirationTtl: TELEMETRY_DAY_TTL_SEC });
           await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
           keysMigratedThisCall += days.length;
         })
@@ -54673,26 +54699,35 @@ self.addEventListener('fetch', e => {
     }
 
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
-    // newest first. Reads up to 300 entries; feedback keys already sort
-    // chronologically as plain strings (see /api/feedback's own comment),
-    // so list() naturally returns oldest-first and this just reverses it.
+    // newest first. Keys sort chronologically (see /api/feedback), so
+    // list() is oldest-first: walk pages keeping a rolling tail, then
+    // GET only the newest FEEDBACK_ADMIN_GET_CAP. Getting every thread
+    // used to grow without bound (no TTL, no prune).
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
-      let allKeys = [];
+      let newestKeys = [];
       let cursor = undefined;
       let listComplete = false;
-      while (!listComplete) {
+      let pages = 0;
+      let sawMore = false;
+      while (!listComplete && pages < 30) {
         const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-        allKeys.push(...listResult.keys);
+        newestKeys.push(...(listResult.keys || []));
+        if (newestKeys.length > FEEDBACK_ADMIN_GET_CAP) {
+          newestKeys = newestKeys.slice(-FEEDBACK_ADMIN_GET_CAP);
+          sawMore = true;
+        }
+        pages++;
         if (listResult.list_complete || !listResult.cursor) {
           listComplete = true;
         } else {
           cursor = listResult.cursor;
         }
       }
-      const keys = allKeys.slice().reverse();
+      const truncated = !listComplete || sawMore;
+      const keys = newestKeys.slice().reverse();
       const entries = await Promise.all(
         keys.map(async (k) => {
           try {
@@ -54714,7 +54749,7 @@ self.addEventListener('fetch', e => {
           }
         })
       );
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: !!truncated }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
@@ -54773,7 +54808,7 @@ self.addEventListener('fetch', e => {
       entry.completed = false;
 
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save reply." }, 500);
       }
@@ -54808,7 +54843,7 @@ self.addEventListener('fetch', e => {
       }
       entry.completed = !!body.completed;
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
       }
@@ -54860,7 +54895,7 @@ self.addEventListener('fetch', e => {
       }
       entry.updatedAt = Date.now();
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
         return json({ ok: false, error: "Could not save edits. Please try again." }, 500);

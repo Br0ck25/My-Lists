@@ -3378,7 +3378,7 @@
           if (dayKeysSorted.length > 95) {
             dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
           }
-          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob), { expirationTtl: TELEMETRY_DAY_TTL_SEC });
           await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
           keysMigratedThisCall += days.length;
         })
@@ -3395,26 +3395,35 @@
     }
 
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
-    // newest first. Reads up to 300 entries; feedback keys already sort
-    // chronologically as plain strings (see /api/feedback's own comment),
-    // so list() naturally returns oldest-first and this just reverses it.
+    // newest first. Keys sort chronologically (see /api/feedback), so
+    // list() is oldest-first: walk pages keeping a rolling tail, then
+    // GET only the newest FEEDBACK_ADMIN_GET_CAP. Getting every thread
+    // used to grow without bound (no TTL, no prune).
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
-      let allKeys = [];
+      let newestKeys = [];
       let cursor = undefined;
       let listComplete = false;
-      while (!listComplete) {
+      let pages = 0;
+      let sawMore = false;
+      while (!listComplete && pages < 30) {
         const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-        allKeys.push(...listResult.keys);
+        newestKeys.push(...(listResult.keys || []));
+        if (newestKeys.length > FEEDBACK_ADMIN_GET_CAP) {
+          newestKeys = newestKeys.slice(-FEEDBACK_ADMIN_GET_CAP);
+          sawMore = true;
+        }
+        pages++;
         if (listResult.list_complete || !listResult.cursor) {
           listComplete = true;
         } else {
           cursor = listResult.cursor;
         }
       }
-      const keys = allKeys.slice().reverse();
+      const truncated = !listComplete || sawMore;
+      const keys = newestKeys.slice().reverse();
       const entries = await Promise.all(
         keys.map(async (k) => {
           try {
@@ -3436,7 +3445,7 @@
           }
         })
       );
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: !!truncated }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
@@ -3495,7 +3504,7 @@
       entry.completed = false;
 
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save reply." }, 500);
       }
@@ -3530,7 +3539,7 @@
       }
       entry.completed = !!body.completed;
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
       }
@@ -3582,7 +3591,7 @@
       }
       entry.updatedAt = Date.now();
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
         return json({ ok: false, error: "Could not save edits. Please try again." }, 500);

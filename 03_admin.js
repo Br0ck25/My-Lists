@@ -299,6 +299,24 @@ async function backfillCreatorLastActive(env, accounts) {
 // checking every title that's ever been tracked. KV has no atomic
 // increment (same tradeoff as bumpStat above), so this is a reasonable
 // running total, not an exact ledger.
+// Telemetry keys used to live forever. `evtcount:` / `evtmeta:` grow one
+// pair per title ever watched; `searchquery:` is worse -- the query string
+// is the key, so an unauthenticated `/api/track-search` loop mints unbounded
+// KV. Day-scoped blobs and indexes expire after 120 days (wider than the
+// 90-day dashboard window). All-time counters expire 400 days after the
+// last increment, so dormant titles/queries drop and active ones refresh.
+const TELEMETRY_DAY_TTL_SEC = 120 * 24 * 60 * 60;
+const TELEMETRY_ALLTIME_TTL_SEC = 400 * 24 * 60 * 60;
+const EVT_DAY_INDEX_CAP = 1000;
+const SEARCH_DAY_INDEX_CAP = 400;
+// Support threads: 180 days from last write (create/reply/edit refreshes).
+const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
+const FEEDBACK_ADMIN_GET_CAP = 300;
+
+async function putFeedbackThread(env, key, entry) {
+  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
@@ -344,16 +362,16 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     } catch {
       index = [];
     }
-    if (!index.includes(id)) index.push(id);
+    if (!index.includes(id) && index.length < EVT_DAY_INDEX_CAP) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       // Overwritten every time rather than only on first sight -- keeps
       // title/mediaType current if either ever changes upstream, and
       // lastSeen doubles as a cheap staleness signal in the dashboard.
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
   } catch (e) {
     // best-effort -- never breaks the actual watch/list action riding along
@@ -426,7 +444,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
                 if (env && env.CONFIGS) {
-                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
                 }
               }
             }
@@ -515,7 +533,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
               if (env && env.CONFIGS) {
-                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
             }
           }
@@ -548,8 +566,8 @@ async function backfillTitleCount(env, eventType, id, title, mediaType, incremen
     const totalRaw = await env.CONFIGS.get(totalKey);
     const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
     await Promise.all([
-      env.CONFIGS.put(totalKey, String(total)),
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
     return true;
   } catch (e) {
@@ -599,12 +617,20 @@ async function recordSearchQuery(env, query) {
     } catch {
       index = [];
     }
-    if (!index.includes(q)) index.push(q);
+    let listed = index.includes(q);
+    if (!listed && index.length < SEARCH_DAY_INDEX_CAP) {
+      index.push(q);
+      listed = true;
+    }
+    // Day index full of other queries: still bump counters for a query
+    // that already has keys, but do not mint a brand-new unique-query
+    // pair -- that is the unbounded, user-controlled keyspace.
+    if (!listed && !daysRaw && !totalRaw) return;
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
     ]);
   } catch (e) {}
 }

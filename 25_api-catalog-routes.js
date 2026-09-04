@@ -4653,7 +4653,7 @@ self.addEventListener('fetch', e => {
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
-            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
@@ -4680,7 +4680,7 @@ self.addEventListener('fetch', e => {
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
-        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
