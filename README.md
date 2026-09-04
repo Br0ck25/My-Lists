@@ -170,6 +170,8 @@ To automatically pre-warm shared **Trakt**, **TMDB**, **Simkl**, and **MDBList**
 4. Set the cron expression to: `*/6 * * * *` (every 6 minutes).
 5. Click **Save** / **Deploy**.
 
+This same cron run also seeds the public list directory/search index (`/lists/public.json`, in-app search) the first time it finds one missing -- a fresh deployment, or the index having been lost some other way -- so a self-hoster with the cron trigger enabled never has to think about it. Without a cron trigger configured, the index instead seeds itself lazily on whichever visitor's request happens to find it missing first, which briefly serves a truncated (capped, oldest-first) directory/search result until that finishes. To seed it immediately and synchronously -- e.g. right after a fresh deploy, without waiting on either of those -- log into `/admin` and POST `/admin/api/rebuild-public-index`.
+
 ---
 
 ### Step 7 — Install in Stremio, Wako, Nuvio, or Any Other Compatible App

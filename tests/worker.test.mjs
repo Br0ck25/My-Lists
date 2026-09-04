@@ -1,6 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { call, createUser, makeD1, makeEnv, makeKv, nextIp } from "./harness.mjs";
+import { call, createUser, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
+
+async function adminCookie(env) {
+  const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
+  const setCookie = r.headers.get("set-cookie") || "";
+  const match = setCookie.match(/^([^=]+=[^;]+)/);
+  return match ? match[1] : "";
+}
 
 const CREATOR_POSTS = [
   "/api/creator/lists",
@@ -39,6 +46,7 @@ const ADMIN_POSTS = [
   "/admin/api/feedback/status",
   "/admin/api/feedback/edit",
   "/admin/api/feedback/delete",
+  "/admin/api/rebuild-public-index",
 ];
 
 describe("authorization matrix", () => {
@@ -392,6 +400,54 @@ describe("directory pagination", () => {
     assert.equal(second.body.ok, true);
     assert.equal(second.body.total, n, `expected total ${n}, got ${second.body.total}`);
     assert.equal(second.body.lists.length, n);
+  });
+
+  it("/admin/api/rebuild-public-index seeds a cold index synchronously", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    // Seeded directly into KV (bypassing the save endpoint, so the
+    // incremental index update never ran) to simulate a genuinely cold
+    // index -- a fresh deploy, or the index key lost some other way.
+    const n = 12;
+    for (let i = 0; i < n; i++) {
+      await kv.put(`creatorlist:idxuser:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    assert.equal(await kv.get("index:publiclists"), null);
+
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.count, n);
+    assert.notEqual(await kv.get("index:publiclists"), null);
+
+    // Now served straight from the index, no bounded-scan fallback needed.
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+  });
+
+  it("scheduled() self-heals a missing index without any admin action", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const n = 7;
+    for (let i = 0; i < n; i++) {
+      await kv.put(`creatorlist:cronuser:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    assert.equal(await kv.get("index:publiclists"), null);
+
+    const pending = [];
+    const ctx = { waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); } };
+    await worker.scheduled({}, env, ctx);
+    await Promise.all(pending);
+
+    assert.notEqual(await kv.get("index:publiclists"), null);
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
   });
 });
 
