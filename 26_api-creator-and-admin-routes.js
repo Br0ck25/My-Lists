@@ -1746,6 +1746,42 @@
         }
       }
 
+      // Conflict guard -- this endpoint used to always blindly overwrite
+      // creatorsync:{username} with whatever this request's snapshot was,
+      // no matter how stale. Two tabs/devices autosaving around the same
+      // time meant whichever PUT landed last in KV won completely, silently
+      // discarding the other one's edits with no error anywhere.
+      //
+      // An updated client now sends expectedUpdatedAt: the updatedAt it
+      // last actually saw (from a prior /sync/load or /sync/save response)
+      // -- i.e. the version its current edits are built on top of. If the
+      // record in KV has moved past that, another device saved in between;
+      // rather than clobber that write, this responds 409 and leaves KV
+      // untouched. The client's own pending edits aren't lost either: they
+      // stay in its DOM/localStorage and go up on the very next autosave,
+      // now against the correct baseline. An older client that doesn't
+      // send expectedUpdatedAt at all gets exactly its previous behavior
+      // (last-write-wins) -- this is purely additive, not a breaking
+      // change to the request shape.
+      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
+      if (expectedUpdatedAt !== null) {
+        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+        if (currentRaw) {
+          try {
+            const current = JSON.parse(currentRaw);
+            if (Number(current.updatedAt) > expectedUpdatedAt) {
+              // Purely for visibility -- this was previously invisible even
+              // to us; now it's at least countable on the admin dashboard.
+              ctx.waitUntil(bumpStat(env, "sync_conflict"));
+              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
+            }
+          } catch {
+            // Existing blob unreadable -- nothing coherent to protect
+            // against; fall through and write normally.
+          }
+        }
+      }
+
       const blob = {
         config: Array.isArray(body.config) ? body.config : [],
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
@@ -1774,7 +1810,9 @@
         // never the problem.
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // updatedAt lets the client advance its own baseline without a
+      // separate /sync/meta round trip -- see expectedUpdatedAt above.
+      return json({ ok: true, updatedAt: blob.updatedAt });
     }
 
     // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,

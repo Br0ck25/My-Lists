@@ -1500,7 +1500,7 @@ async function pushCreatorSync() {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
-    await fetch(ORIGIN + '/api/creator/sync/save', {
+    const res = await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1523,8 +1523,27 @@ async function pushCreatorSync() {
         hiddenMyListsSections: (function() {
           try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
         })(),
+        // The updatedAt this browser last actually saw (from a prior
+        // /sync/load or /sync/save), i.e. the version these edits are
+        // built on top of -- lets the server tell whether another device
+        // saved in between instead of silently overwriting it. See
+        // /api/creator/sync/save's own comment.
+        expectedUpdatedAt: window._serverSyncUpdatedAt,
       }),
     });
+    if (res.status === 409) {
+      // Another device saved more recently than what this browser last
+      // saw. Don't clobber that write -- pull the latest instead. Any
+      // edit still pending in this tab hasn't gone anywhere (it's still
+      // sitting in the DOM/localStorage) and goes up on the next autosave,
+      // now against the correct baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverSyncUpdatedAt = data.updatedAt;
+    }
     window._lastCreatorSyncPushedAt = Date.now();
   } catch (e) {
     // silently fail, it's a background sync

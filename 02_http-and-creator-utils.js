@@ -1106,37 +1106,68 @@ async function likeVoterId(request, env, creatorUsername, scopeId) {
   return `a:${hash}`;
 }
 
+// Reads a ledger key's voter list, tolerating both storage shapes this
+// function has ever written (a bare array, or {voters: [...]}).
+async function readLikeVoters(env, ledgerKey) {
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.voters)) return parsed.voters;
+  } catch {
+    // fall through
+  }
+  return [];
+}
+
 // Applies one vote to a ledger key and returns the resulting count.
 // Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
 // be a new voter -- the caller keeps the existing count rather than
 // silently discarding the vote or growing the key without bound.
+//
+// Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
+// here can lose a vote: two requests can both read the same snapshot, and
+// whichever PUT lands last in KV wins, silently dropping the other one.
+// Rather than a full lock (KV has no primitive to build one on reliably
+// either), this re-reads the ledger after writing and confirms this
+// voter's own membership actually stuck; if another write raced it in
+// between, it retries against that fresh state instead of just trusting
+// its own PUT. Bounded to a handful of attempts -- this only protects
+// against genuinely concurrent requests on one list, not a design that
+// needs to spin forever.
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  let voters = [];
-  try {
-    const raw = await env.CONFIGS.get(ledgerKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) voters = parsed;
-      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const voters = await readLikeVoters(env, ledgerKey);
+    const set = new Set(voters);
+    const had = set.has(voterId);
+    if (liked) {
+      if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+      set.add(voterId);
+    } else {
+      set.delete(voterId);
     }
-  } catch {
-    voters = [];
-  }
-  const set = new Set(voters);
-  const had = set.has(voterId);
-  if (liked) {
-    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
-    set.add(voterId);
-  } else {
-    set.delete(voterId);
-  }
-  // No write at all when nothing changed -- KV allows one write per second
-  // per key, and a double-tap on a busy list should not burn that budget
-  // or race with a genuine vote.
-  if (set.size !== voters.length || had !== set.has(voterId)) {
+    // No write at all when nothing changed -- KV allows one write per
+    // second per key, and a double-tap on a busy list should not burn
+    // that budget or race with a genuine vote.
+    if (set.size === voters.length && had === set.has(voterId)) {
+      return { count: set.size, capped: false };
+    }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    const verifyVoters = await readLikeVoters(env, ledgerKey);
+    if (new Set(verifyVoters).has(voterId) === liked) {
+      return { count: verifyVoters.length, capped: false };
+    }
+    // Someone else's write landed on top of ours between the PUT and this
+    // re-read -- loop and retry against their (now current) state rather
+    // than reporting a count/liked state that isn't what's actually
+    // stored.
   }
-  return { count: set.size, capped: false };
+  // Exhausted retries under sustained contention on this one list: report
+  // whatever is actually in KV right now rather than guessing.
+  const finalVoters = await readLikeVoters(env, ledgerKey);
+  return { count: finalVoters.length, capped: false };
 }
 
 // --- External list URL validation --------------------------------------------

@@ -458,6 +458,52 @@ describe("likes and preview guards", () => {
     const fetchCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/x") + "&airDate=2099-01-01");
     assert.equal(fetchCase.status, 404);
   });
+
+  it("a vote survives a concurrent write racing its own PUT (applyLikeVote retry)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicerace");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        name: "RaceList",
+        type: "movie",
+        visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const slug = saved.body.slug;
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${slug}`;
+
+    // Simulate another request's write landing between this vote's PUT and
+    // its verification read: the very first time applyLikeVote writes to
+    // this ledger key, immediately clobber it with a snapshot that does
+    // NOT include this voter -- exactly the lost-update race a plain
+    // read-modify-write would silently lose to.
+    let injected = false;
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    env.CONFIGS.put = async (key, value) => {
+      await realPut(key, value);
+      if (key === ledgerKey && !injected) {
+        injected = true;
+        await realPut(key, JSON.stringify(["a:racing-voter"]));
+      }
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug },
+    });
+    assert.equal(injected, true);
+    assert.equal(r.body.ok, true);
+    // Both this vote and the "racing" one must be reflected -- not just
+    // whichever write happened to land last.
+    assert.equal(r.body.likes, 2);
+    const finalVoters = JSON.parse(await env.CONFIGS.get(ledgerKey));
+    assert.equal(finalVoters.length, 2);
+    assert.ok(finalVoters.includes("a:racing-voter"));
+  });
 });
 
 describe("admin login", () => {
@@ -475,6 +521,80 @@ describe("admin login", () => {
     const env = makeEnv();
     const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "wrong-key" } });
     assert.equal(r.status, 401);
+  });
+});
+
+describe("sync conflict guard", () => {
+  it("rejects a stale expectedUpdatedAt instead of silently overwriting a newer save", async () => {
+    const env = makeEnv();
+    const bob = await createUser(env, "bobsync");
+
+    const first = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey, config: [{ id: "a", name: "A", url: "https://x" }] },
+    });
+    assert.equal(first.body.ok, true);
+    assert.equal(typeof first.body.updatedAt, "number");
+    const firstUpdatedAt = first.body.updatedAt;
+
+    // Force the clock forward a tick so the "second device" gets a
+    // strictly later updatedAt than the first save.
+    await new Promise((r) => setTimeout(r, 2));
+
+    // "Device B" saves, built on top of the same baseline as device A.
+    const second = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "b", name: "B", url: "https://y" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(second.body.ok, true);
+    const secondUpdatedAt = second.body.updatedAt;
+    assert.ok(secondUpdatedAt > firstUpdatedAt);
+
+    // "Device A", still holding the stale baseline, tries to save next --
+    // must not clobber device B's newer write.
+    const staleAttempt = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "a-edited", name: "A edited", url: "https://x" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(staleAttempt.status, 409);
+    assert.equal(staleAttempt.body.ok, false);
+    assert.equal(staleAttempt.body.conflict, true);
+
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "b");
+    assert.equal(loaded.body.data.updatedAt, secondUpdatedAt);
+  });
+
+  it("a save with no expectedUpdatedAt (older client) keeps the previous last-write-wins behavior", async () => {
+    const env = makeEnv();
+    const carol = await createUser(env, "carolsync");
+    await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "x", name: "X", url: "https://x" }] },
+    });
+    const overwrite = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "y", name: "Y", url: "https://y" }] },
+    });
+    assert.equal(overwrite.body.ok, true);
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "y");
   });
 });
 

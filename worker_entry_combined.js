@@ -2627,37 +2627,68 @@ async function likeVoterId(request, env, creatorUsername, scopeId) {
   return `a:${hash}`;
 }
 
+// Reads a ledger key's voter list, tolerating both storage shapes this
+// function has ever written (a bare array, or {voters: [...]}).
+async function readLikeVoters(env, ledgerKey) {
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.voters)) return parsed.voters;
+  } catch {
+    // fall through
+  }
+  return [];
+}
+
 // Applies one vote to a ledger key and returns the resulting count.
 // Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
 // be a new voter -- the caller keeps the existing count rather than
 // silently discarding the vote or growing the key without bound.
+//
+// Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
+// here can lose a vote: two requests can both read the same snapshot, and
+// whichever PUT lands last in KV wins, silently dropping the other one.
+// Rather than a full lock (KV has no primitive to build one on reliably
+// either), this re-reads the ledger after writing and confirms this
+// voter's own membership actually stuck; if another write raced it in
+// between, it retries against that fresh state instead of just trusting
+// its own PUT. Bounded to a handful of attempts -- this only protects
+// against genuinely concurrent requests on one list, not a design that
+// needs to spin forever.
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  let voters = [];
-  try {
-    const raw = await env.CONFIGS.get(ledgerKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) voters = parsed;
-      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const voters = await readLikeVoters(env, ledgerKey);
+    const set = new Set(voters);
+    const had = set.has(voterId);
+    if (liked) {
+      if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+      set.add(voterId);
+    } else {
+      set.delete(voterId);
     }
-  } catch {
-    voters = [];
-  }
-  const set = new Set(voters);
-  const had = set.has(voterId);
-  if (liked) {
-    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
-    set.add(voterId);
-  } else {
-    set.delete(voterId);
-  }
-  // No write at all when nothing changed -- KV allows one write per second
-  // per key, and a double-tap on a busy list should not burn that budget
-  // or race with a genuine vote.
-  if (set.size !== voters.length || had !== set.has(voterId)) {
+    // No write at all when nothing changed -- KV allows one write per
+    // second per key, and a double-tap on a busy list should not burn
+    // that budget or race with a genuine vote.
+    if (set.size === voters.length && had === set.has(voterId)) {
+      return { count: set.size, capped: false };
+    }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    const verifyVoters = await readLikeVoters(env, ledgerKey);
+    if (new Set(verifyVoters).has(voterId) === liked) {
+      return { count: verifyVoters.length, capped: false };
+    }
+    // Someone else's write landed on top of ours between the PUT and this
+    // re-read -- loop and retry against their (now current) state rather
+    // than reporting a count/liked state that isn't what's actually
+    // stored.
   }
-  return { count: set.size, capped: false };
+  // Exhausted retries under sustained contention on this one list: report
+  // whatever is actually in KV right now rather than guessing.
+  const finalVoters = await readLikeVoters(env, ledgerKey);
+  return { count: finalVoters.length, capped: false };
 }
 
 // --- External list URL validation --------------------------------------------
@@ -21949,7 +21980,10 @@ async function ensureTraktPopularLoaded() {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
+  // s == null -> '' (not String(null)/String(undefined), which render as
+  // the literal text "null"/"undefined" for any field that's legitimately
+  // unset -- see 16_client-row-core.js's escapeHtml, which this matches).
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }
@@ -36508,7 +36542,7 @@ async function pushCreatorSync() {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
-    await fetch(ORIGIN + '/api/creator/sync/save', {
+    const res = await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -36531,8 +36565,27 @@ async function pushCreatorSync() {
         hiddenMyListsSections: (function() {
           try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
         })(),
+        // The updatedAt this browser last actually saw (from a prior
+        // /sync/load or /sync/save), i.e. the version these edits are
+        // built on top of -- lets the server tell whether another device
+        // saved in between instead of silently overwriting it. See
+        // /api/creator/sync/save's own comment.
+        expectedUpdatedAt: window._serverSyncUpdatedAt,
       }),
     });
+    if (res.status === 409) {
+      // Another device saved more recently than what this browser last
+      // saw. Don't clobber that write -- pull the latest instead. Any
+      // edit still pending in this tab hasn't gone anywhere (it's still
+      // sitting in the DOM/localStorage) and goes up on the next autosave,
+      // now against the correct baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverSyncUpdatedAt = data.updatedAt;
+    }
     window._lastCreatorSyncPushedAt = Date.now();
   } catch (e) {
     // silently fail, it's a background sync
@@ -53113,6 +53166,42 @@ self.addEventListener('fetch', e => {
         }
       }
 
+      // Conflict guard -- this endpoint used to always blindly overwrite
+      // creatorsync:{username} with whatever this request's snapshot was,
+      // no matter how stale. Two tabs/devices autosaving around the same
+      // time meant whichever PUT landed last in KV won completely, silently
+      // discarding the other one's edits with no error anywhere.
+      //
+      // An updated client now sends expectedUpdatedAt: the updatedAt it
+      // last actually saw (from a prior /sync/load or /sync/save response)
+      // -- i.e. the version its current edits are built on top of. If the
+      // record in KV has moved past that, another device saved in between;
+      // rather than clobber that write, this responds 409 and leaves KV
+      // untouched. The client's own pending edits aren't lost either: they
+      // stay in its DOM/localStorage and go up on the very next autosave,
+      // now against the correct baseline. An older client that doesn't
+      // send expectedUpdatedAt at all gets exactly its previous behavior
+      // (last-write-wins) -- this is purely additive, not a breaking
+      // change to the request shape.
+      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
+      if (expectedUpdatedAt !== null) {
+        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+        if (currentRaw) {
+          try {
+            const current = JSON.parse(currentRaw);
+            if (Number(current.updatedAt) > expectedUpdatedAt) {
+              // Purely for visibility -- this was previously invisible even
+              // to us; now it's at least countable on the admin dashboard.
+              ctx.waitUntil(bumpStat(env, "sync_conflict"));
+              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
+            }
+          } catch {
+            // Existing blob unreadable -- nothing coherent to protect
+            // against; fall through and write normally.
+          }
+        }
+      }
+
       const blob = {
         config: Array.isArray(body.config) ? body.config : [],
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
@@ -53141,7 +53230,9 @@ self.addEventListener('fetch', e => {
         // never the problem.
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // updatedAt lets the client advance its own baseline without a
+      // separate /sync/meta round trip -- see expectedUpdatedAt above.
+      return json({ ok: true, updatedAt: blob.updatedAt });
     }
 
     // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,
