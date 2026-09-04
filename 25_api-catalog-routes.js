@@ -458,13 +458,23 @@ async function handleFetch(request, env, ctx) {
     }
 
     if (path === "/app.webmanifest") {
+      // background_color (the splash-screen fill while the PWA cold-starts)
+      // and theme_color (the OS status bar / task-switcher chrome color for
+      // an installed PWA) are both static -- the manifest spec has no dark
+      // mode variant, unlike the page's own <meta name="theme-color">,
+      // which 09_page-shell.js already flips between light/dark on load and
+      // on toggleTheme(). So these match that page-level light default
+      // (#F2F2F7) instead of the button accent blue (#007AFF) they were set
+      // to before, which is what showed up as a flat blue bar at launch
+      // regardless of theme -- a dark-theme user still gets the correct
+      // dark chrome within a frame or two, once that in-page script runs.
       const manifest = {
         name: "My Lists",
         short_name: "My Lists",
         start_url: "/",
         display: "standalone",
-        background_color: "#1C1C1E",
-        theme_color: "#007AFF",
+        background_color: "#F2F2F7",
+        theme_color: "#F2F2F7",
         icons: [
           { src: "/icon.png", sizes: "192x192", type: "image/png" },
           { src: "/icon.png", sizes: "512x512", type: "image/png" }

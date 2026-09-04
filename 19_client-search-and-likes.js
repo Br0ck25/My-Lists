@@ -540,7 +540,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
 
     let actionsHtml = '';
     if ((item.source === 'My Lists Addon' || item.source === 'Profile') && usernameSlug) {
-      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829; Unlike' : '&#9825; Like') + '</button>';
+      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829;' : '&#9825;') + '</button>';
       actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedDirect ? 'style="color:var(--danger);"' : '') +
         ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + (item.type || 'movie') + '">' +
@@ -908,11 +908,11 @@ document.addEventListener('click', async (e) => {
       if (wasLiked) {
         forgetLikedList(usernameSlug);
         likeBtn.classList.remove('liked');
-        likeBtn.textContent = '\u2661 Like';
+        likeBtn.textContent = '\u2661';
       } else {
         rememberLikedList(usernameSlug);
         likeBtn.classList.add('liked');
-        likeBtn.textContent = '\u2665 Unlike';
+        likeBtn.textContent = '\u2665';
       }
       if (card) {
         card.dataset.likes = finalLikes;

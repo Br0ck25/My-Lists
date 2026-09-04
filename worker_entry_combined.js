@@ -12185,6 +12185,17 @@ ${seoHeadHtml}
     grid-template-columns: repeat(3, 1fr);
     gap: 10px 8px;
     width: 100%;
+    /* #detailGrid (the "See All" list-details view -- see the /#/list?
+       route) is a direct grid-item child of .tab-panel, same as
+       .lists-subpanel, .channels-subpanel and #itemDetailsBody, all of
+       which needed this same explicit min-width: 0 override before
+       (.tab-panel's own min-width: 0 only protects .tab-panel itself from
+       its parent -- it doesn't cascade to what each child contributes
+       back to .tab-panel's own grid track sizing). Missing it here let a
+       newly added, not-yet-through-the-usual-flow catalog's poster grid
+       force .tab-panel's track wider than the viewport on mobile instead
+       of every poster staying capped at its own column. */
+    min-width: 0;
   }
   @media (min-width: 641px) {
     .poster-grid-3, .live-preview-modal-grid, #detailGrid, #listPreviewGrid {
@@ -15549,7 +15560,7 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Guide</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Step-by-step how-to guides covering every tab: adding catalogs, building Channels, Storylines &amp; Universes, importing lists, and more.</p>
-      <a href="/guide" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
+      <a href="/guide" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
     </div>
 
     <!-- Support & Recommended Debrid Section -->
@@ -22542,7 +22553,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
 
     let actionsHtml = '';
     if ((item.source === 'My Lists Addon' || item.source === 'Profile') && usernameSlug) {
-      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829; Unlike' : '&#9825; Like') + '</button>';
+      actionsHtml += '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLikedProfile ? ' liked' : '') + '" data-username-slug="' + escapeAttr(usernameSlug) + '">' + (alreadyLikedProfile ? '&#9829;' : '&#9825;') + '</button>';
       actionsHtml += '<button type="button" class="lc-btn ' + (addedDirect ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
         (addedDirect ? 'style="color:var(--danger);"' : '') +
         ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + (item.type || 'movie') + '">' +
@@ -22910,11 +22921,11 @@ document.addEventListener('click', async (e) => {
       if (wasLiked) {
         forgetLikedList(usernameSlug);
         likeBtn.classList.remove('liked');
-        likeBtn.textContent = '\u2661 Like';
+        likeBtn.textContent = '\u2661';
       } else {
         rememberLikedList(usernameSlug);
         likeBtn.classList.add('liked');
-        likeBtn.textContent = '\u2665 Unlike';
+        likeBtn.textContent = '\u2665';
       }
       if (card) {
         card.dataset.likes = finalLikes;
@@ -37738,7 +37749,7 @@ function showKeyRevealModal(displayName, creatorKey) {
     '<div class="creator-key-display" id="revealedCreatorKey">' + escapeHtml(creatorKey) + '</div>' +
     '<p class="modal-sub">Save this key somewhere safe. You\\'ll need it to edit your lists from another browser. You can view it again later from Settings.</p>' +
     '<div class="actions">' +
-    '<button type="button" class="secondary" onclick="copyRevealedCreatorKey()">Copy Key</button>' +
+    '<button type="button" class="secondary" id="copyRevealedKeyBtn" onclick="copyRevealedCreatorKey()">Copy Key</button>' +
     '<button type="button" onclick="continueAfterKeyReveal()">Continue</button>' +
     '</div>'
   );
@@ -37746,8 +37757,18 @@ function showKeyRevealModal(displayName, creatorKey) {
 
 function copyRevealedCreatorKey() {
   const text = document.getElementById('revealedCreatorKey').textContent;
+  const btn = document.getElementById('copyRevealedKeyBtn');
+  // Same feedback pattern copyShareListUrl uses -- the button's own label
+  // flips to a checkmark and a toast confirms it, instead of a native
+  // alert() popping a plain OS dialog on top of this app's own styled
+  // "Profile Created" modal.
+  const onCopied = () => {
+    if (btn) btn.textContent = 'Copied ✓';
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Key'; }, 2000);
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => alert('Copied.')).catch(() => prompt('Copy this key:', text));
+    navigator.clipboard.writeText(text).then(onCopied).catch(() => prompt('Copy this key:', text));
   } else {
     prompt('Copy this key:', text);
   }
@@ -41070,6 +41091,36 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 }
 window.renderPosterGridChunked = renderPosterGridChunked;
 
+// Same chunked/rAF batching as renderPosterGridChunked, but appends to
+// whatever the grid already holds instead of clearing it first. A large
+// (100-200+ item) list's See All loads in pages as the user scrolls, and
+// each new page used to go through renderPosterGridChunked with the WHOLE
+// accumulated item list -- wiping and rebuilding every already-rendered
+// poster card (discarding already-decoded images along with it) on every
+// single page. That's what made scrolling through a big list jump around
+// instead of scrolling smoothly: the grid kept getting torn down and
+// rebuilt out from under the user's own scroll position. This only ever
+// needs to add the new page's own items, so it only ever does that.
+function appendPosterGridItems(gridEl, items) {
+  if (!gridEl || !items || !items.length) return;
+  var generation = ++_posterGridGeneration;
+  var cursor = 0;
+  var schedule = (typeof window !== 'undefined' && window.requestAnimationFrame)
+    ? function(fn) { window.requestAnimationFrame(fn); }
+    : function(fn) { setTimeout(fn, 16); };
+  function step() {
+    if (generation !== _posterGridGeneration) return;
+    if (!gridEl.isConnected) return;
+    var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
+    if (!slice.length) return;
+    gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    cursor += slice.length;
+    if (cursor < items.length) schedule(step);
+  }
+  step();
+}
+window.appendPosterGridItems = appendPosterGridItems;
+
 function livePreviewPosterHtml(m) {
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
@@ -42391,17 +42442,23 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     const annotated = freshItems.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
-    let filtered = window._currentListDetailsAllItems;
+    // Filter just THIS page's new items, not the whole accumulated list --
+    // switchListDetailsType's own full re-render already handles what's on
+    // screen changing when the filter itself changes (see its "Instant
+    // client filter" block); this only ever needs to decide whether the
+    // items that just arrived belong on the currently-active tab.
+    let newlyMatching = annotated;
     if (curFilter === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
+      newlyMatching = annotated.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (curFilter === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+      newlyMatching = annotated.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
-    filtered.forEach(item => { item.listUrl = listUrl; item.listName = name; });
-    // Chunked for the same reason the Watch History grid is -- this is the
-    // path a large Custom List, Watchlist or paginated chart takes, and it
-    // rebuilds the whole accumulated grid on every page that arrives.
-    renderPosterGridChunked(gridEl, filtered);
+    newlyMatching.forEach(item => { item.listUrl = listUrl; item.listName = name; });
+    // Append (not rebuild) -- see appendPosterGridItems's own comment for
+    // why: this is the path a large Custom List, Watchlist, or paginated
+    // chart takes as the user scrolls, and it used to tear down and
+    // rebuild every already-rendered poster on every page that arrived.
+    appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
@@ -46571,13 +46628,23 @@ async function handleFetch(request, env, ctx) {
     }
 
     if (path === "/app.webmanifest") {
+      // background_color (the splash-screen fill while the PWA cold-starts)
+      // and theme_color (the OS status bar / task-switcher chrome color for
+      // an installed PWA) are both static -- the manifest spec has no dark
+      // mode variant, unlike the page's own <meta name="theme-color">,
+      // which 09_page-shell.js already flips between light/dark on load and
+      // on toggleTheme(). So these match that page-level light default
+      // (#F2F2F7) instead of the button accent blue (#007AFF) they were set
+      // to before, which is what showed up as a flat blue bar at launch
+      // regardless of theme -- a dark-theme user still gets the correct
+      // dark chrome within a frame or two, once that in-page script runs.
       const manifest = {
         name: "My Lists",
         short_name: "My Lists",
         start_url: "/",
         display: "standalone",
-        background_color: "#1C1C1E",
-        theme_color: "#007AFF",
+        background_color: "#F2F2F7",
+        theme_color: "#F2F2F7",
         icons: [
           { src: "/icon.png", sizes: "192x192", type: "image/png" },
           { src: "/icon.png", sizes: "512x512", type: "image/png" }

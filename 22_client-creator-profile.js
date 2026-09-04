@@ -2433,7 +2433,7 @@ function showKeyRevealModal(displayName, creatorKey) {
     '<div class="creator-key-display" id="revealedCreatorKey">' + escapeHtml(creatorKey) + '</div>' +
     '<p class="modal-sub">Save this key somewhere safe. You\\'ll need it to edit your lists from another browser. You can view it again later from Settings.</p>' +
     '<div class="actions">' +
-    '<button type="button" class="secondary" onclick="copyRevealedCreatorKey()">Copy Key</button>' +
+    '<button type="button" class="secondary" id="copyRevealedKeyBtn" onclick="copyRevealedCreatorKey()">Copy Key</button>' +
     '<button type="button" onclick="continueAfterKeyReveal()">Continue</button>' +
     '</div>'
   );
@@ -2441,8 +2441,18 @@ function showKeyRevealModal(displayName, creatorKey) {
 
 function copyRevealedCreatorKey() {
   const text = document.getElementById('revealedCreatorKey').textContent;
+  const btn = document.getElementById('copyRevealedKeyBtn');
+  // Same feedback pattern copyShareListUrl uses -- the button's own label
+  // flips to a checkmark and a toast confirms it, instead of a native
+  // alert() popping a plain OS dialog on top of this app's own styled
+  // "Profile Created" modal.
+  const onCopied = () => {
+    if (btn) btn.textContent = 'Copied ✓';
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Key'; }, 2000);
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => alert('Copied.')).catch(() => prompt('Copy this key:', text));
+    navigator.clipboard.writeText(text).then(onCopied).catch(() => prompt('Copy this key:', text));
   } else {
     prompt('Copy this key:', text);
   }

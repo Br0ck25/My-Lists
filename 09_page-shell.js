@@ -1056,6 +1056,17 @@ ${seoHeadHtml}
     grid-template-columns: repeat(3, 1fr);
     gap: 10px 8px;
     width: 100%;
+    /* #detailGrid (the "See All" list-details view -- see the /#/list?
+       route) is a direct grid-item child of .tab-panel, same as
+       .lists-subpanel, .channels-subpanel and #itemDetailsBody, all of
+       which needed this same explicit min-width: 0 override before
+       (.tab-panel's own min-width: 0 only protects .tab-panel itself from
+       its parent -- it doesn't cascade to what each child contributes
+       back to .tab-panel's own grid track sizing). Missing it here let a
+       newly added, not-yet-through-the-usual-flow catalog's poster grid
+       force .tab-panel's track wider than the viewport on mobile instead
+       of every poster staying capped at its own column. */
+    min-width: 0;
   }
   @media (min-width: 641px) {
     .poster-grid-3, .live-preview-modal-grid, #detailGrid, #listPreviewGrid {

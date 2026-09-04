@@ -1065,6 +1065,36 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 }
 window.renderPosterGridChunked = renderPosterGridChunked;
 
+// Same chunked/rAF batching as renderPosterGridChunked, but appends to
+// whatever the grid already holds instead of clearing it first. A large
+// (100-200+ item) list's See All loads in pages as the user scrolls, and
+// each new page used to go through renderPosterGridChunked with the WHOLE
+// accumulated item list -- wiping and rebuilding every already-rendered
+// poster card (discarding already-decoded images along with it) on every
+// single page. That's what made scrolling through a big list jump around
+// instead of scrolling smoothly: the grid kept getting torn down and
+// rebuilt out from under the user's own scroll position. This only ever
+// needs to add the new page's own items, so it only ever does that.
+function appendPosterGridItems(gridEl, items) {
+  if (!gridEl || !items || !items.length) return;
+  var generation = ++_posterGridGeneration;
+  var cursor = 0;
+  var schedule = (typeof window !== 'undefined' && window.requestAnimationFrame)
+    ? function(fn) { window.requestAnimationFrame(fn); }
+    : function(fn) { setTimeout(fn, 16); };
+  function step() {
+    if (generation !== _posterGridGeneration) return;
+    if (!gridEl.isConnected) return;
+    var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
+    if (!slice.length) return;
+    gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    cursor += slice.length;
+    if (cursor < items.length) schedule(step);
+  }
+  step();
+}
+window.appendPosterGridItems = appendPosterGridItems;
+
 function livePreviewPosterHtml(m) {
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
@@ -2386,17 +2416,23 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     const annotated = freshItems.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
-    let filtered = window._currentListDetailsAllItems;
+    // Filter just THIS page's new items, not the whole accumulated list --
+    // switchListDetailsType's own full re-render already handles what's on
+    // screen changing when the filter itself changes (see its "Instant
+    // client filter" block); this only ever needs to decide whether the
+    // items that just arrived belong on the currently-active tab.
+    let newlyMatching = annotated;
     if (curFilter === 'movie') {
-      filtered = filtered.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
+      newlyMatching = annotated.filter((it) => it.type === 'movie' || it.kind === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'tv' && it.type !== 'show' && it.type !== 'episode' && it.kind !== 'series' && it.kind !== 'tv'));
     } else if (curFilter === 'series') {
-      filtered = filtered.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+      newlyMatching = annotated.filter((it) => it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.type === 'episode' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
     }
-    filtered.forEach(item => { item.listUrl = listUrl; item.listName = name; });
-    // Chunked for the same reason the Watch History grid is -- this is the
-    // path a large Custom List, Watchlist or paginated chart takes, and it
-    // rebuilds the whole accumulated grid on every page that arrives.
-    renderPosterGridChunked(gridEl, filtered);
+    newlyMatching.forEach(item => { item.listUrl = listUrl; item.listName = name; });
+    // Append (not rebuild) -- see appendPosterGridItems's own comment for
+    // why: this is the path a large Custom List, Watchlist, or paginated
+    // chart takes as the user scrolls, and it used to tear down and
+    // rebuild every already-rendered poster on every page that arrived.
+    appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
