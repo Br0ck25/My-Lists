@@ -4761,10 +4761,32 @@ self.addEventListener('fetch', e => {
       }
 
       // 2. If creatorName is given, also scan recent feedback keys for this creator
+      //
+      // KV list() on `feedback:` returns oldest-first (keys sort
+      // chronologically -- see /admin/api/feedback). A single unpaginated
+      // list({limit:200}) therefore only ever sees the 200 OLDEST entries
+      // system-wide, not the newest -- once total feedback volume passes
+      // that, a real creator's own recent thread falls outside the window
+      // and this scan silently stops finding it, forever, for every
+      // creator whose thread isn't in that fixed oldest-200 slice. Same
+      // fix as /admin/api/feedback: walk every page but only keep a
+      // rolling tail of the newest FEEDBACK_USER_SCAN_CAP keys, bounded so
+      // this stays cheap even with a very large feedback table.
       if (creatorName) {
         try {
-          const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 200 });
-          const scanKeys = (listRes.keys || []).map((k) => k.name);
+          const FEEDBACK_USER_SCAN_CAP = 300; // matches /admin/api/feedback's cap
+          let scanKeys = [];
+          let cursor;
+          let pages = 0;
+          while (pages < 30) {
+            const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
+            scanKeys.push(...(listRes.keys || []).map((k) => k.name));
+            if (scanKeys.length > FEEDBACK_USER_SCAN_CAP) scanKeys = scanKeys.slice(-FEEDBACK_USER_SCAN_CAP);
+            pages++;
+            if (listRes.list_complete || !listRes.cursor) break;
+            cursor = listRes.cursor;
+          }
+          scanKeys.reverse();
           const scanLookups = scanKeys.map(async (kName) => {
             const tid = kName.replace(/^feedback:/, "");
             if (threadsMap.has(tid)) return;

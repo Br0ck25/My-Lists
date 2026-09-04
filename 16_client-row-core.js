@@ -1080,6 +1080,12 @@ function saveUserFeedbackThreadId(threadId) {
 async function loadUserFeedbackThreads() {
   const threadIds = getUserFeedbackThreadIds();
   const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+  // The server requires creatorKey whenever creatorName is present (it
+  // authenticates and rejects the whole request otherwise, per-thread-id
+  // lookups included) -- see /api/feedback/threads. This used to send
+  // creatorName with no key, so every signed-in visitor's support panel
+  // 401'd silently and came back empty, even for their own threadIds.
+  const creatorKey = creatorName ? (localStorage.getItem('myListAddon:creatorKey') || '') : '';
 
   try {
     const res = await fetch(ORIGIN + '/api/feedback/threads', {
@@ -1088,6 +1094,7 @@ async function loadUserFeedbackThreads() {
       body: JSON.stringify({
         threadIds: threadIds,
         creatorName: creatorName,
+        creatorKey: creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);

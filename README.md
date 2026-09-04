@@ -42,10 +42,10 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 ### ⏱Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
-- **Scheduled Cron Worker**: Automatically queries TMDB every 6 hours via Cloudflare Cron Triggers (`0 */6 * * *`) to find newly-aired episodes for caught-up shows and push them to Continue Watching.
+- **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, and to keep the shared provider charts pre-warmed in KV.
 
 ### Creator Profiles & Cloud Sync
-- Free, passwordless account system secured by salted SHA-256 Creator Keys (`CRTR-...`).
+- Free, passwordless account system secured by salted PBKDF2-SHA256 Creator Keys (`MYL-XXXX-XXXX-XXXX`).
 - Synchronize your catalogs, custom lists, channels, presets, likes, and watch history across all your browsers and devices.
 
 ### Admin Dashboard (`/admin`)
@@ -93,9 +93,9 @@ Self-hosting is expected on Cloudflare Workers. Account creation, restore, key r
 
 ---
 
-### Step 3 — (Recommended) Enable Cloudflare KV Storage
+### Step 3 — (Required) Enable Cloudflare KV Storage
 
-KV storage is required for Creator Profiles (cloud sync), short install links, Custom Lists, Channels, Admin analytics, and Feedback storage:
+The Worker boots and serves the catalog/manifest pages without this, but every stateful feature -- Creator Profiles (cloud sync), short install links, Custom Lists, Channels, Admin analytics, and Feedback storage -- silently no-ops without it rather than erroring, so it's easy to deploy and not notice it's missing:
 
 1. In Cloudflare Dashboard sidebar, go to **Storage & Databases** &rarr; **Workers KV**.
 2. Click **Create Instance** (or **Create Namespace**).
@@ -109,9 +109,9 @@ KV storage is required for Creator Profiles (cloud sync), short install links, C
 
 ---
 
-### Step 4 - (Recommended) Enable Cloudflare D1 Storage
+### Step 4 - (Optional) Enable Cloudflare D1 Storage
 
-D1 (SQLite) is required for Creator Profiles, Custom Lists, and Source Groups to handle relational querying and bypass KV limits:
+D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale. If you do enable it later after already having KV data, run `schema.sql` (a **blank-database bootstrap that DROPs existing tables** -- never run it against a live D1 database with data in it; add a file under `migrations/` instead to change a live schema) and then POST `/admin/api/migrate-d1` to backfill existing KV accounts and lists into it:
 
 1. Run `npx wrangler d1 create my-lists-db` in your terminal to provision a new database.
 2. Execute the schema against it: `npx wrangler d1 execute my-lists-db --file=schema.sql --remote`.
@@ -273,7 +273,7 @@ node --test tests/*.test.mjs
 - **"TMDB lookup / episode browsing not working"**: Set the `TMDB_API_KEY` environment secret.
 - **"Cannot save lists / Creator Profiles not working"**: Ensure the KV Namespace binding is named exactly `CONFIGS`.
 - **"Admin dashboard authentication failed"**: Ensure `ADMIN_KEY` is configured as a Secret and KV storage is bound.
-- **"Continue Watching not updating with new episodes"**: Verify that the Cron Trigger (`0 */6 * * *`) is configured under Worker Triggers and `TMDB_API_KEY` is set. Note that cron updates apply to users with Creator Profiles.
+- **"Continue Watching not updating with new episodes"**: Verify that the Cron Trigger (`*/6 * * * *`) is configured under Worker Triggers and `TMDB_API_KEY` is set. Note that cron updates apply to users with Creator Profiles.
 
 ---
 

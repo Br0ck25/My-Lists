@@ -37,5 +37,17 @@ jobs:
       - name: Syntax check combined Worker
         run: node --check worker_entry_combined.js
 
+      # node --check above only parses the outer JS file. The served page
+      # is a giant template literal that renderBuilder() returns as a
+      # STRING -- a syntax error in the inline <script> it contains (i.e.
+      # in any of 09_..24_, the client-side sources) is just string content
+      # to that outer parser and would pass the step above silently, only
+      # to break the page for every real visitor. This actually executes
+      # renderBuilder() in a sandbox and syntax-checks what it returns.
+      - name: Render + validate the builder page
+        run: |
+          node render_check.js rendered.html
+          python3 html_checks.py rendered.html ci
+
       - name: Test suite
         run: node --test tests/*.test.mjs

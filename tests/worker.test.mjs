@@ -180,6 +180,58 @@ describe("feedback threads", () => {
     assert.equal(anon.status, 200);
     assert.ok(anon.body.threads.some((t) => t.id === threadId));
   });
+
+  // KV list() on "feedback:" returns oldest-first. The by-name scan used to
+  // be one unpaginated list({limit:200}) -- once total feedback volume grew
+  // past 200, that window only ever covered the 200 OLDEST entries
+  // system-wide, so a real creator's own recent thread would silently stop
+  // being found no matter how many times they asked. Seed past that old
+  // fixed window and assert the newest entry -- created last, so it sorts
+  // last -- is still returned.
+  it("by-name lookup still finds a creator's newest thread once feedback volume passes the old 200-key window", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicefbvol");
+    for (let i = 0; i < 250; i++) {
+      const id = `${1000000000000 + i}:filler${i}`;
+      await env.CONFIGS.put(`feedback:${id}`, JSON.stringify({
+        id, category: "other", message: `filler ${i}`, contact: null,
+        creatorName: "someoneelse", createdAt: 1000000000000 + i, updatedAt: 1000000000000 + i,
+        completed: false, status: "open", messages: [], userAgent: "",
+      }));
+    }
+    // Sorts after all 250 filler keys (larger timestamp), i.e. newest.
+    const newest = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, message: "my recent report" },
+    });
+    assert.equal(newest.body.ok, true);
+    const threadId = newest.body.entry.id;
+
+    const found = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(found.status, 200);
+    assert.ok(found.body.threads.some((t) => t.id === threadId), "newest thread should still be found past the old 200-key window");
+  });
+
+  // The server correctly requires creatorKey once creatorName is present
+  // (that's the fix for the IDOR where anyone could read any user's
+  // support threads by name alone) -- but the client's own caller was
+  // never updated to send it, so every signed-in visitor's own request
+  // 401'd and silently came back with zero threads, including their
+  // anonymous threadIds ones, since the creatorName check runs first and
+  // returns before threadIds are even looked up. Guard against sending
+  // creatorName without creatorKey creeping back into the shipped bundle.
+  it("served bundle sends creatorKey alongside creatorName when loading feedback threads", async () => {
+    const env = makeEnv();
+    const bundle = await call(env, "/app.js");
+    assert.equal(bundle.status, 200);
+    const start = bundle.text.indexOf("function loadUserFeedbackThreads");
+    assert.notEqual(start, -1, "loadUserFeedbackThreads should be present in the served bundle");
+    const body = bundle.text.slice(start, start + 1200);
+    assert.ok(/creatorKey\s*:\s*creatorKey/.test(body), "loadUserFeedbackThreads must send creatorKey, not just creatorName");
+  });
 });
 
 describe("data isolation", () => {
