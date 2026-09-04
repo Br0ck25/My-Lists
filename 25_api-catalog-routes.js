@@ -30,7 +30,10 @@ async function handleFetch(request, env, ctx) {
     const path = url.pathname;
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      if (isPublicCorsPath(path)) {
+        return new Response(null, { headers: corsHeaders() });
+      }
+      return new Response(null, { status: 204 });
     }
 
     if (path === "/" || path === "") {
@@ -295,7 +298,8 @@ async function handleFetch(request, env, ctx) {
         if (!raw) return null;
         try {
           const l = JSON.parse(raw);
-          if (l.visibility === "private") return null;
+          await stampListVisibilityIfNeeded(env, key, l);
+          if (!isPublicListVisibility(l.visibility)) return null;
           let username = "Anonymous";
           let slug = l.slug || "";
           if (isCreator) {
@@ -383,7 +387,7 @@ async function handleFetch(request, env, ctx) {
         return Response.redirect(`${url.origin}/${m[1]}/configure`, 302);
       }
       const { entries, track, shuffleShelves } = await resolveConfig(m[1], env);
-      return json(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
+      return jsonPublic(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
     }
 
     // bare manifest.json with no config
@@ -391,7 +395,7 @@ async function handleFetch(request, env, ctx) {
       if (isBrowserNavigation(request)) {
         return Response.redirect(`${url.origin}/configure`, 302);
       }
-      return json(buildManifest([], url.origin));
+      return jsonPublic(buildManifest([], url.origin));
     }
 
     // /:config/subtitles/:type/:id.json -- see buildManifest's comment
@@ -416,7 +420,7 @@ async function handleFetch(request, env, ctx) {
       // shouldn't hold up how fast this responds. ctx.waitUntil lets it
       // keep running after the response is already on its way.
       ctx.waitUntil(handleSubtitlesTrack(configParam, stremioType, decodeURIComponent(rawId), env, request));
-      return json({ subtitles: [] });
+      return jsonPublic({ subtitles: [] });
     }
 
     if (path === "/app.webmanifest") {
@@ -614,7 +618,7 @@ self.addEventListener('fetch', e => {
 
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
-      if (!entry || entry.enabled === false) return json({ metas: [] });
+      if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
       const source = detectSource(entry.url);
       const isAutoTrack = source === "autotrack";
@@ -638,14 +642,14 @@ self.addEventListener('fetch', e => {
           );
         }
         if (isUserPersonal) {
-          return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
-        return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
         if (isUserPersonal) {
           console.error("User personal catalog fetch error:", errMsg);
-          return json({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
 
         if (skip === 0 && staleKey) {
@@ -656,7 +660,7 @@ self.addEventListener('fetch', e => {
               // exactly like a normal successful load. `stale` is
               // informational only (visible when debugging via curl), not
               // read by wako/Stremio itself.
-              return json({ metas: JSON.parse(stale), stale: true, error: errMsg });
+              return jsonPublic({ metas: JSON.parse(stale), stale: true, error: errMsg });
             }
           } catch {
             // KV read/parse failed -- fall through to the placeholder below.
@@ -666,7 +670,7 @@ self.addEventListener('fetch', e => {
           // tile so the row still appears instead of silently disappearing.
           // Uses a dummy "tt"-prefixed id since the manifest declares
           // idPrefixes: ["tt", ...] and some clients filter out anything else.
-          return json({
+          return jsonPublic({
             metas: [
               {
                 id: "tt0000000",
@@ -682,7 +686,7 @@ self.addEventListener('fetch', e => {
         // Metas stays empty so wako/Stremio just shows an empty row instead
         // of erroring out, but the reason is still visible if you curl this
         // URL directly while debugging.
-        return json({ metas: [], error: errMsg }, 200);
+        return jsonPublic({ metas: [], error: errMsg }, 200);
       }
     }
 
@@ -775,6 +779,26 @@ self.addEventListener('fetch', e => {
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
+      // Unauthenticated and heavyweight: each call can fan out to TMDB /
+      // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
+      // -- 80/minute is enough for Live Preview paging a shelf, not enough
+      // to use this as a free outbound scanner.
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Couldn't load that list." }, 400, { "Cache-Control": "no-store" });
+      if (env && env.CONFIGS) {
+        const rateKey = `ratelimit:preview:${ip}`;
+        const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
+        if (n >= 80) {
+          return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
+        }
+        ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
+      }
+
+      const sourceUrls = previewSourceUrls(testUrl);
+      if (!sourceUrls.length || !sourceUrls.every(isAllowedCatalogSourceUrl)) {
+        return json({ ok: false, error: "That URL isn't a supported list source." }, 400, { "Cache-Control": "no-store" });
+      }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -797,12 +821,14 @@ self.addEventListener('fetch', e => {
           })),
         };
       } catch (err) {
-        body = { ok: false, error: String(err.message || err) };
+        console.error("preview failed:", err);
+        body = { ok: false, error: "Couldn't load that list." };
       }
 
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });
@@ -848,7 +874,7 @@ self.addEventListener('fetch', e => {
 
       // 1. Synthetic meta for Channels
       if (id.startsWith("channel_")) {
-        if (metaType !== "series") return json({ meta: null });
+        if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
           const { entries } = await resolveConfig(config, env);
@@ -866,11 +892,11 @@ self.addEventListener('fetch', e => {
             }
             if (matchedEntry) break;
           }
-          if (!matchedEntry) return json({ meta: null });
+          if (!matchedEntry) return jsonPublic({ meta: null });
           const meta = buildChannelMeta(matchedEntry, url.origin);
-          return json({ meta: meta || null });
+          return jsonPublic({ meta: meta || null });
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
@@ -880,18 +906,18 @@ self.addEventListener('fetch', e => {
           const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
           const effectiveKey = tmdbKey || TMDB_API_KEY;
           const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
-          if (!meta) return json({ meta: null });
-          return json(
+          if (!meta) return jsonPublic({ meta: null });
+          return jsonPublic(
             { meta },
             200,
             { "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800" }
           );
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
-      return json({ meta: null });
+      return jsonPublic({ meta: null });
     }
 
     // /api/channel-logo?path=...[&format=landscape]
@@ -4586,12 +4612,17 @@ self.addEventListener('fetch', e => {
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-      const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
-      const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
-      const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (!isAdmin && rateCount >= 20) {
-        return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+      let rateLimitKey = null;
+      let rateCount = 0;
+      if (!isAdmin) {
+        const ip = clientIpKey(request);
+        if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
+        rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
+        const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+        rateCount = parseInt(rateCountRaw, 10) || 0;
+        if (rateCount >= 20) {
+          return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+        }
       }
 
       // If replying to an existing thread
@@ -4622,7 +4653,7 @@ self.addEventListener('fetch', e => {
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
-            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
@@ -4649,7 +4680,7 @@ self.addEventListener('fetch', e => {
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
-        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
@@ -5305,11 +5336,11 @@ self.addEventListener('fetch', e => {
         listSlug = baseSlug + "-" + attempt;
         plKey = "publishedlist:user:" + listSlug;
       }
-      const plVisibility = plBody.visibility === "private" ? "private" : "public";
+      const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
       // Anonymous publishes belong in the directory index too.
-      if (plVisibility !== "private") {
+      if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
           isCreator: false,
           username: "user",
@@ -5344,6 +5375,7 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+      await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
@@ -5357,6 +5389,7 @@ self.addEventListener('fetch', e => {
       }
       const listScopeId = `${likeUser}:${likeSlug}`;
       const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const ledgerKey = `listlikevoters:${listScopeId}`;
       const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
 
@@ -5374,7 +5407,7 @@ self.addEventListener('fetch', e => {
         // `c:<user>:<slug>` -- using the wrong prefix here would append a
         // duplicate entry instead of updating the existing one.
         const likeIsCreator = likeKey === likeCreatorKey;
-        if (likeData.visibility !== "private") {
+        if (isPublicListVisibility(likeData.visibility)) {
           ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
             isCreator: likeIsCreator,
             username: likeIsCreator ? likeUser : "user",
@@ -5432,6 +5465,7 @@ self.addEventListener('fetch', e => {
       const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
       const voterId = await likeVoterId(request, env, extVoterName, hash);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
 
       const raw = await env.CONFIGS.get(key);

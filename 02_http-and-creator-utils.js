@@ -6,6 +6,26 @@ function corsHeaders() {
   };
 }
 
+// Stremio / wako fetch catalog, manifest, meta, and public-list JSON from
+// other origins, so those routes still advertise `Access-Control-Allow-Origin:
+// *`. Creator and like endpoints must not: `json()` used to spread
+// corsHeaders() onto every JSON response, including POSTs, and a simple
+// cross-origin POST (text/plain) is not preflighted -- that is how
+// unauthenticated writes (likes) became callable from any page.
+function isPublicCorsPath(path) {
+  const p = String(path || "");
+  if (p === "/manifest.json" || p.endsWith("/manifest.json")) return true;
+  if (p.includes("/catalog/") && p.endsWith(".json")) return true;
+  if (p.includes("/subtitles/") && p.endsWith(".json")) return true;
+  if ((p.includes("/meta/") || p.startsWith("/meta/")) && p.endsWith(".json")) return true;
+  if (p === "/lists/public.json" || p === "/api/public-lists.json") return true;
+  if (/^\/lists\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.json$/.test(p)) return true;
+  if (p === "/icon.png" || p === "/unavailable-poster.svg") return true;
+  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo") return true;
+  if (p.startsWith("/api/scrobble")) return true;
+  return false;
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -100,14 +120,18 @@ function json(data, status = 200, extraHeaders = {}) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "max-age=3600",
-      ...corsHeaders(),
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin
       // call site needing to keep repeating the default just to get it.
+      // CORS is NOT included by default -- see jsonPublic / corsHeaders.
       ...extraHeaders,
     },
   });
+}
+
+function jsonPublic(data, status = 200, extraHeaders = {}) {
+  return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
 // Detect whether a request is a top-level browser page load (someone tapping
@@ -414,6 +438,24 @@ function validateCreatorUsername(raw) {
   return { ok: true, normalized };
 }
 
+// Display names used to be silently overwritten with the validated username
+// (`const displayName = String(body.creatorName || "").trim()`), which was
+// load-bearing as a security control: admin/client HTML never saw interesting
+// input. Accepting a real display name therefore has to ship with length and
+// control-character validation, plus escaping at every render site.
+const CREATOR_DISPLAY_NAME_MAX = 40;
+
+function normalizeCreatorDisplayName(raw, fallbackUsername) {
+  let s = String(raw == null ? "" : raw).replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (!s) s = String(fallbackUsername || "").trim();
+  if (!s) return { ok: false, error: "Display name can't be empty." };
+  if (s.length > CREATOR_DISPLAY_NAME_MAX) {
+    return { ok: false, error: "Display name must be 40 characters or fewer." };
+  }
+  return { ok: true, displayName: s };
+}
+
 // Server-side counterpart to the client-side slugify() inside the builder
 // page's own script (that one only runs in the browser) -- used for
 // turning a publish-a-list list-name into the URL-safe slug segment
@@ -426,6 +468,57 @@ function slugifyServer(s) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
     .slice(0, 60);
+}
+
+// --- List visibility (public / private) --------------------------------------
+//
+// Public exposure used to be `visibility !== "private"`: a missing field,
+// empty string, typo, or garbage value all counted as public. Writes
+// mirrored that (`=== "private" ? "private" : "public"`), so an old client
+// that omitted the field published by default. That is the wrong default
+// for a privacy flag -- only an explicit `"public"` should ever expose a
+// list.
+//
+// Writes now fail closed (`normalizeListVisibility`). Reads now fail closed
+// too (`isPublicListVisibility` === `"public"`). Legacy records that have
+// no enum value were served as public under the old rule, so a one-off
+// backfill stamps those `"public"` before the inverted reads would hide
+// them. `stampListVisibilityIfNeeded` is that backfill, applied lazily on
+// public read/rebuild paths and eagerly from /admin/api/migrate-d1.
+function normalizeListVisibility(raw) {
+  return raw === "public" ? "public" : "private";
+}
+
+function isPublicListVisibility(visibility) {
+  return visibility === "public";
+}
+
+function needsListVisibilityBackfill(visibility) {
+  return visibility !== "public" && visibility !== "private";
+}
+
+function backfillListVisibilityValue(visibility) {
+  // Old rule: anything other than the exact string "private" was public.
+  return visibility === "private" ? "private" : "public";
+}
+
+function effectiveListVisibility(visibility) {
+  if (visibility === "public" || visibility === "private") return visibility;
+  return backfillListVisibilityValue(visibility);
+}
+
+async function stampListVisibilityIfNeeded(env, key, data) {
+  if (!data || typeof data !== "object") return false;
+  if (!needsListVisibilityBackfill(data.visibility)) return false;
+  data.visibility = backfillListVisibilityValue(data.visibility);
+  if (env && env.CONFIGS && key) {
+    try {
+      await env.CONFIGS.put(key, JSON.stringify(data));
+    } catch {
+      // Best-effort: the in-memory value is still stamped for this request.
+    }
+  }
+  return true;
 }
 
 function deslugifyServer(s) {
@@ -955,9 +1048,60 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 // which is the appropriate bar for a non-critical popularity signal.
 const LIKE_VOTER_CAP = 5000;
 
+// Rate limits (and anonymous like votes) key on CF-Connecting-IP, which
+// Cloudflare's edge sets and a client cannot spoof. The old
+// `|| "unknown"` fallback meant every request missing the header shared
+// one global bucket -- a single header-less client could lock everyone
+// else out of signup, and any non-Cloudflare path had no real per-client
+// limit. Fail closed: empty/missing header returns null and the caller
+// rejects. IPv6 is collapsed to a /64 so one subscriber is one bucket
+// rather than 2^64 addresses.
+function expandIpv6Hextets(ip) {
+  const raw = String(ip || "").trim().replace(/^\[/, "").replace(/\]$/, "").split("%")[0];
+  if (!raw || !raw.includes(":")) return null;
+  if (!/^[0-9a-fA-F:]+$/.test(raw)) return null;
+  const sides = raw.split("::");
+  if (sides.length > 2) return null;
+  const parseSide = (s) => (s ? s.split(":") : []);
+  let head = parseSide(sides[0]);
+  let tail = sides.length === 2 ? parseSide(sides[1]) : [];
+  if (head.length === 1 && head[0] === "") head = [];
+  if (tail.length === 1 && tail[0] === "") tail = [];
+  if (sides.length === 1) {
+    if (head.length !== 8) return null;
+  } else if (8 - head.length - tail.length < 0) {
+    return null;
+  }
+  const mid = sides.length === 2 ? Array(8 - head.length - tail.length).fill("0") : [];
+  const all = [...head, ...mid, ...tail];
+  if (all.length !== 8) return null;
+  for (let i = 0; i < 8; i++) {
+    const h = all[i] || "0";
+    if (h.length > 4 || !/^[0-9a-fA-F]+$/.test(h)) return null;
+    all[i] = h.toLowerCase();
+  }
+  return all;
+}
+
+function clientIpKey(request) {
+  const raw = request && request.headers ? request.headers.get("CF-Connecting-IP") : "";
+  const ip = String(raw || "").trim();
+  if (!ip) return null;
+  const v4mapped = ip.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (v4mapped) return v4mapped[1];
+  if (ip.includes(".") && !ip.includes(":")) return ip;
+  const hextets = expandIpv6Hextets(ip);
+  if (hextets) {
+    const prefix = hextets.slice(0, 4).map((h) => h.replace(/^0+(?=[0-9a-f])/, "") || "0");
+    return prefix.join(":") + "::/64";
+  }
+  return ip.toLowerCase();
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
-  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const ip = clientIpKey(request);
+  if (!ip) return null;
   const hash = await hashStringForKey(`${ip}|${scopeId}`);
   return `a:${hash}`;
 }
@@ -1156,7 +1300,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `c:${username}:${slug}`;
       if (seen.has(id)) continue;
@@ -1185,7 +1330,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `a:${slug}`;
       if (seen.has(id)) continue;

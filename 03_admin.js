@@ -200,6 +200,17 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // successful auth, fire-and-forget (never awaited there), so this can
 // never add latency or a failure mode to the actual authenticated action
 // it's riding along with.
+//
+// The timestamp is mirrored into D1's creators.last_active on the same
+// throttle. That column existed for a long time but nothing ever wrote to
+// it, which forced the dashboard to do one KV `get` per account just to
+// render the "Last Active" column -- linear in the account count, and
+// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// thousand creators (the admin dashboard then stopped loading entirely in
+// production; Miniflare doesn't enforce that limit, so it rendered fine
+// locally). Writing it here lets the dashboard read last-active straight
+// out of the creators SELECT it already runs. Accounts that predate this
+// have NULL in D1 and are repaired lazily by backfillCreatorLastActive.
 async function touchCreatorLastSeen(env, username) {
   if (!env || !env.CONFIGS || !username) return;
   try {
@@ -207,9 +218,72 @@ async function touchCreatorLastSeen(env, username) {
     const raw = await env.CONFIGS.get(key);
     const last = parseInt(raw, 10) || 0;
     if (Date.now() - last < 30 * 60 * 1000) return; // updated recently enough
-    await env.CONFIGS.put(key, String(Date.now()));
+    const now = Date.now();
+    await env.CONFIGS.put(key, String(now));
+    if (env.DB) {
+      // Mirrored, never authoritative: KV above is written unconditionally
+      // and remains the source of truth. An UPDATE that matches no row
+      // (account not yet migrated into D1) is harmless -- the dashboard's
+      // backfill fills it once the row exists. Best-effort so a D1 hiccup
+      // can never fail the auth this is riding along on.
+      try {
+        await env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ?")
+          .bind(now, username)
+          .run();
+      } catch (dbErr) {
+        // KV write above already happened; cosmetic value only.
+      }
+    }
   } catch (e) {
     // best-effort -- a missing/stale "Last Active" value is cosmetic only
+  }
+}
+
+// How many NULL last_active rows one dashboard load repairs. Kept well
+// under the subrequest cap: at most this many KV reads plus a single D1
+// batch write per call, so the backfill itself can never be the thing
+// that tips a dashboard load over the limit even mid-migration.
+const LAST_ACTIVE_BACKFILL_BATCH = 100;
+
+// Lazily fills creators.last_active in D1 from the KV creatorlastseen:
+// marker for accounts that still have NULL there -- every account created
+// before touchCreatorLastSeen started mirroring into D1. Runs only on an
+// admin dashboard load, repairs a bounded batch each time, and then has
+// nothing left to do: once a row is set, touchCreatorLastSeen keeps it
+// current going forward. Converges over a handful of loads (1,200 accounts
+// -> ~12 loads) and then costs zero KV reads. Each repaired value is also
+// written onto the in-memory account object so it shows the right "Last
+// Active" on the load that repairs it, not one load later.
+async function backfillCreatorLastActive(env, accounts) {
+  if (!env || !env.DB || !env.CONFIGS || !Array.isArray(accounts)) return;
+  const missing = accounts.filter((c) => c && c.username && !c.lastActive).slice(0, LAST_ACTIVE_BACKFILL_BATCH);
+  if (!missing.length) return;
+  const stmts = [];
+  await Promise.all(
+    missing.map(async (c) => {
+      try {
+        const raw = await env.CONFIGS.get(`creatorlastseen:${c.username}`);
+        const ts = raw ? parseInt(raw, 10) || 0 : 0;
+        if (ts) {
+          c.lastActive = ts;
+          // `AND last_active IS NULL` guards against clobbering a value a
+          // concurrent touch already wrote.
+          stmts.push(
+            env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ? AND last_active IS NULL").bind(ts, c.username)
+          );
+        }
+      } catch {
+        // best-effort per account; retried on a later load
+      }
+    })
+  );
+  if (stmts.length) {
+    try {
+      // One batched D1 call for the whole batch rather than one per row.
+      await env.DB.batch(stmts);
+    } catch (e) {
+      // Non-fatal: the same rows are picked up again on the next load.
+    }
   }
 }
 
@@ -225,6 +299,24 @@ async function touchCreatorLastSeen(env, username) {
 // checking every title that's ever been tracked. KV has no atomic
 // increment (same tradeoff as bumpStat above), so this is a reasonable
 // running total, not an exact ledger.
+// Telemetry keys used to live forever. `evtcount:` / `evtmeta:` grow one
+// pair per title ever watched; `searchquery:` is worse -- the query string
+// is the key, so an unauthenticated `/api/track-search` loop mints unbounded
+// KV. Day-scoped blobs and indexes expire after 120 days (wider than the
+// 90-day dashboard window). All-time counters expire 400 days after the
+// last increment, so dormant titles/queries drop and active ones refresh.
+const TELEMETRY_DAY_TTL_SEC = 120 * 24 * 60 * 60;
+const TELEMETRY_ALLTIME_TTL_SEC = 400 * 24 * 60 * 60;
+const EVT_DAY_INDEX_CAP = 1000;
+const SEARCH_DAY_INDEX_CAP = 400;
+// Support threads: 180 days from last write (create/reply/edit refreshes).
+const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
+const FEEDBACK_ADMIN_GET_CAP = 300;
+
+async function putFeedbackThread(env, key, entry) {
+  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
@@ -270,16 +362,16 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     } catch {
       index = [];
     }
-    if (!index.includes(id)) index.push(id);
+    if (!index.includes(id) && index.length < EVT_DAY_INDEX_CAP) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       // Overwritten every time rather than only on first sight -- keeps
       // title/mediaType current if either ever changes upstream, and
       // lastSeen doubles as a cheap staleness signal in the dashboard.
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
   } catch (e) {
     // best-effort -- never breaks the actual watch/list action riding along
@@ -305,7 +397,17 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
 
   if (window === "alltime") {
     const listResult = await listAllKeys(env.CONFIGS, prefix);
-    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    // Cap the candidate pool. This branch reads the running-total key AND
+    // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
+    // reads each, which is ~2,000 reads at 1,000 titles and crosses
+    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // killing the whole Trending tab. We surface only 100, so a fixed
+    // candidate ceiling bounds the cost regardless of corpus size; the
+    // day-index windows below are capped the same way.
+    const ALLTIME_CANDIDATE_CAP = 400;
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, ALLTIME_CANDIDATE_CAP);
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
         const id = k.name.slice(prefix.length, -":alltime".length);
@@ -342,7 +444,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
                 if (env && env.CONFIGS) {
-                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
                 }
               }
             }
@@ -431,7 +533,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
               if (env && env.CONFIGS) {
-                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
             }
           }
@@ -464,8 +566,8 @@ async function backfillTitleCount(env, eventType, id, title, mediaType, incremen
     const totalRaw = await env.CONFIGS.get(totalKey);
     const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
     await Promise.all([
-      env.CONFIGS.put(totalKey, String(total)),
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
     return true;
   } catch (e) {
@@ -515,12 +617,20 @@ async function recordSearchQuery(env, query) {
     } catch {
       index = [];
     }
-    if (!index.includes(q)) index.push(q);
+    let listed = index.includes(q);
+    if (!listed && index.length < SEARCH_DAY_INDEX_CAP) {
+      index.push(q);
+      listed = true;
+    }
+    // Day index full of other queries: still bump counters for a query
+    // that already has keys, but do not mint a brand-new unique-query
+    // pair -- that is the unbounded, user-controlled keyspace.
+    if (!listed && !daysRaw && !totalRaw) return;
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
     ]);
   } catch (e) {}
 }
@@ -530,7 +640,12 @@ async function computeSearchLeaderboard(env, window) {
   const prefix = "searchquery:";
   if (window === "alltime") {
     const listResult = await listAllKeys(env.CONFIGS, prefix);
-    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    // Same fan-out bound as computeLeaderboard's alltime branch: one read
+    // per query ever recorded, so cap the candidates before the reads.
+    const SEARCH_ALLTIME_CANDIDATE_CAP = 1000;
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, SEARCH_ALLTIME_CANDIDATE_CAP);
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
         const query = k.name.slice(prefix.length, -":alltime".length);
@@ -664,52 +779,91 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   catalogEntries.sort((a, b) => b.count - a.count);
 
   // 2. Community / Creator Lists
+  //
+  // Copy counts live under stats:list_copy:{slug}:total, one key per slug
+  // that has EVER been copied. Enumerate that short prefix ONCE (it's
+  // bounded by real copy activity, not by list count, and lists that have
+  // never been copied have no key) rather than doing one get per list --
+  // that per-list fan-out (plus the reads below) is what made this panel
+  // cost ~2 subrequests per list and eventually cross the 1,000 cap.
+  const copiesBySlug = new Map();
+  try {
+    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:");
+    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      copyTotalKeys.map(async (k) => {
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (count > 0) {
+          const slug = k.name.slice("stats:list_copy:".length, -":total".length);
+          copiesBySlug.set(slug, count);
+        }
+      })
+    );
+  } catch (e) {
+    // best-effort: copy counts are a ranking tiebreak, not load-bearing
+  }
+
+  // Bounded candidate set regardless of store: the panel shows 100 lists,
+  // so there is no reason to read every list in the system to get there.
+  const COMMUNITY_CAP = 100;
   let communityListsRaw = [];
   if (env.DB) {
-    const { results } = await env.DB.prepare("SELECT * FROM creator_lists").all();
-    communityListsRaw = results.filter(row => row.visibility !== 'private').map(row => ({
+    // Project only what's needed and compute the item count in SQL. This
+    // used to SELECT * (pulling every list's full items_json over the wire
+    // just to call .length on it) with no limit. Likes come straight from
+    // the likes column (kept current by the like route), which replaces
+    // the old read of `creatorlistlikes:{slug}` -- a key no code path
+    // writes, so the column used to show 0 for every list.
+    const { results } = await env.DB.prepare(
+      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility = 'public' ORDER BY likes DESC, updated_at DESC LIMIT ?"
+    ).bind(COMMUNITY_CAP).all();
+    communityListsRaw = (results || []).map((row) => ({
       slug: row.id.split(':')[1] || row.id,
       name: row.name,
       creatorName: row.username,
       type: row.type || 'mixed',
-      items: JSON.parse(row.items_json || '[]'),
+      likes: Number(row.likes) || 0,
+      itemCount: Number(row.item_count) || 0,
       updatedAt: row.updated_at || row.created_at || 0,
     }));
   } else {
-    const listResult = await listAllKeys(env.CONFIGS, "creatorlist:");
+    // KV-only fallback, bounded: enumerate at most the cap of keys instead
+    // of every list in the system, then one get per bounded candidate.
+    const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
     communityListsRaw = (await Promise.all(
-      listResult.keys.map(async (k) => {
+      (listResult.keys || []).map(async (k) => {
         const raw = await env.CONFIGS.get(k.name);
         if (!raw) return null;
         let data;
         try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || !data.slug || !data.creatorName) return null;
-        return data;
+        if (!data || !isPublicListVisibility(data.visibility)) return null;
+        if (!data.slug || !data.creatorName) return null;
+        return {
+          slug: data.slug,
+          name: data.name || data.slug,
+          creatorName: data.creatorName,
+          type: data.type || 'mixed',
+          likes: Number(data.likes) || 0,
+          itemCount: Array.isArray(data.items) ? data.items.length : 0,
+          updatedAt: data.updatedAt || data.createdAt || 0,
+        };
       })
     )).filter(Boolean);
   }
 
-  const communityLists = await Promise.all(
-    communityListsRaw.map(async (data) => {
-      const [likesRaw, copiesRaw] = await Promise.all([
-        env.CONFIGS.get(`creatorlistlikes:${data.slug}`),
-        env.CONFIGS.get(`stats:list_copy:${data.slug}:total`),
-      ]);
-      const likes = parseInt(likesRaw, 10) || 0;
-      const copies = parseInt(copiesRaw, 10) || 0;
-      const itemCount = Array.isArray(data.items) ? data.items.length : 0;
-      return {
-        slug: data.slug,
-        name: data.name || data.slug,
-        creator: data.creatorName,
-        type: data.type || 'mixed',
-        itemCount,
-        likes,
-        copies,
-        updatedAt: data.updatedAt || data.createdAt || 0,
-      };
-    })
-  );
+  // No per-list KV reads remain: likes and itemCount already came from the
+  // row/record above, copies come from the one prefix scan.
+  const communityLists = communityListsRaw.map((data) => ({
+    slug: data.slug,
+    name: data.name || data.slug,
+    creator: data.creatorName,
+    type: data.type || 'mixed',
+    itemCount: data.itemCount || 0,
+    likes: data.likes || 0,
+    copies: copiesBySlug.get(data.slug) || 0,
+    updatedAt: data.updatedAt || 0,
+  }));
   const validLists = communityLists.filter(Boolean);
   validLists.sort((a, b) => (b.likes + b.copies * 2) - (a.likes + a.copies * 2));
 
@@ -1017,26 +1171,53 @@ async function renderAdminDashboard(env) {
     rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
   }
 
+  // Creator accounts. The total is counted separately from the rows we
+  // render because creators can outnumber a single request's safe read
+  // budget: the stat card must report the true number of accounts rather
+  // than silently displaying the capped number as if it were the total.
   let creatorAccounts = [];
+  let totalCreatorCount = 0;
+  // Hard ceiling on how many accounts one dashboard load will render. The
+  // page is for a human eyeballing the newest/most-recent accounts, not
+  // paging through thousands, and this keeps a load bounded regardless of
+  // how large the site grows (the real cap is Cloudflare's 1,000
+  // subrequests/invocation; D1 rows are cheap, so this sits just under it
+  // to leave headroom for everything else the page does).
+  const CREATOR_RENDER_CAP = 1000;
   if (env.DB) {
-    const { results } = await env.DB.prepare("SELECT * FROM creators").all();
-    creatorAccounts = await Promise.all(results.map(async (row) => {
-      let lastActive = null;
-      try {
-        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${row.username}`);
-        lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
-      } catch {}
-      return {
-        username: row.username,
-        displayName: row.display_name,
-        createdAt: row.created_at || null,
-        lastActive,
-      };
+    // One query for the count, one bounded query for the rows -- no
+    // per-account reads. last_active now comes straight from the row (kept
+    // current by touchCreatorLastSeen), which is what removed the old
+    // one-KV-get-per-creator fan-out.
+    let count = 0;
+    try {
+      const countRes = await env.DB.prepare("SELECT COUNT(*) AS n FROM creators").all();
+      count = countRes.results && countRes.results[0] ? Number(countRes.results[0].n) || 0 : 0;
+    } catch (e) {
+      console.error("D1 creator count failed:", e);
+    }
+    totalCreatorCount = count;
+    const { results } = await env.DB.prepare(
+      "SELECT username, display_name, created_at, last_active FROM creators ORDER BY last_active DESC, created_at DESC LIMIT ?"
+    ).bind(CREATOR_RENDER_CAP).all();
+    creatorAccounts = (results || []).map((row) => ({
+      username: row.username,
+      displayName: row.display_name,
+      createdAt: row.created_at || null,
+      lastActive: row.last_active || null,
     }));
+    // Historical accounts have NULL last_active in D1; repair a bounded
+    // batch from KV each load (see backfillCreatorLastActive).
+    await backfillCreatorLastActive(env, creatorAccounts);
   } else {
-    // Fallback if D1 isn't working yet
+    // KV-only fallback. listAllKeys is a full cursor sweep (fine for
+    // enumerating, no per-key reads), then bound the fan-out: a KV get per
+    // account over more than this many would blow the subrequest cap, so
+    // cap the renders and report the real total.
+    totalCreatorCount = (creatorResult.keys || []).length;
+    const keys = (creatorResult.keys || []).slice(0, CREATOR_RENDER_CAP);
     creatorAccounts = await Promise.all(
-      creatorResult.keys.map(async (k) => {
+      keys.map(async (k) => {
         const username = k.name.slice("creator:".length);
         let displayName = username;
         let createdAt = null;
@@ -1059,6 +1240,7 @@ async function renderAdminDashboard(env) {
   }
 
   creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
+  const shownCreatorCount = creatorAccounts.length;
   const accountRows = creatorAccounts
     .map(
       (c) =>
@@ -1078,7 +1260,9 @@ async function renderAdminDashboard(env) {
         `<td><button type="button" class="lc-btn secondary" style="padding:4px 10px; font-size:0.8rem;" data-username="${escapeHtmlServer(c.username)}" data-displayname="${escapeHtmlServer(c.displayName)}" onclick="resetCreatorKey(this)">Reset Key</button></td></tr>`
     )
     .join("");
-  const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
+  const creatorTruncatedNote = shownCreatorCount < totalCreatorCount
+    ? `, showing ${shownCreatorCount} of ${totalCreatorCount}`
+    : "";
 
   // Each key is stats:sourcegroup:{group}:total -- strip both ends to get
   // the group name back. ":total" is a fixed suffix here (see bumpStatBy's
@@ -1278,7 +1462,7 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel" data-admin-panel="creators">
     <div class="stat-cards">
-      <div class="stat-card"><div class="stat-value">${creatorAccounts.length}</div><div class="stat-label">Creator accounts${truncatedNote}</div></div>
+      <div class="stat-card"><div class="stat-value">${totalCreatorCount}</div><div class="stat-label">Creator accounts${creatorTruncatedNote}</div></div>
     </div>
     <div class="table-wrap">
       <table>

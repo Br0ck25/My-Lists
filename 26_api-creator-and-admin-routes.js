@@ -1039,14 +1039,16 @@
       return json({ ok: true, users });
     }
 
-    // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
+    // /api/creator/create  (POST)  { creatorName, displayName?, recoveryAnswer? }
+    //   -> { ok, creatorName, displayName, creatorKey }
     // Rate limited to one new profile per minute per IP, tracked via a
     // short-lived KV key rather than anything more elaborate -- this add-on
     // has no user-identity system to rate-limit against besides the
     // requester's own IP.
     if (path === "/api/creator/create" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorcreate:${ip}`;
       if (await env.CONFIGS.get(rateLimitKey)) {
         return json({ ok: false, error: "Please wait a moment before creating another Profile." }, 429);
@@ -1059,7 +1061,9 @@
       }
       const v = validateCreatorUsername(body.creatorName);
       if (!v.ok) return json({ ok: false, error: v.error });
-      const displayName = String(body.creatorName || "").trim();
+      const dn = normalizeCreatorDisplayName(body.displayName, v.normalized);
+      if (!dn.ok) return json({ ok: false, error: dn.error }, 400);
+      const displayName = dn.displayName;
       // Reserve the rate-limit slot before the uniqueness check, not after
       // -- otherwise two requests landing at nearly the same instant could
       // both pass the "is it taken" check before either has written
@@ -1144,7 +1148,8 @@
       } catch {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `resetkeyrate:${ip}:${statsToday()}`;
       const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
@@ -1296,7 +1301,8 @@
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
     if (path === "/api/creator/restore" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorrestore:${ip}`;
       const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
       // More generous than profile creation (this is a normal, repeatable
@@ -1351,7 +1357,7 @@
                 items: data.items || [],
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
-                visibility: data.visibility === "private" ? "private" : "public",
+                visibility: effectiveListVisibility(data.visibility),
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {
@@ -1374,7 +1380,7 @@
               items: data.items || [],
               itemCount: (data.items || []).length,
               likes: data.likes || 0,
-              visibility: data.visibility === "private" ? "private" : "public",
+              visibility: effectiveListVisibility(data.visibility),
               url: `${url.origin}/lists/${auth.username}/watchlist`,
             });
           } catch {}
@@ -1456,7 +1462,7 @@
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
-      const visibility = body.visibility === "private" ? "private" : "public";
+      const visibility = normalizeListVisibility(body.visibility);
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
@@ -1532,7 +1538,7 @@
       ctx.waitUntil(updatePublicListIndex(
         env,
         `c:${auth.username}:${slug}`,
-        visibility === "private" ? null : {
+        isPublicListVisibility(visibility) ? {
           isCreator: true,
           username: auth.username,
           creatorName: auth.displayName || auth.username,
@@ -1542,7 +1548,7 @@
           itemCount: Array.isArray(items) ? items.length : 0,
           likes: likes || 0,
           updatedAt: now,
-        }
+        } : null
       ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
@@ -2642,7 +2648,8 @@
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const listSlug = k.name.slice("publishedlist:user:".length);
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
@@ -2666,7 +2673,8 @@
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
               // key shape is creatorlist:{username}:{slug}
@@ -2866,9 +2874,12 @@
         if (raw) {
           try {
             const parsed = JSON.parse(raw);
-            if (parsed && parsed.visibility !== "private") {
-              listData = parsed;
-              isCreatorList = k.startsWith("creatorlist:");
+            if (parsed) {
+              await stampListVisibilityIfNeeded(env, k, parsed);
+              if (isPublicListVisibility(parsed.visibility)) {
+                listData = parsed;
+                isCreatorList = k.startsWith("creatorlist:");
+              }
             }
           } catch {}
         }
@@ -3221,19 +3232,38 @@
           if (raw) {
             try {
               const data = JSON.parse(raw);
+              await stampListVisibilityIfNeeded(env, k.name, data);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
               // `likes` is carried across too. KV holds the authoritative
               // count, so a migration that omitted it would silently reset
-              // every list to zero in D1.
+              // every list to zero in D1. Visibility is rewritten as well
+              // so the fail-closed public index doesn't hide legacy lists
+              // that were served as public because they had no enum value.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);
             }
           }
+        }
+      }
+
+      // 2b. Anonymous published lists live only in KV. Stamp missing /
+      // garbage visibility the same way as creator lists so the inverted
+      // public-read checks don't hide currently-served lists.
+      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+      for (const k of pKeys.keys) {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw);
+          await stampListVisibilityIfNeeded(env, k.name, data);
+        } catch (e) {
+          results.errors.push(`Published ${k.name}: ` + e.message);
         }
       }
 
@@ -3348,7 +3378,7 @@
           if (dayKeysSorted.length > 95) {
             dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
           }
-          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob), { expirationTtl: TELEMETRY_DAY_TTL_SEC });
           await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
           keysMigratedThisCall += days.length;
         })
@@ -3365,26 +3395,35 @@
     }
 
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
-    // newest first. Reads up to 300 entries; feedback keys already sort
-    // chronologically as plain strings (see /api/feedback's own comment),
-    // so list() naturally returns oldest-first and this just reverses it.
+    // newest first. Keys sort chronologically (see /api/feedback), so
+    // list() is oldest-first: walk pages keeping a rolling tail, then
+    // GET only the newest FEEDBACK_ADMIN_GET_CAP. Getting every thread
+    // used to grow without bound (no TTL, no prune).
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
-      let allKeys = [];
+      let newestKeys = [];
       let cursor = undefined;
       let listComplete = false;
-      while (!listComplete) {
+      let pages = 0;
+      let sawMore = false;
+      while (!listComplete && pages < 30) {
         const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-        allKeys.push(...listResult.keys);
+        newestKeys.push(...(listResult.keys || []));
+        if (newestKeys.length > FEEDBACK_ADMIN_GET_CAP) {
+          newestKeys = newestKeys.slice(-FEEDBACK_ADMIN_GET_CAP);
+          sawMore = true;
+        }
+        pages++;
         if (listResult.list_complete || !listResult.cursor) {
           listComplete = true;
         } else {
           cursor = listResult.cursor;
         }
       }
-      const keys = allKeys.slice().reverse();
+      const truncated = !listComplete || sawMore;
+      const keys = newestKeys.slice().reverse();
       const entries = await Promise.all(
         keys.map(async (k) => {
           try {
@@ -3406,7 +3445,7 @@
           }
         })
       );
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: !!truncated }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
@@ -3465,7 +3504,7 @@
       entry.completed = false;
 
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save reply." }, 500);
       }
@@ -3500,7 +3539,7 @@
       }
       entry.completed = !!body.completed;
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
       }
@@ -3552,7 +3591,7 @@
       }
       entry.updatedAt = Date.now();
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
         return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
@@ -3883,7 +3922,7 @@
       }
     }
 
-    return new Response("Not found", { status: 404, headers: corsHeaders() });
+    return new Response("Not found", { status: 404 });
 }
 
 // The actual Worker export. Delegates to handleFetch (25_api-catalog-

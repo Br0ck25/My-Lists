@@ -1527,6 +1527,26 @@ function corsHeaders() {
   };
 }
 
+// Stremio / wako fetch catalog, manifest, meta, and public-list JSON from
+// other origins, so those routes still advertise `Access-Control-Allow-Origin:
+// *`. Creator and like endpoints must not: `json()` used to spread
+// corsHeaders() onto every JSON response, including POSTs, and a simple
+// cross-origin POST (text/plain) is not preflighted -- that is how
+// unauthenticated writes (likes) became callable from any page.
+function isPublicCorsPath(path) {
+  const p = String(path || "");
+  if (p === "/manifest.json" || p.endsWith("/manifest.json")) return true;
+  if (p.includes("/catalog/") && p.endsWith(".json")) return true;
+  if (p.includes("/subtitles/") && p.endsWith(".json")) return true;
+  if ((p.includes("/meta/") || p.startsWith("/meta/")) && p.endsWith(".json")) return true;
+  if (p === "/lists/public.json" || p === "/api/public-lists.json") return true;
+  if (/^\/lists\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.json$/.test(p)) return true;
+  if (p === "/icon.png" || p === "/unavailable-poster.svg") return true;
+  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo") return true;
+  if (p.startsWith("/api/scrobble")) return true;
+  return false;
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -1621,14 +1641,18 @@ function json(data, status = 200, extraHeaders = {}) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "max-age=3600",
-      ...corsHeaders(),
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin
       // call site needing to keep repeating the default just to get it.
+      // CORS is NOT included by default -- see jsonPublic / corsHeaders.
       ...extraHeaders,
     },
   });
+}
+
+function jsonPublic(data, status = 200, extraHeaders = {}) {
+  return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
 // Detect whether a request is a top-level browser page load (someone tapping
@@ -1935,6 +1959,24 @@ function validateCreatorUsername(raw) {
   return { ok: true, normalized };
 }
 
+// Display names used to be silently overwritten with the validated username
+// (`const displayName = String(body.creatorName || "").trim()`), which was
+// load-bearing as a security control: admin/client HTML never saw interesting
+// input. Accepting a real display name therefore has to ship with length and
+// control-character validation, plus escaping at every render site.
+const CREATOR_DISPLAY_NAME_MAX = 40;
+
+function normalizeCreatorDisplayName(raw, fallbackUsername) {
+  let s = String(raw == null ? "" : raw).replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (!s) s = String(fallbackUsername || "").trim();
+  if (!s) return { ok: false, error: "Display name can't be empty." };
+  if (s.length > CREATOR_DISPLAY_NAME_MAX) {
+    return { ok: false, error: "Display name must be 40 characters or fewer." };
+  }
+  return { ok: true, displayName: s };
+}
+
 // Server-side counterpart to the client-side slugify() inside the builder
 // page's own script (that one only runs in the browser) -- used for
 // turning a publish-a-list list-name into the URL-safe slug segment
@@ -1947,6 +1989,57 @@ function slugifyServer(s) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
     .slice(0, 60);
+}
+
+// --- List visibility (public / private) --------------------------------------
+//
+// Public exposure used to be `visibility !== "private"`: a missing field,
+// empty string, typo, or garbage value all counted as public. Writes
+// mirrored that (`=== "private" ? "private" : "public"`), so an old client
+// that omitted the field published by default. That is the wrong default
+// for a privacy flag -- only an explicit `"public"` should ever expose a
+// list.
+//
+// Writes now fail closed (`normalizeListVisibility`). Reads now fail closed
+// too (`isPublicListVisibility` === `"public"`). Legacy records that have
+// no enum value were served as public under the old rule, so a one-off
+// backfill stamps those `"public"` before the inverted reads would hide
+// them. `stampListVisibilityIfNeeded` is that backfill, applied lazily on
+// public read/rebuild paths and eagerly from /admin/api/migrate-d1.
+function normalizeListVisibility(raw) {
+  return raw === "public" ? "public" : "private";
+}
+
+function isPublicListVisibility(visibility) {
+  return visibility === "public";
+}
+
+function needsListVisibilityBackfill(visibility) {
+  return visibility !== "public" && visibility !== "private";
+}
+
+function backfillListVisibilityValue(visibility) {
+  // Old rule: anything other than the exact string "private" was public.
+  return visibility === "private" ? "private" : "public";
+}
+
+function effectiveListVisibility(visibility) {
+  if (visibility === "public" || visibility === "private") return visibility;
+  return backfillListVisibilityValue(visibility);
+}
+
+async function stampListVisibilityIfNeeded(env, key, data) {
+  if (!data || typeof data !== "object") return false;
+  if (!needsListVisibilityBackfill(data.visibility)) return false;
+  data.visibility = backfillListVisibilityValue(data.visibility);
+  if (env && env.CONFIGS && key) {
+    try {
+      await env.CONFIGS.put(key, JSON.stringify(data));
+    } catch {
+      // Best-effort: the in-memory value is still stamped for this request.
+    }
+  }
+  return true;
 }
 
 function deslugifyServer(s) {
@@ -2476,9 +2569,60 @@ async function fetchTraktWithRetry(url, options = {}, retries = 2) {
 // which is the appropriate bar for a non-critical popularity signal.
 const LIKE_VOTER_CAP = 5000;
 
+// Rate limits (and anonymous like votes) key on CF-Connecting-IP, which
+// Cloudflare's edge sets and a client cannot spoof. The old
+// `|| "unknown"` fallback meant every request missing the header shared
+// one global bucket -- a single header-less client could lock everyone
+// else out of signup, and any non-Cloudflare path had no real per-client
+// limit. Fail closed: empty/missing header returns null and the caller
+// rejects. IPv6 is collapsed to a /64 so one subscriber is one bucket
+// rather than 2^64 addresses.
+function expandIpv6Hextets(ip) {
+  const raw = String(ip || "").trim().replace(/^\[/, "").replace(/\]$/, "").split("%")[0];
+  if (!raw || !raw.includes(":")) return null;
+  if (!/^[0-9a-fA-F:]+$/.test(raw)) return null;
+  const sides = raw.split("::");
+  if (sides.length > 2) return null;
+  const parseSide = (s) => (s ? s.split(":") : []);
+  let head = parseSide(sides[0]);
+  let tail = sides.length === 2 ? parseSide(sides[1]) : [];
+  if (head.length === 1 && head[0] === "") head = [];
+  if (tail.length === 1 && tail[0] === "") tail = [];
+  if (sides.length === 1) {
+    if (head.length !== 8) return null;
+  } else if (8 - head.length - tail.length < 0) {
+    return null;
+  }
+  const mid = sides.length === 2 ? Array(8 - head.length - tail.length).fill("0") : [];
+  const all = [...head, ...mid, ...tail];
+  if (all.length !== 8) return null;
+  for (let i = 0; i < 8; i++) {
+    const h = all[i] || "0";
+    if (h.length > 4 || !/^[0-9a-fA-F]+$/.test(h)) return null;
+    all[i] = h.toLowerCase();
+  }
+  return all;
+}
+
+function clientIpKey(request) {
+  const raw = request && request.headers ? request.headers.get("CF-Connecting-IP") : "";
+  const ip = String(raw || "").trim();
+  if (!ip) return null;
+  const v4mapped = ip.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (v4mapped) return v4mapped[1];
+  if (ip.includes(".") && !ip.includes(":")) return ip;
+  const hextets = expandIpv6Hextets(ip);
+  if (hextets) {
+    const prefix = hextets.slice(0, 4).map((h) => h.replace(/^0+(?=[0-9a-f])/, "") || "0");
+    return prefix.join(":") + "::/64";
+  }
+  return ip.toLowerCase();
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
-  const ip = (request && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const ip = clientIpKey(request);
+  if (!ip) return null;
   const hash = await hashStringForKey(`${ip}|${scopeId}`);
   return `a:${hash}`;
 }
@@ -2677,7 +2821,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `c:${username}:${slug}`;
       if (seen.has(id)) continue;
@@ -2706,7 +2851,8 @@ async function rebuildPublicListIndex(env) {
     if (!raw) continue;
     try {
       const data = JSON.parse(raw);
-      if (data.visibility === "private") continue;
+      await stampListVisibilityIfNeeded(env, k.name, data);
+      if (!isPublicListVisibility(data.visibility)) continue;
       const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
       const id = `a:${slug}`;
       if (seen.has(id)) continue;
@@ -3210,6 +3356,17 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // successful auth, fire-and-forget (never awaited there), so this can
 // never add latency or a failure mode to the actual authenticated action
 // it's riding along with.
+//
+// The timestamp is mirrored into D1's creators.last_active on the same
+// throttle. That column existed for a long time but nothing ever wrote to
+// it, which forced the dashboard to do one KV `get` per account just to
+// render the "Last Active" column -- linear in the account count, and
+// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// thousand creators (the admin dashboard then stopped loading entirely in
+// production; Miniflare doesn't enforce that limit, so it rendered fine
+// locally). Writing it here lets the dashboard read last-active straight
+// out of the creators SELECT it already runs. Accounts that predate this
+// have NULL in D1 and are repaired lazily by backfillCreatorLastActive.
 async function touchCreatorLastSeen(env, username) {
   if (!env || !env.CONFIGS || !username) return;
   try {
@@ -3217,9 +3374,72 @@ async function touchCreatorLastSeen(env, username) {
     const raw = await env.CONFIGS.get(key);
     const last = parseInt(raw, 10) || 0;
     if (Date.now() - last < 30 * 60 * 1000) return; // updated recently enough
-    await env.CONFIGS.put(key, String(Date.now()));
+    const now = Date.now();
+    await env.CONFIGS.put(key, String(now));
+    if (env.DB) {
+      // Mirrored, never authoritative: KV above is written unconditionally
+      // and remains the source of truth. An UPDATE that matches no row
+      // (account not yet migrated into D1) is harmless -- the dashboard's
+      // backfill fills it once the row exists. Best-effort so a D1 hiccup
+      // can never fail the auth this is riding along on.
+      try {
+        await env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ?")
+          .bind(now, username)
+          .run();
+      } catch (dbErr) {
+        // KV write above already happened; cosmetic value only.
+      }
+    }
   } catch (e) {
     // best-effort -- a missing/stale "Last Active" value is cosmetic only
+  }
+}
+
+// How many NULL last_active rows one dashboard load repairs. Kept well
+// under the subrequest cap: at most this many KV reads plus a single D1
+// batch write per call, so the backfill itself can never be the thing
+// that tips a dashboard load over the limit even mid-migration.
+const LAST_ACTIVE_BACKFILL_BATCH = 100;
+
+// Lazily fills creators.last_active in D1 from the KV creatorlastseen:
+// marker for accounts that still have NULL there -- every account created
+// before touchCreatorLastSeen started mirroring into D1. Runs only on an
+// admin dashboard load, repairs a bounded batch each time, and then has
+// nothing left to do: once a row is set, touchCreatorLastSeen keeps it
+// current going forward. Converges over a handful of loads (1,200 accounts
+// -> ~12 loads) and then costs zero KV reads. Each repaired value is also
+// written onto the in-memory account object so it shows the right "Last
+// Active" on the load that repairs it, not one load later.
+async function backfillCreatorLastActive(env, accounts) {
+  if (!env || !env.DB || !env.CONFIGS || !Array.isArray(accounts)) return;
+  const missing = accounts.filter((c) => c && c.username && !c.lastActive).slice(0, LAST_ACTIVE_BACKFILL_BATCH);
+  if (!missing.length) return;
+  const stmts = [];
+  await Promise.all(
+    missing.map(async (c) => {
+      try {
+        const raw = await env.CONFIGS.get(`creatorlastseen:${c.username}`);
+        const ts = raw ? parseInt(raw, 10) || 0 : 0;
+        if (ts) {
+          c.lastActive = ts;
+          // `AND last_active IS NULL` guards against clobbering a value a
+          // concurrent touch already wrote.
+          stmts.push(
+            env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ? AND last_active IS NULL").bind(ts, c.username)
+          );
+        }
+      } catch {
+        // best-effort per account; retried on a later load
+      }
+    })
+  );
+  if (stmts.length) {
+    try {
+      // One batched D1 call for the whole batch rather than one per row.
+      await env.DB.batch(stmts);
+    } catch (e) {
+      // Non-fatal: the same rows are picked up again on the next load.
+    }
   }
 }
 
@@ -3235,6 +3455,24 @@ async function touchCreatorLastSeen(env, username) {
 // checking every title that's ever been tracked. KV has no atomic
 // increment (same tradeoff as bumpStat above), so this is a reasonable
 // running total, not an exact ledger.
+// Telemetry keys used to live forever. `evtcount:` / `evtmeta:` grow one
+// pair per title ever watched; `searchquery:` is worse -- the query string
+// is the key, so an unauthenticated `/api/track-search` loop mints unbounded
+// KV. Day-scoped blobs and indexes expire after 120 days (wider than the
+// 90-day dashboard window). All-time counters expire 400 days after the
+// last increment, so dormant titles/queries drop and active ones refresh.
+const TELEMETRY_DAY_TTL_SEC = 120 * 24 * 60 * 60;
+const TELEMETRY_ALLTIME_TTL_SEC = 400 * 24 * 60 * 60;
+const EVT_DAY_INDEX_CAP = 1000;
+const SEARCH_DAY_INDEX_CAP = 400;
+// Support threads: 180 days from last write (create/reply/edit refreshes).
+const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
+const FEEDBACK_ADMIN_GET_CAP = 300;
+
+async function putFeedbackThread(env, key, entry) {
+  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
@@ -3280,16 +3518,16 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     } catch {
       index = [];
     }
-    if (!index.includes(id)) index.push(id);
+    if (!index.includes(id) && index.length < EVT_DAY_INDEX_CAP) index.push(id);
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       // Overwritten every time rather than only on first sight -- keeps
       // title/mediaType current if either ever changes upstream, and
       // lastSeen doubles as a cheap staleness signal in the dashboard.
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
   } catch (e) {
     // best-effort -- never breaks the actual watch/list action riding along
@@ -3315,7 +3553,17 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
 
   if (window === "alltime") {
     const listResult = await listAllKeys(env.CONFIGS, prefix);
-    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    // Cap the candidate pool. This branch reads the running-total key AND
+    // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
+    // reads each, which is ~2,000 reads at 1,000 titles and crosses
+    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // killing the whole Trending tab. We surface only 100, so a fixed
+    // candidate ceiling bounds the cost regardless of corpus size; the
+    // day-index windows below are capped the same way.
+    const ALLTIME_CANDIDATE_CAP = 400;
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, ALLTIME_CANDIDATE_CAP);
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
         const id = k.name.slice(prefix.length, -":alltime".length);
@@ -3352,7 +3600,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
                 e.title = det.title;
                 if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
                 if (env && env.CONFIGS) {
-                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
                 }
               }
             }
@@ -3441,7 +3689,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
               if (env && env.CONFIGS) {
-                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() })).catch(() => {});
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
             }
           }
@@ -3474,8 +3722,8 @@ async function backfillTitleCount(env, eventType, id, title, mediaType, incremen
     const totalRaw = await env.CONFIGS.get(totalKey);
     const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
     await Promise.all([
-      env.CONFIGS.put(totalKey, String(total)),
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() })),
+      env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
     ]);
     return true;
   } catch (e) {
@@ -3525,12 +3773,20 @@ async function recordSearchQuery(env, query) {
     } catch {
       index = [];
     }
-    if (!index.includes(q)) index.push(q);
+    let listed = index.includes(q);
+    if (!listed && index.length < SEARCH_DAY_INDEX_CAP) {
+      index.push(q);
+      listed = true;
+    }
+    // Day index full of other queries: still bump counters for a query
+    // that already has keys, but do not mint a brand-new unique-query
+    // pair -- that is the unbounded, user-controlled keyspace.
+    if (!listed && !daysRaw && !totalRaw) return;
 
     await Promise.all([
-      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts)),
-      env.CONFIGS.put(totalKey, String(totalCount)),
-      env.CONFIGS.put(indexKey, JSON.stringify(index)),
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
     ]);
   } catch (e) {}
 }
@@ -3540,7 +3796,12 @@ async function computeSearchLeaderboard(env, window) {
   const prefix = "searchquery:";
   if (window === "alltime") {
     const listResult = await listAllKeys(env.CONFIGS, prefix);
-    const alltimeKeys = listResult.keys.filter((k) => k.name.endsWith(":alltime"));
+    // Same fan-out bound as computeLeaderboard's alltime branch: one read
+    // per query ever recorded, so cap the candidates before the reads.
+    const SEARCH_ALLTIME_CANDIDATE_CAP = 1000;
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, SEARCH_ALLTIME_CANDIDATE_CAP);
     const entries = await Promise.all(
       alltimeKeys.map(async (k) => {
         const query = k.name.slice(prefix.length, -":alltime".length);
@@ -3674,52 +3935,91 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   catalogEntries.sort((a, b) => b.count - a.count);
 
   // 2. Community / Creator Lists
+  //
+  // Copy counts live under stats:list_copy:{slug}:total, one key per slug
+  // that has EVER been copied. Enumerate that short prefix ONCE (it's
+  // bounded by real copy activity, not by list count, and lists that have
+  // never been copied have no key) rather than doing one get per list --
+  // that per-list fan-out (plus the reads below) is what made this panel
+  // cost ~2 subrequests per list and eventually cross the 1,000 cap.
+  const copiesBySlug = new Map();
+  try {
+    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:");
+    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      copyTotalKeys.map(async (k) => {
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (count > 0) {
+          const slug = k.name.slice("stats:list_copy:".length, -":total".length);
+          copiesBySlug.set(slug, count);
+        }
+      })
+    );
+  } catch (e) {
+    // best-effort: copy counts are a ranking tiebreak, not load-bearing
+  }
+
+  // Bounded candidate set regardless of store: the panel shows 100 lists,
+  // so there is no reason to read every list in the system to get there.
+  const COMMUNITY_CAP = 100;
   let communityListsRaw = [];
   if (env.DB) {
-    const { results } = await env.DB.prepare("SELECT * FROM creator_lists").all();
-    communityListsRaw = results.filter(row => row.visibility !== 'private').map(row => ({
+    // Project only what's needed and compute the item count in SQL. This
+    // used to SELECT * (pulling every list's full items_json over the wire
+    // just to call .length on it) with no limit. Likes come straight from
+    // the likes column (kept current by the like route), which replaces
+    // the old read of `creatorlistlikes:{slug}` -- a key no code path
+    // writes, so the column used to show 0 for every list.
+    const { results } = await env.DB.prepare(
+      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility = 'public' ORDER BY likes DESC, updated_at DESC LIMIT ?"
+    ).bind(COMMUNITY_CAP).all();
+    communityListsRaw = (results || []).map((row) => ({
       slug: row.id.split(':')[1] || row.id,
       name: row.name,
       creatorName: row.username,
       type: row.type || 'mixed',
-      items: JSON.parse(row.items_json || '[]'),
+      likes: Number(row.likes) || 0,
+      itemCount: Number(row.item_count) || 0,
       updatedAt: row.updated_at || row.created_at || 0,
     }));
   } else {
-    const listResult = await listAllKeys(env.CONFIGS, "creatorlist:");
+    // KV-only fallback, bounded: enumerate at most the cap of keys instead
+    // of every list in the system, then one get per bounded candidate.
+    const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
     communityListsRaw = (await Promise.all(
-      listResult.keys.map(async (k) => {
+      (listResult.keys || []).map(async (k) => {
         const raw = await env.CONFIGS.get(k.name);
         if (!raw) return null;
         let data;
         try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || !data.slug || !data.creatorName) return null;
-        return data;
+        if (!data || !isPublicListVisibility(data.visibility)) return null;
+        if (!data.slug || !data.creatorName) return null;
+        return {
+          slug: data.slug,
+          name: data.name || data.slug,
+          creatorName: data.creatorName,
+          type: data.type || 'mixed',
+          likes: Number(data.likes) || 0,
+          itemCount: Array.isArray(data.items) ? data.items.length : 0,
+          updatedAt: data.updatedAt || data.createdAt || 0,
+        };
       })
     )).filter(Boolean);
   }
 
-  const communityLists = await Promise.all(
-    communityListsRaw.map(async (data) => {
-      const [likesRaw, copiesRaw] = await Promise.all([
-        env.CONFIGS.get(`creatorlistlikes:${data.slug}`),
-        env.CONFIGS.get(`stats:list_copy:${data.slug}:total`),
-      ]);
-      const likes = parseInt(likesRaw, 10) || 0;
-      const copies = parseInt(copiesRaw, 10) || 0;
-      const itemCount = Array.isArray(data.items) ? data.items.length : 0;
-      return {
-        slug: data.slug,
-        name: data.name || data.slug,
-        creator: data.creatorName,
-        type: data.type || 'mixed',
-        itemCount,
-        likes,
-        copies,
-        updatedAt: data.updatedAt || data.createdAt || 0,
-      };
-    })
-  );
+  // No per-list KV reads remain: likes and itemCount already came from the
+  // row/record above, copies come from the one prefix scan.
+  const communityLists = communityListsRaw.map((data) => ({
+    slug: data.slug,
+    name: data.name || data.slug,
+    creator: data.creatorName,
+    type: data.type || 'mixed',
+    itemCount: data.itemCount || 0,
+    likes: data.likes || 0,
+    copies: copiesBySlug.get(data.slug) || 0,
+    updatedAt: data.updatedAt || 0,
+  }));
   const validLists = communityLists.filter(Boolean);
   validLists.sort((a, b) => (b.likes + b.copies * 2) - (a.likes + a.copies * 2));
 
@@ -4027,26 +4327,53 @@ async function renderAdminDashboard(env) {
     rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
   }
 
+  // Creator accounts. The total is counted separately from the rows we
+  // render because creators can outnumber a single request's safe read
+  // budget: the stat card must report the true number of accounts rather
+  // than silently displaying the capped number as if it were the total.
   let creatorAccounts = [];
+  let totalCreatorCount = 0;
+  // Hard ceiling on how many accounts one dashboard load will render. The
+  // page is for a human eyeballing the newest/most-recent accounts, not
+  // paging through thousands, and this keeps a load bounded regardless of
+  // how large the site grows (the real cap is Cloudflare's 1,000
+  // subrequests/invocation; D1 rows are cheap, so this sits just under it
+  // to leave headroom for everything else the page does).
+  const CREATOR_RENDER_CAP = 1000;
   if (env.DB) {
-    const { results } = await env.DB.prepare("SELECT * FROM creators").all();
-    creatorAccounts = await Promise.all(results.map(async (row) => {
-      let lastActive = null;
-      try {
-        const lastRaw = await env.CONFIGS.get(`creatorlastseen:${row.username}`);
-        lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
-      } catch {}
-      return {
-        username: row.username,
-        displayName: row.display_name,
-        createdAt: row.created_at || null,
-        lastActive,
-      };
+    // One query for the count, one bounded query for the rows -- no
+    // per-account reads. last_active now comes straight from the row (kept
+    // current by touchCreatorLastSeen), which is what removed the old
+    // one-KV-get-per-creator fan-out.
+    let count = 0;
+    try {
+      const countRes = await env.DB.prepare("SELECT COUNT(*) AS n FROM creators").all();
+      count = countRes.results && countRes.results[0] ? Number(countRes.results[0].n) || 0 : 0;
+    } catch (e) {
+      console.error("D1 creator count failed:", e);
+    }
+    totalCreatorCount = count;
+    const { results } = await env.DB.prepare(
+      "SELECT username, display_name, created_at, last_active FROM creators ORDER BY last_active DESC, created_at DESC LIMIT ?"
+    ).bind(CREATOR_RENDER_CAP).all();
+    creatorAccounts = (results || []).map((row) => ({
+      username: row.username,
+      displayName: row.display_name,
+      createdAt: row.created_at || null,
+      lastActive: row.last_active || null,
     }));
+    // Historical accounts have NULL last_active in D1; repair a bounded
+    // batch from KV each load (see backfillCreatorLastActive).
+    await backfillCreatorLastActive(env, creatorAccounts);
   } else {
-    // Fallback if D1 isn't working yet
+    // KV-only fallback. listAllKeys is a full cursor sweep (fine for
+    // enumerating, no per-key reads), then bound the fan-out: a KV get per
+    // account over more than this many would blow the subrequest cap, so
+    // cap the renders and report the real total.
+    totalCreatorCount = (creatorResult.keys || []).length;
+    const keys = (creatorResult.keys || []).slice(0, CREATOR_RENDER_CAP);
     creatorAccounts = await Promise.all(
-      creatorResult.keys.map(async (k) => {
+      keys.map(async (k) => {
         const username = k.name.slice("creator:".length);
         let displayName = username;
         let createdAt = null;
@@ -4069,6 +4396,7 @@ async function renderAdminDashboard(env) {
   }
 
   creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
+  const shownCreatorCount = creatorAccounts.length;
   const accountRows = creatorAccounts
     .map(
       (c) =>
@@ -4088,7 +4416,9 @@ async function renderAdminDashboard(env) {
         `<td><button type="button" class="lc-btn secondary" style="padding:4px 10px; font-size:0.8rem;" data-username="${escapeHtmlServer(c.username)}" data-displayname="${escapeHtmlServer(c.displayName)}" onclick="resetCreatorKey(this)">Reset Key</button></td></tr>`
     )
     .join("");
-  const truncatedNote = creatorResult.list_complete === false ? " (showing the first 1000)" : "";
+  const creatorTruncatedNote = shownCreatorCount < totalCreatorCount
+    ? `, showing ${shownCreatorCount} of ${totalCreatorCount}`
+    : "";
 
   // Each key is stats:sourcegroup:{group}:total -- strip both ends to get
   // the group name back. ":total" is a fixed suffix here (see bumpStatBy's
@@ -4288,7 +4618,7 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel" data-admin-panel="creators">
     <div class="stat-cards">
-      <div class="stat-card"><div class="stat-value">${creatorAccounts.length}</div><div class="stat-label">Creator accounts${truncatedNote}</div></div>
+      <div class="stat-card"><div class="stat-value">${totalCreatorCount}</div><div class="stat-label">Creator accounts${creatorTruncatedNote}</div></div>
     </div>
     <div class="table-wrap">
       <table>
@@ -5597,6 +5927,73 @@ function detectSource(input) {
   return "mdblist"; // default / backwards-compatible with existing configs
 }
 
+// /api/preview takes a caller-supplied url and feeds it to fetchCatalog.
+// detectSource used to default unknown strings to "mdblist", and the
+// preview handler echoed the raw fetch error, so an unauthenticated
+// client could probe hosts by the distinct failure strings even though
+// Workers block RFC1918. Gate first: only the sentinels fetchCatalog
+// actually dispatches on, plus https URLs on the provider hosts those
+// fetchers talk to. Published-list URLs are KV-only (no outbound fetch)
+// so any https host with that path shape is fine. Failures after this
+// check still collapse to one generic message at the route.
+function isAllowedCatalogSourceUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return false;
+  if (
+    s.startsWith("mdblist:") ||
+    s.startsWith("trakt:") ||
+    s.startsWith("tmdb:") ||
+    s.startsWith("simkl:") ||
+    s.startsWith("channel:v1:") ||
+    s.startsWith("customlist:v1:") ||
+    s.startsWith("autotrack:") ||
+    s.startsWith("custom:") ||
+    s.startsWith("curated:")
+  ) {
+    return true;
+  }
+  // Bare "user/listname" -- mdblistJsonUrl accepts this and always fetches
+  // mdblist.com, never the string as a URL.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) {
+    const parts = s.split("/").filter(Boolean);
+    return parts.length >= 2 && parts.length <= 8 && parts.every((p) => /^[A-Za-z0-9._-]+$/.test(p));
+  }
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase();
+  if (
+    host === "mdblist.com" || host === "www.mdblist.com" ||
+    host === "trakt.tv" || host === "www.trakt.tv" || host === "app.trakt.tv" ||
+    host === "themoviedb.org" || host === "www.themoviedb.org" ||
+    host === "simkl.com" || host === "www.simkl.com" ||
+    host === "letterboxd.com" || host === "www.letterboxd.com"
+  ) {
+    return true;
+  }
+  // Own published lists -- resolved from KV, never fetched. Any https host
+  // with /lists/{user}/{slug} is the share URL shape parsePublishedListUrl
+  // already accepts (including a sibling workers.dev deployment).
+  if (typeof parsePublishedListUrl === "function" && parsePublishedListUrl(s)) return true;
+  return false;
+}
+
+function previewSourceUrls(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  // channel:v1: / customlist:v1: payloads are JSON that may contain
+  // newlines. Those are not merge separators -- fetchCatalog only splits
+  // the whole url when it is several sources stacked, not a single
+  // sentinel blob. Treat the payload as one URL so a Live Preview of a
+  // Channel still works.
+  if (s.startsWith("channel:v1:") || s.startsWith("customlist:v1:")) return [s];
+  return s.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
 // Parses a pasted trakt.tv list URL into the { user, list } pair the Trakt
 // API needs. Accepts the standard public-list URL shape:
 //   https://trakt.tv/users/USERNAME/lists/LIST-SLUG-OR-ID
@@ -6543,8 +6940,11 @@ async function fetchLiveCreatorListItems(owner, slug, env) {
     if (!raw) continue;
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.items) && parsed.visibility !== "private") {
-        return parsed.items;
+      if (parsed && Array.isArray(parsed.items)) {
+        await stampListVisibilityIfNeeded(env, k, parsed);
+        if (isPublicListVisibility(parsed.visibility)) {
+          return parsed.items;
+        }
       }
     } catch {}
   }
@@ -6975,7 +7375,10 @@ async function fetchPublishedListCatalog(entry, env) {
     if (raw) {
       try {
         const data = JSON.parse(raw);
-        if (data && data.visibility !== "private") payload = data;
+        if (data) {
+          await stampListVisibilityIfNeeded(env, k, data);
+          if (isPublicListVisibility(data.visibility)) payload = data;
+        }
       } catch {}
     }
   }
@@ -13641,7 +14044,7 @@ ${seoHeadHtml}
         var cBar = document.getElementById('creatorProfileBar');
         if (cBar) {
           if (cName && cKey) {
-            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + (cDisp || cName) + '</button></div>';
+            cBar.innerHTML = '<div style="display:flex; align-items:center; gap:8px;"><button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + String(cDisp || cName || '').replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}) + '</button></div>';
           } else {
             cBar.innerHTML = '<div style="display:flex; align-items:center; gap:6px;"><button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button></div>';
           }
@@ -36938,7 +37341,8 @@ function openCreateProfileModal() {
     '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
-    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username"></div>' +
+    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
@@ -36951,6 +37355,8 @@ function openCreateProfileModal() {
 
 async function submitCreateProfile() {
   const name = document.getElementById('createProfileNameInput').value.trim();
+  const displayInput = document.getElementById('createProfileDisplayInput');
+  const displayName = displayInput ? displayInput.value.trim() : '';
   const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
   const errBox = document.getElementById('createProfileError');
   if (!name) {
@@ -36961,7 +37367,7 @@ async function submitCreateProfile() {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: name, recoveryAnswer: recoveryAnswer || undefined }),
+      body: JSON.stringify({ creatorName: name, displayName: displayName || undefined, recoveryAnswer: recoveryAnswer || undefined }),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -45342,7 +45748,10 @@ async function handleFetch(request, env, ctx) {
     const path = url.pathname;
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      if (isPublicCorsPath(path)) {
+        return new Response(null, { headers: corsHeaders() });
+      }
+      return new Response(null, { status: 204 });
     }
 
     if (path === "/" || path === "") {
@@ -45607,7 +46016,8 @@ async function handleFetch(request, env, ctx) {
         if (!raw) return null;
         try {
           const l = JSON.parse(raw);
-          if (l.visibility === "private") return null;
+          await stampListVisibilityIfNeeded(env, key, l);
+          if (!isPublicListVisibility(l.visibility)) return null;
           let username = "Anonymous";
           let slug = l.slug || "";
           if (isCreator) {
@@ -45695,7 +46105,7 @@ async function handleFetch(request, env, ctx) {
         return Response.redirect(`${url.origin}/${m[1]}/configure`, 302);
       }
       const { entries, track, shuffleShelves } = await resolveConfig(m[1], env);
-      return json(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
+      return jsonPublic(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
     }
 
     // bare manifest.json with no config
@@ -45703,7 +46113,7 @@ async function handleFetch(request, env, ctx) {
       if (isBrowserNavigation(request)) {
         return Response.redirect(`${url.origin}/configure`, 302);
       }
-      return json(buildManifest([], url.origin));
+      return jsonPublic(buildManifest([], url.origin));
     }
 
     // /:config/subtitles/:type/:id.json -- see buildManifest's comment
@@ -45728,7 +46138,7 @@ async function handleFetch(request, env, ctx) {
       // shouldn't hold up how fast this responds. ctx.waitUntil lets it
       // keep running after the response is already on its way.
       ctx.waitUntil(handleSubtitlesTrack(configParam, stremioType, decodeURIComponent(rawId), env, request));
-      return json({ subtitles: [] });
+      return jsonPublic({ subtitles: [] });
     }
 
     if (path === "/app.webmanifest") {
@@ -45926,7 +46336,7 @@ self.addEventListener('fetch', e => {
 
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
-      if (!entry || entry.enabled === false) return json({ metas: [] });
+      if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
       const source = detectSource(entry.url);
       const isAutoTrack = source === "autotrack";
@@ -45950,14 +46360,14 @@ self.addEventListener('fetch', e => {
           );
         }
         if (isUserPersonal) {
-          return json({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
-        return json({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         const errMsg = String(err.message || err);
         if (isUserPersonal) {
           console.error("User personal catalog fetch error:", errMsg);
-          return json({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
+          return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
 
         if (skip === 0 && staleKey) {
@@ -45968,7 +46378,7 @@ self.addEventListener('fetch', e => {
               // exactly like a normal successful load. `stale` is
               // informational only (visible when debugging via curl), not
               // read by wako/Stremio itself.
-              return json({ metas: JSON.parse(stale), stale: true, error: errMsg });
+              return jsonPublic({ metas: JSON.parse(stale), stale: true, error: errMsg });
             }
           } catch {
             // KV read/parse failed -- fall through to the placeholder below.
@@ -45978,7 +46388,7 @@ self.addEventListener('fetch', e => {
           // tile so the row still appears instead of silently disappearing.
           // Uses a dummy "tt"-prefixed id since the manifest declares
           // idPrefixes: ["tt", ...] and some clients filter out anything else.
-          return json({
+          return jsonPublic({
             metas: [
               {
                 id: "tt0000000",
@@ -45994,7 +46404,7 @@ self.addEventListener('fetch', e => {
         // Metas stays empty so wako/Stremio just shows an empty row instead
         // of erroring out, but the reason is still visible if you curl this
         // URL directly while debugging.
-        return json({ metas: [], error: errMsg }, 200);
+        return jsonPublic({ metas: [], error: errMsg }, 200);
       }
     }
 
@@ -46087,6 +46497,26 @@ self.addEventListener('fetch', e => {
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
+      // Unauthenticated and heavyweight: each call can fan out to TMDB /
+      // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
+      // -- 80/minute is enough for Live Preview paging a shelf, not enough
+      // to use this as a free outbound scanner.
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Couldn't load that list." }, 400, { "Cache-Control": "no-store" });
+      if (env && env.CONFIGS) {
+        const rateKey = `ratelimit:preview:${ip}`;
+        const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
+        if (n >= 80) {
+          return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
+        }
+        ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
+      }
+
+      const sourceUrls = previewSourceUrls(testUrl);
+      if (!sourceUrls.length || !sourceUrls.every(isAllowedCatalogSourceUrl)) {
+        return json({ ok: false, error: "That URL isn't a supported list source." }, 400, { "Cache-Control": "no-store" });
+      }
+
       let body;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
@@ -46109,12 +46539,14 @@ self.addEventListener('fetch', e => {
           })),
         };
       } catch (err) {
-        body = { ok: false, error: String(err.message || err) };
+        console.error("preview failed:", err);
+        body = { ok: false, error: "Couldn't load that list." };
       }
 
       return new Response(JSON.stringify(body), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
           ...corsHeaders(),
         },
       });
@@ -46160,7 +46592,7 @@ self.addEventListener('fetch', e => {
 
       // 1. Synthetic meta for Channels
       if (id.startsWith("channel_")) {
-        if (metaType !== "series") return json({ meta: null });
+        if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
           const { entries } = await resolveConfig(config, env);
@@ -46178,11 +46610,11 @@ self.addEventListener('fetch', e => {
             }
             if (matchedEntry) break;
           }
-          if (!matchedEntry) return json({ meta: null });
+          if (!matchedEntry) return jsonPublic({ meta: null });
           const meta = buildChannelMeta(matchedEntry, url.origin);
-          return json({ meta: meta || null });
+          return jsonPublic({ meta: meta || null });
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
@@ -46192,18 +46624,18 @@ self.addEventListener('fetch', e => {
           const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
           const effectiveKey = tmdbKey || TMDB_API_KEY;
           const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
-          if (!meta) return json({ meta: null });
-          return json(
+          if (!meta) return jsonPublic({ meta: null });
+          return jsonPublic(
             { meta },
             200,
             { "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800" }
           );
         } catch (err) {
-          return json({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: String(err.message || err) });
         }
       }
 
-      return json({ meta: null });
+      return jsonPublic({ meta: null });
     }
 
     // /api/channel-logo?path=...[&format=landscape]
@@ -49898,12 +50330,17 @@ self.addEventListener('fetch', e => {
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-      const rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
-      const rateCountRaw = isAdmin ? null : await env.CONFIGS.get(rateLimitKey);
-      const rateCount = parseInt(rateCountRaw, 10) || 0;
-      if (!isAdmin && rateCount >= 20) {
-        return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+      let rateLimitKey = null;
+      let rateCount = 0;
+      if (!isAdmin) {
+        const ip = clientIpKey(request);
+        if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
+        rateLimitKey = `feedbackrate:${ip}:${statsToday()}`;
+        const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
+        rateCount = parseInt(rateCountRaw, 10) || 0;
+        if (rateCount >= 20) {
+          return json({ ok: false, error: "You've sent a few messages today -- please try again tomorrow." });
+        }
       }
 
       // If replying to an existing thread
@@ -49934,7 +50371,7 @@ self.addEventListener('fetch', e => {
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
-            await env.CONFIGS.put(`feedback:${threadId}`, JSON.stringify(entry));
+            await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
@@ -49961,7 +50398,7 @@ self.addEventListener('fetch', e => {
         userAgent: (request.headers.get("User-Agent") || "").slice(0, 300),
       };
       try {
-        await env.CONFIGS.put(`feedback:${id}`, JSON.stringify(entry));
+        await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
@@ -50617,11 +51054,11 @@ self.addEventListener('fetch', e => {
         listSlug = baseSlug + "-" + attempt;
         plKey = "publishedlist:user:" + listSlug;
       }
-      const plVisibility = plBody.visibility === "private" ? "private" : "public";
+      const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
       // Anonymous publishes belong in the directory index too.
-      if (plVisibility !== "private") {
+      if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
           isCreator: false,
           username: "user",
@@ -50656,6 +51093,7 @@ self.addEventListener('fetch', e => {
       if (!likeKey) return json({ ok: false, error: "List not found." }, 404);
       let likeData;
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
+      await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
@@ -50669,6 +51107,7 @@ self.addEventListener('fetch', e => {
       }
       const listScopeId = `${likeUser}:${likeSlug}`;
       const voterId = await likeVoterId(request, env, likeVoterName, listScopeId);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const ledgerKey = `listlikevoters:${listScopeId}`;
       const { count, capped } = await applyLikeVote(env, ledgerKey, voterId, !likeUnlike);
 
@@ -50686,7 +51125,7 @@ self.addEventListener('fetch', e => {
         // `c:<user>:<slug>` -- using the wrong prefix here would append a
         // duplicate entry instead of updating the existing one.
         const likeIsCreator = likeKey === likeCreatorKey;
-        if (likeData.visibility !== "private") {
+        if (isPublicListVisibility(likeData.visibility)) {
           ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
             isCreator: likeIsCreator,
             username: likeIsCreator ? likeUser : "user",
@@ -50744,6 +51183,7 @@ self.addEventListener('fetch', e => {
       const hash = await hashStringForKey(normalizedUrl);
       const key = `externallike:${hash}`;
       const voterId = await likeVoterId(request, env, extVoterName, hash);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
       const { count, capped } = await applyLikeVote(env, `extlikevoters:${hash}`, voterId, !unlike);
 
       const raw = await env.CONFIGS.get(key);
@@ -51903,14 +52343,16 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, users });
     }
 
-    // /api/creator/create  (POST)  { creatorName } -> { ok, creatorName, displayName, creatorKey }
+    // /api/creator/create  (POST)  { creatorName, displayName?, recoveryAnswer? }
+    //   -> { ok, creatorName, displayName, creatorKey }
     // Rate limited to one new profile per minute per IP, tracked via a
     // short-lived KV key rather than anything more elaborate -- this add-on
     // has no user-identity system to rate-limit against besides the
     // requester's own IP.
     if (path === "/api/creator/create" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorcreate:${ip}`;
       if (await env.CONFIGS.get(rateLimitKey)) {
         return json({ ok: false, error: "Please wait a moment before creating another Profile." }, 429);
@@ -51923,7 +52365,9 @@ self.addEventListener('fetch', e => {
       }
       const v = validateCreatorUsername(body.creatorName);
       if (!v.ok) return json({ ok: false, error: v.error });
-      const displayName = String(body.creatorName || "").trim();
+      const dn = normalizeCreatorDisplayName(body.displayName, v.normalized);
+      if (!dn.ok) return json({ ok: false, error: dn.error }, 400);
+      const displayName = dn.displayName;
       // Reserve the rate-limit slot before the uniqueness check, not after
       // -- otherwise two requests landing at nearly the same instant could
       // both pass the "is it taken" check before either has written
@@ -52008,7 +52452,8 @@ self.addEventListener('fetch', e => {
       } catch {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `resetkeyrate:${ip}:${statsToday()}`;
       const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
@@ -52160,7 +52605,8 @@ self.addEventListener('fetch', e => {
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
     if (path === "/api/creator/restore" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
       const rateLimitKey = `ratelimit:creatorrestore:${ip}`;
       const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
       // More generous than profile creation (this is a normal, repeatable
@@ -52215,7 +52661,7 @@ self.addEventListener('fetch', e => {
                 items: data.items || [],
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
-                visibility: data.visibility === "private" ? "private" : "public",
+                visibility: effectiveListVisibility(data.visibility),
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {
@@ -52238,7 +52684,7 @@ self.addEventListener('fetch', e => {
               items: data.items || [],
               itemCount: (data.items || []).length,
               likes: data.likes || 0,
-              visibility: data.visibility === "private" ? "private" : "public",
+              visibility: effectiveListVisibility(data.visibility),
               url: `${url.origin}/lists/${auth.username}/watchlist`,
             });
           } catch {}
@@ -52320,7 +52766,7 @@ self.addEventListener('fetch', e => {
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
-      const visibility = body.visibility === "private" ? "private" : "public";
+      const visibility = normalizeListVisibility(body.visibility);
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
@@ -52396,7 +52842,7 @@ self.addEventListener('fetch', e => {
       ctx.waitUntil(updatePublicListIndex(
         env,
         `c:${auth.username}:${slug}`,
-        visibility === "private" ? null : {
+        isPublicListVisibility(visibility) ? {
           isCreator: true,
           username: auth.username,
           creatorName: auth.displayName || auth.username,
@@ -52406,7 +52852,7 @@ self.addEventListener('fetch', e => {
           itemCount: Array.isArray(items) ? items.length : 0,
           likes: likes || 0,
           updatedAt: now,
-        }
+        } : null
       ));
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
@@ -53506,7 +53952,8 @@ self.addEventListener('fetch', e => {
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const listSlug = k.name.slice("publishedlist:user:".length);
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
@@ -53530,7 +53977,8 @@ self.addEventListener('fetch', e => {
             if (!raw) return null;
             try {
               const data = JSON.parse(raw);
-              if (data.visibility === "private") return null;
+              await stampListVisibilityIfNeeded(env, k.name, data);
+              if (!isPublicListVisibility(data.visibility)) return null;
               const itemCount = (data.items || []).length;
               if (itemCount === 0) return null; // Never display lists with 0 items
               // key shape is creatorlist:{username}:{slug}
@@ -53730,9 +54178,12 @@ self.addEventListener('fetch', e => {
         if (raw) {
           try {
             const parsed = JSON.parse(raw);
-            if (parsed && parsed.visibility !== "private") {
-              listData = parsed;
-              isCreatorList = k.startsWith("creatorlist:");
+            if (parsed) {
+              await stampListVisibilityIfNeeded(env, k, parsed);
+              if (isPublicListVisibility(parsed.visibility)) {
+                listData = parsed;
+                isCreatorList = k.startsWith("creatorlist:");
+              }
             }
           } catch {}
         }
@@ -54085,19 +54536,38 @@ self.addEventListener('fetch', e => {
           if (raw) {
             try {
               const data = JSON.parse(raw);
+              await stampListVisibilityIfNeeded(env, k.name, data);
               const listId = `${u}:${slug}`;
               const itemsJson = JSON.stringify(data.items || []);
+              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
               // `likes` is carried across too. KV holds the authoritative
               // count, so a migration that omitted it would silently reset
-              // every list to zero in D1.
+              // every list to zero in D1. Visibility is rewritten as well
+              // so the fail-closed public index doesn't hide legacy lists
+              // that were served as public because they had no enum value.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", data.visibility || "private", itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
               results.lists++;
             } catch (e) {
               results.errors.push(`List ${u}:${slug}: ` + e.message);
             }
           }
+        }
+      }
+
+      // 2b. Anonymous published lists live only in KV. Stamp missing /
+      // garbage visibility the same way as creator lists so the inverted
+      // public-read checks don't hide currently-served lists.
+      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
+      for (const k of pKeys.keys) {
+        const raw = await env.CONFIGS.get(k.name);
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw);
+          await stampListVisibilityIfNeeded(env, k.name, data);
+        } catch (e) {
+          results.errors.push(`Published ${k.name}: ` + e.message);
         }
       }
 
@@ -54212,7 +54682,7 @@ self.addEventListener('fetch', e => {
           if (dayKeysSorted.length > 95) {
             dayKeysSorted.slice(0, dayKeysSorted.length - 95).forEach((k) => delete blob[k]);
           }
-          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob));
+          await env.CONFIGS.put(`${prefix}${id}:days`, JSON.stringify(blob), { expirationTtl: TELEMETRY_DAY_TTL_SEC });
           await Promise.all(days.map((d) => env.CONFIGS.delete(dayKeyNames[d])));
           keysMigratedThisCall += days.length;
         })
@@ -54229,26 +54699,35 @@ self.addEventListener('fetch', e => {
     }
 
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
-    // newest first. Reads up to 300 entries; feedback keys already sort
-    // chronologically as plain strings (see /api/feedback's own comment),
-    // so list() naturally returns oldest-first and this just reverses it.
+    // newest first. Keys sort chronologically (see /api/feedback), so
+    // list() is oldest-first: walk pages keeping a rolling tail, then
+    // GET only the newest FEEDBACK_ADMIN_GET_CAP. Getting every thread
+    // used to grow without bound (no TTL, no prune).
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
-      let allKeys = [];
+      let newestKeys = [];
       let cursor = undefined;
       let listComplete = false;
-      while (!listComplete) {
+      let pages = 0;
+      let sawMore = false;
+      while (!listComplete && pages < 30) {
         const listResult = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-        allKeys.push(...listResult.keys);
+        newestKeys.push(...(listResult.keys || []));
+        if (newestKeys.length > FEEDBACK_ADMIN_GET_CAP) {
+          newestKeys = newestKeys.slice(-FEEDBACK_ADMIN_GET_CAP);
+          sawMore = true;
+        }
+        pages++;
         if (listResult.list_complete || !listResult.cursor) {
           listComplete = true;
         } else {
           cursor = listResult.cursor;
         }
       }
-      const keys = allKeys.slice().reverse();
+      const truncated = !listComplete || sawMore;
+      const keys = newestKeys.slice().reverse();
       const entries = await Promise.all(
         keys.map(async (k) => {
           try {
@@ -54270,7 +54749,7 @@ self.addEventListener('fetch', e => {
           }
         })
       );
-      return json({ ok: true, entries: entries.filter(Boolean), truncated: false }, 200, { "Cache-Control": "no-store" });
+      return json({ ok: true, entries: entries.filter(Boolean), truncated: !!truncated }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/reply  (POST)  { id, message } -> { ok, entry }
@@ -54329,7 +54808,7 @@ self.addEventListener('fetch', e => {
       entry.completed = false;
 
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save reply." }, 500);
       }
@@ -54364,7 +54843,7 @@ self.addEventListener('fetch', e => {
       }
       entry.completed = !!body.completed;
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
       } catch (e) {
         return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
       }
@@ -54416,7 +54895,7 @@ self.addEventListener('fetch', e => {
       }
       entry.updatedAt = Date.now();
       try {
-        await env.CONFIGS.put(key, JSON.stringify(entry));
+        await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
         return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
@@ -54747,7 +55226,7 @@ self.addEventListener('fetch', e => {
       }
     }
 
-    return new Response("Not found", { status: 404, headers: corsHeaders() });
+    return new Response("Not found", { status: 404 });
 }
 
 // The actual Worker export. Delegates to handleFetch (25_api-catalog-
