@@ -518,6 +518,27 @@ describe("likes and preview guards", () => {
     assert.equal(r.body.ok, false);
   });
 
+  it("accepts one of this add-on's own shared chart sentinels (Discover page \"See All\" like)", async () => {
+    const env = makeEnv();
+    // Before the fix, every one of this add-on's own built-in Discover
+    // charts (which use a sentinel like "tmdb:chart:popular" instead of a
+    // real URL) 400'd here with "That URL can't be liked" -- the one
+    // thing this feature could never actually be used on.
+    const r = await call(env, "/api/lists/like-external", {
+      method: "POST",
+      json: { url: "tmdb:chart:popular" },
+    });
+    assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    assert.equal(r.body.likes, 1);
+    // Session/account-relative sentinels stay rejected -- there's no one
+    // shared list a like against "my watchlist" could mean.
+    const rejected = await call(env, "/api/lists/like-external", {
+      method: "POST",
+      json: { url: "trakt:watchlist" },
+    });
+    assert.equal(rejected.status, 400);
+  });
+
   it("double-like is idempotent", async () => {
     const env = makeEnv();
     const alice = await createUser(env, "alicelike");
@@ -810,6 +831,64 @@ describe("list URL query-string handling", () => {
     assert.ok(requestedUrl, "expected a fetch to have been made");
     assert.ok(!requestedUrl.includes("Mode"), `fetch URL leaked the query string into the slug: ${requestedUrl}`);
     assert.equal(requestedUrl, "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster");
+  });
+});
+
+describe("liked lists feed: this add-on's own lists", () => {
+  it("fetches real name/creator/type/count/likes for an own-platform liked list, and gives it a real fetchable URL for posters (unit)", async () => {
+    let renderedLists = null;
+    const fetchedUrls = [];
+    const makeContainer = () => ({ innerHTML: "", dataset: {}, children: [], innerText: "" });
+    const renderLikedListsFeed = loadOneClientFunction("19_client-search-and-likes.js", "renderLikedListsFeed", {
+      ORIGIN: "https://example.test",
+      document: { getElementById: (id) => (id === "likedListsFeed" ? makeContainer() : null) },
+      getLikedListsSet: () => new Set(["alice/my-list"]),
+      ensureMdblistPopularLoaded: async () => [],
+      guessNameFromUrl: (u) => "Guessed " + u,
+      render5PosterListsFeed: (_container, lists) => { renderedLists = lists; },
+      fetch: async (url) => {
+        fetchedUrls.push(url);
+        return {
+          json: async () => ({ ok: true, name: "Alice's Real List", creator: "alice", type: "movie", itemCount: 42, likes: 7 }),
+        };
+      },
+    });
+    await renderLikedListsFeed();
+
+    assert.ok(fetchedUrls.some((u) => u === "https://example.test/lists/alice/my-list.json?format=object"), `expected the real list-detail endpoint to be fetched, got: ${JSON.stringify(fetchedUrls)}`);
+    assert.ok(renderedLists, "expected render5PosterListsFeed to have been called");
+    const own = renderedLists.find((l) => l.kind === "own");
+    assert.ok(own, "expected an own-platform entry");
+    assert.equal(own.usernameSlug, "alice/my-list");
+    // The bug: this used to always be a generic "Community" placeholder
+    // with a hardcoded item/like count and no poster field at all.
+    assert.equal(own.name, "Alice's Real List");
+    assert.equal(own.user, "alice");
+    assert.equal(own.items, 42);
+    assert.equal(own.likes, 7);
+    // A real, fetchable URL -- what lets the existing poster-preview
+    // mechanism (populateSearchResultPosters, keyed off .url) show real
+    // posters instead of none.
+    assert.equal(own.url, "https://example.test/lists/alice/my-list");
+  });
+
+  it("falls back gracefully when the liked list was deleted/unpublished since (unit)", async () => {
+    let renderedLists = null;
+    const makeContainer = () => ({ innerHTML: "", dataset: {}, children: [], innerText: "" });
+    const renderLikedListsFeed = loadOneClientFunction("19_client-search-and-likes.js", "renderLikedListsFeed", {
+      ORIGIN: "https://example.test",
+      document: { getElementById: (id) => (id === "likedListsFeed" ? makeContainer() : null) },
+      getLikedListsSet: () => new Set(["alice/gone-list"]),
+      ensureMdblistPopularLoaded: async () => [],
+      guessNameFromUrl: (u) => "Guessed " + u,
+      render5PosterListsFeed: (_container, lists) => { renderedLists = lists; },
+      fetch: async () => ({ json: async () => ({ ok: false, error: "No list found at that address." }) }),
+    });
+    await renderLikedListsFeed();
+    const own = renderedLists.find((l) => l.kind === "own");
+    assert.ok(own, "expected an own-platform entry even when the real fetch fails");
+    assert.equal(own.usernameSlug, "alice/gone-list");
+    assert.equal(own.url, "");
   });
 });
 

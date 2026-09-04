@@ -1188,9 +1188,43 @@ const EXTERNAL_LIKE_HOSTS = new Set([
   "letterboxd.com", "www.letterboxd.com",
 ]);
 
+// This add-on's own Discover shelves (Popular/Trending/Genre/Collection/
+// Top 10/... charts) aren't backed by a real URL at all -- they're
+// referenced internally by a sentinel string (see detectSource,
+// 04_config-resolution.js), e.g. "tmdb:chart:popular". Those never
+// matched an EXTERNAL_LIKE_HOSTS host, so every one of them 400'd with
+// "That URL can't be liked" the moment someone tried -- this add-on's
+// own built-in charts were the one thing this feature could never
+// actually be used on.
+//
+// Allowing a *prefix* rather than the exact chart/genre/collection id
+// against its real enum doesn't reopen the unbounded-keyspace problem
+// EXTERNAL_LIKE_HOSTS exists to prevent: it's the same shape of risk the
+// host allowlist above already accepts today (any *path* under an
+// allowed host mints its own key, not just the ones that correspond to a
+// real list), just scoped under a small, fixed, code-defined set of
+// prefixes instead of a domain. Deliberately excludes anything session/
+// account-relative (watchlist, history, airing-next, a connected
+// account's own Simkl/Trakt list) -- those resolve to a DIFFERENT real
+// list depending on who's viewing, so there's no one shared thing for a
+// like to mean; the client already never shows a like button for those
+// (see openListDetailsPage).
+const LIKEABLE_SENTINEL_PREFIXES = [
+  "tmdb:chart:", "tmdb:top10:", "tmdb:kids:", "tmdb:holiday:", "tmdb:genre:", "tmdb:collection:",
+  "trakt:chart:", "simkl:chart:",
+];
+const LIKEABLE_SENTINEL_EXACT = new Set(["tmdb:hidden-gems"]);
+
 function normalizeExternalListUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   if (!s || s.length > 300) return null;
+  const lower = s.toLowerCase();
+  if (
+    LIKEABLE_SENTINEL_EXACT.has(lower) ||
+    (LIKEABLE_SENTINEL_PREFIXES.some((p) => lower.startsWith(p)) && /^[a-z0-9:_-]+$/.test(lower))
+  ) {
+    return lower;
+  }
   let u;
   try {
     u = new URL(s);

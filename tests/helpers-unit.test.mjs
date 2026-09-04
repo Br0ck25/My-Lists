@@ -31,7 +31,7 @@ function loadHelpers() {
     chunks.push(src02.slice(start, i));
   }
   const consts = [];
-  for (const name of ["CREATOR_DISPLAY_NAME_MAX", "EXTERNAL_LIKE_HOSTS"]) {
+  for (const name of ["CREATOR_DISPLAY_NAME_MAX", "EXTERNAL_LIKE_HOSTS", "LIKEABLE_SENTINEL_PREFIXES", "LIKEABLE_SENTINEL_EXACT"]) {
     const re = new RegExp(`const ${name}[\\s\\S]*?;`);
     const m = src02.match(re);
     if (m) consts.push(m[0]);
@@ -77,5 +77,22 @@ describe("URL allowlists", () => {
     assert.equal(H.normalizeExternalListUrl("https://evil.example/x"), null);
     assert.equal(H.normalizeExternalListUrl("javascript:alert(1)"), null);
     assert.equal(H.normalizeExternalListUrl("https://trakt.tv/users/a/lists/b"), "https://trakt.tv/users/a/lists/b");
+  });
+
+  it("like-external also accepts this add-on's own shared (non-personal) chart sentinels", () => {
+    assert.equal(H.normalizeExternalListUrl("tmdb:chart:popular"), "tmdb:chart:popular");
+    assert.equal(H.normalizeExternalListUrl("tmdb:hidden-gems"), "tmdb:hidden-gems");
+    assert.equal(H.normalizeExternalListUrl("trakt:chart:trending"), "trakt:chart:trending");
+    assert.equal(H.normalizeExternalListUrl("simkl:chart:anime"), "simkl:chart:anime");
+    // Case-insensitive, matching the real chart sentinels' own casing.
+    assert.equal(H.normalizeExternalListUrl("TMDB:CHART:popular"), "tmdb:chart:popular");
+  });
+
+  it("like-external still rejects session/account-relative sentinels (no single shared list to like)", () => {
+    assert.equal(H.normalizeExternalListUrl("mdblist:watchlist"), null);
+    assert.equal(H.normalizeExternalListUrl("trakt:history"), null);
+    assert.equal(H.normalizeExternalListUrl("simkl:user:alice"), null);
+    // Not a real chart id at all, just an unmatched sentinel-shaped string.
+    assert.equal(H.normalizeExternalListUrl("tmdb:notachart"), null);
   });
 });
