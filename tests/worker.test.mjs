@@ -446,6 +446,36 @@ describe("likes and preview guards", () => {
     assert.equal(r.status, 400);
     assert.equal(r.body.ok, false);
   });
+
+  it("poster-badge rejects a non-allowlisted poster host (was an open redirect / SSRF)", async () => {
+    const env = makeEnv();
+    // No badge params: used to be Response.redirect(posterUrl) -- an open
+    // redirect off this domain to whatever host the caller named.
+    const redirectCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/phish"));
+    assert.equal(redirectCase.status, 404);
+    // A badge param present: used to fetch(posterUrl) server-side and
+    // embed the response in the SVG returned -- an SSRF/open image proxy.
+    const fetchCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/x") + "&airDate=2099-01-01");
+    assert.equal(fetchCase.status, 404);
+  });
+});
+
+describe("admin login", () => {
+  it("rate-limits repeated wrong-key attempts from the same IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+    }
+    assert.equal(last.status, 429);
+  });
+
+  it("does not share the rate-limit bucket across different IPs", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "wrong-key" } });
+    assert.equal(r.status, 401);
+  });
 });
 
 describe("displayName", () => {

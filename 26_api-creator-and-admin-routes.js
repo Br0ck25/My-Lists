@@ -3795,6 +3795,35 @@
           { status: 500, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
         );
       }
+      // Every other credential-bearing endpoint in this app (creator
+      // create/restore/reset-key) rate-limits guesses by IP -- this one
+      // never did, despite guarding the one secret that can rotate any
+      // creator's key via /admin/api/reset-creator-key with no other
+      // verification. Same pattern as /api/creator/restore: a per-IP
+      // counter with a 60s window. Skipped entirely (not failed closed)
+      // when CONFIGS isn't bound, matching every other KV-optional
+      // feature in this app -- login by ADMIN_KEY alone still works.
+      // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
+      // missing, same as restore, because there is no other safe
+      // per-client identity to key a shared bucket on.
+      if (env.CONFIGS) {
+        const ip = clientIpKey(request);
+        if (!ip) {
+          return new Response(renderAdminLoginPage("Could not process this request."), {
+            status: 400,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        const rateLimitKey = `ratelimit:adminlogin:${ip}`;
+        const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
+        if (attempts >= 10) {
+          return new Response(renderAdminLoginPage("Too many attempts. Please wait a minute and try again."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+      }
       let submittedKey = "";
       try {
         const form = await request.formData();
