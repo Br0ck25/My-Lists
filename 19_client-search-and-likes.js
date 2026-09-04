@@ -885,7 +885,11 @@ document.addEventListener('click', async (e) => {
       });
       const data = await res.json();
       if (!data.ok) {
-        alert('Could not update this like: ' + (data.error || 'unknown error'));
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Update Like', data.error || 'Unknown error.', false);
+        } else {
+          alert('Could not update this like: ' + (data.error || 'unknown error'));
+        }
         return;
       }
       const finalLikes = (data.likes !== undefined) ? data.likes : newLikes;
@@ -919,7 +923,11 @@ document.addEventListener('click', async (e) => {
         }).catch(() => {});
       }
     } catch (err) {
-      alert('Network error while updating this like.');
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Network Error', 'Network error while updating this like.', false);
+      } else {
+        alert('Network error while updating this like.');
+      }
     } finally {
       likeBtn.disabled = false;
     }
@@ -949,7 +957,11 @@ document.addEventListener('click', async (e) => {
       });
       const data = await res.json();
       if (!data.ok) {
-        alert('Could not update this like: ' + (data.error || 'unknown error'));
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Update Like', data.error || 'Unknown error.', false);
+        } else {
+          alert('Could not update this like: ' + (data.error || 'unknown error'));
+        }
         return;
       }
       const finalLikes = (data.likes !== undefined) ? data.likes : newLikes;
@@ -991,7 +1003,11 @@ document.addEventListener('click', async (e) => {
         }).catch(() => {});
       }
     } catch (err) {
-      alert('Network error while updating this like.');
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Network Error', 'Network error while updating this like.', false);
+      } else {
+        alert('Network error while updating this like.');
+      }
     } finally {
       likeExternalBtn.disabled = false;
     }
@@ -1396,8 +1412,25 @@ async function renderLikedListsFeed(forceRefresh) {
       if (l.user && l.slug) topMap.set(l.user + '/' + l.slug, l);
     });
 
+    // A liked identifier is either a real external URL (liked via
+    // /api/lists/like-external, stored as the URL itself) or this app's
+    // own "username/slug" (liked via /api/lists/like, stored as that
+    // pair, never a URL at all). The two need different data sources --
+    // and, in render5PosterListsFeed below, a different like/unlike
+    // button wired to the matching endpoint, since sending "username/
+    // slug" to like-external is exactly what made unliking one of this
+    // app's own lists from here fail with "That URL can't be liked".
+    const ownSlugPending = [];
     const likedListObjects = likedUrls.map(u => {
       if (topMap.has(u)) return topMap.get(u);
+      if (!u.includes('://')) {
+        const parts = u.split('/');
+        if (parts.length === 2 && parts[0] && parts[1]) {
+          const placeholder = { usernameSlug: u, kind: 'own' };
+          ownSlugPending.push(placeholder);
+          return placeholder;
+        }
+      }
       const name = guessNameFromUrl(u);
       const isSeries = u.toLowerCase().includes('show') || u.toLowerCase().includes('series') || u.toLowerCase().includes('tv');
       return {
@@ -1409,6 +1442,43 @@ async function renderLikedListsFeed(forceRefresh) {
         likes: 1
       };
     });
+
+    // Real name/creator/type/item count/likes for each of this app's own
+    // liked lists -- and, via the poster-preview fetch the resulting
+    // .url enables (populateSearchResultPosters, keyed off a real
+    // /lists/:user/:slug URL now instead of a bare "username/slug"),
+    // real posters too. Before this, every one of these rendered as a
+    // generic "Community" placeholder with no poster at all -- the
+    // placeholder object never carried one to begin with.
+    await Promise.all(ownSlugPending.map(async (entry) => {
+      const [username, slug] = entry.usernameSlug.split('/');
+      const listUrl = ORIGIN + '/lists/' + encodeURIComponent(username) + '/' + encodeURIComponent(slug);
+      try {
+        const res = await fetch(listUrl + '.json?format=object', { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        if (data && data.ok) {
+          entry.url = listUrl;
+          entry.name = data.name || entry.usernameSlug;
+          entry.user = data.creator || username;
+          entry.type = data.type || 'movie';
+          entry.items = data.itemCount || 0;
+          entry.likes = data.likes || 0;
+          return;
+        }
+      } catch (e) {
+        // falls through to the "unavailable" shape below
+      }
+      // List was unpublished or deleted since being liked -- still shown
+      // (with whatever it's still possible to say about it) so there's a
+      // card to unlike, rather than a liked list that just silently
+      // vanishes from this view with no way to clear it.
+      entry.url = '';
+      entry.name = guessNameFromUrl(entry.usernameSlug);
+      entry.user = 'Unavailable';
+      entry.type = 'movie';
+      entry.items = 0;
+      entry.likes = 0;
+    }));
 
     render5PosterListsFeed(container, likedListObjects);
   } catch (e) {
@@ -1427,12 +1497,26 @@ function render5PosterListsFeed(container, lists) {
 
   const cardsHtml = lists.slice(0, 40).map(function(l) {
     const type = l.type || (l.mediatype === 'show' ? 'series' : 'movie');
-    const added = alreadyAdded.has(l.url + '|' + type);
-    const alreadyLiked = getLikedListsSet().has(l.url);
+    const added = l.url ? alreadyAdded.has(l.url + '|' + type) : false;
     const author = l.user || l.creatorName || 'Official';
     const itemCount = l.items || l.count || null;
+    // This app's own published lists are liked via /api/lists/like with
+    // a username/slug pair; everything else via /api/lists/like-external
+    // with the list's real URL. Every card here used to get the external
+    // button regardless, which sends a bare "username/slug" to an
+    // endpoint that only accepts a real URL and correctly refuses it --
+    // that's the reported "That URL can't be liked" on unlike.
+    const isOwn = l.kind === 'own';
+    const alreadyLiked = isOwn ? getLikedListsSet().has(l.usernameSlug) : getLikedListsSet().has(l.url);
+    const likeBtnHtml = isOwn
+      ? '<button type="button" class="lc-btn searchLikeBtn' + (alreadyLiked ? ' liked' : '') + '" data-username-slug="' + escapeAttr(l.usernameSlug) + '">' +
+          (alreadyLiked ? '&#x2665;' : '&#x2661;') +
+        '</button>'
+      : '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLiked ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
+          (alreadyLiked ? '&#x2665;' : '&#x2661;') +
+        '</button>';
 
-    return '<div class="list-card" data-list-type="' + escapeAttr(type) + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
+    return '<div class="list-card" data-list-type="' + escapeAttr(type) + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
           '<div class="list-card-title searchViewListBtn" style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
@@ -1445,17 +1529,15 @@ function render5PosterListsFeed(container, lists) {
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLiked ? ' liked' : '') + '" data-url="' + escapeAttr(l.url) + '">' +
-            (alreadyLiked ? '&#x2665;' : '&#x2661;') +
-          '</button>' +
+          likeBtnHtml +
           '<button type="button" class="lc-btn ' + (added ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
             (added ? 'style="color:var(--danger);"' : '') +
-            ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
+            ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '">' +
             (added ? 'Remove' : '+ Add') +
           '</button>' +
         '</div>' +
       '</div>' +
-      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
+      '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
     '</div>';
   }).join('');
 

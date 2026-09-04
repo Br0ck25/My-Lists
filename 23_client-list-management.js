@@ -2123,7 +2123,20 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
 
   if (likeBtn) {
-    if (listUrl && !isNoLikesList && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
+    // Watchlist/History/Airing-Next/a connected account's own Simkl or
+    // Trakt list resolve to a DIFFERENT real list depending on who's
+    // viewing (they're session/account-relative, not a fixed shared
+    // list), so there's no one thing a like could mean -- excluded here
+    // for the same reason the server's own sentinel allowlist
+    // (normalizeExternalListUrl, 02_http-and-creator-utils.js) never
+    // accepts them either, rather than showing a button that can only
+    // ever fail.
+    const isPersonalSentinel = listUrl && (
+      listUrl.startsWith('mdblist:watchlist') || listUrl.startsWith('mdblist:history') || listUrl.startsWith('mdblist:airing-next') ||
+      listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') ||
+      listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
+    );
+    if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
