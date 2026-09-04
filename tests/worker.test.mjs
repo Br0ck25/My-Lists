@@ -1034,6 +1034,7 @@ describe("list-details grid never renders a duplicate page (defense in depth)", 
       listUrl: "customlist:v1:...",
       name: "Test List",
       renderPosterGridChunked: () => {},
+      appendPosterGridItems: () => {},
       gridEl: {},
     });
     const page1 = [{ id: "tt1" }, { id: "tt2" }];
@@ -1048,6 +1049,45 @@ describe("list-details grid never renders a duplicate page (defense in depth)", 
       2,
       "the repeated page's items must not be rendered a second time"
     );
+  });
+});
+
+describe("list-details See All scrolls smoothly through a large multi-page list", () => {
+  // The reported bug: scrolling through a large (100-200+ item) list's See
+  // All from Live Preview & Editor was janky/jumpy, unlike Your Custom
+  // Lists' own See All (which embeds the whole list up front and never
+  // re-renders). Root cause: every new page appendItems received got
+  // rendered by handing the WHOLE accumulated item list to
+  // renderPosterGridChunked, which clears the grid (innerHTML = '') and
+  // rebuilds it from scratch -- tearing down and re-inserting every
+  // already-loaded poster card (discarding its already-decoded image)
+  // on every single page as the user scrolled. Fixed by only ever
+  // appending each new page's own items via appendPosterGridItems, which
+  // never clears the grid.
+  it("appendItems appends only each new page's own items, and never rebuilds the whole grid", () => {
+    const renderCalls = [];
+    const appendCalls = [];
+    const winState = {};
+    const appendItems = loadOneClientFunction("23_client-list-management.js", "appendItems", {
+      seenItemIds: new Set(),
+      window: winState,
+      annotatePersonalItem: (it) => it,
+      listUrl: "https://trakt.tv/users/someone/lists/big-list",
+      name: "Big List",
+      gridEl: { isConnected: true },
+      renderPosterGridChunked: (_grid, items) => { renderCalls.push(items.length); },
+      appendPosterGridItems: (_grid, items) => { appendCalls.push(items.length); },
+    });
+
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: "tt" + i, type: "movie" }));
+    const page2 = Array.from({ length: 100 }, (_, i) => ({ id: "tt" + (100 + i), type: "movie" }));
+    const page3 = Array.from({ length: 50 }, (_, i) => ({ id: "tt" + (200 + i), type: "movie" }));
+    appendItems(page1);
+    appendItems(page2);
+    appendItems(page3);
+
+    assert.deepEqual(renderCalls, [], "appendItems must never call the full-rebuild renderer (that stays reserved for switching Movies/Shows/All tabs)");
+    assert.deepEqual(appendCalls, [100, 100, 50], "each page must append only its own new items, not the whole accumulated list");
   });
 });
 

@@ -380,7 +380,7 @@
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Guide</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Step-by-step how-to guides covering every tab: adding catalogs, building Channels, Storylines &amp; Universes, importing lists, and more.</p>
-      <a href="/guide" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
+      <a href="/guide" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
     </div>
 
     <!-- Support & Recommended Debrid Section -->
