@@ -6,6 +6,15 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   const MAX_PAGES = 250; // safety cap (~25,000 items) -- generous headroom above the
   // 6000-item-per-list cap below so a big Watch History copy can still split across
   // several numbered lists instead of silently truncating (see copyListToCustomList)
+  //
+  // A source that doesn't actually honor skip (a malformed/misdetected
+  // URL, or a provider whose pagination silently ignores an out-of-range
+  // offset) can keep answering maybeMore:true with the exact same items
+  // every time -- trusting that alone means a 250-item list can turn into
+  // up to 25,000 duplicated entries before this loop gives up. Tracked by
+  // id so a page that contributes nothing new stops the loop immediately,
+  // the same guard openListDetailsPage's own pagination uses.
+  const seenIds = new Set();
   while (pagesLoaded < MAX_PAGES) {
     const body = { url: listUrl, type: type, skip: skip, sample: 100 };
     if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
@@ -28,7 +37,13 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');
     const pageItems = data.sample || [];
+    let newCount = 0;
     pageItems.forEach((m) => {
+      const key = m && m.id != null ? String(m.id) : null;
+      if (key === null || !seenIds.has(key)) {
+        newCount++;
+        if (key !== null) seenIds.add(key);
+      }
       items.push({
         id: m.id,
         imdbId: m.id,
@@ -44,7 +59,7 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     skip += pageItems.length;
     pagesLoaded++;
     if (btn) btn.textContent = 'Copying' + (progressLabel ? ' ' + progressLabel : '') + '\u2026 (' + items.length + ' so far)';
-    if (!data.maybeMore || pageItems.length === 0) break;
+    if (!data.maybeMore || pageItems.length === 0 || newCount === 0) break;
   }
   return items;
 }

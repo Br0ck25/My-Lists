@@ -5922,6 +5922,15 @@ async function resolveConfig(configParam, env) {
 // in) — public lists work fine with no key.
 function mdblistJsonUrl(input, apikey) {
   let s = input.trim();
+  // Query string / fragment stripped before anything else. Without this,
+  // a URL copied while some filter/view toggle on mdblist's own site is
+  // active (e.g. "?sort=rank", or a trailing "/?Mode=Show"-shaped param)
+  // becomes part of the list slug below -- either glued onto the last
+  // segment, or its own segment entirely if there's a trailing slash
+  // before the "?". Either way the constructed JSON-feed URL points at a
+  // list that doesn't exist, and mdblist 404s (or returns something
+  // unrelated) instead of the real list.
+  s = s.split(/[?#]/)[0];
   s = s.replace(/^https?:\/\/(www\.)?mdblist\.com\/lists\//i, "");
   s = s.replace(/\/(json\/?)?$/i, "");
   const parts = s.split("/").filter(Boolean);
@@ -6011,8 +6020,17 @@ function detectSource(input) {
   if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
   if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
   if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
-  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?$/i.test(s)) return "trakt-watchlist";
-  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.)?trakt\.tv\/users\/[^/]+\/history\/?$/i.test(s)) return "trakt-history";
+  // (www.|app.) and a trailing "?query" or "#hash" both tolerated here --
+  // matching every other trakt.tv regex in this function -- because a
+  // fully $-anchored .../watchlist$ / .../history$ (this used to require
+  // the URL end exactly there) silently failed to recognize a URL copied
+  // while some filter/view toggle on trakt.tv's own site was active (e.g.
+  // a trailing "?something=x"), or one copied from app.trakt.tv. It still
+  // fell through to the generic "trakt" case below rather than erroring,
+  // but generic handling expects a /lists/ path a watchlist/history URL
+  // doesn't have, so the list failed to resolve at all.
+  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?(?:[?#].*)?$/i.test(s)) return "trakt-watchlist";
+  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/history\/?(?:[?#].*)?$/i.test(s)) return "trakt-history";
   if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
@@ -20014,6 +20032,15 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   const MAX_PAGES = 250; // safety cap (~25,000 items) -- generous headroom above the
   // 6000-item-per-list cap below so a big Watch History copy can still split across
   // several numbered lists instead of silently truncating (see copyListToCustomList)
+  //
+  // A source that doesn't actually honor skip (a malformed/misdetected
+  // URL, or a provider whose pagination silently ignores an out-of-range
+  // offset) can keep answering maybeMore:true with the exact same items
+  // every time -- trusting that alone means a 250-item list can turn into
+  // up to 25,000 duplicated entries before this loop gives up. Tracked by
+  // id so a page that contributes nothing new stops the loop immediately,
+  // the same guard openListDetailsPage's own pagination uses.
+  const seenIds = new Set();
   while (pagesLoaded < MAX_PAGES) {
     const body = { url: listUrl, type: type, skip: skip, sample: 100 };
     if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
@@ -20036,7 +20063,13 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');
     const pageItems = data.sample || [];
+    let newCount = 0;
     pageItems.forEach((m) => {
+      const key = m && m.id != null ? String(m.id) : null;
+      if (key === null || !seenIds.has(key)) {
+        newCount++;
+        if (key !== null) seenIds.add(key);
+      }
       items.push({
         id: m.id,
         imdbId: m.id,
@@ -20052,7 +20085,7 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     skip += pageItems.length;
     pagesLoaded++;
     if (btn) btn.textContent = 'Copying' + (progressLabel ? ' ' + progressLabel : '') + '\u2026 (' + items.length + ' so far)';
-    if (!data.maybeMore || pageItems.length === 0) break;
+    if (!data.maybeMore || pageItems.length === 0 || newCount === 0) break;
   }
   return items;
 }
@@ -21945,11 +21978,22 @@ function setListSearchFilter(filter, btn) {
 
 function guessNameFromUrl(u) {
   try {
-    const parts = String(u).split('/').filter(Boolean);
-    let last = parts[parts.length - 1] || u;
+    // Query string and fragment stripped first -- otherwise a URL copied
+    // while some filter/view toggle on the source site is active (e.g.
+    // "?Mode=Show") either becomes the entire guessed name (if there's a
+    // trailing slash before the "?", so it lands in its own "/"-separated
+    // segment) or gets appended to the end of it. Neither is a real list
+    // name; only the path is.
+    const noQuery = String(u).split(/[?#]/)[0];
+    const parts = noQuery.split('/').filter(Boolean);
+    let last = parts[parts.length - 1] || noQuery || u;
     last = last.replace(/[-_]+/g, ' ').trim();
     if (!last) return 'List';
-    return last.replace(/\\b\\w/g, (c) => c.toUpperCase());
+    // Title-case each word. (Previously /\\b\\w/g -- a double-escaped
+    // regex that matches the literal 4-character text "\b\w", not a word
+    // boundary + word character, so this never actually matched anything
+    // and every guessed name silently kept its original casing.)
+    return last.replace(/\b\w/g, (c) => c.toUpperCase());
   } catch (e) {
     return 'List';
   }
@@ -35638,7 +35682,13 @@ async function handleDeleteAccount() {
     const res = await fetch(ORIGIN + '/api/creator/delete-account', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+      // The server requires confirm:"DELETE" on this specific irreversible
+      // action (see /api/creator/delete-account's own comment) -- the same
+      // pattern openResetAccountModal's own confirm:'RESET' already uses
+      // for the sibling account/reset endpoint. This call never sent it,
+      // so every delete attempt failed at the server with "Missing
+      // confirmation." no matter how the person confirmed in this modal.
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, confirm: 'DELETE' }),
     });
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) {
@@ -42039,6 +42089,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   let loadedCount = 0;
   let pagesLoaded = 0;
   const MAX_PAGES = 20;
+  // A source that doesn't actually honor skip (a malformed/misdetected
+  // URL, or a provider whose pagination silently ignores an out-of-range
+  // offset) can keep answering maybeMore:true with the exact same items
+  // every time. Trusting that alone means this loop only stops at
+  // MAX_PAGES * one page's worth of items (up to 2,000) of pure repeats of
+  // a list that might only have a few hundred real items. Tracked
+  // independent of the type-tab filter in appendItems below, by id, so a
+  // page that comes back with zero items this loop hasn't already seen
+  // stops pagination even if the server insists there's more.
+  const seenItemIds = new Set();
 
   const isSimklUserList = listUrl && listUrl.startsWith('simkl:user:');
   const simklStatusMatch = isSimklUserList ? (listUrl.split(':')[3] || 'plantowatch') : '';
@@ -42134,7 +42194,22 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     return it;
   }
 
+  // Returns how many of the passed-in items weren't already in this
+  // list-details view (by id) before appending -- loadNextPage uses this
+  // to tell a genuine next page apart from a source repeating itself.
+  // Preloaded/local sources (custom lists, autotrack, etc.) never call
+  // loadNextPage at all (see its own early-return), so this only ever
+  // runs against real paginated /api/preview results, which always carry
+  // a stable id.
   function appendItems(items) {
+    let newCount = 0;
+    items.forEach((it) => {
+      const key = it && (it.id != null ? String(it.id) : null);
+      if (key === null || !seenItemIds.has(key)) {
+        newCount++;
+        if (key !== null) seenItemIds.add(key);
+      }
+    });
     const annotated = items.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
@@ -42150,6 +42225,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // rebuilds the whole accumulated grid on every page that arrives.
     renderPosterGridChunked(gridEl, filtered);
     loadedCount = window._currentListDetailsAllItems.length;
+    return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
     subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
@@ -42196,10 +42272,15 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         knownTotalItems = data.totalItems;
       }
       const items = data.sample || [];
-      appendItems(items);
+      const newCount = appendItems(items);
       skip += items.length;
       pagesLoaded++;
-      updateStatusAfterPage(data.maybeMore, items.length);
+      // A page that came back non-empty but contributed nothing new (every
+      // id was already in this view) means the source isn't actually
+      // advancing with skip -- treat it as "no more", the same as an
+      // empty page, rather than trusting maybeMore into fetching the same
+      // content again up to MAX_PAGES.
+      updateStatusAfterPage(data.maybeMore, newCount);
     } catch (e) {
       console.error('List preview fetch error:', e);
       statusEl.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(e && e.message ? e.message : 'Network error loading this list.') + '</p>';

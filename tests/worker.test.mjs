@@ -1,5 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { call, createUser, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
 
 async function adminCookie(env) {
@@ -7,6 +11,58 @@ async function adminCookie(env) {
   const setCookie = r.headers.get("set-cookie") || "";
   const match = setCookie.match(/^([^=]+=[^;]+)/);
   return match ? match[1] : "";
+}
+
+// Evaluates one numbered source file on its own, in an isolated vm
+// context, and returns its top-level declarations -- for testing a pure
+// helper function directly without needing the whole Worker/KV/D1
+// environment. Only works for a file whose top-level code is real,
+// standalone JS (00-08, 25-26); files 09-24 are raw string content
+// embedded inside 09_page-shell.js's own giant template literal (the
+// served page's inline <script>) and reference client-only globals
+// (window, document, ...) at their own top level, so they throw here --
+// see loadOneClientFunction below for those instead, and render_check.js
+// for how 09-24 actually get syntax-checked (as the rendered page's
+// inline script, not as standalone files).
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+function loadSourceFunctions(relFile) {
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+  const sandbox = { console, URL, URLSearchParams };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: relFile });
+  return sandbox;
+}
+
+// Extracts and evaluates exactly one top-level `function name(...) {...}`
+// declaration out of a 09-24 client file, brace-balanced so it works
+// regardless of nested blocks inside the function body -- for a
+// self-contained (no calls to other not-yet-defined helpers) pure
+// function, without needing to stand up the whole client bundle's
+// window/document/DOM environment just to reach it.
+// `extraGlobals` seeds anything the extracted function references as a
+// free variable (other client globals, DOM stand-ins, a fetch mock, ...)
+// -- it becomes part of the same sandbox object the function runs in, so
+// a mock passed in here can still be inspected/asserted on after calling
+// the returned function (they share the live object, not a copy).
+function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+  const start = src.search(new RegExp(`(?:async\\s+)?function\\s+${fnName}\\s*\\([^)]*\\)\\s*\\{`));
+  if (start === -1) throw new Error(`${fnName} not found in ${relFile}`);
+  let depth = 0, end = -1;
+  for (let i = start; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) { end = i + 1; break; }
+    }
+  }
+  if (end === -1) throw new Error(`could not find end of ${fnName} in ${relFile}`);
+  const sandbox = { console, ...extraGlobals };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src.slice(start, end), sandbox, { filename: `${relFile}#${fnName}` });
+  return sandbox[fnName];
 }
 
 const CREATOR_POSTS = [
@@ -684,5 +740,129 @@ describe("displayName", () => {
       json: { creatorName: "toolongnameok", displayName: "A".repeat(41) },
     });
     assert.equal(long.status, 400);
+  });
+});
+
+describe("list URL query-string handling", () => {
+  // detectSource, mdblistJsonUrl, and guessNameFromUrl are pure functions
+  // with no dependency on the Worker's KV/D1/fetch environment, so they're
+  // evaluated directly out of the real source file in an isolated vm
+  // context rather than routed through the HTTP harness -- a route-level
+  // test can't tell "correctly detected, then failed for an unrelated
+  // reason" apart from "misdetected", since /api/preview collapses every
+  // failure to one generic error message before it reaches the client.
+  const configFns = loadSourceFunctions("04_config-resolution.js");
+  const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+
+  it("guessNameFromUrl strips a trailing query string instead of using it as the guessed name", () => {
+    // The exact reported bug: a trailing slash before the "?" put the
+    // query string in its own "/"-separated segment, so it became the
+    // *entire* guessed name.
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/my-list/?Mode=Show"), "My List");
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/my-list?Mode=Show"), "My List");
+    assert.equal(guessNameFromUrl("https://trakt.tv/users/someone/lists/best-of-2024"), "Best Of 2024");
+  });
+
+  it("detectSource recognizes Trakt watchlist/history URLs even with a trailing query string", () => {
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/watchlist?Mode=Show"), "trakt-watchlist");
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/history?Mode=Show"), "trakt-history");
+    // Also covers the separate pre-existing gap this fix closed alongside
+    // it: app.trakt.tv was an allowed host (isAllowedCatalogSourceUrl)
+    // but wasn't in this regex's own subdomain match.
+    assert.equal(configFns.detectSource("https://app.trakt.tv/users/someone/watchlist"), "trakt-watchlist");
+    // Still falls through to the generic "trakt" case for an ordinary
+    // list URL -- this fix must not widen the watchlist/history match.
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/lists/best-of-2024"), "trakt");
+  });
+
+  it("mdblistJsonUrl strips a trailing query string instead of folding it into the list slug", () => {
+    assert.equal(
+      configFns.mdblistJsonUrl("https://mdblist.com/lists/someone/my-list/?Mode=Show", ""),
+      "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster"
+    );
+    assert.equal(
+      configFns.mdblistJsonUrl("https://mdblist.com/lists/someone/my-list?Mode=Show", ""),
+      "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster"
+    );
+  });
+
+  it("mdblistJsonUrl's fix holds end-to-end through /api/preview (HTTP level)", async () => {
+    const env = makeEnv();
+    const realFetch = globalThis.fetch;
+    let requestedUrl = null;
+    globalThis.fetch = async (input) => {
+      requestedUrl = typeof input === "string" ? input : input && input.url;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ movies: [{ title: "A Movie", year: 2020, ids: { imdb: "tt0000001" } }] }),
+      };
+    };
+    try {
+      const r = await call(env, "/api/preview", {
+        method: "POST",
+        json: { url: "https://mdblist.com/lists/someone/my-list/?Mode=Show", type: "movie", skip: 0, sample: 10 },
+      });
+      assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(requestedUrl, "expected a fetch to have been made");
+    assert.ok(!requestedUrl.includes("Mode"), `fetch URL leaked the query string into the slug: ${requestedUrl}`);
+    assert.equal(requestedUrl, "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster");
+  });
+});
+
+describe("delete-account confirmation", () => {
+  it("client sends the confirm:'DELETE' the server requires (unit)", async () => {
+    let capturedBody = null;
+    const handleDeleteAccount = loadOneClientFunction("22_client-creator-profile.js", "handleDeleteAccount", {
+      ORIGIN: "https://example.test",
+      activeCreator: { creatorName: "alicedelete", displayName: "Alice" },
+      document: { getElementById: () => null },
+      localStorage: { getItem: () => "MYL-TEST-KEY1-KEY2" },
+      fetch: async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return { json: async () => ({ ok: true }) };
+      },
+      clearLocalAccountData: () => {},
+      closeModal: () => {},
+      showAddedToast: () => {},
+    });
+    await handleDeleteAccount();
+    assert.ok(capturedBody, "expected handleDeleteAccount to have called fetch");
+    // The actual bug: this call never sent `confirm` at all, so the
+    // server's own check (see the next test) rejected every real delete
+    // attempt with "Missing confirmation." no matter how the person
+    // confirmed in the modal.
+    assert.equal(capturedBody.confirm, "DELETE");
+    assert.equal(capturedBody.creatorName, "alicedelete");
+  });
+
+  it("server rejects a delete-account request with no confirm field (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelnoconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error || "", /confirmation/i);
+  });
+
+  it("server accepts and completes a delete-account request with confirm:'DELETE' (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    // The identity itself is gone -- the same key no longer authenticates.
+    const restore = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(restore.status, 401);
   });
 });
