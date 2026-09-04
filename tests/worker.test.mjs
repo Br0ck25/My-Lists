@@ -65,6 +65,40 @@ function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
   return sandbox[fnName];
 }
 
+// Extracts one `it => {...}` item-mapper body that isn't a named top-level
+// function -- it's inline inside a much larger click-delegate handler (the
+// "View"/"See All" buttons for a Custom List), so loadOneClientFunction
+// above can't grab it by name. `mapOpenSnippet` must be an exact substring
+// ending in the arrow's opening "{" (e.g. "...map((it) => {"); `occurrence`
+// picks which match when the same snippet appears more than once in the
+// file. Brace-balanced from there, same technique as loadOneClientFunction.
+// `extraGlobals` supplies whatever free variables (isCw, formatWatchItemLabel,
+// ...) the surrounding function would normally have closed over.
+function loadInlineItemMapper(relFile, mapOpenSnippet, occurrence, extraGlobals = {}) {
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+  let searchFrom = 0, mapStart = -1;
+  for (let n = 0; n <= occurrence; n++) {
+    mapStart = src.indexOf(mapOpenSnippet, searchFrom);
+    if (mapStart === -1) throw new Error(`occurrence ${n} of "${mapOpenSnippet}" not found in ${relFile}`);
+    searchFrom = mapStart + 1;
+  }
+  const braceStart = mapStart + mapOpenSnippet.length - 1;
+  let depth = 0, end = -1;
+  for (let i = braceStart; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) { end = i + 1; break; }
+    }
+  }
+  if (end === -1) throw new Error(`could not find end of mapper body in ${relFile}`);
+  const body = src.slice(braceStart, end);
+  const sandbox = { console, ...extraGlobals };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  return vm.runInContext(`(function(it) ${body})`, sandbox, { filename: `${relFile}#mapper@${mapStart}` });
+}
+
 const CREATOR_POSTS = [
   "/api/creator/lists",
   "/api/creator/lists/save",
@@ -784,6 +818,22 @@ describe("list URL query-string handling", () => {
     assert.equal(guessNameFromUrl("https://trakt.tv/users/someone/lists/best-of-2024"), "Best Of 2024");
   });
 
+  it("guessNameFromUrl uppercases known acronyms instead of just their first letter", () => {
+    // The exact reported bug: plain per-word title-casing turns "imdb" into
+    // "Imdb", not the "IMDB" a person would actually type by hand.
+    assert.equal(
+      guessNameFromUrl("https://app.trakt.tv/users/justin/lists/imdb-top-rated-movies"),
+      "IMDB Top Rated Movies"
+    );
+    assert.equal(
+      guessNameFromUrl("https://mdblist.com/lists/garycrawfordgc/latest-tv-shows"),
+      "Latest TV Shows"
+    );
+    // Not so aggressive that it mangles a word that just happens to start
+    // the same way as an acronym.
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/television-classics"), "Television Classics");
+  });
+
   it("detectSource recognizes Trakt watchlist/history URLs even with a trailing query string", () => {
     assert.equal(configFns.detectSource("https://trakt.tv/users/someone/watchlist?Mode=Show"), "trakt-watchlist");
     assert.equal(configFns.detectSource("https://trakt.tv/users/someone/history?Mode=Show"), "trakt-history");
@@ -831,6 +881,173 @@ describe("list URL query-string handling", () => {
     assert.ok(requestedUrl, "expected a fetch to have been made");
     assert.ok(!requestedUrl.includes("Mode"), `fetch URL leaked the query string into the slug: ${requestedUrl}`);
     assert.equal(requestedUrl, "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster");
+  });
+});
+
+describe("custom list catalog pagination (imported list See All)", () => {
+  // The reported bug: importing a 250-item list via "Import list from a
+  // link" and adding it to Live Preview & Editor's Catalogs, then clicking
+  // See All, only ever showed 200 items (100 real ones, duplicated) --
+  // because fetchCustomListCatalog ignored `skip` entirely and returned the
+  // whole list on every page request. Live Preview's See All (unlike Your
+  // Custom Lists' own See All, which embeds the full array up front) pages
+  // a Custom List through /api/preview with an advancing skip, so this is
+  // a plain server-side pagination bug, testable directly against the real
+  // source file (00-08 is real standalone JS, see loadSourceFunctions).
+  const catalogFns = loadSourceFunctions("05_catalog-core.js");
+
+  function makeMovieItems(n) {
+    const items = [];
+    for (let i = 0; i < n; i++) {
+      items.push({ imdbId: "tt" + String(1000000 + i), title: "Movie " + i, type: "movie", year: 2000 + (i % 20) });
+    }
+    return items;
+  }
+
+  it("fetchCustomListCatalog advances with skip instead of returning the same page every time", async () => {
+    const entry = { url: "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" }), type: "movie" };
+    const page0 = await catalogFns.fetchCustomListCatalog(entry, 0, {});
+    const page1 = await catalogFns.fetchCustomListCatalog(entry, 100, {});
+    const page2 = await catalogFns.fetchCustomListCatalog(entry, 200, {});
+
+    assert.equal(page0.length, 100);
+    assert.equal(page1.length, 100);
+    assert.equal(page2.length, 50);
+    assert.notEqual(page1[0].id, page0[0].id, "the page at skip=100 must not repeat page 0's first item");
+
+    const allIds = [...page0, ...page1, ...page2].map((m) => m.id);
+    assert.equal(new Set(allIds).size, 250, "all 250 items across pages must be unique -- no duplicates, none missing");
+  });
+
+  it("fetchCustomListCatalog reports totalItems/maybeMore so /api/preview's pagination actually stops at the end", async () => {
+    const entry = { url: "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" }), type: "movie" };
+    const lastPage = await catalogFns.fetchCustomListCatalog(entry, 200, {});
+    assert.equal(lastPage.totalItems, 250);
+    const pastEnd = await catalogFns.fetchCustomListCatalog(entry, 250, {});
+    assert.equal(pastEnd.length, 0);
+  });
+
+  it("end-to-end through /api/preview: three successive pages cover all 250 items with no duplicates (HTTP level)", async () => {
+    const env = makeEnv();
+    const url = "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" });
+    const seen = new Set();
+    let skip = 0;
+    let maybeMore = true;
+    let pages = 0;
+    while (maybeMore && pages < 5) {
+      const r = await call(env, "/api/preview", { method: "POST", json: { url, type: "movie", skip, sample: 100 } });
+      assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+      r.body.sample.forEach((it) => seen.add(it.id));
+      skip += r.body.sample.length;
+      maybeMore = r.body.maybeMore;
+      pages++;
+    }
+    assert.equal(seen.size, 250, `expected all 250 unique items across pages, got ${seen.size}`);
+    assert.equal(pages, 3, `expected exactly 3 pages (100+100+50), got ${pages}`);
+  });
+});
+
+describe("custom list Movies/Shows tab filtering (imported list See All)", () => {
+  // The reported bug: a plain movie item's mapped `showId` fell all the way
+  // back to its own imdbId (the fallback chain's last resort, since a movie
+  // has no real showId), so it came out truthy just like a genuine show's
+  // would -- and the Shows tab's filter (!!it.showId) then matched every
+  // movie right alongside actual shows, making Movies/Shows/All all show
+  // the same items. Three call sites shared this exact fallback; this
+  // covers the two most user-reachable ones (Your Custom Lists' own View
+  // button, and the internal customlist:v1: preloaded-item derivation).
+  const movieItem = { imdbId: "tt1000000", title: "Some Movie", type: "movie", year: 2020 };
+  const formatWatchItemLabel = (it) => ({ title: it.title, subtitle: "" });
+
+  it("Your Custom Lists' View button: a plain movie gets no showId (22_client-creator-profile.js)", () => {
+    const mapper = loadInlineItemMapper(
+      "22_client-creator-profile.js",
+      "const sample = rawListItems.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        list: { slug: "imdb-top-rated-movies", type: "movie" },
+        viewBtn: { dataset: { type: "movie" } },
+      }
+    );
+    const mapped = mapper(movieItem);
+    assert.equal(mapped.type, "movie");
+    assert.equal(mapped.showId, null, "a plain movie must not get a truthy showId");
+  });
+
+  it("openListDetailsPage's customlist:v1: derivation: a plain movie gets no showId (23_client-list-management.js)", () => {
+    const mapper = loadInlineItemMapper(
+      "23_client-list-management.js",
+      "const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(rawItems) : rawItems) : rawItems;\n          const sample = itemsToProcess.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        match: { slug: "imdb-top-rated-movies", type: "movie" },
+        type: "movie",
+      }
+    );
+    const mapped = mapper(movieItem);
+    assert.equal(mapped.type, "movie");
+    assert.equal(mapped.showId, null, "a plain movie must not get a truthy showId");
+  });
+
+  it("a genuine show item still keeps its showId (both call sites)", () => {
+    const showItem = { showId: "tt2000000", showTitle: "Some Show", type: "series", id: "tt2000000:1:1" };
+    const creatorMapper = loadInlineItemMapper(
+      "22_client-creator-profile.js",
+      "const sample = rawListItems.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        list: { slug: "some-shows", type: "series" },
+        viewBtn: { dataset: { type: "series" } },
+      }
+    );
+    const mapped = creatorMapper(showItem);
+    assert.equal(mapped.type, "series");
+    assert.equal(mapped.showId, "tt2000000");
+  });
+});
+
+describe("list-details grid never renders a duplicate page (defense in depth)", () => {
+  // Second layer for the same 200-vs-250 bug: even with fetchCustomListCatalog
+  // now paginating correctly, appendItems should never let a page that
+  // repeats already-seen ids double up the rendered grid -- the dedup
+  // check right above it already knew those items weren't new (newCount),
+  // it just didn't act on that before concatenating them in.
+  it("a page that repeats already-seen ids is not concatenated into the grid a second time", () => {
+    const seenItemIds = new Set();
+    const winState = { _currentListDetailsAllItems: [] };
+    const appendItems = loadOneClientFunction("23_client-list-management.js", "appendItems", {
+      seenItemIds,
+      window: winState,
+      annotatePersonalItem: (it) => it,
+      listUrl: "customlist:v1:...",
+      name: "Test List",
+      renderPosterGridChunked: () => {},
+      gridEl: {},
+    });
+    const page1 = [{ id: "tt1" }, { id: "tt2" }];
+    const newCount1 = appendItems(page1);
+    // A source that doesn't actually honor skip repeats the same page.
+    const newCount2 = appendItems(page1);
+
+    assert.equal(newCount1, 2);
+    assert.equal(newCount2, 0, "the repeated page must be detected as contributing nothing new");
+    assert.equal(
+      winState._currentListDetailsAllItems.length,
+      2,
+      "the repeated page's items must not be rendered a second time"
+    );
   });
 });
 

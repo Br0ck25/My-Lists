@@ -7133,7 +7133,7 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   const items = payload.shuffle
     ? seededShuffle(sourceItems, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
     : sourceItems;
-  return items
+  const mapped = items
     .filter((it) => {
       if (!it || !it.imdbId) return false;
       const itType = it.kind || it.type;
@@ -7151,6 +7151,21 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
       poster: it.poster || undefined,
       releaseInfo: it.year || undefined,
     }));
+  // Paginate like every other in-memory source (see fetchCuratedCatalog
+  // just above for the same slice(skip, skip+PAGE_SIZE) + totalItems
+  // shape). This used to ignore skip and return the whole list on every
+  // call. /api/preview and the real Stremio catalog route both call this
+  // with an advancing skip and trust the result to actually advance --
+  // Live Preview & Editor's "See All" pages a Custom List through
+  // /api/preview (unlike Your Custom Lists' own See All, which embeds the
+  // full array up front and never re-fetches), so returning the same
+  // page-0 items again under a "page 2" label made it re-append them and
+  // then stop, capping any imported list over PAGE_SIZE at 2 x PAGE_SIZE
+  // items with half of them duplicates.
+  if (skip >= mapped.length) return [];
+  const sliced = mapped.slice(skip, skip + PAGE_SIZE);
+  sliced.totalItems = mapped.length;
+  return sliced;
 }
 
 // Turns one stored recommendation entry (the exact shape the Discover
@@ -22012,6 +22027,12 @@ function setListSearchFilter(filter, btn) {
 
 function guessNameFromUrl(u) {
   try {
+    // Slug words a plain per-word title-case gets wrong -- known acronyms
+    // that should stay fully uppercase (imdb -> Imdb otherwise, not IMDB)
+    // rather than just their first letter. Common enough in list slugs
+    // (imdb-top-rated, uk-top-10, latest-tv-shows) to special-case
+    // explicitly.
+    const ACRONYMS = ['imdb', 'tmdb', 'tv', 'uk', 'usa', 'hd', 'uhd', 'dc'];
     // Query string and fragment stripped first -- otherwise a URL copied
     // while some filter/view toggle on the source site is active (e.g.
     // "?Mode=Show") either becomes the entire guessed name (if there's a
@@ -22027,7 +22048,13 @@ function guessNameFromUrl(u) {
     // regex that matches the literal 4-character text "\b\w", not a word
     // boundary + word character, so this never actually matched anything
     // and every guessed name silently kept its original casing.)
-    return last.replace(/\b\w/g, (c) => c.toUpperCase());
+    const titled = last.replace(/\b\w/g, (c) => c.toUpperCase());
+    // Then fix up any whole word that's actually a known acronym --
+    // title-casing alone leaves "Imdb Top Rated Movies" instead of the
+    // "IMDB Top Rated Movies" someone would actually type by hand.
+    return titled.replace(/[a-zA-Z]+/g, (word) => (
+      ACRONYMS.includes(word.toLowerCase()) ? word.toUpperCase() : word
+    ));
   } catch (e) {
     return 'List';
   }
@@ -38737,7 +38764,11 @@ if (_creatorDashEl) {
       const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
       return {
         id: showId,
-        showId: showId,
+        // Gated on isShow -- a plain movie has no real showId, so the
+        // fallback chain above lands on its own imdbId, which would read as
+        // a truthy showId here and pull it into the Shows tab's !!it.showId
+        // filter right alongside actual shows.
+        showId: isShow ? showId : null,
         seasonNum: it.seasonNum,
         episodeNum: it.episodeNum,
         type: itemType,
@@ -41717,7 +41748,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
             return {
               id: showId,
-              showId: showId,
+              // showId here is the "is this a TV show" flag the Movies/Shows
+              // tab filters below key off of (!!it.showId) -- id above keeps
+              // the full imdbId/id fallback chain for navigation/posters,
+              // but that same fallback would make every plain movie item
+              // (no real showId, just its own imdbId) carry a truthy showId
+              // too, so the Shows tab matched movies right along with shows.
+              // Only a genuine show/episode gets one here.
+              showId: isShow ? showId : null,
               showTitle: it.showTitle || it.title || it.name,
               seasonNum: it.seasonNum,
               episodeNum: it.episodeNum,
@@ -41761,7 +41799,11 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
               const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
               return {
                 id: showId,
-                showId: showId,
+                // See the equivalent customlist:v1: branch above -- showId
+                // here must stay gated on isShow, or a plain movie's own
+                // imdbId (the fallback's last resort) reads as a truthy
+                // showId and the Shows tab filter (!!it.showId) matches it.
+                showId: isShow ? showId : null,
                 showTitle: it.showTitle || it.title || it.name,
                 seasonNum: it.seasonNum,
                 episodeNum: it.episodeNum,
@@ -42332,14 +42374,21 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   // a stable id.
   function appendItems(items) {
     let newCount = 0;
+    const freshItems = [];
     items.forEach((it) => {
       const key = it && (it.id != null ? String(it.id) : null);
       if (key === null || !seenItemIds.has(key)) {
         newCount++;
         if (key !== null) seenItemIds.add(key);
+        freshItems.push(it);
       }
     });
-    const annotated = items.map(annotatePersonalItem);
+    // Only genuinely new items ever reach the grid -- a page that repeats
+    // an id already shown (a source that doesn't honor skip, say) used to
+    // still get concatenated here even though the pagination-stop check
+    // right below already knew it added nothing, so the same items could
+    // render twice before the loop gave up.
+    const annotated = freshItems.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
     let filtered = window._currentListDetailsAllItems;

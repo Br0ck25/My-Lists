@@ -25,6 +25,12 @@ function setListSearchFilter(filter, btn) {
 
 function guessNameFromUrl(u) {
   try {
+    // Slug words a plain per-word title-case gets wrong -- known acronyms
+    // that should stay fully uppercase (imdb -> Imdb otherwise, not IMDB)
+    // rather than just their first letter. Common enough in list slugs
+    // (imdb-top-rated, uk-top-10, latest-tv-shows) to special-case
+    // explicitly.
+    const ACRONYMS = ['imdb', 'tmdb', 'tv', 'uk', 'usa', 'hd', 'uhd', 'dc'];
     // Query string and fragment stripped first -- otherwise a URL copied
     // while some filter/view toggle on the source site is active (e.g.
     // "?Mode=Show") either becomes the entire guessed name (if there's a
@@ -40,7 +46,13 @@ function guessNameFromUrl(u) {
     // regex that matches the literal 4-character text "\b\w", not a word
     // boundary + word character, so this never actually matched anything
     // and every guessed name silently kept its original casing.)
-    return last.replace(/\b\w/g, (c) => c.toUpperCase());
+    const titled = last.replace(/\b\w/g, (c) => c.toUpperCase());
+    // Then fix up any whole word that's actually a known acronym --
+    // title-casing alone leaves "Imdb Top Rated Movies" instead of the
+    // "IMDB Top Rated Movies" someone would actually type by hand.
+    return titled.replace(/[a-zA-Z]+/g, (word) => (
+      ACRONYMS.includes(word.toLowerCase()) ? word.toUpperCase() : word
+    ));
   } catch (e) {
     return 'List';
   }

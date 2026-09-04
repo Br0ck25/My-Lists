@@ -1743,7 +1743,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
             return {
               id: showId,
-              showId: showId,
+              // showId here is the "is this a TV show" flag the Movies/Shows
+              // tab filters below key off of (!!it.showId) -- id above keeps
+              // the full imdbId/id fallback chain for navigation/posters,
+              // but that same fallback would make every plain movie item
+              // (no real showId, just its own imdbId) carry a truthy showId
+              // too, so the Shows tab matched movies right along with shows.
+              // Only a genuine show/episode gets one here.
+              showId: isShow ? showId : null,
               showTitle: it.showTitle || it.title || it.name,
               seasonNum: it.seasonNum,
               episodeNum: it.episodeNum,
@@ -1787,7 +1794,11 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
               const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
               return {
                 id: showId,
-                showId: showId,
+                // See the equivalent customlist:v1: branch above -- showId
+                // here must stay gated on isShow, or a plain movie's own
+                // imdbId (the fallback's last resort) reads as a truthy
+                // showId and the Shows tab filter (!!it.showId) matches it.
+                showId: isShow ? showId : null,
                 showTitle: it.showTitle || it.title || it.name,
                 seasonNum: it.seasonNum,
                 episodeNum: it.episodeNum,
@@ -2358,14 +2369,21 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   // a stable id.
   function appendItems(items) {
     let newCount = 0;
+    const freshItems = [];
     items.forEach((it) => {
       const key = it && (it.id != null ? String(it.id) : null);
       if (key === null || !seenItemIds.has(key)) {
         newCount++;
         if (key !== null) seenItemIds.add(key);
+        freshItems.push(it);
       }
     });
-    const annotated = items.map(annotatePersonalItem);
+    // Only genuinely new items ever reach the grid -- a page that repeats
+    // an id already shown (a source that doesn't honor skip, say) used to
+    // still get concatenated here even though the pagination-stop check
+    // right below already knew it added nothing, so the same items could
+    // render twice before the loop gave up.
+    const annotated = freshItems.map(annotatePersonalItem);
     window._currentListDetailsAllItems = (window._currentListDetailsAllItems || []).concat(annotated);
     const curFilter = window._currentListDetailsFilter || 'all';
     let filtered = window._currentListDetailsAllItems;
