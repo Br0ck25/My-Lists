@@ -222,10 +222,21 @@ The codebase is organized into modular ES modules that compile into a single `wo
 
 ### Building the Combined Worker
 
-When editing any individual split file (`00_` through `26_`), run the PowerShell build script to rebuild `worker_entry_combined.js`:
+When editing any individual split file (`00_` through `26_`), rebuild `worker_entry_combined.js`:
 
 ```powershell
 .\build.ps1
+```
+
+```bash
+python3 build.py
+```
+
+CI rebuilds from source and fails if the committed Worker drifted. Tests load that Worker in Node with an in-memory KV:
+
+```bash
+node --test tests/*.test.mjs
+# or: bash verify.sh
 ```
 
 ---

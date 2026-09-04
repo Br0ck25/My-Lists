@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rebuild and fail on drift
+        run: |
+          python3 build.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          diff = subprocess.run(
+              ["git", "diff", "--ignore-cr-at-eol", "--", "worker_entry_combined.js"],
+              capture_output=True, text=True,
+          )
+          if diff.stdout.strip():
+              print(diff.stdout)
+              sys.exit("worker_entry_combined.js drifted from source — run python3 build.py")
+          print("build matches committed Worker")
+          PY
+
+      - name: Syntax check combined Worker
+        run: node --check worker_entry_combined.js
+
+      - name: Test suite
+        run: node --test tests/*.test.mjs
