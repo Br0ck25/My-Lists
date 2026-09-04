@@ -2010,6 +2010,19 @@ function addRow(name, url, type, enabled, group, channelId) {
   if (isCuratedRec && (name === 'Recommended Movies' || name === 'Recommended Shows' || !name || name === 'Curated List')) {
     name = 'Recommended';
   }
+  // A row whose own name is itself the pasted URL (typed into both the
+  // name and URL fields, however that happened) makes both the Live
+  // Preview shelf title and its See All page show the raw URL instead of
+  // a real name -- and on mobile, a long unbroken URL can force the See
+  // All header's like/+Add buttons off the edge of the screen (that pair
+  // sits in the same flex row as the title, pushed along with it -- see
+  // #detailTitle's own comment in 09_page-shell.js). Falls back to the
+  // same humanized name guessNameFromUrl already derives everywhere else
+  // a name isn't explicitly given (Bulk Import, "Import list from a
+  // link", ...), so a URL-shaped name never reaches the DOM at all.
+  if (name && typeof guessNameFromUrl === 'function' && new RegExp('^https?://', 'i').test(String(name).trim())) {
+    name = guessNameFromUrl(name);
+  }
   const container = document.getElementById('lists');
   const div = document.createElement('div');
   div.className = 'entry';

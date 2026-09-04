@@ -14248,7 +14248,15 @@ ${seoHeadHtml}
     </div>
     <div class="detail-header-info" style="margin-bottom:14px;">
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-        <h1 id="detailTitle">List Title</h1>
+        <!-- A list opened before its own "nice" name is available (e.g. a
+             row whose configured name is itself a pasted URL) shows that
+             raw URL here. As a flex item, an <h1> defaults to
+             min-width: auto, meaning it won't shrink below its own
+             min-content width -- and a long, unbroken URL's min-content
+             can exceed the viewport on mobile, forcing this whole row
+             (and the like/+Add buttons with it, via their margin-left:
+             auto) past the screen edge instead of wrapping in place. -->
+        <h1 id="detailTitle" style="min-width:0; overflow-wrap:anywhere;">List Title</h1>
         <div style="display:flex; gap:10px; align-items:center; margin-left:auto;">
           <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn">&#9825;</button>
           <button type="button" class="lc-btn primary" id="detailAddBtn">+ Add</button>
@@ -17588,6 +17596,19 @@ function addRow(name, url, type, enabled, group, channelId) {
   const isCuratedRec = String(url || '').startsWith('custom:curated:recommended');
   if (isCuratedRec && (name === 'Recommended Movies' || name === 'Recommended Shows' || !name || name === 'Curated List')) {
     name = 'Recommended';
+  }
+  // A row whose own name is itself the pasted URL (typed into both the
+  // name and URL fields, however that happened) makes both the Live
+  // Preview shelf title and its See All page show the raw URL instead of
+  // a real name -- and on mobile, a long unbroken URL can force the See
+  // All header's like/+Add buttons off the edge of the screen (that pair
+  // sits in the same flex row as the title, pushed along with it -- see
+  // #detailTitle's own comment in 09_page-shell.js). Falls back to the
+  // same humanized name guessNameFromUrl already derives everywhere else
+  // a name isn't explicitly given (Bulk Import, "Import list from a
+  // link", ...), so a URL-shaped name never reaches the DOM at all.
+  if (name && typeof guessNameFromUrl === 'function' && new RegExp('^https?://', 'i').test(String(name).trim())) {
+    name = guessNameFromUrl(name);
   }
   const container = document.getElementById('lists');
   const div = document.createElement('div');
@@ -21574,13 +21595,22 @@ async function onUnifiedImportFilesSelected(input) {
             isWatchCategory = true;
           } else if (lowerName.includes('lists/') || lowerClean.startsWith('lists-')) {
             const listName = cleanBase.replace(/^lists-?/, '').replace(/[-_]/g, ' ').trim();
-            const titleCase = listName.replace(/\b\w/g, c => c.toUpperCase());
+            // Doubled backslashes (\\b\\w) required here -- see
+            // guessNameFromUrl's own comment in 19_client-search-and-likes.js
+            // for why: this file's text passes through the outer template
+            // literal's own backslash-escape processing before the browser
+            // parses it, so a single \b\w here would reach the browser as a
+            // regex matching a literal backspace byte + "w" (matches
+            // nothing) instead of word-boundary + word-character.
+            const titleCase = listName.replace(/\\b\\w/g, c => c.toUpperCase());
             catKey = 'list_' + lowerClean;
             catLabel = 'List: ' + titleCase;
             defaultTarget = 'new';
             defaultNewName = titleCase;
           } else {
-            const humanName = cleanBase.replace(/[-_]/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+            // Doubled backslashes required -- see the titleCase comment
+            // just above.
+            const humanName = cleanBase.replace(/[-_]/g, ' ').trim().replace(/\\b\\w/g, c => c.toUpperCase());
             catKey = lowerClean;
             catLabel = humanName;
             defaultTarget = (lowerClean.includes('watchlist') ? 'watchlist' : (lowerClean.includes('history') || lowerClean.includes('watched') ? 'watch-history' : 'new'));
@@ -22055,11 +22085,21 @@ function guessNameFromUrl(u) {
     let last = parts[parts.length - 1] || noQuery || u;
     last = last.replace(/[-_]+/g, ' ').trim();
     if (!last) return 'List';
-    // Title-case each word. (Previously /\\b\\w/g -- a double-escaped
-    // regex that matches the literal 4-character text "\b\w", not a word
-    // boundary + word character, so this never actually matched anything
-    // and every guessed name silently kept its original casing.)
-    const titled = last.replace(/\b\w/g, (c) => c.toUpperCase());
+    // Title-case each word. The doubled backslashes below (\\b\\w) are
+    // required, not a typo or over-escaping: this file's own text is
+    // embedded as string content inside 09_page-shell.js's outer
+    // template literal (see that file's build-time concatenation
+    // comment), so it passes through one layer of backslash-escape
+    // processing before the browser ever parses it as JS. A single
+    // \b\w here would have the template literal consume that backslash
+    // (\b is its own recognized escape, for a backspace character) and
+    // drop the other, leaving the browser a regex matching a literal
+    // backspace byte followed by "w" -- which matches nothing, so this
+    // silently no-ops and leaves every guessed name in its original
+    // (all-lowercase-slug) casing. Doubling them here is what survives
+    // that pass and reaches the browser as the real \b\w (word boundary
+    // + word character) this is actually meant to be.
+    const titled = last.replace(/\\b\\w/g, (c) => c.toUpperCase());
     // Then fix up any whole word that's actually a known acronym --
     // title-casing alone leaves "Imdb Top Rated Movies" instead of the
     // "IMDB Top Rated Movies" someone would actually type by hand.
@@ -22193,13 +22233,22 @@ function parseListSearchIntent(rawQuery) {
   let source = null;
   let term = q;
 
+  // Doubled backslashes (\\b, \\s, \\., \\+) throughout -- required, not
+  // over-escaping. See guessNameFromUrl's own comment above for why:
+  // this file's text passes through one round of backslash-escape
+  // cooking (09_page-shell.js's outer template literal) before a
+  // browser ever parses it as code, and a single \b/\s/\./\+ wouldn't
+  // survive that pass as the word-boundary/whitespace/literal-dot/
+  // literal-plus regex escapes they're meant to be -- \+ in particular
+  // would survive as a bare +, a quantifier on the character before it
+  // ("y" in "disney+?") instead of a literal "+".
   const patterns = [
-    { source: 'MDBList', regex: /^(?:mdblist|mdb)\b\s*/i },
-    { source: 'Trakt', regex: /^(?:trakt|trakt\.tv)\b\s*/i },
-    { source: 'TMDB', regex: /^(?:tmdb|themoviedb|franchise|collection|collections)\b\s*/i },
-    { source: 'Simkl', regex: /^(?:simkl|anime)\b\s*/i },
-    { source: 'My Lists Addon', regex: /^(?:my\s*lists\s*addon|my\s*lists|mylists|profile|profiles|community)\b\s*/i },
-    { source: 'Streaming', regex: /^(?:netflix|disney\+?|hbo\s*max|max|hulu|apple\s*tv\+?|prime\s*video|amazon|paramount\+?|peacock)\b\s*/i },
+    { source: 'MDBList', regex: /^(?:mdblist|mdb)\\b\\s*/i },
+    { source: 'Trakt', regex: /^(?:trakt|trakt\\.tv)\\b\\s*/i },
+    { source: 'TMDB', regex: /^(?:tmdb|themoviedb|franchise|collection|collections)\\b\\s*/i },
+    { source: 'Simkl', regex: /^(?:simkl|anime)\\b\\s*/i },
+    { source: 'My Lists Addon', regex: /^(?:my\\s*lists\\s*addon|my\\s*lists|mylists|profile|profiles|community)\\b\\s*/i },
+    { source: 'Streaming', regex: /^(?:netflix|disney\\+?|hbo\\s*max|max|hulu|apple\\s*tv\\+?|prime\\s*video|amazon|paramount\\+?|peacock)\\b\\s*/i },
   ];
 
   for (const p of patterns) {

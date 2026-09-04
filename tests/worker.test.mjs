@@ -34,6 +34,48 @@ function loadSourceFunctions(relFile) {
   return sandbox;
 }
 
+// Files 09-24's own text is embedded as STRING CONTENT inside
+// 09_page-shell.js's outer template literal (renderBuilder's giant
+// backtick string -- see that file's own build-time concatenation
+// comment), so by the time a real browser parses any of this code, it
+// has already passed through one round of template-literal string-escape
+// cooking: \\ -> \, \n/\t/\r/\b/\f/\v/\0/`/$ -> their real characters,
+// \xHH and \uHHHH/\u{H...} -> the character they encode, and a backslash
+// before anything else is simply dropped (\d -> d, \s -> s, \. -> .,
+// \b\w -> a real word-boundary + word-char only if written \\b\\w in the
+// source, since a single \b is ITS OWN recognized escape -- a backspace
+// character -- eating that backslash a layer early). A regex literal
+// that needs a real backslash-escape to survive into the browser has to
+// be double-escaped in these files' own source for exactly that reason.
+// loadOneClientFunction/loadInlineItemMapper below read the raw source
+// file directly and hand it straight to vm, skipping that cooking pass
+// entirely -- so without reproducing it here, a correctly double-escaped
+// regex (the one that actually works in production) would test as its
+// naive, uncooked, WRONG meaning instead (e.g. \\b\\w as vm sees it
+// literally matches the 4-character text "\b\w", not a word boundary).
+function cookTemplateLiteralEscapes(text) {
+  return text.replace(/\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|(\r\n|[\s\S]))/g, (_m, hex2, hexBrace, hex4, other) => {
+    if (hex2 !== undefined) return String.fromCharCode(parseInt(hex2, 16));
+    if (hexBrace !== undefined) return String.fromCodePoint(parseInt(hexBrace, 16));
+    if (hex4 !== undefined) return String.fromCharCode(parseInt(hex4, 16));
+    switch (other) {
+      case "\\": return "\\";
+      case "n": return "\n";
+      case "t": return "\t";
+      case "r": return "\r";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "v": return "\v";
+      case "0": return "\0";
+      case "`": return "`";
+      case "$": return "$";
+      case "\n": return "";
+      case "\r\n": return "";
+      default: return other;
+    }
+  });
+}
+
 // Extracts and evaluates exactly one top-level `function name(...) {...}`
 // declaration out of a 09-24 client file, brace-balanced so it works
 // regardless of nested blocks inside the function body -- for a
@@ -61,7 +103,7 @@ function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
   const sandbox = { console, ...extraGlobals };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(src.slice(start, end), sandbox, { filename: `${relFile}#${fnName}` });
+  vm.runInContext(cookTemplateLiteralEscapes(src.slice(start, end)), sandbox, { filename: `${relFile}#${fnName}` });
   return sandbox[fnName];
 }
 
@@ -92,7 +134,7 @@ function loadInlineItemMapper(relFile, mapOpenSnippet, occurrence, extraGlobals 
     }
   }
   if (end === -1) throw new Error(`could not find end of mapper body in ${relFile}`);
-  const body = src.slice(braceStart, end);
+  const body = cookTemplateLiteralEscapes(src.slice(braceStart, end));
   const sandbox = { console, ...extraGlobals };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -834,6 +876,50 @@ describe("list URL query-string handling", () => {
     assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/television-classics"), "Television Classics");
   });
 
+  it("guessNameFromUrl's title-case regex must stay double-escaped (\\\\b\\\\w) to survive being embedded in 09_page-shell.js's own template literal", () => {
+    // This is the actual reported bug behind "it names it like this imdb
+    // top rated movies" resurfacing later as "HD documentary movies 1980
+    // to today" (only the acronym step ran; every other word stayed
+    // lowercase). A PAST fix here ("Previously /\\b\\w/g... this never
+    // actually matched anything") swapped a correctly *double*-escaped
+    // regex for a single-escaped one, believing the double escaping was
+    // the bug. It wasn't: this file's own text is embedded as string
+    // content inside 09_page-shell.js's outer template literal, so it
+    // passes through one round of backslash escape-cooking (see
+    // cookTemplateLiteralEscapes's own comment above) before a browser
+    // ever parses it as code. A single \b\w survives that pass as a
+    // regex matching a literal backspace byte + "w" (matches nothing,
+    // silently no-ops, exactly the bug this reintroduced); \\b\\w
+    // survives it as the real word-boundary + word-character regex this
+    // is supposed to be. (Proven directly against a git checkout of the
+    // single-escaped version during development -- see this fix's PR --
+    // rather than re-deriving that here on every run.)
+    assert.equal(
+      guessNameFromUrl("https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today"),
+      "HD Documentary Movies 1980 To Today"
+    );
+  });
+
+  it("parseListSearchIntent's source-prefix detection needs the same double-escaping (found while fixing the above)", () => {
+    // Same root cause, same file, a few lines up: \b\s escapes here were
+    // also single-escaped, so every one of these regexes matched nothing
+    // at all -- typing "mdblist trending movies" in Lists > Search never
+    // detected MDBList as the source or stripped it from the search term.
+    // Compared field-by-field rather than via deepEqual on the whole
+    // object -- it's built inside a separate vm realm, whose Object
+    // prototype differs from this test file's own, which trips
+    // deepStrictEqual's own-realm check even when every field matches.
+    const parseListSearchIntent = loadOneClientFunction("19_client-search-and-likes.js", "parseListSearchIntent");
+    const mdb = parseListSearchIntent("mdblist trending movies");
+    assert.equal(mdb.term, "trending movies");
+    assert.equal(mdb.source, "MDBList");
+    assert.equal(mdb.isSourceOnly, false);
+    const trakt = parseListSearchIntent("trakt top picks");
+    assert.equal(trakt.term, "top picks");
+    assert.equal(trakt.source, "Trakt");
+    assert.equal(parseListSearchIntent("just a plain search").source, null);
+  });
+
   it("detectSource recognizes Trakt watchlist/history URLs even with a trailing query string", () => {
     assert.equal(configFns.detectSource("https://trakt.tv/users/someone/watchlist?Mode=Show"), "trakt-watchlist");
     assert.equal(configFns.detectSource("https://trakt.tv/users/someone/history?Mode=Show"), "trakt-history");
@@ -944,6 +1030,83 @@ describe("custom list catalog pagination (imported list See All)", () => {
     }
     assert.equal(seen.size, 250, `expected all 250 unique items across pages, got ${seen.size}`);
     assert.equal(pages, 3, `expected exactly 3 pages (100+100+50), got ${pages}`);
+  });
+});
+
+describe("a catalog row never keeps a raw URL as its own name", () => {
+  // Reported bug: a row added with the pasted URL also sitting in the
+  // "name" field (however that happened) showed that raw URL as both the
+  // Live Preview shelf's title and its See All page's title -- and on
+  // mobile, a long unbroken URL forced the See All header's like/+Add
+  // buttons off the edge of the screen, since they share a flex row with
+  // the title (see #detailTitle's own min-width: 0 fix in
+  // 09_page-shell.js). addRow now falls back to guessNameFromUrl for a
+  // URL-shaped name so a raw URL never reaches the DOM as a "name" at all.
+  function makeMockDiv() {
+    return { className: "", dataset: {}, classList: { add: () => {} }, innerHTML: "", querySelector: () => null };
+  }
+
+  it("addRow substitutes a humanized name when the given name is itself a URL", () => {
+    const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+    let createdDiv = null;
+    const addRow = loadOneClientFunction("16_client-row-core.js", "addRow", {
+      guessNameFromUrl,
+      escapeHtml: (s) => String(s == null ? "" : s),
+      escapeAttr: (s) => String(s == null ? "" : s),
+      entryAvatarColor: () => "#000",
+      sourceRowHtml: () => "<div></div>",
+      updateSourceRemoveButtons: () => {},
+      relocateAddSourceBtn: () => {},
+      initTouchDrag: () => {},
+      checkAllDuplicateUrls: () => {},
+      renumber: () => {},
+      showAddedToast: () => {},
+      suppressSave: false,
+      document: {
+        getElementById: () => ({ appendChild: () => {} }),
+        createElement: () => { createdDiv = makeMockDiv(); return createdDiv; },
+      },
+    });
+
+    const rawUrl = "https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today";
+    addRow(rawUrl, rawUrl, "movie", true, "Custom");
+
+    assert.ok(createdDiv, "expected addRow to create the row element");
+    assert.ok(!createdDiv.innerHTML.includes(rawUrl), "the raw URL must not end up anywhere in the row's own markup");
+    assert.ok(
+      createdDiv.innerHTML.includes('value="HD Documentary Movies 1980 To Today"'),
+      `expected the .name input to carry the humanized name, got: ${createdDiv.innerHTML.slice(0, 400)}`
+    );
+    assert.ok(
+      createdDiv.innerHTML.includes("HD Documentary Movies 1980 To Today - Movies"),
+      "expected the Live Preview shelf title to carry the humanized name too"
+    );
+  });
+
+  it("addRow leaves an already-real name untouched", () => {
+    const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+    let createdDiv = null;
+    const addRow = loadOneClientFunction("16_client-row-core.js", "addRow", {
+      guessNameFromUrl,
+      escapeHtml: (s) => String(s == null ? "" : s),
+      escapeAttr: (s) => String(s == null ? "" : s),
+      entryAvatarColor: () => "#000",
+      sourceRowHtml: () => "<div></div>",
+      updateSourceRemoveButtons: () => {},
+      relocateAddSourceBtn: () => {},
+      initTouchDrag: () => {},
+      checkAllDuplicateUrls: () => {},
+      renumber: () => {},
+      showAddedToast: () => {},
+      suppressSave: false,
+      document: {
+        getElementById: () => ({ appendChild: () => {} }),
+        createElement: () => { createdDiv = makeMockDiv(); return createdDiv; },
+      },
+    });
+
+    addRow("My Favorite Movies", "https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today", "movie", true, "Custom");
+    assert.ok(createdDiv.innerHTML.includes('value="My Favorite Movies"'));
   });
 });
 

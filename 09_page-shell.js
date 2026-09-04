@@ -3119,7 +3119,15 @@ ${seoHeadHtml}
     </div>
     <div class="detail-header-info" style="margin-bottom:14px;">
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-        <h1 id="detailTitle">List Title</h1>
+        <!-- A list opened before its own "nice" name is available (e.g. a
+             row whose configured name is itself a pasted URL) shows that
+             raw URL here. As a flex item, an <h1> defaults to
+             min-width: auto, meaning it won't shrink below its own
+             min-content width -- and a long, unbroken URL's min-content
+             can exceed the viewport on mobile, forcing this whole row
+             (and the like/+Add buttons with it, via their margin-left:
+             auto) past the screen edge instead of wrapping in place. -->
+        <h1 id="detailTitle" style="min-width:0; overflow-wrap:anywhere;">List Title</h1>
         <div style="display:flex; gap:10px; align-items:center; margin-left:auto;">
           <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn">&#9825;</button>
           <button type="button" class="lc-btn primary" id="detailAddBtn">+ Add</button>
