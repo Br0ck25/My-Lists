@@ -107,6 +107,11 @@ export function makeD1() {
     _creators: creators,
     _lists: lists,
     prepare(sql) {
+      // Real D1's PreparedStatement exposes run()/all() directly, not only
+      // after .bind() -- bind() is only needed when the query actually has
+      // placeholders. A mock that required .bind() unconditionally masked
+      // any code path calling .prepare(sql).all()/.run() on a parameterless
+      // query (renderAdminDashboard's creator COUNT(*), for one).
       return {
         bind(...args) {
           return {
@@ -114,6 +119,8 @@ export function makeD1() {
             all: async () => all(sql, args),
           };
         },
+        run: async () => run(sql, []),
+        all: async () => all(sql, []),
       };
     },
     async batch(stmts) {

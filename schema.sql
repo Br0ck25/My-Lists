@@ -1,5 +1,8 @@
 -- schema.sql
--- Run this with: npx wrangler d1 execute my-lists-db --file=./schema.sql
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: create a D1 database under Storage & Databases, open its
+--   Console tab, paste this file's contents, and click Run.
+--   Wrangler:  npx wrangler d1 execute my-lists-db --file=./schema.sql
 --
 -- WARNING: this file DROPs every table before creating it. It provisions a
 -- BLANK database and will destroy all existing data. Do NOT run it against a

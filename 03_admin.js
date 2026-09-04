@@ -1137,6 +1137,12 @@ async function renderAdminDashboard(env) {
   if (!env || !env.CONFIGS) {
     return `<!DOCTYPE html><html><body style="background:#F2F2F7;color:#1C1C1E;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
   }
+  // Surfaced in the Maintenance tab below so a dashboard-only self-hoster
+  // (no wrangler.toml in front of them) can see at a glance whether this
+  // Worker even has a D1 database bound, instead of guessing -- D1 is
+  // entirely optional, and every D1-specific action in that tab only
+  // makes sense once this is true.
+  const isD1Bound = !!(env && env.DB);
   const today = statsToday();
   const [
     totalPV, todayPV, totalIN, todayIN, totalPP, todayPP,
@@ -1441,6 +1447,7 @@ async function renderAdminDashboard(env) {
     <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
     <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
     <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
+    <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
   </div>
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
@@ -1666,6 +1673,29 @@ async function renderAdminDashboard(env) {
     <div id="netflixPreviewShows" style="margin-top:28px;"></div>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="maintenance">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">D1 database: ${isD1Bound
+        ? '<span style="color:#30d158;">bound</span>'
+        : '<span style="color:#8E8E93;">not bound</span>'}</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">D1 is entirely optional -- Creator Profiles, Custom Lists, and everything else work fully from KV storage alone with no D1 database at all. ${isD1Bound
+        ? 'This Worker has one bound as <code>DB</code>, so the migration below is available.'
+        : 'This Worker has no D1 database bound (Settings &rarr; Bindings), so there is nothing to migrate -- everything below is inactive until one is added.'}</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="migrateD1Btn" onclick="runMigrateD1()" ${isD1Bound ? '' : 'disabled'}>Migrate KV &rarr; D1</button>
+      <span id="migrateD1Status" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Copies existing Creator Profiles, Custom Lists, and Source Groups from KV into D1 -- needed once after binding a D1 database that already has KV data behind it (a brand-new site with no accounts yet doesn't need this). KV stays the source of truth throughout; safe to run more than once.</p>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It rebuilds itself automatically (on every publish/like, and once per cron run if it's ever found missing), so this is only for forcing an immediate, verifiable rebuild right now -- e.g. right after first setting this Worker up.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
+      <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+  </div>
+
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
   <script>
     const categoryDefaults = {
@@ -1684,6 +1714,7 @@ async function renderAdminDashboard(env) {
       creators: 'management',
       feedback: 'management',
       netflixpreview: 'management',
+      maintenance: 'management',
     };
 
     function switchAdminMainTab(catId) {
@@ -1992,6 +2023,51 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
       loadTrendingData();
       if (typeof loadSearchData === 'function') loadSearchData();
+    }
+
+    // Unlike the two loops above, /admin/api/migrate-d1 does its entire
+    // sweep (creators, creator_lists, source_groups) in one request rather
+    // than resuming across repeated calls, so this is a single fetch.
+    async function runMigrateD1() {
+      const btn = document.getElementById('migrateD1Btn');
+      const status = document.getElementById('migrateD1Status');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      try {
+        const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+        } else {
+          const r = data.results || {};
+          const errCount = (r.errors || []).length;
+          status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
+            (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
+            (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
+            (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
+          if (errCount) console.error('migrate-d1 errors:', r.errors);
+        }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    async function runRebuildPublicIndex() {
+      const btn = document.getElementById('rebuildIndexBtn');
+      const status = document.getElementById('rebuildIndexStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      try {
+        const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
+        const data = await res.json();
+        status.textContent = data.ok
+          ? ('Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') + ' in ' + data.ms + 'ms.')
+          : ('Failed: ' + (data.error || 'unknown error'));
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
     }
 
     async function loadApiUsage() {

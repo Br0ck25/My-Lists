@@ -18,9 +18,16 @@ id = "YOUR_KV_NAMESPACE_ID"
 # --- D1 (optional) -----------------------------------------------------------
 # Optional. Every accessor tries D1 first and falls back to KV, so the app
 # is fully functional with this block commented out. If you do enable it,
-# run schema.sql first and then POST /admin/api/migrate-d1 to backfill
-# existing KV accounts -- an account present in KV but missing from D1 will
-# otherwise not be updated correctly by the key-rotation endpoints.
+# run schema.sql first and then use the "Migrate KV -> D1" button under
+# /admin's Management & Tools -> Maintenance tab (or POST
+# /admin/api/migrate-d1 directly) to backfill existing KV accounts -- an
+# account present in KV but missing from D1 will otherwise not be updated
+# correctly by the key-rotation endpoints.
+#
+# This block (and the commands below) is only relevant if you deploy with
+# `wrangler`. Deploying via the Cloudflare Dashboard instead? See
+# README.md's "Step 4 - Enable Cloudflare D1 Storage" -- every step there,
+# including running schema.sql, is doable from the dashboard alone.
 #   npx wrangler d1 create my-lists-db
 #   npx wrangler d1 execute my-lists-db --file=./schema.sql
 # [[d1_databases]]

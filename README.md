@@ -111,16 +111,33 @@ The Worker boots and serves the catalog/manifest pages without this, but every s
 
 ### Step 4 - (Optional) Enable Cloudflare D1 Storage
 
-D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale. If you do enable it later after already having KV data, run `schema.sql` (a **blank-database bootstrap that DROPs existing tables** -- never run it against a live D1 database with data in it; add a file under `migrations/` instead to change a live schema) and then POST `/admin/api/migrate-d1` to backfill existing KV accounts and lists into it:
+D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped -- most self-hosters can skip this entire section. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale.
 
-1. Run `npx wrangler d1 create my-lists-db` in your terminal to provision a new database.
-2. Execute the schema against it: `npx wrangler d1 execute my-lists-db --file=schema.sql --remote`.
-3. Return to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
-4. Navigate to **Bindings** and click **+ Binding**.
-5. Choose **D1 database** &rarr; click **Add Binding**:
+Every step below is doable entirely from the Cloudflare Dashboard -- nothing here needs `wrangler`, `npx`, or a terminal of any kind, even though D1's own docs (and this file, in an earlier version) usually show the CLI first. A **Wrangler CLI alternative** is noted at the end for anyone who prefers it.
+
+**1. Create the database**
+1. In the Cloudflare Dashboard sidebar, go to **Storage & Databases** &rarr; **D1 SQL Database**.
+2. Click **Create Database**, name it `my-lists-db` (or anything you like), and create it.
+
+**2. Run `schema.sql` against it (once, on a brand-new database only)**
+1. Open the database you just created and click its **Console** tab -- a query box built right into the dashboard.
+2. Open [`schema.sql`](https://github.com/Br0ck25/My-Lists/blob/main/schema.sql) from this repo, copy its entire contents, paste them into the Console, and click **Run** / **Execute**. This creates the `creators`, `creator_lists`, and `source_groups` tables.
+3. &#9888;&#65039; `schema.sql` **DROPs and recreates every table it touches.** Only ever run it once, against a brand-new, empty database. If you need to change the shape of a database that already has real data in it later, use a file under [`migrations/`](https://github.com/Br0ck25/My-Lists/tree/main/migrations) instead -- see "Applying a migration" below -- never `schema.sql` again after this first run.
+
+**3. Bind it to your Worker**
+1. Return to **Compute** &rarr; **Workers & Pages** &rarr; click on your worker.
+2. Navigate to **Settings** &rarr; **Bindings** and click **+ Add**.
+3. Choose **D1 database** &rarr; click **Add Binding**:
    - **Variable name**: `DB` *(must match exactly in all caps)*
-   - **D1 database**: Select the `my-lists-db` database created in step 1.
-6. Click **Save** / **Deploy**.
+   - **D1 database**: Select the database created in step 1.
+4. Click **Save** / **Deploy**.
+
+**4. Backfill any existing KV data into it**
+If you already had Creator Profiles or Custom Lists in KV *before* adding D1 (i.e. you're enabling this on a site that's already been running), D1 starts out empty and needs a one-time copy. Log into `/admin`, open **Management & Tools &rarr; Maintenance**, and click **Migrate KV &rarr; D1**. (A brand-new site with no accounts yet can skip this -- there's nothing to copy.) This is safe to click more than once; KV stays the authoritative copy either way.
+
+**Applying a migration:** files under [`migrations/`](https://github.com/Br0ck25/My-Lists/tree/main/migrations) are small, additive changes to an already-live database (unlike `schema.sql`, they're safe to run with real data present). Open the file on GitHub, copy its `ALTER TABLE`/`CREATE INDEX`/etc. statements (skip the `--` comment lines), paste them into the same D1 Console used in step 2 above, and click **Run**. Apply them in filename order (`0001_...`, `0002_...`, and so on) -- each one assumes the ones before it already ran.
+
+**Wrangler CLI alternative**, if you'd rather use a terminal: `npx wrangler d1 create my-lists-db`, then `npx wrangler d1 execute my-lists-db --file=schema.sql --remote` (or `--file=migrations/000X_....sql --remote` for a specific migration), then bind it the same way as steps 3.2-3.4 above.
 
 ---
 
