@@ -35682,7 +35682,13 @@ async function handleDeleteAccount() {
     const res = await fetch(ORIGIN + '/api/creator/delete-account', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+      // The server requires confirm:"DELETE" on this specific irreversible
+      // action (see /api/creator/delete-account's own comment) -- the same
+      // pattern openResetAccountModal's own confirm:'RESET' already uses
+      // for the sibling account/reset endpoint. This call never sent it,
+      // so every delete attempt failed at the server with "Missing
+      // confirmation." no matter how the person confirmed in this modal.
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, confirm: 'DELETE' }),
     });
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) {

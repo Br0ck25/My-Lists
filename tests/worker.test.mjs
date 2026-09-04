@@ -40,9 +40,14 @@ function loadSourceFunctions(relFile) {
 // self-contained (no calls to other not-yet-defined helpers) pure
 // function, without needing to stand up the whole client bundle's
 // window/document/DOM environment just to reach it.
-function loadOneClientFunction(relFile, fnName) {
+// `extraGlobals` seeds anything the extracted function references as a
+// free variable (other client globals, DOM stand-ins, a fetch mock, ...)
+// -- it becomes part of the same sandbox object the function runs in, so
+// a mock passed in here can still be inspected/asserted on after calling
+// the returned function (they share the live object, not a copy).
+function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
   const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
-  const start = src.search(new RegExp(`function\\s+${fnName}\\s*\\([^)]*\\)\\s*\\{`));
+  const start = src.search(new RegExp(`(?:async\\s+)?function\\s+${fnName}\\s*\\([^)]*\\)\\s*\\{`));
   if (start === -1) throw new Error(`${fnName} not found in ${relFile}`);
   let depth = 0, end = -1;
   for (let i = start; i < src.length; i++) {
@@ -53,7 +58,7 @@ function loadOneClientFunction(relFile, fnName) {
     }
   }
   if (end === -1) throw new Error(`could not find end of ${fnName} in ${relFile}`);
-  const sandbox = { console };
+  const sandbox = { console, ...extraGlobals };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(src.slice(start, end), sandbox, { filename: `${relFile}#${fnName}` });
@@ -805,5 +810,59 @@ describe("list URL query-string handling", () => {
     assert.ok(requestedUrl, "expected a fetch to have been made");
     assert.ok(!requestedUrl.includes("Mode"), `fetch URL leaked the query string into the slug: ${requestedUrl}`);
     assert.equal(requestedUrl, "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster");
+  });
+});
+
+describe("delete-account confirmation", () => {
+  it("client sends the confirm:'DELETE' the server requires (unit)", async () => {
+    let capturedBody = null;
+    const handleDeleteAccount = loadOneClientFunction("22_client-creator-profile.js", "handleDeleteAccount", {
+      ORIGIN: "https://example.test",
+      activeCreator: { creatorName: "alicedelete", displayName: "Alice" },
+      document: { getElementById: () => null },
+      localStorage: { getItem: () => "MYL-TEST-KEY1-KEY2" },
+      fetch: async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return { json: async () => ({ ok: true }) };
+      },
+      clearLocalAccountData: () => {},
+      closeModal: () => {},
+      showAddedToast: () => {},
+    });
+    await handleDeleteAccount();
+    assert.ok(capturedBody, "expected handleDeleteAccount to have called fetch");
+    // The actual bug: this call never sent `confirm` at all, so the
+    // server's own check (see the next test) rejected every real delete
+    // attempt with "Missing confirmation." no matter how the person
+    // confirmed in the modal.
+    assert.equal(capturedBody.confirm, "DELETE");
+    assert.equal(capturedBody.creatorName, "alicedelete");
+  });
+
+  it("server rejects a delete-account request with no confirm field (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelnoconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error || "", /confirmation/i);
+  });
+
+  it("server accepts and completes a delete-account request with confirm:'DELETE' (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    // The identity itself is gone -- the same key no longer authenticates.
+    const restore = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(restore.status, 401);
   });
 });
