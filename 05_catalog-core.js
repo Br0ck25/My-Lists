@@ -776,7 +776,7 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   const items = payload.shuffle
     ? seededShuffle(sourceItems, daysSinceEpochUTC(new Date()) + hashStringToInt(payload.listId || entry.id))
     : sourceItems;
-  return items
+  const mapped = items
     .filter((it) => {
       if (!it || !it.imdbId) return false;
       const itType = it.kind || it.type;
@@ -794,6 +794,21 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
       poster: it.poster || undefined,
       releaseInfo: it.year || undefined,
     }));
+  // Paginate like every other in-memory source (see fetchCuratedCatalog
+  // just above for the same slice(skip, skip+PAGE_SIZE) + totalItems
+  // shape). This used to ignore skip and return the whole list on every
+  // call. /api/preview and the real Stremio catalog route both call this
+  // with an advancing skip and trust the result to actually advance --
+  // Live Preview & Editor's "See All" pages a Custom List through
+  // /api/preview (unlike Your Custom Lists' own See All, which embeds the
+  // full array up front and never re-fetches), so returning the same
+  // page-0 items again under a "page 2" label made it re-append them and
+  // then stop, capping any imported list over PAGE_SIZE at 2 x PAGE_SIZE
+  // items with half of them duplicates.
+  if (skip >= mapped.length) return [];
+  const sliced = mapped.slice(skip, skip + PAGE_SIZE);
+  sliced.totalItems = mapped.length;
+  return sliced;
 }
 
 // Turns one stored recommendation entry (the exact shape the Discover

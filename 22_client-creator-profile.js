@@ -3459,7 +3459,11 @@ if (_creatorDashEl) {
       const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
       return {
         id: showId,
-        showId: showId,
+        // Gated on isShow -- a plain movie has no real showId, so the
+        // fallback chain above lands on its own imdbId, which would read as
+        // a truthy showId here and pull it into the Shows tab's !!it.showId
+        // filter right alongside actual shows.
+        showId: isShow ? showId : null,
         seasonNum: it.seasonNum,
         episodeNum: it.episodeNum,
         type: itemType,
