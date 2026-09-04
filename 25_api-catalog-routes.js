@@ -7,6 +7,31 @@
 // exists purely to run every response back through withSecurityHeaders
 // (02_http-and-creator-utils.js) on the way out, without needing to touch
 // any of the dozens of individual `new Response(...)` call sites below.
+// /api/poster-badge only ever receives a `poster` value this add-on put
+// there itself (see applyBadgedPostersToMetas, 05_catalog-core.js) --
+// every source fetcher resolves posters to one of these three image hosts
+// (TMDB, the Cinemeta/metahub IMDb-poster fallback, or Simkl's own
+// artwork host); nothing in this codebase ever lets a user supply a raw
+// poster URL. A request that names any other host, or a non-https scheme,
+// isn't a real poster -- it's someone probing the endpoint directly, and
+// gets rejected before either the redirect or the fetch further down.
+const POSTER_IMAGE_HOSTS = new Set([
+  "image.tmdb.org",
+  "images.metahub.space",
+  "simkl.in",
+]);
+
+function isAllowedPosterUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw || ""));
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false;
+  return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
+}
+
 async function handleFetch(request, env, ctx) {
     // Populate the env-backed API key globals declared in 00_constants.js
     // for this request. Every helper function elsewhere in this add-on
@@ -94,7 +119,16 @@ async function handleFetch(request, env, ctx) {
       const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
 
-      if (!posterUrl) {
+      if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
+        // Missing entirely, or not one of the image hosts this add-on
+        // itself ever puts in a `poster` field (see isAllowedPosterUrl).
+        // This is a public, CORS-open, unauthenticated endpoint -- without
+        // this check it was both an open redirect (Response.redirect
+        // below, with no badge params) and an SSRF/open image proxy (the
+        // fetch further down, with any badge param present): a caller
+        // could point `poster=` at any http(s) URL and have this Worker
+        // either send a visitor's browser there directly, or fetch it
+        // server-side and echo the response back embedded in the SVG.
         return new Response(null, { status: 404 });
       }
 

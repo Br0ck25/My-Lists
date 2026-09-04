@@ -136,7 +136,10 @@ async function ensureTraktPopularLoaded() {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
+  // s == null -> '' (not String(null)/String(undefined), which render as
+  // the literal text "null"/"undefined" for any field that's legitimately
+  // unset -- see 16_client-row-core.js's escapeHtml, which this matches).
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }

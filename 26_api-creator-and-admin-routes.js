@@ -1746,6 +1746,42 @@
         }
       }
 
+      // Conflict guard -- this endpoint used to always blindly overwrite
+      // creatorsync:{username} with whatever this request's snapshot was,
+      // no matter how stale. Two tabs/devices autosaving around the same
+      // time meant whichever PUT landed last in KV won completely, silently
+      // discarding the other one's edits with no error anywhere.
+      //
+      // An updated client now sends expectedUpdatedAt: the updatedAt it
+      // last actually saw (from a prior /sync/load or /sync/save response)
+      // -- i.e. the version its current edits are built on top of. If the
+      // record in KV has moved past that, another device saved in between;
+      // rather than clobber that write, this responds 409 and leaves KV
+      // untouched. The client's own pending edits aren't lost either: they
+      // stay in its DOM/localStorage and go up on the very next autosave,
+      // now against the correct baseline. An older client that doesn't
+      // send expectedUpdatedAt at all gets exactly its previous behavior
+      // (last-write-wins) -- this is purely additive, not a breaking
+      // change to the request shape.
+      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
+      if (expectedUpdatedAt !== null) {
+        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+        if (currentRaw) {
+          try {
+            const current = JSON.parse(currentRaw);
+            if (Number(current.updatedAt) > expectedUpdatedAt) {
+              // Purely for visibility -- this was previously invisible even
+              // to us; now it's at least countable on the admin dashboard.
+              ctx.waitUntil(bumpStat(env, "sync_conflict"));
+              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
+            }
+          } catch {
+            // Existing blob unreadable -- nothing coherent to protect
+            // against; fall through and write normally.
+          }
+        }
+      }
+
       const blob = {
         config: Array.isArray(body.config) ? body.config : [],
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
@@ -1774,7 +1810,9 @@
         // never the problem.
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // updatedAt lets the client advance its own baseline without a
+      // separate /sync/meta round trip -- see expectedUpdatedAt above.
+      return json({ ok: true, updatedAt: blob.updatedAt });
     }
 
     // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,
@@ -3288,6 +3326,35 @@
       return json({ ok: true, results });
     }
 
+    // /admin/api/rebuild-public-index  (POST) -> { ok, count, ms }
+    // Forces an immediate, synchronous rebuild of index:publiclists (see
+    // getPublicListIndex/rebuildPublicListIndex, 02_http-and-creator-
+    // utils.js) instead of waiting for it to happen lazily. Without this,
+    // a fresh deployment -- or the index key being lost some other way --
+    // serves every visitor of /lists/public.json and list search a
+    // truncated, lexicographically-biased result (capped at 150/250/80
+    // keys) for however long the lazy background rebuild takes to finish,
+    // which scales with how many lists exist. scheduled() below also
+    // triggers this same rebuild automatically whenever the index is
+    // found missing (self-healing within one cron interval even with no
+    // admin action), so this endpoint is for an immediate, verifiable
+    // seed right after a fresh deploy rather than the only way it happens.
+    // Safe to run any time, repeatedly -- it's the exact same full rebuild
+    // the lazy/cron paths already do, just awaited here instead of
+    // deferred.
+    if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      const started = Date.now();
+      try {
+        const entries = await rebuildPublicListIndex(env);
+        return json({ ok: true, count: (entries || []).length, ms: Date.now() - started });
+      } catch (e) {
+        return json({ ok: false, error: "Rebuild failed: " + (e && e.message ? e.message : String(e)) }, 500);
+      }
+    }
+
     // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }
     // One-time migration for the switch (see recordTrackedEvent's own
     // comment) from one KV key per (eventType/query, id, day) to one JSON
@@ -3795,6 +3862,35 @@
           { status: 500, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
         );
       }
+      // Every other credential-bearing endpoint in this app (creator
+      // create/restore/reset-key) rate-limits guesses by IP -- this one
+      // never did, despite guarding the one secret that can rotate any
+      // creator's key via /admin/api/reset-creator-key with no other
+      // verification. Same pattern as /api/creator/restore: a per-IP
+      // counter with a 60s window. Skipped entirely (not failed closed)
+      // when CONFIGS isn't bound, matching every other KV-optional
+      // feature in this app -- login by ADMIN_KEY alone still works.
+      // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
+      // missing, same as restore, because there is no other safe
+      // per-client identity to key a shared bucket on.
+      if (env.CONFIGS) {
+        const ip = clientIpKey(request);
+        if (!ip) {
+          return new Response(renderAdminLoginPage("Could not process this request."), {
+            status: 400,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        const rateLimitKey = `ratelimit:adminlogin:${ip}`;
+        const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
+        if (attempts >= 10) {
+          return new Response(renderAdminLoginPage("Too many attempts. Please wait a minute and try again."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+      }
       let submittedKey = "";
       try {
         const form = await request.formData();
@@ -3944,6 +4040,17 @@ export default {
       Promise.all([
         checkForNewEpisodes(env),
         prewarmSharedCatalogs(env, ctx),
+        // Cheap when index:publiclists already exists (one KV get, no-op).
+        // When it doesn't -- a fresh deployment, or the index key lost
+        // some other way -- this is what keeps a self-hoster who never
+        // visits /admin from serving every visitor a truncated,
+        // lexicographically-biased directory/search result indefinitely:
+        // it self-heals within one cron interval instead of only on
+        // whichever live request happens to hit the cold index first. See
+        // getPublicListIndex's own comment; /admin/api/rebuild-public-index
+        // does the same rebuild on demand, synchronously, for an
+        // immediate/verifiable seed right after a fresh deploy.
+        getPublicListIndex(env, ctx),
       ])
     );
   },

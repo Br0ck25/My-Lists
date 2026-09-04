@@ -16,7 +16,7 @@
 --   npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001_add_likes_to_creator_lists.sql
 --
 -- Existing counts live in KV and are the source of truth. After migrating,
--- POST /admin/api/migrate-to-d1 to copy them across; until then the column
+-- POST /admin/api/migrate-d1 to copy them across; until then the column
 -- reads 0 for lists that have not been liked again since.
 
 ALTER TABLE creator_lists ADD COLUMN likes INTEGER NOT NULL DEFAULT 0;

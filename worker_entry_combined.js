@@ -2627,37 +2627,68 @@ async function likeVoterId(request, env, creatorUsername, scopeId) {
   return `a:${hash}`;
 }
 
+// Reads a ledger key's voter list, tolerating both storage shapes this
+// function has ever written (a bare array, or {voters: [...]}).
+async function readLikeVoters(env, ledgerKey) {
+  try {
+    const raw = await env.CONFIGS.get(ledgerKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.voters)) return parsed.voters;
+  } catch {
+    // fall through
+  }
+  return [];
+}
+
 // Applies one vote to a ledger key and returns the resulting count.
 // Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
 // be a new voter -- the caller keeps the existing count rather than
 // silently discarding the vote or growing the key without bound.
+//
+// Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
+// here can lose a vote: two requests can both read the same snapshot, and
+// whichever PUT lands last in KV wins, silently dropping the other one.
+// Rather than a full lock (KV has no primitive to build one on reliably
+// either), this re-reads the ledger after writing and confirms this
+// voter's own membership actually stuck; if another write raced it in
+// between, it retries against that fresh state instead of just trusting
+// its own PUT. Bounded to a handful of attempts -- this only protects
+// against genuinely concurrent requests on one list, not a design that
+// needs to spin forever.
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  let voters = [];
-  try {
-    const raw = await env.CONFIGS.get(ledgerKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) voters = parsed;
-      else if (parsed && Array.isArray(parsed.voters)) voters = parsed.voters;
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const voters = await readLikeVoters(env, ledgerKey);
+    const set = new Set(voters);
+    const had = set.has(voterId);
+    if (liked) {
+      if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
+      set.add(voterId);
+    } else {
+      set.delete(voterId);
     }
-  } catch {
-    voters = [];
-  }
-  const set = new Set(voters);
-  const had = set.has(voterId);
-  if (liked) {
-    if (!had && set.size >= LIKE_VOTER_CAP) return { count: set.size, capped: true };
-    set.add(voterId);
-  } else {
-    set.delete(voterId);
-  }
-  // No write at all when nothing changed -- KV allows one write per second
-  // per key, and a double-tap on a busy list should not burn that budget
-  // or race with a genuine vote.
-  if (set.size !== voters.length || had !== set.has(voterId)) {
+    // No write at all when nothing changed -- KV allows one write per
+    // second per key, and a double-tap on a busy list should not burn
+    // that budget or race with a genuine vote.
+    if (set.size === voters.length && had === set.has(voterId)) {
+      return { count: set.size, capped: false };
+    }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    const verifyVoters = await readLikeVoters(env, ledgerKey);
+    if (new Set(verifyVoters).has(voterId) === liked) {
+      return { count: verifyVoters.length, capped: false };
+    }
+    // Someone else's write landed on top of ours between the PUT and this
+    // re-read -- loop and retry against their (now current) state rather
+    // than reporting a count/liked state that isn't what's actually
+    // stored.
   }
-  return { count: set.size, capped: false };
+  // Exhausted retries under sustained contention on this one list: report
+  // whatever is actually in KV right now rather than guessing.
+  const finalVoters = await readLikeVoters(env, ledgerKey);
+  return { count: finalVoters.length, capped: false };
 }
 
 // --- External list URL validation --------------------------------------------
@@ -21949,7 +21980,10 @@ async function ensureTraktPopularLoaded() {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
+  // s == null -> '' (not String(null)/String(undefined), which render as
+  // the literal text "null"/"undefined" for any field that's legitimately
+  // unset -- see 16_client-row-core.js's escapeHtml, which this matches).
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }
@@ -36508,7 +36542,7 @@ async function pushCreatorSync() {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
   try {
-    await fetch(ORIGIN + '/api/creator/sync/save', {
+    const res = await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -36531,8 +36565,27 @@ async function pushCreatorSync() {
         hiddenMyListsSections: (function() {
           try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
         })(),
+        // The updatedAt this browser last actually saw (from a prior
+        // /sync/load or /sync/save), i.e. the version these edits are
+        // built on top of -- lets the server tell whether another device
+        // saved in between instead of silently overwriting it. See
+        // /api/creator/sync/save's own comment.
+        expectedUpdatedAt: window._serverSyncUpdatedAt,
       }),
     });
+    if (res.status === 409) {
+      // Another device saved more recently than what this browser last
+      // saw. Don't clobber that write -- pull the latest instead. Any
+      // edit still pending in this tab hasn't gone anywhere (it's still
+      // sitting in the DOM/localStorage) and goes up on the next autosave,
+      // now against the correct baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverSyncUpdatedAt = data.updatedAt;
+    }
     window._lastCreatorSyncPushedAt = Date.now();
   } catch (e) {
     // silently fail, it's a background sync
@@ -45732,6 +45785,31 @@ function renderGuidePage(origin) {
 // exists purely to run every response back through withSecurityHeaders
 // (02_http-and-creator-utils.js) on the way out, without needing to touch
 // any of the dozens of individual `new Response(...)` call sites below.
+// /api/poster-badge only ever receives a `poster` value this add-on put
+// there itself (see applyBadgedPostersToMetas, 05_catalog-core.js) --
+// every source fetcher resolves posters to one of these three image hosts
+// (TMDB, the Cinemeta/metahub IMDb-poster fallback, or Simkl's own
+// artwork host); nothing in this codebase ever lets a user supply a raw
+// poster URL. A request that names any other host, or a non-https scheme,
+// isn't a real poster -- it's someone probing the endpoint directly, and
+// gets rejected before either the redirect or the fetch further down.
+const POSTER_IMAGE_HOSTS = new Set([
+  "image.tmdb.org",
+  "images.metahub.space",
+  "simkl.in",
+]);
+
+function isAllowedPosterUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw || ""));
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false;
+  return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
+}
+
 async function handleFetch(request, env, ctx) {
     // Populate the env-backed API key globals declared in 00_constants.js
     // for this request. Every helper function elsewhere in this add-on
@@ -45819,7 +45897,16 @@ async function handleFetch(request, env, ctx) {
       const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
 
-      if (!posterUrl) {
+      if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
+        // Missing entirely, or not one of the image hosts this add-on
+        // itself ever puts in a `poster` field (see isAllowedPosterUrl).
+        // This is a public, CORS-open, unauthenticated endpoint -- without
+        // this check it was both an open redirect (Response.redirect
+        // below, with no badge params) and an SSRF/open image proxy (the
+        // fetch further down, with any badge param present): a caller
+        // could point `poster=` at any http(s) URL and have this Worker
+        // either send a visitor's browser there directly, or fetch it
+        // server-side and echo the response back embedded in the SVG.
         return new Response(null, { status: 404 });
       }
 
@@ -53079,6 +53166,42 @@ self.addEventListener('fetch', e => {
         }
       }
 
+      // Conflict guard -- this endpoint used to always blindly overwrite
+      // creatorsync:{username} with whatever this request's snapshot was,
+      // no matter how stale. Two tabs/devices autosaving around the same
+      // time meant whichever PUT landed last in KV won completely, silently
+      // discarding the other one's edits with no error anywhere.
+      //
+      // An updated client now sends expectedUpdatedAt: the updatedAt it
+      // last actually saw (from a prior /sync/load or /sync/save response)
+      // -- i.e. the version its current edits are built on top of. If the
+      // record in KV has moved past that, another device saved in between;
+      // rather than clobber that write, this responds 409 and leaves KV
+      // untouched. The client's own pending edits aren't lost either: they
+      // stay in its DOM/localStorage and go up on the very next autosave,
+      // now against the correct baseline. An older client that doesn't
+      // send expectedUpdatedAt at all gets exactly its previous behavior
+      // (last-write-wins) -- this is purely additive, not a breaking
+      // change to the request shape.
+      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
+      if (expectedUpdatedAt !== null) {
+        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+        if (currentRaw) {
+          try {
+            const current = JSON.parse(currentRaw);
+            if (Number(current.updatedAt) > expectedUpdatedAt) {
+              // Purely for visibility -- this was previously invisible even
+              // to us; now it's at least countable on the admin dashboard.
+              ctx.waitUntil(bumpStat(env, "sync_conflict"));
+              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
+            }
+          } catch {
+            // Existing blob unreadable -- nothing coherent to protect
+            // against; fall through and write normally.
+          }
+        }
+      }
+
       const blob = {
         config: Array.isArray(body.config) ? body.config : [],
         keys: body.keys && typeof body.keys === "object" ? body.keys : {},
@@ -53107,7 +53230,9 @@ self.addEventListener('fetch', e => {
         // never the problem.
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // updatedAt lets the client advance its own baseline without a
+      // separate /sync/meta round trip -- see expectedUpdatedAt above.
+      return json({ ok: true, updatedAt: blob.updatedAt });
     }
 
     // /api/creator/sync/save-tracking  (POST)  { creatorName, creatorKey,
@@ -54621,6 +54746,35 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, results });
     }
 
+    // /admin/api/rebuild-public-index  (POST) -> { ok, count, ms }
+    // Forces an immediate, synchronous rebuild of index:publiclists (see
+    // getPublicListIndex/rebuildPublicListIndex, 02_http-and-creator-
+    // utils.js) instead of waiting for it to happen lazily. Without this,
+    // a fresh deployment -- or the index key being lost some other way --
+    // serves every visitor of /lists/public.json and list search a
+    // truncated, lexicographically-biased result (capped at 150/250/80
+    // keys) for however long the lazy background rebuild takes to finish,
+    // which scales with how many lists exist. scheduled() below also
+    // triggers this same rebuild automatically whenever the index is
+    // found missing (self-healing within one cron interval even with no
+    // admin action), so this endpoint is for an immediate, verifiable
+    // seed right after a fresh deploy rather than the only way it happens.
+    // Safe to run any time, repeatedly -- it's the exact same full rebuild
+    // the lazy/cron paths already do, just awaited here instead of
+    // deferred.
+    if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      const started = Date.now();
+      try {
+        const entries = await rebuildPublicListIndex(env);
+        return json({ ok: true, count: (entries || []).length, ms: Date.now() - started });
+      } catch (e) {
+        return json({ ok: false, error: "Rebuild failed: " + (e && e.message ? e.message : String(e)) }, 500);
+      }
+    }
+
     // /admin/api/migrate-day-counts  (POST) -> { ok, done, keysMigratedThisCall }
     // One-time migration for the switch (see recordTrackedEvent's own
     // comment) from one KV key per (eventType/query, id, day) to one JSON
@@ -55128,6 +55282,35 @@ self.addEventListener('fetch', e => {
           { status: 500, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
         );
       }
+      // Every other credential-bearing endpoint in this app (creator
+      // create/restore/reset-key) rate-limits guesses by IP -- this one
+      // never did, despite guarding the one secret that can rotate any
+      // creator's key via /admin/api/reset-creator-key with no other
+      // verification. Same pattern as /api/creator/restore: a per-IP
+      // counter with a 60s window. Skipped entirely (not failed closed)
+      // when CONFIGS isn't bound, matching every other KV-optional
+      // feature in this app -- login by ADMIN_KEY alone still works.
+      // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
+      // missing, same as restore, because there is no other safe
+      // per-client identity to key a shared bucket on.
+      if (env.CONFIGS) {
+        const ip = clientIpKey(request);
+        if (!ip) {
+          return new Response(renderAdminLoginPage("Could not process this request."), {
+            status: 400,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        const rateLimitKey = `ratelimit:adminlogin:${ip}`;
+        const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
+        if (attempts >= 10) {
+          return new Response(renderAdminLoginPage("Too many attempts. Please wait a minute and try again."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
+        await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+      }
       let submittedKey = "";
       try {
         const form = await request.formData();
@@ -55277,6 +55460,17 @@ export default {
       Promise.all([
         checkForNewEpisodes(env),
         prewarmSharedCatalogs(env, ctx),
+        // Cheap when index:publiclists already exists (one KV get, no-op).
+        // When it doesn't -- a fresh deployment, or the index key lost
+        // some other way -- this is what keeps a self-hoster who never
+        // visits /admin from serving every visitor a truncated,
+        // lexicographically-biased directory/search result indefinitely:
+        // it self-heals within one cron interval instead of only on
+        // whichever live request happens to hit the cold index first. See
+        // getPublicListIndex's own comment; /admin/api/rebuild-public-index
+        // does the same rebuild on demand, synchronously, for an
+        // immediate/verifiable seed right after a fresh deploy.
+        getPublicListIndex(env, ctx),
       ])
     );
   },

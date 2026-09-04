@@ -1,6 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { call, createUser, makeD1, makeEnv, makeKv, nextIp } from "./harness.mjs";
+import { call, createUser, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
+
+async function adminCookie(env) {
+  const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
+  const setCookie = r.headers.get("set-cookie") || "";
+  const match = setCookie.match(/^([^=]+=[^;]+)/);
+  return match ? match[1] : "";
+}
 
 const CREATOR_POSTS = [
   "/api/creator/lists",
@@ -39,6 +46,7 @@ const ADMIN_POSTS = [
   "/admin/api/feedback/status",
   "/admin/api/feedback/edit",
   "/admin/api/feedback/delete",
+  "/admin/api/rebuild-public-index",
 ];
 
 describe("authorization matrix", () => {
@@ -393,6 +401,54 @@ describe("directory pagination", () => {
     assert.equal(second.body.total, n, `expected total ${n}, got ${second.body.total}`);
     assert.equal(second.body.lists.length, n);
   });
+
+  it("/admin/api/rebuild-public-index seeds a cold index synchronously", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    // Seeded directly into KV (bypassing the save endpoint, so the
+    // incremental index update never ran) to simulate a genuinely cold
+    // index -- a fresh deploy, or the index key lost some other way.
+    const n = 12;
+    for (let i = 0; i < n; i++) {
+      await kv.put(`creatorlist:idxuser:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    assert.equal(await kv.get("index:publiclists"), null);
+
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.count, n);
+    assert.notEqual(await kv.get("index:publiclists"), null);
+
+    // Now served straight from the index, no bounded-scan fallback needed.
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+  });
+
+  it("scheduled() self-heals a missing index without any admin action", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const n = 7;
+    for (let i = 0; i < n; i++) {
+      await kv.put(`creatorlist:cronuser:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    assert.equal(await kv.get("index:publiclists"), null);
+
+    const pending = [];
+    const ctx = { waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); } };
+    await worker.scheduled({}, env, ctx);
+    await Promise.all(pending);
+
+    assert.notEqual(await kv.get("index:publiclists"), null);
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+  });
 });
 
 describe("likes and preview guards", () => {
@@ -445,6 +501,156 @@ describe("likes and preview guards", () => {
     });
     assert.equal(r.status, 400);
     assert.equal(r.body.ok, false);
+  });
+
+  it("poster-badge rejects a non-allowlisted poster host (was an open redirect / SSRF)", async () => {
+    const env = makeEnv();
+    // No badge params: used to be Response.redirect(posterUrl) -- an open
+    // redirect off this domain to whatever host the caller named.
+    const redirectCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/phish"));
+    assert.equal(redirectCase.status, 404);
+    // A badge param present: used to fetch(posterUrl) server-side and
+    // embed the response in the SVG returned -- an SSRF/open image proxy.
+    const fetchCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/x") + "&airDate=2099-01-01");
+    assert.equal(fetchCase.status, 404);
+  });
+
+  it("a vote survives a concurrent write racing its own PUT (applyLikeVote retry)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicerace");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        name: "RaceList",
+        type: "movie",
+        visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const slug = saved.body.slug;
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${slug}`;
+
+    // Simulate another request's write landing between this vote's PUT and
+    // its verification read: the very first time applyLikeVote writes to
+    // this ledger key, immediately clobber it with a snapshot that does
+    // NOT include this voter -- exactly the lost-update race a plain
+    // read-modify-write would silently lose to.
+    let injected = false;
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    env.CONFIGS.put = async (key, value) => {
+      await realPut(key, value);
+      if (key === ledgerKey && !injected) {
+        injected = true;
+        await realPut(key, JSON.stringify(["a:racing-voter"]));
+      }
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug },
+    });
+    assert.equal(injected, true);
+    assert.equal(r.body.ok, true);
+    // Both this vote and the "racing" one must be reflected -- not just
+    // whichever write happened to land last.
+    assert.equal(r.body.likes, 2);
+    const finalVoters = JSON.parse(await env.CONFIGS.get(ledgerKey));
+    assert.equal(finalVoters.length, 2);
+    assert.ok(finalVoters.includes("a:racing-voter"));
+  });
+});
+
+describe("admin login", () => {
+  it("rate-limits repeated wrong-key attempts from the same IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+    }
+    assert.equal(last.status, 429);
+  });
+
+  it("does not share the rate-limit bucket across different IPs", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "wrong-key" } });
+    assert.equal(r.status, 401);
+  });
+});
+
+describe("sync conflict guard", () => {
+  it("rejects a stale expectedUpdatedAt instead of silently overwriting a newer save", async () => {
+    const env = makeEnv();
+    const bob = await createUser(env, "bobsync");
+
+    const first = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey, config: [{ id: "a", name: "A", url: "https://x" }] },
+    });
+    assert.equal(first.body.ok, true);
+    assert.equal(typeof first.body.updatedAt, "number");
+    const firstUpdatedAt = first.body.updatedAt;
+
+    // Force the clock forward a tick so the "second device" gets a
+    // strictly later updatedAt than the first save.
+    await new Promise((r) => setTimeout(r, 2));
+
+    // "Device B" saves, built on top of the same baseline as device A.
+    const second = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "b", name: "B", url: "https://y" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(second.body.ok, true);
+    const secondUpdatedAt = second.body.updatedAt;
+    assert.ok(secondUpdatedAt > firstUpdatedAt);
+
+    // "Device A", still holding the stale baseline, tries to save next --
+    // must not clobber device B's newer write.
+    const staleAttempt = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "a-edited", name: "A edited", url: "https://x" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(staleAttempt.status, 409);
+    assert.equal(staleAttempt.body.ok, false);
+    assert.equal(staleAttempt.body.conflict, true);
+
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "b");
+    assert.equal(loaded.body.data.updatedAt, secondUpdatedAt);
+  });
+
+  it("a save with no expectedUpdatedAt (older client) keeps the previous last-write-wins behavior", async () => {
+    const env = makeEnv();
+    const carol = await createUser(env, "carolsync");
+    await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "x", name: "X", url: "https://x" }] },
+    });
+    const overwrite = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "y", name: "Y", url: "https://y" }] },
+    });
+    assert.equal(overwrite.body.ok, true);
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "y");
   });
 });
 
