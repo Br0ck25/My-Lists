@@ -756,6 +756,120 @@ describe("audit fix: the public list index rebuilds at any scale", () => {
   });
 });
 
+// /api/creator/reset-key hands back a brand-new working Creator Key on a
+// correct recovery answer, so that answer is a second credential for full
+// account takeover -- and unlike the ~60-bit key it is free text a human
+// picked, lowercased before hashing. It was throttled per IP only, which
+// throttles the wrong dimension entirely: rotating source addresses is free,
+// the account being attacked cannot be swapped out. Rotating IPs took over a
+// test account in five guesses.
+describe("audit fix: recovery answers are throttled per account, not just per IP", () => {
+  // The attack verbatim: a new source IP on every single guess.
+  async function guessWithRotatingIps(env, username, answers) {
+    for (let i = 0; i < answers.length; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST",
+        ip: nextIp(),
+        json: { username, recoveryAnswer: answers[i] },
+      });
+      if (r.body && r.body.ok) return { tookOver: true, atGuess: i + 1 };
+    }
+    return { tookOver: false };
+  }
+  const wrongThenRight = (correct, wrongCount) =>
+    Array.from({ length: wrongCount }, (_, i) => `wrong-answer-${i}`).concat([correct]);
+
+  // Run against both stores. The D1 path is not redundant: it takes a
+  // different code path (an atomic upsert instead of a KV read-modify-write),
+  // and the first version of this throttle counted nothing at all there
+  // while passing on KV, because its hand-written INSERT used a statement
+  // shape d1BumpStat does not.
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`blocks a rotating-IP takeover (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "victimacct", { recoveryAnswer: "fluffy-the-cat" });
+      const res = await guessWithRotatingIps(env, "victimacct", wrongThenRight("fluffy-the-cat", 20));
+      assert.equal(res.tookOver, false, `account taken over on guess #${res.atGuess} despite the per-account budget`);
+    });
+
+    it(`still lets the real owner in, before and after honest typos (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "goodacct", { recoveryAnswer: "correct-horse-battery" });
+      const first = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "goodacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(first.body.ok, true, "a correct answer must work first time");
+
+      // A few genuine typos must not lock the owner out, and succeeding must
+      // not spend the budget that protects them.
+      const env2 = makeEnv(makeStores());
+      await createUser(env2, "typoacct", { recoveryAnswer: "correct-horse-battery" });
+      await guessWithRotatingIps(env2, "typoacct", ["nope-one", "nope-two", "nope-three"]);
+      const late = await call(env2, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "typoacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(late.body.ok, true, `locked out after honest typos: ${late.body.error}`);
+    });
+  }
+
+  it("one account's budget cannot be spent by guesses at another", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await createUser(env, "targetacct", { recoveryAnswer: "correct-horse-battery" });
+    await createUser(env, "bystanderacct", { recoveryAnswer: "different-answer-here" });
+    await guessWithRotatingIps(env, "targetacct", wrongThenRight("nope", 12));
+    // Exhausting one account must leave every other account untouched...
+    const other = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(),
+      json: { username: "bystanderacct", recoveryAnswer: "different-answer-here" },
+    });
+    assert.equal(other.body.ok, true, "an unrelated account was locked out too");
+  });
+
+  it("guesses at a username that does not exist never mint a budget", async () => {
+    // Unknown names must not create per-account counters -- otherwise anyone
+    // can grow that keyspace for free by guessing at names at random.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    for (let i = 0; i < 8; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: `ghostacct${i}`, recoveryAnswer: "whatever-here" },
+      });
+      assert.equal(r.body.ok, false);
+    }
+    const minted = [...kv._store.keys()].filter((k) => k.startsWith("authfail:"));
+    assert.deepEqual(minted, [], `unknown usernames minted counters: ${minted.join(", ")}`);
+  });
+
+  it("requires a recovery answer long enough to be worth having", async () => {
+    const env = makeEnv();
+    const short = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "shortanswer", recoveryAnswer: "cat" },
+    });
+    assert.equal(short.body.ok, false, "a 3-character recovery answer was accepted");
+    assert.equal(short.status, 400);
+
+    const long = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "longanswer", recoveryAnswer: "my-first-pet-was-rex" },
+    });
+    assert.equal(long.body.ok, true, long.body.error);
+
+    // It stays optional -- this must not become a required field.
+    const none = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "noanswer" },
+    });
+    assert.equal(none.body.ok, true, none.body.error);
+  });
+});
+
 describe("likes and preview guards", () => {
   it("rejects like-external URLs off the provider allowlist", async () => {
     const env = makeEnv();

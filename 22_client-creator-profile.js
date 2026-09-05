@@ -2357,8 +2357,8 @@ function openCreateProfileModal() {
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
-    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
-    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional, 8+ characters)" minlength="8"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -2375,6 +2375,14 @@ async function submitCreateProfile() {
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
+    return;
+  }
+  // Mirrors the server's RECOVERY_ANSWER_MIN_LENGTH check so a too-short
+  // answer is caught here, next to the field, instead of coming back as a
+  // server error after the round trip. The server still enforces it -- this
+  // is the message, not the guard.
+  if (recoveryAnswer && recoveryAnswer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
   try {

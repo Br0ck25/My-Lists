@@ -1242,6 +1242,74 @@ async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 
   return false;
 }
 
+// --- Per-account authentication failure budget -------------------------------
+//
+// consumeRateLimit above counts per IP, which is the right dimension for
+// abuse of an expensive endpoint and the wrong one for guessing one
+// account's secret: IPs are cheap and rotate, the account under attack does
+// not. /api/creator/reset-key needs both, because the secret it checks is a
+// recovery answer -- see RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+//
+// Counted per account per day and only on FAILURES, so someone who answers
+// correctly never spends their own budget, and a locked-out account frees
+// itself the next day rather than needing an admin.
+//
+// D1's upsert is atomic, so when it is bound a burst of concurrent guesses
+// cannot all read the same pre-increment value. KV cannot promise that (its
+// reads are edge-cached for up to a minute), so the KV path is looser -- but
+// that is a one-minute window against a 24-hour bucket, which bounds a burst
+// instead of leaving guesses unlimited the way having no per-account counter
+// at all did. Same "D1 when bound, KV otherwise" split as the counters.
+//
+// The KV copies expire on their own via expirationTtl. The D1 rows do not --
+// they are one row per (account that was guessed at, day), only ever read
+// for the current day, so old ones are inert rather than harmful. Worth a
+// sweep eventually if a deployment is attacked persistently; not worth a
+// migration today.
+const AUTH_FAIL_TTL_SEC = 86400;
+
+async function readAuthFailureCount(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(`authfail:${scope}`, day).all();
+      // The query SUCCEEDED, so no row means no failures yet. Deliberately
+      // not readStatCount's "no row -> fall through to KV" rule: that exists
+      // because a missing counter row can mean "not migrated yet", and
+      // applying it here would reset the failure count on every attempt.
+      return results && results.length ? (Number(results[0].n) || 0) : 0;
+    } catch {
+      // Table missing (migration 0002 not applied) or D1 unavailable --
+      // fall through to KV, which is also where the writes will land.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  return parseInt(await env.CONFIGS.get(`authfail:${scope}:${day}`), 10) || 0;
+}
+
+async function noteAuthFailure(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      // d1BumpStat, not a hand-written INSERT. Its statement shape --
+      // VALUES (?, ?, ?) with DO UPDATE SET n = n + excluded.n -- is the one
+      // every other counter here uses, and it is the atomic part. Writing a
+      // near-miss variant of it by hand (DO UPDATE SET n = n + 1, with the
+      // amount inlined rather than bound) is exactly how this throttle
+      // silently counted nothing at all on D1-bound deployments the first
+      // time it was written.
+      await d1BumpStat(env, `authfail:${scope}`, [day], 1);
+      return;
+    } catch {
+      // Same fallback as the read above, so both halves stay on one store.
+    }
+  }
+  if (!env || !env.CONFIGS) return;
+  const key = `authfail:${scope}:${day}`;
+  const n = parseInt(await env.CONFIGS.get(key), 10) || 0;
+  await env.CONFIGS.put(key, String(n + 1), { expirationTtl: AUTH_FAIL_TTL_SEC });
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
   const ip = clientIpKey(request);

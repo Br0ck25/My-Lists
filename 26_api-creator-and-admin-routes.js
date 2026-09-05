@@ -1109,6 +1109,20 @@
       // self-service reset (/api/creator/reset-key) is the only thing
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      // Optional -- but if one is given it has to be long enough to be worth
+      // hashing. It is lowercased before hashing and it can replace the
+      // Creator Key outright via /api/creator/reset-key, so a three-character
+      // answer is a three-character password on the whole account. Rejected
+      // rather than silently accepted, since the person setting it is the
+      // only one who can pick a better one. Existing short answers are
+      // untouched; the per-account failure budget on reset-key is what
+      // protects those.
+      if (recoveryAnswerRaw && recoveryAnswerRaw.length < RECOVERY_ANSWER_MIN_LENGTH) {
+        return json({
+          ok: false,
+          error: `Recovery Answer must be at least ${RECOVERY_ANSWER_MIN_LENGTH} characters -- it can reset your key, so treat it like a password.`,
+        }, 400);
+      }
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
@@ -1200,8 +1214,33 @@
         return json({ ok: false, error: genericError });
       }
       if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+
+      // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
+      // counter alone did not defend this endpoint at all: rotating source
+      // addresses is free, so it bought an attacker unlimited guesses at one
+      // account's recovery answer -- a secret weak enough to fall in a
+      // handful of tries, in exchange for a working Creator Key. See
+      // RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+      //
+      // Checked here, after the profile is known to exist and to have a
+      // recovery answer set, so a wrong or unknown username can never spend
+      // (or create a counter for) an account budget. Still before the
+      // PBKDF2 verification below, so a throttled attempt costs nothing.
+      const resetDay = statsToday();
+      const resetScope = `reset:${v.normalized}`;
+      if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
+        // Same generic message as every other failure path here, so this
+        // does not become a way to ask whether an account exists.
+        return json({ ok: false, error: genericError });
+      }
+
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
-      if (!matches) return json({ ok: false, error: genericError });
+      if (!matches) {
+        // Failures only: answering correctly must never consume the budget
+        // that protects you.
+        await noteAuthFailure(env, resetScope, resetDay);
+        return json({ ok: false, error: genericError });
+      }
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);

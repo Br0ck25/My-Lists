@@ -74,6 +74,29 @@ const MIGRATE_D1_PAGE = 200;
 // admin panel, so they need a ceiling of their own.
 const MIGRATE_D1_ERROR_CAP = 50;
 
+// --- Recovery-answer strength and throttle ----------------------------------
+//
+// A Creator Key is ~60 bits of entropy and infeasible to guess. The optional
+// recovery answer that can REPLACE it via /api/creator/reset-key is not: it
+// is free text a human picks, usually the answer to an implicit security
+// question, and it is lowercased before hashing. That endpoint hands back a
+// brand-new working key on a match, so the recovery answer is a second,
+// far weaker credential for full account takeover.
+//
+// It used to be throttled by IP alone (10/day). IPs are cheap and rotate;
+// the account being attacked does not. Rotating source IPs took over a test
+// account in five guesses. Two things follow from that:
+//
+//   * the throttle has to count per ACCOUNT, not just per source, so the
+//     budget an attacker is spending belongs to the thing being attacked;
+//   * the answer needs a floor on its length, because no rate limit rescues
+//     a secret with a handful of plausible values.
+//
+// Only the per-account failure budget defends existing accounts, so it is
+// the load-bearing half. The minimum length applies to newly set answers.
+const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
+const RECOVERY_ANSWER_MIN_LENGTH = 8;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

@@ -124,6 +124,29 @@ const MIGRATE_D1_PAGE = 200;
 // admin panel, so they need a ceiling of their own.
 const MIGRATE_D1_ERROR_CAP = 50;
 
+// --- Recovery-answer strength and throttle ----------------------------------
+//
+// A Creator Key is ~60 bits of entropy and infeasible to guess. The optional
+// recovery answer that can REPLACE it via /api/creator/reset-key is not: it
+// is free text a human picks, usually the answer to an implicit security
+// question, and it is lowercased before hashing. That endpoint hands back a
+// brand-new working key on a match, so the recovery answer is a second,
+// far weaker credential for full account takeover.
+//
+// It used to be throttled by IP alone (10/day). IPs are cheap and rotate;
+// the account being attacked does not. Rotating source IPs took over a test
+// account in five guesses. Two things follow from that:
+//
+//   * the throttle has to count per ACCOUNT, not just per source, so the
+//     budget an attacker is spending belongs to the thing being attacked;
+//   * the answer needs a floor on its length, because no rate limit rescues
+//     a secret with a handful of plausible values.
+//
+// Only the per-account failure budget defends existing accounts, so it is
+// the load-bearing half. The minimum length applies to newly set answers.
+const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
+const RECOVERY_ANSWER_MIN_LENGTH = 8;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -2823,6 +2846,74 @@ async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
   else await write;
   return false;
+}
+
+// --- Per-account authentication failure budget -------------------------------
+//
+// consumeRateLimit above counts per IP, which is the right dimension for
+// abuse of an expensive endpoint and the wrong one for guessing one
+// account's secret: IPs are cheap and rotate, the account under attack does
+// not. /api/creator/reset-key needs both, because the secret it checks is a
+// recovery answer -- see RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+//
+// Counted per account per day and only on FAILURES, so someone who answers
+// correctly never spends their own budget, and a locked-out account frees
+// itself the next day rather than needing an admin.
+//
+// D1's upsert is atomic, so when it is bound a burst of concurrent guesses
+// cannot all read the same pre-increment value. KV cannot promise that (its
+// reads are edge-cached for up to a minute), so the KV path is looser -- but
+// that is a one-minute window against a 24-hour bucket, which bounds a burst
+// instead of leaving guesses unlimited the way having no per-account counter
+// at all did. Same "D1 when bound, KV otherwise" split as the counters.
+//
+// The KV copies expire on their own via expirationTtl. The D1 rows do not --
+// they are one row per (account that was guessed at, day), only ever read
+// for the current day, so old ones are inert rather than harmful. Worth a
+// sweep eventually if a deployment is attacked persistently; not worth a
+// migration today.
+const AUTH_FAIL_TTL_SEC = 86400;
+
+async function readAuthFailureCount(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(`authfail:${scope}`, day).all();
+      // The query SUCCEEDED, so no row means no failures yet. Deliberately
+      // not readStatCount's "no row -> fall through to KV" rule: that exists
+      // because a missing counter row can mean "not migrated yet", and
+      // applying it here would reset the failure count on every attempt.
+      return results && results.length ? (Number(results[0].n) || 0) : 0;
+    } catch {
+      // Table missing (migration 0002 not applied) or D1 unavailable --
+      // fall through to KV, which is also where the writes will land.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  return parseInt(await env.CONFIGS.get(`authfail:${scope}:${day}`), 10) || 0;
+}
+
+async function noteAuthFailure(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      // d1BumpStat, not a hand-written INSERT. Its statement shape --
+      // VALUES (?, ?, ?) with DO UPDATE SET n = n + excluded.n -- is the one
+      // every other counter here uses, and it is the atomic part. Writing a
+      // near-miss variant of it by hand (DO UPDATE SET n = n + 1, with the
+      // amount inlined rather than bound) is exactly how this throttle
+      // silently counted nothing at all on D1-bound deployments the first
+      // time it was written.
+      await d1BumpStat(env, `authfail:${scope}`, [day], 1);
+      return;
+    } catch {
+      // Same fallback as the read above, so both halves stay on one store.
+    }
+  }
+  if (!env || !env.CONFIGS) return;
+  const key = `authfail:${scope}:${day}`;
+  const n = parseInt(await env.CONFIGS.get(key), 10) || 0;
+  await env.CONFIGS.put(key, String(n + 1), { expirationTtl: AUTH_FAIL_TTL_SEC });
 }
 
 async function likeVoterId(request, env, creatorUsername, scopeId) {
@@ -38354,8 +38445,8 @@ function openCreateProfileModal() {
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
-    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
-    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional, 8+ characters)" minlength="8"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -38372,6 +38463,14 @@ async function submitCreateProfile() {
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
+    return;
+  }
+  // Mirrors the server's RECOVERY_ANSWER_MIN_LENGTH check so a too-short
+  // answer is caught here, next to the field, instead of coming back as a
+  // server error after the round trip. The server still enforces it -- this
+  // is the message, not the guard.
+  if (recoveryAnswer && recoveryAnswer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
   try {
@@ -53788,6 +53887,20 @@ self.addEventListener('fetch', e => {
       // self-service reset (/api/creator/reset-key) is the only thing
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      // Optional -- but if one is given it has to be long enough to be worth
+      // hashing. It is lowercased before hashing and it can replace the
+      // Creator Key outright via /api/creator/reset-key, so a three-character
+      // answer is a three-character password on the whole account. Rejected
+      // rather than silently accepted, since the person setting it is the
+      // only one who can pick a better one. Existing short answers are
+      // untouched; the per-account failure budget on reset-key is what
+      // protects those.
+      if (recoveryAnswerRaw && recoveryAnswerRaw.length < RECOVERY_ANSWER_MIN_LENGTH) {
+        return json({
+          ok: false,
+          error: `Recovery Answer must be at least ${RECOVERY_ANSWER_MIN_LENGTH} characters -- it can reset your key, so treat it like a password.`,
+        }, 400);
+      }
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
@@ -53879,8 +53992,33 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: genericError });
       }
       if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+
+      // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
+      // counter alone did not defend this endpoint at all: rotating source
+      // addresses is free, so it bought an attacker unlimited guesses at one
+      // account's recovery answer -- a secret weak enough to fall in a
+      // handful of tries, in exchange for a working Creator Key. See
+      // RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+      //
+      // Checked here, after the profile is known to exist and to have a
+      // recovery answer set, so a wrong or unknown username can never spend
+      // (or create a counter for) an account budget. Still before the
+      // PBKDF2 verification below, so a throttled attempt costs nothing.
+      const resetDay = statsToday();
+      const resetScope = `reset:${v.normalized}`;
+      if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
+        // Same generic message as every other failure path here, so this
+        // does not become a way to ask whether an account exists.
+        return json({ ok: false, error: genericError });
+      }
+
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
-      if (!matches) return json({ ok: false, error: genericError });
+      if (!matches) {
+        // Failures only: answering correctly must never consume the budget
+        // that protects you.
+        await noteAuthFailure(env, resetScope, resetDay);
+        return json({ ok: false, error: genericError });
+      }
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);

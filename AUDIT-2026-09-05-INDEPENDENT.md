@@ -10,7 +10,8 @@ in-memory Worker harness with instrumented KV → targeted exploit probes.
 
 ## Executive Summary
 
-**Overall rating: READY WITH FIXES**
+**Overall rating: READY WITH FIXES** — both Phase 1 blockers have since been fixed and verified;
+see the Resolution notes on findings 1 and 2. What remains is Phase 2 and below.
 
 The codebase is in good shape and has clearly been engineered with care. Authentication is sound
 (PBKDF2 with per-credential salt, constant-time compare, uniform anti-enumeration errors), cross-user
@@ -170,6 +171,7 @@ code.
 | **Confidence** | Confirmed by execution |
 | **File** | `26_api-creator-and-admin-routes.js` |
 | **Function** | `/api/creator/reset-key` (line 1168); answer set at line 1111 |
+| **Status** | **FIXED** — see "Resolution" at the end of this finding |
 
 **Problem.** The endpoint accepts `{ username, recoveryAnswer }` and, on a match, returns a brand-new
 working Creator Key — full account takeover. The only throttle is `resetkeyrate:{ip}:{day}`, **10 per
@@ -214,6 +216,46 @@ prefer the D1 atomic-upsert path already used by `d1BumpStat` when `env.DB` is b
 
 **Test.** 6 failed resets against one username from 6 different IPs; assert the 6th is rejected even
 with the correct answer, and that a different username is unaffected.
+
+### Resolution (applied)
+
+Two changes, of which the first is the load-bearing one:
+
+1. **Per-account failure budget** (`RESET_KEY_ACCOUNT_MAX_FAILURES = 5`/day), on top of the existing
+   per-IP counter. Counted on failures only, so answering correctly never spends the budget that
+   protects you, and a locked account frees itself the next day without an admin. Checked *after* the
+   profile is known to exist and to have a recovery answer — so a wrong or unknown username can never
+   spend, or create, an account budget — and *before* the PBKDF2 verify, so a throttled attempt is
+   free. The response is the same generic message as every other failure path, preserving the
+   endpoint's anti-enumeration property.
+2. **Entropy floor** (`RECOVERY_ANSWER_MIN_LENGTH = 8`) on newly set answers, enforced server-side
+   and mirrored in the create-profile modal so the message lands next to the field. The answer stays
+   optional. Existing short answers are untouched — the per-account budget is what protects those.
+
+Uses D1's atomic upsert via the existing `d1BumpStat` when `env.DB` is bound, falling back to KV
+otherwise, so the counter cannot be lost to a concurrent burst on deployments that have D1. Rows are
+namespaced `authfail:reset:{username}` with a dated bucket, so they can never surface in the admin
+dashboard (its only prefix query filters `day = 'total'`).
+
+**A bug found by testing the fix, not by reading it.** The first version hand-wrote its D1 statement
+as `... DO UPDATE SET n = n + 1` with the amount inlined rather than bound. That is a near-miss of the
+shape every other counter uses, and it meant the throttle **counted nothing at all on D1-bound
+deployments** — the takeover still succeeded on guess #21 — while passing on KV. Re-running the
+original exploit against both stores caught it; it now calls `d1BumpStat` directly. The regression
+suite runs the takeover against **both** stores for exactly this reason.
+
+Verified after the change — the original attack, a new source IP on every guess:
+
+| | Before | After (KV) | After (D1) |
+|---|---|---|---|
+| Rotating-IP takeover | **succeeded, guess #5** | blocked | blocked |
+| Legitimate owner, first try | works | works | works |
+| Owner after 3 honest typos | works | works | works |
+| Unrelated account | unaffected | unaffected | unaffected |
+| 3-char answer at signup | accepted | rejected | rejected |
+
+Seven regression tests added; the three that assert the fix were confirmed failing against the
+pre-fix code. Full suite: 121/121, `verify.sh` green.
 
 ---
 
@@ -738,7 +780,7 @@ byte-exact concatenation, CI-gated against drift.
 - 🟡 `/api/save:5390`, `/api/publish-list:5463` — add `expirationTtl` or a sweep for records nothing references. **(M4)**
 
 ### `26_api-creator-and-admin-routes.js`
-- 🔴 `/api/creator/reset-key:1168` — add a per-account failure counter; enforce answer entropy at `:1111`. **(2)**
+- ✅ `/api/creator/reset-key:1168` — **DONE.** Per-account failure budget (D1-atomic when bound) plus an entropy floor at `:1111`. **(2)**
 - 🟡 `handleMediaServerScrobble:473` — introduce a scoped, revocable scrobble token. **(8)**
 - 🔵 `scheduled:4128` — assign the API-key globals as `handleFetch` does. **(13)**
 - 🔵 `:1144` — `stats:creator_count` loses increments on the KV path. **(14)**
@@ -765,7 +807,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🔴 PHASE 1 — MUST FIX BEFORE PRODUCTION**
 1. ~~Bounded, resumable public-list index rebuild (finding 1)~~ — **DONE**
-2. Per-account throttle + answer entropy on `/api/creator/reset-key` (finding 2)
+2. ~~Per-account throttle + answer entropy on `/api/creator/reset-key`~~ — **DONE**
 3. ~~Apply the same chunking to `/admin/api/migrate-d1`~~ — **DONE**
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
@@ -843,8 +885,8 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 ## TOP 10 FIXES
 
 1. ~~**Bound and resume the public-list index rebuild**~~ — **DONE.** (Finding 1)
-2. **Per-account throttle on `/api/creator/reset-key`** — the only proven account-takeover path. (2)
-3. **Minimum entropy on recovery answers at creation** — the other half of 2.
+2. ~~**Per-account throttle on `/api/creator/reset-key`**~~ — **DONE.** (2)
+3. ~~**Minimum entropy on recovery answers at creation**~~ — **DONE.**
 4. **`generateShortId()` for feedback thread ids** — one-line change to a token already treated as a capability. (3)
 5. **Authorize `threadId` appends and stop trusting `senderName`.** (4)
 6. **Always rate-limit `/api/recommendations` and `/api/details/batch`.** (5)
