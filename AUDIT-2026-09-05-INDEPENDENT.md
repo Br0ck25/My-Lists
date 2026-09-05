@@ -739,10 +739,13 @@ all generated HTML as template literals — for every occurrence of each name. E
 
 Out of 770 top-level functions, that is a 2% dead rate — low, and no other candidates surfaced.
 
-**Documentation bloat (not code):** the repository root carries `AUDIT-2026-09.md`,
-`AUDIT-2026-09-05.md`, `AUDIT-STATUS.md`, `AUDIT-2026-09-05-STATUS.md`, `Changes.md` and
-`Changes - archive.md` — roughly 570 KB of overlapping historical markdown. Consider a `docs/history/`
-folder so the root shows current documentation only.
+**Documentation bloat (not code):** ✅ **done.** The root carried `docs/history/AUDIT-2026-09.md`,
+`docs/history/AUDIT-2026-09-05.md`, `docs/history/AUDIT-STATUS.md`, `docs/history/AUDIT-2026-09-05-STATUS.md` and `docs/history/Changes - archive.md` —
+528 KB of finished, overlapping markdown sitting next to the source, which made it genuinely hard to
+tell which document was current. All five now live in `docs/history/` with an index explaining what
+each one is. `Changes.md` stayed at the root: it is the *active* development log and the README's
+file tree documents it. `FUNCTION-MAP.md` stayed because `verify.sh`, `gen_map.py` and CI all
+reference it by that path, and `CHANGELOG.md` because that is where a changelog belongs.
 
 ---
 
@@ -951,7 +954,7 @@ byte-exact concatenation, CI-gated against drift.
 - ✅ **DONE.** Inline-handler resolution check added: 733 call sites, 183 functions, 0 unresolved.
 
 ### Repository root
-- 🔵 Move the 6 historical audit/changelog files (~570 KB) into `docs/history/`.
+- ✅ **DONE.** The 5 finished audit/archive files (528 KB) moved into `docs/history/`; the active `Changes.md`, `CHANGELOG.md` and the CI-referenced `FUNCTION-MAP.md` stayed.
 
 ---
 
@@ -972,7 +975,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🔵 PHASE 4 — OPTIONAL**
 ~~12. Delete 241 lines of dead code~~ — **DONE** · ~~13. Handler-resolution CI check~~ — **DONE** · ~~14. Cron global assignment~~ — **DONE** ·
-~~15. Double-escape fix~~ — **DONE** · 16. Docs reorganisation
+~~15. Double-escape fix~~ — **DONE** · ~~16. Docs reorganisation~~ — **DONE**
 
 ---
 
