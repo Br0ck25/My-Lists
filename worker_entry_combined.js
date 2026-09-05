@@ -62,6 +62,35 @@ const ADDON_NAME = "My Lists";
 // drift apart again.
 const CURATED_RECOMMENDATION_LIMIT = 40;
 
+// --- Bounds on the two unauthenticated permanent-KV-write endpoints ---------
+//
+// /api/publish-list and /api/save both accept a body from anyone at all and
+// store it under a KV key that nothing in this Worker ever expires or
+// deletes. Neither used to bound what it stored, so a single anonymous
+// request could park multiple megabytes in KV permanently, as many times as
+// it liked.
+//
+// These ceilings are set far above real usage on purpose -- the largest
+// genuine list observed in an account export was ~1,200 items, and a
+// realistic install config is tens of rows, not thousands. Anything over
+// these is rejected with a clear error rather than silently truncated:
+// quietly storing a shortened list or a shortened install config would
+// trade one bug for a worse, invisible one.
+const PUBLISHED_LIST_ITEMS_MAX = 10000;
+const PUBLISHED_LIST_NAME_MAX = 200;
+const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
+const SAVED_CONFIG_ENTRIES_MAX = 500;
+const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+
+// --- Bound on /api/bulk-resolve's fan-out ------------------------------------
+//
+// That endpoint issues up to two TMDB calls per item and always uses the
+// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
+// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
+// the request. Shared with the client so the chunk size it sends and the
+// size the server accepts cannot drift apart.
+const BULK_RESOLVE_ITEMS_MAX = 200;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -1655,6 +1684,56 @@ function jsonPublic(data, status = 200, extraHeaders = {}) {
   return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
+// Turns an exception into something safe to hand back to a caller, and logs
+// the original.
+//
+// Dozens of routes used to return `String(err.message || err)` verbatim.
+// That is not as bad as it sounds today -- every `throw` in this codebase
+// is deliberately status-only ("Trakt request failed (HTTP 401).") with no
+// URL or key in it, which is checked, and those messages are genuinely
+// useful: a 401 surfaced to the user is how they learn their own API key is
+// wrong. Blanking every one of them to "something went wrong" would be a
+// real regression in the product, not a security win.
+//
+// The problem is that it is one careless `throw new Error(someUrl)` away
+// from shipping an API key to the client, and /api/bulk-resolve already
+// states the rule for the whole file: "the message can carry upstream URLs
+// and internal detail that the caller has no business seeing."
+//
+// So this keeps the message and removes the parts that could ever carry a
+// secret -- any URL, any explicit key/token parameter, and any long opaque
+// token -- rather than choosing between useful and safe. The unredacted
+// error still goes to the log, where the operator can see it.
+function safeErrorMessage(err, fallback = "Something went wrong. Please try again.") {
+  try {
+    console.error("handled error:", err);
+  } catch {
+    // logging must never be the thing that throws
+  }
+  let msg = "";
+  try {
+    // Deliberately not `err.message || err`: an Error with an empty message
+    // would fall through to String(err) and surface the literal word
+    // "Error", which tells the caller nothing and looks like a bug.
+    if (err && typeof err.message === "string") msg = err.message;
+    else if (typeof err === "string") msg = err;
+    else if (err) msg = String(err);
+  } catch {
+    return fallback;
+  }
+  msg = msg.trim();
+  // String(someObject) gives "[object Object]" -- no better than the fallback.
+  if (!msg || msg === "[object Object]") return fallback;
+  msg = msg
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(/\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|key)\b\s*[=:]\s*\S+/gi, "$1=[redacted]")
+    // Anything long and opaque enough to be a credential, even unlabelled.
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+    .trim();
+  if (!msg) return fallback;
+  return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
+}
+
 // Detect whether a request is a top-level browser page load (someone tapping
 // "Configure" and being sent to the manifest URL) vs. a JSON fetch by wako/
 // Stremio itself. We check two independent signals and trust either one:
@@ -2466,7 +2545,10 @@ async function fetchWithPerUserCacheUncoalesced({
   }
 
   try {
-    const freshData = await fetchFn();
+    // Bounded, so a provider that hangs rather than failing still reaches
+    // the fallback tiers below instead of holding the request open -- see
+    // withTimeout's own comment.
+    const freshData = await withTimeout(fetchFn(), OUTBOUND_TIMEOUT_MS, providerLabel);
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
       
@@ -2528,8 +2610,73 @@ async function fetchWithPerUserCacheUncoalesced({
   return null;
 }
 
+// --- Outbound request timeouts -----------------------------------------------
+//
+// Nothing in this add-on used to bound how long a provider could take. The
+// multi-tier fallback in fetchWithPerUserCacheUncoalesced above (memory ->
+// KV -> edge cache -> stale) is good, but it only ever fires on a
+// REJECTION: a provider that accepts the connection and then never
+// responds produced no rejection at all, so the request simply hung and
+// the stale data sitting right there was never served.
+//
+// Two places are enough to cover essentially every outbound call, rather
+// than editing ~135 individual fetch() sites:
+//   * fetchWithTimeout, used by the shared retry helper below, aborts the
+//     underlying request.
+//   * withTimeout, wrapped around the circuit breaker's fetchFn, turns a
+//     hang into the rejection the fallback tiers already know how to
+//     handle -- so a stalled provider now degrades to last-known-good data
+//     instead of a spinner.
+//
+// 10s is chosen against what the callers are: catalog and metadata reads
+// that a Stremio/wako client is actively waiting on. A provider that has
+// not answered in ten seconds is not about to make the request feel fast;
+// serving slightly stale data is strictly better than holding the
+// connection open.
+const OUTBOUND_TIMEOUT_MS = 10000;
+
+// AbortSignal.timeout exists in the Workers runtime, but this also runs
+// inside render_check.js's sandbox (which deliberately provides a minimal
+// global set) and in tests that stub fetch -- so the capability is probed
+// rather than assumed, and its absence just means no signal.
+function timeoutSignal(ms) {
+  try {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return AbortSignal.timeout(ms);
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+async function fetchWithTimeout(url, options = {}, ms = OUTBOUND_TIMEOUT_MS) {
+  // A caller that already manages its own signal keeps it.
+  if (options && options.signal) return fetch(url, options);
+  const signal = timeoutSignal(ms);
+  return fetch(url, signal ? { ...options, signal } : options);
+}
+
+// Rejects if `promise` has not settled within `ms`. Used where the work is
+// a caller-supplied closure rather than a single fetch (see the circuit
+// breaker's fetchFn), so an AbortSignal cannot be threaded in directly.
+// The underlying request is not cancelled here -- the point is to stop
+// WAITING on it, so the fallback tiers can serve.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label || "Upstream"} did not respond within ${ms}ms`)),
+      ms
+    );
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 async function fetchTraktWithRetry(url, options = {}, retries = 2) {
-  let res = await fetch(url, options);
+  let res = await fetchWithTimeout(url, options);
   if (res.status === 429 && retries > 0) {
     const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
     const jitter = Math.floor(Math.random() * 500);
@@ -2617,6 +2764,32 @@ function clientIpKey(request) {
     return prefix.join(":") + "::/64";
   }
   return ip.toLowerCase();
+}
+
+// --- Shared per-IP rate limiter --------------------------------------------
+//
+// The same IP-keyed 60-second KV slot /api/preview, /api/creator/create,
+// /api/creator/restore and /admin/login each grew their own copy of. Pulled
+// out because the endpoints that spend THIS Worker owner's provider quota
+// (rather than the caller's own key) all need it and all want it to behave
+// identically.
+//
+// Returns true when the caller is over budget and the request should stop.
+// Follows the convention the existing call sites already established:
+// skipped entirely when CONFIGS isn't bound (every KV-optional feature here
+// degrades rather than fails closed), and the increment rides on
+// ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
+// request it is protecting. Callers check for a missing client IP
+// themselves, since what to return in that case is route-specific.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+  if (!env || !env.CONFIGS || !ip) return false;
+  const key = `ratelimit:${bucket}:${ip}`;
+  const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
+  if (used >= maxPerWindow) return true;
+  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
+  else await write;
+  return false;
 }
 
 async function likeVoterId(request, env, creatorUsername, scopeId) {
@@ -2978,13 +3151,25 @@ async function getPublicListIndex(env, ctx) {
   }
 }
 
-async function listAllKeys(namespace, prefix) {
+// Pages a whole prefix, following the cursor to completion.
+//
+// `maxKeys` (optional) caps how many keys are collected. It exists for
+// prefixes whose key space is not intrinsically bounded -- see the caps in
+// computeCatalogAndCommunityLeaderboards (03_admin.js), where an
+// unbounded scan followed by one get per key was enough to push a request
+// past Cloudflare's per-invocation subrequest limit. Callers that pass it
+// must treat `list_complete: false` as "there was more" rather than
+// assuming they have everything; callers that omit it keep the previous
+// exhaustive behaviour exactly.
+async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   const keys = [];
   let cursor;
   do {
+    const remaining = maxKeys - keys.length;
+    if (remaining <= 0) return { keys, list_complete: false };
     const result = await namespace.list({
       prefix,
-      limit: 1000,
+      limit: Math.min(1000, remaining),
       ...(cursor ? { cursor } : {})
     });
     keys.push(...result.keys);
@@ -3028,7 +3213,20 @@ async function purgeCreatorData(env, username, options = {}) {
         await env.CONFIGS.delete(k.name);
         // Drop it from the directory index too, or a deleted account's
         // lists keep appearing publicly until the next full rebuild.
-        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
+        const listPath = k.name.slice("creatorlist:".length);
+        purgedListIds.push("c:" + listPath);
+        // And the list's like ledger, keyed listlikevoters:{user}:{slug}
+        // (see applyLikeVote's call site in /api/lists/like). These used to
+        // survive the account: because delete-account frees the username for
+        // re-registration, whoever claimed it next and made a list with the
+        // same slug inherited the previous owner's ledger -- a like count
+        // they never earned, and every voter in the old ledger silently
+        // unable to like it.
+        try {
+          await env.CONFIGS.delete(`listlikevoters:${listPath}`);
+        } catch (e) {
+          // best-effort: a stranded ledger is untidy, not harmful on its own
+        }
         listsCleared++;
       }
       if (res.list_complete || !res.cursor) break;
@@ -3074,8 +3272,14 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
-    // legacy names, harmless if absent
+    // Playback diagnostics (handleSubtitlesTrack writes it,
+    // /api/creator/track-status reads it) and the scrobble seen-user set
+    // (handleMediaServerScrobble). Both are live keys, not legacy ones --
+    // creatortrack: was previously listed under the legacy heading below,
+    // which was simply wrong about it.
     `creatortrack:${u}`,
+    `scrobbleseenusers:${u}`,
+    // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,
     `creatorprofile:${u}`,
@@ -3248,9 +3452,49 @@ function statsToday() {
   return easternDateKey(new Date());
 }
 
+// --- Counter storage ---------------------------------------------------------
+//
+// Every counter here used to be a KV read-modify-write: GET, add one, PUT.
+// KV has no atomic increment and no compare-and-swap, so two overlapping
+// requests both read the same number and both write the same number+1, and
+// one is silently lost. Measured against this Worker: twenty concurrent
+// requests recorded as ONE.
+//
+// Production is worse than that measurement, in two ways that compound with
+// traffic: KV reads are edge-cached, so every request inside a cache window
+// can read the same stale value; and KV allows roughly one write per second
+// per key, which the hot keys (stats:pageviews:total and each day bucket)
+// are. The dashboard therefore drifts further from reality the busier the
+// deployment gets -- downward, silently, while still rendering a confident,
+// precise-looking number.
+//
+// SQLite's upsert is atomic and removes the class outright. This is the same
+// shape the source_groups counter has always used (see bumpStatBy below) --
+// every other counter now works the way that one already did.
+//
+// D1 stays OPTIONAL, exactly as it is everywhere else in this codebase: with
+// no DB bound the KV path below runs unchanged, lost updates and all. That
+// is a real remaining limitation for KV-only deployments, not an oversight
+// -- KV genuinely cannot do this correctly, and the honest options there are
+// to bind D1 or to read the numbers as approximate.
+async function d1BumpStat(env, kind, buckets, amount) {
+  // One statement per bucket, sent as a batch so the whole bump is a single
+  // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
+  const stmts = buckets.map((bucket) =>
+    env.DB.prepare(
+      "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO UPDATE SET n = n + excluded.n"
+    ).bind(kind, bucket, amount)
+  );
+  await env.DB.batch(stmts);
+}
+
 async function bumpStat(env, kind) {
   if (!env || !env.CONFIGS) return;
   try {
+    if (env.DB) {
+      await d1BumpStat(env, kind, ["total", statsToday()], 1);
+      return;
+    }
     const totalKey = `stats:${kind}:total`;
     const dayKey = `stats:${kind}:${statsToday()}`;
     const [totalRaw, dayRaw] = await Promise.all([env.CONFIGS.get(totalKey), env.CONFIGS.get(dayKey)]);
@@ -3277,10 +3521,18 @@ async function bumpStatBy(env, kind, amount) {
     const totalKey = `stats:${kind}:total`;
     
     if (env.DB && kind.startsWith("sourcegroup:")) {
+      // Left exactly as it was: source groups have their own table, their
+      // own read path in renderAdminDashboard, and their own branch in
+      // /admin/api/migrate-d1. It was already atomic -- it is the precedent
+      // the rest of this now follows, not something to re-route.
       const groupName = kind.slice("sourcegroup:".length);
       await env.DB.prepare(
         "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = source_groups.install_count + excluded.install_count"
       ).bind(groupName, groupName, amount).run();
+    } else if (env.DB) {
+      // Total only, no day bucket -- see this function's own comment on why
+      // per-source-group counters are all-time.
+      await d1BumpStat(env, kind, ["total"], amount);
     } else {
       const totalRaw = await env.CONFIGS.get(totalKey);
       const total = (parseInt(totalRaw, 10) || 0) + amount;
@@ -3968,33 +4220,43 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
   } catch (e) {}
 }
 
-async function computeCatalogAndCommunityLeaderboards(env) {
+// Hard ceilings on what this one panel may cost, independent of how many
+// stats:* keys exist.
+//
+// This function enumerates three prefixes and then issues one KV get per
+// ":total" key it finds, so its subrequest count used to scale 1:1 with
+// the size of those key spaces -- and none of the three is intrinsically
+// bounded. A caller who minted enough keys (see recordListCopySlug's
+// comment for how that was possible without any authentication) pushed
+// this past Cloudflare's per-invocation subrequest limit, at which point
+// the panel threw on every load and there was no route that could delete
+// the keys again to recover it.
+//
+// The scan cap bounds the enumeration (one list() call per 1,000 keys);
+// the read cap bounds the far more expensive per-key gets. Both are far
+// above any real deployment -- a genuine install has tens of catalog
+// names and source groups, not hundreds -- so this truncates abuse and
+// nothing else. Truncating renders a partial panel rather than throwing,
+// which is the right failure mode for a dashboard: some data beats a
+// permanently broken tab.
+const STAT_KEY_SCAN_CAP = 20000;
+const STAT_TOTALS_READ_CAP = 500;
+
+async function computeCatalogAndCommunityLeaderboards(env, ctx) {
   if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
-  
+
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
-  const [catalogList, sourceGroupList] = await Promise.all([
-    listAllKeys(env.CONFIGS, "stats:catalog_add:"),
-    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
-  ]);
-
   const catalogMap = new Map();
-  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total"));
-  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total"));
-
-  await Promise.all([
-    ...totalCatalogKeys.map(async (k) => {
-      const name = k.name.slice("stats:catalog_add:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      const count = parseInt(raw, 10) || 0;
-      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
-    }),
-    ...totalSourceGroupKeys.map(async (k) => {
-      const name = k.name.slice("stats:sourcegroup:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      const count = parseInt(raw, 10) || 0;
-      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
-    }),
+  const [catalogTotals, sourceGroupTotals] = await Promise.all([
+    readStatTotalsByPrefix(env, "catalog_add:"),
+    readSourceGroupTotals(env),
   ]);
+  for (const [name, count] of catalogTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
+  for (const [name, count] of sourceGroupTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
 
   const catalogEntries = Array.from(catalogMap.entries()).map(([name, count]) => ({ name, count }));
   catalogEntries.sort((a, b) => b.count - a.count);
@@ -4007,20 +4269,9 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   // never been copied have no key) rather than doing one get per list --
   // that per-list fan-out (plus the reads below) is what made this panel
   // cost ~2 subrequests per list and eventually cross the 1,000 cap.
-  const copiesBySlug = new Map();
+  let copiesBySlug = new Map();
   try {
-    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:");
-    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total"));
-    await Promise.all(
-      copyTotalKeys.map(async (k) => {
-        const raw = await env.CONFIGS.get(k.name);
-        const count = parseInt(raw, 10) || 0;
-        if (count > 0) {
-          const slug = k.name.slice("stats:list_copy:".length, -":total".length);
-          copiesBySlug.set(slug, count);
-        }
-      })
-    );
+    copiesBySlug = await readStatTotalsByPrefix(env, "list_copy:");
   } catch (e) {
     // best-effort: copy counts are a ranking tiebreak, not load-bearing
   }
@@ -4049,28 +4300,69 @@ async function computeCatalogAndCommunityLeaderboards(env) {
       updatedAt: row.updated_at || row.created_at || 0,
     }));
   } else {
-    // KV-only fallback, bounded: enumerate at most the cap of keys instead
-    // of every list in the system, then one get per bounded candidate.
-    const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
-    communityListsRaw = (await Promise.all(
-      (listResult.keys || []).map(async (k) => {
-        const raw = await env.CONFIGS.get(k.name);
-        if (!raw) return null;
-        let data;
-        try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || !isPublicListVisibility(data.visibility)) return null;
-        if (!data.slug || !data.creatorName) return null;
-        return {
-          slug: data.slug,
-          name: data.name || data.slug,
-          creatorName: data.creatorName,
-          type: data.type || 'mixed',
-          likes: Number(data.likes) || 0,
-          itemCount: Array.isArray(data.items) ? data.items.length : 0,
-          updatedAt: data.updatedAt || data.createdAt || 0,
-        };
-      })
-    )).filter(Boolean);
+    // KV-only: rank from the directory index, which already carries likes,
+    // itemCount and the creator's display name, and is already sorted by
+    // likes (see sortPublicIndexEntries, 02_http-and-creator-utils.js).
+    //
+    // This replaces a bounded prefix scan that was wrong twice over:
+    //
+    //  * It read the alphabetically-first COMMUNITY_CAP keys and then
+    //    sorted THOSE by likes, so with more lists than the cap the panel
+    //    reported a lexicographic sample as "top". You cannot get the top
+    //    100 by likes out of an arbitrary 100.
+    //  * It then dropped every candidate without a `creatorName` field --
+    //    and /api/creator/lists/save has never written one (the record is
+    //    { name, slug, type, items, visibility, likes, createdAt,
+    //    updatedAt }, and the creator is in the KEY). So in practice the
+    //    filter discarded everything and this panel showed nothing at all
+    //    whenever D1 was unbound.
+    //
+    // Reading the index also removes the one-KV-get-per-candidate fan-out
+    // entirely: it is a single get.
+    const indexEntries = await getPublicListIndex(env, ctx);
+    if (indexEntries) {
+      communityListsRaw = indexEntries
+        .filter((e) => e && e.isCreator && (e.itemCount || 0) > 0)
+        .slice(0, COMMUNITY_CAP)
+        .map((e) => ({
+          slug: e.slug,
+          name: e.name || e.slug,
+          creatorName: e.creatorName || e.username,
+          type: e.type || 'mixed',
+          likes: Number(e.likes) || 0,
+          itemCount: Number(e.itemCount) || 0,
+          updatedAt: e.updatedAt || 0,
+        }));
+    } else {
+      // Index absent and a rebuild is already running (or could not start).
+      // Bounded scan for this one request; the creator comes from the key,
+      // which is where it has always actually lived.
+      const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
+      communityListsRaw = (await Promise.all(
+        (listResult.keys || []).map(async (k) => {
+          const raw = await env.CONFIGS.get(k.name);
+          if (!raw) return null;
+          let data;
+          try { data = JSON.parse(raw); } catch { return null; }
+          if (!data || !isPublicListVisibility(data.visibility)) return null;
+          const rest = k.name.slice("creatorlist:".length);
+          const sep = rest.indexOf(":");
+          if (sep === -1) return null;
+          const username = rest.slice(0, sep);
+          const slug = data.slug || rest.slice(sep + 1);
+          if (!username || !slug) return null;
+          return {
+            slug,
+            name: data.name || slug,
+            creatorName: username,
+            type: data.type || 'mixed',
+            likes: Number(data.likes) || 0,
+            itemCount: Array.isArray(data.items) ? data.items.length : 0,
+            updatedAt: data.updatedAt || data.createdAt || 0,
+          };
+        })
+      )).filter(Boolean);
+    }
   }
 
   // No per-list KV reads remain: likes and itemCount already came from the
@@ -4099,17 +4391,14 @@ async function computeAudienceAnalytics(env) {
   // comment), a no-op single read on every call after that.
   await migrateGenreDecadeStatsIfNeeded(env);
 
-  const [movieRaw, seriesRaw, episodeRaw, genreBlobRaw, decadeBlobRaw] = await Promise.all([
-    env.CONFIGS.get("stats:watch_type:movie:total"),
-    env.CONFIGS.get("stats:watch_type:series:total"),
-    env.CONFIGS.get("stats:watch_type:episode:total"),
+  const [movies, series, episodes, genreBlobRaw, decadeBlobRaw] = await Promise.all([
+    readStatCount(env, "watch_type:movie", "total"),
+    readStatCount(env, "watch_type:series", "total"),
+    readStatCount(env, "watch_type:episode", "total"),
     env.CONFIGS.get("stats:genres:alltime"),
     env.CONFIGS.get("stats:decades:alltime"),
   ]);
 
-  const movies = parseInt(movieRaw, 10) || 0;
-  const series = parseInt(seriesRaw, 10) || 0;
-  const episodes = parseInt(episodeRaw, 10) || 0;
   const totalWatch = movies + series + episodes;
 
   let genreCounts = {};
@@ -4148,10 +4437,174 @@ async function computeAudienceAnalytics(env) {
 // arbitrary junk trying to spam garbage keys into KV. This caps length and
 // character set rather than trusting it outright; doesn't need to be
 // exhaustive, just enough that a genuine group name always passes through
-// untouched and abuse can't create unbounded distinct keys.
+// untouched.
+//
+// NOTE: this bounds the character set and the LENGTH of a single name, not
+// the NUMBER of distinct names -- a caller sending 40-char random strings
+// still mints a new key every time. That is acceptable here only because
+// /api/track-install is rate-limited per IP; anywhere without a rate limit
+// needs a real allowlist instead (see recordListCopySlug below, and the
+// caps in computeCatalogAndCommunityLeaderboards that stop a large key
+// space from breaking the dashboard whatever produced it).
 function sanitizeStatGroupName(raw) {
   const s = String(raw || "").trim().slice(0, 40);
   return /^[A-Za-z0-9 &().'-]+$/.test(s) ? s : null;
+}
+
+// The "copies" column of the admin Community Lists panel is keyed by a
+// list's own slug (see computeCatalogAndCommunityLeaderboards, which looks
+// up copiesBySlug.get(data.slug)). The client, though, sends
+// `listUrl || listName` as the event id -- a full provider URL, or a
+// human-readable list title. Neither is a slug, so the stored counts
+// essentially never matched anything the panel could display: the whole
+// stats:list_copy: namespace was write-only.
+//
+// Worse, because the id was accepted verbatim (any 100 characters), every
+// distinct URL or title minted two brand-new permanent KV keys from an
+// endpoint with no authentication -- an unbounded key-space write
+// primitive, and one that the panel above then paid one KV read per key to
+// enumerate.
+//
+// Both problems have the same fix: only record a copy of a list that
+// actually lives on THIS add-on, keyed by the slug the panel is already
+// looking for. The key space is then bounded by the number of real
+// published lists, and the counts land where they can actually be read.
+// Copies of external provider lists are simply not counted -- which is
+// what was already happening in practice, just without the storage cost.
+function recordListCopySlug(rawId, origin) {
+  const raw = String(rawId || "").trim();
+  if (!raw || raw.length > 300) return null;
+  let pathname = "";
+  if (/^https?:\/\//i.test(raw)) {
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return null;
+    }
+    // Only this Worker's own list URLs. An external provider's URL is not
+    // a list this dashboard can show a copy count for.
+    if (origin) {
+      let originHost = "";
+      try {
+        originHost = new URL(origin).hostname.toLowerCase();
+      } catch {
+        return null;
+      }
+      if (u.hostname.toLowerCase() !== originHost) return null;
+    }
+    pathname = u.pathname;
+  } else {
+    // Also accept a bare path, which is what a same-origin relative link
+    // resolves to before the client expands it.
+    if (!raw.startsWith("/")) return null;
+    pathname = raw;
+  }
+  // /lists/{user}/{slug}  ->  {slug}
+  const m = pathname.match(/^\/lists\/[^/]+\/([^/]+?)(?:\.json)?\/?$/);
+  if (!m) return null;
+  let slug;
+  try {
+    slug = decodeURIComponent(m[1]).toLowerCase();
+  } catch {
+    slug = m[1].toLowerCase();
+  }
+  // Same shape slugifyServer produces, so this can only ever name a key
+  // that a real list could also have produced.
+  return /^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) ? slug : null;
+}
+
+// --- Counter reads -----------------------------------------------------------
+//
+// D1 is authoritative when bound, and falls back to KV when the row is
+// ABSENT rather than reporting zero. A missing row means "not migrated
+// yet", not "never happened" -- the same rule getCreator already applies to
+// accounts, and the reason binding D1 does not make a dashboard's history
+// vanish before the operator presses "Migrate KV -> D1". Once the migration
+// has run (or once new activity lands), D1 wins and the KV copy is inert.
+//
+// Deliberately NOT "D1 + KV summed": /admin/api/migrate-d1 COPIES the KV
+// value into D1, so summing would double every migrated counter.
+async function readStatCount(env, kind, bucket) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(kind, bucket).all();
+      if (results && results.length) return Number(results[0].n) || 0;
+    } catch (e) {
+      // Table missing (migration 0002 not applied yet) or D1 unavailable --
+      // fall through to KV rather than showing zeroes.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  const raw = await env.CONFIGS.get(`stats:${kind}:${bucket}`);
+  return parseInt(raw, 10) || 0;
+}
+
+// All-time totals for a family of counters ("catalog_add:", "list_copy:"),
+// as a Map of the name after the prefix -> count.
+//
+// With D1 this is one indexed query. Without it, it is the prefix scan it
+// always was, still bounded by STAT_KEY_SCAN_CAP / STAT_TOTALS_READ_CAP so
+// a large key space cannot push this request past Cloudflare's subrequest
+// limit (see computeCatalogAndCommunityLeaderboards' own comment).
+async function readStatTotalsByPrefix(env, prefix) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ORDER BY n DESC LIMIT ?"
+      ).bind(prefix + "%", STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) {
+          const name = String(row.kind).slice(prefix.length);
+          if (name) out.set(name, Number(row.n) || 0);
+        }
+        return out;
+      }
+      // No rows: fall through to KV, same "not migrated yet" rule as
+      // readStatCount.
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to KV.
+    }
+  }
+  const listed = await listAllKeys(env.CONFIGS, `stats:${prefix}`, STAT_KEY_SCAN_CAP);
+  const totalKeys = (listed.keys || [])
+    .filter((k) => k.name.endsWith(":total"))
+    .slice(0, STAT_TOTALS_READ_CAP);
+  await Promise.all(
+    totalKeys.map(async (k) => {
+      const raw = await env.CONFIGS.get(k.name);
+      const count = parseInt(raw, 10) || 0;
+      const name = k.name.slice(`stats:${prefix}`.length, -":total".length);
+      if (name) out.set(name, count);
+    })
+  );
+  return out;
+}
+
+// Source groups keep their own table and their own migrate-d1 branch (see
+// bumpStatBy), so they are read separately from the generic stats table --
+// this mirrors the split renderAdminDashboard already makes.
+async function readSourceGroupTotals(env) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT name, install_count FROM source_groups ORDER BY install_count DESC LIMIT ?"
+      ).bind(STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) out.set(row.name, Number(row.install_count) || 0);
+        return out;
+      }
+    } catch (e) {
+      // fall through to KV
+    }
+  }
+  return readStatTotalsByPrefix({ CONFIGS: env.CONFIGS }, "sourcegroup:");
 }
 
 // Reads every stats:{kind}:YYYY-MM-DD entry via a prefix list (there's no
@@ -4159,6 +4612,23 @@ function sanitizeStatGroupName(raw) {
 // { "YYYY-MM-DD": count } map, skipping the :total key itself.
 async function loadStatsByDay(env, kind) {
   if (!env || !env.CONFIGS) return {};
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT day, n FROM stats WHERE kind = ? AND day != 'total'"
+      ).bind(kind).all();
+      // Same fallback rule as readStatCount: no rows at all means this
+      // counter has not been migrated yet, so read KV instead of drawing an
+      // empty chart. One real day bucket is enough to trust D1.
+      if (results && results.length) {
+        const byDay = {};
+        for (const row of results) byDay[row.day] = Number(row.n) || 0;
+        return byDay;
+      }
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to the KV scan.
+    }
+  }
   const prefix = `stats:${kind}:`;
   const result = await listAllKeys(env.CONFIGS, prefix);
   const byDay = {};
@@ -4370,12 +4840,12 @@ async function renderAdminDashboard(env) {
     pvByDay, inByDay, ppByDay,
     creatorResult, sourceGroupResult
   ] = await Promise.all([
-    env.CONFIGS.get("stats:pageviews:total"),
-    env.CONFIGS.get(`stats:pageviews:${today}`),
-    env.CONFIGS.get("stats:installs:total"),
-    env.CONFIGS.get(`stats:installs:${today}`),
-    env.CONFIGS.get("stats:playback_pings:total"),
-    env.CONFIGS.get(`stats:playback_pings:${today}`),
+    readStatCount(env, "pageviews", "total"),
+    readStatCount(env, "pageviews", today),
+    readStatCount(env, "installs", "total"),
+    readStatCount(env, "installs", today),
+    readStatCount(env, "playback_pings", "total"),
+    readStatCount(env, "playback_pings", today),
     loadStatsByDay(env, "pageviews"),
     loadStatsByDay(env, "installs"),
     loadStatsByDay(env, "playback_pings"),
@@ -4673,12 +5143,12 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
     <div class="stat-cards">
-      <div class="stat-card"><div class="stat-value">${parseInt(totalPV, 10) || 0}</div><div class="stat-label">Total page views</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayPV, 10) || 0}</div><div class="stat-label">Page views today</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(totalIN, 10) || 0}</div><div class="stat-label">Total install links</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayIN, 10) || 0}</div><div class="stat-label">Install links today</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(totalPP, 10) || 0}</div><div class="stat-label">Total playback streams</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayPP, 10) || 0}</div><div class="stat-label">Streams today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalPV) || 0}</div><div class="stat-label">Total page views</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPV) || 0}</div><div class="stat-label">Page views today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalIN) || 0}</div><div class="stat-label">Total install links</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayIN) || 0}</div><div class="stat-label">Install links today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalPP) || 0}</div><div class="stat-label">Total playback streams</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPP) || 0}</div><div class="stat-label">Streams today</div></div>
     </div>
     <div class="table-wrap">
       <table>
@@ -6241,47 +6711,6 @@ async function fetchTopLists(apikey, env = null, ctx = null) {
   });
 }
 
-// Searches trakt.tv's public lists by name via their official search API.
-// Only needs the fixed TRAKT_CLIENT_ID (same key used for fetching list
-// items) — no user auth required for public list search.
-// Peeks at a small sample of a Trakt list's items (unfiltered by type) to
-// determine whether it's a movies list, a shows list, or genuinely mixed --
-// used so the "Search Lists" results can offer just one relevant Add
-// button instead of always defensively offering both. A shallow sample
-// (not the whole list) is a deliberate trade-off: correct for the
-// overwhelmingly common case of a single-type list, and falls back to
-// "unknown" (both buttons, the previous always-safe behavior) for anything
-// ambiguous or genuinely mixed.
-async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
-  const src = `https://api.trakt.tv/users/${encodeURIComponent(user)}/lists/${encodeURIComponent(
-    slug
-  )}/items?limit=20`;
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey || TRAKT_CLIENT_ID,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    };
-    if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-    const res = await fetchTraktWithRetry(src, {
-      headers,
-      cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 86400, cacheEverything: true },
-    });
-    if (!res.ok) return "unknown";
-    const data = await res.json();
-    const items = Array.isArray(data) ? data : [];
-    const hasMovie = items.some((it) => it.movie);
-    const hasShow = items.some((it) => it.show);
-    if (hasMovie && hasShow) return "mixed";
-    if (hasMovie) return "movie";
-    if (hasShow) return "series";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 async function searchTraktLists(query, traktKeyOverride) {
   const rawQ = (query || "").trim();
   if (!rawQ) return [];
@@ -6824,11 +7253,6 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <circle cx="76" cy="25" r="2.5" fill="#AF52DE" opacity="0.8" />
   </g>
 </svg>`;
-}
-
-function getPaddedChannelLogo(rawPoster, origin) {
-  if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
-  return rawPoster;
 }
 
 function getChannelBackdropUrl(payload) {
@@ -8971,39 +9395,6 @@ function trailerStreamsFor(ytKey) {
   return ytKey ? [{ title: "Trailer", ytId: ytKey }] : undefined;
 }
 
-// For items that only carry an IMDB id (mdblist/Trakt sources never expose
-// a TMDB id), resolving a trailer needs an extra round trip: TMDB's /find
-// endpoint to translate imdb_id -> tmdb_id, then a /videos call on that id.
-// Both legs are hard-cached at Cloudflare's edge (shared across every user
-// of the add-on, same as fetchTmdbDetails below), so this only costs a real
-// TMDB request the first time any list anywhere references a given title.
-// Best-effort: any failure just means no trailer, never a broken catalog.
-async function fetchTrailerForImdb(imdbId, type, apiKey) {
-  if (!apiKey || !imdbId) return null;
-  try {
-    const findRes = await fetch(
-      `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(apiKey)}&external_source=imdb_id`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!findRes.ok) return null;
-    const findData = await findRes.json();
-    const kind = type === "series" ? "tv" : "movie";
-    const resultsKey = kind === "tv" ? "tv_results" : "movie_results";
-    const match = (findData[resultsKey] || [])[0];
-    if (!match) return null;
-
-    const videosRes = await fetch(
-      `https://api.themoviedb.org/3/${kind}/${match.id}/videos?api_key=${encodeURIComponent(apiKey)}`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!videosRes.ok) return null;
-    const videosData = await videosRes.json();
-    return pickTrailerKey(videosData.results);
-  } catch {
-    return null;
-  }
-}
-
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
 // fetchTmdbDetails's append_to_response=videos, see below).
@@ -10444,10 +10835,35 @@ async function checkForNewEpisodes(env) {
     }
 
     if (blobChanged || stillFullyWatched.length !== fullyWatched.length) {
-      blob.continueWatching = continueWatching;
-      blob.fullyWatchedShowIds = stillFullyWatched;
-      blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
+      // Re-read before writing, and write only the two fields this sweep
+      // actually computes.
+      //
+      // `blob` was read at the top of this account's turn, and everything
+      // since has been TMDB network I/O -- seconds, not milliseconds. The
+      // old code wrote that whole snapshot back, so anything the account's
+      // own browser saved in the meantime (a newly watched episode, a
+      // refreshed Airing Next, recomputed recommendations) was silently
+      // reverted, with the save and the cron both reporting success.
+      //
+      // /api/creator/sync/save-tracking already guards the mirror image of
+      // this -- a stale CLIENT push wiping a server-side scrobble -- with
+      // a rescue-merge. This is the same hazard in the other direction,
+      // and the same reasoning applies: the writer must only own the
+      // fields it computed.
+      const targetKey = `creatorsynctracking:${username}`;
+      let target = blob;
+      try {
+        const freshRaw = await env.CONFIGS.get(targetKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {
+        // Unreadable/unparseable right now -- fall back to the snapshot we
+        // already have rather than dropping a real Continue Watching update.
+        target = blob;
+      }
+      target.continueWatching = continueWatching;
+      target.fullyWatchedShowIds = stillFullyWatched;
+      target.updatedAt = Date.now();
+      await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
 }
@@ -10701,33 +11117,6 @@ const STREAMING_ALL = [
     showUrl: "tmdb:chart:peacock",
   },
 ];
-
-// Builds the static HTML rows for a streaming quick-add panel from one of
-// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
-function getProviderIconBadge(name, group) {
-  const n = (name || '').toLowerCase();
-  if (group === 'Combined Charts' || n === 'popular' || n === 'trending' || n.includes('(all services)')) {
-    return '<span class="provider-chip-icon" style="background:var(--accent);color:#fff;font-weight:800;font-size:0.7rem;letter-spacing:-0.02em;">ML</span>';
-  }
-  if (group === 'MDBList Charts' || n.includes('mdblist') || n.includes('streaming charts') || n.includes('moviemeter') || n.includes('us daily')) {
-    return '<span class="provider-chip-icon" style="background:#007AFF;color:#fff;font-weight:700;">M</span>';
-  }
-  if (n.includes('netflix')) return '<span class="provider-chip-icon netflix">N</span>';
-  if (n.includes('prime') || n.includes('amazon')) return '<span class="provider-chip-icon prime">P</span>';
-  if (n.includes('apple')) return '<span class="provider-chip-icon apple">A</span>';
-  if (n.includes('disney')) return '<span class="provider-chip-icon disney">D+</span>';
-  if (n.includes('max') || n.includes('hbo')) return '<span class="provider-chip-icon max">M</span>';
-  if (n.includes('hulu')) return '<span class="provider-chip-icon hulu">h</span>';
-  if (n.includes('paramount')) return '<span class="provider-chip-icon paramount">P+</span>';
-  if (n.includes('peacock')) return '<span class="provider-chip-icon peacock">P</span>';
-  if (n.includes('discovery')) return '<span class="provider-chip-icon discovery">D</span>';
-  if (n.includes('tmdb')) return '<span class="provider-chip-icon" style="background:#01b4e4;color:#fff;">T</span>';
-  if (n.includes('trakt')) return '<span class="provider-chip-icon" style="background:#ed1c24;color:#fff;">T</span>';
-  if (n.includes('simkl')) return '<span class="provider-chip-icon" style="background:#000;border:1px solid #333;color:#fff;">S</span>';
-  if (group === 'Kids') return '<span class="provider-chip-icon" style="background:#FF9900;color:#fff;">K</span>';
-  if (group === 'Genres') return '<span class="provider-chip-icon" style="background:#5856D6;color:#fff;">G</span>';
-  return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
-}
 
 function buildStreamingRowsHtml(list, labelSuffix, group) {
   const rows = list.map((p) => {
@@ -15645,12 +16034,13 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
 
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
-  );
-}
-function escapeAttr(s) { return escapeHtml(s); }
+// escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
+// They used to be declared here too; since every client module shares one
+// script scope in the browser, that later declaration won, and this copy
+// was dead. The two were not even equivalent -- this one used
+// String(s || ''), which turns a legitimate 0 into an empty string, while
+// the surviving one uses String(s == null ? '' : s) and renders "0". Both
+// are hoisted, so the survivor is available to every caller here.
 
 (function earlySubmenuSync() {
   try {
@@ -16384,39 +16774,14 @@ function showAddedToast(msg) {
   }, 2200);
 }
 
-function handlePosterImgError(img) {
-  if (!img || img.dataset.hasFailedFallback) {
-    if (img) {
-      img.style.display = 'none';
-      const parent = img.parentElement;
-      if (parent && !parent.querySelector('.live-preview-poster-placeholder')) {
-        const ph = document.createElement('div');
-        ph.className = 'live-preview-poster live-preview-poster-placeholder';
-        ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
-        parent.appendChild(ph);
-      }
-    }
-    return;
-  }
-  img.dataset.hasFailedFallback = '1';
-  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
-  const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-  const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-  const id = (card && card.dataset.id) || (card && card.dataset.imdbId) || '';
-  if (title || id) {
-    const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
-    const imdbId = id.startsWith('tt') ? id : '';
-    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
-      .then(r => r.json())
-      .then(data => {
-        if (data && data.ok && data.poster) {
-          img.src = data.poster;
-          img.style.display = '';
-        }
-      })
-      .catch(() => {});
-  }
-}
+// handlePosterImgError used to be defined here as well. Every client
+// module ends up in ONE script in the browser, so that second declaration
+// silently overrode this one (23_client-list-management.js is later in
+// build order) and this copy never ran -- editing it changed nothing,
+// which is exactly the trap a duplicate top-level declaration sets. The
+// surviving definition now covers both DOM shapes; see
+// showPosterPlaceholderFor there. html_checks.py fails the build if a
+// duplicate is ever reintroduced.
 
 function resolveMissingPostersInDom(rootEl) {
   const container = rootEl || document;
@@ -20793,6 +21158,39 @@ async function markSimklListAllWatched(btn) {
   }
 }
 
+// Sends an arbitrarily large title list to /api/bulk-resolve in bounded
+// chunks and returns every resolved row together.
+//
+// That endpoint issues up to two TMDB calls per item and always spends the
+// Worker owner's shared key, so it now caps a single request at
+// BULK_RESOLVE_ITEMS_MAX (see 00_constants.js). Sending a whole category
+// in one request, as this used to, exceeded Cloudflare's per-invocation
+// subrequest limit well before the cap existed -- so a big Letterboxd
+// import did not partly work, it failed the category outright. Chunking
+// makes an import of any size succeed as several bounded calls, and the
+// chunk size comes from the same constant the server validates against so
+// the two cannot drift apart.
+//
+// Throws on the first failed chunk, matching the previous single-request
+// behaviour: each caller already has its own catch that reports the
+// category as failed rather than silently importing half of it.
+async function bulkResolveInChunks(items) {
+  const list = Array.isArray(items) ? items : [];
+  const CHUNK = ${BULK_RESOLVE_ITEMS_MAX};
+  const out = [];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const res = await fetch(ORIGIN + '/api/bulk-resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: list.slice(i, i + CHUNK) }),
+    });
+    const data = await res.json();
+    if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
+    if (Array.isArray(data.resolved)) out.push.apply(out, data.resolved);
+  }
+  return out;
+}
+
 // --- Import from Trakt export --------------------------------------------
 //
 // Trakt VIP's own export (Settings > Data > Export on trakt.tv) is a .zip
@@ -21296,15 +21694,9 @@ window.runLetterboxdExportImport = async function() {
     // Bulk resolve
     const resolvedItems = [];
     try {
-      const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: uniqueItems }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'unknown error');
-      
-      for (const m of data.resolved) {
+      const resolvedAll = await bulkResolveInChunks(uniqueItems);
+
+      for (const m of resolvedAll) {
         if (!m.imdbId) continue;
         resolvedItems.push({
           imdbId: m.imdbId,
@@ -21906,29 +22298,25 @@ async function runUnifiedListImport() {
     const toResolve = rawItems.filter(it => !it.imdbId && it.title);
     if (toResolve.length > 0) {
       try {
-        const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: toResolve }),
+        const resolvedAll = await bulkResolveInChunks(toResolve);
+        const resolvedMap = new Map();
+        resolvedAll.forEach(r => {
+          if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
         });
-        const data = await res.json();
-        if (data.ok && Array.isArray(data.resolved)) {
-          const resolvedMap = new Map();
-          data.resolved.forEach(r => {
-            if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
-          });
-          rawItems.forEach(it => {
-            if (!it.imdbId && it.title) {
-              const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
-              if (found && found.imdbId) {
-                it.imdbId = found.imdbId;
-                it.id = found.imdbId;
-                it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
-              }
+        rawItems.forEach(it => {
+          if (!it.imdbId && it.title) {
+            const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
+            if (found && found.imdbId) {
+              it.imdbId = found.imdbId;
+              it.id = found.imdbId;
+              it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
             }
-          });
-        }
-      } catch (e) {}
+          }
+        });
+      } catch (e) {
+        // Same as before: an unresolved title keeps whatever metadata it
+        // already had and the import continues.
+      }
     }
 
     const finalItems = rawItems.map(it => ({
@@ -35709,21 +36097,11 @@ async function migrateLocalCustomListsToAccount() {
 
 let lastCreatorListsData = null; // cached result of the last dashboard fetch, so Edit/Share don't need a round-trip
 
-function showModal(innerHtml, extraClass) {
-  closeModal();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'activeModalOverlay';
-  overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) closeModal();
-  });
-  document.body.appendChild(overlay);
-}
-function closeModal() {
-  const existing = document.getElementById('activeModalOverlay');
-  if (existing) existing.remove();
-}
+// showModal/closeModal live in 16_client-row-core.js. Byte-identical copies
+// were declared here too; in the browser's single shared script scope that
+// meant one silently overrode the other. Same behaviour either way, so
+// nothing changed by removing them -- but a future edit to one copy would
+// have appeared to do nothing at all.
 
 function renderCreatorProfileBar() {
   const bar = document.getElementById('creatorProfileBar');
@@ -40897,12 +41275,53 @@ async function renderLivePreview() {
   await Promise.all(workers);
 }
 
+// Hides a poster that could not be loaded and shows a "No poster" tile in
+// its place.
+//
+// Two different markups reach here, and this used to assume only one of
+// them. livePreviewPosterHtml (below) emits a hidden placeholder as the
+// img's immediate next sibling, so revealing img.nextElementSibling was
+// right there. Every other call site emits no placeholder at all:
+// renderCatalogSearchResults (19_client-search-and-likes.js) follows the
+// img with .poster-add-overlay, the list-card mini tiles
+// (22_client-creator-profile.js) follow it with .cw-remove-btn and
+// .list-card-count-overlay, and the replacement <img> that
+// resolveMissingPostersInDom (16_client-row-core.js) swaps in has no
+// sibling whatsoever.
+//
+// At those sites the old code hid the poster and then set display:flex on
+// whatever happened to sit next to it, so no "No poster" tile ever
+// appeared -- just an empty gap -- and on the count badge, which is shown
+// and hidden per breakpoint by a media query, an inline display:flex
+// overrode that query and put the badge on screen at both widths at once.
+//
+// So: reveal a real placeholder when one exists, create one when it does
+// not, and never touch a sibling that is not a placeholder.
+function showPosterPlaceholderFor(img) {
+  if (!img) return;
+  img.style.display = 'none';
+  const parent = img.parentElement;
+  if (!parent) return;
+  let ph = null;
+  const sib = img.nextElementSibling;
+  if (sib && sib.classList && sib.classList.contains('live-preview-poster-placeholder')) {
+    ph = sib;
+  } else {
+    ph = parent.querySelector(':scope > .live-preview-poster-placeholder');
+  }
+  if (!ph) {
+    ph = document.createElement('div');
+    ph.className = 'live-preview-poster live-preview-poster-placeholder';
+    ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
+    parent.appendChild(ph);
+  }
+  ph.style.display = 'flex';
+}
+
 function handlePosterImgError(img) {
   if (!img) return;
   if (img.dataset.hasFailedFallback) {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
     return;
   }
   img.dataset.hasFailedFallback = '1';
@@ -40926,20 +41345,14 @@ function handlePosterImgError(img) {
           img.src = data.poster;
           img.style.display = '';
         } else {
-          img.style.display = 'none';
-          const ph = img.nextElementSibling;
-          if (ph) ph.style.display = 'flex';
+          showPosterPlaceholderFor(img);
         }
       })
       .catch(() => {
-        img.style.display = 'none';
-        const ph = img.nextElementSibling;
-        if (ph) ph.style.display = 'flex';
+        showPosterPlaceholderFor(img);
       });
   } else {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
   }
 }
 
@@ -46909,7 +47322,7 @@ self.addEventListener('fetch', e => {
         }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
-        const errMsg = String(err.message || err);
+        const errMsg = safeErrorMessage(err);
         if (isUserPersonal) {
           console.error("User personal catalog fetch error:", errMsg);
           return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
@@ -47159,7 +47572,7 @@ self.addEventListener('fetch', e => {
           const meta = buildChannelMeta(matchedEntry, url.origin);
           return jsonPublic({ meta: meta || null });
         } catch (err) {
-          return jsonPublic({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: safeErrorMessage(err) });
         }
       }
 
@@ -47176,7 +47589,7 @@ self.addEventListener('fetch', e => {
             { "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800" }
           );
         } catch (err) {
-          return jsonPublic({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: safeErrorMessage(err) });
         }
       }
 
@@ -47278,7 +47691,7 @@ self.addEventListener('fetch', e => {
         const lists = await fetchTopLists(MDBLIST_POPULAR_KEY, env, ctx);
         return json({ ok: true, lists });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47450,7 +47863,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, results });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47595,7 +48008,7 @@ self.addEventListener('fetch', e => {
           seasons,
         });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47626,7 +48039,7 @@ self.addEventListener('fetch', e => {
         }));
         return json({ ok: true, episodes });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47908,7 +48321,7 @@ self.addEventListener('fetch', e => {
         if (!resolved.length) return json({ ok: false, error: "Couldn't resolve any shows in that list to TMDB." });
         return json({ ok: true, shows: resolved });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47923,7 +48336,7 @@ self.addEventListener('fetch', e => {
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
         return json({ ok: true, imdbId: details.imdbId });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47939,7 +48352,7 @@ self.addEventListener('fetch', e => {
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this show." });
         return json({ ok: true, imdbId: details.imdbId });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47955,6 +48368,18 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
+      // Up to 24 ids, each costing a find + a recommendations call, so a
+      // single request is ~48 TMDB calls. Limited only when it falls back
+      // to the shared key, same reasoning as /api/details/batch above.
+      // The Discover tab issues one of these per load, so 30/minute is far
+      // more than any real session needs.
+      if (!body.tmdbKey) {
+        const recIp = clientIpKey(request);
+        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
+          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+        }
+      }
 
       const [movieLists, showLists] = await Promise.all([
         Promise.all(movieIds.map(async (rawId) => {
@@ -48244,7 +48669,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists: results.slice(0, 30) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err), lists: [] });
+        return json({ ok: false, error: safeErrorMessage(err), lists: [] });
       }
     }
 
@@ -48261,7 +48686,7 @@ self.addEventListener('fetch', e => {
         if (!traktKey) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + lists.length));
         return json({ ok: true, lists });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48476,7 +48901,7 @@ self.addEventListener('fetch', e => {
         if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
         return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48695,7 +49120,7 @@ self.addEventListener('fetch', e => {
         }
         return json({ ok: true, ...data });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -48769,7 +49194,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, access_token: data.access_token, username: traktUsername });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -48915,7 +49340,7 @@ self.addEventListener('fetch', e => {
           },
         });
       } catch (err) {
-        return failWith("network", String(err.message || err));
+        return failWith("network", safeErrorMessage(err));
       }
     }
 
@@ -49030,7 +49455,7 @@ self.addEventListener('fetch', e => {
           },
         });
       } catch (err) {
-        return failWith("network", String(err.message || err));
+        return failWith("network", safeErrorMessage(err));
       }
     }
 
@@ -49200,7 +49625,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists, username: simklUsername });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -49327,7 +49752,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", action, target, data: tData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49408,7 +49833,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("simkl", safeUserHash(token));
           return json({ ok: true, provider: "simkl", action, target: targetStatus, data: sData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49444,7 +49869,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "watchlist", data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -49467,7 +49892,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "favorite", data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -49490,7 +49915,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "custom", listId, data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
       }
@@ -49558,7 +49983,7 @@ self.addEventListener('fetch', e => {
                 lastErr = mData.error || `MDBList error (HTTP ${mRes.status})`;
               }
             } catch (err) {
-              lastErr = String(err.message || err);
+              lastErr = safeErrorMessage(err);
             }
           }
           if (!success) {
@@ -49594,7 +50019,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("mdblist", safeUserHash(token));
             return json({ ok: true, provider: "mdblist", action, target: "history", data: mData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -49629,7 +50054,7 @@ self.addEventListener('fetch', e => {
                 lastErr = mData.error || `MDBList error (HTTP ${mRes.status})`;
               }
             } catch (err) {
-              lastErr = String(err.message || err);
+              lastErr = safeErrorMessage(err);
             }
           }
           if (!success) {
@@ -49787,7 +50212,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", syncedCount: items.length, data: tData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49866,7 +50291,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("simkl", safeUserHash(token));
           return json({ ok: true, provider: "simkl", syncedCount: items.length, data: sData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49950,7 +50375,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("mdblist", safeUserHash(token));
           return json({ ok: true, provider: "mdblist", syncedCount: items.length, data: mData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50024,7 +50449,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50066,7 +50491,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50112,7 +50537,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50180,7 +50605,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50205,7 +50630,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("tmdb", safeUserHash(sessionId));
           return json({ ok: true, provider: "tmdb", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50271,7 +50696,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("mdblist", safeUserHash(token));
           return json({ ok: true, provider: "mdblist", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50796,7 +51221,7 @@ self.addEventListener('fetch', e => {
         const username = (result && result.username) || "";
         return json({ ok: true, lists, username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -50851,7 +51276,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, items: historyResult.items || [], hasMore: !!historyResult.hasMore });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51091,6 +51516,17 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true });
       let body;
       try { body = await request.json(); } catch { return json({ ok: true }); }
+      // recordSearchQuery keys `searchquery:{q}:days` on the query text
+      // itself, so like /api/track-event this is an unauthenticated write
+      // whose key name comes from the caller. Same per-IP bucket, same
+      // ok:true-on-limit behaviour (it's a beacon, not a feature).
+      const searchIp = clientIpKey(request);
+      if (!searchIp) return json({ ok: true });
+      const searchRateKey = `ratelimit:tracksearch:${searchIp}`;
+      const searchAttempts = parseInt((await env.CONFIGS.get(searchRateKey)) || "0", 10);
+      if (searchAttempts >= 30) return json({ ok: true });
+      ctx.waitUntil(env.CONFIGS.put(searchRateKey, String(searchAttempts + 1), { expirationTtl: 60 }));
+
       if (body && typeof body.query === "string" && body.query.trim()) {
         ctx.waitUntil(recordSearchQuery(env, body.query.trim()));
       }
@@ -51109,26 +51545,49 @@ self.addEventListener('fetch', e => {
       } catch {
         return json({ ok: true });
       }
+      // Unauthenticated, and every branch below writes a KV key derived
+      // from caller input -- so it gets the same per-IP bucket the other
+      // anonymous write endpoints here use. Returns ok:true rather than
+      // 429 on purpose: this is a fire-and-forget beacon, and a real
+      // client has nothing useful to do with a rejection.
+      // CONFIGS is guaranteed bound at this point (checked above).
+      const trackIp = clientIpKey(request);
+      if (!trackIp) return json({ ok: true });
+      const trackRateKey = `ratelimit:trackevent:${trackIp}`;
+      const trackAttempts = parseInt((await env.CONFIGS.get(trackRateKey)) || "0", 10);
+      if (trackAttempts >= 30) return json({ ok: true });
+      ctx.waitUntil(env.CONFIGS.put(trackRateKey, String(trackAttempts + 1), { expirationTtl: 60 }));
+
       const events = Array.isArray(body.events) ? body.events.slice(0, 50) : [];
-      const allowedTypes = new Set(["watched", "list-add", "list-copy", "catalog-add"]);
+      // "catalog-add" is deliberately absent: no client has ever sent it
+      // (installed catalogs are counted by /api/track-install, which feeds
+      // stats:sourcegroup: instead), so the only thing that branch could
+      // still do was let an anonymous caller mint stats:catalog_add: keys
+      // that nothing legitimate ever writes.
+      const allowedTypes = new Set(["watched", "list-add", "list-copy"]);
       await Promise.all(
         events.map((e) => {
           if (!e || !allowedTypes.has(e.eventType)) return Promise.resolve();
-          if (e.eventType === "catalog-add") {
-            const name = sanitizeStatGroupName(e.title || e.id);
-            if (name) return bumpStat(env, `catalog_add:${name}`);
-            return Promise.resolve();
-          }
           if (e.eventType === "list-copy") {
-            const slug = String(e.id || "").trim().slice(0, 100);
+            // Only this add-on's own lists, keyed by the slug the admin
+            // panel actually reads -- see recordListCopySlug (03_admin.js).
+            const slug = recordListCopySlug(e.id, url.origin);
             if (slug) return bumpStat(env, `list_copy:${slug}`);
             return Promise.resolve();
           }
           if (!e.id) return Promise.resolve();
+          // The id becomes part of three permanent KV key names
+          // (evtcount:/evtmeta:), so it is constrained to the shape a real
+          // title id actually has -- "tt123", "tt123:1:2", "tmdb:456",
+          // "channel_x", a bare TMDB number. Truncating to 100 characters
+          // bounded the length but not the contents, which let arbitrary
+          // text (including markup) end up in key names.
+          const evtId = String(e.id).trim();
+          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId)) return Promise.resolve();
           return recordTrackedEvent(
             env,
             e.eventType,
-            String(e.id).slice(0, 100),
+            evtId,
             String(e.title || "").slice(0, 200),
             e.mediaType === "series" ? "series" : "movie"
           );
@@ -51363,7 +51822,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51445,7 +51904,7 @@ self.addEventListener('fetch', e => {
                 hasMore = false;
               }
             } catch (e) {
-              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: String(e.message || e) });
+              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: safeErrorMessage(e) });
               break;
             }
           }
@@ -51493,7 +51952,7 @@ self.addEventListener('fetch', e => {
                 hasMore = false;
               }
             } catch (e) {
-              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: String(e.message || e) });
+              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: safeErrorMessage(e) });
               break;
             }
           }
@@ -51501,7 +51960,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, items: allItems, debug: logs });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51550,7 +52009,7 @@ self.addEventListener('fetch', e => {
           traktAccessToken
         });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51564,6 +52023,19 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) {
         return json({ ok: false, error: "no-kv" });
       }
+      // Unauthenticated, and each call writes a permanent KV key (the
+      // install config) that nothing ever expires or deletes. Generous
+      // bucket -- regenerating an install link a few times while adjusting
+      // rows is normal -- but not unlimited.
+      const saveIp = clientIpKey(request);
+      if (!saveIp) return json({ ok: false, error: "Could not process this request." }, 400);
+      const saveRateKey = `ratelimit:save:${saveIp}`;
+      const saveAttempts = parseInt((await env.CONFIGS.get(saveRateKey)) || "0", 10);
+      if (saveAttempts >= 20) {
+        return json({ ok: false, error: "Too many saves just now. Please wait a minute and try again." }, 429);
+      }
+      await env.CONFIGS.put(saveRateKey, String(saveAttempts + 1), { expirationTtl: 60 });
+
       let body;
       try {
         body = await request.json();
@@ -51573,6 +52045,15 @@ self.addEventListener('fetch', e => {
       const entries = Array.isArray(body.entries) ? body.entries : [];
       if (!entries.length) {
         return json({ ok: false, error: "No lists provided." }, 400);
+      }
+      // A config is a list of catalog rows; the builder's own URL-length
+      // problem (see generateShortId's comment) starts around 20 rows, so
+      // this ceiling is orders of magnitude above real use and only
+      // rejects a payload built to waste storage. Rejected, not truncated
+      // -- a silently shortened install config would be worse than an
+      // error.
+      if (entries.length > SAVED_CONFIG_ENTRIES_MAX) {
+        return json({ ok: false, error: "Too many lists in that configuration." }, 413);
       }
       const payload = { entries };
       if (body.tmdbKey) payload.tmdbKey = body.tmdbKey;
@@ -51594,18 +52075,38 @@ self.addEventListener('fetch', e => {
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
 
+      const savePayload = JSON.stringify(payload);
+      // Row count alone is not a size bound -- a row carries a URL, a
+      // name and a group. Checked on the exact bytes about to be stored.
+      if (savePayload.length > SAVED_CONFIG_BYTES_MAX) {
+        return json({ ok: false, error: "That configuration is too large to save." }, 413);
+      }
+
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
         id = generateShortId();
         const existing = await env.CONFIGS.get(id);
         if (!existing) break;
       }
-      await env.CONFIGS.put(id, JSON.stringify(payload));
+      await env.CONFIGS.put(id, savePayload);
       return json({ ok: true, id });
     }
 
     if (path === "/api/publish-list" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      // Unauthenticated, and every call mints a permanent KV key that no
+      // route in this Worker can ever delete again. Same per-IP bucket as
+      // /api/creator/create, just a little more permissive because
+      // publishing several lists in one sitting is normal.
+      const plIp = clientIpKey(request);
+      if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
+      const plRateKey = `ratelimit:publishlist:${plIp}`;
+      const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
+      if (plAttempts >= 10) {
+        return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
+      }
+      await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
+
       let plBody;
       try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
       const baseSlug = slugifyServer(plBody.name || "");
@@ -51613,6 +52114,20 @@ self.addEventListener('fetch', e => {
       const plItems = Array.isArray(plBody.items) ? plBody.items : [];
       if (!baseSlug) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!plType) return json({ ok: false, error: "Missing or invalid list type." }, 400);
+      // Bounds, deliberately REJECTING rather than truncating: silently
+      // storing a shortened list is exactly the kind of quiet data loss
+      // this endpoint should not be capable of, and a real list that is
+      // over the limit deserves to be told so. The ceilings are far above
+      // anything genuine -- a real account's largest observed list was
+      // ~1,200 items (see compactCustomListItem, 22_client-creator-
+      // profile.js) -- and exist only to stop an anonymous caller storing
+      // multi-megabyte payloads permanently.
+      if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
+        return json({ ok: false, error: "That list name is too long." }, 400);
+      }
+      if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
       let listSlug = baseSlug;
       let plKey = "publishedlist:user:" + listSlug;
       for (let attempt = 2; attempt <= 500; attempt++) {
@@ -51623,7 +52138,15 @@ self.addEventListener('fetch', e => {
       }
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
+      // Item COUNT alone is not a size bound -- individual items carry
+      // titles, overviews and poster URLs, so a few thousand of them can
+      // still be many megabytes. This is the bound that actually protects
+      // storage, checked on the exact bytes about to be written.
+      if (plPayload.length > PUBLISHED_LIST_BYTES_MAX) {
+        return json({ ok: false, error: "That list is too large to publish." }, 413);
+      }
+      await env.CONFIGS.put(plKey, plPayload);
       // Anonymous publishes belong in the directory index too.
       if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
@@ -51682,27 +52205,55 @@ self.addEventListener('fetch', e => {
       // search, and the admin dashboard all read it from there and none of
       // them should have to open a ledger per list. Derived from the
       // ledger, never incremented, so it cannot drift upward on its own.
+      //
+      // Re-read before writing. `likeData` was parsed before applyLikeVote,
+      // which spends several KV round-trips on the ledger (up to four
+      // read/write/verify attempts under contention). Writing that stale
+      // snapshot back put the WHOLE record -- items included -- on top of
+      // whatever landed in the meantime, so a like arriving while the
+      // list's owner was saving silently reverted their edit, with both
+      // requests returning 200. Only the one field this route owns gets
+      // written, onto the current record.
       if ((likeData.likes || 0) !== count) {
-        likeData.likes = count;
-        await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
-        // The directory ranks by likes, so the index has to see this or the
-        // ordering freezes at whatever it was when the index was built.
-        // Only on an actual change -- a repeated like writes nothing.
-        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
-        // `c:<user>:<slug>` -- using the wrong prefix here would append a
-        // duplicate entry instead of updating the existing one.
-        const likeIsCreator = likeKey === likeCreatorKey;
-        if (isPublicListVisibility(likeData.visibility)) {
-          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
-            isCreator: likeIsCreator,
-            username: likeIsCreator ? likeUser : "user",
-            slug: likeSlug,
-            name: likeData.name || "List",
-            type: likeData.type || "mixed",
-            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
-            likes: count,
-            updatedAt: likeData.updatedAt || likeData.createdAt || null,
-          }));
+        // Re-read, then copy only `likes` onto the CURRENT record. If it
+        // vanished or turned unparseable while the vote was being
+        // recorded, write nothing at all: the ledger already holds the
+        // vote, and re-creating the record from a stale copy would be
+        // worse than leaving the denormalised count to catch up on the
+        // next like.
+        const freshRaw = await env.CONFIGS.get(likeKey);
+        let updated = null;
+        if (freshRaw) {
+          try {
+            updated = JSON.parse(freshRaw);
+            updated.likes = count;
+          } catch {
+            updated = null;
+          }
+        }
+        if (updated) {
+          await env.CONFIGS.put(likeKey, JSON.stringify(updated));
+          // The directory ranks by likes, so the index has to see this or the
+          // ordering freezes at whatever it was when the index was built.
+          // Only on an actual change -- a repeated like writes nothing.
+          // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+          // `c:<user>:<slug>` -- using the wrong prefix here would append a
+          // duplicate entry instead of updating the existing one.
+          // Fed from `updated`, not the pre-vote snapshot, so the indexed
+          // name/type/itemCount match what is actually stored.
+          const likeIsCreator = likeKey === likeCreatorKey;
+          if (isPublicListVisibility(updated.visibility)) {
+            ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+              isCreator: likeIsCreator,
+              username: likeIsCreator ? likeUser : "user",
+              slug: likeSlug,
+              name: updated.name || "List",
+              type: updated.type || "mixed",
+              itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
+              likes: count,
+              updatedAt: updated.updatedAt || updated.createdAt || null,
+            }));
+          }
         }
       }
 
@@ -51811,6 +52362,19 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
+      // Rate-limited only when this falls back to the Worker owner's shared
+      // TMDB key. A visitor who supplied their own is spending their own
+      // quota, so there is nothing here to protect them from -- and
+      // throttling them would break exactly the power users who set a key
+      // up. 60/minute leaves plenty of room for the real bulk caller
+      // (refreshAiringNext pages a large Watch History 60 ids at a time).
+      if (!reqBody.tmdbKey) {
+        const batchIp = clientIpKey(request);
+        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
+          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
+        }
+      }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";
       const region = reqBody.region || "";
@@ -52276,21 +52840,46 @@ self.addEventListener('fetch', e => {
           }
         }
 
-        // Auto-remove watched item from user's Creator Watchlist if present
+        // Auto-remove watched item from user's Creator Watchlist if present.
+        //
+        // This used to enumerate the account's whole creatorlist: prefix and
+        // then GET every single list, on EVERY playback ping, just to find
+        // the one named "Watchlist" -- so the cost of a ping scaled with how
+        // many lists the person owns. The enumeration also had no cursor, so
+        // past a thousand lists it silently stopped looking.
+        //
+        // The watchlist has a canonical key: /api/creator/sync/save-tracking
+        // writes creatorlist:{user}:watchlist directly, and slugifyServer
+        // turns any list actually named "Watchlist" into that same slug. So
+        // the common path is one GET. The scan survives only as a fallback
+        // for the shapes the old loop also accepted (an isWatchlist flag, or
+        // a name that slugified differently), and is now paged and bounded
+        // rather than silently truncating.
         try {
-          const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:` });
-          for (const k of (listKeys.keys || [])) {
-            const rawList = await env.CONFIGS.get(k.name);
-            if (!rawList) continue;
+          const removeWatchedFrom = async (key, rawList) => {
+            if (!rawList) return;
             const l = JSON.parse(rawList);
-            const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
-            if (isWatchlist && Array.isArray(l.items) && l.items.length) {
-              const initLen = l.items.length;
-              l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
-              if (l.items.length !== initLen) {
-                l.updatedAt = Date.now();
-                await env.CONFIGS.put(k.name, JSON.stringify(l));
-              }
+            if (!Array.isArray(l.items) || !l.items.length) return;
+            const initLen = l.items.length;
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+            if (l.items.length !== initLen) {
+              l.updatedAt = Date.now();
+              await env.CONFIGS.put(key, JSON.stringify(l));
+            }
+          };
+
+          const canonicalKey = `creatorlist:${auth.username}:watchlist`;
+          const canonicalRaw = await env.CONFIGS.get(canonicalKey);
+          if (canonicalRaw) {
+            await removeWatchedFrom(canonicalKey, canonicalRaw);
+          } else {
+            const listKeys = await listAllKeys(env.CONFIGS, `creatorlist:${auth.username}:`, 200);
+            for (const k of (listKeys.keys || [])) {
+              const rawList = await env.CONFIGS.get(k.name);
+              if (!rawList) continue;
+              const l = JSON.parse(rawList);
+              const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
+              if (isWatchlist) await removeWatchedFrom(k.name, rawList);
             }
           }
         } catch {}
@@ -54632,7 +55221,7 @@ self.addEventListener('fetch', e => {
           });
         return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -55108,7 +55697,7 @@ self.addEventListener('fetch', e => {
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
       
-      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
       // 1. Creators
       const cKeys = await listAllKeys(env.CONFIGS, "creator:");
@@ -55191,6 +55780,48 @@ self.addEventListener('fetch', e => {
           } catch (e) {
             results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
           }
+        }
+      }
+
+      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+      //
+      // Until these are copied across, each counter falls back to its KV
+      // value rather than reporting zero (see readStatCount, 03_admin.js),
+      // so a dashboard's history never visibly vanishes just because D1 got
+      // bound. After this runs, D1 is authoritative and the KV copies are
+      // inert.
+      //
+      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+      // safe to run more than once (the admin button can be pressed again,
+      // and the other three sections above are idempotent too), and an
+      // additive upsert here would double every counter on the second run.
+      // sourcegroup: is skipped -- section 3 above already migrated it into
+      // its own table, and copying it here too would count it twice in the
+      // Installed Catalogs panel, which sums both.
+      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
+      for (const k of statKeys.keys) {
+        const rest = k.name.slice("stats:".length);
+        const sep = rest.lastIndexOf(":");
+        if (sep === -1) continue;
+        const kind = rest.slice(0, sep);
+        const bucket = rest.slice(sep + 1);
+        if (!kind || !bucket) continue;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        // Only the numeric counters. stats:genres:alltime and
+        // stats:decades:alltime are JSON blobs, and
+        // stats:genredecade:migrated is a sentinel -- none of them belong
+        // in an integer column.
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
+        const raw = await env.CONFIGS.get(k.name);
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n)) continue;
+        try {
+          await env.DB.prepare(
+            "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
+          ).bind(kind, bucket, n).run();
+          results.stats++;
+        } catch (e) {
+          results.errors.push(`Stat ${k.name}: ` + e.message);
         }
       }
 
@@ -55571,7 +56202,7 @@ self.addEventListener('fetch', e => {
         return json({ ok: true, searches }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "catalogs_lists") {
-        const data = await computeCatalogAndCommunityLeaderboards(env);
+        const data = await computeCatalogAndCommunityLeaderboards(env, ctx);
         return json({ ok: true, ...data }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "audience") {
@@ -55672,7 +56303,7 @@ self.addEventListener('fetch', e => {
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         return json({ ok: true, region, providerId, movies, shows }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -55722,7 +56353,7 @@ self.addEventListener('fetch', e => {
         results = results.slice(0, 40).map((p) => ({ id: p.id, name: p.name }));
         return json({ ok: true, results }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -55824,6 +56455,32 @@ self.addEventListener('fetch', e => {
       }
       if (!bulkBody || !Array.isArray(bulkBody.items)) {
         return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      // Unauthenticated, and unlike every other TMDB route here this one
+      // has no per-user key override at all -- it ALWAYS spends the Worker
+      // owner's shared TMDB_API_KEY (see the comment on tmdbCallCount
+      // below). Two things were missing:
+      //
+      // 1. A bound on `items`. The loop below issues up to two TMDB calls
+      //    per item, so a single request with a few thousand items blew
+      //    straight past Cloudflare's per-invocation subrequest limit --
+      //    which meant large Letterboxd imports were already failing here
+      //    -- while spending the owner's TMDB quota on the way.
+      // 2. A rate limit, so the same request cannot simply be repeated.
+      //
+      // The cap rejects rather than truncates: silently resolving the
+      // first N films of an import and dropping the rest is exactly the
+      // kind of quiet data loss this audit was about. The client chunks
+      // its own requests to this size (see resolveViaBulkResolve,
+      // 18_client-copy-and-trakt-export.js), so a real import of any size
+      // still completes -- it just arrives as several bounded calls.
+      const bulkIp = clientIpKey(request);
+      if (!bulkIp) return json({ ok: false, error: "Could not resolve those titles." }, 400);
+      if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
+        return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
+      }
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       try {
         const body = bulkBody;

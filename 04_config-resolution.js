@@ -373,47 +373,6 @@ async function fetchTopLists(apikey, env = null, ctx = null) {
   });
 }
 
-// Searches trakt.tv's public lists by name via their official search API.
-// Only needs the fixed TRAKT_CLIENT_ID (same key used for fetching list
-// items) — no user auth required for public list search.
-// Peeks at a small sample of a Trakt list's items (unfiltered by type) to
-// determine whether it's a movies list, a shows list, or genuinely mixed --
-// used so the "Search Lists" results can offer just one relevant Add
-// button instead of always defensively offering both. A shallow sample
-// (not the whole list) is a deliberate trade-off: correct for the
-// overwhelmingly common case of a single-type list, and falls back to
-// "unknown" (both buttons, the previous always-safe behavior) for anything
-// ambiguous or genuinely mixed.
-async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
-  const src = `https://api.trakt.tv/users/${encodeURIComponent(user)}/lists/${encodeURIComponent(
-    slug
-  )}/items?limit=20`;
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey || TRAKT_CLIENT_ID,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    };
-    if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-    const res = await fetchTraktWithRetry(src, {
-      headers,
-      cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 86400, cacheEverything: true },
-    });
-    if (!res.ok) return "unknown";
-    const data = await res.json();
-    const items = Array.isArray(data) ? data : [];
-    const hasMovie = items.some((it) => it.movie);
-    const hasShow = items.some((it) => it.show);
-    if (hasMovie && hasShow) return "mixed";
-    if (hasMovie) return "movie";
-    if (hasShow) return "series";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 async function searchTraktLists(query, traktKeyOverride) {
   const rawQ = (query || "").trim();
   if (!rawQ) return [];

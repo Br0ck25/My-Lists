@@ -346,39 +346,6 @@ function trailerStreamsFor(ytKey) {
   return ytKey ? [{ title: "Trailer", ytId: ytKey }] : undefined;
 }
 
-// For items that only carry an IMDB id (mdblist/Trakt sources never expose
-// a TMDB id), resolving a trailer needs an extra round trip: TMDB's /find
-// endpoint to translate imdb_id -> tmdb_id, then a /videos call on that id.
-// Both legs are hard-cached at Cloudflare's edge (shared across every user
-// of the add-on, same as fetchTmdbDetails below), so this only costs a real
-// TMDB request the first time any list anywhere references a given title.
-// Best-effort: any failure just means no trailer, never a broken catalog.
-async function fetchTrailerForImdb(imdbId, type, apiKey) {
-  if (!apiKey || !imdbId) return null;
-  try {
-    const findRes = await fetch(
-      `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(apiKey)}&external_source=imdb_id`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!findRes.ok) return null;
-    const findData = await findRes.json();
-    const kind = type === "series" ? "tv" : "movie";
-    const resultsKey = kind === "tv" ? "tv_results" : "movie_results";
-    const match = (findData[resultsKey] || [])[0];
-    if (!match) return null;
-
-    const videosRes = await fetch(
-      `https://api.themoviedb.org/3/${kind}/${match.id}/videos?api_key=${encodeURIComponent(apiKey)}`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!videosRes.ok) return null;
-    const videosData = await videosRes.json();
-    return pickTrailerKey(videosData.results);
-  } catch {
-    return null;
-  }
-}
-
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
 // fetchTmdbDetails's append_to_response=videos, see below).
@@ -1819,10 +1786,35 @@ async function checkForNewEpisodes(env) {
     }
 
     if (blobChanged || stillFullyWatched.length !== fullyWatched.length) {
-      blob.continueWatching = continueWatching;
-      blob.fullyWatchedShowIds = stillFullyWatched;
-      blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
+      // Re-read before writing, and write only the two fields this sweep
+      // actually computes.
+      //
+      // `blob` was read at the top of this account's turn, and everything
+      // since has been TMDB network I/O -- seconds, not milliseconds. The
+      // old code wrote that whole snapshot back, so anything the account's
+      // own browser saved in the meantime (a newly watched episode, a
+      // refreshed Airing Next, recomputed recommendations) was silently
+      // reverted, with the save and the cron both reporting success.
+      //
+      // /api/creator/sync/save-tracking already guards the mirror image of
+      // this -- a stale CLIENT push wiping a server-side scrobble -- with
+      // a rescue-merge. This is the same hazard in the other direction,
+      // and the same reasoning applies: the writer must only own the
+      // fields it computed.
+      const targetKey = `creatorsynctracking:${username}`;
+      let target = blob;
+      try {
+        const freshRaw = await env.CONFIGS.get(targetKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {
+        // Unreadable/unparseable right now -- fall back to the snapshot we
+        // already have rather than dropping a real Continue Watching update.
+        target = blob;
+      }
+      target.continueWatching = continueWatching;
+      target.fullyWatchedShowIds = stillFullyWatched;
+      target.updatedAt = Date.now();
+      await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
 }

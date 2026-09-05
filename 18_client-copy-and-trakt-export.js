@@ -686,6 +686,39 @@ async function markSimklListAllWatched(btn) {
   }
 }
 
+// Sends an arbitrarily large title list to /api/bulk-resolve in bounded
+// chunks and returns every resolved row together.
+//
+// That endpoint issues up to two TMDB calls per item and always spends the
+// Worker owner's shared key, so it now caps a single request at
+// BULK_RESOLVE_ITEMS_MAX (see 00_constants.js). Sending a whole category
+// in one request, as this used to, exceeded Cloudflare's per-invocation
+// subrequest limit well before the cap existed -- so a big Letterboxd
+// import did not partly work, it failed the category outright. Chunking
+// makes an import of any size succeed as several bounded calls, and the
+// chunk size comes from the same constant the server validates against so
+// the two cannot drift apart.
+//
+// Throws on the first failed chunk, matching the previous single-request
+// behaviour: each caller already has its own catch that reports the
+// category as failed rather than silently importing half of it.
+async function bulkResolveInChunks(items) {
+  const list = Array.isArray(items) ? items : [];
+  const CHUNK = ${BULK_RESOLVE_ITEMS_MAX};
+  const out = [];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const res = await fetch(ORIGIN + '/api/bulk-resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: list.slice(i, i + CHUNK) }),
+    });
+    const data = await res.json();
+    if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
+    if (Array.isArray(data.resolved)) out.push.apply(out, data.resolved);
+  }
+  return out;
+}
+
 // --- Import from Trakt export --------------------------------------------
 //
 // Trakt VIP's own export (Settings > Data > Export on trakt.tv) is a .zip
@@ -1189,15 +1222,9 @@ window.runLetterboxdExportImport = async function() {
     // Bulk resolve
     const resolvedItems = [];
     try {
-      const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: uniqueItems }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'unknown error');
-      
-      for (const m of data.resolved) {
+      const resolvedAll = await bulkResolveInChunks(uniqueItems);
+
+      for (const m of resolvedAll) {
         if (!m.imdbId) continue;
         resolvedItems.push({
           imdbId: m.imdbId,
@@ -1799,29 +1826,25 @@ async function runUnifiedListImport() {
     const toResolve = rawItems.filter(it => !it.imdbId && it.title);
     if (toResolve.length > 0) {
       try {
-        const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: toResolve }),
+        const resolvedAll = await bulkResolveInChunks(toResolve);
+        const resolvedMap = new Map();
+        resolvedAll.forEach(r => {
+          if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
         });
-        const data = await res.json();
-        if (data.ok && Array.isArray(data.resolved)) {
-          const resolvedMap = new Map();
-          data.resolved.forEach(r => {
-            if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
-          });
-          rawItems.forEach(it => {
-            if (!it.imdbId && it.title) {
-              const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
-              if (found && found.imdbId) {
-                it.imdbId = found.imdbId;
-                it.id = found.imdbId;
-                it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
-              }
+        rawItems.forEach(it => {
+          if (!it.imdbId && it.title) {
+            const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
+            if (found && found.imdbId) {
+              it.imdbId = found.imdbId;
+              it.id = found.imdbId;
+              it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
             }
-          });
-        }
-      } catch (e) {}
+          }
+        });
+      } catch (e) {
+        // Same as before: an unresolved title keeps whatever metadata it
+        // already had and the import continues.
+      }
     }
 
     const finalItems = rawItems.map(it => ({

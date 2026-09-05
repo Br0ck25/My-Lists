@@ -1365,3 +1365,819 @@ describe("delete-account confirmation", () => {
     assert.equal(restore.status, 401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Audit 2026-09-05 -- regression tests for the four production blockers.
+// Each test fails against the code as it was before the corresponding fix.
+// ---------------------------------------------------------------------------
+
+describe("audit fix 1: /api/track-event cannot mint unbounded KV keys", () => {
+  it("ignores list-copy ids that are not one of this add-on's own list URLs", async () => {
+    const env = makeEnv();
+    const events = [];
+    for (let i = 0; i < 40; i++) {
+      events.push({ eventType: "list-copy", id: "SPAM-<img src=x onerror=alert(1)>-" + i });
+    }
+    // External provider URLs are legitimate input but are not lists this
+    // dashboard can show a copy count for -- they must not mint keys either.
+    events.push({ eventType: "list-copy", id: "https://mdblist.com/lists/someone/their-list" });
+    const r = await call(env, "/api/track-event", { method: "POST", json: { events } });
+    assert.equal(r.status, 200);
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("stats:list_copy:"));
+    assert.deepEqual(minted, [], `expected no keys, got ${JSON.stringify(minted.slice(0, 3))}`);
+  });
+
+  it("still records a copy of one of this add-on's own lists, keyed by its slug", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "list-copy", id: "https://example.test/lists/alice/top-ten" }] },
+    });
+    assert.equal(r.status, 200);
+    // Keyed by slug alone -- which is what computeCatalogAndCommunityLeaderboards
+    // looks up (copiesBySlug.get(data.slug)), so the count is now actually readable.
+    assert.equal(env.CONFIGS._store.get("stats:list_copy:top-ten:total"), "1");
+  });
+
+  it("rejects watched/list-add ids that are not real title-id shapes", async () => {
+    const env = makeEnv();
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "<script>alert(1)</script>", title: "x" }] },
+    });
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtcount:") || k.startsWith("evtmeta:"));
+    assert.deepEqual(minted, []);
+
+    // A genuine id still works.
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "tt1234567", title: "Real Movie" }] },
+    });
+    assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("evtcount:watched:tt1234567:")));
+  });
+
+  it("rate-limits repeated anonymous beacons from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    for (let i = 0; i < 40; i++) {
+      await call(env, "/api/track-event", {
+        method: "POST",
+        ip,
+        json: { events: [{ eventType: "watched", id: "tt" + i }] },
+      });
+    }
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtmeta:watched:"));
+    assert.ok(minted.length <= 30, `expected the per-IP cap to stop this at 30, got ${minted.length}`);
+  });
+
+  it("admin catalogs/lists panel stays within a bounded subrequest budget", async () => {
+    const env = makeEnv();
+    // Far more keys than any real deployment, as an attacker would have left behind.
+    for (let i = 0; i < 3000; i++) await env.CONFIGS.put(`stats:list_copy:spam-${i}:total`, "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    let ops = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const origList = env.CONFIGS.list.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { ops++; return origGet(...a); };
+    env.CONFIGS.list = async (...a) => { ops++; return origList(...a); };
+
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    assert.equal(r.status, 200, "panel must still render, not throw");
+    // Cloudflare allows 1,000 subrequests per invocation. Before the caps this
+    // was 1:1 with the key count (3,000 here) and the panel broke permanently.
+    assert.ok(ops < 1000, `expected a bounded subrequest count, got ${ops}`);
+  });
+});
+
+describe("audit fix 2: a like cannot revert a concurrent list save", () => {
+  it("keeps the creator's newer items when a like lands mid-save", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicelikerace");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }],
+      },
+    });
+    const listKey = [...env.CONFIGS._store.keys()].find((k) => k.startsWith("creatorlist:alicelikerace:"));
+
+    // Park the like immediately after it reads the list record, which is
+    // the exact window applyLikeVote's KV round-trips used to leave open.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === listKey && ++reads === 1) await gate;
+      return v;
+    };
+
+    const likeP = call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: "alicelikerace", slug: "race-list", action: "like" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug: "race-list",
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }, { id: "tt3" }, { id: "tt4" }, { id: "tt5" }],
+      },
+    });
+    release();
+    await likeP;
+
+    const stored = JSON.parse(env.CONFIGS._store.get(listKey));
+    assert.equal(stored.items.length, 5, "the like must not write back its pre-vote snapshot");
+    assert.equal(stored.likes, 1, "and the like itself must still be recorded");
+  });
+});
+
+describe("audit fix 4: unauthenticated permanent writes are bounded", () => {
+  it("rejects an oversized published list instead of storing it", async () => {
+    const env = makeEnv();
+    const items = Array.from({ length: 20000 }, (_, i) => ({ id: "tt" + i, title: "X".repeat(200) }));
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "spam list", type: "movie", items },
+    });
+    assert.equal(r.status, 413);
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0);
+  });
+
+  it("still publishes a realistically large list", async () => {
+    const env = makeEnv();
+    // Larger than the biggest real account list observed (~1,200 items).
+    const items = Array.from({ length: 2000 }, (_, i) => ({ id: "tt" + i }));
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "Big But Real", type: "movie", items },
+    });
+    assert.equal(r.body.ok, true, `expected a normal publish to succeed, got ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert.equal(JSON.parse(env.CONFIGS._store.get("publishedlist:user:big-but-real")).items.length, 2000,
+      "and it must be stored in full, not silently truncated");
+  });
+
+  it("rate-limits repeated anonymous publishes from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 15; i++) {
+      const r = await call(env, "/api/publish-list", {
+        method: "POST", ip,
+        json: { name: "list " + i, type: "movie", items: [{ id: "tt1" }] },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 15 rapid publishes");
+  });
+
+  it("rejects an oversized install config instead of storing it", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 900 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.status, 413);
+  });
+
+  it("still saves a normal install config", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 30 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.body.ok, true);
+    assert.ok(r.body.id);
+  });
+});
+
+describe("audit fix 3: the Continue Watching cron cannot revert a concurrent save", () => {
+  it("keeps watch history a user saved while the cron sweep was mid-flight", async () => {
+    const env = makeEnv();
+    env.TMDB_API_KEY = "test-tmdb-key";
+    const bob = await createUser(env, "bobcronrace");
+    const TKEY = "creatorsynctracking:bobcronrace";
+    await env.CONFIGS.put(TKEY, JSON.stringify({
+      watchHistory: [{ id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 }],
+      continueWatching: [], fullyWatchedShowIds: ["tt9"], updatedAt: 1000,
+    }));
+
+    // Minimal TMDB stub: resolve tt9 -> 55, and report an unwatched S1E3 so
+    // the sweep actually has a Continue Watching update to write.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      const url = String(u);
+      const J = (o) => new Response(JSON.stringify(o), { headers: { "content-type": "application/json" } });
+      if (url.includes("/find/")) return J({ tv_results: [{ id: 55 }] });
+      if (/\/tv\/55\/season\/1\b/.test(url)) {
+        return J({ episodes: [
+          { id: 990, episode_number: 2, name: "Ep2", air_date: "2020-01-01" },
+          { id: 991, episode_number: 3, name: "Brand New Ep", air_date: "2020-01-08" },
+        ]});
+      }
+      return J({ episodes: [] });
+    };
+
+    // Park the cron right after ITS OWN read of the tracking blob (the
+    // second read of that key -- the first belongs to ensureTrackingMigrated),
+    // which stands in for the TMDB round-trips that make this window seconds wide.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    let cronPhase = true;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === TKEY && cronPhase && ++reads === 2) await gate;
+      return v;
+    };
+
+    try {
+      const pending = [];
+      worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+      await new Promise((r) => setTimeout(r, 40));
+
+      cronPhase = false;
+      await call(env, "/api/creator/sync/save-tracking", {
+        method: "POST",
+        json: {
+          creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+          fullyWatchedShowIds: ["tt9"], continueWatching: [],
+          watchHistory: [
+            { id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 },
+            { id: "tt7", type: "movie", title: "Just Watched This", watchedAt: Date.now() },
+          ],
+        },
+      });
+
+      release();
+      await Promise.all(pending);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const stored = JSON.parse(env.CONFIGS._store.get(TKEY));
+      assert.ok(
+        stored.watchHistory.some((i) => i.id === "tt7"),
+        "the cron must not write its stale snapshot over what the user just saved"
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("audit fix 8: handlePosterImgError works for every call site's markup", () => {
+  // Minimal DOM stand-ins -- enough for the placeholder logic, no jsdom.
+  function makeEl(tag, className = "") {
+    const el = {
+      tagName: tag.toUpperCase(),
+      className,
+      style: {},
+      dataset: {},
+      children: [],
+      parentElement: null,
+      innerHTML: "",
+      get classList() {
+        const self = this;
+        return { contains: (c) => String(self.className).split(/\s+/).includes(c) };
+      },
+      get nextElementSibling() {
+        if (!this.parentElement) return null;
+        const sibs = this.parentElement.children;
+        return sibs[sibs.indexOf(this) + 1] || null;
+      },
+      appendChild(child) { child.parentElement = this; this.children.push(child); return child; },
+      closest() { return null; },
+      querySelector(sel) {
+        const want = sel.replace(":scope > ", "").replace(".", "");
+        return this.children.find((c) => String(c.className).split(/\s+/).includes(want)) || null;
+      },
+    };
+    return el;
+  }
+  function load() {
+    const doc = { createElement: (t) => makeEl(t) };
+    return loadOneClientFunction("23_client-list-management.js", "handlePosterImgError", {
+      document: doc,
+      ORIGIN: "https://example.test",
+      fetch: () => Promise.reject(new Error("no network")),
+      showPosterPlaceholderFor: loadOneClientFunction(
+        "23_client-list-management.js", "showPosterPlaceholderFor", { document: doc }
+      ),
+    });
+  }
+
+  it("reveals the existing placeholder when the markup provides one as the next sibling", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    const ph = wrap.appendChild(makeEl("div", "live-preview-poster live-preview-poster-placeholder"));
+    ph.style.display = "none";
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    assert.equal(ph.style.display, "flex", "the provided placeholder should be shown");
+    assert.equal(wrap.children.length, 2, "and no second placeholder should be created");
+  });
+
+  it("creates a placeholder when the markup has no placeholder sibling", () => {
+    const handle = load();
+    // The list-card mini tile shape: img, then a remove button, then a
+    // breakpoint-scoped count badge. Neither is a placeholder.
+    const wrap = makeEl("div", "list-card-mini-poster-img-wrap");
+    const img = wrap.appendChild(makeEl("img"));
+    const removeBtn = wrap.appendChild(makeEl("button", "cw-remove-btn"));
+    const countBadge = wrap.appendChild(makeEl("div", "list-card-count-overlay desktop-only"));
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    // The actual regression: the old code set display:flex on whatever sat
+    // next to the img. On the count badge that overrode the media query
+    // that hides it at the other breakpoint, and no placeholder ever
+    // appeared -- just an empty gap.
+    assert.equal(removeBtn.style.display, undefined, "must not touch the remove button");
+    assert.equal(countBadge.style.display, undefined, "must not override the badge's breakpoint CSS");
+    const created = wrap.children.find((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.ok(created, "a 'No poster' placeholder should have been created");
+    assert.equal(created.style.display, "flex");
+    assert.match(created.innerHTML, /No poster/);
+  });
+
+  it("does not stack placeholders when called twice", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    handle(img);
+    const phs = wrap.children.filter((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.equal(phs.length, 1);
+  });
+
+  it("handles an img with no sibling at all (the swapped-in fallback image)", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    assert.ok(wrap.children.some((c) => String(c.className).includes("live-preview-poster-placeholder")));
+  });
+});
+
+describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
+  it("rejects a bulk-resolve request larger than the server's fan-out cap", async () => {
+    const env = makeEnv();
+    const items = Array.from({ length: 500 }, (_, i) => ({ title: "Film " + i, year: 2000 }));
+    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items } });
+    // Two TMDB calls per item: 500 items would have been ~1,000 subrequests,
+    // past Cloudflare's per-invocation limit, on the owner's shared key.
+    assert.equal(r.status, 413);
+  });
+
+  it("rate-limits repeated bulk-resolve calls from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 25; i++) {
+      const r = await call(env, "/api/bulk-resolve", {
+        method: "POST", ip, json: { items: [{ title: "X", year: 2000 }] },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 25 rapid calls");
+  });
+
+  it("rate-limits /api/details/batch only when it falls back to the shared TMDB key", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let sharedLimited = 0;
+    for (let i = 0; i < 70; i++) {
+      const r = await call(env, "/api/details/batch", { method: "POST", ip, json: { ids: ["tt1"] } });
+      if (r.status === 429) sharedLimited++;
+    }
+    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+
+    // A visitor who supplied their own key spends their own quota, so the
+    // limit must not apply to them -- throttling them would penalise
+    // exactly the users who bothered to configure a key.
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 70; i++) {
+      const r = await call(env, "/api/details/batch", {
+        method: "POST", ip: ownKeyIp, json: { ids: ["tt1"], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0, "callers using their own TMDB key must never be rate-limited");
+  });
+
+  it("rate-limits /api/recommendations only when it falls back to the shared TMDB key", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", { method: "POST", ip, json: { movieIds: [] } });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0);
+  });
+
+  it("client chunks bulk-resolve to exactly the size the server accepts", () => {
+    // The chunk size is interpolated from the same server constant the
+    // route validates against, so the two cannot drift apart.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "18_client-copy-and-trakt-export.js"), "utf8");
+    assert.match(src, /const CHUNK = \$\{BULK_RESOLVE_ITEMS_MAX\};/,
+      "the client chunk size must come from BULK_RESOLVE_ITEMS_MAX, not a hardcoded number");
+    const constants = fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8");
+    const m = constants.match(/const BULK_RESOLVE_ITEMS_MAX = (\d+);/);
+    assert.ok(m, "BULK_RESOLVE_ITEMS_MAX should be defined in 00_constants.js");
+    // ~2 TMDB calls per item must stay well inside Cloudflare's 1,000
+    // subrequests per invocation.
+    assert.ok(Number(m[1]) * 2 < 900, "the cap must leave subrequest headroom");
+  });
+
+  it("leaves caller-credentialed provider endpoints unthrottled", async () => {
+    // These spend the CALLER's provider quota (they 400 without a token),
+    // so a limit here would only break large legitimate history syncs.
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 30; i++) {
+      const r = await call(env, "/api/trakt-history-raw", {
+        method: "POST", ip, json: { accessToken: "" },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.equal(limited, 0);
+  });
+});
+
+describe("audit fix 10: admin Community Lists ranks by likes, not by key order", () => {
+  async function seed(env, count) {
+    const alice = await createUser(env, "rankuser");
+    for (let i = 0; i < count; i++) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "List " + String(i).padStart(3, "0"), type: "movie",
+        visibility: "public", items: [{ id: "tt1" }],
+      }});
+    }
+    // The genuinely most-liked list sorts LAST alphabetically.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "ZZZ Most Liked", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 5; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "rankuser", slug: "zzz-most-liked", action: "like" } });
+    }
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    return (login.headers.get("set-cookie") || "").split(";")[0];
+  }
+
+  it("shows lists at all (the record has no creatorName field to filter on)", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 2);
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    // /api/creator/lists/save writes { name, slug, type, items, visibility,
+    // likes, createdAt, updatedAt } -- no creatorName; the creator is in the
+    // KEY. The old code required data.creatorName and so dropped every
+    // single list, leaving this panel permanently empty without D1.
+    assert.ok((r.body.communityLists || []).length > 0, "the panel must not be empty");
+    assert.ok(r.body.communityLists.every((l) => l.creator), "every row needs a creator");
+  });
+
+  it("ranks the genuinely most-liked list first, past the 100-row cap", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    // First load warms the index (rebuilt in the background), same as
+    // /api/search-published-lists.
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const lists = r.body.communityLists || [];
+    assert.equal(lists[0].name, "ZZZ Most Liked", "top row must be the most-liked list");
+    assert.equal(lists[0].likes, 5);
+  });
+
+  it("reads the panel from one KV get instead of one per candidate", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    let gets = 0;
+    const og = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    assert.ok(gets < 20, `expected a handful of KV reads, got ${gets}`);
+  });
+});
+
+describe("audit fix 14: every env var the code requires is documented", () => {
+  it("names MDBLIST_CLIENT_SECRET in both README.md and wrangler.toml", () => {
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    assert.match(readme, /MDBLIST_CLIENT_SECRET/);
+    assert.match(wrangler, /MDBLIST_CLIENT_SECRET/);
+  });
+
+  it("documents every env var the Worker actually reads", () => {
+    // Guards the whole class: an operator following the setup docs exactly
+    // should never hit a feature that reports itself "not configured".
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    const docs = readme + "\n" + wrangler;
+    const used = new Set();
+    for (const f of fs.readdirSync(REPO_ROOT).filter((n) => /^\d\d_.*\.js$/.test(n))) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      for (const m of src.matchAll(/\benv\.([A-Z][A-Z0-9_]+)/g)) used.add(m[1]);
+    }
+    const undocumented = [...used].filter((name) => !docs.includes(name)).sort();
+    assert.deepEqual(undocumented, [], `undocumented env vars: ${undocumented.join(", ")}`);
+  });
+});
+
+
+describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
+  it("records every one of 20 concurrent page views (the KV path records ~1)", async () => {
+    const kvOnly = makeEnv();
+    await Promise.all(Array.from({ length: 20 }, () => call(kvOnly, "/")));
+    const kvCount = parseInt(kvOnly.CONFIGS._store.get("stats:pageviews:total") || "0", 10);
+
+    const withD1 = makeEnv({ DB: makeD1() });
+    await Promise.all(Array.from({ length: 20 }, () => call(withD1, "/")));
+    const d1Count = withD1.DB._stat("pageviews", "total") || 0;
+
+    // The KV read-modify-write loses almost all of them: every concurrent
+    // request reads the same value and writes the same value+1.
+    assert.ok(kvCount < 20, `KV path is expected to lose updates, got ${kvCount}`);
+    // The D1 upsert increments inside the statement, so none are lost.
+    assert.equal(d1Count, 20, `D1 path must record all 20, got ${d1Count}`);
+  });
+
+  it("writes both the all-time and the per-day bucket", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await call(env, "/");
+    const buckets = env.DB._statBuckets("pageviews");
+    assert.equal(buckets.length, 2);
+    assert.ok(buckets.includes("total"));
+    assert.ok(buckets.some((b) => /^\d{4}-\d{2}-\d{2}$/.test(b)), "expected a YYYY-MM-DD day bucket");
+  });
+
+  it("the admin dashboard treats D1 as authoritative over a stale KV copy", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    for (let i = 0; i < 7; i++) await call(env, "/");
+    // A leftover KV value from before D1 was bound must NOT win: it is the
+    // undercounted one, and reading it is what this fix exists to stop.
+    await env.CONFIGS.put("stats:pageviews:total", "3");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">7<\/div>/, "expected the D1 count (7), not the stale KV copy (3)");
+    assert.doesNotMatch(r.text, /<div class="stat-value">3<\/div>\s*<div class="stat-label">Total page views<\/div>/);
+  });
+
+  it("falls back to the KV count when D1 has no row yet (not migrated)", async () => {
+    // Binding D1 must not make an existing dashboard's history vanish
+    // before the operator presses "Migrate KV -> D1".
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "4242");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">4242<\/div>/);
+  });
+
+  it("migrate-d1 copies KV counters across, and is safe to run twice", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "100");
+    await env.CONFIGS.put("stats:pageviews:2026-09-01", "40");
+    // Non-counter stats keys must not be dragged into an integer column.
+    await env.CONFIGS.put("stats:genres:alltime", JSON.stringify({ Drama: 3 }));
+    await env.CONFIGS.put("stats:genredecade:migrated", "1");
+
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    const first = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(first.body.ok, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 100);
+    assert.equal(env.DB._stat("pageviews", "2026-09-01"), 40);
+    assert.equal(env.DB._stat("genres", "alltime"), undefined, "JSON blobs must not be migrated as counters");
+
+    // Re-running must not double the counts (DO NOTHING, not n = n + ...).
+    await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(env.DB._stat("pageviews", "total"), 100, "a second migration must not double counts");
+  });
+
+  it("keeps counting correctly in KV-only deployments", async () => {
+    // D1 is optional here; nothing above may break the no-DB path.
+    const env = makeEnv();
+    await call(env, "/");
+    assert.equal(env.CONFIGS._store.get("stats:pageviews:total"), "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">1<\/div>/);
+  });
+});
+
+
+describe("audit fix 13: outbound requests are bounded by a timeout", () => {
+  it("wires a timeout signal into the shared fetch helper", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let sawSignal = false;
+    sandbox.fetch = async (_url, opts) => { sawSignal = !!(opts && opts.signal); return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: (ms) => ({ __timeoutMs: ms }) };
+    await sandbox.fetchTraktWithRetry("https://api.trakt.tv/x", {});
+    assert.equal(sawSignal, true, "fetchTraktWithRetry must pass an abort signal");
+  });
+
+  it("leaves a caller's own signal alone", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    const mine = { mine: true };
+    let seen = null;
+    sandbox.fetch = async (_url, opts) => { seen = opts.signal; return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: () => ({ __timeout: true }) };
+    await sandbox.fetchWithTimeout("https://x/", { signal: mine });
+    assert.equal(seen, mine);
+  });
+
+  it("still works where AbortSignal.timeout is unavailable", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let called = false;
+    sandbox.fetch = async () => { called = true; return { status: 200 }; };
+    // No AbortSignal in this sandbox at all -- the capability is probed,
+    // not assumed (render_check.js's sandbox omits it).
+    await sandbox.fetchWithTimeout("https://x/", {});
+    assert.equal(called, true);
+  });
+
+  it("turns a hung upstream into a rejection so the stale fallback can serve", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    // loadSourceFunctions' sandbox is deliberately minimal; the Workers
+    // runtime provides these.
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    const hang = new Promise(() => {});          // never settles
+    await assert.rejects(
+      () => sandbox.withTimeout(hang, 20, "TMDB"),
+      /TMDB did not respond within 20ms/
+    );
+  });
+
+  it("passes a value straight through when it settles in time", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    assert.equal(await sandbox.withTimeout(Promise.resolve("ok"), 1000, "TMDB"), "ok");
+  });
+});
+
+describe("audit fix 11: a playback ping does not read every list the creator owns", () => {
+  it("reads the watchlist directly instead of scanning", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "pinguser");
+    // One watchlist plus a pile of unrelated lists.
+    await env.CONFIGS.put("creatorlist:pinguser:watchlist", JSON.stringify({
+      slug: "watchlist", name: "Watchlist", type: "movie", visibility: "private",
+      items: [{ id: "tt111" }, { id: "tt222" }],
+    }));
+    for (let i = 0; i < 40; i++) {
+      await env.CONFIGS.put(`creatorlist:pinguser:other-${i}`, JSON.stringify({
+        slug: `other-${i}`, name: "Other " + i, type: "movie", visibility: "private", items: [{ id: "tt999" }],
+      }));
+    }
+
+    let gets = 0;
+    const og = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+
+    const config = Buffer.from(JSON.stringify({
+      entries: [], track: true, trackCreatorName: alice.creatorName, trackCreatorKey: alice.creatorKey,
+    })).toString("base64url");
+    await call(env, `/${config}/subtitles/movie/tt111.json`);
+
+    // Before: one list() plus one get() per list (41 here) on every ping.
+    assert.ok(gets < 15, `expected a handful of KV reads per ping, got ${gets}`);
+    const wl = JSON.parse(env.CONFIGS._store.get("creatorlist:pinguser:watchlist"));
+    assert.deepEqual(wl.items.map((i) => i.id), ["tt222"], "the watched item should still be removed");
+  });
+});
+
+describe("audit fix 12: deleting an account leaves nothing behind", () => {
+  it("removes the like ledger and the scrobble seen-user set", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "purgeuser");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Fav Films", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    await call(env, "/api/lists/like", { method: "POST", json: { username: "purgeuser", slug: "fav-films", action: "like" } });
+    await env.CONFIGS.put("scrobbleseenusers:purgeuser", JSON.stringify(["someone"]));
+    await env.CONFIGS.put("creatortrack:purgeuser", JSON.stringify({ lastPingAt: 1 }));
+    assert.ok(env.CONFIGS._store.has("listlikevoters:purgeuser:fav-films"), "precondition: ledger exists");
+
+    const r = await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+    assert.equal(r.body.ok, true);
+
+    const leftovers = [...env.CONFIGS._store.keys()].filter((k) => k.includes("purgeuser"));
+    assert.deepEqual(leftovers, [], `nothing should reference the deleted account, found: ${leftovers.join(", ")}`);
+  });
+
+  it("does not let a recycled username inherit the old like count", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 3; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    }
+    await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+
+    // Someone else claims the freed username and happens to pick the same slug.
+    const bob = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt9" }],
+    }});
+    const like = await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    assert.equal(like.body.likes, 1, "a brand-new list must start from zero, not inherit the old ledger");
+  });
+});
+
+
+describe("audit fix 7: error messages are useful but cannot carry a secret", () => {
+  const load = () => loadSourceFunctions("02_http-and-creator-utils.js").safeErrorMessage;
+
+  it("keeps the genuinely useful upstream message", () => {
+    const safeErrorMessage = load();
+    // This is how someone learns their own API key is wrong -- blanking it
+    // would be a product regression, not a security win.
+    assert.equal(safeErrorMessage(new Error("Trakt request failed (HTTP 401).")),
+      "Trakt request failed (HTTP 401).");
+  });
+
+  it("strips a URL that a future careless throw might include", () => {
+    const safeErrorMessage = load();
+    const msg = safeErrorMessage(new Error("fetch failed for https://api.themoviedb.org/3/movie/1?api_key=abcdef123456"));
+    assert.doesNotMatch(msg, /themoviedb\.org/);
+    assert.doesNotMatch(msg, /abcdef123456/);
+    assert.match(msg, /\[url\]/);
+  });
+
+  it("redacts a labelled key or token even without a URL", () => {
+    const safeErrorMessage = load();
+    for (const raw of [
+      "bad request: api_key=sk_live_9f8e7d6c5b4a3210",
+      "auth failed, access_token: ya29.aVeryLongOpaqueTokenValue",
+      "client_secret=hunter2hunter2hunter2",
+    ]) {
+      const msg = safeErrorMessage(new Error(raw));
+      assert.match(msg, /\[redacted\]/, `expected redaction in: ${msg}`);
+      assert.doesNotMatch(msg, /sk_live|ya29\.|hunter2/);
+    }
+  });
+
+  it("redacts a long unlabelled opaque token", () => {
+    const safeErrorMessage = load();
+    const token = "A".repeat(40);
+    assert.doesNotMatch(safeErrorMessage(new Error("upstream said " + token)), /AAAA/);
+  });
+
+  it("falls back to a generic message when there is nothing safe to say", () => {
+    const safeErrorMessage = load();
+    assert.match(safeErrorMessage(null), /Something went wrong/);
+    assert.match(safeErrorMessage(new Error("")), /Something went wrong/);
+  });
+
+  it("bounds the length so a huge message cannot be echoed back", () => {
+    const safeErrorMessage = load();
+    assert.ok(safeErrorMessage(new Error("x".repeat(5000))).length <= 201);
+  });
+
+  it("no route still returns a raw exception message", () => {
+    for (const f of ["25_api-catalog-routes.js", "26_api-creator-and-admin-routes.js"]) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      assert.doesNotMatch(src, /String\((?:err|e)\.message \|\| (?:err|e)\)/,
+        `${f} still returns a raw exception message; use safeErrorMessage()`);
+    }
+  });
+});

@@ -344,21 +344,11 @@ async function migrateLocalCustomListsToAccount() {
 
 let lastCreatorListsData = null; // cached result of the last dashboard fetch, so Edit/Share don't need a round-trip
 
-function showModal(innerHtml, extraClass) {
-  closeModal();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'activeModalOverlay';
-  overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) closeModal();
-  });
-  document.body.appendChild(overlay);
-}
-function closeModal() {
-  const existing = document.getElementById('activeModalOverlay');
-  if (existing) existing.remove();
-}
+// showModal/closeModal live in 16_client-row-core.js. Byte-identical copies
+// were declared here too; in the browser's single shared script scope that
+// meant one silently overrode the other. Same behaviour either way, so
+// nothing changed by removing them -- but a future edit to one copy would
+// have appeared to do nothing at all.
 
 function renderCreatorProfileBar() {
   const bar = document.getElementById('creatorProfileBar');

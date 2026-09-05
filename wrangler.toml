@@ -73,5 +73,6 @@ crons = ["*/6 * * * *"]
 #   npx wrangler secret put MDBLIST_API_KEY         # mdblist.com/preferences
 #   npx wrangler secret put MDBLIST_POPULAR_KEY     # optional, for the Toplists proxy
 #   npx wrangler secret put MDBLIST_CLIENT_ID       # required only for MDBList OAuth
+#   npx wrangler secret put MDBLIST_CLIENT_SECRET   # required with the id above; OAuth fails without it
 #   npx wrangler secret put SIMKL_CLIENT_ID         # simkl.com/settings/developer/
 #   npx wrangler secret put SIMKL_CLIENT_SECRET     # required only for Simkl OAuth

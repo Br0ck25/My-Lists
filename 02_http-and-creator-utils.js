@@ -134,6 +134,56 @@ function jsonPublic(data, status = 200, extraHeaders = {}) {
   return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
+// Turns an exception into something safe to hand back to a caller, and logs
+// the original.
+//
+// Dozens of routes used to return `String(err.message || err)` verbatim.
+// That is not as bad as it sounds today -- every `throw` in this codebase
+// is deliberately status-only ("Trakt request failed (HTTP 401).") with no
+// URL or key in it, which is checked, and those messages are genuinely
+// useful: a 401 surfaced to the user is how they learn their own API key is
+// wrong. Blanking every one of them to "something went wrong" would be a
+// real regression in the product, not a security win.
+//
+// The problem is that it is one careless `throw new Error(someUrl)` away
+// from shipping an API key to the client, and /api/bulk-resolve already
+// states the rule for the whole file: "the message can carry upstream URLs
+// and internal detail that the caller has no business seeing."
+//
+// So this keeps the message and removes the parts that could ever carry a
+// secret -- any URL, any explicit key/token parameter, and any long opaque
+// token -- rather than choosing between useful and safe. The unredacted
+// error still goes to the log, where the operator can see it.
+function safeErrorMessage(err, fallback = "Something went wrong. Please try again.") {
+  try {
+    console.error("handled error:", err);
+  } catch {
+    // logging must never be the thing that throws
+  }
+  let msg = "";
+  try {
+    // Deliberately not `err.message || err`: an Error with an empty message
+    // would fall through to String(err) and surface the literal word
+    // "Error", which tells the caller nothing and looks like a bug.
+    if (err && typeof err.message === "string") msg = err.message;
+    else if (typeof err === "string") msg = err;
+    else if (err) msg = String(err);
+  } catch {
+    return fallback;
+  }
+  msg = msg.trim();
+  // String(someObject) gives "[object Object]" -- no better than the fallback.
+  if (!msg || msg === "[object Object]") return fallback;
+  msg = msg
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(/\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|key)\b\s*[=:]\s*\S+/gi, "$1=[redacted]")
+    // Anything long and opaque enough to be a credential, even unlabelled.
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+    .trim();
+  if (!msg) return fallback;
+  return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
+}
+
 // Detect whether a request is a top-level browser page load (someone tapping
 // "Configure" and being sent to the manifest URL) vs. a JSON fetch by wako/
 // Stremio itself. We check two independent signals and trust either one:
@@ -945,7 +995,10 @@ async function fetchWithPerUserCacheUncoalesced({
   }
 
   try {
-    const freshData = await fetchFn();
+    // Bounded, so a provider that hangs rather than failing still reaches
+    // the fallback tiers below instead of holding the request open -- see
+    // withTimeout's own comment.
+    const freshData = await withTimeout(fetchFn(), OUTBOUND_TIMEOUT_MS, providerLabel);
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
       
@@ -1007,8 +1060,73 @@ async function fetchWithPerUserCacheUncoalesced({
   return null;
 }
 
+// --- Outbound request timeouts -----------------------------------------------
+//
+// Nothing in this add-on used to bound how long a provider could take. The
+// multi-tier fallback in fetchWithPerUserCacheUncoalesced above (memory ->
+// KV -> edge cache -> stale) is good, but it only ever fires on a
+// REJECTION: a provider that accepts the connection and then never
+// responds produced no rejection at all, so the request simply hung and
+// the stale data sitting right there was never served.
+//
+// Two places are enough to cover essentially every outbound call, rather
+// than editing ~135 individual fetch() sites:
+//   * fetchWithTimeout, used by the shared retry helper below, aborts the
+//     underlying request.
+//   * withTimeout, wrapped around the circuit breaker's fetchFn, turns a
+//     hang into the rejection the fallback tiers already know how to
+//     handle -- so a stalled provider now degrades to last-known-good data
+//     instead of a spinner.
+//
+// 10s is chosen against what the callers are: catalog and metadata reads
+// that a Stremio/wako client is actively waiting on. A provider that has
+// not answered in ten seconds is not about to make the request feel fast;
+// serving slightly stale data is strictly better than holding the
+// connection open.
+const OUTBOUND_TIMEOUT_MS = 10000;
+
+// AbortSignal.timeout exists in the Workers runtime, but this also runs
+// inside render_check.js's sandbox (which deliberately provides a minimal
+// global set) and in tests that stub fetch -- so the capability is probed
+// rather than assumed, and its absence just means no signal.
+function timeoutSignal(ms) {
+  try {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return AbortSignal.timeout(ms);
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+async function fetchWithTimeout(url, options = {}, ms = OUTBOUND_TIMEOUT_MS) {
+  // A caller that already manages its own signal keeps it.
+  if (options && options.signal) return fetch(url, options);
+  const signal = timeoutSignal(ms);
+  return fetch(url, signal ? { ...options, signal } : options);
+}
+
+// Rejects if `promise` has not settled within `ms`. Used where the work is
+// a caller-supplied closure rather than a single fetch (see the circuit
+// breaker's fetchFn), so an AbortSignal cannot be threaded in directly.
+// The underlying request is not cancelled here -- the point is to stop
+// WAITING on it, so the fallback tiers can serve.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label || "Upstream"} did not respond within ${ms}ms`)),
+      ms
+    );
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 async function fetchTraktWithRetry(url, options = {}, retries = 2) {
-  let res = await fetch(url, options);
+  let res = await fetchWithTimeout(url, options);
   if (res.status === 429 && retries > 0) {
     const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
     const jitter = Math.floor(Math.random() * 500);
@@ -1096,6 +1214,32 @@ function clientIpKey(request) {
     return prefix.join(":") + "::/64";
   }
   return ip.toLowerCase();
+}
+
+// --- Shared per-IP rate limiter --------------------------------------------
+//
+// The same IP-keyed 60-second KV slot /api/preview, /api/creator/create,
+// /api/creator/restore and /admin/login each grew their own copy of. Pulled
+// out because the endpoints that spend THIS Worker owner's provider quota
+// (rather than the caller's own key) all need it and all want it to behave
+// identically.
+//
+// Returns true when the caller is over budget and the request should stop.
+// Follows the convention the existing call sites already established:
+// skipped entirely when CONFIGS isn't bound (every KV-optional feature here
+// degrades rather than fails closed), and the increment rides on
+// ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
+// request it is protecting. Callers check for a missing client IP
+// themselves, since what to return in that case is route-specific.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+  if (!env || !env.CONFIGS || !ip) return false;
+  const key = `ratelimit:${bucket}:${ip}`;
+  const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
+  if (used >= maxPerWindow) return true;
+  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
+  else await write;
+  return false;
 }
 
 async function likeVoterId(request, env, creatorUsername, scopeId) {
@@ -1457,13 +1601,25 @@ async function getPublicListIndex(env, ctx) {
   }
 }
 
-async function listAllKeys(namespace, prefix) {
+// Pages a whole prefix, following the cursor to completion.
+//
+// `maxKeys` (optional) caps how many keys are collected. It exists for
+// prefixes whose key space is not intrinsically bounded -- see the caps in
+// computeCatalogAndCommunityLeaderboards (03_admin.js), where an
+// unbounded scan followed by one get per key was enough to push a request
+// past Cloudflare's per-invocation subrequest limit. Callers that pass it
+// must treat `list_complete: false` as "there was more" rather than
+// assuming they have everything; callers that omit it keep the previous
+// exhaustive behaviour exactly.
+async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   const keys = [];
   let cursor;
   do {
+    const remaining = maxKeys - keys.length;
+    if (remaining <= 0) return { keys, list_complete: false };
     const result = await namespace.list({
       prefix,
-      limit: 1000,
+      limit: Math.min(1000, remaining),
       ...(cursor ? { cursor } : {})
     });
     keys.push(...result.keys);
@@ -1507,7 +1663,20 @@ async function purgeCreatorData(env, username, options = {}) {
         await env.CONFIGS.delete(k.name);
         // Drop it from the directory index too, or a deleted account's
         // lists keep appearing publicly until the next full rebuild.
-        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
+        const listPath = k.name.slice("creatorlist:".length);
+        purgedListIds.push("c:" + listPath);
+        // And the list's like ledger, keyed listlikevoters:{user}:{slug}
+        // (see applyLikeVote's call site in /api/lists/like). These used to
+        // survive the account: because delete-account frees the username for
+        // re-registration, whoever claimed it next and made a list with the
+        // same slug inherited the previous owner's ledger -- a like count
+        // they never earned, and every voter in the old ledger silently
+        // unable to like it.
+        try {
+          await env.CONFIGS.delete(`listlikevoters:${listPath}`);
+        } catch (e) {
+          // best-effort: a stranded ledger is untidy, not harmful on its own
+        }
         listsCleared++;
       }
       if (res.list_complete || !res.cursor) break;
@@ -1553,8 +1722,14 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
-    // legacy names, harmless if absent
+    // Playback diagnostics (handleSubtitlesTrack writes it,
+    // /api/creator/track-status reads it) and the scrobble seen-user set
+    // (handleMediaServerScrobble). Both are live keys, not legacy ones --
+    // creatortrack: was previously listed under the legacy heading below,
+    // which was simply wrong about it.
     `creatortrack:${u}`,
+    `scrobbleseenusers:${u}`,
+    // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,
     `creatorprofile:${u}`,

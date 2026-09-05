@@ -30,7 +30,23 @@ python3 html_checks.py rendered.html local
 rm -f rendered.html inner_local.js
 
 echo
-echo "=== 5. tests ==="
+echo "=== 5. FUNCTION-MAP.md drift ==="
+# gen_map.py is only useful if it is actually re-run. It was not: 26% of the
+# map's 811 line numbers pointed at a line that no longer held that symbol,
+# so navigating by it quietly sent you to the wrong place. Regenerating is
+# cheap and deterministic, so the map is now checked the same way the
+# combined Worker is.
+python3 gen_map.py > /dev/null
+if git diff --ignore-cr-at-eol --quiet -- FUNCTION-MAP.md; then
+  echo "  OK"
+else
+  echo "  FAILED — FUNCTION-MAP.md is stale; run: python3 gen_map.py"
+  git diff --ignore-cr-at-eol --stat -- FUNCTION-MAP.md
+  exit 1
+fi
+
+echo
+echo "=== 6. tests ==="
 node --test tests/*.test.mjs
 
 echo

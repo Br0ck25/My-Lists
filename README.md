@@ -157,7 +157,8 @@ The add-on works out-of-the-box with public MDBList and TMDB links. Adding API k
 | `SIMKL_CLIENT_SECRET` | Simkl OAuth token exchange for private lists and history sync | Same Simkl app as above |
 | `MDBLIST_API_KEY` | Private MDBList lists, Watchlist quick-add fallback, history sync | [mdblist.com/preferences](https://mdblist.com/preferences) |
 | `MDBLIST_POPULAR_KEY` | Dedicated key for MDBList Toplists / Popular Lists browser | Same MDBList preferences as above |
-| `MDBLIST_CLIENT_ID` | MDBList OAuth client ID | [mdblist.com/preferences](https://mdblist.com/preferences) |
+| `MDBLIST_CLIENT_ID` | MDBList OAuth client ID — **`MDBLIST_CLIENT_SECRET` must be set too, or MDBList OAuth fails with "not configured"** | [mdblist.com/preferences](https://mdblist.com/preferences) |
+| `MDBLIST_CLIENT_SECRET` | MDBList OAuth token exchange (required alongside `MDBLIST_CLIENT_ID` for MDBList account login) | Same MDBList preferences as above |
 
 #### OAuth Redirect URIs
 If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set the OAuth callback URLs in their respective developer portals to:
@@ -165,6 +166,24 @@ If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set th
 - **Simkl**: `https://your-worker-name.your-subdomain.workers.dev/api/simkl/oauth/callback`
 - **MDBList**: `https://your-worker-name.your-subdomain.workers.dev/api/mdblist/oauth/callback`
 - **TMDB**: `https://your-worker-name.your-subdomain.workers.dev/api/tmdb/oauth/callback`
+
+#### A note on media-server scrobble URLs
+
+The Plex / Jellyfin / Emby webhook endpoint (`/api/scrobble`) authenticates from the
+URL itself — either `?config=<your install id>` or `?creator=<name>&key=<your Creator
+Key>`. That is forced by the webhook senders, which cannot attach custom headers, but
+it does mean **the key travels in a URL** and so may be recorded in server logs, proxy
+logs, and your media server's own configuration screen.
+
+Practical consequences:
+
+- Treat a scrobble URL like a password. Don't paste it into screenshots, issues, or
+  support threads.
+- If one leaks, rotate it: **Account &rarr; Reset Creator Key** in the app (or
+  `POST /api/creator/reset-key`). The old key stops working immediately and any
+  webhook still using it will simply stop being accepted.
+- Prefer the `?config=` form where you can — it points at a stored install config
+  rather than spelling the Creator Key out in the URL.
 
 ---
 

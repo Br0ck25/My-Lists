@@ -405,21 +405,46 @@
           }
         }
 
-        // Auto-remove watched item from user's Creator Watchlist if present
+        // Auto-remove watched item from user's Creator Watchlist if present.
+        //
+        // This used to enumerate the account's whole creatorlist: prefix and
+        // then GET every single list, on EVERY playback ping, just to find
+        // the one named "Watchlist" -- so the cost of a ping scaled with how
+        // many lists the person owns. The enumeration also had no cursor, so
+        // past a thousand lists it silently stopped looking.
+        //
+        // The watchlist has a canonical key: /api/creator/sync/save-tracking
+        // writes creatorlist:{user}:watchlist directly, and slugifyServer
+        // turns any list actually named "Watchlist" into that same slug. So
+        // the common path is one GET. The scan survives only as a fallback
+        // for the shapes the old loop also accepted (an isWatchlist flag, or
+        // a name that slugified differently), and is now paged and bounded
+        // rather than silently truncating.
         try {
-          const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:` });
-          for (const k of (listKeys.keys || [])) {
-            const rawList = await env.CONFIGS.get(k.name);
-            if (!rawList) continue;
+          const removeWatchedFrom = async (key, rawList) => {
+            if (!rawList) return;
             const l = JSON.parse(rawList);
-            const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
-            if (isWatchlist && Array.isArray(l.items) && l.items.length) {
-              const initLen = l.items.length;
-              l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
-              if (l.items.length !== initLen) {
-                l.updatedAt = Date.now();
-                await env.CONFIGS.put(k.name, JSON.stringify(l));
-              }
+            if (!Array.isArray(l.items) || !l.items.length) return;
+            const initLen = l.items.length;
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+            if (l.items.length !== initLen) {
+              l.updatedAt = Date.now();
+              await env.CONFIGS.put(key, JSON.stringify(l));
+            }
+          };
+
+          const canonicalKey = `creatorlist:${auth.username}:watchlist`;
+          const canonicalRaw = await env.CONFIGS.get(canonicalKey);
+          if (canonicalRaw) {
+            await removeWatchedFrom(canonicalKey, canonicalRaw);
+          } else {
+            const listKeys = await listAllKeys(env.CONFIGS, `creatorlist:${auth.username}:`, 200);
+            for (const k of (listKeys.keys || [])) {
+              const rawList = await env.CONFIGS.get(k.name);
+              if (!rawList) continue;
+              const l = JSON.parse(rawList);
+              const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
+              if (isWatchlist) await removeWatchedFrom(k.name, rawList);
             }
           }
         } catch {}
@@ -2761,7 +2786,7 @@
           });
         return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -3237,7 +3262,7 @@
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
       
-      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
       // 1. Creators
       const cKeys = await listAllKeys(env.CONFIGS, "creator:");
@@ -3320,6 +3345,48 @@
           } catch (e) {
             results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
           }
+        }
+      }
+
+      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+      //
+      // Until these are copied across, each counter falls back to its KV
+      // value rather than reporting zero (see readStatCount, 03_admin.js),
+      // so a dashboard's history never visibly vanishes just because D1 got
+      // bound. After this runs, D1 is authoritative and the KV copies are
+      // inert.
+      //
+      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+      // safe to run more than once (the admin button can be pressed again,
+      // and the other three sections above are idempotent too), and an
+      // additive upsert here would double every counter on the second run.
+      // sourcegroup: is skipped -- section 3 above already migrated it into
+      // its own table, and copying it here too would count it twice in the
+      // Installed Catalogs panel, which sums both.
+      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
+      for (const k of statKeys.keys) {
+        const rest = k.name.slice("stats:".length);
+        const sep = rest.lastIndexOf(":");
+        if (sep === -1) continue;
+        const kind = rest.slice(0, sep);
+        const bucket = rest.slice(sep + 1);
+        if (!kind || !bucket) continue;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        // Only the numeric counters. stats:genres:alltime and
+        // stats:decades:alltime are JSON blobs, and
+        // stats:genredecade:migrated is a sentinel -- none of them belong
+        // in an integer column.
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
+        const raw = await env.CONFIGS.get(k.name);
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n)) continue;
+        try {
+          await env.DB.prepare(
+            "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
+          ).bind(kind, bucket, n).run();
+          results.stats++;
+        } catch (e) {
+          results.errors.push(`Stat ${k.name}: ` + e.message);
         }
       }
 
@@ -3700,7 +3767,7 @@
         return json({ ok: true, searches }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "catalogs_lists") {
-        const data = await computeCatalogAndCommunityLeaderboards(env);
+        const data = await computeCatalogAndCommunityLeaderboards(env, ctx);
         return json({ ok: true, ...data }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "audience") {
@@ -3801,7 +3868,7 @@
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         return json({ ok: true, region, providerId, movies, shows }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -3851,7 +3918,7 @@
         results = results.slice(0, 40).map((p) => ({ id: p.id, name: p.name }));
         return json({ ok: true, results }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -3953,6 +4020,32 @@
       }
       if (!bulkBody || !Array.isArray(bulkBody.items)) {
         return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      // Unauthenticated, and unlike every other TMDB route here this one
+      // has no per-user key override at all -- it ALWAYS spends the Worker
+      // owner's shared TMDB_API_KEY (see the comment on tmdbCallCount
+      // below). Two things were missing:
+      //
+      // 1. A bound on `items`. The loop below issues up to two TMDB calls
+      //    per item, so a single request with a few thousand items blew
+      //    straight past Cloudflare's per-invocation subrequest limit --
+      //    which meant large Letterboxd imports were already failing here
+      //    -- while spending the owner's TMDB quota on the way.
+      // 2. A rate limit, so the same request cannot simply be repeated.
+      //
+      // The cap rejects rather than truncates: silently resolving the
+      // first N films of an import and dropping the rest is exactly the
+      // kind of quiet data loss this audit was about. The client chunks
+      // its own requests to this size (see resolveViaBulkResolve,
+      // 18_client-copy-and-trakt-export.js), so a real import of any size
+      // still completes -- it just arrives as several bounded calls.
+      const bulkIp = clientIpKey(request);
+      if (!bulkIp) return json({ ok: false, error: "Could not resolve those titles." }, 400);
+      if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
+        return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
+      }
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       try {
         const body = bulkBody;

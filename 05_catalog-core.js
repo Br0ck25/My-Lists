@@ -469,11 +469,6 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
 </svg>`;
 }
 
-function getPaddedChannelLogo(rawPoster, origin) {
-  if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
-  return rawPoster;
-}
-
 function getChannelBackdropUrl(payload) {
   if (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) {
     return payload.backdrop;
