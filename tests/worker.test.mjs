@@ -1009,6 +1009,43 @@ describe("audit fix: recovery answers are throttled per account, not just per IP
   });
 });
 
+// The page loads fflate from a CDN that the CSP's script-src allows, so
+// whatever that URL returns runs with full page privileges -- and this page
+// keeps myListAddon:creatorKey, the MDBList/Simkl access tokens and the
+// provider API keys in localStorage, all readable by any script in it.
+// Pinning the version is not integrity checking.
+describe("audit fix: the CDN script is integrity-pinned", () => {
+  it("carries an SRI hash and crossorigin on every external script", async () => {
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const externals = [...page.text.matchAll(/<script\b[^>]*\bsrc="(https?:[^"]+)"[^>]*>/g)];
+    assert.ok(externals.length > 0, "expected at least one external script tag");
+    for (const [tag, src] of externals) {
+      assert.match(tag, /\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"/, `no SRI hash on ${src}`);
+      // Required for SRI to be enforced on a cross-origin script.
+      assert.match(tag, /\bcrossorigin="anonymous"/, `no crossorigin on ${src}`);
+      // A hash only means anything against a pinned version.
+      assert.match(src, /@\d+\.\d+\.\d+\//, `unpinned version in ${src}`);
+    }
+  });
+
+  it("pins a hash that matches the bytes the CDN actually serves", { skip: !process.env.NETWORK_TESTS }, async () => {
+    // Opt-in (NETWORK_TESTS=1): the rest of the suite is hermetic, and CI
+    // should not fail because a CDN is briefly unreachable. Run this when
+    // changing the script URL or bumping its version.
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const m = page.text.match(/<script\b[^>]*\bsrc="(https:[^"]+)"[^>]*\bintegrity="sha384-([A-Za-z0-9+/=]+)"/);
+    assert.ok(m, "no integrity-pinned external script found");
+    const [, src, pinned] = m;
+    const res = await fetch(src);
+    assert.equal(res.status, 200);
+    const digest = await crypto.subtle.digest("SHA-384", await res.arrayBuffer());
+    const actual = Buffer.from(digest).toString("base64");
+    assert.equal(actual, pinned, `SRI hash does not match what ${src} serves -- regenerate it`);
+  });
+});
+
 describe("likes and preview guards", () => {
   it("rejects like-external URLs off the provider allowlist", async () => {
     const env = makeEnv();

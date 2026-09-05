@@ -14832,7 +14832,27 @@ ${seoHeadHtml}
     transform: scale(0.96);
   }
 /*MYLISTS_APP_CSS_END*/</style>
-<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<!-- fflate, for reading Trakt/Letterboxd export .zips entirely client-side.
+     Loaded from a CDN the CSP's script-src allows, so whatever this URL
+     returns runs with full page privileges -- and this page holds
+     myListAddon:creatorKey, mdblistAccessToken, simklAccessToken and the
+     provider API keys in localStorage, all readable by any script in it.
+     Pinning the version is not integrity checking; the integrity hash is.
+     It is a SHA-384 of the exact 32,665-byte 0.8.2 UMD bundle, so a
+     substituted or tampered response simply does not execute.
+     crossorigin="anonymous" is required for SRI on a cross-origin script
+     (jsDelivr serves access-control-allow-origin: *).
+     If this is ever repointed at a new version, the hash MUST be
+     regenerated with it:
+       curl -sS <url> | openssl dgst -sha384 -binary | openssl base64 -A
+     A mismatch blocks the script, which the callers already handle: every
+     use site checks for fflate being undefined and shows a real message
+     (see 18_client-copy-and-trakt-export.js).
+     NB: no backticks in this comment -- this whole file is string content
+     inside renderBuilder's template literal, so one would close it early. -->
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"
+        integrity="sha384-DT0Ls0mO7JmjTnT+oBuMhEJzYJO1zUqzuuMXNdnOmOQRIpN2BgSjvBV/j50NngIT"
+        crossorigin="anonymous"></script>
 </head>
 <body>
 <div class="page">

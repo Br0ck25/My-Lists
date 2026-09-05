@@ -423,7 +423,9 @@ these in `localStorage`, all readable by any script in it:
 
 The version is pinned, which is good, but pinning is not integrity checking.
 
-**Fix** (hash computed from the live file during this audit):
+**Fix (applied)** — hash recomputed from the live file and confirmed stable across fetches (32,665
+bytes), with `crossorigin="anonymous"` because SRI is not enforced on a cross-origin script without
+it (jsDelivr serves `access-control-allow-origin: *`):
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"
@@ -433,7 +435,13 @@ The version is pinned, which is good, but pinning is not integrity checking.
 
 The existing `typeof fflate === 'undefined'` guards (`18_client-copy-and-trakt-export.js:792`, `:1141`,
 `:1424`) already produce a clear user-facing message if the script is blocked, so an integrity
-mismatch degrades gracefully.
+mismatch degrades gracefully rather than breaking the page.
+
+Two tests: a hermetic one asserting every external `<script>` in the rendered page carries an SRI
+hash, `crossorigin`, and a pinned version (confirmed failing against the pre-fix page), and a
+network-gated one (`NETWORK_TESTS=1`) that re-fetches the URL and checks the pinned hash still matches
+what the CDN serves — the check to run when bumping the version. It is opt-in so CI cannot fail
+because a CDN is briefly unreachable.
 
 ---
 
@@ -809,7 +817,7 @@ byte-exact concatenation, CI-gated against drift.
 - 🔵 `:1144` — `stats:creator_count` loses increments on the KV path. **(14)**
 
 ### `09_page-shell.js`
-- 🟠 `:2982` — add `integrity` + `crossorigin` to the fflate `<script>`. **(6)**
+- ✅ `:2982` — **DONE.** `integrity` + `crossorigin` on the fflate `<script>`. **(6)**
 
 ### `03_admin.js`
 - 🔵 `feedbackCardHtml:2545` — remove the double escape on `who`. **(10)**
@@ -835,7 +843,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
 ~~3. CSPRNG thread ids (3)~~ — **DONE** · ~~4. Thread append authorization (4)~~ — **DONE** ·
-~~5. Rate-limit bypass (5)~~ — **DONE** · 6. SRI on the CDN script (6)
+~~5. Rate-limit bypass (5)~~ — **DONE** · ~~6. SRI on the CDN script (6)~~ — **DONE**
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
 7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · 9. Like-ledger consistency (9) ·
@@ -913,7 +921,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 4. ~~**`generateShortId()` for feedback thread ids**~~ — **DONE.** (3)
 5. ~~**Authorize `threadId` appends and stop trusting `senderName`.**~~ — **DONE.** (4)
 6. ~~**Always rate-limit `/api/recommendations` and `/api/details/batch`.**~~ — **DONE.** (5)
-7. **Add SRI to the fflate `<script>`.** (6)
+7. ~~**Add SRI to the fflate `<script>`.**~~ — **DONE.** (6)
 8. **Move the reset-key and admin-login limiters onto D1's atomic upsert.** (7)
 9. **Cap and cache `/api/channel-logo`; add TTL/sweep to `/api/save` + `/api/publish-list` keys.**
 10. **Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.
