@@ -12,8 +12,9 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 7 of 16 findings closed** (all 4 production blockers, the client-bundle
-duplicate-declaration class, the shared-key fan-out endpoints, and the build-header fragility).
+**Progress: 9 of 16 findings closed** (all 4 production blockers, the client-bundle
+duplicate-declaration class, the shared-key fan-out endpoints, the admin Community Lists
+panel, the undocumented secret, and the build-header fragility).
 
 ---
 
@@ -28,6 +29,8 @@ duplicate-declaration class, the shared-key fan-out endpoints, and the build-hea
 | 16 | `build.py` recovered its header from its own previous output, so editing `00_constants.js` made the build unrunnable | 🟡 Low | 2026-09-05 | `ff9cbfe` | `verify.sh` step 2 (header now in `header.js`, proven byte-identical) |
 | 8 | Duplicate `handlePosterImgError` in the client bundle; the losing definition was the one most call sites were written for | 🟠 Medium | 2026-09-05 | `ae5c52d` | `audit fix 8` (4 tests) + `html_checks.py` duplicate-declaration guard |
 | 5 | Unauthenticated endpoints spending the Worker owner's shared provider quota were unbounded; `/api/bulk-resolve` also had no cap on `items` at all | 🟠 Medium | 2026-09-05 | `f2aea3a` | `audit fix 5` (6 tests) |
+| 10 | Admin "Top Community Lists" was permanently **empty** without D1, and mis-ranked when it wasn't | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 10` (3 tests) |
+| 14 | `MDBLIST_CLIENT_SECRET` required but documented nowhere | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 14` (2 tests, incl. an all-env-vars guard) |
 
 ### What changed, per fix
 
@@ -71,18 +74,34 @@ duplicate-declaration class, the shared-key fan-out endpoints, and the build-hea
 > caller-supplied provider token, so they spend the **caller's** quota, not the
 > owner's. A limit there would only break large legitimate history syncs.
 
+**10 — admin Community Lists** (`03_admin.js`, `26_`)
+Two bugs, and the worse one was not the one originally reported.
+
+> **Correction to the audit report.** The report said this panel "ranks the
+> alphabetically-first 100". True — but without D1 bound it was actually
+> **permanently empty**. The KV path dropped any candidate lacking a `creatorName`
+> field, and `/api/creator/lists/save` has never written one: the record is
+> `{ name, slug, type, items, visibility, likes, createdAt, updatedAt }` and the
+> creator lives in the **key**. The audit's own fixture fabricated that field,
+> which hid it. Verified against records written by the real save route.
+
+- Both are fixed by ranking from `index:publiclists` (already carries likes, itemCount and the creator display name; already sorted by likes).
+- Fan-out collapses from one KV get per candidate to **one get total** — measured 223 → 1 on a 120-list fixture.
+- Cold index: falls back to a bounded scan for that one request while the rebuild runs in the background, exactly as `/api/search-published-lists` does; correct from the next load. The fallback now derives the creator from the key rather than the never-written field.
+
+**14 — `MDBLIST_CLIENT_SECRET`** (`README.md`, `wrangler.toml`)
+Required by `/api/mdblist/oauth/callback`, absent from both setup docs, so following them exactly still produced "not configured". Now documented in both — and a test asserts **every** `env.*` var the Worker reads is named in the docs, closing the class rather than the instance.
+
 ---
 
 ## ⬜ Open — next up, in recommended order
 
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
-| 10 | Admin "Top Community Lists" ranks the alphabetically-first 100 in KV-only mode | 🟠 Medium | `03_admin.js:~833` | Reports a lexicographic sample as "top". Fix = rank from `index:publiclists`, which already carries likes and is already sorted — also removes ~100 KV reads per dashboard load. |
 | 9 | Stat counters are non-atomic read-modify-writes | 🟠 Med-High | `03_admin.js` `bumpStat`/`bumpStatBy`/`recordTrackedEvent`/`recordSearchQuery` | 20 concurrent requests recorded as 1. Worsens with traffic (KV edge-cached reads + 1 write/sec/key). Fix = shard hot keys, or move counters to D1, or label the panels approximate. Needs a migration — the largest of the remaining items. |
 | 13 | No timeout on any of ~135 outbound fetches | 🟠 Medium | `02_` `fetchWithPerUserCacheUncoalesced`, `fetchTraktWithRetry` | A hung upstream stalls the request; the stale-fallback tiers only trigger on rejection. Fix = `AbortSignal.timeout` at the two shared helpers, not 135 call sites. |
 | 11 | N+1 KV reads on every playback ping | 🟠 Medium | `26_:~410` | Enumerates and reads every one of the creator's lists to find the watchlist; also has no cursor, so it truncates at 1,000. Fix = read `creatorlist:{u}:watchlist` directly, scan only as fallback. |
 | 12 | Orphaned KV on account deletion | 🟠 Low-Med | `02_` `purgeCreatorData` | `listlikevoters:{u}:*` and `scrobbleseenusers:{u}` survive deletion, so a recycled username inherits stale like counts. Also: the `creatortrack:` "legacy" comment is wrong — it is a live key. |
-| 14 | `MDBLIST_CLIENT_SECRET` required but documented nowhere | 🟠 Medium | `wrangler.toml`, `README.md` | Operators follow the docs exactly and MDBList OAuth still fails "not configured". One-line docs fix. |
 | 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | `26_:~448` | Largely forced (Plex/Jellyfin webhooks can't set headers). Fix = document the trade and the rotation path, don't redesign. |
 | 7 | ~40 handlers return raw `String(err.message)` | 🟡 Low | `25_`, `26_` | Leaks nothing today (all `throw`s are status-only) but contradicts the policy stated at `/api/bulk-resolve`. |
 | 15 | `FUNCTION-MAP.md` line numbers 26% stale (211 of 811) | 🟡 Low | `FUNCTION-MAP.md`, `gen_map.py` | Nothing regenerates or validates it. Fix = add to `verify.sh`/CI, or drop line numbers. |
