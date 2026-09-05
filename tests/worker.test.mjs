@@ -1006,6 +1006,88 @@ describe("bug: My Channels See All showed one item per show, not per episode", (
   });
 });
 
+// Discover's popular-lists feed types each entry, and that type is what the
+// poster preview and See All are fetched with. /api/trakt-popular-lists used
+// to answer "movie" for every single list, and to build the list URL from
+// Trakt's DISPLAY username rather than the API-addressable slug.
+describe("bug: Trakt popular lists were all typed movie, with display-name URLs", () => {
+  // Trakt's /lists/popular payload, shaped the way their API really returns it.
+  const traktPopularPayload = [
+    { list: { name: "IMDB: Top Rated TV Shows", ids: { slug: "imdb-top-rated-tv-shows" }, item_count: 245, likes: 4350,
+              user: { username: "justin", ids: { slug: "justin" } } } },
+    { list: { name: "Shut Up, And Watch", ids: { slug: "shut-up-and-watch" }, item_count: 132, likes: 1538,
+              user: { username: "CanConfirm", ids: { slug: "canconfirm" } } } },
+    { list: { name: "A24", ids: { slug: "a24" }, item_count: 216, likes: 1420,
+              user: { username: "Fidel.cb", ids: { slug: "fidel-cb" } } } },
+    { list: { name: "Great Popular Shows", ids: { slug: "great-popular-shows" }, item_count: 534, likes: 1221,
+              user: { username: "Spell3ound", ids: { slug: "spell3ound" } } } },
+    { list: { name: "Best Movies of 2024", ids: { slug: "best-movies-2024" }, item_count: 50, likes: 900,
+              user: { username: "someone", ids: { slug: "someone" } } } },
+  ];
+
+  async function popularLists() {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      if (String(typeof u === "string" ? u : u.url).includes("/lists/popular")) {
+        return new Response(JSON.stringify(traktPopularPayload), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      // makeEnv only carries CONFIGS/ADMIN_KEY/DB through, so the provider key
+      // has to be set on the env object itself or the route short-circuits to
+      // { ok: false } before it ever calls Trakt.
+      const env = { ...makeEnv(), TRAKT_CLIENT_ID: "test-trakt-key" };
+      const r = await call(env, "/api/trakt-popular-lists");
+      assert.equal(r.body.ok, true, "route returned no lists -- is the Trakt key set on env?");
+      return r.body.lists;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("does not report every popular list as movies", async () => {
+    const lists = await popularLists();
+    const byName = Object.fromEntries(lists.map((l) => [l.name, l]));
+    // A shows-only list previewed as movies returns zero items, which is why
+    // these rendered with no posters and a "No items found" See All.
+    assert.equal(byName["IMDB: Top Rated TV Shows"].type, "series");
+    assert.equal(byName["Great Popular Shows"].type, "series");
+    assert.equal(byName["Best Movies of 2024"].type, "movie");
+    // Ambiguous names must not be guessed at: "mixed" makes the client fetch
+    // movies AND series and merge them, the same thing it already does for an
+    // ambiguous search result.
+    assert.equal(byName["Shut Up, And Watch"].type, "mixed");
+    assert.equal(byName["A24"].type, "mixed");
+    assert.ok(!lists.every((l) => l.type === "movie"), "every list is still typed movie");
+  });
+
+  it("addresses users by their API slug, not their display name", async () => {
+    const lists = await popularLists();
+    const a24 = lists.find((l) => l.name === "A24");
+    // "Fidel.cb" is the display name; Trakt's API needs "fidel-cb". Building
+    // the URL from the display name made this list fail to load entirely.
+    assert.equal(a24.url, "https://trakt.tv/users/fidel-cb/lists/a24");
+    assert.equal(a24.user, "Fidel.cb", "the display name should still be shown to the reader");
+
+    for (const l of lists) {
+      const userPart = l.url.split("/users/")[1].split("/")[0];
+      assert.ok(!userPart.includes("."), `list URL still carries a display name: ${l.url}`);
+    }
+  });
+
+  it("carries contentType so the search path agrees with the feed", async () => {
+    // renderListSearchResults reads contentType first; without it a popular
+    // list fell back to the same hardcoded type the feed had.
+    const lists = await popularLists();
+    assert.equal(lists.find((l) => l.name === "Great Popular Shows").contentType, "series");
+    assert.equal(lists.find((l) => l.name === "Best Movies of 2024").contentType, "movie");
+    assert.equal(lists.find((l) => l.name === "A24").contentType, "unknown");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();
