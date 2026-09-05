@@ -388,18 +388,17 @@ call (24 ids × find + recommendations + similar); `/api/details/batch` up to 60
 enough to unlock unlimited invocations of that fan-out against the deployment's own subrequest, CPU
 and billing budget.
 
-**Fix.** Always rate-limit; vary only the ceiling.
+**Fix (applied).** Always rate-limited; only the ceiling varies —
+`/api/recommendations` 30/min shared vs 120 with a key, `/api/details/batch` 60 vs 240. Power users
+who set a real key keep their headroom; the Worker's own budget stops being unbounded.
 
-```js
-const byoKey = !!body.tmdbKey;
-const recIp = clientIpKey(request);
-if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
-if (await consumeRateLimit(env, ctx, "recommendations", recIp, byoKey ? 120 : 30)) {
-  return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
-}
-```
-
-Power users who set a real key keep working; the Worker's own budget stops being unbounded.
+A note on the test suite: an existing test asserted
+`ownKeyLimited === 0, "callers using their own TMDB key must never be rate-limited"`. That was not an
+incidental assumption — it encoded the vulnerability as intended behaviour, and it kept passing after
+the fix only because its 70 iterations fell under the new 240 ceiling. It has been rewritten to
+assert the property that was actually wanted: a *higher ceiling*, not the absence of one. Both
+endpoints now have a test proving a bring-your-own-key caller clears the shared ceiling and still
+hits a limit eventually; both were confirmed failing against the pre-fix code.
 
 ---
 
@@ -799,7 +798,7 @@ byte-exact concatenation, CI-gated against drift.
 ### `25_api-catalog-routes.js`
 - ✅ `:4720` — **DONE.** `generateShortId()` instead of `Math.random()` for thread ids. **(3)**
 - ✅ `:4684` — **DONE.** Owned threads require the account key; `senderName` is derived. **(4)**
-- 🟠 `:1744` and `:5739` — always rate-limit; raise the ceiling for bring-your-own-key. **(5)**
+- ✅ `:1744` and `:5739` — **DONE.** Always rate-limited; higher ceiling for bring-your-own-key. **(5)**
 - 🟡 `/api/channel-logo:972` — cap the fetched image size; serve with a long `max-age`.
 - 🟡 `/api/save:5390`, `/api/publish-list:5463` — add `expirationTtl` or a sweep for records nothing references. **(M4)**
 
@@ -836,7 +835,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
 ~~3. CSPRNG thread ids (3)~~ — **DONE** · ~~4. Thread append authorization (4)~~ — **DONE** ·
-5. Rate-limit bypass (5) · 6. SRI on the CDN script (6)
+~~5. Rate-limit bypass (5)~~ — **DONE** · 6. SRI on the CDN script (6)
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
 7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · 9. Like-ledger consistency (9) ·
@@ -913,7 +912,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 3. ~~**Minimum entropy on recovery answers at creation**~~ — **DONE.**
 4. ~~**`generateShortId()` for feedback thread ids**~~ — **DONE.** (3)
 5. ~~**Authorize `threadId` appends and stop trusting `senderName`.**~~ — **DONE.** (4)
-6. **Always rate-limit `/api/recommendations` and `/api/details/batch`.** (5)
+6. ~~**Always rate-limit `/api/recommendations` and `/api/details/batch`.**~~ — **DONE.** (5)
 7. **Add SRI to the fflate `<script>`.** (6)
 8. **Move the reset-key and admin-login limiters onto D1's atomic upsert.** (7)
 9. **Cap and cache `/api/channel-logo`; add TTL/sweep to `/api/save` + `/api/publish-list` keys.**

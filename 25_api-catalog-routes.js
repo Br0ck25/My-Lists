@@ -1736,17 +1736,27 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
-      // Up to 24 ids, each costing a find + a recommendations call, so a
-      // single request is ~48 TMDB calls. Limited only when it falls back
-      // to the shared key, same reasoning as /api/details/batch above.
-      // The Discover tab issues one of these per load, so 30/minute is far
-      // more than any real session needs.
-      if (!body.tmdbKey) {
-        const recIp = clientIpKey(request);
-        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
-        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
-          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
-        }
+      // Up to 24 ids, each costing a find + a recommendations call (and a
+      // similar call when recommendations comes back empty), so a single
+      // request is up to ~72 outbound subrequests.
+      //
+      // This used to skip the limit ENTIRELY whenever the body carried a
+      // tmdbKey, on the reasoning that a caller spending their own quota
+      // needs no protecting. True of TMDB's quota; not true of this
+      // Worker's. The field was never validated, so `tmdbKey: "x"` bought
+      // unlimited invocations of that fan-out against this deployment's own
+      // subrequest, CPU and billing budget -- measured at 0 of 40 requests
+      // blocked, versus 10 of 40 without the field.
+      //
+      // So: always limited, only the ceiling differs. A visitor who really
+      // has their own key gets far more headroom (they are not competing for
+      // the shared key), while the endpoint stops being an open amplifier.
+      // The Discover tab issues one of these per load, so even 30/minute is
+      // well beyond what a real session needs.
+      const recIp = clientIpKey(request);
+      if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+      if (await consumeRateLimit(env, ctx, "recommendations", recIp, body.tmdbKey ? 120 : 30)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
       }
 
       const [movieLists, showLists] = await Promise.all([
@@ -5808,18 +5818,22 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
-      // Rate-limited only when this falls back to the Worker owner's shared
-      // TMDB key. A visitor who supplied their own is spending their own
-      // quota, so there is nothing here to protect them from -- and
-      // throttling them would break exactly the power users who set a key
-      // up. 60/minute leaves plenty of room for the real bulk caller
-      // (refreshAiringNext pages a large Watch History 60 ids at a time).
-      if (!reqBody.tmdbKey) {
-        const batchIp = clientIpKey(request);
-        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
-        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
-          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
-        }
+      // Same correction as /api/recommendations above: this used to skip the
+      // limit outright whenever the body carried a tmdbKey. Supplying your
+      // own key does mean you are spending your own TMDB quota, but it never
+      // meant you were spending your own subrequests -- and the field was
+      // never validated, so any non-empty string unlocked an unlimited
+      // 60-id fan-out against this Worker.
+      //
+      // Always limited now, with a much higher ceiling for a caller who
+      // brought a key, so the power users this exemption existed for keep
+      // their headroom. 60/minute already leaves plenty of room for the real
+      // bulk caller (refreshAiringNext pages a large Watch History 60 ids at
+      // a time).
+      const batchIp = clientIpKey(request);
+      if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, reqBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";

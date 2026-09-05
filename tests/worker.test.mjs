@@ -2177,7 +2177,14 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     assert.ok(limited > 0, "expected the per-IP bucket to reject some of 25 rapid calls");
   });
 
-  it("rate-limits /api/details/batch only when it falls back to the shared TMDB key", async () => {
+  // This test used to assert that a caller supplying their own tmdbKey "must
+  // never be rate-limited". That was the wrong property, and it was the
+  // vulnerability: bringing your own key means you are spending your own
+  // TMDB quota, but it never meant you were spending your own subrequests,
+  // and the field was never validated. Any non-empty string therefore
+  // unlocked an unlimited 60-id fan-out against this Worker's budget.
+  // The correct property is a HIGHER ceiling, not the absence of one.
+  it("gives bring-your-own-key callers more headroom on /api/details/batch, not an exemption", async () => {
     const env = makeEnv();
     const ip = nextIp();
     let sharedLimited = 0;
@@ -2187,9 +2194,8 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     }
     assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
 
-    // A visitor who supplied their own key spends their own quota, so the
-    // limit must not apply to them -- throttling them would penalise
-    // exactly the users who bothered to configure a key.
+    // The headroom the exemption existed to give is preserved: a caller with
+    // their own key sails past the shared-key ceiling.
     const ownKeyIp = nextIp();
     let ownKeyLimited = 0;
     for (let i = 0; i < 70; i++) {
@@ -2198,7 +2204,53 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
       });
       if (r.status === 429) ownKeyLimited++;
     }
-    assert.equal(ownKeyLimited, 0, "callers using their own TMDB key must never be rate-limited");
+    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+
+    // ...but it is a ceiling, not an exemption.
+    const floodIp = nextIp();
+    let floodLimited = 0;
+    for (let i = 0; i < 260; i++) {
+      const r = await call(env, "/api/details/batch", {
+        method: "POST", ip: floodIp, json: { ids: ["tt1"], tmdbKey: "anything-at-all" },
+      });
+      if (r.status === 429) floodLimited++;
+    }
+    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
+  });
+
+  it("gives bring-your-own-key callers more headroom on /api/recommendations, not an exemption", async () => {
+    // Up to ~72 outbound subrequests per call, so this is the bigger
+    // amplifier of the two.
+    const env = makeEnv();
+    const sharedIp = nextIp();
+    let sharedLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: sharedIp, json: { movieIds: [], showIds: [] },
+      });
+      if (r.status === 429) sharedLimited++;
+    }
+    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], showIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+
+    const floodIp = nextIp();
+    let floodLimited = 0;
+    for (let i = 0; i < 140; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: floodIp, json: { movieIds: [], showIds: [], tmdbKey: "x" },
+      });
+      if (r.status === 429) floodLimited++;
+    }
+    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
   });
 
   it("rate-limits /api/recommendations only when it falls back to the shared TMDB key", async () => {
