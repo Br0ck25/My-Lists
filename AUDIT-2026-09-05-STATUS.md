@@ -12,9 +12,10 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 10 of 16 findings closed** (all 4 production blockers, the client-bundle
+**Progress: 13 of 16 findings closed** (all 4 production blockers, the client-bundle
 duplicate-declaration class, the shared-key fan-out endpoints, the admin Community Lists
-panel, the counter atomicity, the undocumented secret, and the build-header fragility).
+panel, the counter atomicity, outbound timeouts, the per-ping N+1,
+account-purge completeness, the undocumented secret, and the build-header fragility).
 
 ---
 
@@ -32,6 +33,9 @@ panel, the counter atomicity, the undocumented secret, and the build-header frag
 | 10 | Admin "Top Community Lists" was permanently **empty** without D1, and mis-ranked when it wasn't | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 10` (3 tests) |
 | 14 | `MDBLIST_CLIENT_SECRET` required but documented nowhere | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 14` (2 tests, incl. an all-env-vars guard) |
 | 9 | Stat counters were non-atomic read-modify-writes; 20 concurrent requests recorded as 1 | 🟠 Med-High | 2026-09-05 | `7321e7c` | `audit fix 9` (6 tests) |
+| 13 | No timeout on any of ~135 outbound fetches; the stale-fallback tiers only fire on rejection, so a hang was never covered | 🟠 Medium | 2026-09-05 | `f9a439b` | `audit fix 13` (5 tests) |
+| 11 | Every playback ping read every list the creator owns, uncursored | 🟠 Medium | 2026-09-05 | `f9a439b` | `audit fix 11` (1 test) |
+| 12 | Account deletion left like ledgers behind, so a recycled username inherited a stranger's like count | 🟠 Low-Med | 2026-09-05 | `f9a439b` | `audit fix 12` (2 tests) |
 
 ### What changed, per fix
 
@@ -118,15 +122,21 @@ Took option 3, the D1 fix. Measured lost-update rate before and after:
 > one-line upsert — and their read fan-out is already bounded by `EVT_DAY_INDEX_CAP` /
 > `SEARCH_DAY_INDEX_CAP`. Tracked below.
 
+**13 — outbound timeouts** (`02_`)
+Covered at two shared helpers rather than ~135 call sites: `fetchWithTimeout` aborts the request, and `withTimeout` wraps the circuit breaker's caller-supplied `fetchFn` (where a signal cannot be threaded in) so a hang becomes the rejection the existing memory → KV → edge → stale fallback already handles. 10s, chosen against what the callers are: reads a Stremio/wako client is actively waiting on. `AbortSignal.timeout` is probed, not assumed — `render_check.js`'s sandbox deliberately omits it.
+
+**11 — per-ping N+1** (`26_`)
+The watchlist has a canonical key (`creatorlist:{user}:watchlist`, written by save-tracking; `slugifyServer` maps any list actually named "Watchlist" to the same slug), so the common path is now one GET instead of a full prefix enumeration plus one GET per list. The scan survives only as a bounded, paged fallback for the other shapes the old loop accepted — previously it was uncursored and silently stopped looking past 1,000 lists.
+
+**12 — account purge** (`02_`)
+`listlikevoters:{user}:{slug}` and `scrobbleseenusers:{user}` were never deleted. The ledger was the harmful one: `delete-account` frees the username for re-registration, so whoever claimed it next and picked the same slug inherited the previous owner's like count — and every voter in the old ledger was silently unable to like it. There is a test driving that end to end. Also corrected `creatortrack:{user}`, which sat under the "legacy names" heading but is live (written by `handleSubtitlesTrack`, read by `/api/creator/track-status`).
+
 ---
 
 ## ⬜ Open — next up, in recommended order
 
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
-| 13 | No timeout on any of ~135 outbound fetches | 🟠 Medium | `02_` `fetchWithPerUserCacheUncoalesced`, `fetchTraktWithRetry` | A hung upstream stalls the request; the stale-fallback tiers only trigger on rejection. Fix = `AbortSignal.timeout` at the two shared helpers, not 135 call sites. |
-| 11 | N+1 KV reads on every playback ping | 🟠 Medium | `26_:~410` | Enumerates and reads every one of the creator's lists to find the watchlist; also has no cursor, so it truncates at 1,000. Fix = read `creatorlist:{u}:watchlist` directly, scan only as fallback. |
-| 12 | Orphaned KV on account deletion | 🟠 Low-Med | `02_` `purgeCreatorData` | `listlikevoters:{u}:*` and `scrobbleseenusers:{u}` survive deletion, so a recycled username inherits stale like counts. Also: the `creatortrack:` "legacy" comment is wrong — it is a live key. |
 | 9b | `recordTrackedEvent` / `recordSearchQuery` still use KV read-modify-write | 🟡 Low | `03_admin.js` | Carved out of finding 9: they store a JSON day-map blob plus a capped index array, so D1 means a schema redesign, not the same upsert. Read fan-out is already capped, so the leaderboards undercount rather than break. |
 | 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | `26_:~448` | Largely forced (Plex/Jellyfin webhooks can't set headers). Fix = document the trade and the rotation path, don't redesign. |
 | 7 | ~40 handlers return raw `String(err.message)` | 🟡 Low | `25_`, `26_` | Leaks nothing today (all `throw`s are status-only) but contradicts the policy stated at `/api/bulk-resolve`. |
