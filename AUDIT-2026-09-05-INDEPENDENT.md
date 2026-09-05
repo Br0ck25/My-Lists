@@ -21,6 +21,13 @@ usually has — stored XSS in the admin panel, unresolved inline handlers, dupli
 stale-JavaScript service-worker traps, source/generated drift, credential leakage in error messages —
 were specifically tested for and are **not** present.
 
+> **Post-audit note.** Five further defects were reported from real use and are recorded under
+> **Field-Reported Bugs** below, including a critical one (finding 18) that had already left a live
+> account with 129 public-directory entries for 22 real lists — 53 records where there should be 22,
+> and 76 entries pointing at records that no longer exist. All five are client-side or
+> client-driven, which is precisely where this audit's method does not look. See question 9 of the
+> Final Verdict.
+
 Two issues should be fixed before the user base grows, and both are *silent* failures:
 
 1. **The public list directory permanently breaks itself at scale.** Past roughly 500 public lists the
@@ -660,6 +667,122 @@ so the lossy path is the default one.
 
 ---
 
+## Field-Reported Bugs (found after the audit, by using the product)
+
+Five defects the audit pass did not find. They are recorded here because *how* they were missed is
+more useful than the fixes: every one of them lives in the client, and the audit's method — route
+execution against an instrumented Worker harness — never renders a page or clicks anything. The
+harness proves the server behaves; it says nothing about what the browser then does with the answer.
+Three of the five are server-visible only as a *pattern* of individually valid requests.
+
+### 16. Channel "See All" collapsed every episode of a show into one tile — ✅ FIXED
+
+**🟡 Medium · `20_client-channel-builder.js`**
+
+Every episode shared the show's identity, so a channel of 40 episodes across 5 shows deduplicated down
+to 5 tiles. Fixed with `channelItemId(it, idx)`, which returns `showId:season:episode` — the id shape
+the rest of the codebase already uses for episodes — with a name-based fallback for items carrying no
+id at all.
+
+### 17. Discover's Trakt lists 404'd and loaded no posters — ✅ FIXED
+
+**🟡 Medium · `25_api-catalog-routes.js`, `/api/trakt-popular-lists`**
+
+The route addressed users by their **display name** rather than their API slug, so every generated URL
+404'd — which is exactly why the same lists worked when searched for and not when opened from
+Discover. It also typed every list `mixed`, so nothing matched the poster fetch. Now uses
+`user.ids.slug` for URLs (display name for the label only) and infers movie/series from the list name,
+falling back to `mixed` only when genuinely ambiguous.
+
+**Why the audit missed it:** the endpoint returns `ok:true` with well-formed data. Nothing is wrong
+until you follow one of the URLs, which no test did.
+
+### 18. Runaway duplicate lists: 129 directory entries for 22 real lists — ✅ FIXED
+
+**🔴 Critical · `26_…` `/api/creator/lists/save`, `/api/creator/lists`; `22_client-creator-profile.js`**
+
+One account's directory held 44 entries for the same 462-item list (`coming-of-age-3` …
+`coming-of-age-53`) and 29 for another, every entry reporting an identical item count, minted seconds
+apart across a ten-minute window. Three defects compounded into a loop that could not terminate:
+
+1. `/api/creator/lists/save` treated `body.slug` as advisory — honoured only if the slug already
+   appeared in `creatorlistorder:{user}`, and **silently discarded otherwise**, with a different slug
+   minted from the name and `ok:true` returned as though the request had been carried out.
+2. `/api/creator/lists` built its reply from that order key alone.
+3. `renderCreatorDashboard` fired one unawaited save per missing list, all at once, and threw every
+   reply away.
+
+`creatorlistorder:{user}` is a single KV value rewritten read-modify-write, and KV has no
+compare-and-swap. 22 lists meant 22 concurrent saves, 21 lost order entries, 21 records that existed but
+were invisible to the dashboard, and a re-upload of all of them on the next render:
+
+```
+render 1: saw  0 lists -> fired 22 saves | records: 22 | in order: 1
+render 2: saw  1 list  -> fired 21 saves | records: 22 | in order: 2
+render 3: saw  2 lists -> fired 20 saves | records: 22 | in order: 3
+```
+
+Fixed on both sides, either of which stops the runaway alone: a save that names a slug gets that slug
+(sanitised through `slugifyServer`, since it now reaches a KV key name and a URL path from an arbitrary
+body field); `order` decides display order rather than existence, with orphaned records recovered and
+`order` repaired; allocating a *new* slug checks KV as well as `order`, so it cannot overwrite a live
+record; and the client uploads one list at a time, awaits each reply, and records the slug it gets back.
+
+**Still outstanding at the time of writing:** the 76 stranded directory entries this already produced.
+Their removals were lost to the same missing atomicity, in `updatePublicListIndex` rather than the order
+key. The daily re-derivation added alongside the fix clears them on its next run once deployed, and the
+admin "Delete a creator's lists" panel removes them now.
+
+**Why the audit missed it.** This is the finding worth learning from. Finding 15 examined the very same
+function and caught a *different* slug bug in it. Every individual request here is valid and every
+response is `ok:true` — the defect is only visible in the aggregate, across many requests, over time,
+with an eventually-consistent store in between. The audit tested each route; it never asked what
+happens when a client calls one in a loop. Reproducing it required injecting a real `await` boundary
+into the KV mock, because the mock is strongly consistent and serialises every handler, which hides the
+problem completely.
+
+It is also the concrete cost of the failure class `purgeCreatorData` already documents about itself:
+**an endpoint that reports success for a request it did not carry out.** That function's comment
+records a "delete my account" that returned `ok:true` and left the account fully intact. The save
+route was doing the same thing in a quieter register. The bill on one account: 129 directory entries
+for 22 real lists, of which 53 still have a record behind them and 76 do not.
+
+### 19. Removing one Watch History item reloaded the whole list — ✅ FIXED
+
+**🟡 Medium · `22_client-creator-profile.js`, `23_client-list-management.js`**
+
+`removeWatchHistoryItemDirect` called `renderWatchHistoryGrid()` whenever the See All page was open, and
+that starts with `gridEl.innerHTML = ''` and rebuilds every tile — blanking the grid, re-requesting every
+poster, and scrolling back to the top. The work was wasted too: the clicked tile had already been faded
+out by `removeListItemFromDetails`, and no surviving tile had changed. Now updated in place.
+
+### 20. A grouped Watch History show tile removed from the wrong list — ✅ FIXED
+
+**🟡 Medium · `23_client-list-management.js`**
+
+In grouped-by-show mode the grid built its show tiles with `removeShowId`. `livePreviewPosterHtml` reads
+that field as *"this is a Continue Watching tile"* — it tests for it ahead of `removeHistoryId`, and
+`isCwItem` keys off it too. So the × on a grouped Watch History show rendered as
+`data-remove-type="cw"` titled "Remove from Continue Watching", dispatched to
+`dismissContinueWatchingShow`, left the watch history untouched, and picked up Continue Watching's
+poster badge settings. Now carries `removeHistoryId`; `removeWatchHistoryItemDirect` already matches on
+`showId`, so it clears every watched episode of that show and nothing else.
+
+**Why the audit missed 19 and 20:** neither is reachable without rendering the page and clicking. The
+audit's `html_checks.py` addition proves every inline handler *resolves to a function*; it cannot know
+that the function it resolves to is the wrong one.
+
+### What this says about the audit's method
+
+The harness covers the server well and found real server defects. Its blind spot is the client, and the
+gap is not incidental — three of these five (17, 18, 20) are cases where the server is behaving exactly
+as written and the defect is in what the caller does with the answer, or in a pattern only visible
+across many calls. Closing it properly needs either a browser-driving test (Playwright reaches the
+sandbox but not the live site; a local `wrangler dev` target would work) or, more cheaply, loading
+client functions in a `vm` with DOM stubs — which is how findings 19 and 20 are now regression-tested.
+
+---
+
 ## Scalability Findings
 
 Finding 1 is the dominant one. Behaviour by deployment size:
@@ -1084,3 +1207,18 @@ audit markdown at the repository root, against 241 lines of genuinely dead JavaS
 Second: KV read-modify-write contention — like counts, `stats:*` counters and the rate limiters all
 degrade as concurrency rises, and the D1 path that fixes this is optional and commented out by
 default in `wrangler.toml`.
+
+> **Update — this one came true, on a key this answer did not name.** Finding 18 is exactly this
+> failure mode, and it did not wait for the user base to grow: `creatorlistorder:{user}` and the
+> public-index key are both single-value read-modify-writes, and a single browser was enough to
+> produce the concurrency, because the client fired 22 saves at once. It left one account with 31
+> surplus list records and 76 directory entries pointing at nothing. The lesson to carry: this answer treated contention as a
+> *scale* risk, when the contended keys are per-user and the concurrency comes from one client's own
+> fan-out. Every remaining single-key read-modify-write in this codebase should be read that way.
+
+**9. What did the audit itself miss?** Five client-side defects, listed under Field-Reported Bugs
+above, one of them critical. The method — route execution against an instrumented Worker harness —
+never renders a page or clicks anything, and never calls a route in a loop. It proves the server
+behaves; it says nothing about what the browser does with the answer, or about defects that are only
+visible in the aggregate across many individually valid requests. That is the gap to close next, and
+findings 19 and 20 now show the cheap way to do it: load client functions in a `vm` with DOM stubs.
