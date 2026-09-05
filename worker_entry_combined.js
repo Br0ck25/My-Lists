@@ -147,6 +147,15 @@ const MIGRATE_D1_ERROR_CAP = 50;
 const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
 const RECOVERY_ANSWER_MIN_LENGTH = 8;
 
+// --- Bound on /api/channel-logo's inlined image ------------------------------
+//
+// That endpoint fetches a TMDB image and base64-encodes it into an SVG,
+// holding the whole thing in memory twice (a byte array, then a binary
+// string) before encoding. It is unauthenticated, so the size of what it
+// will buffer needs a ceiling rather than being whatever the upstream
+// happens to return. A w500 poster is tens of kilobytes.
+const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -47926,18 +47935,24 @@ self.addEventListener('fetch', e => {
 
     // /api/channel-poster -> Returns branded SVG channel poster or landscape backdrop
     if (path === "/api/channel-poster") {
-      const name = url.searchParams.get("name") || "TV Channel";
+      // Bounded: the name is rendered into the SVG, and wrapSvgText does not
+      // break a single long word, so an unbounded value just inflates the
+      // response. 200 is far past any real channel name.
+      const name = (url.searchParams.get("name") || "TV Channel").slice(0, 200);
       const bg = url.searchParams.get("bg") || "";
       const format = url.searchParams.get("format") || "";
       const svg = format === "landscape"
         ? generateChannelBackdropSvg(name, bg)
         : generateChannelPosterSvg(name, bg);
+      // Deterministic for a given name/bg/format -- it is text on a
+      // generated background, with no per-viewer or time-varying content --
+      // so there is nothing to keep fresh. It was marked no-store, which
+      // meant every request re-rendered it at the edge and at the client for
+      // an image that never changes.
       return new Response(svg, {
         headers: {
           "Content-Type": "image/svg+xml; charset=utf-8",
-          "Cache-Control": "no-cache, no-store, must-revalidate",
-          "Pragma": "no-cache",
-          "Expires": "0",
+          "Cache-Control": "public, max-age=86400",
           ...corsHeaders(),
         },
       });
@@ -48019,6 +48034,14 @@ self.addEventListener('fetch', e => {
       const logoPath = url.searchParams.get("path");
       const format = url.searchParams.get("format") || "";
       if (!logoPath) return new Response("Missing path", { status: 400 });
+      // Only something shaped like a TMDB image path. The value is
+      // interpolated into an image.tmdb.org URL, and while URL parsing keeps
+      // the host pinned there (so this was never SSRF), an unvalidated path
+      // still made this a general fetch-and-base64 proxy for that host,
+      // reachable by anyone, for any path they cared to name.
+      if (!/^\/?[A-Za-z0-9._-]{1,128}\.(png|jpg|jpeg|webp|svg)$/i.test(logoPath)) {
+        return new Response("Bad path", { status: 400 });
+      }
       try {
         const tmdbUrl = `https://image.tmdb.org/t/p/w500${logoPath.startsWith("/") ? logoPath : "/" + logoPath}`;
         const tmdbRes = await fetch(tmdbUrl, {
@@ -48026,8 +48049,23 @@ self.addEventListener('fetch', e => {
           cf: { cacheTtl: 604800, cacheEverything: true },
         });
         if (!tmdbRes.ok) return new Response("Image not found", { status: 404 });
+        // Bound what gets buffered and base64'd. A w500 poster is tens of
+        // kilobytes; anything far past that is not a logo, and this endpoint
+        // holds the whole thing in memory twice (bytes, then a binary string)
+        // before encoding it.
+        const declaredLength = parseInt(tmdbRes.headers.get("content-length") || "", 10);
+        if (Number.isFinite(declaredLength) && declaredLength > CHANNEL_LOGO_MAX_BYTES) {
+          return new Response("Image too large", { status: 413 });
+        }
         const arrayBuffer = await tmdbRes.arrayBuffer();
+        if (arrayBuffer.byteLength > CHANNEL_LOGO_MAX_BYTES) {
+          // No content-length header, or it lied.
+          return new Response("Image too large", { status: 413 });
+        }
         const contentType = tmdbRes.headers.get("content-type") || "image/png";
+        // Escaped because it lands in an SVG attribute and comes from an
+        // upstream response header rather than from this Worker.
+        const safeContentType = escapeXml(contentType.split(";")[0].trim() || "image/png");
         const bytes = new Uint8Array(arrayBuffer);
         let binary = "";
         const len = bytes.byteLength;
@@ -48035,7 +48073,7 @@ self.addEventListener('fetch', e => {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64 = btoa(binary);
-        const dataUri = `data:${contentType};base64,${base64}`;
+        const dataUri = `data:${safeContentType};base64,${base64}`;
 
         const svg = format === "landscape"
           ? `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="338" viewBox="0 0 600 338">
@@ -48077,12 +48115,16 @@ self.addEventListener('fetch', e => {
   </g>
 </svg>`;
 
+        // Deterministic for a given path/format, and callers already append
+        // their own `v` cache-buster (see getPremadeChannelLogo,
+        // 05_catalog-core.js), so this can be cached hard. It was no-store,
+        // which meant every single request re-fetched the image from TMDB
+        // and re-base64'd it -- the whole cost of this endpoint, repeated
+        // for output that cannot change.
         return new Response(svg, {
           headers: {
             "Content-Type": "image/svg+xml; charset=utf-8",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
+            "Cache-Control": "public, max-age=604800, immutable",
             ...corsHeaders(),
           },
         });

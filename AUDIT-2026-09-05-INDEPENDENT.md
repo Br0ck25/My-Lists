@@ -617,9 +617,16 @@ only a rolling newest-300 tail; `checkForNewEpisodes` is cursor-paginated at 25 
   base64-encodes the whole body per request, then returns `Cache-Control: no-cache, no-store,
   must-revalidate`, so Cloudflare never caches the Worker's own response and every hit repeats the
   encode. There is no size cap on the fetched image. `logoPath` is unvalidated; URL parsing confines
-  it to `image.tmdb.org`, so this is an open image proxy for that one host rather than SSRF. **Fix:**
-  cap the response size, and serve with a long `max-age` — the output is deterministic for a given
-  path and format.
+  it to `image.tmdb.org`, so this is an open image proxy for that one host rather than SSRF.
+  **Fixed:** `path` must now look like a TMDB image filename (rejected before any upstream call, so a
+  probe costs nothing); the buffered image is capped at 2 MB, enforced against both a declared
+  `content-length` and the actual byte length so a missing or dishonest header cannot slip past; the
+  upstream `content-type` is escaped before it lands in an SVG attribute; and both this and
+  `/api/channel-poster` now send a long `max-age` instead of `no-store`, since their output is
+  deterministic and callers already append their own `v` cache-buster. `/api/channel-poster`'s `name`
+  is also bounded at 200 chars — `wrapSvgText` does not break a single long word, so an unbounded
+  value just inflated the response. Four regression tests, all confirmed failing against the pre-fix
+  code.
 - **`rebuildPublicListIndex` is fully sequential** — `await get` per list in a `for` loop. Even below
   the subrequest cliff, 400 lists is 400 serialised round-trips. Batch it.
 
@@ -829,7 +836,7 @@ byte-exact concatenation, CI-gated against drift.
 - ✅ `:4720` — **DONE.** `generateShortId()` instead of `Math.random()` for thread ids. **(3)**
 - ✅ `:4684` — **DONE.** Owned threads require the account key; `senderName` is derived. **(4)**
 - ✅ `:1744` and `:5739` — **DONE.** Always rate-limited; higher ceiling for bring-your-own-key. **(5)**
-- 🟡 `/api/channel-logo:972` — cap the fetched image size; serve with a long `max-age`.
+- ✅ `/api/channel-logo:972` — **DONE.** Path validated, image capped, response cached.
 - 🟡 `/api/save:5390`, `/api/publish-list:5463` — add `expirationTtl` or a sweep for records nothing references. **(M4)**
 
 ### `26_api-creator-and-admin-routes.js`
@@ -869,7 +876,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
 7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
-10. `channel-logo` caching + size cap · 11. TTL/sweep for anonymous records
+~~10. `channel-logo` caching + size cap~~ — **DONE** · 11. TTL/sweep for anonymous records
 
 **🔵 PHASE 4 — OPTIONAL**
 12. Delete 241 lines of dead code · 13. Handler-resolution CI check · 14. Cron global assignment ·
@@ -945,7 +952,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 6. ~~**Always rate-limit `/api/recommendations` and `/api/details/batch`.**~~ — **DONE.** (5)
 7. ~~**Add SRI to the fflate `<script>`.**~~ — **DONE.** (6)
 8. **Move the reset-key and admin-login limiters onto D1's atomic upsert.** (7)
-9. **Cap and cache `/api/channel-logo`; add TTL/sweep to `/api/save` + `/api/publish-list` keys.**
+9. ~~**Cap and cache `/api/channel-logo`**~~ — **DONE.** TTL/sweep for `/api/save` + `/api/publish-list` keys still open.
 10. **Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.
 
 ---

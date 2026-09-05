@@ -97,6 +97,15 @@ const MIGRATE_D1_ERROR_CAP = 50;
 const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
 const RECOVERY_ANSWER_MIN_LENGTH = 8;
 
+// --- Bound on /api/channel-logo's inlined image ------------------------------
+//
+// That endpoint fetches a TMDB image and base64-encodes it into an SVG,
+// holding the whole thing in memory twice (a byte array, then a binary
+// string) before encoding. It is unauthenticated, so the size of what it
+// will buffer needs a ceiling rather than being whatever the upstream
+// happens to return. A w500 poster is tens of kilobytes.
+const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

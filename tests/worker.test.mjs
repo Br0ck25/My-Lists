@@ -513,6 +513,88 @@ describe("audit fix: support threads are capabilities, not open mailboxes", () =
   });
 });
 
+// /api/channel-logo fetches a TMDB image and base64-encodes it into an SVG.
+// It is unauthenticated, took any path at all, buffered whatever the upstream
+// returned, and answered no-store -- so every request repeated the whole
+// fetch-and-encode for output that cannot change.
+describe("audit fix: the channel image endpoints are bounded and cacheable", () => {
+  function stubUpstream(sizes = {}) {
+    const seen = [];
+    globalThis.fetch = async (u) => {
+      const href = typeof u === "string" ? u : u.url;
+      seen.push(href);
+      for (const [marker, size] of Object.entries(sizes)) {
+        if (href.includes(marker)) {
+          const headers = { "content-type": "image/png" };
+          if (size.declare !== false) headers["content-length"] = String(size.bytes);
+          return new Response(new Uint8Array(size.bytes), { status: 200, headers });
+        }
+      }
+      return new Response(new Uint8Array([137, 80, 78, 71]), {
+        status: 200, headers: { "content-type": "image/png" },
+      });
+    };
+    return seen;
+  }
+
+  it("serves real TMDB logo paths, cached rather than no-store", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/wLqRr0YLAqmWKAHYFhkQBQFCDLL.jpg", "wLqRr0YLAqmWKAHYFhkQBQFCDLL.png", "/abc123.webp"]) {
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 200, `real path rejected: ${p}`);
+        assert.match(r.headers.get("cache-control") || "", /max-age=\d{4,}/, "output is deterministic and must be cacheable");
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("rejects anything not shaped like a TMDB image path, without calling upstream", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      const seen = stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/../../etc/passwd", "/t/p/original/anything", "/justsomepath", "/a.png?x=1"]) {
+        const before = seen.length;
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 400, `should have been rejected: ${p}`);
+        assert.equal(seen.length, before, `rejected path still hit the upstream: ${p}`);
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("refuses an oversized image, with or without a content-length header", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream({
+        huge: { bytes: 3 * 1024 * 1024 },
+        nolen: { bytes: 3 * 1024 * 1024, declare: false },
+      });
+      const env = makeEnv();
+      const declared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/huge0000000.png"));
+      assert.equal(declared.status, 413);
+      // A missing or dishonest content-length must not get past the cap.
+      const undeclared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/nolen000000.png"));
+      assert.equal(undeclared.status, 413);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("bounds and escapes the channel-poster name, and caches the result", async () => {
+    const env = makeEnv();
+    const huge = await call(env, "/api/channel-poster?name=" + encodeURIComponent("A".repeat(5000)));
+    assert.equal(huge.status, 200);
+    assert.ok(huge.text.length < 10000, `a 5000-char name produced ${huge.text.length} bytes of SVG`);
+    assert.match(huge.headers.get("cache-control") || "", /max-age=\d{4,}/);
+
+    const injected = await call(env, "/api/channel-poster?name=" +
+      encodeURIComponent("</text><script>alert(1)</script>"));
+    assert.equal(injected.status, 200);
+    // Served as image/svg+xml from this origin, so raw markup here would run.
+    assert.ok(!injected.text.includes("<script>"), "channel name was not escaped into the SVG");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();
