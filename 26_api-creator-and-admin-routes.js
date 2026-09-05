@@ -1566,10 +1566,18 @@
         // someone-else/top-10 are unrelated), so the collision check and
         // auto-increment only look at this creator's own list keys.
         const baseSlug = slugifyServer(name) || "list";
-        slug = baseSlug;
-        for (let attempt = 2; attempt <= 500; attempt++) {
-          if (!order.includes(slug)) break;
-          slug = `${baseSlug}-${attempt}`;
+        // Checked against an in-memory array rather than KV, so this one was
+        // never a subrequest problem -- but it had the same fall-through:
+        // past the bound it kept a slug that WAS taken and saved over that
+        // list. Scoped to this creator's own namespace, so only their own
+        // list was ever at risk, but silently replacing it is still the
+        // wrong answer.
+        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        if (!slug) {
+          return json(
+            { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+            409
+          );
         }
       }
 

@@ -1405,6 +1405,53 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
   return { count: finalVoters.length, capped: false };
 }
 
+// --- Slug allocation ---------------------------------------------------------
+//
+// Picks a slug nothing has claimed yet, given an async predicate that says
+// whether a candidate is taken.
+//
+// Numbered suffixes first, because "-2"/"-3" make far nicer URLs than a
+// random token, but only a few of them: the numbered scan is O(n) in how
+// many lists already share a name, and at /api/publish-list each of those
+// checks is a KV read. 500 collisions meant 501 KV reads for one publish --
+// half of Cloudflare's per-invocation subrequest budget, on an
+// unauthenticated endpoint, and a condition anyone could manufacture just by
+// publishing the same list name repeatedly. After that it switches to a
+// random suffix, which needs one check regardless of how crowded the name is.
+//
+// Returns "" when it cannot find a free slug, and callers MUST treat that as
+// a failure. Both call sites previously ran a bounded numbered loop and then
+// used whatever slug it exited on -- which, once the bound was reached, was a
+// slug that WAS taken. The write then went straight over an existing list:
+// at /api/publish-list, publishing a 501st list called "Movies" silently
+// replaced the contents of movies-500, returned ok:true, and handed back
+// that list's URL as if it were yours.
+const SLUG_NUMBERED_ATTEMPTS = 10;
+const SLUG_RANDOM_ATTEMPTS = 5;
+
+// Uniqueness, not secrecy -- this only has to avoid colliding with other
+// lists sharing a name, so the slight modulo bias here does not matter.
+function randomSlugSuffix() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+async function pickFreeSlug(baseSlug, isTaken) {
+  if (!(await isTaken(baseSlug))) return baseSlug;
+  for (let attempt = 2; attempt <= SLUG_NUMBERED_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${attempt}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  for (let attempt = 0; attempt < SLUG_RANDOM_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${randomSlugSuffix()}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  return "";
+}
+
 // --- External list URL validation --------------------------------------------
 //
 // /api/lists/like-external hashes a caller-supplied URL into a KV key. With

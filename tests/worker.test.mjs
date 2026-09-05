@@ -666,6 +666,104 @@ describe("audit fix: credential endpoints bound guesses across rolling windows",
   });
 });
 
+// Both list-saving endpoints allocated a slug by trying baseSlug, then
+// baseSlug-2, -3 ... up to 500, and then USING WHATEVER THE LOOP EXITED ON.
+// Past the bound that is a slug which is taken, and the write went straight
+// over the existing list.
+describe("audit fix: slug allocation never lands on a taken slug", () => {
+  it("does not overwrite an existing published list once the numbered range fills", async () => {
+    const kv = makeKv();
+    kv._store.set("publishedlist:user:movies", JSON.stringify({ name: "Movies", items: [] }));
+    for (let i = 2; i <= 500; i++) {
+      kv._store.set(`publishedlist:user:movies-${i}`, JSON.stringify({
+        name: "Movies", type: "movie", visibility: "public",
+        items: [{ id: `tt-EXISTING-${i}`, name: `someone else's list ${i}` }],
+      }));
+    }
+    const env = makeEnv({ CONFIGS: kv });
+    const before = kv._store.get("publishedlist:user:movies-500");
+
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "Movies", type: "movie", items: [{ id: "tt-MINE" }], visibility: "public" },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(kv._store.get("publishedlist:user:movies-500"), before,
+      "publishing over a full numbered range destroyed an existing list");
+    // Whatever slug it did hand back must be free and must be where the new
+    // list actually landed.
+    const mine = JSON.parse(kv._store.get(`publishedlist:user:${r.body.listName}`));
+    assert.equal(mine.items[0].id, "tt-MINE");
+    assert.match(r.body.url, new RegExp(`/lists/user/${r.body.listName}$`));
+  });
+
+  it("allocates a slug in constant KV reads however crowded the name is", async () => {
+    // Each numbered attempt used to be its own KV read, so one publish of a
+    // heavily-collided name cost ~501 subrequests -- half the per-invocation
+    // budget, on an unauthenticated endpoint, in a state anyone could
+    // manufacture by publishing the same name repeatedly.
+    async function readsForPublish(existing) {
+      const kv = makeKv();
+      kv._store.set("publishedlist:user:movies", "{}");
+      for (let i = 2; i <= existing; i++) kv._store.set(`publishedlist:user:movies-${i}`, "{}");
+      let reads = 0;
+      const realGet = kv.get.bind(kv);
+      kv.get = async (...a) => { reads++; return realGet(...a); };
+      const env = makeEnv({ CONFIGS: kv });
+      const r = await call(env, "/api/publish-list", {
+        method: "POST",
+        json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+      });
+      assert.equal(r.body.ok, true, r.body.error);
+      return reads;
+    }
+    const few = await readsForPublish(1);
+    const many = await readsForPublish(499);
+    assert.ok(many <= few + 20, `499 collisions cost ${many} KV reads vs ${few} for one -- the scan is still linear`);
+    assert.ok(many < 100, `one publish spent ${many} KV reads`);
+  });
+
+  it("keeps tidy numbered slugs for the ordinary case", async () => {
+    // The random suffix is the fallback, not the default: a second list of
+    // the same name should still get "-2", not a token.
+    const env = makeEnv();
+    const first = await call(env, "/api/publish-list", {
+      method: "POST", json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+    });
+    const second = await call(env, "/api/publish-list", {
+      method: "POST", ip: nextIp(),
+      json: { name: "Movies", type: "movie", items: [{ id: "tt2" }], visibility: "public" },
+    });
+    assert.equal(first.body.listName, "movies");
+    assert.equal(second.body.listName, "movies-2");
+  });
+
+  it("does not overwrite a creator's own list once their numbered range fills", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceslug");
+    // 500 lists all called "Movies" in this creator's own namespace.
+    const order = ["movies"];
+    for (let i = 2; i <= 500; i++) order.push(`movies-${i}`);
+    await env.CONFIGS.put(`creatorlistorder:${alice.creatorName}`, JSON.stringify({ order }));
+    await env.CONFIGS.put(`creatorlist:${alice.creatorName}:movies-500`, JSON.stringify({
+      name: "Movies", slug: "movies-500", type: "movie", visibility: "public",
+      items: [{ id: "tt-EXISTING" }], likes: 3, createdAt: 1, updatedAt: 1,
+    }));
+    const before = await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`);
+
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Movies", type: "movie", visibility: "public", items: [{ id: "tt-MINE" }],
+      },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`), before,
+      "saving over a full numbered range destroyed the creator's own list");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();

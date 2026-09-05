@@ -5617,14 +5617,17 @@ self.addEventListener('fetch', e => {
       if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
         return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
       }
-      let listSlug = baseSlug;
-      let plKey = "publishedlist:user:" + listSlug;
-      for (let attempt = 2; attempt <= 500; attempt++) {
-        const existing = await env.CONFIGS.get(plKey);
-        if (!existing) break;
-        listSlug = baseSlug + "-" + attempt;
-        plKey = "publishedlist:user:" + listSlug;
+      // Never falls through onto a slug that is taken -- see pickFreeSlug.
+      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
+        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
+      );
+      if (!listSlug) {
+        return json(
+          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+          409
+        );
       }
+      const plKey = "publishedlist:user:" + listSlug;
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });

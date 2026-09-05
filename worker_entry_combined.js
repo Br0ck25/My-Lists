@@ -3041,6 +3041,53 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
   return { count: finalVoters.length, capped: false };
 }
 
+// --- Slug allocation ---------------------------------------------------------
+//
+// Picks a slug nothing has claimed yet, given an async predicate that says
+// whether a candidate is taken.
+//
+// Numbered suffixes first, because "-2"/"-3" make far nicer URLs than a
+// random token, but only a few of them: the numbered scan is O(n) in how
+// many lists already share a name, and at /api/publish-list each of those
+// checks is a KV read. 500 collisions meant 501 KV reads for one publish --
+// half of Cloudflare's per-invocation subrequest budget, on an
+// unauthenticated endpoint, and a condition anyone could manufacture just by
+// publishing the same list name repeatedly. After that it switches to a
+// random suffix, which needs one check regardless of how crowded the name is.
+//
+// Returns "" when it cannot find a free slug, and callers MUST treat that as
+// a failure. Both call sites previously ran a bounded numbered loop and then
+// used whatever slug it exited on -- which, once the bound was reached, was a
+// slug that WAS taken. The write then went straight over an existing list:
+// at /api/publish-list, publishing a 501st list called "Movies" silently
+// replaced the contents of movies-500, returned ok:true, and handed back
+// that list's URL as if it were yours.
+const SLUG_NUMBERED_ATTEMPTS = 10;
+const SLUG_RANDOM_ATTEMPTS = 5;
+
+// Uniqueness, not secrecy -- this only has to avoid colliding with other
+// lists sharing a name, so the slight modulo bias here does not matter.
+function randomSlugSuffix() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+async function pickFreeSlug(baseSlug, isTaken) {
+  if (!(await isTaken(baseSlug))) return baseSlug;
+  for (let attempt = 2; attempt <= SLUG_NUMBERED_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${attempt}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  for (let attempt = 0; attempt < SLUG_RANDOM_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${randomSlugSuffix()}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  return "";
+}
+
 // --- External list URL validation --------------------------------------------
 //
 // /api/lists/like-external hashes a caller-supplied URL into a KV key. With
@@ -52693,14 +52740,17 @@ self.addEventListener('fetch', e => {
       if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
         return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
       }
-      let listSlug = baseSlug;
-      let plKey = "publishedlist:user:" + listSlug;
-      for (let attempt = 2; attempt <= 500; attempt++) {
-        const existing = await env.CONFIGS.get(plKey);
-        if (!existing) break;
-        listSlug = baseSlug + "-" + attempt;
-        plKey = "publishedlist:user:" + listSlug;
+      // Never falls through onto a slug that is taken -- see pickFreeSlug.
+      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
+        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
+      );
+      if (!listSlug) {
+        return json(
+          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+          409
+        );
       }
+      const plKey = "publishedlist:user:" + listSlug;
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
@@ -54570,10 +54620,18 @@ self.addEventListener('fetch', e => {
         // someone-else/top-10 are unrelated), so the collision check and
         // auto-increment only look at this creator's own list keys.
         const baseSlug = slugifyServer(name) || "list";
-        slug = baseSlug;
-        for (let attempt = 2; attempt <= 500; attempt++) {
-          if (!order.includes(slug)) break;
-          slug = `${baseSlug}-${attempt}`;
+        // Checked against an in-memory array rather than KV, so this one was
+        // never a subrequest problem -- but it had the same fall-through:
+        // past the bound it kept a slug that WAS taken and saved over that
+        // list. Scoped to this creator's own namespace, so only their own
+        // list was ever at risk, but silently replacing it is still the
+        // wrong answer.
+        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        if (!slug) {
+          return json(
+            { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+            409
+          );
         }
       }
 
