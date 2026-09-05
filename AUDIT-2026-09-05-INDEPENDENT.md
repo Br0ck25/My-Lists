@@ -609,12 +609,12 @@ Four regression tests; the three asserting the fix confirmed failing against the
 
 ---
 
-### 10. Double-escaped creator name in the admin reply placeholder
+### 10. Double-escaped creator name in the admin reply placeholder — ✅ FIXED
 
 **🔵 Low · `03_admin.js:2545`**
 
 `who` is already HTML-escaped at line 2494, then escaped again for the placeholder. A creator named
-`A&B` renders as `Type reply to A&amp;B`. Cosmetic only — use the raw name for that one interpolation.
+`A&B` renders as `Type reply to A&amp;B`. Cosmetic only. **Fixed** by using the already-escaped value for that one interpolation, with a note on `who` saying it is pre-escaped so the next caller does not repeat the mistake.
 
 ### 11. CSP comment cites a CI step that does not exist
 
@@ -633,7 +633,7 @@ worth adding to `html_checks.py` to keep it that way, rather than deleting the c
 `if (a.length !== b.length) return false;` returns before the constant-time loop, revealing
 `ADMIN_KEY`'s length via timing. Compare fixed-length digests of both inputs instead.
 
-### 13. Latent: cron never populates the module-level API-key globals
+### 13. Latent: cron never populates the module-level API-key globals — ✅ FIXED
 
 **🔵 Low (no live defect) · `25_api-catalog-routes.js:44–51`, `26_…:4128`**
 
@@ -644,8 +644,11 @@ a cron tick, those globals are `""`.
 I verified this is currently harmless: both `prewarmSharedCatalogs` (`07_…:1827–1831`) and
 `checkForNewEpisodes` (`07_…:1682`) read `env.X` directly and thread it down explicitly. But 36 bare
 references to those globals exist across `03_`, `05_`, `06_` and `07_`, and any future cron-reachable
-call into one of them fails silently with an empty key. Assign the globals at the top of `scheduled()`
-exactly as `handleFetch` does — three lines, removes the whole class.
+call into one of them fails silently with an empty key. **Fixed** by extracting `applyEnvApiKeys(env)` next to the
+declarations it owns and calling it from *both* entry points, so they cannot drift again.
+Demonstrated on a real fresh isolate (the built Worker in its own `vm` context, cron as the only
+event): before, all four globals were `""` after a tick; now they carry the configured values. A
+regression test does exactly that, and fails against the pre-fix build.
 
 ### 14. Counter updates lost under concurrency on the KV path
 
@@ -931,14 +934,14 @@ byte-exact concatenation, CI-gated against drift.
 ### `26_api-creator-and-admin-routes.js`
 - ✅ `/api/creator/reset-key:1168` — **DONE.** Per-account failure budget (D1-atomic when bound) plus an entropy floor at `:1111`. **(2)**
 - ✅ `handleMediaServerScrobble:473` — **DONE.** Scoped, revocable scrobble token; creator+key kept for compatibility. **(8)**
-- 🔵 `scheduled:4128` — assign the API-key globals as `handleFetch` does. **(13)**
+- ✅ `scheduled:4128` — **DONE.** Both entry points call the shared `applyEnvApiKeys`. **(13)**
 - 🔵 `:1144` — `stats:creator_count` loses increments on the KV path. **(14)**
 
 ### `09_page-shell.js`
 - ✅ `:2982` — **DONE.** `integrity` + `crossorigin` on the fflate `<script>`. **(6)**
 
 ### `03_admin.js`
-- 🔵 `feedbackCardHtml:2545` — remove the double escape on `who`. **(10)**
+- ✅ `feedbackCardHtml:2545` — **DONE.** Double escape removed. **(10)**
 - 🔵 `switchAdminTab:2026` — dead, delete.
 
 ### `16_`, `17_`, `19_`, `20_`, `21_`, `22_`, `23_`, `24_`
@@ -968,8 +971,8 @@ byte-exact concatenation, CI-gated against drift.
 ~~10. `channel-logo` caching + size cap~~ — **DONE** · ~~11. TTL/sweep for anonymous records~~ — **won't do (see M4 correction)** · **15. Slug overwrite — DONE**
 
 **🔵 PHASE 4 — OPTIONAL**
-~~12. Delete 241 lines of dead code~~ — **DONE** · ~~13. Handler-resolution CI check~~ — **DONE** · 14. Cron global assignment ·
-15. Double-escape fix · 16. Docs reorganisation
+~~12. Delete 241 lines of dead code~~ — **DONE** · ~~13. Handler-resolution CI check~~ — **DONE** · ~~14. Cron global assignment~~ — **DONE** ·
+~~15. Double-escape fix~~ — **DONE** · 16. Docs reorganisation
 
 ---
 

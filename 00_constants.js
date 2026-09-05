@@ -106,6 +106,32 @@ const RECOVERY_ANSWER_MIN_LENGTH = 8;
 // happens to return. A w500 poster is tens of kilobytes.
 const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 
+// --- Connecting the env-backed API key globals -------------------------------
+//
+// The `let` globals below are the names every helper in this add-on
+// references (TMDB_API_KEY, TRAKT_CLIENT_ID, ...). They start empty and have
+// to be pointed at whatever this Worker owner configured. This is the one
+// place that does it, so the fetch and scheduled entry points cannot drift.
+//
+// scheduled() has to call it too, and did not. Nothing is broken today only
+// because both cron functions happen to read env.X directly and thread it
+// down -- but 36 bare references to these globals exist across 03_, 05_,
+// 06_ and 07_, and the first cron-reachable call into any of them would have
+// silently used an empty key: no crash, no error, just a provider quietly
+// returning nothing. Three lines here retires the whole class.
+//
+// `|| ""` guards against `env` not carrying the property at all, which is
+// how a missing Worker secret or var normally reads.
+function applyEnvApiKeys(env) {
+  TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+  TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+  SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+  SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+  MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+  MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+  MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+}
+
 // --- Daily failure budgets on the credential endpoints -----------------------
 //
 // /admin/login and /api/creator/restore each already carry a 60-second

@@ -866,6 +866,64 @@ describe("audit fix: the scrobble webhook carries a revocable token, not the Cre
   });
 });
 
+// The env-backed API key globals (TMDB_API_KEY and friends) are the names
+// ~36 call sites across 03_, 05_, 06_ and 07_ reference directly. Only the
+// fetch handler used to point them at env, so on an isolate whose first
+// event was a cron tick they were all "". Nothing was broken in practice --
+// both cron functions happen to read env.X and thread it down -- but the
+// first cron-reachable helper that used a bare global would have run with an
+// empty key: no crash, no error, a provider quietly returning nothing.
+describe("audit fix: the cron connects the API key globals too", () => {
+  it("populates them on an isolate whose first event is a cron tick", async () => {
+    // A real fresh isolate: the built Worker evaluated in its own vm context,
+    // with scheduled() as the only thing that ever runs.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "worker_entry_combined.js"), "utf8");
+    const cut = src.lastIndexOf("export default");
+    assert.notEqual(cut, -1);
+
+    const sandbox = {
+      console, Date, Math, JSON, TextEncoder, TextDecoder, URL, URLSearchParams,
+      Response, Request, Headers, AbortController, AbortSignal, Promise, Map, Set,
+      Array, Object, String, Number, Error, RegExp, structuredClone,
+      crypto: globalThis.crypto,
+      atob: (v) => Buffer.from(v, "base64").toString("binary"),
+      btoa: (v) => Buffer.from(v, "binary").toString("base64"),
+      setTimeout, clearTimeout, setInterval, clearInterval,
+      caches: { default: { match: async () => null, put: async () => {} } },
+      fetch: async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } }),
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    // `let` at the top level of a vm script is script-scoped rather than a
+    // property of the sandbox, so the readout has to be defined in the SAME
+    // script to close over those bindings.
+    vm.runInContext(
+      src.slice(0, cut) +
+      "\nglobalThis.__exp = " + src.slice(cut).replace(/^export default/, "") +
+      "\nglobalThis.__keys = () => ({ TMDB_API_KEY, TRAKT_CLIENT_ID, SIMKL_CLIENT_ID, MDBLIST_API_KEY });",
+      sandbox, { filename: "worker_entry_combined.js" }
+    );
+
+    assert.equal(sandbox.__keys().TMDB_API_KEY, "", "globals should start empty");
+
+    const env = {
+      CONFIGS: {
+        get: async () => null, put: async () => {}, delete: async () => {},
+        list: async () => ({ keys: [], list_complete: true }),
+      },
+      TMDB_API_KEY: "REAL_TMDB", TRAKT_CLIENT_ID: "REAL_TRAKT",
+      SIMKL_CLIENT_ID: "REAL_SIMKL", MDBLIST_API_KEY: "REAL_MDBLIST",
+    };
+    await sandbox.__exp.scheduled({}, env, { waitUntil: () => {} });
+
+    const keys = sandbox.__keys();
+    assert.equal(keys.TMDB_API_KEY, "REAL_TMDB");
+    assert.equal(keys.TRAKT_CLIENT_ID, "REAL_TRAKT");
+    assert.equal(keys.SIMKL_CLIENT_ID, "REAL_SIMKL");
+    assert.equal(keys.MDBLIST_API_KEY, "REAL_MDBLIST");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();

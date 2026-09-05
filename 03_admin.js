@@ -2524,6 +2524,10 @@ async function renderAdminDashboard(env) {
       const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
       const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
       const isSelfLogged = f.creatorName === 'admin';
+      // Already escaped here, so every use of it below must NOT escape it
+      // again -- the reply placeholder did, and rendered a creator called
+      // A&B as A&amp;B. (No backticks in this function: everything from
+      // renderAdminDashboard's opening backtick onwards is string content.)
       const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
@@ -2575,7 +2579,7 @@ async function renderAdminDashboard(env) {
         '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
         (!isSelfLogged ?
           '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
-            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + escapeHtmlAdmin(who) + '...">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + who + '...">' +
             '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
           '</div>' : ''
         ) +

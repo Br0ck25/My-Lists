@@ -4352,6 +4352,10 @@ export default {
   // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
   // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
+    // Same as the fetch handler above: nothing that runs below may see an
+    // empty API key just because this isolate's first event happened to be a
+    // cron tick rather than a request. See applyEnvApiKeys.
+    applyEnvApiKeys(env);
     ctx.waitUntil(
       Promise.all([
         checkForNewEpisodes(env),

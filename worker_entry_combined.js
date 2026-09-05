@@ -156,6 +156,32 @@ const RECOVERY_ANSWER_MIN_LENGTH = 8;
 // happens to return. A w500 poster is tens of kilobytes.
 const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 
+// --- Connecting the env-backed API key globals -------------------------------
+//
+// The `let` globals below are the names every helper in this add-on
+// references (TMDB_API_KEY, TRAKT_CLIENT_ID, ...). They start empty and have
+// to be pointed at whatever this Worker owner configured. This is the one
+// place that does it, so the fetch and scheduled entry points cannot drift.
+//
+// scheduled() has to call it too, and did not. Nothing is broken today only
+// because both cron functions happen to read env.X directly and thread it
+// down -- but 36 bare references to these globals exist across 03_, 05_,
+// 06_ and 07_, and the first cron-reachable call into any of them would have
+// silently used an empty key: no crash, no error, just a provider quietly
+// returning nothing. Three lines here retires the whole class.
+//
+// `|| ""` guards against `env` not carrying the property at all, which is
+// how a missing Worker secret or var normally reads.
+function applyEnvApiKeys(env) {
+  TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+  TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+  SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+  SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+  MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+  MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+  MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+}
+
 // --- Daily failure budgets on the credential endpoints -----------------------
 //
 // /admin/login and /api/creator/restore each already carry a 60-second
@@ -6433,6 +6459,10 @@ async function renderAdminDashboard(env) {
       const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
       const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
       const isSelfLogged = f.creatorName === 'admin';
+      // Already escaped here, so every use of it below must NOT escape it
+      // again -- the reply placeholder did, and rendered a creator called
+      // A&B as A&amp;B. (No backticks in this function: everything from
+      // renderAdminDashboard's opening backtick onwards is string content.)
       const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
@@ -6484,7 +6514,7 @@ async function renderAdminDashboard(env) {
         '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
         (!isSelfLogged ?
           '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
-            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + escapeHtmlAdmin(who) + '...">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + who + '...">' +
             '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
           '</div>' : ''
         ) +
@@ -47031,23 +47061,11 @@ function isAllowedPosterUrl(raw) {
 }
 
 async function handleFetch(request, env, ctx) {
-    // Populate the env-backed API key globals declared in 00_constants.js
-    // for this request. Every helper function elsewhere in this add-on
-    // already references these five by name (TMDB_API_KEY, TRAKT_CLIENT_ID,
-    // etc.) -- this is the one place, run first, that actually connects
-    // them to whatever this Worker owner configured (or left unset, which
-    // is fine: every feature gated on one of these degrades to a clear
-    // in-app error message rather than a crash -- see each one's usage for
-    // that message). `|| ""` guards against `env` not having the property
-    // at all, same as a missing Worker secret/var normally reads as
-    // undefined rather than an empty string.
-    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
-    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
-    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
-    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
-    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
-    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
-    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+    // Point the env-backed API key globals (00_constants.js) at whatever
+    // this Worker owner configured, before anything can read them. A feature
+    // whose key is unset degrades to a clear in-app message rather than
+    // crashing -- see each key's usage for that message.
+    applyEnvApiKeys(env);
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -57281,6 +57299,10 @@ export default {
   // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
   // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
+    // Same as the fetch handler above: nothing that runs below may see an
+    // empty API key just because this isolate's first event happened to be a
+    // cron tick rather than a request. See applyEnvApiKeys.
+    applyEnvApiKeys(env);
     ctx.waitUntil(
       Promise.all([
         checkForNewEpisodes(env),

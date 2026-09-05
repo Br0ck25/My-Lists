@@ -33,23 +33,11 @@ function isAllowedPosterUrl(raw) {
 }
 
 async function handleFetch(request, env, ctx) {
-    // Populate the env-backed API key globals declared in 00_constants.js
-    // for this request. Every helper function elsewhere in this add-on
-    // already references these five by name (TMDB_API_KEY, TRAKT_CLIENT_ID,
-    // etc.) -- this is the one place, run first, that actually connects
-    // them to whatever this Worker owner configured (or left unset, which
-    // is fine: every feature gated on one of these degrades to a clear
-    // in-app error message rather than a crash -- see each one's usage for
-    // that message). `|| ""` guards against `env` not having the property
-    // at all, same as a missing Worker secret/var normally reads as
-    // undefined rather than an empty string.
-    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
-    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
-    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
-    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
-    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
-    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
-    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+    // Point the env-backed API key globals (00_constants.js) at whatever
+    // this Worker owner configured, before anything can read them. A feature
+    // whose key is unset degrades to a clear in-app message rather than
+    // crashing -- see each key's usage for that message.
+    applyEnvApiKeys(env);
 
     const url = new URL(request.url);
     const path = url.pathname;
