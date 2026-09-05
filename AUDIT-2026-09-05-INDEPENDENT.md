@@ -509,9 +509,31 @@ read — the default `cacheTtl` for a KV `get` is 60 seconds — makes it conclu
 it and PUT again, up to 4 times, against a key KV limits to **one write per second**. Under no
 contention at all this can burn the write budget and still return a count that does not match storage.
 
-**Fix.** Drop the verify-and-retry loop and accept last-write-wins for likes (they are already capped
-and non-critical), or move the ledger to D1 where the write is atomic — the `creator_lists.likes`
-column already exists and is maintained.
+**Fix (applied) — and a correction to this finding.** My first attempt did what this finding
+recommended: drop the retry entirely. That was wrong. An existing test asserts the retry's real value
+(a vote surviving a genuine concurrent write), and unlike the `tmdbKey` test that encoded a
+vulnerability, *this* one guards a property worth keeping. Removing tested, working protection on the
+strength of an unverified theory is exactly the trap the brief warns about.
+
+The retry is kept, but **gated on evidence of another writer**: an id present in the read-back that
+was not in our own pre-write snapshot and is not ours. A real clobber leaves that trace (the other
+request wrote its own voter); a stale read cannot, because a stale read is by definition the state we
+already saw. No evidence ⇒ trust our own PUT and stop. Attempts also drop 4 → 3.
+
+Measured with a KV that serves the pre-write value for several reads after a write (edge caching does
+not clear within one request):
+
+| | Old | New |
+|---|---|---|
+| Normal vote | 1 write | 1 write |
+| Stale read after the PUT | **2 writes** | 1 write |
+| Genuine concurrent clobber | vote survives | vote survives |
+
+**Correction to the severity stated above:** the amplification is 2×, not the "up to 4" this finding
+originally claimed — the existing no-change guard absorbs later attempts. Still a doubling of writes
+against a 1-write/sec key on every vote whenever the edge cache is stale, which is most likely on a
+busy list, i.e. exactly when it hurts. Both properties now have a test, each confirmed failing
+against the other implementation.
 
 ### 10. Double-escaped creator name in the admin reply placeholder
 
@@ -798,7 +820,7 @@ byte-exact concatenation, CI-gated against drift.
 
 ### `02_http-and-creator-utils.js`
 - ✅ `rebuildPublicListIndex:1480` — **DONE.** Chunked, resumable, budget-bounded; records read with bounded concurrency. **(Finding 1)**
-- 🟡 `applyLikeVote:1283` — remove the PUT-then-verify retry loop; KV has no read-your-writes. **(9)**
+- ✅ `applyLikeVote:1283` — **DONE.** Retry kept but gated on evidence of another writer. **(9)**
 - 🟡 `consumeRateLimit:1234` — `await` the write; move security-critical buckets to D1. **(7)**
 - 🔵 `timingSafeEqualHex:346` — compare fixed-length digests, not raw lengths. **(12)**
 - 🔵 comment at `:45` — the CI step it cites does not exist; add the check. **(11)**
@@ -846,7 +868,7 @@ byte-exact concatenation, CI-gated against drift.
 ~~5. Rate-limit bypass (5)~~ — **DONE** · ~~6. SRI on the CDN script (6)~~ — **DONE**
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
-7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · 9. Like-ledger consistency (9) ·
+7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
 10. `channel-logo` caching + size cap · 11. TTL/sweep for anonymous records
 
 **🔵 PHASE 4 — OPTIONAL**

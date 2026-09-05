@@ -1334,24 +1334,37 @@ async function readLikeVoters(env, ledgerKey) {
 }
 
 // Applies one vote to a ledger key and returns the resulting count.
-// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
-// be a new voter -- the caller keeps the existing count rather than
-// silently discarding the vote or growing the key without bound.
+// `capped: true` means the ledger is full (see LIKE_VOTER_CAP) and this
+// would have been a new voter -- the caller keeps the existing count rather
+// than silently discarding the vote or growing the key without bound.
 //
 // Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
 // here can lose a vote: two requests can both read the same snapshot, and
-// whichever PUT lands last in KV wins, silently dropping the other one.
-// Rather than a full lock (KV has no primitive to build one on reliably
-// either), this re-reads the ledger after writing and confirms this
-// voter's own membership actually stuck; if another write raced it in
-// between, it retries against that fresh state instead of just trusting
-// its own PUT. Bounded to a handful of attempts -- this only protects
-// against genuinely concurrent requests on one list, not a design that
-// needs to spin forever.
+// whichever PUT lands last wins. This writes, re-reads, and retries against
+// the fresh state if its own vote did not survive.
+//
+// The subtlety is WHEN to retry. KV does not promise read-your-writes -- its
+// reads are edge-cached -- so "my vote is not in the value I just read back"
+// has two completely different causes: another writer really did land on top
+// of us, or KV simply served a stale copy and nothing happened at all.
+// Retrying on both treats every stale read as contention, which on an
+// otherwise idle list spends several writes against a key KV limits to one
+// write per second, and can still report a count that does not match
+// storage.
+//
+// So the retry is gated on EVIDENCE of another writer: an id present now
+// that was not in our own pre-write snapshot and is not ours. A real
+// clobber leaves that trace (the other request wrote its own voter); a
+// stale read cannot, because a stale read is by definition the state we
+// already saw. No evidence means our PUT is good and the read was simply
+// behind, so we trust it and stop.
+const LIKE_VOTE_MAX_ATTEMPTS = 3;
+
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  const MAX_ATTEMPTS = 4;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  let lastCount = 0;
+  for (let attempt = 0; attempt < LIKE_VOTE_MAX_ATTEMPTS; attempt++) {
     const voters = await readLikeVoters(env, ledgerKey);
+    const before = new Set(voters);
     const set = new Set(voters);
     const had = set.has(voterId);
     if (liked) {
@@ -1360,24 +1373,34 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
     } else {
       set.delete(voterId);
     }
-    // No write at all when nothing changed -- KV allows one write per
-    // second per key, and a double-tap on a busy list should not burn
-    // that budget or race with a genuine vote.
-    if (set.size === voters.length && had === set.has(voterId)) {
+    lastCount = set.size;
+    // No write at all when nothing changed -- KV allows one write per second
+    // per key, and a double-tap on a busy list should not burn that budget.
+    // The size comparison also collapses a ledger that had duplicate
+    // entries, since `set` is deduplicated.
+    if (had === liked && set.size === voters.length) {
       return { count: set.size, capped: false };
     }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
-    const verifyVoters = await readLikeVoters(env, ledgerKey);
-    if (new Set(verifyVoters).has(voterId) === liked) {
-      return { count: verifyVoters.length, capped: false };
+
+    const after = await readLikeVoters(env, ledgerKey);
+    const afterSet = new Set(after);
+    if (afterSet.has(voterId) === liked) {
+      // Our vote is visible in storage. Done.
+      return { count: after.length, capped: false };
     }
-    // Someone else's write landed on top of ours between the PUT and this
-    // re-read -- loop and retry against their (now current) state rather
-    // than reporting a count/liked state that isn't what's actually
-    // stored.
+    // Our vote is missing. Is there any trace of another writer?
+    const anotherWriterLanded = [...afterSet].some((id) => id !== voterId && !before.has(id));
+    if (!anotherWriterLanded) {
+      // No trace: this is a stale read of the state we already had, not a
+      // lost update. Trust our own PUT rather than writing it again.
+      return { count: lastCount, capped: false };
+    }
+    // Someone else's write really did land on top of ours -- loop and merge
+    // against their now-current state.
   }
-  // Exhausted retries under sustained contention on this one list: report
-  // whatever is actually in KV right now rather than guessing.
+  // Sustained genuine contention on this one list: report what is actually
+  // in KV rather than guessing.
   const finalVoters = await readLikeVoters(env, ledgerKey);
   return { count: finalVoters.length, capped: false };
 }

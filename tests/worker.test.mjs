@@ -1131,6 +1131,55 @@ describe("likes and preview guards", () => {
     assert.equal(fetchCase.status, 404);
   });
 
+  // The companion to the race test below. Retrying whenever a vote is not
+  // visible in the read-back treats every stale read as contention, and KV
+  // reads are edge-cached, so on an otherwise idle list that spent a second
+  // write against a key KV limits to one write per second. The retry is now
+  // gated on evidence of another writer -- an id present that was not in our
+  // own pre-write snapshot -- which a stale read cannot produce.
+  it("does not re-write the ledger when KV merely serves a stale read", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicestale");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "StaleList", type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${saved.body.slug}`;
+
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const realGet = env.CONFIGS.get.bind(env.CONFIGS);
+    let ledgerWrites = 0;
+    let previous = null;
+    let havePrevious = false; // a first write's previous value is legitimately null
+    let servedStale = 0;
+    env.CONFIGS.put = async (key, value) => {
+      if (key === ledgerKey) { previous = await realGet(key); havePrevious = true; ledgerWrites++; }
+      return realPut(key, value);
+    };
+    // Edge caching does not clear within one request, so serve the pre-write
+    // value for several reads rather than just one.
+    env.CONFIGS.get = async (key, type) => {
+      if (key === ledgerKey && havePrevious && servedStale < 6) { servedStale++; return previous; }
+      return realGet(key, type);
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug: saved.body.slug },
+    });
+    assert.equal(r.body.ok, true);
+    assert.ok(servedStale > 0, "the stale-read condition never triggered");
+    assert.equal(ledgerWrites, 1, `a stale read caused ${ledgerWrites} writes to a 1-write/sec key`);
+
+    const stored = JSON.parse(await realGet(ledgerKey));
+    assert.equal(stored.length, 1);
+    assert.equal(r.body.likes, stored.length, "reported count does not match storage");
+  });
+
   it("a vote survives a concurrent write racing its own PUT (applyLikeVote retry)", async () => {
     const env = makeEnv();
     const alice = await createUser(env, "alicerace");
