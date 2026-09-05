@@ -41,6 +41,39 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // size the server accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
+// --- Bounds on the KV -> D1 backfill sweep ----------------------------------
+//
+// /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
+// publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
+// a D1 write on each key it keeps -- both of which count against
+// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
+// whole sweep in one request with no cap, so on a site big enough to need
+// migrating it aborted partway through with "Too many subrequests" and
+// backfilled only whatever it had reached.
+//
+// That failure is worse than it looks: per wrangler.toml, an account present
+// in KV but missing from D1 is exactly the case /api/creator/reset-key and
+// /admin/api/reset-creator-key handle incorrectly, because a D1 UPDATE
+// matching zero rows still reports success. So the endpoint whose job is to
+// prevent that state was itself the thing leaving accounts in it.
+//
+// It now runs in resumable chunks against migrated1:state, the same shape
+// /admin/api/migrate-day-counts and the public-index rebuild use. Every
+// section of the sweep is idempotent (DO NOTHING, or DO UPDATE to a value
+// derived only from KV), so re-processing a key across a chunk boundary is
+// harmless -- which is what makes chunking safe here.
+const MIGRATE_D1_STATE_KEY = "migrated1:state";
+const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+// This endpoint has its invocation to itself (it is admin-triggered, not
+// ridden along on the cron), so it can claim more of the 1,000 than the
+// index rebuild does -- but still well short of it, since a chunk that
+// throws saves no progress.
+const MIGRATE_D1_OPS_PER_RUN = 700;
+const MIGRATE_D1_PAGE = 200;
+// Errors accumulate across every chunk of a run and are handed back to the
+// admin panel, so they need a ceiling of their own.
+const MIGRATE_D1_ERROR_CAP = 50;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

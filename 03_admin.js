@@ -2291,27 +2291,47 @@ async function renderAdminDashboard(env) {
       if (typeof loadSearchData === 'function') loadSearchData();
     }
 
-    // Unlike the two loops above, /admin/api/migrate-d1 does its entire
-    // sweep (creators, creator_lists, source_groups) in one request rather
-    // than resuming across repeated calls, so this is a single fetch.
+    // Like the loops above, /admin/api/migrate-d1 now does one bounded chunk
+    // per call rather than the whole sweep -- see its own comment for why a
+    // single pass could not survive a site large enough to need migrating --
+    // so this keeps calling until it reports done. The results object comes
+    // back cumulative for the whole run, so the final response already holds
+    // the totals and there is nothing to add up here.
+    //
+    // No backticks in this function, or anywhere else inside
+    // renderAdminDashboard's returned template literal: everything from that
+    // opening backtick onwards is string content, so one here would close the
+    // template early and break the whole admin page. (The module-scope
+    // helpers at the top of this file are ordinary JS and do use them.)
     async function runMigrateD1() {
       const btn = document.getElementById('migrateD1Btn');
       const status = document.getElementById('migrateD1Status');
       btn.disabled = true;
       status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) {
-          status.textContent = 'Failed: ' + (data.error || 'unknown error');
-        } else {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
           const r = data.results || {};
+          if (!data.done) {
+            status.textContent = 'Working\u2026 ' + (data.scanned || 0) + ' key' + ((data.scanned || 0) === 1 ? '' : 's') +
+              ' scanned, ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ' and ' +
+              (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ' migrated so far.';
+            continue;
+          }
           const errCount = (r.errors || []).length;
           status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
             (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
             (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
             (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
           if (errCount) console.error('migrate-d1 errors:', r.errors);
+          break;
         }
       } catch (e) {
         status.textContent = 'Failed: network error.';

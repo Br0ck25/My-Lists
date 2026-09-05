@@ -2154,6 +2154,100 @@ describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
     assert.equal(env.DB._stat("pageviews", "total"), 100, "a second migration must not double counts");
   });
 
+  // migrate-d1 spends a KV read plus a D1 statement per key, both of which
+  // count against Cloudflare's 1,000-subrequest cap. As a single unbounded
+  // pass it therefore aborted partway through on exactly the sites big
+  // enough to need it, backfilling a prefix of the accounts and reporting
+  // ok -- and an account left in KV but missing from D1 is the case the
+  // key-rotation endpoints get wrong, because a D1 UPDATE matching zero
+  // rows still reports success.
+  it("migrate-d1 backfills every account at a scale that used to abort it", async () => {
+    const n = 900;
+    // A KV that enforces the real per-invocation limit, and a D1 whose
+    // statements are charged against the same budget, as they really are.
+    const inner = makeKv();
+    let spentThisInvocation = 0;
+    let peak = 0;
+    const charge = () => {
+      spentThisInvocation += 1;
+      if (spentThisInvocation > peak) peak = spentThisInvocation;
+      if (spentThisInvocation > 1000) throw new Error("Too many subrequests.");
+    };
+    const kv = {
+      _store: inner._store,
+      async get(...a) { charge(); return inner.get(...a); },
+      async put(...a) { charge(); return inner.put(...a); },
+      async delete(...a) { charge(); return inner.delete(...a); },
+      async list(...a) { charge(); return inner.list(...a); },
+    };
+    const realDb = makeD1();
+    const db = {
+      _creators: realDb._creators,
+      _lists: realDb._lists,
+      _stat: realDb._stat,
+      prepare(sql) {
+        const st = realDb.prepare(sql);
+        const chargedRun = (target) => async () => { charge(); return target.run(); };
+        const chargedAll = (target) => async () => { charge(); return target.all(); };
+        return {
+          bind(...a) {
+            const b = st.bind(...a);
+            return { run: chargedRun(b), all: chargedAll(b) };
+          },
+          run: chargedRun(st),
+          all: chargedAll(st),
+        };
+      },
+      batch: realDb.batch,
+    };
+
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    for (let i = 0; i < n; i++) {
+      const username = `user${String(i).padStart(5, "0")}`;
+      inner._store.set(`creator:${username}`, JSON.stringify({
+        displayName: `Real ${username}`, keyHash: `hash-${i}`, createdAt: 1,
+      }));
+      inner._store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: i % 5, createdAt: 1, updatedAt: 1,
+      }));
+    }
+
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      spentThisInvocation = 0; // a new call is a new invocation, with a new budget
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      assert.equal(last.body.ok, true, `call ${calls} failed: ${last.body.error}`);
+    } while (!last.body.done && calls < 200);
+
+    assert.equal(last.body.done, true, "migration never reported done");
+    assert.ok(peak <= 1000, `one invocation spent ${peak} subrequests, over the limit`);
+    // The point of the whole endpoint: no account may be left behind.
+    assert.equal(db._creators.size, n, `only ${db._creators.size} of ${n} creators reached D1`);
+    assert.equal(db._lists.size, n, `only ${db._lists.size} of ${n} lists reached D1`);
+    assert.equal(last.body.results.creators, n);
+  });
+
+  it("migrate-d1 restarts cleanly from unparseable resume state", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "77");
+    await env.CONFIGS.put("migrated1:state", "{not json");
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    } while (!last.body.done && calls < 50);
+    assert.equal(last.body.done, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 77);
+    // Resume state must not outlive the run that used it.
+    assert.equal(await env.CONFIGS.get("migrated1:state"), null, "resume state leaked");
+  });
+
   it("keeps counting correctly in KV-only deployments", async () => {
     // D1 is optional here; nothing above may break the no-DB path.
     const env = makeEnv();

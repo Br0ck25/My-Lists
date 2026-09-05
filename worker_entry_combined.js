@@ -91,6 +91,39 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // size the server accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
+// --- Bounds on the KV -> D1 backfill sweep ----------------------------------
+//
+// /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
+// publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
+// a D1 write on each key it keeps -- both of which count against
+// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
+// whole sweep in one request with no cap, so on a site big enough to need
+// migrating it aborted partway through with "Too many subrequests" and
+// backfilled only whatever it had reached.
+//
+// That failure is worse than it looks: per wrangler.toml, an account present
+// in KV but missing from D1 is exactly the case /api/creator/reset-key and
+// /admin/api/reset-creator-key handle incorrectly, because a D1 UPDATE
+// matching zero rows still reports success. So the endpoint whose job is to
+// prevent that state was itself the thing leaving accounts in it.
+//
+// It now runs in resumable chunks against migrated1:state, the same shape
+// /admin/api/migrate-day-counts and the public-index rebuild use. Every
+// section of the sweep is idempotent (DO NOTHING, or DO UPDATE to a value
+// derived only from KV), so re-processing a key across a chunk boundary is
+// harmless -- which is what makes chunking safe here.
+const MIGRATE_D1_STATE_KEY = "migrated1:state";
+const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+// This endpoint has its invocation to itself (it is admin-triggered, not
+// ridden along on the cron), so it can claim more of the 1,000 than the
+// index rebuild does -- but still well short of it, since a chunk that
+// throws saves no progress.
+const MIGRATE_D1_OPS_PER_RUN = 700;
+const MIGRATE_D1_PAGE = 200;
+// Errors accumulate across every chunk of a run and are handed back to the
+// admin panel, so they need a ceiling of their own.
+const MIGRATE_D1_ERROR_CAP = 50;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -5889,27 +5922,47 @@ async function renderAdminDashboard(env) {
       if (typeof loadSearchData === 'function') loadSearchData();
     }
 
-    // Unlike the two loops above, /admin/api/migrate-d1 does its entire
-    // sweep (creators, creator_lists, source_groups) in one request rather
-    // than resuming across repeated calls, so this is a single fetch.
+    // Like the loops above, /admin/api/migrate-d1 now does one bounded chunk
+    // per call rather than the whole sweep -- see its own comment for why a
+    // single pass could not survive a site large enough to need migrating --
+    // so this keeps calling until it reports done. The results object comes
+    // back cumulative for the whole run, so the final response already holds
+    // the totals and there is nothing to add up here.
+    //
+    // No backticks in this function, or anywhere else inside
+    // renderAdminDashboard's returned template literal: everything from that
+    // opening backtick onwards is string content, so one here would close the
+    // template early and break the whole admin page. (The module-scope
+    // helpers at the top of this file are ordinary JS and do use them.)
     async function runMigrateD1() {
       const btn = document.getElementById('migrateD1Btn');
       const status = document.getElementById('migrateD1Status');
       btn.disabled = true;
       status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) {
-          status.textContent = 'Failed: ' + (data.error || 'unknown error');
-        } else {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
           const r = data.results || {};
+          if (!data.done) {
+            status.textContent = 'Working\u2026 ' + (data.scanned || 0) + ' key' + ((data.scanned || 0) === 1 ? '' : 's') +
+              ' scanned, ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ' and ' +
+              (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ' migrated so far.';
+            continue;
+          }
           const errCount = (r.errors || []).length;
           status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
             (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
             (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
             (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
           if (errCount) console.error('migrate-d1 errors:', r.errors);
+          break;
         }
       } catch (e) {
         status.textContent = 'Failed: network error.';
@@ -55881,142 +55934,228 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
     }
 
-    // /admin/api/migrate-d1 (POST) -> { ok, results }
-    // Backfills creators, creator_lists, and source_groups from KV to D1.
+    // /admin/api/migrate-d1 (POST) -> { ok, done, results, thisCall, scanned }
+    // Backfills creators, creator_lists, published-list visibility stamps,
+    // source_groups and the stats counters from KV to D1.
+    //
+    // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
+    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // and the previous single-pass version simply aborted partway through on
+    // any site large enough to actually need migrating -- backfilling a
+    // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
+    // for why that particular half-finished state is dangerous rather than
+    // merely incomplete.
+    //
+    // Keep calling until `done` is true; runMigrateD1 (03_admin.js) does that
+    // loop. `results` is cumulative across the whole run, `thisCall` is just
+    // this chunk. Still safe to run repeatedly from scratch: every write here
+    // is idempotent.
     if (path === "/admin/api/migrate-d1" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
-      
-      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
-      // 1. Creators
-      const cKeys = await listAllKeys(env.CONFIGS, "creator:");
-      for (const k of cKeys.keys) {
-        const username = k.name.slice("creator:".length);
-        const raw = await env.CONFIGS.get(k.name);
-        if (raw) {
+      // Every KV read/write and every D1 statement goes through these, so the
+      // budget reflects what was actually spent rather than a guess.
+      let ops = 0;
+      const spent = () => ops >= MIGRATE_D1_OPS_PER_RUN;
+      const countedKv = {
+        get: (...a) => { ops++; return env.CONFIGS.get(...a); },
+        put: (...a) => { ops++; return env.CONFIGS.put(...a); },
+        delete: (...a) => { ops++; return env.CONFIGS.delete(...a); },
+        list: (...a) => { ops++; return env.CONFIGS.list(...a); },
+      };
+      // stampListVisibilityIfNeeded writes through env.CONFIGS itself.
+      const countedEnv = { ...env, CONFIGS: countedKv };
+      const d1Run = (stmt) => { ops++; return stmt.run(); };
+
+      ops++;
+      const stateRaw = await env.CONFIGS.get(MIGRATE_D1_STATE_KEY);
+      let state = null;
+      try {
+        state = stateRaw ? JSON.parse(stateRaw) : null;
+      } catch {
+        state = null;
+      }
+      // Anything unparseable or from an older shape restarts the sweep rather
+      // than resuming into the middle of it. Restarting is cheap here because
+      // every write is idempotent.
+      if (!state || state.v !== 1 || typeof state.phase !== "number" || !Array.isArray(state.pending) || !state.results) {
+        state = {
+          v: 1,
+          phase: 0,
+          cursor: "",
+          pending: [],
+          scanned: 0,
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+        };
+      }
+      const results = state.results;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      const noteError = (msg) => {
+        if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
+      };
+
+      async function migrateKey(phase, keyName) {
+        // 0. Creators
+        if (phase === 0) {
+          const username = keyName.slice("creator:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
           try {
             const data = JSON.parse(raw);
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
-            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0).run();
-            results.creators++;
+            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
+            results.creators++; thisCall.creators++;
           } catch (e) {
-            results.errors.push(`Creator ${username}: ` + e.message);
+            noteError(`Creator ${username}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2. Creator Lists
-      const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-      for (const k of lKeys.keys) {
-        // Two capture groups, so they are match[1] and match[2]. The old
-        // `[, , u, slug]` skipped one element too many: slug came out
-        // undefined, the `if (u && slug)` guard below rejected every key,
-        // and the migration silently reported "lists: 0" while claiming ok.
-        const [, u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
-        if (u && slug) {
-          const raw = await env.CONFIGS.get(k.name);
-          if (raw) {
-            try {
-              const data = JSON.parse(raw);
-              await stampListVisibilityIfNeeded(env, k.name, data);
-              const listId = `${u}:${slug}`;
-              const itemsJson = JSON.stringify(data.items || []);
-              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
-              // `likes` is carried across too. KV holds the authoritative
-              // count, so a migration that omitted it would silently reset
-              // every list to zero in D1. Visibility is rewritten as well
-              // so the fail-closed public index doesn't hide legacy lists
-              // that were served as public because they had no enum value.
-              await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
-              results.lists++;
-            } catch (e) {
-              results.errors.push(`List ${u}:${slug}: ` + e.message);
-            }
+        // 1. Creator Lists
+        if (phase === 1) {
+          // Two capture groups, so they are match[1] and match[2]. The old
+          // `[, , u, slug]` skipped one element too many: slug came out
+          // undefined, the `if (u && slug)` guard below rejected every key,
+          // and the migration silently reported "lists: 0" while claiming ok.
+          const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
+          if (!u || !slug) return;
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            const listId = `${u}:${slug}`;
+            const itemsJson = JSON.stringify(data.items || []);
+            const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
+            // `likes` is carried across too. KV holds the authoritative
+            // count, so a migration that omitted it would silently reset
+            // every list to zero in D1. Visibility is rewritten as well
+            // so the fail-closed public index doesn't hide legacy lists
+            // that were served as public because they had no enum value.
+            await d1Run(env.DB.prepare(
+              "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+            ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
+            results.lists++; thisCall.lists++;
+          } catch (e) {
+            noteError(`List ${u}:${slug}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2b. Anonymous published lists live only in KV. Stamp missing /
-      // garbage visibility the same way as creator lists so the inverted
-      // public-read checks don't hide currently-served lists.
-      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-      for (const k of pKeys.keys) {
-        const raw = await env.CONFIGS.get(k.name);
-        if (!raw) continue;
-        try {
-          const data = JSON.parse(raw);
-          await stampListVisibilityIfNeeded(env, k.name, data);
-        } catch (e) {
-          results.errors.push(`Published ${k.name}: ` + e.message);
+        // 2. Anonymous published lists live only in KV. Stamp missing /
+        // garbage visibility the same way as creator lists so the inverted
+        // public-read checks don't hide currently-served lists.
+        if (phase === 2) {
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            results.published++; thisCall.published++;
+          } catch (e) {
+            noteError(`Published ${keyName}: ` + e.message);
+          }
+          return;
         }
-      }
 
-      // 3. Source Groups
-      const sKeys = await listAllKeys(env.CONFIGS, "stats:sourcegroup:");
-      for (const k of sKeys.keys) {
-        if (k.name.endsWith(":total")) {
-          const groupName = k.name.slice("stats:sourcegroup:".length, -":total".length);
-          const raw = await env.CONFIGS.get(k.name);
+        // 3. Source Groups
+        if (phase === 3) {
+          if (!keyName.endsWith(":total")) return;
+          const groupName = keyName.slice("stats:sourcegroup:".length, -":total".length);
+          const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
-            ).bind(groupName, groupName, count).run();
-            results.sourcegroups++;
+            ).bind(groupName, groupName, count));
+            results.sourcegroups++; thisCall.sourcegroups++;
           } catch (e) {
-            results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
+            noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
-      //
-      // Until these are copied across, each counter falls back to its KV
-      // value rather than reporting zero (see readStatCount, 03_admin.js),
-      // so a dashboard's history never visibly vanishes just because D1 got
-      // bound. After this runs, D1 is authoritative and the KV copies are
-      // inert.
-      //
-      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
-      // safe to run more than once (the admin button can be pressed again,
-      // and the other three sections above are idempotent too), and an
-      // additive upsert here would double every counter on the second run.
-      // sourcegroup: is skipped -- section 3 above already migrated it into
-      // its own table, and copying it here too would count it twice in the
-      // Installed Catalogs panel, which sums both.
-      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
-      for (const k of statKeys.keys) {
-        const rest = k.name.slice("stats:".length);
+        // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+        //
+        // Until these are copied across, each counter falls back to its KV
+        // value rather than reporting zero (see readStatCount, 03_admin.js),
+        // so a dashboard's history never visibly vanishes just because D1 got
+        // bound. After this runs, D1 is authoritative and the KV copies are
+        // inert.
+        //
+        // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+        // safe to run more than once (the admin button can be pressed again,
+        // and every other section is idempotent too), and an additive upsert
+        // here would double every counter on the second run. sourcegroup: is
+        // skipped -- phase 3 above already migrated it into its own table,
+        // and copying it here too would count it twice in the Installed
+        // Catalogs panel, which sums both.
+        const rest = keyName.slice("stats:".length);
         const sep = rest.lastIndexOf(":");
-        if (sep === -1) continue;
+        if (sep === -1) return;
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
-        if (!kind || !bucket) continue;
-        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        if (!kind || !bucket) return;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
         // stats:genredecade:migrated is a sentinel -- none of them belong
         // in an integer column.
-        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
-        const raw = await env.CONFIGS.get(k.name);
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
+        const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) continue;
+        if (!Number.isFinite(n)) return;
         try {
-          await env.DB.prepare(
+          await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
-          ).bind(kind, bucket, n).run();
-          results.stats++;
+          ).bind(kind, bucket, n));
+          results.stats++; thisCall.stats++;
         } catch (e) {
-          results.errors.push(`Stat ${k.name}: ` + e.message);
+          noteError(`Stat ${keyName}: ` + e.message);
         }
       }
 
-      return json({ ok: true, results });
+      let scannedThisCall = 0;
+      while (state.phase < MIGRATE_D1_PREFIXES.length && !spent()) {
+        if (!state.pending.length) {
+          if (state.cursor === null) {
+            state.phase++;
+            state.cursor = "";
+            continue;
+          }
+          const listOpts = { prefix: MIGRATE_D1_PREFIXES[state.phase], limit: MIGRATE_D1_PAGE };
+          if (state.cursor) listOpts.cursor = state.cursor;
+          const listRes = await countedKv.list(listOpts);
+          state.pending = (listRes.keys || []).map((k) => k.name);
+          state.cursor = (listRes.list_complete || !listRes.cursor) ? null : listRes.cursor;
+          if (!state.pending.length) continue;
+        }
+        // shift() as we go, so whatever is left in `pending` when the budget
+        // runs out is exactly what this run still owes.
+        while (state.pending.length && !spent()) {
+          const keyName = state.pending.shift();
+          await migrateKey(state.phase, keyName);
+          scannedThisCall++;
+        }
+      }
+
+      state.scanned = (state.scanned || 0) + scannedThisCall;
+      const done = state.phase >= MIGRATE_D1_PREFIXES.length;
+      if (done) {
+        try {
+          await env.CONFIGS.delete(MIGRATE_D1_STATE_KEY);
+        } catch {
+          // A stranded state key only costs the next run a restart, and
+          // every write in the sweep is idempotent.
+        }
+      } else {
+        await env.CONFIGS.put(MIGRATE_D1_STATE_KEY, JSON.stringify(state));
+      }
+
+      return json({ ok: true, done, results, thisCall, scanned: state.scanned });
     }
 
     // /admin/api/rebuild-public-index  (POST) -> { ok, done, count, scanned, ms }

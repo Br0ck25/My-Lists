@@ -145,11 +145,20 @@ attack, single-publication and state cleanup, recovery from corrupt/stale resume
 chunk attempts, and the admin loop. **Verified they fail against the pre-fix code** (3 failures) and
 pass after. Full suite: 112/112, `verify.sh` green.
 
-**Not fixed, same bug class:** `/admin/api/migrate-d1` (`26_…:3268–3366`) does the identical unbounded
-`listAllKeys` + per-key `get` sweep across four prefixes in one invocation, and hits the same cliff.
-It is admin-only and manually triggered, so it is lower severity, but it needs the same chunking —
-and per `wrangler.toml` its failure is what leaves an account in KV but not D1, which the key-rotation
-endpoints then handle incorrectly. Tracked as a follow-up rather than folded into this change.
+**Same bug class, also now fixed:** `/admin/api/migrate-d1` did the identical unbounded
+`listAllKeys` + per-key `get` sweep, across five prefixes in one invocation, with a D1 write per key
+on top — and both KV reads and D1 statements count against the same 1,000. Verified: with 2,000
+creators and 2,000 lists it died outright with `Too many subrequests`. That failure is worse than
+merely incomplete, because per `wrangler.toml` an account left in KV but missing from D1 is precisely
+the case the key-rotation endpoints get wrong (a D1 `UPDATE` matching zero rows still reports
+success) — so the endpoint whose job is to prevent that state was the thing creating it.
+
+It now chunks against `migrated1:state` the same way, with `MIGRATE_D1_OPS_PER_RUN = 700` (it has its
+invocation to itself). Measured: 2,000 creators + 2,000 lists complete in 12 calls, peak **702**
+subrequests, every account present in D1. Every write in the sweep was already idempotent
+(`DO NOTHING`, or `DO UPDATE` to a value derived only from KV), which is what makes re-processing a
+key across a chunk boundary safe. Two regression tests added, confirmed failing against the pre-fix
+code.
 
 ---
 
@@ -757,7 +766,7 @@ byte-exact concatenation, CI-gated against drift.
 **🔴 PHASE 1 — MUST FIX BEFORE PRODUCTION**
 1. ~~Bounded, resumable public-list index rebuild (finding 1)~~ — **DONE**
 2. Per-account throttle + answer entropy on `/api/creator/reset-key` (finding 2)
-3. Apply the same chunking to `/admin/api/migrate-d1` (same bug class as 1, admin-only)
+3. ~~Apply the same chunking to `/admin/api/migrate-d1`~~ — **DONE**
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
 3. CSPRNG thread ids (3) · 4. Thread append authorization (4) · 5. Rate-limit bypass (5) ·
