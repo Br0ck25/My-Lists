@@ -12,7 +12,8 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 5 of 16 findings closed** (all 4 production blockers + 1 blocker-adjacent).
+**Progress: 6 of 16 findings closed** (all 4 production blockers, plus the client-bundle
+duplicate-declaration class and the build-header fragility).
 
 ---
 
@@ -25,6 +26,7 @@ fix, so "what is still open" is always answerable from `main` alone.
 | 3 | `checkForNewEpisodes` cron wrote a stale whole tracking blob, silently destroying user watch history | 🔴 Critical | 2026-09-05 | `ff9cbfe` | `audit fix 3` (1 test) |
 | 4 | `/api/publish-list` + `/api/save`: unauthenticated, uncapped, permanent KV writes | 🔴 High | 2026-09-05 | `ff9cbfe` | `audit fix 4` (4 tests) |
 | 16 | `build.py` recovered its header from its own previous output, so editing `00_constants.js` made the build unrunnable | 🟡 Low | 2026-09-05 | `ff9cbfe` | `verify.sh` step 2 (header now in `header.js`, proven byte-identical) |
+| 8 | Duplicate `handlePosterImgError` in the client bundle; the losing definition was the one most call sites were written for | 🟠 Medium | 2026-09-05 | `ae5c52d` | `audit fix 8` (4 tests) + `html_checks.py` duplicate-declaration guard |
 
 ### What changed, per fix
 
@@ -41,6 +43,21 @@ fix, so "what is still open" is always answerable from `main` alone.
 
 **4 — `/api/publish-list` + `/api/save`** — bounds in `00_constants.js` (`PUBLISHED_LIST_ITEMS_MAX` 10,000; `PUBLISHED_LIST_BYTES_MAX` 2 MB; `SAVED_CONFIG_ENTRIES_MAX` 500; `SAVED_CONFIG_BYTES_MAX` 512 KB) plus per-IP rate limits. Ceilings are ~8× the largest real list observed. **Rejects, never truncates.**
 
+**8 — duplicate top-level declarations in the client bundle** (`16_`, `22_`, `23_`, `html_checks.py`)
+- `handlePosterImgError`: the two definitions implemented different DOM contracts, and `23_`'s won (later in build order). It revealed `img.nextElementSibling`, which is a real placeholder at only one of the five call sites. Now routed through `showPosterPlaceholderFor`, which reveals a placeholder when one exists and creates one when it does not, and never touches a non-placeholder sibling. `16_`'s copy deleted.
+- Also removed the other three shadowed duplicates: `escapeHtml`/`escapeAttr` (`16_`, superseded by `19_`'s — which differ: `String(s || '')` turns a legitimate `0` into `''`, `String(s == null ? '' : s)` renders `"0"`) and `showModal`/`closeModal` (`22_`, byte-identical to `16_`'s).
+- `html_checks.py` now fails the build on any duplicate top-level `function` declaration in the served client script. Verified by reintroducing one: it exits 1 and names the symbol.
+
+> **Correction to the audit report's description of this finding.** The report said the
+> old code "force-shows the ✕ remove button / count overlay in place of the poster."
+> That overstates it: `.cw-remove-btn` and `.poster-add-overlay` are already
+> `display:flex` in CSS, so setting it again was a no-op for them. The real symptoms
+> were (a) **no "No poster" placeholder was ever created** at four of the five call
+> sites — just an empty gap — and (b) on `.list-card-count-overlay`, which *is*
+> shown/hidden per breakpoint by a media query, the inline `display:flex` overrode
+> that query and put the badge on screen at both widths at once. The fix and its
+> priority are unchanged.
+
 ---
 
 ## ⬜ Open — next up, in recommended order
@@ -48,7 +65,6 @@ fix, so "what is still open" is always answerable from `main` alone.
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
 | 5 | Missing rate limits on the remaining unauthenticated write and shared-key fan-out endpoints | 🟠 Medium | `25_`: `/api/details/batch`, `/api/bulk-resolve`, `/api/recommendations`, `/api/external-list/*` | Anonymous callers can burn the operator's TMDB/Trakt/MDBList quota. Same per-IP pattern now used in four places. |
-| 8 | Duplicate `handlePosterImgError`; the losing definition is the one 3 of 5 call sites were written for | 🟠 Medium | `16_:800` vs `23_:825` | A failed poster force-shows the ✕ remove button / count overlay in its place. Fix = delete `16_`'s + make `23_`'s branch class-check the sibling. Add the CI duplicate-declaration guard at the same time. |
 | 10 | Admin "Top Community Lists" ranks the alphabetically-first 100 in KV-only mode | 🟠 Medium | `03_admin.js:~833` | Reports a lexicographic sample as "top". Fix = rank from `index:publiclists`, which already carries likes and is already sorted — also removes ~100 KV reads per dashboard load. |
 | 9 | Stat counters are non-atomic read-modify-writes | 🟠 Med-High | `03_admin.js` `bumpStat`/`bumpStatBy`/`recordTrackedEvent`/`recordSearchQuery` | 20 concurrent requests recorded as 1. Worsens with traffic (KV edge-cached reads + 1 write/sec/key). Fix = shard hot keys, or move counters to D1, or label the panels approximate. Needs a migration — the largest of the remaining items. |
 | 13 | No timeout on any of ~135 outbound fetches | 🟠 Medium | `02_` `fetchWithPerUserCacheUncoalesced`, `fetchTraktWithRetry` | A hung upstream stalls the request; the stale-fallback tiers only trigger on rejection. Fix = `AbortSignal.timeout` at the two shared helpers, not 135 call sites. |
@@ -58,7 +74,7 @@ fix, so "what is still open" is always answerable from `main` alone.
 | 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | `26_:~448` | Largely forced (Plex/Jellyfin webhooks can't set headers). Fix = document the trade and the rotation path, don't redesign. |
 | 7 | ~40 handlers return raw `String(err.message)` | 🟡 Low | `25_`, `26_` | Leaks nothing today (all `throw`s are status-only) but contradicts the policy stated at `/api/bulk-resolve`. |
 | 15 | `FUNCTION-MAP.md` line numbers 26% stale (211 of 811) | 🟡 Low | `FUNCTION-MAP.md`, `gen_map.py` | Nothing regenerates or validates it. Fix = add to `verify.sh`/CI, or drop line numbers. |
-| — | Dead code: 4 unreferenced server functions + 4 shadowed client duplicates | 🟡 Low | see audit "Dead Code" | `classifyTraktListContentType`, `getPaddedChannelLogo`, `fetchTrailerForImdb`, `getProviderIconBadge`; `escapeHtml`/`escapeAttr` (`16_`), `showModal`/`closeModal` (`22_`). Do finding 8 first — they are the same edit. |
+| — | Dead code: 4 unreferenced server functions | 🟡 Low | see audit "Dead Code" | `classifyTraktListContentType` (`04_`), `getPaddedChannelLogo` (`05_`), `fetchTrailerForImdb` (`07_`), `getProviderIconBadge` (`08_`). The 4 shadowed *client* duplicates were removed with finding 8. Deleting these makes `FUNCTION-MAP.md` staler, so pair it with finding 15. |
 
 ---
 
