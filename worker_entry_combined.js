@@ -17364,6 +17364,26 @@ function saveUserFeedbackThreadId(threadId) {
   } catch (e) {}
 }
 
+// The signed-in identity to attach to a feedback message, but only when it
+// can actually be proven. /api/feedback authenticates any creatorName it is
+// given and ignores the claim when the key does not match, so a name without
+// a key buys nothing. Returns nulls when there is nothing provable, which the
+// server treats as an ordinary anonymous message.
+function feedbackCreatorAuth() {
+  const name = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName)
+    ? activeCreator.creatorName
+    : null;
+  if (!name) return { creatorName: null, creatorKey: null };
+  let key = '';
+  try {
+    key = localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    key = '';
+  }
+  if (!key) return { creatorName: null, creatorKey: null };
+  return { creatorName: name, creatorKey: key };
+}
+
 async function loadUserFeedbackThreads() {
   const threadIds = getUserFeedbackThreadIds();
   const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
@@ -17507,7 +17527,12 @@ async function sendUserFeedbackReply() {
   if (statusEl) statusEl.textContent = 'Sending reply\u2026';
 
   const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
-  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+  // Name AND key, or neither. The server proves any claimed identity before
+  // recording it (a bare name used to be taken on trust and rendered in the
+  // admin panel as the sender), so a name sent without a key is simply
+  // dropped there and the message is filed anonymously. Sending the pair
+  // when we have it is what keeps the thread attached to the account.
+  const creatorAuth = feedbackCreatorAuth();
 
   try {
     const res = await fetch(ORIGIN + '/api/feedback', {
@@ -17516,7 +17541,8 @@ async function sendUserFeedbackReply() {
       body: JSON.stringify({
         threadId: activeFeedbackThreadId,
         message: text,
-        creatorName: creatorName,
+        creatorName: creatorAuth.creatorName,
+        creatorKey: creatorAuth.creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -17559,7 +17585,9 @@ async function submitFeedback() {
         category: category,
         message: message,
         contact: contact,
-        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+        // See feedbackCreatorAuth: name and key travel together or not at all.
+        creatorName: feedbackCreatorAuth().creatorName,
+        creatorKey: feedbackCreatorAuth().creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -51639,10 +51667,36 @@ self.addEventListener('fetch', e => {
       const allowedCategories = new Set(["bug", "improvement", "idea", "other"]);
       const category = allowedCategories.has(body.category) ? body.category : "other";
       const contact = String(body.contact || "").trim().slice(0, 200);
-      const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+      const claimedCreator = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
+
+      // A claimed creatorName used to be recorded, and rendered in the admin
+      // panel as the sender, on nothing but the caller's say-so -- so anyone
+      // could file or answer feedback wearing someone else's name. It is now
+      // proven before it is stored anywhere.
+      //
+      // An unprovable claim is DROPPED, not rejected. This is the support
+      // channel: the person whose key stopped working is exactly the person
+      // who needs to reach support, and 401ing them here would close the one
+      // door they have left. Their message still goes through, just as an
+      // anonymous one -- which is all "we could not verify who you are"
+      // honestly supports. (Replying to a thread that already belongs to an
+      // account is the separate, stricter case, handled below.)
+      //
+      // The admin panel is the one exemption: its "Log something yourself"
+      // button posts creatorName:"admin" with fromAdminPanel:true and no key
+      // (see submitAdminFeedback, 03_admin.js), and "admin" is a marker that
+      // feedbackCardHtml keys off, not a Creator Profile to authenticate.
+      let authedCreator = null;
+      if (!isAdmin && claimedCreator) {
+        const auth = await authenticateCreator(claimedCreator, body.creatorKey ? String(body.creatorKey) : "");
+        if (auth.ok) authedCreator = auth.username;
+      }
+      // What actually gets stored: the admin marker, a proven username, or
+      // nothing. Never the raw claim.
+      const creatorName = isAdmin ? claimedCreator : authedCreator;
       let rateLimitKey = null;
       let rateCount = 0;
       if (!isAdmin) {
@@ -51658,10 +51712,42 @@ self.addEventListener('fetch', e => {
 
       // If replying to an existing thread
       if (threadId) {
+        let entry = null;
         try {
           const raw = await env.CONFIGS.get(`feedback:${threadId}`);
-          if (raw) {
-            const entry = JSON.parse(raw);
+          if (raw) entry = JSON.parse(raw);
+        } catch (e) {
+          entry = null;
+        }
+
+        // A thread id is a capability, and for a thread nobody owns that is
+        // the whole design: an anonymous reporter has no account and follows
+        // up with nothing else. But a thread that DOES belong to an account
+        // is not a bare capability -- the id alone used to be enough for any
+        // stranger to append to it, reopen it, and pick their own display
+        // name, which the admin panel then rendered as the sender.
+        //
+        // A stored name that no longer normalises to a valid username (legacy
+        // free-text) cannot be authenticated as by anyone, so treating it as
+        // owned would strand the thread. Those stay id-capability threads.
+        if (entry && !isAdmin) {
+          const ownerRaw = entry.creatorName ? String(entry.creatorName).trim() : "";
+          let ownerNorm = "";
+          if (ownerRaw) {
+            const ownerV = validateCreatorUsername(ownerRaw);
+            if (ownerV && ownerV.ok) ownerNorm = ownerV.normalized;
+          }
+          if (ownerNorm && ownerNorm !== authedCreator) {
+            return json(
+              { ok: false, error: "That conversation belongs to an account. Sign in to reply to it." },
+              403,
+              { "Cache-Control": "no-store" }
+            );
+          }
+        }
+
+        try {
+          if (entry) {
             if (!Array.isArray(entry.messages) || !entry.messages.length) {
               entry.messages = [{
                 id: `msg_init`,
@@ -51674,7 +51760,11 @@ self.addEventListener('fetch', e => {
             const newMsg = {
               id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
               sender: isAdmin ? "admin" : "user",
-              senderName: isAdmin ? "Developer" : (creatorName || entry.creatorName || "User"),
+              // Derived, never taken from the request body. This is what
+              // the admin panel renders as the sender, so letting the
+              // caller choose it meant a stranger could plant a message
+              // signed "Developer" inside someone else's thread.
+              senderName: isAdmin ? "Developer" : (entry.creatorName || authedCreator || "User"),
               text: message,
               timestamp: Date.now()
             };
@@ -51683,6 +51773,9 @@ self.addEventListener('fetch', e => {
             entry.status = isAdmin ? "replied" : "open";
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
+            // Claiming an unowned thread now takes proof, not just the id --
+            // otherwise anyone holding it could attach their own account to
+            // someone else's report.
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
             await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
@@ -51692,7 +51785,18 @@ self.addEventListener('fetch', e => {
       }
 
       // New Thread
-      const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      //
+      // The id is a capability: /api/feedback/threads hands the whole thread
+      // -- every message plus the contact address the form asks for -- to
+      // anyone who presents it, deliberately, so anonymous reporters can
+      // follow up. It was minted with Math.random(), which is not a CSPRNG:
+      // V8's xorshift128+ state is recoverable from a handful of outputs, so
+      // filing a few reports of your own leaked the ids being handed to
+      // other people from the same isolate. generateShortId is the same
+      // crypto.getRandomValues helper the OAuth state cookies use.
+      // Date.now() stays as the prefix -- /admin/api/feedback relies on
+      // these keys sorting chronologically.
+      const id = `${Date.now()}:${generateShortId()}`;
       const entry = {
         id, category, message, contact: contact || null, creatorName,
         createdAt: Date.now(),
@@ -51703,6 +51807,8 @@ self.addEventListener('fetch', e => {
           {
             id: `msg_${Date.now()}_1`,
             sender: isAdmin ? "admin" : "user",
+            // creatorName here is the proven name (or the admin marker),
+            // never the raw claim -- see its assignment above.
             senderName: isAdmin ? "Developer" : (creatorName || "User"),
             text: message,
             timestamp: Date.now()

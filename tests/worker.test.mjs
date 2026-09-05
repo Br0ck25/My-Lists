@@ -286,9 +286,20 @@ describe("feedback threads", () => {
   it("name lookup needs the key; anonymous threadIds still work", async () => {
     const env = makeEnv();
     const alice = await createUser(env, "alicefb");
+    // The key is required to ATTRIBUTE a thread to an account: /api/feedback
+    // proves any claimed creatorName before storing it, and silently drops a
+    // claim it cannot verify (an unverifiable claim must not close the
+    // support channel -- see that endpoint's own comment). Without the key
+    // here the thread would be filed anonymously and the by-name lookup
+    // below would correctly not find it.
     const posted = await call(env, "/api/feedback", {
       method: "POST",
-      json: { message: "secret report", creatorName: alice.creatorName, contact: "me@example.com" },
+      json: {
+        message: "secret report",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        contact: "me@example.com",
+      },
     });
     assert.equal(posted.body.ok, true);
     const threadId = posted.body.entry.id;
@@ -342,7 +353,7 @@ describe("feedback threads", () => {
     // Sorts after all 250 filler keys (larger timestamp), i.e. newest.
     const newest = await call(env, "/api/feedback", {
       method: "POST",
-      json: { creatorName: alice.creatorName, message: "my recent report" },
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, message: "my recent report" },
     });
     assert.equal(newest.body.ok, true);
     const threadId = newest.body.entry.id;
@@ -371,6 +382,134 @@ describe("feedback threads", () => {
     assert.notEqual(start, -1, "loadUserFeedbackThreads should be present in the served bundle");
     const body = bundle.text.slice(start, start + 1200);
     assert.ok(/creatorKey\s*:\s*creatorKey/.test(body), "loadUserFeedbackThreads must send creatorKey, not just creatorName");
+  });
+});
+
+// A support thread holds free-text messages plus the contact address the
+// feedback form asks for, and /api/feedback/threads hands the whole thing to
+// anyone presenting the thread id -- deliberately, so anonymous reporters can
+// follow up. That makes the id a capability, and it was minted with
+// Math.random(): ~31 bits from a PRNG whose state is recoverable from a few
+// outputs. Worse, the id alone let a stranger APPEND to any thread, choosing
+// the display name the admin panel renders as the sender.
+describe("audit fix: support threads are capabilities, not open mailboxes", () => {
+  it("mints thread ids from the CSPRNG, not Math.random", async () => {
+    const env = makeEnv();
+    const ids = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await call(env, "/api/feedback", { method: "POST", json: { message: `report ${i}` } });
+      ids.push(r.body.entry.id);
+    }
+    for (const id of ids) {
+      const random = id.split(":")[1] || "";
+      // generateShortId is 9 random bytes base64url-encoded -> 12 chars.
+      // Math.random().toString(36).slice(2, 8) was 6.
+      assert.equal(random.length, 12, `thread id "${id}" does not carry a 12-char random part`);
+      assert.match(random, /^[A-Za-z0-9_-]{12}$/);
+    }
+    assert.equal(new Set(ids).size, ids.length, "thread ids collided");
+    // The timestamp prefix has to stay: /admin/api/feedback relies on these
+    // keys sorting chronologically.
+    assert.match(ids[0], /^\d{10,}:/);
+  });
+
+  it("will not let a stranger append to a thread that belongs to an account", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicethread");
+    const posted = await call(env, "/api/feedback", {
+      method: "POST",
+      json: {
+        message: "my private bug report",
+        contact: "victim@example.com",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+      },
+    });
+    const threadId = posted.body.entry.id;
+    assert.equal(posted.body.entry.creatorName, alice.creatorName);
+
+    const stranger = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "injected by stranger", creatorName: "Developer" },
+    });
+    assert.equal(stranger.status, 403, "a stranger holding the id could still write into an owned thread");
+    assert.equal(stranger.body.ok, false);
+
+    // The owner themselves is of course still fine.
+    const owner = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { threadId, message: "following up", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(owner.body.ok, true, owner.body.error);
+    assert.equal(owner.body.entry.messages.length, 2);
+  });
+
+  it("keeps anonymous threads reachable by id, but not the sender name", async () => {
+    // The id-as-capability model is the point for someone with no account,
+    // so this must keep working -- what must not is choosing who the message
+    // appears to be from.
+    const env = makeEnv();
+    const anon = await call(env, "/api/feedback", { method: "POST", json: { message: "anonymous report" } });
+    const threadId = anon.body.entry.id;
+
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "a follow-up", creatorName: "Developer" },
+    });
+    assert.equal(reply.body.ok, true, "anonymous follow-up by thread id must still work");
+    const names = reply.body.entry.messages.map((m) => m.senderName);
+    assert.ok(!names.includes("Developer"), `sender name was taken from the request body: ${names.join(", ")}`);
+    assert.ok(reply.body.entry.messages.every((m) => m.sender === "user"));
+  });
+
+  it("drops an identity claim it cannot prove instead of storing it", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicevictim");
+    const impersonation = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "impersonation attempt", creatorName: alice.creatorName },
+    });
+    // The message still goes through -- this is the support channel, and
+    // someone whose key has stopped working is exactly who needs it -- but
+    // the unproven name is not recorded.
+    assert.equal(impersonation.body.ok, true, "an unverifiable claim must not close the support channel");
+    assert.equal(impersonation.body.entry.creatorName, null, "an unproven creatorName was stored");
+    assert.equal(impersonation.body.entry.messages[0].senderName, "User");
+
+    // ...and it must not show up in the real account's thread list.
+    const mine = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(mine.body.threads.some((t) => t.id === impersonation.body.entry.id), false);
+  });
+
+  it("leaves the admin panel's own self-logging and replies working", async () => {
+    // submitAdminFeedback posts creatorName:"admin" with fromAdminPanel:true
+    // and no key -- "admin" is a marker feedbackCardHtml keys off, not a
+    // Creator Profile, so it must not be run through creator auth.
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceadminfb");
+    const owned = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "user report", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+
+    const selfLog = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { category: "bug", message: "logged by admin", creatorName: "admin", fromAdminPanel: true },
+    });
+    assert.equal(selfLog.body.ok, true, selfLog.body.error);
+    assert.equal(selfLog.body.entry.creatorName, "admin", "the admin self-log marker was stripped");
+
+    // And the admin must still be able to answer a thread they do not own.
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { threadId: owned.body.entry.id, message: "admin here", fromAdminPanel: true },
+    });
+    assert.equal(reply.body.ok, true, reply.body.error);
+    assert.equal(reply.body.entry.messages.slice(-1)[0].senderName, "Developer");
   });
 });
 

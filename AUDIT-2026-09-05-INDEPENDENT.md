@@ -293,15 +293,17 @@ Confirmed anonymously with only the id:
 { "contact": "victim@example.com", "msgs": ["my private bug report"] }
 ```
 
-**Fix.** `generateShortId()` (`02_http-and-creator-utils.js:322`) already exists and uses
-`crypto.getRandomValues`. Use it:
+**Fix (applied).** `generateShortId()` (`02_http-and-creator-utils.js:322`) already existed and uses
+`crypto.getRandomValues`. Now:
 
 ```js
 const id = `${Date.now()}:${generateShortId()}`;
 ```
 
-Old ids keep working — this only changes newly minted ones. Add a per-IP limit to
-`/api/feedback/threads` as well.
+Verified: the random half went from 6 chars of `Math.random` (~31 bits) to **12 chars / 72 bits** of
+CSPRNG output. Old ids keep working — only newly minted ones change — and the `Date.now()` prefix
+stays, because `/admin/api/feedback` relies on these keys sorting chronologically. A per-IP limit on
+`/api/feedback/threads` is still outstanding.
 
 ---
 
@@ -328,9 +330,31 @@ The admin dashboard renders `senderName` (`03_admin.js:2512`), so a stranger can
 attributed to "Developer" inside another user's support thread. The output is correctly HTML-escaped,
 so this is impersonation, not XSS.
 
-**Fix.** When the target thread has a `creatorName`, require that account's key before appending.
-Leave the anonymous append path only for threads that have no `creatorName`. Never take `senderName`
-from the request — derive it from the authenticated identity, or hard-code `"User"`.
+**Fix (applied).** A thread that belongs to an account now requires that account's key to append
+(403 otherwise); a thread nobody owns keeps the id-capability model, which is the whole point for a
+reporter with no account. `senderName` is derived and never read from the request. A claimed
+`creatorName` is authenticated before it is stored or rendered anywhere.
+
+One deliberate choice worth recording: an identity claim that **cannot** be proven is *dropped* — the
+message is filed anonymously — rather than rejected with a 401. This is the support channel, and the
+person whose key has stopped working is precisely the person who needs it; closing that door to
+enforce attribution would be the wrong trade. Appending to an already-owned thread is the separate,
+strict case and does hard-fail.
+
+The admin panel's "Log something yourself" button is exempt: it posts `creatorName: "admin"` with
+`fromAdminPanel: true` and no key, and `"admin"` is a marker `feedbackCardHtml` keys off rather than a
+Creator Profile. Missing that would have broken admin self-logging.
+
+| | Before | After |
+|---|---|---|
+| Stranger appends to an owned thread with just the id | succeeded | **403** |
+| Sender name chosen by the caller (`"Developer"`) | rendered as sent | derived; spoof gone |
+| Report filed in someone else's name, no key | stored and rendered | claim dropped, filed anonymously |
+| Anonymous follow-up by thread id | worked | still works |
+| Owner replying to their own thread | worked | still works |
+| Admin self-log / admin reply | worked | still works |
+
+Five regression tests; the four that assert the fix were confirmed failing against the pre-fix code.
 
 ---
 
@@ -773,8 +797,8 @@ byte-exact concatenation, CI-gated against drift.
 - 🔵 comment at `:45` — the CI step it cites does not exist; add the check. **(11)**
 
 ### `25_api-catalog-routes.js`
-- 🟠 `:4720` — `generateShortId()` instead of `Math.random()` for thread ids. **(3)**
-- 🟠 `:4684` — authorize `threadId` appends; never take `senderName` from the body. **(4)**
+- ✅ `:4720` — **DONE.** `generateShortId()` instead of `Math.random()` for thread ids. **(3)**
+- ✅ `:4684` — **DONE.** Owned threads require the account key; `senderName` is derived. **(4)**
 - 🟠 `:1744` and `:5739` — always rate-limit; raise the ceiling for bring-your-own-key. **(5)**
 - 🟡 `/api/channel-logo:972` — cap the fetched image size; serve with a long `max-age`.
 - 🟡 `/api/save:5390`, `/api/publish-list:5463` — add `expirationTtl` or a sweep for records nothing references. **(M4)**
@@ -811,8 +835,8 @@ byte-exact concatenation, CI-gated against drift.
 3. ~~Apply the same chunking to `/admin/api/migrate-d1`~~ — **DONE**
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
-3. CSPRNG thread ids (3) · 4. Thread append authorization (4) · 5. Rate-limit bypass (5) ·
-6. SRI on the CDN script (6)
+~~3. CSPRNG thread ids (3)~~ — **DONE** · ~~4. Thread append authorization (4)~~ — **DONE** ·
+5. Rate-limit bypass (5) · 6. SRI on the CDN script (6)
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
 7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · 9. Like-ledger consistency (9) ·
@@ -887,8 +911,8 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 1. ~~**Bound and resume the public-list index rebuild**~~ — **DONE.** (Finding 1)
 2. ~~**Per-account throttle on `/api/creator/reset-key`**~~ — **DONE.** (2)
 3. ~~**Minimum entropy on recovery answers at creation**~~ — **DONE.**
-4. **`generateShortId()` for feedback thread ids** — one-line change to a token already treated as a capability. (3)
-5. **Authorize `threadId` appends and stop trusting `senderName`.** (4)
+4. ~~**`generateShortId()` for feedback thread ids**~~ — **DONE.** (3)
+5. ~~**Authorize `threadId` appends and stop trusting `senderName`.**~~ — **DONE.** (4)
 6. **Always rate-limit `/api/recommendations` and `/api/details/batch`.** (5)
 7. **Add SRI to the fflate `<script>`.** (6)
 8. **Move the reset-key and admin-login limiters onto D1's atomic upsert.** (7)

@@ -1053,6 +1053,26 @@ function saveUserFeedbackThreadId(threadId) {
   } catch (e) {}
 }
 
+// The signed-in identity to attach to a feedback message, but only when it
+// can actually be proven. /api/feedback authenticates any creatorName it is
+// given and ignores the claim when the key does not match, so a name without
+// a key buys nothing. Returns nulls when there is nothing provable, which the
+// server treats as an ordinary anonymous message.
+function feedbackCreatorAuth() {
+  const name = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName)
+    ? activeCreator.creatorName
+    : null;
+  if (!name) return { creatorName: null, creatorKey: null };
+  let key = '';
+  try {
+    key = localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    key = '';
+  }
+  if (!key) return { creatorName: null, creatorKey: null };
+  return { creatorName: name, creatorKey: key };
+}
+
 async function loadUserFeedbackThreads() {
   const threadIds = getUserFeedbackThreadIds();
   const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
@@ -1196,7 +1216,12 @@ async function sendUserFeedbackReply() {
   if (statusEl) statusEl.textContent = 'Sending reply\u2026';
 
   const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
-  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+  // Name AND key, or neither. The server proves any claimed identity before
+  // recording it (a bare name used to be taken on trust and rendered in the
+  // admin panel as the sender), so a name sent without a key is simply
+  // dropped there and the message is filed anonymously. Sending the pair
+  // when we have it is what keeps the thread attached to the account.
+  const creatorAuth = feedbackCreatorAuth();
 
   try {
     const res = await fetch(ORIGIN + '/api/feedback', {
@@ -1205,7 +1230,8 @@ async function sendUserFeedbackReply() {
       body: JSON.stringify({
         threadId: activeFeedbackThreadId,
         message: text,
-        creatorName: creatorName,
+        creatorName: creatorAuth.creatorName,
+        creatorKey: creatorAuth.creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -1248,7 +1274,9 @@ async function submitFeedback() {
         category: category,
         message: message,
         contact: contact,
-        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+        // See feedbackCreatorAuth: name and key travel together or not at all.
+        creatorName: feedbackCreatorAuth().creatorName,
+        creatorKey: feedbackCreatorAuth().creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
