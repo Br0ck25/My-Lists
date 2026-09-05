@@ -3799,3 +3799,177 @@ describe("duplicate lists: the dashboard upload loop terminates", () => {
       "numbered duplicate slugs were minted: " + keys.map((k) => k.name).join(", "));
   });
 });
+
+// Removing one item from Watch History's See All page used to call
+// renderWatchHistoryGrid(), which starts with gridEl.innerHTML = '' and
+// rebuilds every tile -- so deleting one thing blanked the grid, re-requested
+// every poster and scrolled back to the top. It now updates in place.
+describe("watch history See All: removing an item does not rebuild the grid", () => {
+  function makeCard(removeId) {
+    const card = { style: {}, parentNode: null };
+    const btn = {
+      dataset: { removeType: "history", removeId: String(removeId) },
+      closest: (sel) => (sel.includes("live-preview-poster-card") ? card : null),
+    };
+    card.btn = btn;
+    return card;
+  }
+  function makeDom(cards, opts = {}) {
+    const grid = {
+      innerHTML: "<!-- rendered once -->",
+      cards: cards.slice(),
+      querySelectorAll() { return this.cards.map((c) => c.btn); },
+    };
+    grid.cards.forEach((c) => {
+      c.parentNode = { removeChild: (x) => { grid.cards = grid.cards.filter((k) => k !== x); x.parentNode = null; } };
+    });
+    const sub = { textContent: "" };
+    const status = { innerHTML: "" };
+    const tab = { hasAttribute: (a) => (a === "hidden" ? !!opts.hidden : false) };
+    return {
+      grid, sub, status,
+      document: { getElementById: (id) => ({
+        detailGrid: grid, detailSubtitle: sub, detailStatus: status, "content-list-details": tab,
+      }[id] || null) },
+    };
+  }
+  function load(dom, win, grouped) {
+    return loadOneClientFunction("23_client-list-management.js", "updateWatchHistoryGridAfterRemoval", {
+      document: dom.document,
+      window: win,
+      localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (grouped ? "true" : "false") : null) },
+      watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+        watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      }),
+    });
+  }
+
+  it("leaves the surviving tiles and the grid markup untouched", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2"), makeCard("tt3")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    // The person removed tt2; the raw list has already dropped it and its own
+    // handler is fading its tile out.
+    cards[1].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }, { id: "tt3" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true, "should report that it handled the update itself");
+    assert.equal(dom.grid.innerHTML, before, "the grid was rebuilt -- that is the reload the person sees");
+    assert.equal(dom.grid.cards.length, 3, "the fading tile must be left to its own animation, not yanked");
+    assert.equal(dom.sub.textContent, "2 items");
+  });
+
+  it("drops any other tile the removal took with it, without a rebuild", () => {
+    const cards = [makeCard("tt1"), makeCard("s1:1:1"), makeCard("s1:1:2")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    cards[1].style.opacity = "0";
+    // Removing a show clears every episode of it from the raw list.
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.innerHTML, before, "the grid must not be rebuilt to drop a stale tile");
+    assert.deepEqual(dom.grid.cards.map((c) => c.btn.dataset.removeId), ["tt1", "s1:1:1"],
+      "the stale episode tile should be gone; the fading one left alone");
+    assert.equal(dom.sub.textContent, "1 item");
+  });
+
+  it("counts against the active filter pill, not the whole history", () => {
+    const dom = makeDom([makeCard("tt1"), makeCard("s1:1:1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1", type: "movie" }, { id: "s1:1:1", showId: "s1" }],
+      _watchHistoryFilter: "movie",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "1 item");
+    assert.equal(dom.status.innerHTML, "");
+  });
+
+  it("says so, rather than guessing, when the last item goes", () => {
+    const cards = [makeCard("tt1")];
+    const dom = makeDom(cards);
+    cards[0].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "0 items");
+    assert.match(dom.status.innerHTML, /No matching items/);
+  });
+
+  it("hands grouped-by-show mode back to the full render, which really does need it", () => {
+    const dom = makeDom([makeCard("s1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "s1:1:1", showId: "s1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win, true)(), false,
+      "a show tile's episode count changes and the tile can disappear -- that needs re-laying out");
+  });
+
+  it("does nothing to a See All page showing some other list", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2")];
+    const dom = makeDom(cards);
+    const win = {
+      _currentListDetailsParams: { listUrl: "trakt:history", name: "Trakt History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.cards.length, 2, "another list's tiles must not be touched");
+    assert.equal(dom.sub.textContent, "", "nor its subtitle rewritten");
+  });
+});
+
+describe("watch history See All: the remove handler stops rebuilding the grid", () => {
+  // The one that reproduces the reported behaviour rather than covering the
+  // new helper: removeWatchHistoryItemDirect used to call renderWatchHistoryGrid
+  // unconditionally whenever the See All page was open.
+  function run({ grouped = false } = {}) {
+    const calls = { fullRender: 0, inPlace: 0 };
+    const map = { "watch-history": { items: [{ id: "tt1" }, { id: "tt2" }] } };
+    const win = {};
+    const detailTab = { hidden: false };
+    const remove = loadOneClientFunction("22_client-creator-profile.js", "removeWatchHistoryItemDirect", {
+      window: win,
+      document: { getElementById: (id) => (id === "content-list-details" ? detailTab : null) },
+      loadLocalCustomLists: () => map,
+      saveLocalCustomListsMap: () => true,
+      scheduleCreatorSyncSave: () => {},
+      renderCreatorDashboard: () => {},
+      showAddedToast: () => {},
+      syncAiringNextWatchState: () => {},
+      renderWatchHistoryGrid: () => { calls.fullRender++; },
+      updateWatchHistoryGridAfterRemoval: () => { calls.inPlace++; return !grouped; },
+    });
+    win._rawWatchHistoryItems = [{ id: "tt1" }, { id: "tt2" }];
+    remove("tt2", null);
+    return { calls, win, map };
+  }
+
+  it("updates in place instead of re-rendering every tile", () => {
+    const { calls, win, map } = run();
+    assert.equal(calls.inPlace, 1, "the in-place update should be attempted");
+    assert.equal(calls.fullRender, 0,
+      "the grid was rebuilt from scratch -- that is the whole list reloading on a single removal");
+    assert.deepEqual(win._rawWatchHistoryItems.map((i) => i.id), ["tt1"], "the item must still actually be removed");
+    assert.deepEqual(map["watch-history"].items.map((i) => i.id), ["tt1"]);
+  });
+
+  it("still falls back to the full render when the in-place update cannot cope", () => {
+    const { calls } = run({ grouped: true });
+    assert.equal(calls.inPlace, 1);
+    assert.equal(calls.fullRender, 1, "grouped-by-show needs the layout recomputing and must not be left stale");
+  });
+});

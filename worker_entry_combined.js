@@ -40976,7 +40976,13 @@ function removeWatchHistoryItemDirect(id, btn) {
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
     window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
     if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
-      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      // Update the open See All page in place. Rebuilding it -- which is what
+      // renderWatchHistoryGrid does, starting from innerHTML = '' -- blanked
+      // the grid, re-requested every poster and scrolled back to the top on
+      // every single removal. The full render stays as the fallback for the
+      // one case that really does need re-laying out (grouped by show).
+      const handled = (typeof updateWatchHistoryGridAfterRemoval === 'function') && updateWatchHistoryGridAfterRemoval();
+      if (!handled && typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
     }
   }
 }
@@ -42536,6 +42542,71 @@ window.toggleWatchHistoryGroupShows = function(checked) {
   if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
 };
 
+// The type a raw Watch History entry shows up as in the ungrouped grid, and
+// whether it survives the current filter pill. Shared so that the full render
+// below and the in-place update beside it cannot disagree about what "3 items"
+// means.
+function watchHistoryGridType(it) {
+  return (it && it.showId) ? 'series' : ((it && it.type) || 'movie');
+}
+function watchHistoryPassesFilter(it, filter) {
+  const t = watchHistoryGridType(it);
+  if (filter === 'movie') return t === 'movie';
+  if (filter === 'series') return t === 'series' || t === 'episode';
+  return true;
+}
+
+// Called after ONE item has been taken out of Watch History while the See All
+// page is open. Returns true if it brought the page up to date on its own.
+//
+// This exists because the removal used to call renderWatchHistoryGrid(), and
+// that starts with gridEl.innerHTML = '' -- so deleting a single item blanked
+// the grid and rebuilt every tile from scratch, re-requesting every poster and
+// throwing the person back to the top of a list they had scrolled into. On a
+// history of any real size that reads as the whole list reloading, which is
+// exactly what it was.
+//
+// Nothing about the surviving tiles changed, so nothing about them needs to be
+// re-rendered: the clicked tile is already being faded out by the handler that
+// got us here, anything else the removal took with it is dropped in place, and
+// the counts are recomputed from the raw items. Grouped-by-show mode is the one
+// case that genuinely needs the layout recomputing (a show tile's episode count
+// changes, and the tile disappears entirely at zero), so it says so and lets the
+// caller fall back.
+function updateWatchHistoryGridAfterRemoval() {
+  const gridEl = document.getElementById('detailGrid');
+  const detailTab = document.getElementById('content-list-details');
+  // Not on screen -- reopening the page renders it fresh from
+  // _rawWatchHistoryItems anyway, so there is nothing to keep in step here.
+  if (!gridEl || !detailTab || detailTab.hasAttribute('hidden')) return true;
+  const p = window._currentListDetailsParams;
+  if (!p) return true;
+  const isLocalHist = (!p.listUrl && p.name && p.name.toLowerCase().includes('watch history')) || p.listUrl === 'watch-history' || p.listUrl === 'custom:watch-history' || p.listUrl === 'autotrack:watch-history';
+  if (!isLocalHist) return true;
+  if (localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true') return false;
+
+  const live = new Set();
+  (window._rawWatchHistoryItems || []).forEach((it) => {
+    if (it) live.add(String(it.id || it.imdbId || ''));
+  });
+  gridEl.querySelectorAll('.cw-remove-btn[data-remove-type="history"]').forEach((b) => {
+    if (live.has(String(b.dataset.removeId || ''))) return;
+    const card = b.closest('.live-preview-poster-card');
+    // Leave the one already mid-fade to its own animation.
+    if (!card || card.style.opacity === '0') return;
+    if (card.parentNode) card.parentNode.removeChild(card);
+  });
+
+  const filter = window._watchHistoryFilter || 'all';
+  const remaining = (window._rawWatchHistoryItems || []).filter((it) => watchHistoryPassesFilter(it, filter)).length;
+  const subEl = document.getElementById('detailSubtitle');
+  if (subEl) subEl.textContent = remaining + ' item' + (remaining === 1 ? '' : 's');
+  const statusEl = document.getElementById('detailStatus');
+  if (statusEl) statusEl.innerHTML = remaining ? '' : '<small>No matching items found.</small>';
+  return true;
+}
+window.updateWatchHistoryGridAfterRemoval = updateWatchHistoryGridAfterRemoval;
+
 window.renderWatchHistoryGrid = function() {
   const gridEl = document.getElementById('detailGrid');
   const statusEl = document.getElementById('detailStatus');
@@ -42634,7 +42705,7 @@ window.renderWatchHistoryGrid = function() {
       const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
       return {
         id: it.showId || it.imdbId || it.id,
-        type: it.showId ? 'series' : (it.type || 'movie'),
+        type: watchHistoryGridType(it),
         name: label.title,
         subtitle: label.subtitle,
         poster: it.poster || it.showPoster || '',
@@ -42645,6 +42716,8 @@ window.renderWatchHistoryGrid = function() {
     });
   }
 
+  // Same predicate as watchHistoryPassesFilter, against the processed tiles
+  // (grouping rewrites an episode's type, so this cannot read the raw item).
   if (filter === 'movie') {
     processed = processed.filter((it) => it.type === 'movie');
   } else if (filter === 'series') {

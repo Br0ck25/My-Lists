@@ -4578,7 +4578,13 @@ function removeWatchHistoryItemDirect(id, btn) {
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
     window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
     if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
-      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      // Update the open See All page in place. Rebuilding it -- which is what
+      // renderWatchHistoryGrid does, starting from innerHTML = '' -- blanked
+      // the grid, re-requested every poster and scrolled back to the top on
+      // every single removal. The full render stays as the fallback for the
+      // one case that really does need re-laying out (grouped by show).
+      const handled = (typeof updateWatchHistoryGridAfterRemoval === 'function') && updateWatchHistoryGridAfterRemoval();
+      if (!handled && typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
     }
   }
 }
