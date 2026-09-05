@@ -200,6 +200,14 @@ function applyEnvApiKeys(env) {
 // The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
 // Creator Key is ~60 bits -- so this is defence in depth, not the load-
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+// How many of one creator's lists /admin/api/delete-creator-list will remove
+// in a single call. Each slug costs a KV read, a KV delete, a ledger delete
+// and (with D1 bound) a statement, so this keeps one call well inside
+// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// larger cleanup still completes -- it just arrives as several bounded calls,
+// the same shape the other maintenance tools use.
+const ADMIN_LIST_DELETE_MAX = 50;
+
 const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
 const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 
@@ -3136,6 +3144,99 @@ async function usernameForScrobbleToken(env, token) {
   }
 }
 
+// Drops a batch of ids from the public index in ONE write.
+//
+// Deliberately not one updatePublicListIndex call per list: that is a
+// read-modify-write on a single key, so a run of them loses each other's
+// updates and strands entries in the directory pointing at records that no
+// longer exist -- a list that advertises an item count and then 404s when
+// opened. That is not hypothetical: a bulk delete left 76 such entries in a
+// live deployment, and nothing ever cleaned them up because the index only
+// used to rebuild when it was MISSING, never when it was merely wrong (see
+// refreshPublicListIndexIfStale).
+async function removeListsFromPublicIndex(env, ids) {
+  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    if (!idx) return;
+    const gone = new Set(ids);
+    await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+  } catch (e) {
+    console.error("public list index cleanup failed", e);
+  }
+}
+
+// Deletes one or more of a creator's lists: the KV record, the D1 row, the
+// like ledger, the entry in their display order, and the directory index --
+// with a single index write and a single order write however many slugs are
+// passed.
+//
+// One function because the account purge and the per-list delete used to be
+// written out separately and drifted (see purgeCreatorData's own comment on
+// exactly that). The like ledger matters in particular: leaving
+// listlikevoters:{user}:{slug} behind means whoever next creates a list at
+// that same slug inherits a like count they never earned, and every voter in
+// the old ledger is silently unable to like it.
+async function deleteCreatorLists(env, username, slugs) {
+  const out = { deleted: [], missing: [] };
+  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
+
+  for (const slug of slugs) {
+    const key = `creatorlist:${username}:${slug}`;
+    let existed = false;
+    try {
+      existed = !!(await env.CONFIGS.get(key));
+    } catch {
+      existed = false;
+    }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+      } catch (dbErr) {
+        console.error("D1 write error (deleteCreatorLists):", dbErr);
+      }
+    }
+    // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
+    // skipping the KV delete on that basis leaves the list live in KV -- a
+    // delete that reports success and deletes nothing.
+    try {
+      await env.CONFIGS.delete(key);
+    } catch (e) {
+      console.error("deleteCreatorLists: could not delete", key, e);
+    }
+    try {
+      await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
+    } catch (e) {
+      // A stranded ledger is untidy, not harmful on its own.
+    }
+    (existed ? out.deleted : out.missing).push(slug);
+  }
+
+  // Every slug asked for comes out of the index, including ones whose record
+  // was already gone -- those phantom entries are the whole reason an admin
+  // reaches for this.
+  await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`));
+
+  try {
+    const orderRaw = await env.CONFIGS.get(`creatorlistorder:${username}`);
+    let order = [];
+    try {
+      order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+    } catch {
+      order = [];
+    }
+    const gone = new Set(slugs);
+    const next = order.filter((s) => !gone.has(s));
+    if (next.length !== order.length || orderRaw) {
+      await env.CONFIGS.put(`creatorlistorder:${username}`, JSON.stringify({ order: next }));
+    }
+  } catch (e) {
+    console.error("deleteCreatorLists: could not update list order", e);
+  }
+
+  return out;
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -3589,15 +3690,10 @@ async function rebuildPublicListIndex(env, options = {}) {
   return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
-// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
-// rebuild run after the response so the requesting user doesn't pay for it.
-async function getPublicListIndex(env, ctx) {
-  const idx = await readPublicListIndex(env);
-  if (idx) return idx.entries;
-
-  // Rebuilding is a full scan; a burst of traffic against a cold index must
-  // not start one per request. First caller takes a 60s lock and rebuilds,
-  // the rest fall through to the bounded legacy scan for this one request.
+// Runs ONE rebuild chunk under a shared short lock, so a burst of traffic
+// against a cold or stale index cannot start a rebuild per request. Returns
+// the finished entries when this chunk completed the build, else null.
+async function advancePublicListIndexBuild(env, ctx) {
   let gotLock = false;
   try {
     const lock = await env.CONFIGS.get("lock:publiclistindex");
@@ -3606,15 +3702,10 @@ async function getPublicListIndex(env, ctx) {
       gotLock = true;
     }
   } catch {
-    // If the lock read fails, fall through to the scan rather than risking
-    // a rebuild stampede.
+    // If the lock read fails, do nothing rather than risk a stampede.
   }
   if (!gotLock) return null;
 
-  // One chunk per call -- see rebuildPublicListIndex. A small deployment
-  // finishes in this one chunk and gets its index immediately; a large one
-  // makes bounded progress and is served the legacy scan meanwhile, with the
-  // cron carrying the build to completion.
   const runChunk = async () => {
     try {
       return await rebuildPublicListIndex(env);
@@ -3623,9 +3714,9 @@ async function getPublicListIndex(env, ctx) {
       return null;
     } finally {
       // Released as soon as the chunk ends rather than left to expire: a
-      // rebuild now takes many chunks, and sitting on the lock for its full
-      // 60s TTL would cap progress at one chunk a minute for no benefit. The
-      // TTL stays as the backstop for a chunk that dies outright.
+      // rebuild takes many chunks, and sitting on the lock for its full 60s
+      // TTL would cap progress at one chunk a minute for no benefit. The TTL
+      // stays as the backstop for a chunk that dies outright.
       try {
         await env.CONFIGS.delete("lock:publiclistindex");
       } catch {
@@ -3635,12 +3726,64 @@ async function getPublicListIndex(env, ctx) {
   };
 
   if (ctx && typeof ctx.waitUntil === "function") {
-    // Rebuild in the background; serve this request from the legacy scan.
     ctx.waitUntil(runChunk());
     return null;
   }
   const res = await runChunk();
   return res && res.done ? res.entries : null;
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+  // A small deployment finishes in this one chunk and gets its index
+  // immediately; a large one makes bounded progress and is served the legacy
+  // scan meanwhile, with the cron carrying the build to completion.
+  return await advancePublicListIndexBuild(env, ctx);
+}
+
+// The index is a DERIVED cache maintained incrementally by
+// updatePublicListIndex, which is a read-modify-write on one key -- so
+// concurrent or rapid-fire updates lose each other. Its own comment accepts
+// that on the grounds that a lost entry costs one list's visibility "until
+// the next rebuild". The gap was that nothing ever caused one: a rebuild
+// only ever ran when the index was MISSING, never when it was merely wrong,
+// so a lost update was permanent.
+//
+// It was: a bulk delete left 76 entries in a live directory advertising item
+// counts for records that no longer existed, and they stayed there. This is
+// what closes that -- the cron re-derives the whole index from the
+// authoritative creatorlist:/publishedlist: keys once a day, so anything
+// stranded is gone within one cycle without anyone having to notice.
+//
+// The live index keeps serving untouched while a refresh runs: the chunked
+// rebuild only writes when its final chunk lands, so readers never see a
+// half-scanned directory.
+const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+async function refreshPublicListIndexIfStale(env, ctx) {
+  if (!env || !env.CONFIGS) return;
+  const idx = await readPublicListIndex(env);
+  if (!idx) {
+    // Cold start -- same path as a live request would take.
+    await advancePublicListIndexBuild(env, ctx);
+    return;
+  }
+  // A build already part-way through has to keep being advanced, or it stalls
+  // forever at whatever chunk it reached: the read path above returns early
+  // while an index exists, so the cron is the only thing driving it.
+  let building = false;
+  try {
+    building = !!(await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY));
+  } catch {
+    building = false;
+  }
+  const age = idx.updatedAt ? (Date.now() - idx.updatedAt) : Infinity;
+  if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
+    await advancePublicListIndexBuild(env, ctx);
+  }
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -3739,17 +3882,7 @@ async function purgeCreatorData(env, username, options = {}) {
   // One index write for the whole account rather than one per list --
   // deleting an account with 200 lists should not be 200 read-modify-writes
   // against the same key (KV allows 1 write/sec/key).
-  if (purgedListIds.length) {
-    try {
-      const idx = await readPublicListIndex(env);
-      if (idx) {
-        const gone = new Set(purgedListIds);
-        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
-      }
-    } catch (e) {
-      console.error("purgeCreatorData: index cleanup failed", e);
-    }
-  }
+  await removeListsFromPublicIndex(env, purgedListIds);
 
   // The scrobble token is keyed by the token, not the username, so it has to
   // be resolved through the reverse index before that index is deleted --
@@ -5891,9 +6024,21 @@ async function renderAdminDashboard(env) {
 
     <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
-      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It rebuilds itself automatically (on every publish/like, and once per cron run if it's ever found missing), so this is only for forcing an immediate, verifiable rebuild right now -- e.g. right after first setting this Worker up.</p>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
       <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Delete a creator&rsquo;s lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Removes specific lists belonging to one Creator Profile: the list itself, its likes, its place in that creator&rsquo;s order, and its directory entry. Use it for content a creator cannot or will not remove themselves. A slug whose list is already gone is still cleared from the directory, which is how you get rid of an entry that shows an item count but opens empty.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list. Prefer &ldquo;Rebuild Public List Index&rdquo; above first &mdash; if the lists are only phantom directory entries, that fixes them without deleting anything.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListUserInput" class="admin-select" placeholder="Creator username" style="margin-right:6px;">
+        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:260px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
+      <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
   </div>
 
@@ -6263,6 +6408,62 @@ async function renderAdminDashboard(env) {
           if (errCount) console.error('migrate-d1 errors:', r.errors);
           break;
         }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Irreversible, so it asks first and names exactly what it is about to
+    // remove. The endpoint caps each call (ADMIN_LIST_DELETE_MAX), so a bigger
+    // cleanup is sent as several batches here rather than rejected.
+    async function runDeleteCreatorLists() {
+      const btn = document.getElementById('deleteListBtn');
+      const status = document.getElementById('deleteListStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      const rawSlugs = (document.getElementById('deleteListSlugsInput').value || '').trim();
+      if (!username || !rawSlugs) {
+        status.textContent = 'Enter a username and at least one slug.';
+        return;
+      }
+      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
+        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\n\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      let remaining = null;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-creator-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+          remaining = data.remaining;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
+          ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
+          (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -54701,29 +54902,11 @@ self.addEventListener('fetch', e => {
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      if (env.DB) {
-        try {
-          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
-        } catch (dbErr) {
-          console.error("D1 write error (creatorlist delete):", dbErr);
-        }
-      }
-
-      // Unconditional, for the same reason as the key rotation above: a
-      // DELETE matching zero D1 rows still "succeeds", and skipping the KV
-      // delete on that basis left the list live in KV -- a delete that
-      // reported ok:true and deleted nothing.
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
-      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
-      let order = [];
-      try {
-        order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
-      } catch {
-        order = [];
-      }
-      order = order.filter((s) => s !== slug);
-      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
+      // Shared with /admin/api/delete-creator-list so the two cannot drift --
+      // the same lesson purgeCreatorData records about itself. It also drops
+      // the like ledger, which this route used to leave behind for whoever
+      // next created a list at the same slug to inherit.
+      await deleteCreatorLists(env, auth.username, [slug]);
       return json({ ok: true });
     }
 
@@ -56646,6 +56829,71 @@ self.addEventListener('fetch', e => {
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
+    //   -> { ok, deleted: [...], missing: [...], remaining }
+    // Admin-only removal of one creator's lists, for cleaning up content the
+    // owner cannot or will not remove themselves -- and, in particular, for
+    // clearing PHANTOM directory entries: a list whose index entry survived
+    // but whose record is gone advertises an item count and then 404s when
+    // opened, and until now there was no way to get rid of one at all. Slugs
+    // whose record has already vanished still come out of the index, and are
+    // reported back under `missing` rather than treated as an error.
+    //
+    // Deliberately per-list rather than per-creator: "delete this account's
+    // lists" is what /api/creator/delete-account already does, with the
+    // account's own key. This is a scalpel, and it is irreversible -- there is
+    // no undo and no backup of a deleted list.
+    //
+    // Goes through the same deleteCreatorLists the creator's own delete route
+    // uses, so an admin deletion cannot clean up differently (or less
+    // thoroughly) than the owner's does.
+    if (path === "/admin/api/delete-creator-list" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+
+      // Accepts one slug or many; both shapes end up as a bounded list.
+      const rawSlugs = Array.isArray(body.slugs)
+        ? body.slugs
+        : (body.slug ? [body.slug] : []);
+      const slugs = [...new Set(
+        rawSlugs.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean)
+      )];
+      if (!slugs.length) return json({ ok: false, error: "No slugs given." }, 400);
+      if (slugs.length > ADMIN_LIST_DELETE_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (limit ${ADMIN_LIST_DELETE_MAX}). Send them in batches.`,
+        }, 413);
+      }
+
+      const result = await deleteCreatorLists(env, v.normalized, slugs);
+      // How many that creator has left, so the caller can tell when a
+      // multi-batch cleanup is finished without guessing.
+      let remaining = null;
+      try {
+        const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
+        remaining = listed.keys.length;
+      } catch (e) {
+        remaining = null;
+      }
+      return json({
+        ok: true,
+        username: v.normalized,
+        deleted: result.deleted,
+        missing: result.missing,
+        remaining,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
@@ -57381,7 +57629,14 @@ export default {
         // rebuilt nothing at all once there were more than ~500 lists.
         // /admin/api/rebuild-public-index drives the same chunks back to
         // back for an immediate seed right after a fresh deploy.
-        getPublicListIndex(env, ctx),
+        //
+        // This also re-derives the index once a day even when one already
+        // exists. The index is maintained incrementally by a read-modify-write
+        // on a single key, so rapid updates lose each other -- and nothing
+        // used to repair that, because a rebuild only ever ran when the index
+        // was MISSING, never when it was merely wrong. See
+        // refreshPublicListIndexIfStale.
+        refreshPublicListIndexIfStale(env, ctx),
       ])
     );
   },

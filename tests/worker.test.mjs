@@ -1088,6 +1088,215 @@ describe("bug: Trakt popular lists were all typed movie, with display-name URLs"
   });
 });
 
+// The public index is a derived cache maintained by a read-modify-write on a
+// single key, so a burst of updates loses some of them. Nothing used to repair
+// that: a rebuild only ever ran when the index was MISSING, never when it was
+// merely wrong. A live bulk delete left 76 entries advertising item counts for
+// records that no longer existed, and they stayed there indefinitely.
+describe("bug: a stale public index never repaired itself", () => {
+  function seedWithPhantoms(phantomCount) {
+    const kv = makeKv();
+    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
+    const entries = [];
+    const order = [];
+    for (const [slug, n] of [["hgtv", 79], ["travel", 47]]) {
+      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
+        name: slug, slug, type: "series", visibility: "public",
+        items: Array.from({ length: n }, (_, i) => ({ id: "tt" + i })), likes: 0, updatedAt: 1,
+      }));
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "series", itemCount: n, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    // Entries whose record is gone: the directory shows a count, opening 404s.
+    for (let i = 0; i < phantomCount; i++) {
+      const slug = `ghost-${i}`;
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
+    return { kv, entries };
+  }
+
+  async function runCron(env, kv, maxTicks = 40) {
+    for (let t = 1; t <= maxTicks; t++) {
+      kv._store.delete("lock:publiclistindex");
+      const pending = [];
+      await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+      await Promise.all(pending);
+      if (!kv._store.has("index:publiclists:build")) return t;
+    }
+    return -1;
+  }
+
+  it("re-derives a stale index and drops entries whose record is gone", async () => {
+    const { kv, entries } = seedWithPhantoms(76);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
+    const env = makeEnv({ CONFIGS: kv });
+
+    const before = await call(env, "/lists/public.json?limit=500");
+    assert.equal(before.body.total, 78, "expected the phantom entries to start out visible");
+
+    assert.notEqual(await runCron(env, kv), -1, "the refresh never completed");
+
+    const after = await call(env, "/lists/public.json?limit=500");
+    assert.equal(after.body.total, 2, "phantom entries survived the refresh");
+    assert.deepEqual((after.body.lists || []).map((l) => l.slug).sort(), ["hgtv", "travel"]);
+    // The real lists must come through intact, not merely survive.
+    assert.equal(after.body.lists.find((l) => l.slug === "hgtv").itemCount, 79);
+  });
+
+  it("leaves a fresh index alone", async () => {
+    // Re-deriving on every tick would be a full scan of every list, forever.
+    const { kv, entries } = seedWithPhantoms(3);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+    const env = makeEnv({ CONFIGS: kv });
+    const snapshot = kv._store.get("index:publiclists");
+
+    const pending = [];
+    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+    await Promise.all(pending);
+
+    assert.equal(kv._store.get("index:publiclists"), snapshot, "a fresh index was rebuilt needlessly");
+  });
+
+  it("keeps serving the old index while a multi-chunk refresh is in flight", async () => {
+    // A partial scan must never be published as though it were the whole
+    // directory, or the listing would shrink and grow while it runs.
+    const { kv, entries } = seedWithPhantoms(400);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
+    const env = makeEnv({ CONFIGS: kv });
+
+    kv._store.delete("lock:publiclistindex");
+    const pending = [];
+    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+    await Promise.all(pending);
+
+    if (kv._store.has("index:publiclists:build")) {
+      const mid = await call(env, "/lists/public.json?limit=500");
+      assert.equal(mid.body.total, 402, "the directory changed mid-refresh");
+    }
+    assert.notEqual(await runCron(env, kv), -1);
+    const after = await call(env, "/lists/public.json?limit=500");
+    assert.equal(after.body.total, 2);
+  });
+});
+
+describe("admin: deleting a creator's lists", () => {
+  async function setup(phantoms = 2) {
+    const kv = makeKv();
+    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
+    const entries = [];
+    const order = [];
+    for (const slug of ["keepme", "deleteme"]) {
+      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
+        name: slug, slug, type: "series", visibility: "public",
+        items: [{ id: "tt1" }], likes: 2, updatedAt: 1,
+      }));
+      kv._store.set(`listlikevoters:someone:${slug}`, JSON.stringify(["a:one", "a:two"]));
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "series", itemCount: 1, likes: 2, updatedAt: 1 });
+      order.push(slug);
+    }
+    for (let i = 0; i < phantoms; i++) {
+      const slug = `ghost-${i}`;
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+    const env = makeEnv({ CONFIGS: kv });
+    return { kv, env, cookie: await adminCookie(env) };
+  }
+
+  it("requires admin auth", async () => {
+    const { env } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.status, 401);
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "the list was deleted anyway");
+  });
+
+  it("removes the list, its likes, its order entry and its directory entry", async () => {
+    const { kv, env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, ["deleteme"]);
+
+    assert.equal(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "record left behind");
+    // A stranded ledger means whoever next takes that slug inherits its likes.
+    assert.equal(await env.CONFIGS.get("listlikevoters:someone:deleteme"), null, "like ledger left behind");
+    assert.equal(JSON.parse(kv._store.get("creatorlistorder:someone")).order.includes("deleteme"), false);
+
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => l.slug === "deleteme"), false, "still in the directory");
+    // ...and the untouched list is untouched.
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:keepme"), null);
+    assert.notEqual(await env.CONFIGS.get("listlikevoters:someone:keepme"), null);
+  });
+
+  it("clears a phantom entry whose record is already gone", async () => {
+    // The whole reason an admin reaches for this: an entry that advertises an
+    // item count and then opens empty. It is reported as missing, not failed.
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["ghost-0", "ghost-1"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, []);
+    assert.deepEqual(r.body.missing.sort(), ["ghost-0", "ghost-1"]);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => String(l.slug).startsWith("ghost-")), false);
+  });
+
+  it("bounds how many lists one call may delete", async () => {
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie,
+      json: { username: "someone", slugs: Array.from({ length: 60 }, (_, i) => "x" + i) },
+    });
+    assert.equal(r.status, 413);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("rejects a bad username or an empty slug list", async () => {
+    const { env, cookie } = await setup();
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "", slugs: ["x"] } })).status, 400);
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: [] } })).status, 400);
+  });
+
+  it("the creator's own delete route cleans up the same way", async () => {
+    // Both go through deleteCreatorLists so an admin deletion and an owner
+    // deletion cannot clean up differently -- the like ledger in particular
+    // used to survive the owner's own delete.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedel2");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+              name: "Temp", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const slug = saved.body.slug;
+    await env.CONFIGS.put(`listlikevoters:${alice.creatorName}:${slug}`, JSON.stringify(["a:one"]));
+
+    const del = await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug },
+    });
+    assert.equal(del.body.ok, true);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:${slug}`), null);
+    assert.equal(await env.CONFIGS.get(`listlikevoters:${alice.creatorName}:${slug}`), null,
+      "the owner's own delete still leaves the like ledger behind");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();

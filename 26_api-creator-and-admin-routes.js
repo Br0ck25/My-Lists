@@ -1695,29 +1695,11 @@
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      if (env.DB) {
-        try {
-          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
-        } catch (dbErr) {
-          console.error("D1 write error (creatorlist delete):", dbErr);
-        }
-      }
-
-      // Unconditional, for the same reason as the key rotation above: a
-      // DELETE matching zero D1 rows still "succeeds", and skipping the KV
-      // delete on that basis left the list live in KV -- a delete that
-      // reported ok:true and deleted nothing.
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
-      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
-      let order = [];
-      try {
-        order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
-      } catch {
-        order = [];
-      }
-      order = order.filter((s) => s !== slug);
-      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
+      // Shared with /admin/api/delete-creator-list so the two cannot drift --
+      // the same lesson purgeCreatorData records about itself. It also drops
+      // the like ledger, which this route used to leave behind for whoever
+      // next created a list at the same slug to inherit.
+      await deleteCreatorLists(env, auth.username, [slug]);
       return json({ ok: true });
     }
 
@@ -3640,6 +3622,71 @@
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
+    //   -> { ok, deleted: [...], missing: [...], remaining }
+    // Admin-only removal of one creator's lists, for cleaning up content the
+    // owner cannot or will not remove themselves -- and, in particular, for
+    // clearing PHANTOM directory entries: a list whose index entry survived
+    // but whose record is gone advertises an item count and then 404s when
+    // opened, and until now there was no way to get rid of one at all. Slugs
+    // whose record has already vanished still come out of the index, and are
+    // reported back under `missing` rather than treated as an error.
+    //
+    // Deliberately per-list rather than per-creator: "delete this account's
+    // lists" is what /api/creator/delete-account already does, with the
+    // account's own key. This is a scalpel, and it is irreversible -- there is
+    // no undo and no backup of a deleted list.
+    //
+    // Goes through the same deleteCreatorLists the creator's own delete route
+    // uses, so an admin deletion cannot clean up differently (or less
+    // thoroughly) than the owner's does.
+    if (path === "/admin/api/delete-creator-list" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+
+      // Accepts one slug or many; both shapes end up as a bounded list.
+      const rawSlugs = Array.isArray(body.slugs)
+        ? body.slugs
+        : (body.slug ? [body.slug] : []);
+      const slugs = [...new Set(
+        rawSlugs.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean)
+      )];
+      if (!slugs.length) return json({ ok: false, error: "No slugs given." }, 400);
+      if (slugs.length > ADMIN_LIST_DELETE_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (limit ${ADMIN_LIST_DELETE_MAX}). Send them in batches.`,
+        }, 413);
+      }
+
+      const result = await deleteCreatorLists(env, v.normalized, slugs);
+      // How many that creator has left, so the caller can tell when a
+      // multi-batch cleanup is finished without guessing.
+      let remaining = null;
+      try {
+        const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
+        remaining = listed.keys.length;
+      } catch (e) {
+        remaining = null;
+      }
+      return json({
+        ok: true,
+        username: v.normalized,
+        deleted: result.deleted,
+        missing: result.missing,
+        remaining,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
@@ -4375,7 +4422,14 @@ export default {
         // rebuilt nothing at all once there were more than ~500 lists.
         // /admin/api/rebuild-public-index drives the same chunks back to
         // back for an immediate seed right after a fresh deploy.
-        getPublicListIndex(env, ctx),
+        //
+        // This also re-derives the index once a day even when one already
+        // exists. The index is maintained incrementally by a read-modify-write
+        // on a single key, so rapid updates lose each other -- and nothing
+        // used to repair that, because a rebuild only ever ran when the index
+        // was MISSING, never when it was merely wrong. See
+        // refreshPublicListIndexIfStale.
+        refreshPublicListIndexIfStale(env, ctx),
       ])
     );
   },
