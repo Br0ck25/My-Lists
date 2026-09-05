@@ -472,11 +472,23 @@
       const configParam = url.searchParams.get("config") || url.searchParams.get("token") || "";
       const queryCreator = url.searchParams.get("creator") || url.searchParams.get("user") || "";
       const queryKey = url.searchParams.get("key") || "";
+      // The preferred credential for this endpoint: a revocable token that
+      // authorises recording playback for one account and nothing else. A
+      // webhook URL necessarily carries its credential in the query string
+      // (Plex/Jellyfin/Emby accept a URL and nothing else), where it lands in
+      // the media server's config and logs -- so what it carries should not
+      // be the Creator Key. See getOrCreateScrobbleToken.
+      const scrobbleToken = url.searchParams.get("st") || "";
 
       let authUser = null;
       let effectiveTmdbKey = TMDB_API_KEY;
 
-      if (configParam) {
+      if (scrobbleToken) {
+        const tokenUser = await usernameForScrobbleToken(env, scrobbleToken);
+        if (tokenUser) authUser = tokenUser;
+      }
+
+      if (!authUser && configParam) {
         try {
           const resolved = await resolveConfig(configParam, env);
           if (resolved && resolved.trackCreatorName && resolved.trackCreatorKey) {
@@ -497,6 +509,11 @@
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      // creator+key still works: webhook URLs handed out before scrobble
+      // tokens existed are sitting in people's media servers, and breaking
+      // them would silently stop their history syncing with no error anyone
+      // would see. The dashboard only ever shows the token form now, so
+      // these age out as people re-copy the URL.
       await ensureTrackingMigrated(env, authUser);
 
       if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
@@ -1360,6 +1377,33 @@
         JSON.stringify({ ...profile, keyHash })
       );
       return json({ ok: true, creatorKey });
+    }
+
+    // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
+    //   -> { ok, token }
+    // Returns this account's media-server scrobble token, minting one on
+    // first use. `rotate: true` issues a fresh one and revokes the previous,
+    // which is what "regenerate" in the dashboard does when a webhook URL
+    // has been shared or logged somewhere it should not have been.
+    //
+    // Authenticated with the Creator Key, like every other account
+    // operation -- the token is what the WEBHOOK carries, not what this
+    // endpoint accepts.
+    if (path === "/api/creator/scrobble-token" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) {
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
+      const token = await getOrCreateScrobbleToken(env, auth.username, body.rotate === true);
+      if (!token) return json({ ok: false, error: "Could not issue a webhook token." }, 500);
+      return json({ ok: true, token }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }

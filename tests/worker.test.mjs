@@ -764,6 +764,108 @@ describe("audit fix: slug allocation never lands on a taken slug", () => {
   });
 });
 
+// A media-server webhook URL has to carry its credential in the query string
+// -- Plex, Jellyfin and Emby accept a URL and nothing else -- so it ends up in
+// their configuration and their logs. It used to carry the Creator Key: the
+// credential for the whole account, with no expiry, whose only remedy on
+// exposure was a rotation that signs the owner out everywhere.
+describe("audit fix: the scrobble webhook carries a revocable token, not the Creator Key", () => {
+  const scrobblePayload = { event: "media.scrobble", Metadata: { type: "movie", title: "X", year: 2000 } };
+  const scrobble = (env, qs) => call(env, "/api/scrobble?" + qs, { method: "POST", ip: nextIp(), json: scrobblePayload });
+  const mint = async (env, auth, rotate) => (await call(env, "/api/creator/scrobble-token", {
+    method: "POST", ip: nextIp(), json: { ...auth, rotate },
+  })).body;
+
+  it("issues one stable token per account, and only to the key holder", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetok");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+
+    const first = await mint(env, auth, false);
+    assert.equal(first.ok, true, first.error);
+    assert.ok(first.token && first.token.length >= 16, "token is too short to be a credential");
+    // Re-asking must not mint a second one, or every dashboard load would
+    // orphan a live credential.
+    const again = await mint(env, auth, false);
+    assert.equal(again.token, first.token);
+
+    const wrongKey = await call(env, "/api/creator/scrobble-token", {
+      method: "POST", json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+    });
+    assert.equal(wrongKey.status, 401);
+  });
+
+  it("accepts the token on the webhook, and rejects a junk or missing one", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokuse");
+    const { token } = await mint(env, { creatorName: alice.creatorName, creatorKey: alice.creatorKey }, false);
+
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+    assert.equal((await scrobble(env, "st=deadbeefdeadbeef")).status, 401);
+    assert.equal((await scrobble(env, "")).status, 401);
+  });
+
+  it("regenerating revokes the previous webhook URL", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokrot");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const before = (await mint(env, auth, false)).token;
+    const after = (await mint(env, auth, true)).token;
+
+    assert.notEqual(after, before, "rotate returned the same token");
+    assert.equal((await scrobble(env, "st=" + before)).status, 401, "the old webhook URL still works");
+    assert.equal((await scrobble(env, "st=" + after)).status, 200);
+  });
+
+  it("keeps pre-existing creator+key webhook URLs working", async () => {
+    // Those URLs are sitting in people's media servers. Breaking them would
+    // silently stop their history syncing with no error anyone would see.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetoklegacy");
+    const legacy = `creator=${encodeURIComponent(alice.creatorName)}&key=${encodeURIComponent(alice.creatorKey)}`;
+    assert.equal((await scrobble(env, legacy)).status, 200);
+  });
+
+  it("revokes the token when the account is deleted", async () => {
+    // The token is keyed BY TOKEN, so it cannot be reached from a username
+    // prefix sweep -- miss it and a deleted account leaves behind a live
+    // credential that still authorises writes for it.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokdel");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const { token } = await mint(env, auth, false);
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...auth, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true, del.body.error);
+
+    assert.equal(await env.CONFIGS.get(`scrobbletoken:${token}`), null, "the token key outlived the account");
+    assert.equal(await env.CONFIGS.get(`creatorscrobbletoken:${alice.creatorName}`), null, "the reverse index outlived the account");
+    assert.equal((await scrobble(env, "st=" + token)).status, 401, "a deleted account's webhook still authorises writes");
+  });
+
+  it("no longer builds a webhook URL out of the Creator Key", async () => {
+    // The panel's markup is assembled client-side, and the client bundle is
+    // served from /app.js rather than inlined into the shell at "/" -- so
+    // this checks the shipped bundle. The URL builder must take a token, and
+    // the old key-bearing construction must be gone entirely.
+    const env = makeEnv();
+    const bundle = await call(env, "/app.js");
+    assert.equal(bundle.status, 200);
+    assert.match(bundle.text, /\/api\/scrobble\?st=/, "the webhook URL builder should use the token parameter");
+    assert.ok(
+      !/scrobble\?creator=['"]\s*\+\s*encodeURIComponent/.test(bundle.text),
+      "the client still builds a webhook URL containing creator+key"
+    );
+    assert.ok(
+      !/buildScrobbleWebhookUrl\(\s*activeCreator\.creatorName/.test(bundle.text),
+      "buildScrobbleWebhookUrl is still being called with a creator name and key"
+    );
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();

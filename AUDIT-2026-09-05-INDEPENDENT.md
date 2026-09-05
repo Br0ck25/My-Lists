@@ -507,9 +507,32 @@ credential; a URL is the worst place for one (Cloudflare request logs, browser h
 headers, media-server config files and their logs). There is no scoped or independently revocable
 token, so a leaked webhook URL means rotating the key and re-pairing every device.
 
-**Fix.** Mint a per-integration scrobble token (`creatorscrobbletoken:{token}` → username), revocable
-from the dashboard without rotating the Creator Key. Keep accepting the current form for
-compatibility, and prefer a header when one is present.
+**Fix (applied).** A scrobble token now authorises exactly one thing — recording playback for one
+account — and the webhook URL is `/api/scrobble?st=<token>`. One token per account, stored both ways
+(`scrobbletoken:{token}` → username for the hot path, `creatorscrobbletoken:{username}` → token for
+revocation), minted on first use and returned by `POST /api/creator/scrobble-token`, which is itself
+authenticated with the Creator Key. The dashboard gained a **Regenerate** button that issues a fresh
+token and revokes the old URL without touching the key or signing anyone out.
+
+`creator` + `key` still works: those URLs are sitting inside people's media servers, and breaking them
+would silently stop history syncing with no error anyone would see. The dashboard only ever shows the
+token form now, so they age out as people re-copy.
+
+One thing the design had to get right: the token is keyed **by token**, so a username-prefix sweep
+cannot reach it. Miss that and a deleted account leaves behind a live credential that still
+authorises writes for it — the exact failure `purgeCreatorData` exists to prevent. It is resolved
+through the reverse index and revoked before that index is deleted, with a test asserting a deleted
+account's webhook returns 401.
+
+| | Before | After |
+|---|---|---|
+| What the webhook URL carries | the Creator Key | a scoped token |
+| Exposure remedy | rotate the key, re-sign-in everywhere | regenerate, nothing else affected |
+| Old URL after regenerate | n/a | 401 |
+| Webhook after account deletion | key still valid until rotated | 401, token revoked |
+| Pre-existing creator+key URLs | worked | still work |
+
+Six regression tests; the five asserting the change confirmed failing against the pre-fix code.
 
 ---
 
@@ -903,7 +926,7 @@ byte-exact concatenation, CI-gated against drift.
 
 ### `26_api-creator-and-admin-routes.js`
 - ✅ `/api/creator/reset-key:1168` — **DONE.** Per-account failure budget (D1-atomic when bound) plus an entropy floor at `:1111`. **(2)**
-- 🟡 `handleMediaServerScrobble:473` — introduce a scoped, revocable scrobble token. **(8)**
+- ✅ `handleMediaServerScrobble:473` — **DONE.** Scoped, revocable scrobble token; creator+key kept for compatibility. **(8)**
 - 🔵 `scheduled:4128` — assign the API-key globals as `handleFetch` does. **(13)**
 - 🔵 `:1144` — `stats:creator_count` loses increments on the KV path. **(14)**
 
@@ -937,7 +960,7 @@ byte-exact concatenation, CI-gated against drift.
 ~~5. Rate-limit bypass (5)~~ — **DONE** · ~~6. SRI on the CDN script (6)~~ — **DONE**
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
-~~7. D1-backed limiters (7)~~ — **DONE** · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
+~~7. D1-backed limiters (7)~~ — **DONE** · ~~8. Scoped scrobble token (8)~~ — **DONE** · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
 ~~10. `channel-logo` caching + size cap~~ — **DONE** · ~~11. TTL/sweep for anonymous records~~ — **won't do (see M4 correction)** · **15. Slug overwrite — DONE**
 
 **🔵 PHASE 4 — OPTIONAL**

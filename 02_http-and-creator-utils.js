@@ -1405,6 +1405,73 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
   return { count: finalVoters.length, capped: false };
 }
 
+// --- Scrobble tokens ---------------------------------------------------------
+//
+// A media-server webhook URL has to carry its credential in the query
+// string: Plex, Jellyfin and Emby let you paste a URL and nothing else. That
+// URL then lives in the media server's configuration, in its logs, and in
+// any request log along the way.
+//
+// It used to carry the Creator Key itself, which is the credential for the
+// whole account and has no expiry. Anyone who read that URL out of a log had
+// full access, and the only remedy was rotating the key -- which breaks
+// every other device the owner had signed in on.
+//
+// A scrobble token is a separate, revocable credential that authorises
+// exactly one thing: recording playback for one account. Regenerating it
+// invalidates the old webhook URL and touches nothing else. One per account,
+// stored both ways so it can be looked up by token on the hot path and
+// found by username for revocation and account deletion.
+function scrobbleTokenKey(token) {
+  return `scrobbletoken:${token}`;
+}
+function creatorScrobbleTokenKey(username) {
+  return `creatorscrobbletoken:${username}`;
+}
+
+// Returns the account's current token, minting one if it has none.
+// `rotate` forces a fresh token and revokes the previous one.
+async function getOrCreateScrobbleToken(env, username, rotate = false) {
+  if (!env || !env.CONFIGS) return "";
+  let existing = "";
+  try {
+    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+  } catch {
+    existing = "";
+  }
+  if (existing && !rotate) return existing;
+
+  // Same CSPRNG helper the OAuth state cookies use.
+  const token = generateShortId() + generateShortId();
+  await env.CONFIGS.put(scrobbleTokenKey(token), username);
+  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+  if (existing) {
+    // Revoke the old one, so a leaked webhook URL actually stops working.
+    try {
+      await env.CONFIGS.delete(scrobbleTokenKey(existing));
+    } catch {
+      // A stranded token is the one failure worth shouting about here, but
+      // it cannot be helped from inside this request; the reverse index no
+      // longer points at it either way.
+      console.error("scrobble token rotation: could not revoke the previous token");
+    }
+  }
+  return token;
+}
+
+// Resolves a presented token to the account it belongs to, or "" .
+async function usernameForScrobbleToken(env, token) {
+  if (!env || !env.CONFIGS) return "";
+  const t = String(token || "").trim();
+  // Shape check before touching KV, so a junk value cannot mint reads.
+  if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  try {
+    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+  } catch {
+    return "";
+  }
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -2020,6 +2087,20 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   }
 
+  // The scrobble token is keyed by the token, not the username, so it has to
+  // be resolved through the reverse index before that index is deleted --
+  // otherwise a deleted or reset account leaves a live webhook credential
+  // behind that still authorises writes for it.
+  try {
+    const staleToken = await env.CONFIGS.get(creatorScrobbleTokenKey(u));
+    if (staleToken) {
+      await env.CONFIGS.delete(scrobbleTokenKey(staleToken));
+      keysCleared++;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: could not revoke the scrobble token", e);
+  }
+
   // Everything else the account owns, under the key names actually in use
   // today, plus the legacy ones (harmless if absent) so an old account
   // still gets fully cleaned.
@@ -2040,6 +2121,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // which was simply wrong about it.
     `creatortrack:${u}`,
     `scrobbleseenusers:${u}`,
+    // The reverse index only. The token key itself is keyed BY TOKEN, so it
+    // cannot be reached from a username prefix -- it is deleted explicitly
+    // just above this list.
+    creatorScrobbleTokenKey(u),
     // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,

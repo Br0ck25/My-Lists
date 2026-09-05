@@ -3041,6 +3041,73 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
   return { count: finalVoters.length, capped: false };
 }
 
+// --- Scrobble tokens ---------------------------------------------------------
+//
+// A media-server webhook URL has to carry its credential in the query
+// string: Plex, Jellyfin and Emby let you paste a URL and nothing else. That
+// URL then lives in the media server's configuration, in its logs, and in
+// any request log along the way.
+//
+// It used to carry the Creator Key itself, which is the credential for the
+// whole account and has no expiry. Anyone who read that URL out of a log had
+// full access, and the only remedy was rotating the key -- which breaks
+// every other device the owner had signed in on.
+//
+// A scrobble token is a separate, revocable credential that authorises
+// exactly one thing: recording playback for one account. Regenerating it
+// invalidates the old webhook URL and touches nothing else. One per account,
+// stored both ways so it can be looked up by token on the hot path and
+// found by username for revocation and account deletion.
+function scrobbleTokenKey(token) {
+  return `scrobbletoken:${token}`;
+}
+function creatorScrobbleTokenKey(username) {
+  return `creatorscrobbletoken:${username}`;
+}
+
+// Returns the account's current token, minting one if it has none.
+// `rotate` forces a fresh token and revokes the previous one.
+async function getOrCreateScrobbleToken(env, username, rotate = false) {
+  if (!env || !env.CONFIGS) return "";
+  let existing = "";
+  try {
+    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+  } catch {
+    existing = "";
+  }
+  if (existing && !rotate) return existing;
+
+  // Same CSPRNG helper the OAuth state cookies use.
+  const token = generateShortId() + generateShortId();
+  await env.CONFIGS.put(scrobbleTokenKey(token), username);
+  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+  if (existing) {
+    // Revoke the old one, so a leaked webhook URL actually stops working.
+    try {
+      await env.CONFIGS.delete(scrobbleTokenKey(existing));
+    } catch {
+      // A stranded token is the one failure worth shouting about here, but
+      // it cannot be helped from inside this request; the reverse index no
+      // longer points at it either way.
+      console.error("scrobble token rotation: could not revoke the previous token");
+    }
+  }
+  return token;
+}
+
+// Resolves a presented token to the account it belongs to, or "" .
+async function usernameForScrobbleToken(env, token) {
+  if (!env || !env.CONFIGS) return "";
+  const t = String(token || "").trim();
+  // Shape check before touching KV, so a junk value cannot mint reads.
+  if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  try {
+    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+  } catch {
+    return "";
+  }
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -3656,6 +3723,20 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   }
 
+  // The scrobble token is keyed by the token, not the username, so it has to
+  // be resolved through the reverse index before that index is deleted --
+  // otherwise a deleted or reset account leaves a live webhook credential
+  // behind that still authorises writes for it.
+  try {
+    const staleToken = await env.CONFIGS.get(creatorScrobbleTokenKey(u));
+    if (staleToken) {
+      await env.CONFIGS.delete(scrobbleTokenKey(staleToken));
+      keysCleared++;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: could not revoke the scrobble token", e);
+  }
+
   // Everything else the account owns, under the key names actually in use
   // today, plus the legacy ones (harmless if absent) so an old account
   // still gets fully cleaned.
@@ -3676,6 +3757,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // which was simply wrong about it.
     `creatortrack:${u}`,
     `scrobbleseenusers:${u}`,
+    // The reverse index only. The token key itself is keyed BY TOKEN, so it
+    // cannot be reached from a username prefix -- it is deleted explicitly
+    // just above this list.
+    creatorScrobbleTokenKey(u),
     // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,
@@ -37006,8 +37091,6 @@ function renderTrackPlaybackSection() {
   }
   let enabled = false;
   try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  const webhookUrl = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
 
   let filterUsers = false;
   let allowedUsers = '';
@@ -37032,8 +37115,9 @@ function renderTrackPlaybackSection() {
       '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
       '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
       '<div class="webhook-input-group">' +
-        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="Loading\u2026" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
         '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
+        '<button type="button" class="secondary lc-btn" onclick="regenerateScrobbleWebhookUrl()" title="Issues a new webhook URL and stops the old one working. Use this if the URL has been shared or logged somewhere it should not have been." style="padding:8px 14px; font-size:0.84rem;">Regenerate</button>' +
       '</div>' +
 
       '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
@@ -37091,10 +37175,64 @@ function renderTrackPlaybackSection() {
 
   refreshTrackPlaybackStatus();
   loadScrobbleSeenUsers();
+  // Fills the webhook field in after the section is on screen. Deliberately
+  // not awaited: the URL now needs a round trip (it carries a scrobble token
+  // rather than the Creator Key), and the rest of the panel should not wait
+  // on it.
+  refreshScrobbleWebhookUrl(false);
 }
 
-function buildScrobbleWebhookUrl(creatorName, creatorKey) {
-  return ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(creatorName) + '&key=' + encodeURIComponent(creatorKey);
+// The webhook URL ends up pasted into Plex/Jellyfin/Emby, stored in their
+// configuration and written to their logs, so what it carries matters. It
+// used to carry the Creator Key -- the credential for the whole account,
+// with no expiry -- which meant anyone who read that URL out of a log had
+// everything, and the only remedy was rotating the key and re-signing in on
+// every device. It now carries a scrobble token: revocable on its own,
+// good for nothing but recording playback for this account.
+function buildScrobbleWebhookUrl(scrobbleToken) {
+  return ORIGIN + '/api/scrobble?st=' + encodeURIComponent(scrobbleToken || '');
+}
+
+// Fetches (and on first use mints) this account's scrobble token.
+// rotate === true issues a fresh one and revokes the old webhook URL.
+async function fetchScrobbleToken(rotate) {
+  if (!activeCreator || !activeCreator.creatorName) return '';
+  let creatorKey = '';
+  try { creatorKey = localStorage.getItem('myListAddon:creatorKey') || ''; } catch (e) {}
+  if (!creatorKey) return '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, rotate: rotate === true }),
+    });
+    const data = await res.json().catch(() => null);
+    return (data && data.ok && data.token) ? data.token : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Fills the webhook field in. Kept out of the initial render so a dashboard
+// load does not block on it, and so a failure leaves a readable message in
+// the field rather than a half-built URL.
+async function refreshScrobbleWebhookUrl(rotate) {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input) return;
+  input.value = rotate ? 'Generating a new URL\u2026' : 'Loading\u2026';
+  const token = await fetchScrobbleToken(rotate);
+  const current = document.getElementById('scrobbleWebhookInput');
+  if (!current) return;
+  current.value = token
+    ? buildScrobbleWebhookUrl(token)
+    : 'Could not load your webhook URL \u2014 reload the page and try again.';
+  if (rotate && token && typeof showAddedToast === 'function') {
+    showAddedToast('New webhook URL generated \u2014 the old one no longer works \u2713');
+  }
+}
+
+async function regenerateScrobbleWebhookUrl() {
+  await refreshScrobbleWebhookUrl(true);
 }
 
 function onScrobbleFilterUsersToggle(cb) {
@@ -37128,12 +37266,7 @@ function onScrobbleBlockAnonChange(cb) {
   if (typeof pushTrackingSync === 'function') pushTrackingSync();
 }
 
-function _refreshScrobbleWebhookInput() {
-  const input = document.getElementById('scrobbleWebhookInput');
-  if (!input || !activeCreator) return;
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  input.value = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
-}
+
 
 function syncScrobbleUserCheckboxes() {
   const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
@@ -53526,11 +53659,23 @@ self.addEventListener('fetch', e => {
       const configParam = url.searchParams.get("config") || url.searchParams.get("token") || "";
       const queryCreator = url.searchParams.get("creator") || url.searchParams.get("user") || "";
       const queryKey = url.searchParams.get("key") || "";
+      // The preferred credential for this endpoint: a revocable token that
+      // authorises recording playback for one account and nothing else. A
+      // webhook URL necessarily carries its credential in the query string
+      // (Plex/Jellyfin/Emby accept a URL and nothing else), where it lands in
+      // the media server's config and logs -- so what it carries should not
+      // be the Creator Key. See getOrCreateScrobbleToken.
+      const scrobbleToken = url.searchParams.get("st") || "";
 
       let authUser = null;
       let effectiveTmdbKey = TMDB_API_KEY;
 
-      if (configParam) {
+      if (scrobbleToken) {
+        const tokenUser = await usernameForScrobbleToken(env, scrobbleToken);
+        if (tokenUser) authUser = tokenUser;
+      }
+
+      if (!authUser && configParam) {
         try {
           const resolved = await resolveConfig(configParam, env);
           if (resolved && resolved.trackCreatorName && resolved.trackCreatorKey) {
@@ -53551,6 +53696,11 @@ self.addEventListener('fetch', e => {
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      // creator+key still works: webhook URLs handed out before scrobble
+      // tokens existed are sitting in people's media servers, and breaking
+      // them would silently stop their history syncing with no error anyone
+      // would see. The dashboard only ever shows the token form now, so
+      // these age out as people re-copy the URL.
       await ensureTrackingMigrated(env, authUser);
 
       if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
@@ -54414,6 +54564,33 @@ self.addEventListener('fetch', e => {
         JSON.stringify({ ...profile, keyHash })
       );
       return json({ ok: true, creatorKey });
+    }
+
+    // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
+    //   -> { ok, token }
+    // Returns this account's media-server scrobble token, minting one on
+    // first use. `rotate: true` issues a fresh one and revokes the previous,
+    // which is what "regenerate" in the dashboard does when a webhook URL
+    // has been shared or logged somewhere it should not have been.
+    //
+    // Authenticated with the Creator Key, like every other account
+    // operation -- the token is what the WEBHOOK carries, not what this
+    // endpoint accepts.
+    if (path === "/api/creator/scrobble-token" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) {
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
+      const token = await getOrCreateScrobbleToken(env, auth.username, body.rotate === true);
+      if (!token) return json({ ok: false, error: "Could not issue a webhook token." }, 500);
+      return json({ ok: true, token }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
