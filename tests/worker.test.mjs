@@ -1825,3 +1825,85 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     assert.equal(limited, 0);
   });
 });
+
+describe("audit fix 10: admin Community Lists ranks by likes, not by key order", () => {
+  async function seed(env, count) {
+    const alice = await createUser(env, "rankuser");
+    for (let i = 0; i < count; i++) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "List " + String(i).padStart(3, "0"), type: "movie",
+        visibility: "public", items: [{ id: "tt1" }],
+      }});
+    }
+    // The genuinely most-liked list sorts LAST alphabetically.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "ZZZ Most Liked", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 5; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "rankuser", slug: "zzz-most-liked", action: "like" } });
+    }
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    return (login.headers.get("set-cookie") || "").split(";")[0];
+  }
+
+  it("shows lists at all (the record has no creatorName field to filter on)", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 2);
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    // /api/creator/lists/save writes { name, slug, type, items, visibility,
+    // likes, createdAt, updatedAt } -- no creatorName; the creator is in the
+    // KEY. The old code required data.creatorName and so dropped every
+    // single list, leaving this panel permanently empty without D1.
+    assert.ok((r.body.communityLists || []).length > 0, "the panel must not be empty");
+    assert.ok(r.body.communityLists.every((l) => l.creator), "every row needs a creator");
+  });
+
+  it("ranks the genuinely most-liked list first, past the 100-row cap", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    // First load warms the index (rebuilt in the background), same as
+    // /api/search-published-lists.
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const lists = r.body.communityLists || [];
+    assert.equal(lists[0].name, "ZZZ Most Liked", "top row must be the most-liked list");
+    assert.equal(lists[0].likes, 5);
+  });
+
+  it("reads the panel from one KV get instead of one per candidate", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    let gets = 0;
+    const og = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    assert.ok(gets < 20, `expected a handful of KV reads, got ${gets}`);
+  });
+});
+
+describe("audit fix 14: every env var the code requires is documented", () => {
+  it("names MDBLIST_CLIENT_SECRET in both README.md and wrangler.toml", () => {
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    assert.match(readme, /MDBLIST_CLIENT_SECRET/);
+    assert.match(wrangler, /MDBLIST_CLIENT_SECRET/);
+  });
+
+  it("documents every env var the Worker actually reads", () => {
+    // Guards the whole class: an operator following the setup docs exactly
+    // should never hit a feature that reports itself "not configured".
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    const docs = readme + "\n" + wrangler;
+    const used = new Set();
+    for (const f of fs.readdirSync(REPO_ROOT).filter((n) => /^\d\d_.*\.js$/.test(n))) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      for (const m of src.matchAll(/\benv\.([A-Z][A-Z0-9_]+)/g)) used.add(m[1]);
+    }
+    const undocumented = [...used].filter((name) => !docs.includes(name)).sort();
+    assert.deepEqual(undocumented, [], `undocumented env vars: ${undocumented.join(", ")}`);
+  });
+});

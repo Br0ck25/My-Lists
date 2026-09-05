@@ -3700,7 +3700,7 @@
         return json({ ok: true, searches }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "catalogs_lists") {
-        const data = await computeCatalogAndCommunityLeaderboards(env);
+        const data = await computeCatalogAndCommunityLeaderboards(env, ctx);
         return json({ ok: true, ...data }, 200, { "Cache-Control": "no-store" });
       }
       if (section === "audience") {

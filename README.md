@@ -157,7 +157,8 @@ The add-on works out-of-the-box with public MDBList and TMDB links. Adding API k
 | `SIMKL_CLIENT_SECRET` | Simkl OAuth token exchange for private lists and history sync | Same Simkl app as above |
 | `MDBLIST_API_KEY` | Private MDBList lists, Watchlist quick-add fallback, history sync | [mdblist.com/preferences](https://mdblist.com/preferences) |
 | `MDBLIST_POPULAR_KEY` | Dedicated key for MDBList Toplists / Popular Lists browser | Same MDBList preferences as above |
-| `MDBLIST_CLIENT_ID` | MDBList OAuth client ID | [mdblist.com/preferences](https://mdblist.com/preferences) |
+| `MDBLIST_CLIENT_ID` | MDBList OAuth client ID — **`MDBLIST_CLIENT_SECRET` must be set too, or MDBList OAuth fails with "not configured"** | [mdblist.com/preferences](https://mdblist.com/preferences) |
+| `MDBLIST_CLIENT_SECRET` | MDBList OAuth token exchange (required alongside `MDBLIST_CLIENT_ID` for MDBList account login) | Same MDBList preferences as above |
 
 #### OAuth Redirect URIs
 If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set the OAuth callback URLs in their respective developer portals to:

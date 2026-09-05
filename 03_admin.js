@@ -769,7 +769,7 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
 const STAT_KEY_SCAN_CAP = 20000;
 const STAT_TOTALS_READ_CAP = 500;
 
-async function computeCatalogAndCommunityLeaderboards(env) {
+async function computeCatalogAndCommunityLeaderboards(env, ctx) {
   if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
 
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
@@ -850,28 +850,69 @@ async function computeCatalogAndCommunityLeaderboards(env) {
       updatedAt: row.updated_at || row.created_at || 0,
     }));
   } else {
-    // KV-only fallback, bounded: enumerate at most the cap of keys instead
-    // of every list in the system, then one get per bounded candidate.
-    const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
-    communityListsRaw = (await Promise.all(
-      (listResult.keys || []).map(async (k) => {
-        const raw = await env.CONFIGS.get(k.name);
-        if (!raw) return null;
-        let data;
-        try { data = JSON.parse(raw); } catch { return null; }
-        if (!data || !isPublicListVisibility(data.visibility)) return null;
-        if (!data.slug || !data.creatorName) return null;
-        return {
-          slug: data.slug,
-          name: data.name || data.slug,
-          creatorName: data.creatorName,
-          type: data.type || 'mixed',
-          likes: Number(data.likes) || 0,
-          itemCount: Array.isArray(data.items) ? data.items.length : 0,
-          updatedAt: data.updatedAt || data.createdAt || 0,
-        };
-      })
-    )).filter(Boolean);
+    // KV-only: rank from the directory index, which already carries likes,
+    // itemCount and the creator's display name, and is already sorted by
+    // likes (see sortPublicIndexEntries, 02_http-and-creator-utils.js).
+    //
+    // This replaces a bounded prefix scan that was wrong twice over:
+    //
+    //  * It read the alphabetically-first COMMUNITY_CAP keys and then
+    //    sorted THOSE by likes, so with more lists than the cap the panel
+    //    reported a lexicographic sample as "top". You cannot get the top
+    //    100 by likes out of an arbitrary 100.
+    //  * It then dropped every candidate without a `creatorName` field --
+    //    and /api/creator/lists/save has never written one (the record is
+    //    { name, slug, type, items, visibility, likes, createdAt,
+    //    updatedAt }, and the creator is in the KEY). So in practice the
+    //    filter discarded everything and this panel showed nothing at all
+    //    whenever D1 was unbound.
+    //
+    // Reading the index also removes the one-KV-get-per-candidate fan-out
+    // entirely: it is a single get.
+    const indexEntries = await getPublicListIndex(env, ctx);
+    if (indexEntries) {
+      communityListsRaw = indexEntries
+        .filter((e) => e && e.isCreator && (e.itemCount || 0) > 0)
+        .slice(0, COMMUNITY_CAP)
+        .map((e) => ({
+          slug: e.slug,
+          name: e.name || e.slug,
+          creatorName: e.creatorName || e.username,
+          type: e.type || 'mixed',
+          likes: Number(e.likes) || 0,
+          itemCount: Number(e.itemCount) || 0,
+          updatedAt: e.updatedAt || 0,
+        }));
+    } else {
+      // Index absent and a rebuild is already running (or could not start).
+      // Bounded scan for this one request; the creator comes from the key,
+      // which is where it has always actually lived.
+      const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
+      communityListsRaw = (await Promise.all(
+        (listResult.keys || []).map(async (k) => {
+          const raw = await env.CONFIGS.get(k.name);
+          if (!raw) return null;
+          let data;
+          try { data = JSON.parse(raw); } catch { return null; }
+          if (!data || !isPublicListVisibility(data.visibility)) return null;
+          const rest = k.name.slice("creatorlist:".length);
+          const sep = rest.indexOf(":");
+          if (sep === -1) return null;
+          const username = rest.slice(0, sep);
+          const slug = data.slug || rest.slice(sep + 1);
+          if (!username || !slug) return null;
+          return {
+            slug,
+            name: data.name || slug,
+            creatorName: username,
+            type: data.type || 'mixed',
+            likes: Number(data.likes) || 0,
+            itemCount: Array.isArray(data.items) ? data.items.length : 0,
+            updatedAt: data.updatedAt || data.createdAt || 0,
+          };
+        })
+      )).filter(Boolean);
+    }
   }
 
   // No per-list KV reads remain: likes and itemCount already came from the
