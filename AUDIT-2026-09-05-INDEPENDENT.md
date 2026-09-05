@@ -551,6 +551,41 @@ against a 1-write/sec key on every vote whenever the edge cache is stale, which 
 busy list, i.e. exactly when it hurts. Both properties now have a test, each confirmed failing
 against the other implementation.
 
+### 15. Slug allocation could silently overwrite an existing list
+
+**🟠 High · Confirmed by execution · `25_api-catalog-routes.js:5622`, `26_…:1570` · FIXED**
+
+Found while investigating M4, and not present in the original report. Both list-saving endpoints
+allocated a slug by trying `baseSlug`, then `baseSlug-2`, `-3` … up to 500 — and then **used whatever
+the loop exited on**. Past the bound that is a slug which is already taken, and the write went
+straight over the existing record.
+
+Reproduced: with 500 lists already named "Movies", one more anonymous `POST /api/publish-list`
+returned `ok: true` with `listName: "movies-500"` and **replaced that list's contents**, handing back
+its URL as the publisher's own. The original is gone and its shared link now serves someone else's
+content. No authentication at any point, and the precondition is manufacturable at 10 publishes/min.
+
+The same loop spent one KV read per attempt, so a single publish of a heavily-collided name cost
+**501 KV reads** — half of Cloudflare's per-invocation subrequest budget, again unauthenticated.
+
+`/api/creator/lists/save` had the identical fall-through. It checks an in-memory array rather than KV
+so it was never a subrequest problem, and it is scoped to one creator's own namespace so only their
+own list was at risk — but silently replacing it is still wrong.
+
+**Fix.** A shared `pickFreeSlug(baseSlug, isTaken)`: a few numbered attempts (so ordinary URLs stay
+tidy — a second "Movies" is still `movies-2`), then a random suffix, then **failure** rather than a
+collision. An empty return is a 409, never a write.
+
+| | Before | After |
+|---|---|---|
+| 501st publish of a colliding name | overwrites `movies-500` | new `movies-<random>`, existing untouched |
+| KV reads for one publish, 499 collisions | **501** | **13**, constant |
+| Second list of the same name | `movies-2` | `movies-2` (unchanged) |
+
+Four regression tests; the three asserting the fix confirmed failing against the pre-fix code.
+
+---
+
 ### 10. Double-escaped creator name in the admin reply placeholder
 
 **🔵 Low · `03_admin.js:2545`**
@@ -800,6 +835,16 @@ Single namespace, `CONFIGS`. D1 is optional; every accessor tries D1 first and f
 **Two prefixes have no delete path at all:** `publishedlist:user:` and `/api/save` config keys. Both
 are written by unauthenticated endpoints. See M4 / finding 1.
 
+**Correction to M4 — its recommended fix was wrong and is deliberately not implemented.** M4
+proposed adding an `expirationTtl` to these. That would destroy user data: `publishedlist:user:*`
+records back real shareable URLs at `/lists/user/<slug>`, and `/api/save` configs back the install
+URLs sitting inside people's Stremio/wako clients. Expiring either silently breaks shared links and
+installed add-ons. The rate limits (10–20/min/IP) and size caps (2 MB list, 512 KB config) already
+bound the growth, and the genuinely *harmful* consequence — the index rebuild dying — is fixed under
+finding 1. What is left is storage cost, not a correctness problem. A safe cleanup would need a
+last-accessed signal that does not itself cost a write per read, which is a feature rather than an
+audit fix. Investigating it did turn up a real data-loss bug: **finding 15**.
+
 ---
 
 ## Dependency Map
@@ -853,7 +898,8 @@ byte-exact concatenation, CI-gated against drift.
 - ✅ `:4684` — **DONE.** Owned threads require the account key; `senderName` is derived. **(4)**
 - ✅ `:1744` and `:5739` — **DONE.** Always rate-limited; higher ceiling for bring-your-own-key. **(5)**
 - ✅ `/api/channel-logo:972` — **DONE.** Path validated, image capped, response cached.
-- 🟡 `/api/save:5390`, `/api/publish-list:5463` — add `expirationTtl` or a sweep for records nothing references. **(M4)**
+- ⛔ `/api/save:5390`, `/api/publish-list:5463` — **won't do.** A TTL here breaks shared links and installed add-ons; see the M4 correction. **(M4)**
+- ✅ `/api/publish-list:5622` — **DONE.** Slug allocation can no longer land on a taken slug. **(15)**
 
 ### `26_api-creator-and-admin-routes.js`
 - ✅ `/api/creator/reset-key:1168` — **DONE.** Per-account failure budget (D1-atomic when bound) plus an entropy floor at `:1111`. **(2)**
@@ -892,7 +938,7 @@ byte-exact concatenation, CI-gated against drift.
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
 ~~7. D1-backed limiters (7)~~ — **DONE** · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
-~~10. `channel-logo` caching + size cap~~ — **DONE** · 11. TTL/sweep for anonymous records
+~~10. `channel-logo` caching + size cap~~ — **DONE** · ~~11. TTL/sweep for anonymous records~~ — **won't do (see M4 correction)** · **15. Slug overwrite — DONE**
 
 **🔵 PHASE 4 — OPTIONAL**
 12. Delete 241 lines of dead code · 13. Handler-resolution CI check · 14. Cron global assignment ·
