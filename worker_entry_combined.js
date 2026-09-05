@@ -1677,9 +1677,11 @@ function isPublicCorsPath(path) {
 //
 // CSP is deliberately not the strict, script-src-locked-down kind: this
 // app relies on plenty of inline <script> blocks and inline onclick=/
-// onchange= handlers throughout the builder/admin pages (see the
-// verification pipeline's own "onclick/onchange handler resolution check"
-// step), which only work with 'unsafe-inline' on script-src. Tightening
+// onchange= handlers throughout the builder/admin pages, which only work
+// with 'unsafe-inline' on script-src. (That trade is only reasonable if the
+// handlers actually resolve, which html_checks.py now verifies across all
+// 733 of them -- for a long time this comment cited that step before it
+// existed.) Tightening
 // that further would mean a nonce- or hash-based rewrite of every inline
 // handler -- a real project of its own, not a header tweak. What this CSP
 // still buys, even with 'unsafe-inline' allowed: no loading of scripts/

@@ -788,7 +788,11 @@ Documentation is in unusually good shape. Checked and **correct**:
   both `wrangler.toml` and `README.md`. No undocumented variables, no documented-but-unused ones.
 - The cron cadence, the KV binding requirement, and the optional-D1 fallback all match the code.
 
-One inaccuracy: **finding 11** — the CSP comment cites a CI step that does not exist.
+One inaccuracy: **finding 11** — the CSP comment cited a CI step that did not exist. ✅ **Fixed by
+building the step**: `html_checks.py` now resolves every inline handler, and the comment says what is
+actually true. It covers **733 call sites across 183 functions** — including handlers inside
+client-generated markup, which is most of this app's UI — and is verified to catch both a typo'd
+handler and a function deleted while a button still calls it.
 
 ---
 
@@ -941,7 +945,7 @@ byte-exact concatenation, CI-gated against drift.
 - 🔵 Delete the 15 remaining dead functions listed above (241 lines total with `switchAdminTab`).
 
 ### `html_checks.py`
-- 🔵 Add the inline-handler resolution check the CSP comment already promises. It passes today.
+- ✅ **DONE.** Inline-handler resolution check added: 733 call sites, 183 functions, 0 unresolved.
 
 ### Repository root
 - 🔵 Move the 6 historical audit/changelog files (~570 KB) into `docs/history/`.
@@ -964,7 +968,7 @@ byte-exact concatenation, CI-gated against drift.
 ~~10. `channel-logo` caching + size cap~~ — **DONE** · ~~11. TTL/sweep for anonymous records~~ — **won't do (see M4 correction)** · **15. Slug overwrite — DONE**
 
 **🔵 PHASE 4 — OPTIONAL**
-~~12. Delete 241 lines of dead code~~ — **DONE** · 13. Handler-resolution CI check · 14. Cron global assignment ·
+~~12. Delete 241 lines of dead code~~ — **DONE** · ~~13. Handler-resolution CI check~~ — **DONE** · 14. Cron global assignment ·
 15. Double-escape fix · 16. Docs reorganisation
 
 ---
@@ -1038,7 +1042,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 7. ~~**Add SRI to the fflate `<script>`.**~~ — **DONE.** (6)
 8. ~~**Move the reset-key and admin-login limiters onto D1's atomic upsert.**~~ — **DONE.** (7)
 9. ~~**Cap and cache `/api/channel-logo`**~~ — **DONE.** TTL/sweep for `/api/save` + `/api/publish-list` keys still open.
-10. **Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.
+10. ~~**Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.~~ — **DONE** (and considerably more besides).
 
 ---
 
