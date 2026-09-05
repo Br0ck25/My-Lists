@@ -12,6 +12,26 @@ const ADDON_NAME = "My Lists";
 // drift apart again.
 const CURATED_RECOMMENDATION_LIMIT = 40;
 
+// --- Bounds on the two unauthenticated permanent-KV-write endpoints ---------
+//
+// /api/publish-list and /api/save both accept a body from anyone at all and
+// store it under a KV key that nothing in this Worker ever expires or
+// deletes. Neither used to bound what it stored, so a single anonymous
+// request could park multiple megabytes in KV permanently, as many times as
+// it liked.
+//
+// These ceilings are set far above real usage on purpose -- the largest
+// genuine list observed in an account export was ~1,200 items, and a
+// realistic install config is tens of rows, not thousands. Anything over
+// these is rejected with a clear error rather than silently truncated:
+// quietly storing a shortened list or a shortened install config would
+// trade one bug for a worse, invisible one.
+const PUBLISHED_LIST_ITEMS_MAX = 10000;
+const PUBLISHED_LIST_NAME_MAX = 200;
+const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
+const SAVED_CONFIG_ENTRIES_MAX = 500;
+const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

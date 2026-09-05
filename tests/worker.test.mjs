@@ -1365,3 +1365,265 @@ describe("delete-account confirmation", () => {
     assert.equal(restore.status, 401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Audit 2026-09-05 -- regression tests for the four production blockers.
+// Each test fails against the code as it was before the corresponding fix.
+// ---------------------------------------------------------------------------
+
+describe("audit fix 1: /api/track-event cannot mint unbounded KV keys", () => {
+  it("ignores list-copy ids that are not one of this add-on's own list URLs", async () => {
+    const env = makeEnv();
+    const events = [];
+    for (let i = 0; i < 40; i++) {
+      events.push({ eventType: "list-copy", id: "SPAM-<img src=x onerror=alert(1)>-" + i });
+    }
+    // External provider URLs are legitimate input but are not lists this
+    // dashboard can show a copy count for -- they must not mint keys either.
+    events.push({ eventType: "list-copy", id: "https://mdblist.com/lists/someone/their-list" });
+    const r = await call(env, "/api/track-event", { method: "POST", json: { events } });
+    assert.equal(r.status, 200);
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("stats:list_copy:"));
+    assert.deepEqual(minted, [], `expected no keys, got ${JSON.stringify(minted.slice(0, 3))}`);
+  });
+
+  it("still records a copy of one of this add-on's own lists, keyed by its slug", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "list-copy", id: "https://example.test/lists/alice/top-ten" }] },
+    });
+    assert.equal(r.status, 200);
+    // Keyed by slug alone -- which is what computeCatalogAndCommunityLeaderboards
+    // looks up (copiesBySlug.get(data.slug)), so the count is now actually readable.
+    assert.equal(env.CONFIGS._store.get("stats:list_copy:top-ten:total"), "1");
+  });
+
+  it("rejects watched/list-add ids that are not real title-id shapes", async () => {
+    const env = makeEnv();
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "<script>alert(1)</script>", title: "x" }] },
+    });
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtcount:") || k.startsWith("evtmeta:"));
+    assert.deepEqual(minted, []);
+
+    // A genuine id still works.
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "tt1234567", title: "Real Movie" }] },
+    });
+    assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("evtcount:watched:tt1234567:")));
+  });
+
+  it("rate-limits repeated anonymous beacons from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    for (let i = 0; i < 40; i++) {
+      await call(env, "/api/track-event", {
+        method: "POST",
+        ip,
+        json: { events: [{ eventType: "watched", id: "tt" + i }] },
+      });
+    }
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtmeta:watched:"));
+    assert.ok(minted.length <= 30, `expected the per-IP cap to stop this at 30, got ${minted.length}`);
+  });
+
+  it("admin catalogs/lists panel stays within a bounded subrequest budget", async () => {
+    const env = makeEnv();
+    // Far more keys than any real deployment, as an attacker would have left behind.
+    for (let i = 0; i < 3000; i++) await env.CONFIGS.put(`stats:list_copy:spam-${i}:total`, "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    let ops = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const origList = env.CONFIGS.list.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { ops++; return origGet(...a); };
+    env.CONFIGS.list = async (...a) => { ops++; return origList(...a); };
+
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    assert.equal(r.status, 200, "panel must still render, not throw");
+    // Cloudflare allows 1,000 subrequests per invocation. Before the caps this
+    // was 1:1 with the key count (3,000 here) and the panel broke permanently.
+    assert.ok(ops < 1000, `expected a bounded subrequest count, got ${ops}`);
+  });
+});
+
+describe("audit fix 2: a like cannot revert a concurrent list save", () => {
+  it("keeps the creator's newer items when a like lands mid-save", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicelikerace");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }],
+      },
+    });
+    const listKey = [...env.CONFIGS._store.keys()].find((k) => k.startsWith("creatorlist:alicelikerace:"));
+
+    // Park the like immediately after it reads the list record, which is
+    // the exact window applyLikeVote's KV round-trips used to leave open.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === listKey && ++reads === 1) await gate;
+      return v;
+    };
+
+    const likeP = call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: "alicelikerace", slug: "race-list", action: "like" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug: "race-list",
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }, { id: "tt3" }, { id: "tt4" }, { id: "tt5" }],
+      },
+    });
+    release();
+    await likeP;
+
+    const stored = JSON.parse(env.CONFIGS._store.get(listKey));
+    assert.equal(stored.items.length, 5, "the like must not write back its pre-vote snapshot");
+    assert.equal(stored.likes, 1, "and the like itself must still be recorded");
+  });
+});
+
+describe("audit fix 4: unauthenticated permanent writes are bounded", () => {
+  it("rejects an oversized published list instead of storing it", async () => {
+    const env = makeEnv();
+    const items = Array.from({ length: 20000 }, (_, i) => ({ id: "tt" + i, title: "X".repeat(200) }));
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "spam list", type: "movie", items },
+    });
+    assert.equal(r.status, 413);
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0);
+  });
+
+  it("still publishes a realistically large list", async () => {
+    const env = makeEnv();
+    // Larger than the biggest real account list observed (~1,200 items).
+    const items = Array.from({ length: 2000 }, (_, i) => ({ id: "tt" + i }));
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "Big But Real", type: "movie", items },
+    });
+    assert.equal(r.body.ok, true, `expected a normal publish to succeed, got ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert.equal(JSON.parse(env.CONFIGS._store.get("publishedlist:user:big-but-real")).items.length, 2000,
+      "and it must be stored in full, not silently truncated");
+  });
+
+  it("rate-limits repeated anonymous publishes from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 15; i++) {
+      const r = await call(env, "/api/publish-list", {
+        method: "POST", ip,
+        json: { name: "list " + i, type: "movie", items: [{ id: "tt1" }] },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 15 rapid publishes");
+  });
+
+  it("rejects an oversized install config instead of storing it", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 900 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.status, 413);
+  });
+
+  it("still saves a normal install config", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 30 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.body.ok, true);
+    assert.ok(r.body.id);
+  });
+});
+
+describe("audit fix 3: the Continue Watching cron cannot revert a concurrent save", () => {
+  it("keeps watch history a user saved while the cron sweep was mid-flight", async () => {
+    const env = makeEnv();
+    env.TMDB_API_KEY = "test-tmdb-key";
+    const bob = await createUser(env, "bobcronrace");
+    const TKEY = "creatorsynctracking:bobcronrace";
+    await env.CONFIGS.put(TKEY, JSON.stringify({
+      watchHistory: [{ id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 }],
+      continueWatching: [], fullyWatchedShowIds: ["tt9"], updatedAt: 1000,
+    }));
+
+    // Minimal TMDB stub: resolve tt9 -> 55, and report an unwatched S1E3 so
+    // the sweep actually has a Continue Watching update to write.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      const url = String(u);
+      const J = (o) => new Response(JSON.stringify(o), { headers: { "content-type": "application/json" } });
+      if (url.includes("/find/")) return J({ tv_results: [{ id: 55 }] });
+      if (/\/tv\/55\/season\/1\b/.test(url)) {
+        return J({ episodes: [
+          { id: 990, episode_number: 2, name: "Ep2", air_date: "2020-01-01" },
+          { id: 991, episode_number: 3, name: "Brand New Ep", air_date: "2020-01-08" },
+        ]});
+      }
+      return J({ episodes: [] });
+    };
+
+    // Park the cron right after ITS OWN read of the tracking blob (the
+    // second read of that key -- the first belongs to ensureTrackingMigrated),
+    // which stands in for the TMDB round-trips that make this window seconds wide.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    let cronPhase = true;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === TKEY && cronPhase && ++reads === 2) await gate;
+      return v;
+    };
+
+    try {
+      const pending = [];
+      worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+      await new Promise((r) => setTimeout(r, 40));
+
+      cronPhase = false;
+      await call(env, "/api/creator/sync/save-tracking", {
+        method: "POST",
+        json: {
+          creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+          fullyWatchedShowIds: ["tt9"], continueWatching: [],
+          watchHistory: [
+            { id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 },
+            { id: "tt7", type: "movie", title: "Just Watched This", watchedAt: Date.now() },
+          ],
+        },
+      });
+
+      release();
+      await Promise.all(pending);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const stored = JSON.parse(env.CONFIGS._store.get(TKEY));
+      assert.ok(
+        stored.watchHistory.some((i) => i.id === "tt7"),
+        "the cron must not write its stale snapshot over what the user just saved"
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});

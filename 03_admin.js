@@ -747,18 +747,40 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
   } catch (e) {}
 }
 
+// Hard ceilings on what this one panel may cost, independent of how many
+// stats:* keys exist.
+//
+// This function enumerates three prefixes and then issues one KV get per
+// ":total" key it finds, so its subrequest count used to scale 1:1 with
+// the size of those key spaces -- and none of the three is intrinsically
+// bounded. A caller who minted enough keys (see recordListCopySlug's
+// comment for how that was possible without any authentication) pushed
+// this past Cloudflare's per-invocation subrequest limit, at which point
+// the panel threw on every load and there was no route that could delete
+// the keys again to recover it.
+//
+// The scan cap bounds the enumeration (one list() call per 1,000 keys);
+// the read cap bounds the far more expensive per-key gets. Both are far
+// above any real deployment -- a genuine install has tens of catalog
+// names and source groups, not hundreds -- so this truncates abuse and
+// nothing else. Truncating renders a partial panel rather than throwing,
+// which is the right failure mode for a dashboard: some data beats a
+// permanently broken tab.
+const STAT_KEY_SCAN_CAP = 20000;
+const STAT_TOTALS_READ_CAP = 500;
+
 async function computeCatalogAndCommunityLeaderboards(env) {
   if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
-  
+
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
   const [catalogList, sourceGroupList] = await Promise.all([
-    listAllKeys(env.CONFIGS, "stats:catalog_add:"),
-    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
+    listAllKeys(env.CONFIGS, "stats:catalog_add:", STAT_KEY_SCAN_CAP),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:", STAT_KEY_SCAN_CAP),
   ]);
 
   const catalogMap = new Map();
-  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total"));
-  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total"));
+  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
+  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
 
   await Promise.all([
     ...totalCatalogKeys.map(async (k) => {
@@ -788,8 +810,8 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   // cost ~2 subrequests per list and eventually cross the 1,000 cap.
   const copiesBySlug = new Map();
   try {
-    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:");
-    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total"));
+    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:", STAT_KEY_SCAN_CAP);
+    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
     await Promise.all(
       copyTotalKeys.map(async (k) => {
         const raw = await env.CONFIGS.get(k.name);
@@ -927,10 +949,81 @@ async function computeAudienceAnalytics(env) {
 // arbitrary junk trying to spam garbage keys into KV. This caps length and
 // character set rather than trusting it outright; doesn't need to be
 // exhaustive, just enough that a genuine group name always passes through
-// untouched and abuse can't create unbounded distinct keys.
+// untouched.
+//
+// NOTE: this bounds the character set and the LENGTH of a single name, not
+// the NUMBER of distinct names -- a caller sending 40-char random strings
+// still mints a new key every time. That is acceptable here only because
+// /api/track-install is rate-limited per IP; anywhere without a rate limit
+// needs a real allowlist instead (see recordListCopySlug below, and the
+// caps in computeCatalogAndCommunityLeaderboards that stop a large key
+// space from breaking the dashboard whatever produced it).
 function sanitizeStatGroupName(raw) {
   const s = String(raw || "").trim().slice(0, 40);
   return /^[A-Za-z0-9 &().'-]+$/.test(s) ? s : null;
+}
+
+// The "copies" column of the admin Community Lists panel is keyed by a
+// list's own slug (see computeCatalogAndCommunityLeaderboards, which looks
+// up copiesBySlug.get(data.slug)). The client, though, sends
+// `listUrl || listName` as the event id -- a full provider URL, or a
+// human-readable list title. Neither is a slug, so the stored counts
+// essentially never matched anything the panel could display: the whole
+// stats:list_copy: namespace was write-only.
+//
+// Worse, because the id was accepted verbatim (any 100 characters), every
+// distinct URL or title minted two brand-new permanent KV keys from an
+// endpoint with no authentication -- an unbounded key-space write
+// primitive, and one that the panel above then paid one KV read per key to
+// enumerate.
+//
+// Both problems have the same fix: only record a copy of a list that
+// actually lives on THIS add-on, keyed by the slug the panel is already
+// looking for. The key space is then bounded by the number of real
+// published lists, and the counts land where they can actually be read.
+// Copies of external provider lists are simply not counted -- which is
+// what was already happening in practice, just without the storage cost.
+function recordListCopySlug(rawId, origin) {
+  const raw = String(rawId || "").trim();
+  if (!raw || raw.length > 300) return null;
+  let pathname = "";
+  if (/^https?:\/\//i.test(raw)) {
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return null;
+    }
+    // Only this Worker's own list URLs. An external provider's URL is not
+    // a list this dashboard can show a copy count for.
+    if (origin) {
+      let originHost = "";
+      try {
+        originHost = new URL(origin).hostname.toLowerCase();
+      } catch {
+        return null;
+      }
+      if (u.hostname.toLowerCase() !== originHost) return null;
+    }
+    pathname = u.pathname;
+  } else {
+    // Also accept a bare path, which is what a same-origin relative link
+    // resolves to before the client expands it.
+    if (!raw.startsWith("/")) return null;
+    pathname = raw;
+  }
+  // /lists/{user}/{slug}  ->  {slug}
+  const m = pathname.match(/^\/lists\/[^/]+\/([^/]+?)(?:\.json)?\/?$/);
+  if (!m) return null;
+  let slug;
+  try {
+    slug = decodeURIComponent(m[1]).toLowerCase();
+  } catch {
+    slug = m[1].toLowerCase();
+  }
+  // Same shape slugifyServer produces, so this can only ever name a key
+  // that a real list could also have produced.
+  return /^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) ? slug : null;
 }
 
 // Reads every stats:{kind}:YYYY-MM-DD entry via a prefix list (there's no

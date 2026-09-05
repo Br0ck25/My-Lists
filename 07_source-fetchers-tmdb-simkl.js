@@ -1819,10 +1819,35 @@ async function checkForNewEpisodes(env) {
     }
 
     if (blobChanged || stillFullyWatched.length !== fullyWatched.length) {
-      blob.continueWatching = continueWatching;
-      blob.fullyWatchedShowIds = stillFullyWatched;
-      blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
+      // Re-read before writing, and write only the two fields this sweep
+      // actually computes.
+      //
+      // `blob` was read at the top of this account's turn, and everything
+      // since has been TMDB network I/O -- seconds, not milliseconds. The
+      // old code wrote that whole snapshot back, so anything the account's
+      // own browser saved in the meantime (a newly watched episode, a
+      // refreshed Airing Next, recomputed recommendations) was silently
+      // reverted, with the save and the cron both reporting success.
+      //
+      // /api/creator/sync/save-tracking already guards the mirror image of
+      // this -- a stale CLIENT push wiping a server-side scrobble -- with
+      // a rescue-merge. This is the same hazard in the other direction,
+      // and the same reasoning applies: the writer must only own the
+      // fields it computed.
+      const targetKey = `creatorsynctracking:${username}`;
+      let target = blob;
+      try {
+        const freshRaw = await env.CONFIGS.get(targetKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {
+        // Unreadable/unparseable right now -- fall back to the snapshot we
+        // already have rather than dropping a real Continue Watching update.
+        target = blob;
+      }
+      target.continueWatching = continueWatching;
+      target.fullyWatchedShowIds = stillFullyWatched;
+      target.updatedAt = Date.now();
+      await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
 }

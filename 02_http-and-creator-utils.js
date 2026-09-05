@@ -1457,13 +1457,25 @@ async function getPublicListIndex(env, ctx) {
   }
 }
 
-async function listAllKeys(namespace, prefix) {
+// Pages a whole prefix, following the cursor to completion.
+//
+// `maxKeys` (optional) caps how many keys are collected. It exists for
+// prefixes whose key space is not intrinsically bounded -- see the caps in
+// computeCatalogAndCommunityLeaderboards (03_admin.js), where an
+// unbounded scan followed by one get per key was enough to push a request
+// past Cloudflare's per-invocation subrequest limit. Callers that pass it
+// must treat `list_complete: false` as "there was more" rather than
+// assuming they have everything; callers that omit it keep the previous
+// exhaustive behaviour exactly.
+async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   const keys = [];
   let cursor;
   do {
+    const remaining = maxKeys - keys.length;
+    if (remaining <= 0) return { keys, list_complete: false };
     const result = await namespace.list({
       prefix,
-      limit: 1000,
+      limit: Math.min(1000, remaining),
       ...(cursor ? { cursor } : {})
     });
     keys.push(...result.keys);

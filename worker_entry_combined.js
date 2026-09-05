@@ -62,6 +62,26 @@ const ADDON_NAME = "My Lists";
 // drift apart again.
 const CURATED_RECOMMENDATION_LIMIT = 40;
 
+// --- Bounds on the two unauthenticated permanent-KV-write endpoints ---------
+//
+// /api/publish-list and /api/save both accept a body from anyone at all and
+// store it under a KV key that nothing in this Worker ever expires or
+// deletes. Neither used to bound what it stored, so a single anonymous
+// request could park multiple megabytes in KV permanently, as many times as
+// it liked.
+//
+// These ceilings are set far above real usage on purpose -- the largest
+// genuine list observed in an account export was ~1,200 items, and a
+// realistic install config is tens of rows, not thousands. Anything over
+// these is rejected with a clear error rather than silently truncated:
+// quietly storing a shortened list or a shortened install config would
+// trade one bug for a worse, invisible one.
+const PUBLISHED_LIST_ITEMS_MAX = 10000;
+const PUBLISHED_LIST_NAME_MAX = 200;
+const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
+const SAVED_CONFIG_ENTRIES_MAX = 500;
+const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -2978,13 +2998,25 @@ async function getPublicListIndex(env, ctx) {
   }
 }
 
-async function listAllKeys(namespace, prefix) {
+// Pages a whole prefix, following the cursor to completion.
+//
+// `maxKeys` (optional) caps how many keys are collected. It exists for
+// prefixes whose key space is not intrinsically bounded -- see the caps in
+// computeCatalogAndCommunityLeaderboards (03_admin.js), where an
+// unbounded scan followed by one get per key was enough to push a request
+// past Cloudflare's per-invocation subrequest limit. Callers that pass it
+// must treat `list_complete: false` as "there was more" rather than
+// assuming they have everything; callers that omit it keep the previous
+// exhaustive behaviour exactly.
+async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   const keys = [];
   let cursor;
   do {
+    const remaining = maxKeys - keys.length;
+    if (remaining <= 0) return { keys, list_complete: false };
     const result = await namespace.list({
       prefix,
-      limit: 1000,
+      limit: Math.min(1000, remaining),
       ...(cursor ? { cursor } : {})
     });
     keys.push(...result.keys);
@@ -3968,18 +4000,40 @@ async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
   } catch (e) {}
 }
 
+// Hard ceilings on what this one panel may cost, independent of how many
+// stats:* keys exist.
+//
+// This function enumerates three prefixes and then issues one KV get per
+// ":total" key it finds, so its subrequest count used to scale 1:1 with
+// the size of those key spaces -- and none of the three is intrinsically
+// bounded. A caller who minted enough keys (see recordListCopySlug's
+// comment for how that was possible without any authentication) pushed
+// this past Cloudflare's per-invocation subrequest limit, at which point
+// the panel threw on every load and there was no route that could delete
+// the keys again to recover it.
+//
+// The scan cap bounds the enumeration (one list() call per 1,000 keys);
+// the read cap bounds the far more expensive per-key gets. Both are far
+// above any real deployment -- a genuine install has tens of catalog
+// names and source groups, not hundreds -- so this truncates abuse and
+// nothing else. Truncating renders a partial panel rather than throwing,
+// which is the right failure mode for a dashboard: some data beats a
+// permanently broken tab.
+const STAT_KEY_SCAN_CAP = 20000;
+const STAT_TOTALS_READ_CAP = 500;
+
 async function computeCatalogAndCommunityLeaderboards(env) {
   if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
-  
+
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
   const [catalogList, sourceGroupList] = await Promise.all([
-    listAllKeys(env.CONFIGS, "stats:catalog_add:"),
-    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
+    listAllKeys(env.CONFIGS, "stats:catalog_add:", STAT_KEY_SCAN_CAP),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:", STAT_KEY_SCAN_CAP),
   ]);
 
   const catalogMap = new Map();
-  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total"));
-  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total"));
+  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
+  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
 
   await Promise.all([
     ...totalCatalogKeys.map(async (k) => {
@@ -4009,8 +4063,8 @@ async function computeCatalogAndCommunityLeaderboards(env) {
   // cost ~2 subrequests per list and eventually cross the 1,000 cap.
   const copiesBySlug = new Map();
   try {
-    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:");
-    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total"));
+    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:", STAT_KEY_SCAN_CAP);
+    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
     await Promise.all(
       copyTotalKeys.map(async (k) => {
         const raw = await env.CONFIGS.get(k.name);
@@ -4148,10 +4202,81 @@ async function computeAudienceAnalytics(env) {
 // arbitrary junk trying to spam garbage keys into KV. This caps length and
 // character set rather than trusting it outright; doesn't need to be
 // exhaustive, just enough that a genuine group name always passes through
-// untouched and abuse can't create unbounded distinct keys.
+// untouched.
+//
+// NOTE: this bounds the character set and the LENGTH of a single name, not
+// the NUMBER of distinct names -- a caller sending 40-char random strings
+// still mints a new key every time. That is acceptable here only because
+// /api/track-install is rate-limited per IP; anywhere without a rate limit
+// needs a real allowlist instead (see recordListCopySlug below, and the
+// caps in computeCatalogAndCommunityLeaderboards that stop a large key
+// space from breaking the dashboard whatever produced it).
 function sanitizeStatGroupName(raw) {
   const s = String(raw || "").trim().slice(0, 40);
   return /^[A-Za-z0-9 &().'-]+$/.test(s) ? s : null;
+}
+
+// The "copies" column of the admin Community Lists panel is keyed by a
+// list's own slug (see computeCatalogAndCommunityLeaderboards, which looks
+// up copiesBySlug.get(data.slug)). The client, though, sends
+// `listUrl || listName` as the event id -- a full provider URL, or a
+// human-readable list title. Neither is a slug, so the stored counts
+// essentially never matched anything the panel could display: the whole
+// stats:list_copy: namespace was write-only.
+//
+// Worse, because the id was accepted verbatim (any 100 characters), every
+// distinct URL or title minted two brand-new permanent KV keys from an
+// endpoint with no authentication -- an unbounded key-space write
+// primitive, and one that the panel above then paid one KV read per key to
+// enumerate.
+//
+// Both problems have the same fix: only record a copy of a list that
+// actually lives on THIS add-on, keyed by the slug the panel is already
+// looking for. The key space is then bounded by the number of real
+// published lists, and the counts land where they can actually be read.
+// Copies of external provider lists are simply not counted -- which is
+// what was already happening in practice, just without the storage cost.
+function recordListCopySlug(rawId, origin) {
+  const raw = String(rawId || "").trim();
+  if (!raw || raw.length > 300) return null;
+  let pathname = "";
+  if (/^https?:\/\//i.test(raw)) {
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return null;
+    }
+    // Only this Worker's own list URLs. An external provider's URL is not
+    // a list this dashboard can show a copy count for.
+    if (origin) {
+      let originHost = "";
+      try {
+        originHost = new URL(origin).hostname.toLowerCase();
+      } catch {
+        return null;
+      }
+      if (u.hostname.toLowerCase() !== originHost) return null;
+    }
+    pathname = u.pathname;
+  } else {
+    // Also accept a bare path, which is what a same-origin relative link
+    // resolves to before the client expands it.
+    if (!raw.startsWith("/")) return null;
+    pathname = raw;
+  }
+  // /lists/{user}/{slug}  ->  {slug}
+  const m = pathname.match(/^\/lists\/[^/]+\/([^/]+?)(?:\.json)?\/?$/);
+  if (!m) return null;
+  let slug;
+  try {
+    slug = decodeURIComponent(m[1]).toLowerCase();
+  } catch {
+    slug = m[1].toLowerCase();
+  }
+  // Same shape slugifyServer produces, so this can only ever name a key
+  // that a real list could also have produced.
+  return /^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) ? slug : null;
 }
 
 // Reads every stats:{kind}:YYYY-MM-DD entry via a prefix list (there's no
@@ -10444,10 +10569,35 @@ async function checkForNewEpisodes(env) {
     }
 
     if (blobChanged || stillFullyWatched.length !== fullyWatched.length) {
-      blob.continueWatching = continueWatching;
-      blob.fullyWatchedShowIds = stillFullyWatched;
-      blob.updatedAt = Date.now();
-      await env.CONFIGS.put(`creatorsynctracking:${username}`, JSON.stringify(blob));
+      // Re-read before writing, and write only the two fields this sweep
+      // actually computes.
+      //
+      // `blob` was read at the top of this account's turn, and everything
+      // since has been TMDB network I/O -- seconds, not milliseconds. The
+      // old code wrote that whole snapshot back, so anything the account's
+      // own browser saved in the meantime (a newly watched episode, a
+      // refreshed Airing Next, recomputed recommendations) was silently
+      // reverted, with the save and the cron both reporting success.
+      //
+      // /api/creator/sync/save-tracking already guards the mirror image of
+      // this -- a stale CLIENT push wiping a server-side scrobble -- with
+      // a rescue-merge. This is the same hazard in the other direction,
+      // and the same reasoning applies: the writer must only own the
+      // fields it computed.
+      const targetKey = `creatorsynctracking:${username}`;
+      let target = blob;
+      try {
+        const freshRaw = await env.CONFIGS.get(targetKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {
+        // Unreadable/unparseable right now -- fall back to the snapshot we
+        // already have rather than dropping a real Continue Watching update.
+        target = blob;
+      }
+      target.continueWatching = continueWatching;
+      target.fullyWatchedShowIds = stillFullyWatched;
+      target.updatedAt = Date.now();
+      await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
 }
@@ -51091,6 +51241,17 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return json({ ok: true });
       let body;
       try { body = await request.json(); } catch { return json({ ok: true }); }
+      // recordSearchQuery keys `searchquery:{q}:days` on the query text
+      // itself, so like /api/track-event this is an unauthenticated write
+      // whose key name comes from the caller. Same per-IP bucket, same
+      // ok:true-on-limit behaviour (it's a beacon, not a feature).
+      const searchIp = clientIpKey(request);
+      if (!searchIp) return json({ ok: true });
+      const searchRateKey = `ratelimit:tracksearch:${searchIp}`;
+      const searchAttempts = parseInt((await env.CONFIGS.get(searchRateKey)) || "0", 10);
+      if (searchAttempts >= 30) return json({ ok: true });
+      ctx.waitUntil(env.CONFIGS.put(searchRateKey, String(searchAttempts + 1), { expirationTtl: 60 }));
+
       if (body && typeof body.query === "string" && body.query.trim()) {
         ctx.waitUntil(recordSearchQuery(env, body.query.trim()));
       }
@@ -51109,26 +51270,49 @@ self.addEventListener('fetch', e => {
       } catch {
         return json({ ok: true });
       }
+      // Unauthenticated, and every branch below writes a KV key derived
+      // from caller input -- so it gets the same per-IP bucket the other
+      // anonymous write endpoints here use. Returns ok:true rather than
+      // 429 on purpose: this is a fire-and-forget beacon, and a real
+      // client has nothing useful to do with a rejection.
+      // CONFIGS is guaranteed bound at this point (checked above).
+      const trackIp = clientIpKey(request);
+      if (!trackIp) return json({ ok: true });
+      const trackRateKey = `ratelimit:trackevent:${trackIp}`;
+      const trackAttempts = parseInt((await env.CONFIGS.get(trackRateKey)) || "0", 10);
+      if (trackAttempts >= 30) return json({ ok: true });
+      ctx.waitUntil(env.CONFIGS.put(trackRateKey, String(trackAttempts + 1), { expirationTtl: 60 }));
+
       const events = Array.isArray(body.events) ? body.events.slice(0, 50) : [];
-      const allowedTypes = new Set(["watched", "list-add", "list-copy", "catalog-add"]);
+      // "catalog-add" is deliberately absent: no client has ever sent it
+      // (installed catalogs are counted by /api/track-install, which feeds
+      // stats:sourcegroup: instead), so the only thing that branch could
+      // still do was let an anonymous caller mint stats:catalog_add: keys
+      // that nothing legitimate ever writes.
+      const allowedTypes = new Set(["watched", "list-add", "list-copy"]);
       await Promise.all(
         events.map((e) => {
           if (!e || !allowedTypes.has(e.eventType)) return Promise.resolve();
-          if (e.eventType === "catalog-add") {
-            const name = sanitizeStatGroupName(e.title || e.id);
-            if (name) return bumpStat(env, `catalog_add:${name}`);
-            return Promise.resolve();
-          }
           if (e.eventType === "list-copy") {
-            const slug = String(e.id || "").trim().slice(0, 100);
+            // Only this add-on's own lists, keyed by the slug the admin
+            // panel actually reads -- see recordListCopySlug (03_admin.js).
+            const slug = recordListCopySlug(e.id, url.origin);
             if (slug) return bumpStat(env, `list_copy:${slug}`);
             return Promise.resolve();
           }
           if (!e.id) return Promise.resolve();
+          // The id becomes part of three permanent KV key names
+          // (evtcount:/evtmeta:), so it is constrained to the shape a real
+          // title id actually has -- "tt123", "tt123:1:2", "tmdb:456",
+          // "channel_x", a bare TMDB number. Truncating to 100 characters
+          // bounded the length but not the contents, which let arbitrary
+          // text (including markup) end up in key names.
+          const evtId = String(e.id).trim();
+          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId)) return Promise.resolve();
           return recordTrackedEvent(
             env,
             e.eventType,
-            String(e.id).slice(0, 100),
+            evtId,
             String(e.title || "").slice(0, 200),
             e.mediaType === "series" ? "series" : "movie"
           );
@@ -51564,6 +51748,19 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) {
         return json({ ok: false, error: "no-kv" });
       }
+      // Unauthenticated, and each call writes a permanent KV key (the
+      // install config) that nothing ever expires or deletes. Generous
+      // bucket -- regenerating an install link a few times while adjusting
+      // rows is normal -- but not unlimited.
+      const saveIp = clientIpKey(request);
+      if (!saveIp) return json({ ok: false, error: "Could not process this request." }, 400);
+      const saveRateKey = `ratelimit:save:${saveIp}`;
+      const saveAttempts = parseInt((await env.CONFIGS.get(saveRateKey)) || "0", 10);
+      if (saveAttempts >= 20) {
+        return json({ ok: false, error: "Too many saves just now. Please wait a minute and try again." }, 429);
+      }
+      await env.CONFIGS.put(saveRateKey, String(saveAttempts + 1), { expirationTtl: 60 });
+
       let body;
       try {
         body = await request.json();
@@ -51573,6 +51770,15 @@ self.addEventListener('fetch', e => {
       const entries = Array.isArray(body.entries) ? body.entries : [];
       if (!entries.length) {
         return json({ ok: false, error: "No lists provided." }, 400);
+      }
+      // A config is a list of catalog rows; the builder's own URL-length
+      // problem (see generateShortId's comment) starts around 20 rows, so
+      // this ceiling is orders of magnitude above real use and only
+      // rejects a payload built to waste storage. Rejected, not truncated
+      // -- a silently shortened install config would be worse than an
+      // error.
+      if (entries.length > SAVED_CONFIG_ENTRIES_MAX) {
+        return json({ ok: false, error: "Too many lists in that configuration." }, 413);
       }
       const payload = { entries };
       if (body.tmdbKey) payload.tmdbKey = body.tmdbKey;
@@ -51594,18 +51800,38 @@ self.addEventListener('fetch', e => {
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
 
+      const savePayload = JSON.stringify(payload);
+      // Row count alone is not a size bound -- a row carries a URL, a
+      // name and a group. Checked on the exact bytes about to be stored.
+      if (savePayload.length > SAVED_CONFIG_BYTES_MAX) {
+        return json({ ok: false, error: "That configuration is too large to save." }, 413);
+      }
+
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
         id = generateShortId();
         const existing = await env.CONFIGS.get(id);
         if (!existing) break;
       }
-      await env.CONFIGS.put(id, JSON.stringify(payload));
+      await env.CONFIGS.put(id, savePayload);
       return json({ ok: true, id });
     }
 
     if (path === "/api/publish-list" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      // Unauthenticated, and every call mints a permanent KV key that no
+      // route in this Worker can ever delete again. Same per-IP bucket as
+      // /api/creator/create, just a little more permissive because
+      // publishing several lists in one sitting is normal.
+      const plIp = clientIpKey(request);
+      if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
+      const plRateKey = `ratelimit:publishlist:${plIp}`;
+      const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
+      if (plAttempts >= 10) {
+        return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
+      }
+      await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
+
       let plBody;
       try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
       const baseSlug = slugifyServer(plBody.name || "");
@@ -51613,6 +51839,20 @@ self.addEventListener('fetch', e => {
       const plItems = Array.isArray(plBody.items) ? plBody.items : [];
       if (!baseSlug) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!plType) return json({ ok: false, error: "Missing or invalid list type." }, 400);
+      // Bounds, deliberately REJECTING rather than truncating: silently
+      // storing a shortened list is exactly the kind of quiet data loss
+      // this endpoint should not be capable of, and a real list that is
+      // over the limit deserves to be told so. The ceilings are far above
+      // anything genuine -- a real account's largest observed list was
+      // ~1,200 items (see compactCustomListItem, 22_client-creator-
+      // profile.js) -- and exist only to stop an anonymous caller storing
+      // multi-megabyte payloads permanently.
+      if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
+        return json({ ok: false, error: "That list name is too long." }, 400);
+      }
+      if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
       let listSlug = baseSlug;
       let plKey = "publishedlist:user:" + listSlug;
       for (let attempt = 2; attempt <= 500; attempt++) {
@@ -51623,7 +51863,15 @@ self.addEventListener('fetch', e => {
       }
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
-      await env.CONFIGS.put(plKey, JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow }));
+      const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
+      // Item COUNT alone is not a size bound -- individual items carry
+      // titles, overviews and poster URLs, so a few thousand of them can
+      // still be many megabytes. This is the bound that actually protects
+      // storage, checked on the exact bytes about to be written.
+      if (plPayload.length > PUBLISHED_LIST_BYTES_MAX) {
+        return json({ ok: false, error: "That list is too large to publish." }, 413);
+      }
+      await env.CONFIGS.put(plKey, plPayload);
       // Anonymous publishes belong in the directory index too.
       if (isPublicListVisibility(plVisibility)) {
         ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
@@ -51682,27 +51930,55 @@ self.addEventListener('fetch', e => {
       // search, and the admin dashboard all read it from there and none of
       // them should have to open a ledger per list. Derived from the
       // ledger, never incremented, so it cannot drift upward on its own.
+      //
+      // Re-read before writing. `likeData` was parsed before applyLikeVote,
+      // which spends several KV round-trips on the ledger (up to four
+      // read/write/verify attempts under contention). Writing that stale
+      // snapshot back put the WHOLE record -- items included -- on top of
+      // whatever landed in the meantime, so a like arriving while the
+      // list's owner was saving silently reverted their edit, with both
+      // requests returning 200. Only the one field this route owns gets
+      // written, onto the current record.
       if ((likeData.likes || 0) !== count) {
-        likeData.likes = count;
-        await env.CONFIGS.put(likeKey, JSON.stringify(likeData));
-        // The directory ranks by likes, so the index has to see this or the
-        // ordering freezes at whatever it was when the index was built.
-        // Only on an actual change -- a repeated like writes nothing.
-        // Anonymous lists are indexed as `a:<slug>`, creator-owned as
-        // `c:<user>:<slug>` -- using the wrong prefix here would append a
-        // duplicate entry instead of updating the existing one.
-        const likeIsCreator = likeKey === likeCreatorKey;
-        if (isPublicListVisibility(likeData.visibility)) {
-          ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
-            isCreator: likeIsCreator,
-            username: likeIsCreator ? likeUser : "user",
-            slug: likeSlug,
-            name: likeData.name || "List",
-            type: likeData.type || "mixed",
-            itemCount: Array.isArray(likeData.items) ? likeData.items.length : 0,
-            likes: count,
-            updatedAt: likeData.updatedAt || likeData.createdAt || null,
-          }));
+        // Re-read, then copy only `likes` onto the CURRENT record. If it
+        // vanished or turned unparseable while the vote was being
+        // recorded, write nothing at all: the ledger already holds the
+        // vote, and re-creating the record from a stale copy would be
+        // worse than leaving the denormalised count to catch up on the
+        // next like.
+        const freshRaw = await env.CONFIGS.get(likeKey);
+        let updated = null;
+        if (freshRaw) {
+          try {
+            updated = JSON.parse(freshRaw);
+            updated.likes = count;
+          } catch {
+            updated = null;
+          }
+        }
+        if (updated) {
+          await env.CONFIGS.put(likeKey, JSON.stringify(updated));
+          // The directory ranks by likes, so the index has to see this or the
+          // ordering freezes at whatever it was when the index was built.
+          // Only on an actual change -- a repeated like writes nothing.
+          // Anonymous lists are indexed as `a:<slug>`, creator-owned as
+          // `c:<user>:<slug>` -- using the wrong prefix here would append a
+          // duplicate entry instead of updating the existing one.
+          // Fed from `updated`, not the pre-vote snapshot, so the indexed
+          // name/type/itemCount match what is actually stored.
+          const likeIsCreator = likeKey === likeCreatorKey;
+          if (isPublicListVisibility(updated.visibility)) {
+            ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+              isCreator: likeIsCreator,
+              username: likeIsCreator ? likeUser : "user",
+              slug: likeSlug,
+              name: updated.name || "List",
+              type: updated.type || "mixed",
+              itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
+              likes: count,
+              updatedAt: updated.updatedAt || updated.createdAt || null,
+            }));
+          }
         }
       }
 
