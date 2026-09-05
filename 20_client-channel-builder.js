@@ -5129,12 +5129,6 @@ async function spliceCrossoverEvent(eventId, btn) {
   }
 }
 
-function reverseChannelDraft() {
-  if (!channelDraftItems.length) return;
-  channelDraftItems.reverse();
-  renderChannelDraftList();
-}
-
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
   if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;

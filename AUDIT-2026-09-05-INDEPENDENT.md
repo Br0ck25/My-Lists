@@ -713,7 +713,7 @@ all generated HTML as template literals — for every occurrence of each name. E
 **exactly once**: its own declaration. No call site, no string reference, no inline handler, no
 `window.*` assignment.
 
-**SAFE TO DELETE — 16 functions, 241 lines**
+**SAFE TO DELETE — 16 functions, 241 lines** — ✅ **all removed** (260 lines with their comment blocks; `_refreshScrobbleWebhookInput` went with the scrobble-token work, the other 15 in one pass, re-verified against the build at the time of deletion)
 
 | File | Function | Lines |
 |---|---|---|
@@ -964,7 +964,7 @@ byte-exact concatenation, CI-gated against drift.
 ~~10. `channel-logo` caching + size cap~~ — **DONE** · ~~11. TTL/sweep for anonymous records~~ — **won't do (see M4 correction)** · **15. Slug overwrite — DONE**
 
 **🔵 PHASE 4 — OPTIONAL**
-12. Delete 241 lines of dead code · 13. Handler-resolution CI check · 14. Cron global assignment ·
+~~12. Delete 241 lines of dead code~~ — **DONE** · 13. Handler-resolution CI check · 14. Cron global assignment ·
 15. Double-escape fix · 16. Docs reorganisation
 
 ---

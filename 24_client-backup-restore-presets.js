@@ -126,20 +126,6 @@ function rehydrateEntries(entries, customLists, channels) {
   return (entries || []).map((e) => rehydrateEntry(e, customLists, channels));
 }
 
-// Rows whose reference could not be resolved. Used to tell the person which
-// rows came back empty instead of letting them find out by scrolling past a
-// blank shelf.
-function unresolvedEntryNames(entries) {
-  const out = [];
-  (entries || []).forEach((e) => {
-    const split = splitPayloadUrl(e && e.url);
-    if (!split) return;
-    const p = split.payload;
-    if (p.itemsRef && !(Array.isArray(p.items) && p.items.length)) out.push(e.name || p.itemsRef);
-  });
-  return out;
-}
-
 window.dereferenceEntries = dereferenceEntries;
 window.rehydrateEntries = rehydrateEntries;
 
@@ -1986,12 +1972,6 @@ function copyLink(url) {
     }
     alert('Manifest URL: ' + url);
   });
-}
-
-function openInNuvio(installUrl, e) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(installUrl).catch(() => {});
-  }
 }
 
 async function generate() {

@@ -2022,11 +2022,6 @@ async function renderAdminDashboard(env) {
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
     }
 
-    // Alias for compatibility
-    function switchAdminTab(tabId) {
-      switchAdminSubTab(tabId);
-    }
-
     function restoreAdminActiveTab() {
       let targetTab = '';
       const hashTab = (window.location.hash || '').replace(/^#/, '').trim();

@@ -1611,68 +1611,6 @@ function setListSearchChip(filter, btn) {
   });
 }
 
-function quickAddProvider(name) {
-  const providerData = {
-    'Netflix': {
-      top10Movie: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies',
-      top10Series: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/netflix-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/netflix-shows'
-    },
-    'Prime Video': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows'
-    },
-    'Apple TV+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/slimshizn/apple-tv-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows'
-    },
-    'Disney+': {
-      top10Movie: 'https://mdblist.com/lists/andykai/disney-top-10-no-hulu',
-      top10Series: 'https://mdblist.com/lists/andykai/disney-trending-no-hulu',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/disney-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/disney-shows'
-    },
-    'HBO Max': {
-      top10Movie: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q',
-      top10Series: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd',
-      movie: 'https://mdblist.com/lists/snoak/latest-max-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hbo-shows'
-    },
-    'Hulu': {
-      top10Movie: 'https://mdblist.com/lists/hulupiv/hulu-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/hulupiv/hulu-top-10-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/hulu-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hulu-shows'
-    },
-    'Paramount+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/snoak/latest-paramount-plus-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows'
-    },
-    'Peacock': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/peacock-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/peacockpiv/peacock-top-10-shows',
-      movie: 'https://mdblist.com/lists/tvgeniekodi/peacock-movies',
-      series: 'https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows'
-    }
-  };
-  const data = providerData[name];
-  if (data) {
-    if (data.top10Movie) addRow(name + ' Top 10', data.top10Movie, 'movie', true, 'Streaming Top 10');
-    if (data.top10Series) addRow(name + ' Top 10', data.top10Series, 'series', true, 'Streaming Top 10');
-    if (data.movie) addRow(name, data.movie, 'movie', true, name);
-    if (data.series) addRow(name, data.series, 'series', true, name);
-    saveState();
-    switchTab('catalogs');
-  }
-}
-
 // Kept as a no-op (not removed) -- the poster-click handler in
 // 19_client-search-and-likes.js still calls this defensively before every
 // item-details open, and detailOverlay itself no longer exists (it's the
@@ -2126,22 +2064,6 @@ function addRow(name, url, type, enabled, group, channelId) {
 // here on, editable/removable a source at a time like any other.
 function addCombinedRow(name, urls, type, group) {
   addRow(name, urls.join('\\n'), type, true, group);
-}
-
-function addQuickAddRowsFromPairs(list, group, labelSuffix = "") {
-  list.forEach((p) => {
-    const label = labelSuffix ? p.name + " " + labelSuffix : p.name;
-    if (p.movieUrl) addRow(label, p.movieUrl, "movie", true, group);
-    if (p.showUrl) addRow(label, p.showUrl, "series", true, group);
-  });
-  saveState();
-}
-
-function addQuickAddRowsFromSimpleList(list, group) {
-  list.forEach((l) => {
-    addRow(l.name, l.url, l.type, true, group);
-  });
-  saveState();
 }
 
 ${buildAddAllFnJs("addAllMdblistCharts", buildAddAllPairsCallsJs(MDBLIST_OFFICIAL_CHARTS, "MDBList Charts", ""))}

@@ -5929,11 +5929,6 @@ async function renderAdminDashboard(env) {
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
     }
 
-    // Alias for compatibility
-    function switchAdminTab(tabId) {
-      switchAdminSubTab(tabId);
-    }
-
     function restoreAdminActiveTab() {
       let targetTab = '';
       const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
@@ -18127,68 +18122,6 @@ function setListSearchChip(filter, btn) {
   });
 }
 
-function quickAddProvider(name) {
-  const providerData = {
-    'Netflix': {
-      top10Movie: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies',
-      top10Series: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/netflix-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/netflix-shows'
-    },
-    'Prime Video': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows'
-    },
-    'Apple TV+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/slimshizn/apple-tv-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows'
-    },
-    'Disney+': {
-      top10Movie: 'https://mdblist.com/lists/andykai/disney-top-10-no-hulu',
-      top10Series: 'https://mdblist.com/lists/andykai/disney-trending-no-hulu',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/disney-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/disney-shows'
-    },
-    'HBO Max': {
-      top10Movie: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q',
-      top10Series: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd',
-      movie: 'https://mdblist.com/lists/snoak/latest-max-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hbo-shows'
-    },
-    'Hulu': {
-      top10Movie: 'https://mdblist.com/lists/hulupiv/hulu-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/hulupiv/hulu-top-10-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/hulu-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hulu-shows'
-    },
-    'Paramount+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/snoak/latest-paramount-plus-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows'
-    },
-    'Peacock': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/peacock-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/peacockpiv/peacock-top-10-shows',
-      movie: 'https://mdblist.com/lists/tvgeniekodi/peacock-movies',
-      series: 'https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows'
-    }
-  };
-  const data = providerData[name];
-  if (data) {
-    if (data.top10Movie) addRow(name + ' Top 10', data.top10Movie, 'movie', true, 'Streaming Top 10');
-    if (data.top10Series) addRow(name + ' Top 10', data.top10Series, 'series', true, 'Streaming Top 10');
-    if (data.movie) addRow(name, data.movie, 'movie', true, name);
-    if (data.series) addRow(name, data.series, 'series', true, name);
-    saveState();
-    switchTab('catalogs');
-  }
-}
-
 // Kept as a no-op (not removed) -- the poster-click handler in
 // 19_client-search-and-likes.js still calls this defensively before every
 // item-details open, and detailOverlay itself no longer exists (it's the
@@ -18642,22 +18575,6 @@ function addRow(name, url, type, enabled, group, channelId) {
 // here on, editable/removable a source at a time like any other.
 function addCombinedRow(name, urls, type, group) {
   addRow(name, urls.join('\\n'), type, true, group);
-}
-
-function addQuickAddRowsFromPairs(list, group, labelSuffix = "") {
-  list.forEach((p) => {
-    const label = labelSuffix ? p.name + " " + labelSuffix : p.name;
-    if (p.movieUrl) addRow(label, p.movieUrl, "movie", true, group);
-    if (p.showUrl) addRow(label, p.showUrl, "series", true, group);
-  });
-  saveState();
-}
-
-function addQuickAddRowsFromSimpleList(list, group) {
-  list.forEach((l) => {
-    addRow(l.name, l.url, l.type, true, group);
-  });
-  saveState();
 }
 
 ${buildAddAllFnJs("addAllMdblistCharts", buildAddAllPairsCallsJs(MDBLIST_OFFICIAL_CHARTS, "MDBList Charts", ""))}
@@ -19648,11 +19565,6 @@ async function startTraktDeviceLogin() {
 }
 
 let myPrivateTraktListsTimer = null;
-function scheduleMyPrivateTraktListsRefresh() {
-  clearTimeout(myPrivateTraktListsTimer);
-  myPrivateTraktListsTimer = setTimeout(runMyPrivateTraktLists, 200);
-}
-
 async function runMyPrivateTraktLists() {
   const box = document.getElementById('myPrivateTraktListsResult');
   if (!box) return;
@@ -20020,32 +19932,6 @@ function onTmdbKeyInputChanged() {
   }
   renderTmdbConnectStatus();
   scheduleMyTmdbListsRefresh();
-}
-
-async function testTmdbConnection() {
-  const input = document.getElementById('tmdbKeyInput');
-  const statusEl = document.getElementById('tmdbConnectStatus');
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  if (!key) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">Please enter your TMDB API Key or Access Token first.</span>';
-    return;
-  }
-  if (statusEl) statusEl.innerHTML = '<span style="color:var(--muted);">Testing TMDB connection\u2026</span>';
-  try {
-    const res = await fetch(ORIGIN + '/api/tmdb-search-lists?q=star&tmdbKey=' + encodeURIComponent(key));
-    const data = await res.json();
-    if (data.ok) {
-      localStorage.setItem('myListAddon:tmdbKey', key);
-      saveState();
-      if (statusEl) statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB API Key verified and active.</span>';
-      renderTmdbConnectStatus();
-      scheduleMyTmdbListsRefresh();
-    } else {
-      if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Invalid TMDB Key: ' + escapeHtml(data.error || 'Check your key and try again.') + '</span>';
-    }
-  } catch (e) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Network error testing TMDB key.</span>';
-  }
 }
 
 function startTmdbConnect() {
@@ -22996,31 +22882,6 @@ async function runUnifiedListImport() {
   if (resultBox) resultBox.innerHTML = summaryHtml;
 }
 
-
-function setListSearchFilter(filter, btn) {
-  if (btn) {
-    document.querySelectorAll('#listSearchTypeChips .subnav-pill').forEach(function(p) {
-      p.classList.remove('active');
-      const c = p.querySelector('.check-icon');
-      if (c) c.remove();
-    });
-    btn.classList.add('active');
-    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
-  }
-  const cards = document.querySelectorAll('#listSearchResult .list-card');
-  cards.forEach(function(card) {
-    const cardType = card.getAttribute('data-list-type') || 'movie';
-    if (filter === 'all') {
-      card.style.display = '';
-    } else if (filter === 'movie') {
-      card.style.display = (cardType === 'movie' || cardType === 'mixed') ? '' : 'none';
-    } else if (filter === 'series') {
-      card.style.display = (cardType === 'series' || cardType === 'mixed') ? '' : 'none';
-    } else {
-      card.style.display = '';
-    }
-  });
-}
 
 function guessNameFromUrl(u) {
   try {
@@ -31399,12 +31260,6 @@ async function spliceCrossoverEvent(eventId, btn) {
   }
 }
 
-function reverseChannelDraft() {
-  if (!channelDraftItems.length) return;
-  channelDraftItems.reverse();
-  renderChannelDraftList();
-}
-
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
   if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;
@@ -33385,36 +33240,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-async function runCustomListSearch() {
-  const q = document.getElementById('customListSearchInput').value.trim();
-  const searchType = document.getElementById('customListSearchType').value; // 'movie' or 'tv'
-  const box = document.getElementById('customListSearchResult');
-  if (!q) {
-    box.innerHTML = '';
-    return;
-  }
-  box.innerHTML = '<p><small>Searching\u2026</small></p>';
-  try {
-    fetch(ORIGIN + '/api/track-search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q }),
-      keepalive: true,
-    }).catch(() => {});
-  } catch (e) {}
-  try {
-    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=' + searchType, { cache: 'no-store' });
-    const data = await res.json();
-    if (!data.ok) {
-      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Search failed.') + '</p>';
-      return;
-    }
-    renderCustomListSearchResults(data.results, searchType);
-  } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error while searching.</p>';
-  }
-}
-
 function renderCustomListSearchResults(results, searchType) {
   const box = document.getElementById('customListSearchResult');
   if (!results.length) {
@@ -34142,11 +33967,6 @@ function updateCustomListSaveButtonLabel() {
 }
 
 
-
-function closeCreateListModal() {
-  document.getElementById('listsSubCreateList').style.display = 'none';
-  document.getElementById('listsSubMyLists').style.display = 'block';
-}
 
 function setCustomListDraftTypeToggle(type) {
   if (type === 'mixed') {
@@ -36273,11 +36093,6 @@ function getHiddenMyListsSections() {
   } catch (e) {
     return [];
   }
-}
-
-function isMyListsSectionHidden(section) {
-  if (!section) return false;
-  return getHiddenMyListsSections().includes(String(section));
 }
 
 // Applies the current hidden-sections state directly to each panel's own
@@ -41356,12 +41171,6 @@ function toggleLivePreviewEdit() {
   }
 }
 
-function toggleCompactView(btn) {
-  const container = document.getElementById('lists');
-  const isCompact = container.classList.toggle('compact');
-  btn.textContent = isCompact ? 'Full view' : 'Compact view';
-}
-
 function slugify(s) {
   return s.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'').slice(0,60);
 }
@@ -41416,55 +41225,6 @@ async function testSourceRow(btn) {
     resultEl.textContent = '\u2717 Network error testing this list.';
   } finally {
     btn.disabled = false;
-  }
-}
-
-// Runs every row's Test one panel at a time (well, CONCURRENCY at a time)
-// by just calling the exact same testSourceRow used for a single row --
-// same inline per-row result, same everything, just walking the whole
-// list instead of one button click. A summary alert at the end since
-// there's no single place on a long list where all the individual
-// testresult divs would be visible at once.
-async function testAllSources() {
-  const buttons = Array.from(document.querySelectorAll('#lists .btn-test'));
-  if (!buttons.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('No Lists', 'No lists to test yet -- add some above first.', false);
-    else alert('No lists to test yet -- add some above first.');
-    return;
-  }
-  const testAllBtn = document.getElementById('testAllBtn');
-  if (testAllBtn) {
-    testAllBtn.disabled = true;
-    testAllBtn.textContent = 'Testing all\u2026';
-  }
-
-  let idx = 0;
-  const CONCURRENCY = 4;
-  async function worker() {
-    while (idx < buttons.length) {
-      const i = idx++;
-      if (testAllBtn) testAllBtn.textContent = 'Testing all\u2026 (' + (i + 1) + '/' + buttons.length + ')';
-      await testSourceRow(buttons[i]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, buttons.length) }, () => worker()));
-
-  let okCount = 0;
-  let errCount = 0;
-  document.querySelectorAll('#lists .testresult').forEach((el) => {
-    if (el.classList.contains('ok')) okCount++;
-    else if (el.classList.contains('err')) errCount++;
-  });
-
-  if (testAllBtn) {
-    testAllBtn.disabled = false;
-    testAllBtn.textContent = 'Test all';
-  }
-  const summaryMsg = 'Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.';
-  if (typeof showAppAlert === 'function') {
-    showAppAlert(errCount > 0 ? 'Testing Complete (With Errors)' : 'Testing Complete', summaryMsg, errCount === 0);
-  } else {
-    alert(summaryMsg);
   }
 }
 
@@ -43780,20 +43540,6 @@ function rehydrateEntries(entries, customLists, channels) {
   return (entries || []).map((e) => rehydrateEntry(e, customLists, channels));
 }
 
-// Rows whose reference could not be resolved. Used to tell the person which
-// rows came back empty instead of letting them find out by scrolling past a
-// blank shelf.
-function unresolvedEntryNames(entries) {
-  const out = [];
-  (entries || []).forEach((e) => {
-    const split = splitPayloadUrl(e && e.url);
-    if (!split) return;
-    const p = split.payload;
-    if (p.itemsRef && !(Array.isArray(p.items) && p.items.length)) out.push(e.name || p.itemsRef);
-  });
-  return out;
-}
-
 window.dereferenceEntries = dereferenceEntries;
 window.rehydrateEntries = rehydrateEntries;
 
@@ -45640,12 +45386,6 @@ function copyLink(url) {
     }
     alert('Manifest URL: ' + url);
   });
-}
-
-function openInNuvio(installUrl, e) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(installUrl).catch(() => {});
-  }
 }
 
 async function generate() {

@@ -279,12 +279,6 @@ function toggleLivePreviewEdit() {
   }
 }
 
-function toggleCompactView(btn) {
-  const container = document.getElementById('lists');
-  const isCompact = container.classList.toggle('compact');
-  btn.textContent = isCompact ? 'Full view' : 'Compact view';
-}
-
 function slugify(s) {
   return s.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'').slice(0,60);
 }
@@ -339,55 +333,6 @@ async function testSourceRow(btn) {
     resultEl.textContent = '\u2717 Network error testing this list.';
   } finally {
     btn.disabled = false;
-  }
-}
-
-// Runs every row's Test one panel at a time (well, CONCURRENCY at a time)
-// by just calling the exact same testSourceRow used for a single row --
-// same inline per-row result, same everything, just walking the whole
-// list instead of one button click. A summary alert at the end since
-// there's no single place on a long list where all the individual
-// testresult divs would be visible at once.
-async function testAllSources() {
-  const buttons = Array.from(document.querySelectorAll('#lists .btn-test'));
-  if (!buttons.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('No Lists', 'No lists to test yet -- add some above first.', false);
-    else alert('No lists to test yet -- add some above first.');
-    return;
-  }
-  const testAllBtn = document.getElementById('testAllBtn');
-  if (testAllBtn) {
-    testAllBtn.disabled = true;
-    testAllBtn.textContent = 'Testing all\u2026';
-  }
-
-  let idx = 0;
-  const CONCURRENCY = 4;
-  async function worker() {
-    while (idx < buttons.length) {
-      const i = idx++;
-      if (testAllBtn) testAllBtn.textContent = 'Testing all\u2026 (' + (i + 1) + '/' + buttons.length + ')';
-      await testSourceRow(buttons[i]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, buttons.length) }, () => worker()));
-
-  let okCount = 0;
-  let errCount = 0;
-  document.querySelectorAll('#lists .testresult').forEach((el) => {
-    if (el.classList.contains('ok')) okCount++;
-    else if (el.classList.contains('err')) errCount++;
-  });
-
-  if (testAllBtn) {
-    testAllBtn.disabled = false;
-    testAllBtn.textContent = 'Test all';
-  }
-  const summaryMsg = 'Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.';
-  if (typeof showAppAlert === 'function') {
-    showAppAlert(errCount > 0 ? 'Testing Complete (With Errors)' : 'Testing Complete', summaryMsg, errCount === 0);
-  } else {
-    alert(summaryMsg);
   }
 }
 

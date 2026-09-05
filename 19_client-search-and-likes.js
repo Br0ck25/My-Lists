@@ -1,28 +1,3 @@
-function setListSearchFilter(filter, btn) {
-  if (btn) {
-    document.querySelectorAll('#listSearchTypeChips .subnav-pill').forEach(function(p) {
-      p.classList.remove('active');
-      const c = p.querySelector('.check-icon');
-      if (c) c.remove();
-    });
-    btn.classList.add('active');
-    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
-  }
-  const cards = document.querySelectorAll('#listSearchResult .list-card');
-  cards.forEach(function(card) {
-    const cardType = card.getAttribute('data-list-type') || 'movie';
-    if (filter === 'all') {
-      card.style.display = '';
-    } else if (filter === 'movie') {
-      card.style.display = (cardType === 'movie' || cardType === 'mixed') ? '' : 'none';
-    } else if (filter === 'series') {
-      card.style.display = (cardType === 'series' || cardType === 'mixed') ? '' : 'none';
-    } else {
-      card.style.display = '';
-    }
-  });
-}
-
 function guessNameFromUrl(u) {
   try {
     // Slug words a plain per-word title-case gets wrong -- known acronyms
