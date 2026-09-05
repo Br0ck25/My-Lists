@@ -106,6 +106,27 @@ const RECOVERY_ANSWER_MIN_LENGTH = 8;
 // happens to return. A w500 poster is tens of kilobytes.
 const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 
+// --- Daily failure budgets on the credential endpoints -----------------------
+//
+// /admin/login and /api/creator/restore each already carry a 60-second
+// per-IP bucket in KV. Those bound a burst, but KV reads are edge-cached and
+// KV has no atomic increment, so a determined caller can read a stale count
+// and slip past. That is acceptable as burst-shaping and NOT as the only
+// thing standing in front of a credential.
+//
+// So both also carry a per-IP DAILY budget, spent only on failures and
+// backed by D1's atomic upsert wherever D1 is bound (see noteAuthFailure,
+// 02_http-and-creator-utils.js). Successes never consume it, so a legitimate
+// admin or someone restoring on a run of new devices is unaffected; the
+// ceilings are set far above any plausible honest failure count and reset
+// daily on their own.
+//
+// The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
+// Creator Key is ~60 bits -- so this is defence in depth, not the load-
+// bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
+const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

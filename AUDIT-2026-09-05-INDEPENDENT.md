@@ -472,9 +472,25 @@ This affects `/admin/login` (10/min), `/api/creator/restore`, `/api/creator/rese
 credential behind them is strong enough that this is defence-in-depth. It is **not** acceptable for
 finding 2, where the credential is weak — which is why that one is rated Critical.
 
-**Fix.** Where a limiter is a real security control (reset-key, admin login, restore), back it with
-D1's atomic upsert — the pattern already exists in `d1BumpStat` (`03_admin.js`) — or Durable Objects,
-and `await` the write. Leave the KV version for abuse-shaping on the cheap endpoints.
+**Fix (applied).** All three credential endpoints now carry a **daily failure budget** alongside their
+60-second bucket, spent only on failures and backed by D1's atomic upsert wherever D1 is bound:
+reset-key per account (finding 2), `/admin/login` at 50/day/IP, `/api/creator/restore` at 100/day/IP.
+The KV buckets stay as burst-shaping.
+
+The gap this closes is not really staleness — it is that a 60-second window **resets every minute**,
+so across rolling windows it bounded nothing at all. Measured: one IP made 54 wrong-key attempts at
+`/admin/login` and 101 at `/api/creator/restore` before the daily budget stopped it; previously
+neither ever stopped. Successes never consume the budget, verified with 60 consecutive successful
+admin logins from one IP — a budget the admin could exhaust by logging in would lock out the one
+person able to fix it.
+
+Two things from this finding are **not** changed, deliberately. `consumeRateLimit`'s
+`ctx.waitUntil` write stays fire-and-forget: it guards only the abuse-shaping buckets
+(recommendations, details-batch, bulk-resolve), and every credential-guarding limiter already
+`await`s its write. And no per-minute D1 bucket was introduced — it would mean one row per (IP,
+minute) with nothing to clean them up, which is a worse problem than the one it solves.
+
+Five regression tests; the three asserting the fix confirmed failing against the pre-fix code.
 
 ---
 
@@ -828,7 +844,7 @@ byte-exact concatenation, CI-gated against drift.
 ### `02_http-and-creator-utils.js`
 - ✅ `rebuildPublicListIndex:1480` — **DONE.** Chunked, resumable, budget-bounded; records read with bounded concurrency. **(Finding 1)**
 - ✅ `applyLikeVote:1283` — **DONE.** Retry kept but gated on evidence of another writer. **(9)**
-- 🟡 `consumeRateLimit:1234` — `await` the write; move security-critical buckets to D1. **(7)**
+- ✅ `consumeRateLimit:1234` — **DONE.** Credential endpoints gained D1-atomic daily failure budgets; the KV buckets stay as burst-shaping. **(7)**
 - 🔵 `timingSafeEqualHex:346` — compare fixed-length digests, not raw lengths. **(12)**
 - 🔵 comment at `:45` — the CI step it cites does not exist; add the check. **(11)**
 
@@ -875,7 +891,7 @@ byte-exact concatenation, CI-gated against drift.
 ~~5. Rate-limit bypass (5)~~ — **DONE** · ~~6. SRI on the CDN script (6)~~ — **DONE**
 
 **🟡 PHASE 3 — RELIABILITY / CLEANUP**
-7. D1-backed limiters (7) · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
+~~7. D1-backed limiters (7)~~ — **DONE** · 8. Scoped scrobble token (8) · ~~9. Like-ledger consistency (9)~~ — **DONE** ·
 ~~10. `channel-logo` caching + size cap~~ — **DONE** · 11. TTL/sweep for anonymous records
 
 **🔵 PHASE 4 — OPTIONAL**
@@ -951,7 +967,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 5. ~~**Authorize `threadId` appends and stop trusting `senderName`.**~~ — **DONE.** (4)
 6. ~~**Always rate-limit `/api/recommendations` and `/api/details/batch`.**~~ — **DONE.** (5)
 7. ~~**Add SRI to the fflate `<script>`.**~~ — **DONE.** (6)
-8. **Move the reset-key and admin-login limiters onto D1's atomic upsert.** (7)
+8. ~~**Move the reset-key and admin-login limiters onto D1's atomic upsert.**~~ — **DONE.** (7)
 9. ~~**Cap and cache `/api/channel-logo`**~~ — **DONE.** TTL/sweep for `/api/save` + `/api/publish-list` keys still open.
 10. **Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.
 

@@ -156,6 +156,27 @@ const RECOVERY_ANSWER_MIN_LENGTH = 8;
 // happens to return. A w500 poster is tens of kilobytes.
 const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 
+// --- Daily failure budgets on the credential endpoints -----------------------
+//
+// /admin/login and /api/creator/restore each already carry a 60-second
+// per-IP bucket in KV. Those bound a burst, but KV reads are edge-cached and
+// KV has no atomic increment, so a determined caller can read a stale count
+// and slip past. That is acceptable as burst-shaping and NOT as the only
+// thing standing in front of a credential.
+//
+// So both also carry a per-IP DAILY budget, spent only on failures and
+// backed by D1's atomic upsert wherever D1 is bound (see noteAuthFailure,
+// 02_http-and-creator-utils.js). Successes never consume it, so a legitimate
+// admin or someone restoring on a run of new devices is unaffected; the
+// ceilings are set far above any plausible honest failure count and reset
+// daily on their own.
+//
+// The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
+// Creator Key is ~60 bits -- so this is defence in depth, not the load-
+// bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
+const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -54359,6 +54380,17 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Too many attempts. Please wait a minute and try again." }, 429);
       }
       await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+      // Same reasoning as /admin/login: the 60s bucket shapes a burst, this
+      // daily budget is what actually bounds guessing at a Creator Key over
+      // time. Spent on failures only, so restoring on a run of new devices
+      // costs nothing.
+      const restoreFailScope = `restore:${ip}`;
+      const restoreFailDay = statsToday();
+      if (await readAuthFailureCount(env, restoreFailScope, restoreFailDay) >= CREATOR_RESTORE_MAX_FAILURES_PER_DAY) {
+        return json({ ok: false, error: "Too many failed attempts today. Please try again tomorrow." }, 429);
+      }
+
       let body;
       try {
         body = await request.json();
@@ -54366,7 +54398,10 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) {
+        if (auth.error !== "no-kv") await noteAuthFailure(env, restoreFailScope, restoreFailDay);
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
       return json({ ok: true, creatorName: auth.username, displayName: auth.displayName });
     }
 
@@ -57059,6 +57094,10 @@ self.addEventListener('fetch', e => {
       // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
       // missing, same as restore, because there is no other safe
       // per-client identity to key a shared bucket on.
+      // Set inside the KV branch below and read again after the compare, so
+      // only a genuine wrong key spends the daily budget.
+      let adminLoginFailScope = "";
+      let adminLoginFailDay = "";
       if (env.CONFIGS) {
         const ip = clientIpKey(request);
         if (!ip) {
@@ -57076,6 +57115,19 @@ self.addEventListener('fetch', e => {
           });
         }
         await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+        // The 60s bucket above shapes a burst but leans on a KV counter that
+        // is edge-cached and non-atomic, so it is not the only thing that
+        // should stand in front of ADMIN_KEY. This daily budget is spent on
+        // failures only and is atomic wherever D1 is bound.
+        adminLoginFailScope = `adminlogin:${ip}`;
+        adminLoginFailDay = statsToday();
+        if (await readAuthFailureCount(env, adminLoginFailScope, adminLoginFailDay) >= ADMIN_LOGIN_MAX_FAILURES_PER_DAY) {
+          return new Response(renderAdminLoginPage("Too many failed attempts today. Please try again tomorrow."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
       }
       let submittedKey = "";
       try {
@@ -57085,6 +57137,10 @@ self.addEventListener('fetch', e => {
         // falls through with an empty key, which will fail the compare below
       }
       if (!timingSafeEqualHex(submittedKey, env.ADMIN_KEY)) {
+        // Failures only -- a correct key must never spend the budget that
+        // protects it, or an admin who logs in often would lock themselves
+        // out.
+        if (adminLoginFailScope) await noteAuthFailure(env, adminLoginFailScope, adminLoginFailDay);
         return new Response(renderAdminLoginPage("Incorrect key."), {
           status: 401,
           headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },

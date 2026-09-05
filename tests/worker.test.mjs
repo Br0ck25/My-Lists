@@ -595,6 +595,77 @@ describe("audit fix: the channel image endpoints are bounded and cacheable", () 
   });
 });
 
+// The 60-second per-IP buckets on /admin/login and /api/creator/restore bound
+// a burst, but they are KV counters -- edge-cached reads, no atomic increment
+// -- and they reset every minute, so across rolling windows they placed no
+// bound at all on how many guesses one address could make in a day. Both now
+// also carry a daily failure budget, spent only on failures and atomic
+// wherever D1 is bound.
+describe("audit fix: credential endpoints bound guesses across rolling windows", () => {
+  // Deleting the 60s key is what a real attacker gets for free by waiting:
+  // the short window rolls over, and only the daily budget accumulates.
+  async function rollWindow(env, key) { await env.CONFIGS.delete(key); }
+
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`bounds admin-login guessing across rolling 60s windows (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      let attempted = 0;
+      let blocked = false;
+      for (let round = 0; round < 15 && !blocked; round++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        for (let i = 0; i < 9; i++) {
+          const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+          attempted++;
+          if (r.status === 429) { blocked = true; break; }
+        }
+      }
+      assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+    });
+
+    it(`never spends the admin budget on a correct key (${label})`, async () => {
+      // A budget that successes consume would lock out the one person who
+      // can fix it.
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      for (let i = 0; i < 60; i++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: env.ADMIN_KEY } });
+        assert.equal(r.status, 302, `login ${i + 1} was refused -- successes are spending the budget`);
+      }
+    });
+  }
+
+  it("bounds creator-restore guessing, and leaves the real key working", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const alice = await createUser(env, "alicerestorecap");
+    const ip = nextIp();
+    let attempted = 0;
+    let blocked = false;
+    for (let round = 0; round < 20 && !blocked; round++) {
+      await rollWindow(env, `ratelimit:creatorrestore:${ip}`);
+      for (let i = 0; i < 19; i++) {
+        const r = await call(env, "/api/creator/restore", {
+          method: "POST", ip,
+          json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+        });
+        attempted++;
+        if (r.status === 429) { blocked = true; break; }
+      }
+    }
+    assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+
+    const good = await call(env, "/api/creator/restore", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(good.body.ok, true, `the real key stopped working: ${good.body.error}`);
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();
