@@ -12,10 +12,8 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 13 of 16 findings closed** (all 4 production blockers, the client-bundle
-duplicate-declaration class, the shared-key fan-out endpoints, the admin Community Lists
-panel, the counter atomicity, outbound timeouts, the per-ping N+1,
-account-purge completeness, the undocumented secret, and the build-header fragility).
+**Progress: 15 of 16 findings closed** — plus the dead-code list. The only item left is 9b,
+carved out of finding 9 and deliberately deferred (see below). 
 
 ---
 
@@ -34,6 +32,9 @@ account-purge completeness, the undocumented secret, and the build-header fragil
 | 14 | `MDBLIST_CLIENT_SECRET` required but documented nowhere | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 14` (2 tests, incl. an all-env-vars guard) |
 | 9 | Stat counters were non-atomic read-modify-writes; 20 concurrent requests recorded as 1 | 🟠 Med-High | 2026-09-05 | `7321e7c` | `audit fix 9` (6 tests) |
 | 13 | No timeout on any of ~135 outbound fetches; the stale-fallback tiers only fire on rejection, so a hang was never covered | 🟠 Medium | 2026-09-05 | `f9a439b` | `audit fix 13` (5 tests) |
+| 7 | ~45 handlers returned a raw exception message | 🟡 Low | 2026-09-05 | `ceb226f` | `audit fix 7` (7 tests) |
+| 15 | `FUNCTION-MAP.md` line numbers 26% stale | 🟡 Low | 2026-09-05 | `ceb226f` | `verify.sh` step 5 + CI drift check |
+| 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | 2026-09-05 | `ceb226f` | documented in README (forced by webhook senders) |
 | 11 | Every playback ping read every list the creator owns, uncursored | 🟠 Medium | 2026-09-05 | `f9a439b` | `audit fix 11` (1 test) |
 | 12 | Account deletion left like ledgers behind, so a recycled username inherited a stranger's like count | 🟠 Low-Med | 2026-09-05 | `f9a439b` | `audit fix 12` (2 tests) |
 
@@ -131,17 +132,19 @@ The watchlist has a canonical key (`creatorlist:{user}:watchlist`, written by sa
 **12 — account purge** (`02_`)
 `listlikevoters:{user}:{slug}` and `scrobbleseenusers:{user}` were never deleted. The ledger was the harmful one: `delete-account` frees the username for re-registration, so whoever claimed it next and picked the same slug inherited the previous owner's like count — and every voter in the old ledger was silently unable to like it. There is a test driving that end to end. Also corrected `creatortrack:{user}`, which sat under the "legacy names" heading but is live (written by `handleSubtitlesTrack`, read by `/api/creator/track-status`).
 
+**7 / 15 / 6 / dead code — the cleanup pass**
+- **Error hygiene (7):** 45 sites now go through `safeErrorMessage`, which *keeps* the message (a surfaced HTTP 401 is how a user learns their key is wrong — blanking it would be a product regression), logs the original, and strips URLs, labelled key/token parameters and long opaque tokens. Writing the tests found a flaw in the sanitizer itself: an `Error` with an empty message fell through to `String(err)` and surfaced the literal word "Error". Fixed.
+- **FUNCTION-MAP (15):** regenerated (825 symbols, 0 wrong, from 211/811 wrong) and now drift-checked by `verify.sh` and CI, the same way the combined Worker is. Confirmed the check fails on real drift.
+- **Scrobble key in URL (6):** documented, not redesigned — the webhook senders cannot attach headers, so the key has to be in the URL. The README now says so, warns it lands in logs, and points at key rotation.
+- **Dead code:** the 4 server functions removed after re-verifying each was referenced only by its own definition.
+
 ---
 
-## ⬜ Open — next up, in recommended order
+## ⬜ Open — one item, deliberately deferred
 
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
 | 9b | `recordTrackedEvent` / `recordSearchQuery` still use KV read-modify-write | 🟡 Low | `03_admin.js` | Carved out of finding 9: they store a JSON day-map blob plus a capped index array, so D1 means a schema redesign, not the same upsert. Read fan-out is already capped, so the leaderboards undercount rather than break. |
-| 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | `26_:~448` | Largely forced (Plex/Jellyfin webhooks can't set headers). Fix = document the trade and the rotation path, don't redesign. |
-| 7 | ~40 handlers return raw `String(err.message)` | 🟡 Low | `25_`, `26_` | Leaks nothing today (all `throw`s are status-only) but contradicts the policy stated at `/api/bulk-resolve`. |
-| 15 | `FUNCTION-MAP.md` line numbers 26% stale (211 of 811) | 🟡 Low | `FUNCTION-MAP.md`, `gen_map.py` | Nothing regenerates or validates it. Fix = add to `verify.sh`/CI, or drop line numbers. |
-| — | Dead code: 4 unreferenced server functions | 🟡 Low | see audit "Dead Code" | `classifyTraktListContentType` (`04_`), `getPaddedChannelLogo` (`05_`), `fetchTrailerForImdb` (`07_`), `getProviderIconBadge` (`08_`). The 4 shadowed *client* duplicates were removed with finding 8. Deleting these makes `FUNCTION-MAP.md` staler, so pair it with finding 15. |
 
 ---
 
