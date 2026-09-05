@@ -945,7 +945,10 @@ async function fetchWithPerUserCacheUncoalesced({
   }
 
   try {
-    const freshData = await fetchFn();
+    // Bounded, so a provider that hangs rather than failing still reaches
+    // the fallback tiers below instead of holding the request open -- see
+    // withTimeout's own comment.
+    const freshData = await withTimeout(fetchFn(), OUTBOUND_TIMEOUT_MS, providerLabel);
     if (freshData !== null && freshData !== undefined) {
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
       
@@ -1007,8 +1010,73 @@ async function fetchWithPerUserCacheUncoalesced({
   return null;
 }
 
+// --- Outbound request timeouts -----------------------------------------------
+//
+// Nothing in this add-on used to bound how long a provider could take. The
+// multi-tier fallback in fetchWithPerUserCacheUncoalesced above (memory ->
+// KV -> edge cache -> stale) is good, but it only ever fires on a
+// REJECTION: a provider that accepts the connection and then never
+// responds produced no rejection at all, so the request simply hung and
+// the stale data sitting right there was never served.
+//
+// Two places are enough to cover essentially every outbound call, rather
+// than editing ~135 individual fetch() sites:
+//   * fetchWithTimeout, used by the shared retry helper below, aborts the
+//     underlying request.
+//   * withTimeout, wrapped around the circuit breaker's fetchFn, turns a
+//     hang into the rejection the fallback tiers already know how to
+//     handle -- so a stalled provider now degrades to last-known-good data
+//     instead of a spinner.
+//
+// 10s is chosen against what the callers are: catalog and metadata reads
+// that a Stremio/wako client is actively waiting on. A provider that has
+// not answered in ten seconds is not about to make the request feel fast;
+// serving slightly stale data is strictly better than holding the
+// connection open.
+const OUTBOUND_TIMEOUT_MS = 10000;
+
+// AbortSignal.timeout exists in the Workers runtime, but this also runs
+// inside render_check.js's sandbox (which deliberately provides a minimal
+// global set) and in tests that stub fetch -- so the capability is probed
+// rather than assumed, and its absence just means no signal.
+function timeoutSignal(ms) {
+  try {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return AbortSignal.timeout(ms);
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+async function fetchWithTimeout(url, options = {}, ms = OUTBOUND_TIMEOUT_MS) {
+  // A caller that already manages its own signal keeps it.
+  if (options && options.signal) return fetch(url, options);
+  const signal = timeoutSignal(ms);
+  return fetch(url, signal ? { ...options, signal } : options);
+}
+
+// Rejects if `promise` has not settled within `ms`. Used where the work is
+// a caller-supplied closure rather than a single fetch (see the circuit
+// breaker's fetchFn), so an AbortSignal cannot be threaded in directly.
+// The underlying request is not cancelled here -- the point is to stop
+// WAITING on it, so the fallback tiers can serve.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label || "Upstream"} did not respond within ${ms}ms`)),
+      ms
+    );
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 async function fetchTraktWithRetry(url, options = {}, retries = 2) {
-  let res = await fetch(url, options);
+  let res = await fetchWithTimeout(url, options);
   if (res.status === 429 && retries > 0) {
     const retrySec = parseInt((res.headers && res.headers.get("Retry-After")) || "1", 10);
     const jitter = Math.floor(Math.random() * 500);
@@ -1545,7 +1613,20 @@ async function purgeCreatorData(env, username, options = {}) {
         await env.CONFIGS.delete(k.name);
         // Drop it from the directory index too, or a deleted account's
         // lists keep appearing publicly until the next full rebuild.
-        purgedListIds.push("c:" + k.name.slice("creatorlist:".length));
+        const listPath = k.name.slice("creatorlist:".length);
+        purgedListIds.push("c:" + listPath);
+        // And the list's like ledger, keyed listlikevoters:{user}:{slug}
+        // (see applyLikeVote's call site in /api/lists/like). These used to
+        // survive the account: because delete-account frees the username for
+        // re-registration, whoever claimed it next and made a list with the
+        // same slug inherited the previous owner's ledger -- a like count
+        // they never earned, and every voter in the old ledger silently
+        // unable to like it.
+        try {
+          await env.CONFIGS.delete(`listlikevoters:${listPath}`);
+        } catch (e) {
+          // best-effort: a stranded ledger is untidy, not harmful on its own
+        }
         listsCleared++;
       }
       if (res.list_complete || !res.cursor) break;
@@ -1591,8 +1672,14 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
-    // legacy names, harmless if absent
+    // Playback diagnostics (handleSubtitlesTrack writes it,
+    // /api/creator/track-status reads it) and the scrobble seen-user set
+    // (handleMediaServerScrobble). Both are live keys, not legacy ones --
+    // creatortrack: was previously listed under the legacy heading below,
+    // which was simply wrong about it.
     `creatortrack:${u}`,
+    `scrobbleseenusers:${u}`,
+    // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,
     `creatorprofile:${u}`,

@@ -1992,3 +1992,133 @@ describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
     assert.match(r.text, /<div class="stat-value">1<\/div>/);
   });
 });
+
+
+describe("audit fix 13: outbound requests are bounded by a timeout", () => {
+  it("wires a timeout signal into the shared fetch helper", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let sawSignal = false;
+    sandbox.fetch = async (_url, opts) => { sawSignal = !!(opts && opts.signal); return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: (ms) => ({ __timeoutMs: ms }) };
+    await sandbox.fetchTraktWithRetry("https://api.trakt.tv/x", {});
+    assert.equal(sawSignal, true, "fetchTraktWithRetry must pass an abort signal");
+  });
+
+  it("leaves a caller's own signal alone", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    const mine = { mine: true };
+    let seen = null;
+    sandbox.fetch = async (_url, opts) => { seen = opts.signal; return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: () => ({ __timeout: true }) };
+    await sandbox.fetchWithTimeout("https://x/", { signal: mine });
+    assert.equal(seen, mine);
+  });
+
+  it("still works where AbortSignal.timeout is unavailable", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let called = false;
+    sandbox.fetch = async () => { called = true; return { status: 200 }; };
+    // No AbortSignal in this sandbox at all -- the capability is probed,
+    // not assumed (render_check.js's sandbox omits it).
+    await sandbox.fetchWithTimeout("https://x/", {});
+    assert.equal(called, true);
+  });
+
+  it("turns a hung upstream into a rejection so the stale fallback can serve", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    // loadSourceFunctions' sandbox is deliberately minimal; the Workers
+    // runtime provides these.
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    const hang = new Promise(() => {});          // never settles
+    await assert.rejects(
+      () => sandbox.withTimeout(hang, 20, "TMDB"),
+      /TMDB did not respond within 20ms/
+    );
+  });
+
+  it("passes a value straight through when it settles in time", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    assert.equal(await sandbox.withTimeout(Promise.resolve("ok"), 1000, "TMDB"), "ok");
+  });
+});
+
+describe("audit fix 11: a playback ping does not read every list the creator owns", () => {
+  it("reads the watchlist directly instead of scanning", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "pinguser");
+    // One watchlist plus a pile of unrelated lists.
+    await env.CONFIGS.put("creatorlist:pinguser:watchlist", JSON.stringify({
+      slug: "watchlist", name: "Watchlist", type: "movie", visibility: "private",
+      items: [{ id: "tt111" }, { id: "tt222" }],
+    }));
+    for (let i = 0; i < 40; i++) {
+      await env.CONFIGS.put(`creatorlist:pinguser:other-${i}`, JSON.stringify({
+        slug: `other-${i}`, name: "Other " + i, type: "movie", visibility: "private", items: [{ id: "tt999" }],
+      }));
+    }
+
+    let gets = 0;
+    const og = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+
+    const config = Buffer.from(JSON.stringify({
+      entries: [], track: true, trackCreatorName: alice.creatorName, trackCreatorKey: alice.creatorKey,
+    })).toString("base64url");
+    await call(env, `/${config}/subtitles/movie/tt111.json`);
+
+    // Before: one list() plus one get() per list (41 here) on every ping.
+    assert.ok(gets < 15, `expected a handful of KV reads per ping, got ${gets}`);
+    const wl = JSON.parse(env.CONFIGS._store.get("creatorlist:pinguser:watchlist"));
+    assert.deepEqual(wl.items.map((i) => i.id), ["tt222"], "the watched item should still be removed");
+  });
+});
+
+describe("audit fix 12: deleting an account leaves nothing behind", () => {
+  it("removes the like ledger and the scrobble seen-user set", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "purgeuser");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Fav Films", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    await call(env, "/api/lists/like", { method: "POST", json: { username: "purgeuser", slug: "fav-films", action: "like" } });
+    await env.CONFIGS.put("scrobbleseenusers:purgeuser", JSON.stringify(["someone"]));
+    await env.CONFIGS.put("creatortrack:purgeuser", JSON.stringify({ lastPingAt: 1 }));
+    assert.ok(env.CONFIGS._store.has("listlikevoters:purgeuser:fav-films"), "precondition: ledger exists");
+
+    const r = await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+    assert.equal(r.body.ok, true);
+
+    const leftovers = [...env.CONFIGS._store.keys()].filter((k) => k.includes("purgeuser"));
+    assert.deepEqual(leftovers, [], `nothing should reference the deleted account, found: ${leftovers.join(", ")}`);
+  });
+
+  it("does not let a recycled username inherit the old like count", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 3; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    }
+    await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+
+    // Someone else claims the freed username and happens to pick the same slug.
+    const bob = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt9" }],
+    }});
+    const like = await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    assert.equal(like.body.likes, 1, "a brand-new list must start from zero, not inherit the old ledger");
+  });
+});

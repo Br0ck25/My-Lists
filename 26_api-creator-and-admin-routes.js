@@ -405,21 +405,46 @@
           }
         }
 
-        // Auto-remove watched item from user's Creator Watchlist if present
+        // Auto-remove watched item from user's Creator Watchlist if present.
+        //
+        // This used to enumerate the account's whole creatorlist: prefix and
+        // then GET every single list, on EVERY playback ping, just to find
+        // the one named "Watchlist" -- so the cost of a ping scaled with how
+        // many lists the person owns. The enumeration also had no cursor, so
+        // past a thousand lists it silently stopped looking.
+        //
+        // The watchlist has a canonical key: /api/creator/sync/save-tracking
+        // writes creatorlist:{user}:watchlist directly, and slugifyServer
+        // turns any list actually named "Watchlist" into that same slug. So
+        // the common path is one GET. The scan survives only as a fallback
+        // for the shapes the old loop also accepted (an isWatchlist flag, or
+        // a name that slugified differently), and is now paged and bounded
+        // rather than silently truncating.
         try {
-          const listKeys = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:` });
-          for (const k of (listKeys.keys || [])) {
-            const rawList = await env.CONFIGS.get(k.name);
-            if (!rawList) continue;
+          const removeWatchedFrom = async (key, rawList) => {
+            if (!rawList) return;
             const l = JSON.parse(rawList);
-            const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
-            if (isWatchlist && Array.isArray(l.items) && l.items.length) {
-              const initLen = l.items.length;
-              l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
-              if (l.items.length !== initLen) {
-                l.updatedAt = Date.now();
-                await env.CONFIGS.put(k.name, JSON.stringify(l));
-              }
+            if (!Array.isArray(l.items) || !l.items.length) return;
+            const initLen = l.items.length;
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId) !== imdbId && String(it.showId || '') !== imdbId);
+            if (l.items.length !== initLen) {
+              l.updatedAt = Date.now();
+              await env.CONFIGS.put(key, JSON.stringify(l));
+            }
+          };
+
+          const canonicalKey = `creatorlist:${auth.username}:watchlist`;
+          const canonicalRaw = await env.CONFIGS.get(canonicalKey);
+          if (canonicalRaw) {
+            await removeWatchedFrom(canonicalKey, canonicalRaw);
+          } else {
+            const listKeys = await listAllKeys(env.CONFIGS, `creatorlist:${auth.username}:`, 200);
+            for (const k of (listKeys.keys || [])) {
+              const rawList = await env.CONFIGS.get(k.name);
+              if (!rawList) continue;
+              const l = JSON.parse(rawList);
+              const isWatchlist = l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist;
+              if (isWatchlist) await removeWatchedFrom(k.name, rawList);
             }
           }
         } catch {}
