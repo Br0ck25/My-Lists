@@ -33,23 +33,11 @@ function isAllowedPosterUrl(raw) {
 }
 
 async function handleFetch(request, env, ctx) {
-    // Populate the env-backed API key globals declared in 00_constants.js
-    // for this request. Every helper function elsewhere in this add-on
-    // already references these five by name (TMDB_API_KEY, TRAKT_CLIENT_ID,
-    // etc.) -- this is the one place, run first, that actually connects
-    // them to whatever this Worker owner configured (or left unset, which
-    // is fine: every feature gated on one of these degrades to a clear
-    // in-app error message rather than a crash -- see each one's usage for
-    // that message). `|| ""` guards against `env` not having the property
-    // at all, same as a missing Worker secret/var normally reads as
-    // undefined rather than an empty string.
-    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
-    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
-    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
-    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
-    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
-    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
-    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+    // Point the env-backed API key globals (00_constants.js) at whatever
+    // this Worker owner configured, before anything can read them. A feature
+    // whose key is unset degrades to a clear in-app message rather than
+    // crashing -- see each key's usage for that message.
+    applyEnvApiKeys(env);
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -880,18 +868,24 @@ self.addEventListener('fetch', e => {
 
     // /api/channel-poster -> Returns branded SVG channel poster or landscape backdrop
     if (path === "/api/channel-poster") {
-      const name = url.searchParams.get("name") || "TV Channel";
+      // Bounded: the name is rendered into the SVG, and wrapSvgText does not
+      // break a single long word, so an unbounded value just inflates the
+      // response. 200 is far past any real channel name.
+      const name = (url.searchParams.get("name") || "TV Channel").slice(0, 200);
       const bg = url.searchParams.get("bg") || "";
       const format = url.searchParams.get("format") || "";
       const svg = format === "landscape"
         ? generateChannelBackdropSvg(name, bg)
         : generateChannelPosterSvg(name, bg);
+      // Deterministic for a given name/bg/format -- it is text on a
+      // generated background, with no per-viewer or time-varying content --
+      // so there is nothing to keep fresh. It was marked no-store, which
+      // meant every request re-rendered it at the edge and at the client for
+      // an image that never changes.
       return new Response(svg, {
         headers: {
           "Content-Type": "image/svg+xml; charset=utf-8",
-          "Cache-Control": "no-cache, no-store, must-revalidate",
-          "Pragma": "no-cache",
-          "Expires": "0",
+          "Cache-Control": "public, max-age=86400",
           ...corsHeaders(),
         },
       });
@@ -973,6 +967,14 @@ self.addEventListener('fetch', e => {
       const logoPath = url.searchParams.get("path");
       const format = url.searchParams.get("format") || "";
       if (!logoPath) return new Response("Missing path", { status: 400 });
+      // Only something shaped like a TMDB image path. The value is
+      // interpolated into an image.tmdb.org URL, and while URL parsing keeps
+      // the host pinned there (so this was never SSRF), an unvalidated path
+      // still made this a general fetch-and-base64 proxy for that host,
+      // reachable by anyone, for any path they cared to name.
+      if (!/^\/?[A-Za-z0-9._-]{1,128}\.(png|jpg|jpeg|webp|svg)$/i.test(logoPath)) {
+        return new Response("Bad path", { status: 400 });
+      }
       try {
         const tmdbUrl = `https://image.tmdb.org/t/p/w500${logoPath.startsWith("/") ? logoPath : "/" + logoPath}`;
         const tmdbRes = await fetch(tmdbUrl, {
@@ -980,8 +982,23 @@ self.addEventListener('fetch', e => {
           cf: { cacheTtl: 604800, cacheEverything: true },
         });
         if (!tmdbRes.ok) return new Response("Image not found", { status: 404 });
+        // Bound what gets buffered and base64'd. A w500 poster is tens of
+        // kilobytes; anything far past that is not a logo, and this endpoint
+        // holds the whole thing in memory twice (bytes, then a binary string)
+        // before encoding it.
+        const declaredLength = parseInt(tmdbRes.headers.get("content-length") || "", 10);
+        if (Number.isFinite(declaredLength) && declaredLength > CHANNEL_LOGO_MAX_BYTES) {
+          return new Response("Image too large", { status: 413 });
+        }
         const arrayBuffer = await tmdbRes.arrayBuffer();
+        if (arrayBuffer.byteLength > CHANNEL_LOGO_MAX_BYTES) {
+          // No content-length header, or it lied.
+          return new Response("Image too large", { status: 413 });
+        }
         const contentType = tmdbRes.headers.get("content-type") || "image/png";
+        // Escaped because it lands in an SVG attribute and comes from an
+        // upstream response header rather than from this Worker.
+        const safeContentType = escapeXml(contentType.split(";")[0].trim() || "image/png");
         const bytes = new Uint8Array(arrayBuffer);
         let binary = "";
         const len = bytes.byteLength;
@@ -989,7 +1006,7 @@ self.addEventListener('fetch', e => {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64 = btoa(binary);
-        const dataUri = `data:${contentType};base64,${base64}`;
+        const dataUri = `data:${safeContentType};base64,${base64}`;
 
         const svg = format === "landscape"
           ? `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="338" viewBox="0 0 600 338">
@@ -1031,12 +1048,16 @@ self.addEventListener('fetch', e => {
   </g>
 </svg>`;
 
+        // Deterministic for a given path/format, and callers already append
+        // their own `v` cache-buster (see getPremadeChannelLogo,
+        // 05_catalog-core.js), so this can be cached hard. It was no-store,
+        // which meant every single request re-fetched the image from TMDB
+        // and re-base64'd it -- the whole cost of this endpoint, repeated
+        // for output that cannot change.
         return new Response(svg, {
           headers: {
             "Content-Type": "image/svg+xml; charset=utf-8",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
+            "Cache-Control": "public, max-age=604800, immutable",
             ...corsHeaders(),
           },
         });
@@ -1736,17 +1757,27 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
-      // Up to 24 ids, each costing a find + a recommendations call, so a
-      // single request is ~48 TMDB calls. Limited only when it falls back
-      // to the shared key, same reasoning as /api/details/batch above.
-      // The Discover tab issues one of these per load, so 30/minute is far
-      // more than any real session needs.
-      if (!body.tmdbKey) {
-        const recIp = clientIpKey(request);
-        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
-        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
-          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
-        }
+      // Up to 24 ids, each costing a find + a recommendations call (and a
+      // similar call when recommendations comes back empty), so a single
+      // request is up to ~72 outbound subrequests.
+      //
+      // This used to skip the limit ENTIRELY whenever the body carried a
+      // tmdbKey, on the reasoning that a caller spending their own quota
+      // needs no protecting. True of TMDB's quota; not true of this
+      // Worker's. The field was never validated, so `tmdbKey: "x"` bought
+      // unlimited invocations of that fan-out against this deployment's own
+      // subrequest, CPU and billing budget -- measured at 0 of 40 requests
+      // blocked, versus 10 of 40 without the field.
+      //
+      // So: always limited, only the ceiling differs. A visitor who really
+      // has their own key gets far more headroom (they are not competing for
+      // the shared key), while the endpoint stops being an open amplifier.
+      // The Discover tab issues one of these per load, so even 30/minute is
+      // well beyond what a real session needs.
+      const recIp = clientIpKey(request);
+      if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+      if (await consumeRateLimit(env, ctx, "recommendations", recIp, body.tmdbKey ? 120 : 30)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
       }
 
       const [movieLists, showLists] = await Promise.all([
@@ -4664,10 +4695,36 @@ self.addEventListener('fetch', e => {
       const allowedCategories = new Set(["bug", "improvement", "idea", "other"]);
       const category = allowedCategories.has(body.category) ? body.category : "other";
       const contact = String(body.contact || "").trim().slice(0, 200);
-      const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+      const claimedCreator = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
+
+      // A claimed creatorName used to be recorded, and rendered in the admin
+      // panel as the sender, on nothing but the caller's say-so -- so anyone
+      // could file or answer feedback wearing someone else's name. It is now
+      // proven before it is stored anywhere.
+      //
+      // An unprovable claim is DROPPED, not rejected. This is the support
+      // channel: the person whose key stopped working is exactly the person
+      // who needs to reach support, and 401ing them here would close the one
+      // door they have left. Their message still goes through, just as an
+      // anonymous one -- which is all "we could not verify who you are"
+      // honestly supports. (Replying to a thread that already belongs to an
+      // account is the separate, stricter case, handled below.)
+      //
+      // The admin panel is the one exemption: its "Log something yourself"
+      // button posts creatorName:"admin" with fromAdminPanel:true and no key
+      // (see submitAdminFeedback, 03_admin.js), and "admin" is a marker that
+      // feedbackCardHtml keys off, not a Creator Profile to authenticate.
+      let authedCreator = null;
+      if (!isAdmin && claimedCreator) {
+        const auth = await authenticateCreator(claimedCreator, body.creatorKey ? String(body.creatorKey) : "");
+        if (auth.ok) authedCreator = auth.username;
+      }
+      // What actually gets stored: the admin marker, a proven username, or
+      // nothing. Never the raw claim.
+      const creatorName = isAdmin ? claimedCreator : authedCreator;
       let rateLimitKey = null;
       let rateCount = 0;
       if (!isAdmin) {
@@ -4683,10 +4740,42 @@ self.addEventListener('fetch', e => {
 
       // If replying to an existing thread
       if (threadId) {
+        let entry = null;
         try {
           const raw = await env.CONFIGS.get(`feedback:${threadId}`);
-          if (raw) {
-            const entry = JSON.parse(raw);
+          if (raw) entry = JSON.parse(raw);
+        } catch (e) {
+          entry = null;
+        }
+
+        // A thread id is a capability, and for a thread nobody owns that is
+        // the whole design: an anonymous reporter has no account and follows
+        // up with nothing else. But a thread that DOES belong to an account
+        // is not a bare capability -- the id alone used to be enough for any
+        // stranger to append to it, reopen it, and pick their own display
+        // name, which the admin panel then rendered as the sender.
+        //
+        // A stored name that no longer normalises to a valid username (legacy
+        // free-text) cannot be authenticated as by anyone, so treating it as
+        // owned would strand the thread. Those stay id-capability threads.
+        if (entry && !isAdmin) {
+          const ownerRaw = entry.creatorName ? String(entry.creatorName).trim() : "";
+          let ownerNorm = "";
+          if (ownerRaw) {
+            const ownerV = validateCreatorUsername(ownerRaw);
+            if (ownerV && ownerV.ok) ownerNorm = ownerV.normalized;
+          }
+          if (ownerNorm && ownerNorm !== authedCreator) {
+            return json(
+              { ok: false, error: "That conversation belongs to an account. Sign in to reply to it." },
+              403,
+              { "Cache-Control": "no-store" }
+            );
+          }
+        }
+
+        try {
+          if (entry) {
             if (!Array.isArray(entry.messages) || !entry.messages.length) {
               entry.messages = [{
                 id: `msg_init`,
@@ -4699,7 +4788,11 @@ self.addEventListener('fetch', e => {
             const newMsg = {
               id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
               sender: isAdmin ? "admin" : "user",
-              senderName: isAdmin ? "Developer" : (creatorName || entry.creatorName || "User"),
+              // Derived, never taken from the request body. This is what
+              // the admin panel renders as the sender, so letting the
+              // caller choose it meant a stranger could plant a message
+              // signed "Developer" inside someone else's thread.
+              senderName: isAdmin ? "Developer" : (entry.creatorName || authedCreator || "User"),
               text: message,
               timestamp: Date.now()
             };
@@ -4708,6 +4801,9 @@ self.addEventListener('fetch', e => {
             entry.status = isAdmin ? "replied" : "open";
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
+            // Claiming an unowned thread now takes proof, not just the id --
+            // otherwise anyone holding it could attach their own account to
+            // someone else's report.
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
             await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
@@ -4717,7 +4813,18 @@ self.addEventListener('fetch', e => {
       }
 
       // New Thread
-      const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      //
+      // The id is a capability: /api/feedback/threads hands the whole thread
+      // -- every message plus the contact address the form asks for -- to
+      // anyone who presents it, deliberately, so anonymous reporters can
+      // follow up. It was minted with Math.random(), which is not a CSPRNG:
+      // V8's xorshift128+ state is recoverable from a handful of outputs, so
+      // filing a few reports of your own leaked the ids being handed to
+      // other people from the same isolate. generateShortId is the same
+      // crypto.getRandomValues helper the OAuth state cookies use.
+      // Date.now() stays as the prefix -- /admin/api/feedback relies on
+      // these keys sorting chronologically.
+      const id = `${Date.now()}:${generateShortId()}`;
       const entry = {
         id, category, message, contact: contact || null, creatorName,
         createdAt: Date.now(),
@@ -4728,6 +4835,8 @@ self.addEventListener('fetch', e => {
           {
             id: `msg_${Date.now()}_1`,
             sender: isAdmin ? "admin" : "user",
+            // creatorName here is the proven name (or the admin marker),
+            // never the raw claim -- see its assignment above.
             senderName: isAdmin ? "Developer" : (creatorName || "User"),
             text: message,
             timestamp: Date.now()
@@ -5496,14 +5605,17 @@ self.addEventListener('fetch', e => {
       if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
         return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
       }
-      let listSlug = baseSlug;
-      let plKey = "publishedlist:user:" + listSlug;
-      for (let attempt = 2; attempt <= 500; attempt++) {
-        const existing = await env.CONFIGS.get(plKey);
-        if (!existing) break;
-        listSlug = baseSlug + "-" + attempt;
-        plKey = "publishedlist:user:" + listSlug;
+      // Never falls through onto a slug that is taken -- see pickFreeSlug.
+      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
+        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
+      );
+      if (!listSlug) {
+        return json(
+          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+          409
+        );
       }
+      const plKey = "publishedlist:user:" + listSlug;
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
@@ -5730,18 +5842,22 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
-      // Rate-limited only when this falls back to the Worker owner's shared
-      // TMDB key. A visitor who supplied their own is spending their own
-      // quota, so there is nothing here to protect them from -- and
-      // throttling them would break exactly the power users who set a key
-      // up. 60/minute leaves plenty of room for the real bulk caller
-      // (refreshAiringNext pages a large Watch History 60 ids at a time).
-      if (!reqBody.tmdbKey) {
-        const batchIp = clientIpKey(request);
-        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
-        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
-          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
-        }
+      // Same correction as /api/recommendations above: this used to skip the
+      // limit outright whenever the body carried a tmdbKey. Supplying your
+      // own key does mean you are spending your own TMDB quota, but it never
+      // meant you were spending your own subrequests -- and the field was
+      // never validated, so any non-empty string unlocked an unlimited
+      // 60-id fan-out against this Worker.
+      //
+      // Always limited now, with a much higher ceiling for a caller who
+      // brought a key, so the power users this exemption existed for keep
+      // their headroom. 60/minute already leaves plenty of room for the real
+      // bulk caller (refreshAiringNext pages a large Watch History 60 ids at
+      // a time).
+      const batchIp = clientIpKey(request);
+      if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, reqBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";

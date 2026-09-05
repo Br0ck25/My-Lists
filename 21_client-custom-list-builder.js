@@ -29,36 +29,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-async function runCustomListSearch() {
-  const q = document.getElementById('customListSearchInput').value.trim();
-  const searchType = document.getElementById('customListSearchType').value; // 'movie' or 'tv'
-  const box = document.getElementById('customListSearchResult');
-  if (!q) {
-    box.innerHTML = '';
-    return;
-  }
-  box.innerHTML = '<p><small>Searching\u2026</small></p>';
-  try {
-    fetch(ORIGIN + '/api/track-search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q }),
-      keepalive: true,
-    }).catch(() => {});
-  } catch (e) {}
-  try {
-    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=' + searchType, { cache: 'no-store' });
-    const data = await res.json();
-    if (!data.ok) {
-      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Search failed.') + '</p>';
-      return;
-    }
-    renderCustomListSearchResults(data.results, searchType);
-  } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error while searching.</p>';
-  }
-}
-
 function renderCustomListSearchResults(results, searchType) {
   const box = document.getElementById('customListSearchResult');
   if (!results.length) {
@@ -786,11 +756,6 @@ function updateCustomListSaveButtonLabel() {
 }
 
 
-
-function closeCreateListModal() {
-  document.getElementById('listsSubCreateList').style.display = 'none';
-  document.getElementById('listsSubMyLists').style.display = 'block';
-}
 
 function setCustomListDraftTypeToggle(type) {
   if (type === 'mixed') {
@@ -2917,11 +2882,6 @@ function getHiddenMyListsSections() {
   } catch (e) {
     return [];
   }
-}
-
-function isMyListsSectionHidden(section) {
-  if (!section) return false;
-  return getHiddenMyListsSections().includes(String(section));
 }
 
 // Applies the current hidden-sections state directly to each panel's own

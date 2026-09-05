@@ -770,8 +770,6 @@ function renderTrackPlaybackSection() {
   }
   let enabled = false;
   try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  const webhookUrl = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
 
   let filterUsers = false;
   let allowedUsers = '';
@@ -796,8 +794,9 @@ function renderTrackPlaybackSection() {
       '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
       '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
       '<div class="webhook-input-group">' +
-        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="Loading\u2026" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
         '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
+        '<button type="button" class="secondary lc-btn" onclick="regenerateScrobbleWebhookUrl()" title="Issues a new webhook URL and stops the old one working. Use this if the URL has been shared or logged somewhere it should not have been." style="padding:8px 14px; font-size:0.84rem;">Regenerate</button>' +
       '</div>' +
 
       '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
@@ -855,10 +854,64 @@ function renderTrackPlaybackSection() {
 
   refreshTrackPlaybackStatus();
   loadScrobbleSeenUsers();
+  // Fills the webhook field in after the section is on screen. Deliberately
+  // not awaited: the URL now needs a round trip (it carries a scrobble token
+  // rather than the Creator Key), and the rest of the panel should not wait
+  // on it.
+  refreshScrobbleWebhookUrl(false);
 }
 
-function buildScrobbleWebhookUrl(creatorName, creatorKey) {
-  return ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(creatorName) + '&key=' + encodeURIComponent(creatorKey);
+// The webhook URL ends up pasted into Plex/Jellyfin/Emby, stored in their
+// configuration and written to their logs, so what it carries matters. It
+// used to carry the Creator Key -- the credential for the whole account,
+// with no expiry -- which meant anyone who read that URL out of a log had
+// everything, and the only remedy was rotating the key and re-signing in on
+// every device. It now carries a scrobble token: revocable on its own,
+// good for nothing but recording playback for this account.
+function buildScrobbleWebhookUrl(scrobbleToken) {
+  return ORIGIN + '/api/scrobble?st=' + encodeURIComponent(scrobbleToken || '');
+}
+
+// Fetches (and on first use mints) this account's scrobble token.
+// rotate === true issues a fresh one and revokes the old webhook URL.
+async function fetchScrobbleToken(rotate) {
+  if (!activeCreator || !activeCreator.creatorName) return '';
+  let creatorKey = '';
+  try { creatorKey = localStorage.getItem('myListAddon:creatorKey') || ''; } catch (e) {}
+  if (!creatorKey) return '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, rotate: rotate === true }),
+    });
+    const data = await res.json().catch(() => null);
+    return (data && data.ok && data.token) ? data.token : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Fills the webhook field in. Kept out of the initial render so a dashboard
+// load does not block on it, and so a failure leaves a readable message in
+// the field rather than a half-built URL.
+async function refreshScrobbleWebhookUrl(rotate) {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input) return;
+  input.value = rotate ? 'Generating a new URL\u2026' : 'Loading\u2026';
+  const token = await fetchScrobbleToken(rotate);
+  const current = document.getElementById('scrobbleWebhookInput');
+  if (!current) return;
+  current.value = token
+    ? buildScrobbleWebhookUrl(token)
+    : 'Could not load your webhook URL \u2014 reload the page and try again.';
+  if (rotate && token && typeof showAddedToast === 'function') {
+    showAddedToast('New webhook URL generated \u2014 the old one no longer works \u2713');
+  }
+}
+
+async function regenerateScrobbleWebhookUrl() {
+  await refreshScrobbleWebhookUrl(true);
 }
 
 function onScrobbleFilterUsersToggle(cb) {
@@ -892,12 +945,7 @@ function onScrobbleBlockAnonChange(cb) {
   if (typeof pushTrackingSync === 'function') pushTrackingSync();
 }
 
-function _refreshScrobbleWebhookInput() {
-  const input = document.getElementById('scrobbleWebhookInput');
-  if (!input || !activeCreator) return;
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  input.value = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
-}
+
 
 function syncScrobbleUserCheckboxes() {
   const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
@@ -2357,8 +2405,8 @@ function openCreateProfileModal() {
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
-    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
-    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional, 8+ characters)" minlength="8"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -2375,6 +2423,14 @@ async function submitCreateProfile() {
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
+    return;
+  }
+  // Mirrors the server's RECOVERY_ANSWER_MIN_LENGTH check so a too-short
+  // answer is caught here, next to the field, instead of coming back as a
+  // server error after the round trip. The server still enforces it -- this
+  // is the message, not the guard.
+  if (recoveryAnswer && recoveryAnswer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
   try {

@@ -2022,11 +2022,6 @@ async function renderAdminDashboard(env) {
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
     }
 
-    // Alias for compatibility
-    function switchAdminTab(tabId) {
-      switchAdminSubTab(tabId);
-    }
-
     function restoreAdminActiveTab() {
       let targetTab = '';
       const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
@@ -2291,27 +2286,47 @@ async function renderAdminDashboard(env) {
       if (typeof loadSearchData === 'function') loadSearchData();
     }
 
-    // Unlike the two loops above, /admin/api/migrate-d1 does its entire
-    // sweep (creators, creator_lists, source_groups) in one request rather
-    // than resuming across repeated calls, so this is a single fetch.
+    // Like the loops above, /admin/api/migrate-d1 now does one bounded chunk
+    // per call rather than the whole sweep -- see its own comment for why a
+    // single pass could not survive a site large enough to need migrating --
+    // so this keeps calling until it reports done. The results object comes
+    // back cumulative for the whole run, so the final response already holds
+    // the totals and there is nothing to add up here.
+    //
+    // No backticks in this function, or anywhere else inside
+    // renderAdminDashboard's returned template literal: everything from that
+    // opening backtick onwards is string content, so one here would close the
+    // template early and break the whole admin page. (The module-scope
+    // helpers at the top of this file are ordinary JS and do use them.)
     async function runMigrateD1() {
       const btn = document.getElementById('migrateD1Btn');
       const status = document.getElementById('migrateD1Status');
       btn.disabled = true;
       status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) {
-          status.textContent = 'Failed: ' + (data.error || 'unknown error');
-        } else {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
           const r = data.results || {};
+          if (!data.done) {
+            status.textContent = 'Working\u2026 ' + (data.scanned || 0) + ' key' + ((data.scanned || 0) === 1 ? '' : 's') +
+              ' scanned, ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ' and ' +
+              (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ' migrated so far.';
+            continue;
+          }
           const errCount = (r.errors || []).length;
           status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
             (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
             (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
             (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
           if (errCount) console.error('migrate-d1 errors:', r.errors);
+          break;
         }
       } catch (e) {
         status.textContent = 'Failed: network error.';
@@ -2319,17 +2334,35 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    // The endpoint does one bounded chunk per call (see its own comment for
+    // why a rebuild cannot be one pass), so this loops until it reports
+    // done -- the same shape as runMigrateDayCounts above.
     async function runRebuildPublicIndex() {
       const btn = document.getElementById('rebuildIndexBtn');
       const status = document.getElementById('rebuildIndexStatus');
       btn.disabled = true;
       status.textContent = 'Working\u2026';
+      const started = Date.now();
+      let scanned = 0;
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
-        const data = await res.json();
-        status.textContent = data.ok
-          ? ('Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') + ' in ' + data.ms + 'ms.')
-          : ('Failed: ' + (data.error || 'unknown error'));
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
+          scanned += data.scanned || 0;
+          if (data.done) {
+            status.textContent = 'Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') +
+              ' from ' + scanned + ' record' + (scanned === 1 ? '' : 's') + ' in ' + (Date.now() - started) + 'ms.';
+            break;
+          }
+          status.textContent = 'Working\u2026 ' + scanned + ' record' + (scanned === 1 ? '' : 's') +
+            ' scanned, ' + data.count + ' indexed so far.';
+        }
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -2491,6 +2524,10 @@ async function renderAdminDashboard(env) {
       const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
       const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
       const isSelfLogged = f.creatorName === 'admin';
+      // Already escaped here, so every use of it below must NOT escape it
+      // again -- the reply placeholder did, and rendered a creator called
+      // A&B as A&amp;B. (No backticks in this function: everything from
+      // renderAdminDashboard's opening backtick onwards is string content.)
       const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
@@ -2542,7 +2579,7 @@ async function renderAdminDashboard(env) {
         '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
         (!isSelfLogged ?
           '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
-            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + escapeHtmlAdmin(who) + '...">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + who + '...">' +
             '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
           '</div>' : ''
         ) +

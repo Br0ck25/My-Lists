@@ -41,6 +41,118 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // size the server accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
+// --- Bounds on the KV -> D1 backfill sweep ----------------------------------
+//
+// /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
+// publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
+// a D1 write on each key it keeps -- both of which count against
+// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
+// whole sweep in one request with no cap, so on a site big enough to need
+// migrating it aborted partway through with "Too many subrequests" and
+// backfilled only whatever it had reached.
+//
+// That failure is worse than it looks: per wrangler.toml, an account present
+// in KV but missing from D1 is exactly the case /api/creator/reset-key and
+// /admin/api/reset-creator-key handle incorrectly, because a D1 UPDATE
+// matching zero rows still reports success. So the endpoint whose job is to
+// prevent that state was itself the thing leaving accounts in it.
+//
+// It now runs in resumable chunks against migrated1:state, the same shape
+// /admin/api/migrate-day-counts and the public-index rebuild use. Every
+// section of the sweep is idempotent (DO NOTHING, or DO UPDATE to a value
+// derived only from KV), so re-processing a key across a chunk boundary is
+// harmless -- which is what makes chunking safe here.
+const MIGRATE_D1_STATE_KEY = "migrated1:state";
+const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+// This endpoint has its invocation to itself (it is admin-triggered, not
+// ridden along on the cron), so it can claim more of the 1,000 than the
+// index rebuild does -- but still well short of it, since a chunk that
+// throws saves no progress.
+const MIGRATE_D1_OPS_PER_RUN = 700;
+const MIGRATE_D1_PAGE = 200;
+// Errors accumulate across every chunk of a run and are handed back to the
+// admin panel, so they need a ceiling of their own.
+const MIGRATE_D1_ERROR_CAP = 50;
+
+// --- Recovery-answer strength and throttle ----------------------------------
+//
+// A Creator Key is ~60 bits of entropy and infeasible to guess. The optional
+// recovery answer that can REPLACE it via /api/creator/reset-key is not: it
+// is free text a human picks, usually the answer to an implicit security
+// question, and it is lowercased before hashing. That endpoint hands back a
+// brand-new working key on a match, so the recovery answer is a second,
+// far weaker credential for full account takeover.
+//
+// It used to be throttled by IP alone (10/day). IPs are cheap and rotate;
+// the account being attacked does not. Rotating source IPs took over a test
+// account in five guesses. Two things follow from that:
+//
+//   * the throttle has to count per ACCOUNT, not just per source, so the
+//     budget an attacker is spending belongs to the thing being attacked;
+//   * the answer needs a floor on its length, because no rate limit rescues
+//     a secret with a handful of plausible values.
+//
+// Only the per-account failure budget defends existing accounts, so it is
+// the load-bearing half. The minimum length applies to newly set answers.
+const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
+const RECOVERY_ANSWER_MIN_LENGTH = 8;
+
+// --- Bound on /api/channel-logo's inlined image ------------------------------
+//
+// That endpoint fetches a TMDB image and base64-encodes it into an SVG,
+// holding the whole thing in memory twice (a byte array, then a binary
+// string) before encoding. It is unauthenticated, so the size of what it
+// will buffer needs a ceiling rather than being whatever the upstream
+// happens to return. A w500 poster is tens of kilobytes.
+const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
+// --- Connecting the env-backed API key globals -------------------------------
+//
+// The `let` globals below are the names every helper in this add-on
+// references (TMDB_API_KEY, TRAKT_CLIENT_ID, ...). They start empty and have
+// to be pointed at whatever this Worker owner configured. This is the one
+// place that does it, so the fetch and scheduled entry points cannot drift.
+//
+// scheduled() has to call it too, and did not. Nothing is broken today only
+// because both cron functions happen to read env.X directly and thread it
+// down -- but 36 bare references to these globals exist across 03_, 05_,
+// 06_ and 07_, and the first cron-reachable call into any of them would have
+// silently used an empty key: no crash, no error, just a provider quietly
+// returning nothing. Three lines here retires the whole class.
+//
+// `|| ""` guards against `env` not carrying the property at all, which is
+// how a missing Worker secret or var normally reads.
+function applyEnvApiKeys(env) {
+  TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+  TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+  SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+  SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+  MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+  MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+  MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+}
+
+// --- Daily failure budgets on the credential endpoints -----------------------
+//
+// /admin/login and /api/creator/restore each already carry a 60-second
+// per-IP bucket in KV. Those bound a burst, but KV reads are edge-cached and
+// KV has no atomic increment, so a determined caller can read a stale count
+// and slip past. That is acceptable as burst-shaping and NOT as the only
+// thing standing in front of a credential.
+//
+// So both also carry a per-IP DAILY budget, spent only on failures and
+// backed by D1's atomic upsert wherever D1 is bound (see noteAuthFailure,
+// 02_http-and-creator-utils.js). Successes never consume it, so a legitimate
+// admin or someone restoring on a run of new devices is unaffected; the
+// ceilings are set far above any plausible honest failure count and reset
+// daily on their own.
+//
+// The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
+// Creator Key is ~60 bits -- so this is defence in depth, not the load-
+// bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
+const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

@@ -286,9 +286,20 @@ describe("feedback threads", () => {
   it("name lookup needs the key; anonymous threadIds still work", async () => {
     const env = makeEnv();
     const alice = await createUser(env, "alicefb");
+    // The key is required to ATTRIBUTE a thread to an account: /api/feedback
+    // proves any claimed creatorName before storing it, and silently drops a
+    // claim it cannot verify (an unverifiable claim must not close the
+    // support channel -- see that endpoint's own comment). Without the key
+    // here the thread would be filed anonymously and the by-name lookup
+    // below would correctly not find it.
     const posted = await call(env, "/api/feedback", {
       method: "POST",
-      json: { message: "secret report", creatorName: alice.creatorName, contact: "me@example.com" },
+      json: {
+        message: "secret report",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        contact: "me@example.com",
+      },
     });
     assert.equal(posted.body.ok, true);
     const threadId = posted.body.entry.id;
@@ -342,7 +353,7 @@ describe("feedback threads", () => {
     // Sorts after all 250 filler keys (larger timestamp), i.e. newest.
     const newest = await call(env, "/api/feedback", {
       method: "POST",
-      json: { creatorName: alice.creatorName, message: "my recent report" },
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, message: "my recent report" },
     });
     assert.equal(newest.body.ok, true);
     const threadId = newest.body.entry.id;
@@ -371,6 +382,545 @@ describe("feedback threads", () => {
     assert.notEqual(start, -1, "loadUserFeedbackThreads should be present in the served bundle");
     const body = bundle.text.slice(start, start + 1200);
     assert.ok(/creatorKey\s*:\s*creatorKey/.test(body), "loadUserFeedbackThreads must send creatorKey, not just creatorName");
+  });
+});
+
+// A support thread holds free-text messages plus the contact address the
+// feedback form asks for, and /api/feedback/threads hands the whole thing to
+// anyone presenting the thread id -- deliberately, so anonymous reporters can
+// follow up. That makes the id a capability, and it was minted with
+// Math.random(): ~31 bits from a PRNG whose state is recoverable from a few
+// outputs. Worse, the id alone let a stranger APPEND to any thread, choosing
+// the display name the admin panel renders as the sender.
+describe("audit fix: support threads are capabilities, not open mailboxes", () => {
+  it("mints thread ids from the CSPRNG, not Math.random", async () => {
+    const env = makeEnv();
+    const ids = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await call(env, "/api/feedback", { method: "POST", json: { message: `report ${i}` } });
+      ids.push(r.body.entry.id);
+    }
+    for (const id of ids) {
+      const random = id.split(":")[1] || "";
+      // generateShortId is 9 random bytes base64url-encoded -> 12 chars.
+      // Math.random().toString(36).slice(2, 8) was 6.
+      assert.equal(random.length, 12, `thread id "${id}" does not carry a 12-char random part`);
+      assert.match(random, /^[A-Za-z0-9_-]{12}$/);
+    }
+    assert.equal(new Set(ids).size, ids.length, "thread ids collided");
+    // The timestamp prefix has to stay: /admin/api/feedback relies on these
+    // keys sorting chronologically.
+    assert.match(ids[0], /^\d{10,}:/);
+  });
+
+  it("will not let a stranger append to a thread that belongs to an account", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicethread");
+    const posted = await call(env, "/api/feedback", {
+      method: "POST",
+      json: {
+        message: "my private bug report",
+        contact: "victim@example.com",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+      },
+    });
+    const threadId = posted.body.entry.id;
+    assert.equal(posted.body.entry.creatorName, alice.creatorName);
+
+    const stranger = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "injected by stranger", creatorName: "Developer" },
+    });
+    assert.equal(stranger.status, 403, "a stranger holding the id could still write into an owned thread");
+    assert.equal(stranger.body.ok, false);
+
+    // The owner themselves is of course still fine.
+    const owner = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { threadId, message: "following up", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(owner.body.ok, true, owner.body.error);
+    assert.equal(owner.body.entry.messages.length, 2);
+  });
+
+  it("keeps anonymous threads reachable by id, but not the sender name", async () => {
+    // The id-as-capability model is the point for someone with no account,
+    // so this must keep working -- what must not is choosing who the message
+    // appears to be from.
+    const env = makeEnv();
+    const anon = await call(env, "/api/feedback", { method: "POST", json: { message: "anonymous report" } });
+    const threadId = anon.body.entry.id;
+
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "a follow-up", creatorName: "Developer" },
+    });
+    assert.equal(reply.body.ok, true, "anonymous follow-up by thread id must still work");
+    const names = reply.body.entry.messages.map((m) => m.senderName);
+    assert.ok(!names.includes("Developer"), `sender name was taken from the request body: ${names.join(", ")}`);
+    assert.ok(reply.body.entry.messages.every((m) => m.sender === "user"));
+  });
+
+  it("drops an identity claim it cannot prove instead of storing it", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicevictim");
+    const impersonation = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "impersonation attempt", creatorName: alice.creatorName },
+    });
+    // The message still goes through -- this is the support channel, and
+    // someone whose key has stopped working is exactly who needs it -- but
+    // the unproven name is not recorded.
+    assert.equal(impersonation.body.ok, true, "an unverifiable claim must not close the support channel");
+    assert.equal(impersonation.body.entry.creatorName, null, "an unproven creatorName was stored");
+    assert.equal(impersonation.body.entry.messages[0].senderName, "User");
+
+    // ...and it must not show up in the real account's thread list.
+    const mine = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(mine.body.threads.some((t) => t.id === impersonation.body.entry.id), false);
+  });
+
+  it("leaves the admin panel's own self-logging and replies working", async () => {
+    // submitAdminFeedback posts creatorName:"admin" with fromAdminPanel:true
+    // and no key -- "admin" is a marker feedbackCardHtml keys off, not a
+    // Creator Profile, so it must not be run through creator auth.
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceadminfb");
+    const owned = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "user report", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+
+    const selfLog = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { category: "bug", message: "logged by admin", creatorName: "admin", fromAdminPanel: true },
+    });
+    assert.equal(selfLog.body.ok, true, selfLog.body.error);
+    assert.equal(selfLog.body.entry.creatorName, "admin", "the admin self-log marker was stripped");
+
+    // And the admin must still be able to answer a thread they do not own.
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { threadId: owned.body.entry.id, message: "admin here", fromAdminPanel: true },
+    });
+    assert.equal(reply.body.ok, true, reply.body.error);
+    assert.equal(reply.body.entry.messages.slice(-1)[0].senderName, "Developer");
+  });
+});
+
+// /api/channel-logo fetches a TMDB image and base64-encodes it into an SVG.
+// It is unauthenticated, took any path at all, buffered whatever the upstream
+// returned, and answered no-store -- so every request repeated the whole
+// fetch-and-encode for output that cannot change.
+describe("audit fix: the channel image endpoints are bounded and cacheable", () => {
+  function stubUpstream(sizes = {}) {
+    const seen = [];
+    globalThis.fetch = async (u) => {
+      const href = typeof u === "string" ? u : u.url;
+      seen.push(href);
+      for (const [marker, size] of Object.entries(sizes)) {
+        if (href.includes(marker)) {
+          const headers = { "content-type": "image/png" };
+          if (size.declare !== false) headers["content-length"] = String(size.bytes);
+          return new Response(new Uint8Array(size.bytes), { status: 200, headers });
+        }
+      }
+      return new Response(new Uint8Array([137, 80, 78, 71]), {
+        status: 200, headers: { "content-type": "image/png" },
+      });
+    };
+    return seen;
+  }
+
+  it("serves real TMDB logo paths, cached rather than no-store", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/wLqRr0YLAqmWKAHYFhkQBQFCDLL.jpg", "wLqRr0YLAqmWKAHYFhkQBQFCDLL.png", "/abc123.webp"]) {
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 200, `real path rejected: ${p}`);
+        assert.match(r.headers.get("cache-control") || "", /max-age=\d{4,}/, "output is deterministic and must be cacheable");
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("rejects anything not shaped like a TMDB image path, without calling upstream", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      const seen = stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/../../etc/passwd", "/t/p/original/anything", "/justsomepath", "/a.png?x=1"]) {
+        const before = seen.length;
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 400, `should have been rejected: ${p}`);
+        assert.equal(seen.length, before, `rejected path still hit the upstream: ${p}`);
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("refuses an oversized image, with or without a content-length header", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream({
+        huge: { bytes: 3 * 1024 * 1024 },
+        nolen: { bytes: 3 * 1024 * 1024, declare: false },
+      });
+      const env = makeEnv();
+      const declared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/huge0000000.png"));
+      assert.equal(declared.status, 413);
+      // A missing or dishonest content-length must not get past the cap.
+      const undeclared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/nolen000000.png"));
+      assert.equal(undeclared.status, 413);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("bounds and escapes the channel-poster name, and caches the result", async () => {
+    const env = makeEnv();
+    const huge = await call(env, "/api/channel-poster?name=" + encodeURIComponent("A".repeat(5000)));
+    assert.equal(huge.status, 200);
+    assert.ok(huge.text.length < 10000, `a 5000-char name produced ${huge.text.length} bytes of SVG`);
+    assert.match(huge.headers.get("cache-control") || "", /max-age=\d{4,}/);
+
+    const injected = await call(env, "/api/channel-poster?name=" +
+      encodeURIComponent("</text><script>alert(1)</script>"));
+    assert.equal(injected.status, 200);
+    // Served as image/svg+xml from this origin, so raw markup here would run.
+    assert.ok(!injected.text.includes("<script>"), "channel name was not escaped into the SVG");
+  });
+});
+
+// The 60-second per-IP buckets on /admin/login and /api/creator/restore bound
+// a burst, but they are KV counters -- edge-cached reads, no atomic increment
+// -- and they reset every minute, so across rolling windows they placed no
+// bound at all on how many guesses one address could make in a day. Both now
+// also carry a daily failure budget, spent only on failures and atomic
+// wherever D1 is bound.
+describe("audit fix: credential endpoints bound guesses across rolling windows", () => {
+  // Deleting the 60s key is what a real attacker gets for free by waiting:
+  // the short window rolls over, and only the daily budget accumulates.
+  async function rollWindow(env, key) { await env.CONFIGS.delete(key); }
+
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`bounds admin-login guessing across rolling 60s windows (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      let attempted = 0;
+      let blocked = false;
+      for (let round = 0; round < 15 && !blocked; round++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        for (let i = 0; i < 9; i++) {
+          const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+          attempted++;
+          if (r.status === 429) { blocked = true; break; }
+        }
+      }
+      assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+    });
+
+    it(`never spends the admin budget on a correct key (${label})`, async () => {
+      // A budget that successes consume would lock out the one person who
+      // can fix it.
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      for (let i = 0; i < 60; i++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: env.ADMIN_KEY } });
+        assert.equal(r.status, 302, `login ${i + 1} was refused -- successes are spending the budget`);
+      }
+    });
+  }
+
+  it("bounds creator-restore guessing, and leaves the real key working", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const alice = await createUser(env, "alicerestorecap");
+    const ip = nextIp();
+    let attempted = 0;
+    let blocked = false;
+    for (let round = 0; round < 20 && !blocked; round++) {
+      await rollWindow(env, `ratelimit:creatorrestore:${ip}`);
+      for (let i = 0; i < 19; i++) {
+        const r = await call(env, "/api/creator/restore", {
+          method: "POST", ip,
+          json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+        });
+        attempted++;
+        if (r.status === 429) { blocked = true; break; }
+      }
+    }
+    assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+
+    const good = await call(env, "/api/creator/restore", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(good.body.ok, true, `the real key stopped working: ${good.body.error}`);
+  });
+});
+
+// Both list-saving endpoints allocated a slug by trying baseSlug, then
+// baseSlug-2, -3 ... up to 500, and then USING WHATEVER THE LOOP EXITED ON.
+// Past the bound that is a slug which is taken, and the write went straight
+// over the existing list.
+describe("audit fix: slug allocation never lands on a taken slug", () => {
+  it("does not overwrite an existing published list once the numbered range fills", async () => {
+    const kv = makeKv();
+    kv._store.set("publishedlist:user:movies", JSON.stringify({ name: "Movies", items: [] }));
+    for (let i = 2; i <= 500; i++) {
+      kv._store.set(`publishedlist:user:movies-${i}`, JSON.stringify({
+        name: "Movies", type: "movie", visibility: "public",
+        items: [{ id: `tt-EXISTING-${i}`, name: `someone else's list ${i}` }],
+      }));
+    }
+    const env = makeEnv({ CONFIGS: kv });
+    const before = kv._store.get("publishedlist:user:movies-500");
+
+    const r = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "Movies", type: "movie", items: [{ id: "tt-MINE" }], visibility: "public" },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(kv._store.get("publishedlist:user:movies-500"), before,
+      "publishing over a full numbered range destroyed an existing list");
+    // Whatever slug it did hand back must be free and must be where the new
+    // list actually landed.
+    const mine = JSON.parse(kv._store.get(`publishedlist:user:${r.body.listName}`));
+    assert.equal(mine.items[0].id, "tt-MINE");
+    assert.match(r.body.url, new RegExp(`/lists/user/${r.body.listName}$`));
+  });
+
+  it("allocates a slug in constant KV reads however crowded the name is", async () => {
+    // Each numbered attempt used to be its own KV read, so one publish of a
+    // heavily-collided name cost ~501 subrequests -- half the per-invocation
+    // budget, on an unauthenticated endpoint, in a state anyone could
+    // manufacture by publishing the same name repeatedly.
+    async function readsForPublish(existing) {
+      const kv = makeKv();
+      kv._store.set("publishedlist:user:movies", "{}");
+      for (let i = 2; i <= existing; i++) kv._store.set(`publishedlist:user:movies-${i}`, "{}");
+      let reads = 0;
+      const realGet = kv.get.bind(kv);
+      kv.get = async (...a) => { reads++; return realGet(...a); };
+      const env = makeEnv({ CONFIGS: kv });
+      const r = await call(env, "/api/publish-list", {
+        method: "POST",
+        json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+      });
+      assert.equal(r.body.ok, true, r.body.error);
+      return reads;
+    }
+    const few = await readsForPublish(1);
+    const many = await readsForPublish(499);
+    assert.ok(many <= few + 20, `499 collisions cost ${many} KV reads vs ${few} for one -- the scan is still linear`);
+    assert.ok(many < 100, `one publish spent ${many} KV reads`);
+  });
+
+  it("keeps tidy numbered slugs for the ordinary case", async () => {
+    // The random suffix is the fallback, not the default: a second list of
+    // the same name should still get "-2", not a token.
+    const env = makeEnv();
+    const first = await call(env, "/api/publish-list", {
+      method: "POST", json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+    });
+    const second = await call(env, "/api/publish-list", {
+      method: "POST", ip: nextIp(),
+      json: { name: "Movies", type: "movie", items: [{ id: "tt2" }], visibility: "public" },
+    });
+    assert.equal(first.body.listName, "movies");
+    assert.equal(second.body.listName, "movies-2");
+  });
+
+  it("does not overwrite a creator's own list once their numbered range fills", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceslug");
+    // 500 lists all called "Movies" in this creator's own namespace.
+    const order = ["movies"];
+    for (let i = 2; i <= 500; i++) order.push(`movies-${i}`);
+    await env.CONFIGS.put(`creatorlistorder:${alice.creatorName}`, JSON.stringify({ order }));
+    await env.CONFIGS.put(`creatorlist:${alice.creatorName}:movies-500`, JSON.stringify({
+      name: "Movies", slug: "movies-500", type: "movie", visibility: "public",
+      items: [{ id: "tt-EXISTING" }], likes: 3, createdAt: 1, updatedAt: 1,
+    }));
+    const before = await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`);
+
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Movies", type: "movie", visibility: "public", items: [{ id: "tt-MINE" }],
+      },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`), before,
+      "saving over a full numbered range destroyed the creator's own list");
+  });
+});
+
+// A media-server webhook URL has to carry its credential in the query string
+// -- Plex, Jellyfin and Emby accept a URL and nothing else -- so it ends up in
+// their configuration and their logs. It used to carry the Creator Key: the
+// credential for the whole account, with no expiry, whose only remedy on
+// exposure was a rotation that signs the owner out everywhere.
+describe("audit fix: the scrobble webhook carries a revocable token, not the Creator Key", () => {
+  const scrobblePayload = { event: "media.scrobble", Metadata: { type: "movie", title: "X", year: 2000 } };
+  const scrobble = (env, qs) => call(env, "/api/scrobble?" + qs, { method: "POST", ip: nextIp(), json: scrobblePayload });
+  const mint = async (env, auth, rotate) => (await call(env, "/api/creator/scrobble-token", {
+    method: "POST", ip: nextIp(), json: { ...auth, rotate },
+  })).body;
+
+  it("issues one stable token per account, and only to the key holder", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetok");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+
+    const first = await mint(env, auth, false);
+    assert.equal(first.ok, true, first.error);
+    assert.ok(first.token && first.token.length >= 16, "token is too short to be a credential");
+    // Re-asking must not mint a second one, or every dashboard load would
+    // orphan a live credential.
+    const again = await mint(env, auth, false);
+    assert.equal(again.token, first.token);
+
+    const wrongKey = await call(env, "/api/creator/scrobble-token", {
+      method: "POST", json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+    });
+    assert.equal(wrongKey.status, 401);
+  });
+
+  it("accepts the token on the webhook, and rejects a junk or missing one", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokuse");
+    const { token } = await mint(env, { creatorName: alice.creatorName, creatorKey: alice.creatorKey }, false);
+
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+    assert.equal((await scrobble(env, "st=deadbeefdeadbeef")).status, 401);
+    assert.equal((await scrobble(env, "")).status, 401);
+  });
+
+  it("regenerating revokes the previous webhook URL", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokrot");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const before = (await mint(env, auth, false)).token;
+    const after = (await mint(env, auth, true)).token;
+
+    assert.notEqual(after, before, "rotate returned the same token");
+    assert.equal((await scrobble(env, "st=" + before)).status, 401, "the old webhook URL still works");
+    assert.equal((await scrobble(env, "st=" + after)).status, 200);
+  });
+
+  it("keeps pre-existing creator+key webhook URLs working", async () => {
+    // Those URLs are sitting in people's media servers. Breaking them would
+    // silently stop their history syncing with no error anyone would see.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetoklegacy");
+    const legacy = `creator=${encodeURIComponent(alice.creatorName)}&key=${encodeURIComponent(alice.creatorKey)}`;
+    assert.equal((await scrobble(env, legacy)).status, 200);
+  });
+
+  it("revokes the token when the account is deleted", async () => {
+    // The token is keyed BY TOKEN, so it cannot be reached from a username
+    // prefix sweep -- miss it and a deleted account leaves behind a live
+    // credential that still authorises writes for it.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokdel");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const { token } = await mint(env, auth, false);
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...auth, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true, del.body.error);
+
+    assert.equal(await env.CONFIGS.get(`scrobbletoken:${token}`), null, "the token key outlived the account");
+    assert.equal(await env.CONFIGS.get(`creatorscrobbletoken:${alice.creatorName}`), null, "the reverse index outlived the account");
+    assert.equal((await scrobble(env, "st=" + token)).status, 401, "a deleted account's webhook still authorises writes");
+  });
+
+  it("no longer builds a webhook URL out of the Creator Key", async () => {
+    // The panel's markup is assembled client-side, and the client bundle is
+    // served from /app.js rather than inlined into the shell at "/" -- so
+    // this checks the shipped bundle. The URL builder must take a token, and
+    // the old key-bearing construction must be gone entirely.
+    const env = makeEnv();
+    const bundle = await call(env, "/app.js");
+    assert.equal(bundle.status, 200);
+    assert.match(bundle.text, /\/api\/scrobble\?st=/, "the webhook URL builder should use the token parameter");
+    assert.ok(
+      !/scrobble\?creator=['"]\s*\+\s*encodeURIComponent/.test(bundle.text),
+      "the client still builds a webhook URL containing creator+key"
+    );
+    assert.ok(
+      !/buildScrobbleWebhookUrl\(\s*activeCreator\.creatorName/.test(bundle.text),
+      "buildScrobbleWebhookUrl is still being called with a creator name and key"
+    );
+  });
+});
+
+// The env-backed API key globals (TMDB_API_KEY and friends) are the names
+// ~36 call sites across 03_, 05_, 06_ and 07_ reference directly. Only the
+// fetch handler used to point them at env, so on an isolate whose first
+// event was a cron tick they were all "". Nothing was broken in practice --
+// both cron functions happen to read env.X and thread it down -- but the
+// first cron-reachable helper that used a bare global would have run with an
+// empty key: no crash, no error, a provider quietly returning nothing.
+describe("audit fix: the cron connects the API key globals too", () => {
+  it("populates them on an isolate whose first event is a cron tick", async () => {
+    // A real fresh isolate: the built Worker evaluated in its own vm context,
+    // with scheduled() as the only thing that ever runs.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "worker_entry_combined.js"), "utf8");
+    const cut = src.lastIndexOf("export default");
+    assert.notEqual(cut, -1);
+
+    const sandbox = {
+      console, Date, Math, JSON, TextEncoder, TextDecoder, URL, URLSearchParams,
+      Response, Request, Headers, AbortController, AbortSignal, Promise, Map, Set,
+      Array, Object, String, Number, Error, RegExp, structuredClone,
+      crypto: globalThis.crypto,
+      atob: (v) => Buffer.from(v, "base64").toString("binary"),
+      btoa: (v) => Buffer.from(v, "binary").toString("base64"),
+      setTimeout, clearTimeout, setInterval, clearInterval,
+      caches: { default: { match: async () => null, put: async () => {} } },
+      fetch: async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } }),
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    // `let` at the top level of a vm script is script-scoped rather than a
+    // property of the sandbox, so the readout has to be defined in the SAME
+    // script to close over those bindings.
+    vm.runInContext(
+      src.slice(0, cut) +
+      "\nglobalThis.__exp = " + src.slice(cut).replace(/^export default/, "") +
+      "\nglobalThis.__keys = () => ({ TMDB_API_KEY, TRAKT_CLIENT_ID, SIMKL_CLIENT_ID, MDBLIST_API_KEY });",
+      sandbox, { filename: "worker_entry_combined.js" }
+    );
+
+    assert.equal(sandbox.__keys().TMDB_API_KEY, "", "globals should start empty");
+
+    const env = {
+      CONFIGS: {
+        get: async () => null, put: async () => {}, delete: async () => {},
+        list: async () => ({ keys: [], list_complete: true }),
+      },
+      TMDB_API_KEY: "REAL_TMDB", TRAKT_CLIENT_ID: "REAL_TRAKT",
+      SIMKL_CLIENT_ID: "REAL_SIMKL", MDBLIST_API_KEY: "REAL_MDBLIST",
+    };
+    await sandbox.__exp.scheduled({}, env, { waitUntil: () => {} });
+
+    const keys = sandbox.__keys();
+    assert.equal(keys.TMDB_API_KEY, "REAL_TMDB");
+    assert.equal(keys.TRAKT_CLIENT_ID, "REAL_TRAKT");
+    assert.equal(keys.SIMKL_CLIENT_ID, "REAL_SIMKL");
+    assert.equal(keys.MDBLIST_API_KEY, "REAL_MDBLIST");
   });
 });
 
@@ -583,6 +1133,330 @@ describe("directory pagination", () => {
   });
 });
 
+// Cloudflare aborts a Worker invocation after 1,000 subrequests, and KV
+// reads count. The index rebuild used to be a single unbounded pass at
+// roughly two reads per list, so past ~500 public lists it threw partway,
+// the throw was swallowed by the ctx.waitUntil(...).catch(...) at its only
+// call sites, the index was never written, and /lists/public.json fell back
+// to the legacy bounded scan -- the alphabetically-first 100 creators,
+// permanently, with nothing logged that a user or operator would ever see.
+//
+// These tests run the rebuild against a KV that enforces the real limit, so
+// a regression to any single-pass scan fails here instead of silently in
+// production.
+describe("audit fix: the public list index rebuilds at any scale", () => {
+  // Throws exactly the way the runtime does once an invocation has spent
+  // its subrequest budget. Reset between invocations, never within one.
+  function cappedKv(initial = {}, cap = 1000) {
+    const inner = makeKv(initial);
+    let n = 0;
+    let peak = 0;
+    const charge = () => {
+      n += 1;
+      if (n > peak) peak = n;
+      if (n > cap) throw new Error("Too many subrequests.");
+    };
+    return {
+      _store: inner._store,
+      _resetInvocation: () => { n = 0; },
+      _peak: () => peak,
+      async get(...a) { charge(); return inner.get(...a); },
+      async put(...a) { charge(); return inner.put(...a); },
+      async delete(...a) { charge(); return inner.delete(...a); },
+      async list(...a) { charge(); return inner.list(...a); },
+    };
+  }
+
+  function seedPublicLists(store, count) {
+    for (let i = 0; i < count; i++) {
+      const username = `user${String(i).padStart(5, "0")}`;
+      store.set(`creator:${username}`, JSON.stringify({
+        displayName: `Real ${username}`, keyHash: "pbkdf2:1:00:00", createdAt: 1,
+      }));
+      store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: i % 7, createdAt: 1, updatedAt: 1,
+      }));
+    }
+  }
+
+  // Drives cron-shaped ticks until the index lands. Each tick is a separate
+  // invocation, so each gets a fresh subrequest budget -- which is the whole
+  // point of chunking the rebuild.
+  async function driveToCompletion(env, kv, maxTicks = 200) {
+    for (let tick = 1; tick <= maxTicks; tick++) {
+      kv._resetInvocation();
+      kv._store.delete("lock:publiclistindex");
+      await call(env, "/lists/public.json");
+      if (kv._store.has("index:publiclists")) return tick;
+    }
+    return -1;
+  }
+
+  it("indexes every list past the point a single-pass scan died", async () => {
+    const n = 1000;
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+
+    const ticks = await driveToCompletion(env, kv);
+    assert.notEqual(ticks, -1, "index never completed");
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+
+    kv._resetInvocation();
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n, `directory reports ${listing.body.total} of ${n} lists`);
+  });
+
+  it("survives invisible records that cost a read but never reach the directory", async () => {
+    // rebuildPublicListIndex must read a record before it can test
+    // visibility, so a private list costs the same as a public one.
+    // /api/publish-list is unauthenticated and its records default to
+    // private, which made this a way to break the directory on purpose:
+    // ~900 of them took a 20-list deployment past the limit for good.
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, 20);
+    for (let i = 0; i < 900; i++) {
+      kv._store.set(`publishedlist:user:junk-${i}`, JSON.stringify({
+        name: "junk", visibility: "private", items: [{ id: "tt0111161" }],
+      }));
+    }
+    const env = makeEnv({ CONFIGS: kv });
+
+    assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+
+    kv._resetInvocation();
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, 20, "the 20 real lists must still all be listed");
+  });
+
+  it("publishes the index only once, and cleans up after itself", async () => {
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, 700);
+    const env = makeEnv({ CONFIGS: kv });
+
+    await driveToCompletion(env, kv);
+    // A partial scan must never be published as though it were complete,
+    // and the resume state must not outlive the build that used it.
+    assert.equal(kv._store.has("index:publiclists:build"), false, "build state leaked");
+    const settled = kv._store.get("index:publiclists");
+    for (let i = 0; i < 3; i++) {
+      kv._resetInvocation();
+      await call(env, "/lists/public.json");
+    }
+    assert.equal(kv._store.get("index:publiclists"), settled, "a completed index was rebuilt needlessly");
+  });
+
+  it("restarts cleanly from unparseable or stale resume state", async () => {
+    for (const bad of ["{not json", JSON.stringify({ v: 0, phase: 99 })]) {
+      const kv = cappedKv({}, 1000);
+      seedPublicLists(kv._store, 200);
+      kv._store.set("index:publiclists:build", bad);
+      const env = makeEnv({ CONFIGS: kv });
+      assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
+      kv._resetInvocation();
+      const listing = await call(env, "/lists/public.json?limit=500");
+      assert.equal(listing.body.total, 200, `stale state ${bad.slice(0, 12)} lost lists`);
+    }
+  });
+
+  it("loses nothing and duplicates nothing under concurrent rebuild attempts", async () => {
+    const n = 900;
+    // Deliberately NOT the capped KV here: five concurrent requests are five
+    // separate Worker invocations with five separate subrequest budgets, and
+    // a single shared counter would model that wrongly. The budget is
+    // covered by the tests above; this one is about the lock and the resume
+    // state holding up when chunks race.
+    const kv = makeKv();
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+
+    for (let round = 0; round < 60 && !kv._store.has("index:publiclists"); round++) {
+      kv._store.delete("lock:publiclistindex");
+      await Promise.all([0, 1, 2, 3, 4].map(() => call(env, "/lists/public.json")));
+    }
+    const entries = JSON.parse(kv._store.get("index:publiclists") || '{"entries":[]}').entries;
+    assert.equal(entries.length, n);
+    assert.equal(new Set(entries.map((e) => e.id)).size, n, "duplicate entries in the index");
+  });
+
+  it("/admin/api/rebuild-public-index reports progress and finishes across calls", async () => {
+    const n = 1500;
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+    const cookie = await adminCookie(env);
+
+    let calls = 0;
+    let scanned = 0;
+    let last;
+    do {
+      calls += 1;
+      kv._resetInvocation();
+      last = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+      assert.equal(last.body.ok, true);
+      scanned += last.body.scanned || 0;
+    } while (!last.body.done && calls < 100);
+
+    assert.equal(last.body.done, true, "rebuild never reported done");
+    assert.equal(last.body.count, n);
+    assert.ok(scanned >= n, `scanned ${scanned}, expected at least ${n}`);
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+  });
+});
+
+// /api/creator/reset-key hands back a brand-new working Creator Key on a
+// correct recovery answer, so that answer is a second credential for full
+// account takeover -- and unlike the ~60-bit key it is free text a human
+// picked, lowercased before hashing. It was throttled per IP only, which
+// throttles the wrong dimension entirely: rotating source addresses is free,
+// the account being attacked cannot be swapped out. Rotating IPs took over a
+// test account in five guesses.
+describe("audit fix: recovery answers are throttled per account, not just per IP", () => {
+  // The attack verbatim: a new source IP on every single guess.
+  async function guessWithRotatingIps(env, username, answers) {
+    for (let i = 0; i < answers.length; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST",
+        ip: nextIp(),
+        json: { username, recoveryAnswer: answers[i] },
+      });
+      if (r.body && r.body.ok) return { tookOver: true, atGuess: i + 1 };
+    }
+    return { tookOver: false };
+  }
+  const wrongThenRight = (correct, wrongCount) =>
+    Array.from({ length: wrongCount }, (_, i) => `wrong-answer-${i}`).concat([correct]);
+
+  // Run against both stores. The D1 path is not redundant: it takes a
+  // different code path (an atomic upsert instead of a KV read-modify-write),
+  // and the first version of this throttle counted nothing at all there
+  // while passing on KV, because its hand-written INSERT used a statement
+  // shape d1BumpStat does not.
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`blocks a rotating-IP takeover (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "victimacct", { recoveryAnswer: "fluffy-the-cat" });
+      const res = await guessWithRotatingIps(env, "victimacct", wrongThenRight("fluffy-the-cat", 20));
+      assert.equal(res.tookOver, false, `account taken over on guess #${res.atGuess} despite the per-account budget`);
+    });
+
+    it(`still lets the real owner in, before and after honest typos (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "goodacct", { recoveryAnswer: "correct-horse-battery" });
+      const first = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "goodacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(first.body.ok, true, "a correct answer must work first time");
+
+      // A few genuine typos must not lock the owner out, and succeeding must
+      // not spend the budget that protects them.
+      const env2 = makeEnv(makeStores());
+      await createUser(env2, "typoacct", { recoveryAnswer: "correct-horse-battery" });
+      await guessWithRotatingIps(env2, "typoacct", ["nope-one", "nope-two", "nope-three"]);
+      const late = await call(env2, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "typoacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(late.body.ok, true, `locked out after honest typos: ${late.body.error}`);
+    });
+  }
+
+  it("one account's budget cannot be spent by guesses at another", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await createUser(env, "targetacct", { recoveryAnswer: "correct-horse-battery" });
+    await createUser(env, "bystanderacct", { recoveryAnswer: "different-answer-here" });
+    await guessWithRotatingIps(env, "targetacct", wrongThenRight("nope", 12));
+    // Exhausting one account must leave every other account untouched...
+    const other = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(),
+      json: { username: "bystanderacct", recoveryAnswer: "different-answer-here" },
+    });
+    assert.equal(other.body.ok, true, "an unrelated account was locked out too");
+  });
+
+  it("guesses at a username that does not exist never mint a budget", async () => {
+    // Unknown names must not create per-account counters -- otherwise anyone
+    // can grow that keyspace for free by guessing at names at random.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    for (let i = 0; i < 8; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: `ghostacct${i}`, recoveryAnswer: "whatever-here" },
+      });
+      assert.equal(r.body.ok, false);
+    }
+    const minted = [...kv._store.keys()].filter((k) => k.startsWith("authfail:"));
+    assert.deepEqual(minted, [], `unknown usernames minted counters: ${minted.join(", ")}`);
+  });
+
+  it("requires a recovery answer long enough to be worth having", async () => {
+    const env = makeEnv();
+    const short = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "shortanswer", recoveryAnswer: "cat" },
+    });
+    assert.equal(short.body.ok, false, "a 3-character recovery answer was accepted");
+    assert.equal(short.status, 400);
+
+    const long = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "longanswer", recoveryAnswer: "my-first-pet-was-rex" },
+    });
+    assert.equal(long.body.ok, true, long.body.error);
+
+    // It stays optional -- this must not become a required field.
+    const none = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "noanswer" },
+    });
+    assert.equal(none.body.ok, true, none.body.error);
+  });
+});
+
+// The page loads fflate from a CDN that the CSP's script-src allows, so
+// whatever that URL returns runs with full page privileges -- and this page
+// keeps myListAddon:creatorKey, the MDBList/Simkl access tokens and the
+// provider API keys in localStorage, all readable by any script in it.
+// Pinning the version is not integrity checking.
+describe("audit fix: the CDN script is integrity-pinned", () => {
+  it("carries an SRI hash and crossorigin on every external script", async () => {
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const externals = [...page.text.matchAll(/<script\b[^>]*\bsrc="(https?:[^"]+)"[^>]*>/g)];
+    assert.ok(externals.length > 0, "expected at least one external script tag");
+    for (const [tag, src] of externals) {
+      assert.match(tag, /\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"/, `no SRI hash on ${src}`);
+      // Required for SRI to be enforced on a cross-origin script.
+      assert.match(tag, /\bcrossorigin="anonymous"/, `no crossorigin on ${src}`);
+      // A hash only means anything against a pinned version.
+      assert.match(src, /@\d+\.\d+\.\d+\//, `unpinned version in ${src}`);
+    }
+  });
+
+  it("pins a hash that matches the bytes the CDN actually serves", { skip: !process.env.NETWORK_TESTS }, async () => {
+    // Opt-in (NETWORK_TESTS=1): the rest of the suite is hermetic, and CI
+    // should not fail because a CDN is briefly unreachable. Run this when
+    // changing the script URL or bumping its version.
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const m = page.text.match(/<script\b[^>]*\bsrc="(https:[^"]+)"[^>]*\bintegrity="sha384-([A-Za-z0-9+/=]+)"/);
+    assert.ok(m, "no integrity-pinned external script found");
+    const [, src, pinned] = m;
+    const res = await fetch(src);
+    assert.equal(res.status, 200);
+    const digest = await crypto.subtle.digest("SHA-384", await res.arrayBuffer());
+    const actual = Buffer.from(digest).toString("base64");
+    assert.equal(actual, pinned, `SRI hash does not match what ${src} serves -- regenerate it`);
+  });
+});
+
 describe("likes and preview guards", () => {
   it("rejects like-external URLs off the provider allowlist", async () => {
     const env = makeEnv();
@@ -666,6 +1540,55 @@ describe("likes and preview guards", () => {
     // embed the response in the SVG returned -- an SSRF/open image proxy.
     const fetchCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/x") + "&airDate=2099-01-01");
     assert.equal(fetchCase.status, 404);
+  });
+
+  // The companion to the race test below. Retrying whenever a vote is not
+  // visible in the read-back treats every stale read as contention, and KV
+  // reads are edge-cached, so on an otherwise idle list that spent a second
+  // write against a key KV limits to one write per second. The retry is now
+  // gated on evidence of another writer -- an id present that was not in our
+  // own pre-write snapshot -- which a stale read cannot produce.
+  it("does not re-write the ledger when KV merely serves a stale read", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicestale");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "StaleList", type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${saved.body.slug}`;
+
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const realGet = env.CONFIGS.get.bind(env.CONFIGS);
+    let ledgerWrites = 0;
+    let previous = null;
+    let havePrevious = false; // a first write's previous value is legitimately null
+    let servedStale = 0;
+    env.CONFIGS.put = async (key, value) => {
+      if (key === ledgerKey) { previous = await realGet(key); havePrevious = true; ledgerWrites++; }
+      return realPut(key, value);
+    };
+    // Edge caching does not clear within one request, so serve the pre-write
+    // value for several reads rather than just one.
+    env.CONFIGS.get = async (key, type) => {
+      if (key === ledgerKey && havePrevious && servedStale < 6) { servedStale++; return previous; }
+      return realGet(key, type);
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug: saved.body.slug },
+    });
+    assert.equal(r.body.ok, true);
+    assert.ok(servedStale > 0, "the stale-read condition never triggered");
+    assert.equal(ledgerWrites, 1, `a stale read caused ${ledgerWrites} writes to a 1-write/sec key`);
+
+    const stored = JSON.parse(await realGet(ledgerKey));
+    assert.equal(stored.length, 1);
+    assert.equal(r.body.likes, stored.length, "reported count does not match storage");
   });
 
   it("a vote survives a concurrent write racing its own PUT (applyLikeVote retry)", async () => {
@@ -1751,7 +2674,14 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     assert.ok(limited > 0, "expected the per-IP bucket to reject some of 25 rapid calls");
   });
 
-  it("rate-limits /api/details/batch only when it falls back to the shared TMDB key", async () => {
+  // This test used to assert that a caller supplying their own tmdbKey "must
+  // never be rate-limited". That was the wrong property, and it was the
+  // vulnerability: bringing your own key means you are spending your own
+  // TMDB quota, but it never meant you were spending your own subrequests,
+  // and the field was never validated. Any non-empty string therefore
+  // unlocked an unlimited 60-id fan-out against this Worker's budget.
+  // The correct property is a HIGHER ceiling, not the absence of one.
+  it("gives bring-your-own-key callers more headroom on /api/details/batch, not an exemption", async () => {
     const env = makeEnv();
     const ip = nextIp();
     let sharedLimited = 0;
@@ -1761,9 +2691,8 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     }
     assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
 
-    // A visitor who supplied their own key spends their own quota, so the
-    // limit must not apply to them -- throttling them would penalise
-    // exactly the users who bothered to configure a key.
+    // The headroom the exemption existed to give is preserved: a caller with
+    // their own key sails past the shared-key ceiling.
     const ownKeyIp = nextIp();
     let ownKeyLimited = 0;
     for (let i = 0; i < 70; i++) {
@@ -1772,7 +2701,53 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
       });
       if (r.status === 429) ownKeyLimited++;
     }
-    assert.equal(ownKeyLimited, 0, "callers using their own TMDB key must never be rate-limited");
+    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+
+    // ...but it is a ceiling, not an exemption.
+    const floodIp = nextIp();
+    let floodLimited = 0;
+    for (let i = 0; i < 260; i++) {
+      const r = await call(env, "/api/details/batch", {
+        method: "POST", ip: floodIp, json: { ids: ["tt1"], tmdbKey: "anything-at-all" },
+      });
+      if (r.status === 429) floodLimited++;
+    }
+    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
+  });
+
+  it("gives bring-your-own-key callers more headroom on /api/recommendations, not an exemption", async () => {
+    // Up to ~72 outbound subrequests per call, so this is the bigger
+    // amplifier of the two.
+    const env = makeEnv();
+    const sharedIp = nextIp();
+    let sharedLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: sharedIp, json: { movieIds: [], showIds: [] },
+      });
+      if (r.status === 429) sharedLimited++;
+    }
+    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], showIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+
+    const floodIp = nextIp();
+    let floodLimited = 0;
+    for (let i = 0; i < 140; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: floodIp, json: { movieIds: [], showIds: [], tmdbKey: "x" },
+      });
+      if (r.status === 429) floodLimited++;
+    }
+    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
   });
 
   it("rate-limits /api/recommendations only when it falls back to the shared TMDB key", async () => {
@@ -1979,6 +2954,100 @@ describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
     // Re-running must not double the counts (DO NOTHING, not n = n + ...).
     await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
     assert.equal(env.DB._stat("pageviews", "total"), 100, "a second migration must not double counts");
+  });
+
+  // migrate-d1 spends a KV read plus a D1 statement per key, both of which
+  // count against Cloudflare's 1,000-subrequest cap. As a single unbounded
+  // pass it therefore aborted partway through on exactly the sites big
+  // enough to need it, backfilling a prefix of the accounts and reporting
+  // ok -- and an account left in KV but missing from D1 is the case the
+  // key-rotation endpoints get wrong, because a D1 UPDATE matching zero
+  // rows still reports success.
+  it("migrate-d1 backfills every account at a scale that used to abort it", async () => {
+    const n = 900;
+    // A KV that enforces the real per-invocation limit, and a D1 whose
+    // statements are charged against the same budget, as they really are.
+    const inner = makeKv();
+    let spentThisInvocation = 0;
+    let peak = 0;
+    const charge = () => {
+      spentThisInvocation += 1;
+      if (spentThisInvocation > peak) peak = spentThisInvocation;
+      if (spentThisInvocation > 1000) throw new Error("Too many subrequests.");
+    };
+    const kv = {
+      _store: inner._store,
+      async get(...a) { charge(); return inner.get(...a); },
+      async put(...a) { charge(); return inner.put(...a); },
+      async delete(...a) { charge(); return inner.delete(...a); },
+      async list(...a) { charge(); return inner.list(...a); },
+    };
+    const realDb = makeD1();
+    const db = {
+      _creators: realDb._creators,
+      _lists: realDb._lists,
+      _stat: realDb._stat,
+      prepare(sql) {
+        const st = realDb.prepare(sql);
+        const chargedRun = (target) => async () => { charge(); return target.run(); };
+        const chargedAll = (target) => async () => { charge(); return target.all(); };
+        return {
+          bind(...a) {
+            const b = st.bind(...a);
+            return { run: chargedRun(b), all: chargedAll(b) };
+          },
+          run: chargedRun(st),
+          all: chargedAll(st),
+        };
+      },
+      batch: realDb.batch,
+    };
+
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    for (let i = 0; i < n; i++) {
+      const username = `user${String(i).padStart(5, "0")}`;
+      inner._store.set(`creator:${username}`, JSON.stringify({
+        displayName: `Real ${username}`, keyHash: `hash-${i}`, createdAt: 1,
+      }));
+      inner._store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: i % 5, createdAt: 1, updatedAt: 1,
+      }));
+    }
+
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      spentThisInvocation = 0; // a new call is a new invocation, with a new budget
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      assert.equal(last.body.ok, true, `call ${calls} failed: ${last.body.error}`);
+    } while (!last.body.done && calls < 200);
+
+    assert.equal(last.body.done, true, "migration never reported done");
+    assert.ok(peak <= 1000, `one invocation spent ${peak} subrequests, over the limit`);
+    // The point of the whole endpoint: no account may be left behind.
+    assert.equal(db._creators.size, n, `only ${db._creators.size} of ${n} creators reached D1`);
+    assert.equal(db._lists.size, n, `only ${db._lists.size} of ${n} lists reached D1`);
+    assert.equal(last.body.results.creators, n);
+  });
+
+  it("migrate-d1 restarts cleanly from unparseable resume state", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "77");
+    await env.CONFIGS.put("migrated1:state", "{not json");
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    } while (!last.body.done && calls < 50);
+    assert.equal(last.body.done, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 77);
+    // Resume state must not outlive the run that used it.
+    assert.equal(await env.CONFIGS.get("migrated1:state"), null, "resume state leaked");
   });
 
   it("keeps counting correctly in KV-only deployments", async () => {

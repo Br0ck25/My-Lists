@@ -823,11 +823,6 @@ async function startTraktDeviceLogin() {
 }
 
 let myPrivateTraktListsTimer = null;
-function scheduleMyPrivateTraktListsRefresh() {
-  clearTimeout(myPrivateTraktListsTimer);
-  myPrivateTraktListsTimer = setTimeout(runMyPrivateTraktLists, 200);
-}
-
 async function runMyPrivateTraktLists() {
   const box = document.getElementById('myPrivateTraktListsResult');
   if (!box) return;
@@ -1195,32 +1190,6 @@ function onTmdbKeyInputChanged() {
   }
   renderTmdbConnectStatus();
   scheduleMyTmdbListsRefresh();
-}
-
-async function testTmdbConnection() {
-  const input = document.getElementById('tmdbKeyInput');
-  const statusEl = document.getElementById('tmdbConnectStatus');
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  if (!key) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">Please enter your TMDB API Key or Access Token first.</span>';
-    return;
-  }
-  if (statusEl) statusEl.innerHTML = '<span style="color:var(--muted);">Testing TMDB connection\u2026</span>';
-  try {
-    const res = await fetch(ORIGIN + '/api/tmdb-search-lists?q=star&tmdbKey=' + encodeURIComponent(key));
-    const data = await res.json();
-    if (data.ok) {
-      localStorage.setItem('myListAddon:tmdbKey', key);
-      saveState();
-      if (statusEl) statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB API Key verified and active.</span>';
-      renderTmdbConnectStatus();
-      scheduleMyTmdbListsRefresh();
-    } else {
-      if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Invalid TMDB Key: ' + escapeHtml(data.error || 'Check your key and try again.') + '</span>';
-    }
-  } catch (e) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Network error testing TMDB key.</span>';
-  }
 }
 
 function startTmdbConnect() {

@@ -41,9 +41,11 @@ function isPublicCorsPath(path) {
 //
 // CSP is deliberately not the strict, script-src-locked-down kind: this
 // app relies on plenty of inline <script> blocks and inline onclick=/
-// onchange= handlers throughout the builder/admin pages (see the
-// verification pipeline's own "onclick/onchange handler resolution check"
-// step), which only work with 'unsafe-inline' on script-src. Tightening
+// onchange= handlers throughout the builder/admin pages, which only work
+// with 'unsafe-inline' on script-src. (That trade is only reasonable if the
+// handlers actually resolve, which html_checks.py now verifies across all
+// 733 of them -- for a long time this comment cited that step before it
+// existed.) Tightening
 // that further would mean a nonce- or hash-based rewrite of every inline
 // handler -- a real project of its own, not a header tweak. What this CSP
 // still buys, even with 'unsafe-inline' allowed: no loading of scripts/
@@ -1242,6 +1244,74 @@ async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 
   return false;
 }
 
+// --- Per-account authentication failure budget -------------------------------
+//
+// consumeRateLimit above counts per IP, which is the right dimension for
+// abuse of an expensive endpoint and the wrong one for guessing one
+// account's secret: IPs are cheap and rotate, the account under attack does
+// not. /api/creator/reset-key needs both, because the secret it checks is a
+// recovery answer -- see RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+//
+// Counted per account per day and only on FAILURES, so someone who answers
+// correctly never spends their own budget, and a locked-out account frees
+// itself the next day rather than needing an admin.
+//
+// D1's upsert is atomic, so when it is bound a burst of concurrent guesses
+// cannot all read the same pre-increment value. KV cannot promise that (its
+// reads are edge-cached for up to a minute), so the KV path is looser -- but
+// that is a one-minute window against a 24-hour bucket, which bounds a burst
+// instead of leaving guesses unlimited the way having no per-account counter
+// at all did. Same "D1 when bound, KV otherwise" split as the counters.
+//
+// The KV copies expire on their own via expirationTtl. The D1 rows do not --
+// they are one row per (account that was guessed at, day), only ever read
+// for the current day, so old ones are inert rather than harmful. Worth a
+// sweep eventually if a deployment is attacked persistently; not worth a
+// migration today.
+const AUTH_FAIL_TTL_SEC = 86400;
+
+async function readAuthFailureCount(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(`authfail:${scope}`, day).all();
+      // The query SUCCEEDED, so no row means no failures yet. Deliberately
+      // not readStatCount's "no row -> fall through to KV" rule: that exists
+      // because a missing counter row can mean "not migrated yet", and
+      // applying it here would reset the failure count on every attempt.
+      return results && results.length ? (Number(results[0].n) || 0) : 0;
+    } catch {
+      // Table missing (migration 0002 not applied) or D1 unavailable --
+      // fall through to KV, which is also where the writes will land.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  return parseInt(await env.CONFIGS.get(`authfail:${scope}:${day}`), 10) || 0;
+}
+
+async function noteAuthFailure(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      // d1BumpStat, not a hand-written INSERT. Its statement shape --
+      // VALUES (?, ?, ?) with DO UPDATE SET n = n + excluded.n -- is the one
+      // every other counter here uses, and it is the atomic part. Writing a
+      // near-miss variant of it by hand (DO UPDATE SET n = n + 1, with the
+      // amount inlined rather than bound) is exactly how this throttle
+      // silently counted nothing at all on D1-bound deployments the first
+      // time it was written.
+      await d1BumpStat(env, `authfail:${scope}`, [day], 1);
+      return;
+    } catch {
+      // Same fallback as the read above, so both halves stay on one store.
+    }
+  }
+  if (!env || !env.CONFIGS) return;
+  const key = `authfail:${scope}:${day}`;
+  const n = parseInt(await env.CONFIGS.get(key), 10) || 0;
+  await env.CONFIGS.put(key, String(n + 1), { expirationTtl: AUTH_FAIL_TTL_SEC });
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
   const ip = clientIpKey(request);
@@ -1266,24 +1336,37 @@ async function readLikeVoters(env, ledgerKey) {
 }
 
 // Applies one vote to a ledger key and returns the resulting count.
-// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
-// be a new voter -- the caller keeps the existing count rather than
-// silently discarding the vote or growing the key without bound.
+// `capped: true` means the ledger is full (see LIKE_VOTER_CAP) and this
+// would have been a new voter -- the caller keeps the existing count rather
+// than silently discarding the vote or growing the key without bound.
 //
 // Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
 // here can lose a vote: two requests can both read the same snapshot, and
-// whichever PUT lands last in KV wins, silently dropping the other one.
-// Rather than a full lock (KV has no primitive to build one on reliably
-// either), this re-reads the ledger after writing and confirms this
-// voter's own membership actually stuck; if another write raced it in
-// between, it retries against that fresh state instead of just trusting
-// its own PUT. Bounded to a handful of attempts -- this only protects
-// against genuinely concurrent requests on one list, not a design that
-// needs to spin forever.
+// whichever PUT lands last wins. This writes, re-reads, and retries against
+// the fresh state if its own vote did not survive.
+//
+// The subtlety is WHEN to retry. KV does not promise read-your-writes -- its
+// reads are edge-cached -- so "my vote is not in the value I just read back"
+// has two completely different causes: another writer really did land on top
+// of us, or KV simply served a stale copy and nothing happened at all.
+// Retrying on both treats every stale read as contention, which on an
+// otherwise idle list spends several writes against a key KV limits to one
+// write per second, and can still report a count that does not match
+// storage.
+//
+// So the retry is gated on EVIDENCE of another writer: an id present now
+// that was not in our own pre-write snapshot and is not ours. A real
+// clobber leaves that trace (the other request wrote its own voter); a
+// stale read cannot, because a stale read is by definition the state we
+// already saw. No evidence means our PUT is good and the read was simply
+// behind, so we trust it and stop.
+const LIKE_VOTE_MAX_ATTEMPTS = 3;
+
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  const MAX_ATTEMPTS = 4;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  let lastCount = 0;
+  for (let attempt = 0; attempt < LIKE_VOTE_MAX_ATTEMPTS; attempt++) {
     const voters = await readLikeVoters(env, ledgerKey);
+    const before = new Set(voters);
     const set = new Set(voters);
     const had = set.has(voterId);
     if (liked) {
@@ -1292,26 +1375,150 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
     } else {
       set.delete(voterId);
     }
-    // No write at all when nothing changed -- KV allows one write per
-    // second per key, and a double-tap on a busy list should not burn
-    // that budget or race with a genuine vote.
-    if (set.size === voters.length && had === set.has(voterId)) {
+    lastCount = set.size;
+    // No write at all when nothing changed -- KV allows one write per second
+    // per key, and a double-tap on a busy list should not burn that budget.
+    // The size comparison also collapses a ledger that had duplicate
+    // entries, since `set` is deduplicated.
+    if (had === liked && set.size === voters.length) {
       return { count: set.size, capped: false };
     }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
-    const verifyVoters = await readLikeVoters(env, ledgerKey);
-    if (new Set(verifyVoters).has(voterId) === liked) {
-      return { count: verifyVoters.length, capped: false };
+
+    const after = await readLikeVoters(env, ledgerKey);
+    const afterSet = new Set(after);
+    if (afterSet.has(voterId) === liked) {
+      // Our vote is visible in storage. Done.
+      return { count: after.length, capped: false };
     }
-    // Someone else's write landed on top of ours between the PUT and this
-    // re-read -- loop and retry against their (now current) state rather
-    // than reporting a count/liked state that isn't what's actually
-    // stored.
+    // Our vote is missing. Is there any trace of another writer?
+    const anotherWriterLanded = [...afterSet].some((id) => id !== voterId && !before.has(id));
+    if (!anotherWriterLanded) {
+      // No trace: this is a stale read of the state we already had, not a
+      // lost update. Trust our own PUT rather than writing it again.
+      return { count: lastCount, capped: false };
+    }
+    // Someone else's write really did land on top of ours -- loop and merge
+    // against their now-current state.
   }
-  // Exhausted retries under sustained contention on this one list: report
-  // whatever is actually in KV right now rather than guessing.
+  // Sustained genuine contention on this one list: report what is actually
+  // in KV rather than guessing.
   const finalVoters = await readLikeVoters(env, ledgerKey);
   return { count: finalVoters.length, capped: false };
+}
+
+// --- Scrobble tokens ---------------------------------------------------------
+//
+// A media-server webhook URL has to carry its credential in the query
+// string: Plex, Jellyfin and Emby let you paste a URL and nothing else. That
+// URL then lives in the media server's configuration, in its logs, and in
+// any request log along the way.
+//
+// It used to carry the Creator Key itself, which is the credential for the
+// whole account and has no expiry. Anyone who read that URL out of a log had
+// full access, and the only remedy was rotating the key -- which breaks
+// every other device the owner had signed in on.
+//
+// A scrobble token is a separate, revocable credential that authorises
+// exactly one thing: recording playback for one account. Regenerating it
+// invalidates the old webhook URL and touches nothing else. One per account,
+// stored both ways so it can be looked up by token on the hot path and
+// found by username for revocation and account deletion.
+function scrobbleTokenKey(token) {
+  return `scrobbletoken:${token}`;
+}
+function creatorScrobbleTokenKey(username) {
+  return `creatorscrobbletoken:${username}`;
+}
+
+// Returns the account's current token, minting one if it has none.
+// `rotate` forces a fresh token and revokes the previous one.
+async function getOrCreateScrobbleToken(env, username, rotate = false) {
+  if (!env || !env.CONFIGS) return "";
+  let existing = "";
+  try {
+    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+  } catch {
+    existing = "";
+  }
+  if (existing && !rotate) return existing;
+
+  // Same CSPRNG helper the OAuth state cookies use.
+  const token = generateShortId() + generateShortId();
+  await env.CONFIGS.put(scrobbleTokenKey(token), username);
+  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+  if (existing) {
+    // Revoke the old one, so a leaked webhook URL actually stops working.
+    try {
+      await env.CONFIGS.delete(scrobbleTokenKey(existing));
+    } catch {
+      // A stranded token is the one failure worth shouting about here, but
+      // it cannot be helped from inside this request; the reverse index no
+      // longer points at it either way.
+      console.error("scrobble token rotation: could not revoke the previous token");
+    }
+  }
+  return token;
+}
+
+// Resolves a presented token to the account it belongs to, or "" .
+async function usernameForScrobbleToken(env, token) {
+  if (!env || !env.CONFIGS) return "";
+  const t = String(token || "").trim();
+  // Shape check before touching KV, so a junk value cannot mint reads.
+  if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  try {
+    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+  } catch {
+    return "";
+  }
+}
+
+// --- Slug allocation ---------------------------------------------------------
+//
+// Picks a slug nothing has claimed yet, given an async predicate that says
+// whether a candidate is taken.
+//
+// Numbered suffixes first, because "-2"/"-3" make far nicer URLs than a
+// random token, but only a few of them: the numbered scan is O(n) in how
+// many lists already share a name, and at /api/publish-list each of those
+// checks is a KV read. 500 collisions meant 501 KV reads for one publish --
+// half of Cloudflare's per-invocation subrequest budget, on an
+// unauthenticated endpoint, and a condition anyone could manufacture just by
+// publishing the same list name repeatedly. After that it switches to a
+// random suffix, which needs one check regardless of how crowded the name is.
+//
+// Returns "" when it cannot find a free slug, and callers MUST treat that as
+// a failure. Both call sites previously ran a bounded numbered loop and then
+// used whatever slug it exited on -- which, once the bound was reached, was a
+// slug that WAS taken. The write then went straight over an existing list:
+// at /api/publish-list, publishing a 501st list called "Movies" silently
+// replaced the contents of movies-500, returned ok:true, and handed back
+// that list's URL as if it were yours.
+const SLUG_NUMBERED_ATTEMPTS = 10;
+const SLUG_RANDOM_ATTEMPTS = 5;
+
+// Uniqueness, not secrecy -- this only has to avoid colliding with other
+// lists sharing a name, so the slight modulo bias here does not matter.
+function randomSlugSuffix() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+async function pickFreeSlug(baseSlug, isTaken) {
+  if (!(await isTaken(baseSlug))) return baseSlug;
+  for (let attempt = 2; attempt <= SLUG_NUMBERED_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${attempt}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  for (let attempt = 0; attempt < SLUG_RANDOM_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${randomSlugSuffix()}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  return "";
 }
 
 // --- External list URL validation --------------------------------------------
@@ -1415,6 +1622,50 @@ const PUBLIC_INDEX_KEY = "index:publiclists";
 // size. Beyond this the tail is dropped (least-liked first).
 const PUBLIC_INDEX_MAX = 20000;
 
+// --- Rebuild chunking --------------------------------------------------------
+//
+// A full rebuild costs roughly one KV read per list, plus (the first time a
+// given record is seen) one for its creator's display name and one to stamp a
+// missing visibility. Cloudflare caps a Worker invocation at 1,000
+// subrequests, so the old single-pass scan stopped working entirely somewhere
+// around 500 public lists: it threw partway through, and because every call
+// site runs it inside ctx.waitUntil(...).catch(...) the throw was swallowed,
+// the index was never written, and the directory fell back to the legacy
+// bounded scan -- the alphabetically-first 100 creators, forever, with no
+// error surfaced anywhere.
+//
+// It was also reachable on purpose. rebuildPublicListIndex reads each record
+// BEFORE testing visibility, so a list that never appears in the directory
+// still costs a read, and /api/publish-list mints permanent, private-by-
+// default records for anyone at 10/minute. ~900 of those were enough to push
+// a deployment holding only 20 real public lists past the limit for good.
+//
+// So a rebuild now runs in resumable chunks, the same shape
+// /admin/api/migrate-day-counts already uses: one page of keys per
+// invocation, progress parked in index:publiclists:build, and the finished
+// index published only once the final page lands. The cron ticks every 6
+// minutes, so a cold index converges on its own at any scale instead of
+// never completing at all.
+const PUBLIC_INDEX_BUILD_KEY = "index:publiclists:build";
+const PUBLIC_INDEX_BUILD_PREFIXES = ["creatorlist:", "publishedlist:user:"];
+// KV operations one chunk may spend. Deliberately a minority of the 1,000
+// available, because a chunk usually runs inside the cron invocation and
+// shares that budget with prewarmSharedCatalogs (~142 subrequests) and
+// checkForNewEpisodes (up to ~400: 25 accounts plus a 150-show check
+// budget). This has to be low enough that a chunk can never be the thing
+// that trips the limit -- a chunk that throws saves no progress, so an
+// over-generous budget would reproduce the exact "never completes" failure
+// this chunking exists to fix.
+const PUBLIC_INDEX_BUILD_OPS_PER_RUN = 300;
+// ...and the ceiling for a chunk kicked off by /admin/api/rebuild-public-index,
+// which has the invocation to itself.
+const PUBLIC_INDEX_BUILD_OPS_ADMIN = 800;
+const PUBLIC_INDEX_BUILD_PAGE = 400;
+// Records are fetched in parallel within a chunk. The old code awaited each
+// get in sequence, so even a rebuild that fit inside the limit was one
+// serialised round-trip per list.
+const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
+
 async function readPublicListIndex(env) {
   if (!env || !env.CONFIGS) return null;
   try {
@@ -1475,93 +1726,205 @@ async function updatePublicListIndex(env, id, entry) {
   }
 }
 
-// Full scan -> index. Expensive (one KV get per list), so it runs only when
-// the index is missing, and only one caller at a time via a short lock.
-async function rebuildPublicListIndex(env) {
-  const entries = [];
-  const seen = new Set();
+// Persisted progress for an in-flight rebuild. Anything unparseable, or from
+// an older shape, simply restarts the build rather than half-applying.
+function emptyPublicIndexBuildState() {
+  return { v: 1, phase: 0, cursor: "", pending: [], entries: [], names: {} };
+}
+
+async function readPublicIndexBuildState(env) {
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
+    if (!raw) return emptyPublicIndexBuildState();
+    const s = JSON.parse(raw);
+    if (!s || s.v !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
+      return emptyPublicIndexBuildState();
+    }
+    return {
+      v: 1,
+      phase: Number(s.phase) || 0,
+      cursor: typeof s.cursor === "string" ? s.cursor : "",
+      pending: s.pending.filter((k) => typeof k === "string"),
+      entries: s.entries.filter(Boolean),
+      names: s.names && typeof s.names === "object" ? s.names : {},
+    };
+  } catch {
+    return emptyPublicIndexBuildState();
+  }
+}
+
+// Runs ONE chunk of a rebuild and returns:
+//   { done: true,  entries }                     -- index written and published
+//   { done: false, entries: null, ... }          -- progress saved, call again
+//
+// Callers that need the finished article must keep calling (the cron does).
+// Until it reports done the live index key is left exactly as it was, so a
+// partial scan is never published as if it were complete.
+//
+// One caveat worth knowing: a list published *behind* the cursor while a
+// multi-chunk rebuild is in flight is not picked up by that rebuild. It lands
+// in the index the moment the build finishes and updatePublicListIndex takes
+// over again, or on the next rebuild. Directory visibility lagging a cold
+// start by a few minutes is the tradeoff for it converging at all.
+async function rebuildPublicListIndex(env, options = {}) {
+  const opBudget = Number(options.opBudget) || PUBLIC_INDEX_BUILD_OPS_PER_RUN;
+
+  // Every KV call this chunk makes goes through here, so the budget tracks
+  // what was actually spent rather than a worst-case guess -- which matters
+  // because the per-key cost varies (a cached display name and an
+  // already-stamped visibility cost nothing extra).
+  let ops = 0;
+  const kv = env.CONFIGS;
+  const counted = {
+    get: (...a) => { ops++; return kv.get(...a); },
+    put: (...a) => { ops++; return kv.put(...a); },
+    delete: (...a) => { ops++; return kv.delete(...a); },
+    list: (...a) => { ops++; return kv.list(...a); },
+  };
+  // stampListVisibilityIfNeeded and getCreator take an env, not a namespace.
+  const countedEnv = { ...env, CONFIGS: counted };
+
+  ops++; // readPublicIndexBuildState's own get
+  const state = await readPublicIndexBuildState(env);
+  const seen = new Set(state.entries.map((e) => e && e.id).filter(Boolean));
 
   // Search matches against the creator's display name too, so the index has
-  // to carry it. Cached per username: creators are far fewer than lists, and
-  // without this the rebuild would do a second get for every list.
-  const displayNameCache = new Map();
+  // to carry it. Cached across chunks in the build state -- creators are far
+  // fewer than lists, and without this the rebuild would do a second get for
+  // every list, every time.
+  const inFlightNames = new Map();
   async function resolveDisplayName(username) {
-    if (displayNameCache.has(username)) return displayNameCache.get(username);
-    let name = username;
+    if (Object.prototype.hasOwnProperty.call(state.names, username)) return state.names[username];
+    // Two workers in the same batch can miss on the same username; only one
+    // of them should pay for the lookup.
+    if (inFlightNames.has(username)) return inFlightNames.get(username);
+    const p = (async () => {
+      let name = username;
+      try {
+        const profileRaw = await getCreator(countedEnv, username);
+        if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+      } catch {
+        // fall back to the raw username slug
+      }
+      state.names[username] = name;
+      return name;
+    })();
+    inFlightNames.set(username, p);
     try {
-      const profileRaw = await getCreator(env, username);
-      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
-    } catch {
-      // fall back to the raw username slug
+      return await p;
+    } finally {
+      inFlightNames.delete(username);
     }
-    displayNameCache.set(username, name);
-    return name;
   }
 
-  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-  for (const k of creatorKeys.keys) {
-    const rest = k.name.slice("creatorlist:".length);
-    const sep = rest.indexOf(":");
-    if (sep === -1) continue;
-    const username = rest.slice(0, sep);
-    const slug = rest.slice(sep + 1);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  async function buildEntry(phase, keyName) {
+    const prefix = PUBLIC_INDEX_BUILD_PREFIXES[phase];
+    const rest = keyName.slice(prefix.length);
+    let username = "user";
+    let slug = rest;
+    let id = `a:${rest}`;
+    if (phase === 0) {
+      const sep = rest.indexOf(":");
+      if (sep === -1) return null;
+      username = rest.slice(0, sep);
+      slug = rest.slice(sep + 1);
+      id = `c:${username}:${slug}`;
+    }
+    if (seen.has(id)) return null;
+    const raw = await counted.get(keyName);
+    if (!raw) return null;
     try {
       const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `c:${username}:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
+      await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+      if (!isPublicListVisibility(data.visibility)) return null;
+      return {
         id,
-        isCreator: true,
+        isCreator: phase === 0,
         username,
-        creatorName: await resolveDisplayName(username),
+        ...(phase === 0 ? { creatorName: await resolveDisplayName(username) } : {}),
         slug,
         name: data.name || "List",
         type: data.type || "mixed",
-        itemCount,
+        itemCount: Array.isArray(data.items) ? data.items.length : (data.itemCount || 0),
         likes: data.likes || 0,
         updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      };
     } catch {
       // skip unparseable record
+      return null;
     }
   }
 
-  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-  for (const k of anonKeys.keys) {
-    const slug = k.name.slice("publishedlist:user:".length);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  let scanned = 0;
+
+  // Outer loop: keep taking work until the budget runs out or every prefix is
+  // exhausted. A small deployment finishes all of this in a single chunk, so
+  // its behaviour is exactly what it was before.
+  while (state.phase < PUBLIC_INDEX_BUILD_PREFIXES.length && ops < opBudget) {
+    if (!state.pending.length) {
+      if (state.cursor === null) {
+        // This prefix is finished; move to the next one.
+        state.phase++;
+        state.cursor = "";
+        continue;
+      }
+      const listOpts = { prefix: PUBLIC_INDEX_BUILD_PREFIXES[state.phase], limit: PUBLIC_INDEX_BUILD_PAGE };
+      if (state.cursor) listOpts.cursor = state.cursor;
+      const res = await counted.list(listOpts);
+      state.pending = (res.keys || []).map((k) => k.name);
+      state.cursor = (res.list_complete || !res.cursor) ? null : res.cursor;
+      if (!state.pending.length) continue;
+    }
+
+    // Claim keys from the head of `pending` in bounded-concurrency batches,
+    // stopping as soon as the budget is gone. Workers claim strictly in
+    // order, so everything before `next` was fully processed and everything
+    // from `next` on is still owed -- which is what gets persisted.
+    const phase = state.phase;
+    const batch = state.pending;
+    let next = 0;
+    const collected = [];
+    const worker = async () => {
+      while (next < batch.length && ops < opBudget) {
+        const keyName = batch[next++];
+        const entry = await buildEntry(phase, keyName);
+        if (entry) collected.push(entry);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PUBLIC_INDEX_BUILD_CONCURRENCY, batch.length) }, worker)
+    );
+    scanned += next;
+    state.pending = batch.slice(next);
+
+    for (const entry of collected) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      state.entries.push(entry);
+    }
+    // Bound the state blob the same way the published index is bounded, so a
+    // very large deployment cannot grow it past what KV will hold.
+    if (state.entries.length > PUBLIC_INDEX_MAX) {
+      state.entries = sortPublicIndexEntries(state.entries).slice(0, PUBLIC_INDEX_MAX);
+      seen.clear();
+      for (const e of state.entries) seen.add(e.id);
+    }
+  }
+
+  if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
+    const trimmed = await writePublicListIndex(env, state.entries);
     try {
-      const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `a:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
-        id,
-        isCreator: false,
-        username: "user",
-        slug,
-        name: data.name || "List",
-        type: data.type || "mixed",
-        itemCount,
-        likes: data.likes || 0,
-        updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      await kv.delete(PUBLIC_INDEX_BUILD_KEY);
     } catch {
-      // skip unparseable record
+      // A stranded build state is harmless: the next rebuild that starts
+      // from it simply resumes a scan whose result is already published,
+      // and readPublicListIndex short-circuits before ever getting there.
     }
+    return { done: true, entries: trimmed, scanned, ops, entriesSoFar: trimmed.length };
   }
 
-  return await writePublicListIndex(env, entries);
+  await kv.put(PUBLIC_INDEX_BUILD_KEY, JSON.stringify(state));
+  return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
 // Returns index entries, rebuilding if absent. `ctx` (optional) lets the
@@ -1586,19 +1949,36 @@ async function getPublicListIndex(env, ctx) {
   }
   if (!gotLock) return null;
 
+  // One chunk per call -- see rebuildPublicListIndex. A small deployment
+  // finishes in this one chunk and gets its index immediately; a large one
+  // makes bounded progress and is served the legacy scan meanwhile, with the
+  // cron carrying the build to completion.
+  const runChunk = async () => {
+    try {
+      return await rebuildPublicListIndex(env);
+    } catch (err) {
+      console.error("public list index rebuild failed:", err);
+      return null;
+    } finally {
+      // Released as soon as the chunk ends rather than left to expire: a
+      // rebuild now takes many chunks, and sitting on the lock for its full
+      // 60s TTL would cap progress at one chunk a minute for no benefit. The
+      // TTL stays as the backstop for a chunk that dies outright.
+      try {
+        await env.CONFIGS.delete("lock:publiclistindex");
+      } catch {
+        // Expiry will clear it.
+      }
+    }
+  };
+
   if (ctx && typeof ctx.waitUntil === "function") {
     // Rebuild in the background; serve this request from the legacy scan.
-    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
-      console.error("public list index rebuild failed:", err);
-    }));
+    ctx.waitUntil(runChunk());
     return null;
   }
-  try {
-    return await rebuildPublicListIndex(env);
-  } catch (err) {
-    console.error("public list index rebuild failed:", err);
-    return null;
-  }
+  const res = await runChunk();
+  return res && res.done ? res.entries : null;
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -1709,6 +2089,20 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   }
 
+  // The scrobble token is keyed by the token, not the username, so it has to
+  // be resolved through the reverse index before that index is deleted --
+  // otherwise a deleted or reset account leaves a live webhook credential
+  // behind that still authorises writes for it.
+  try {
+    const staleToken = await env.CONFIGS.get(creatorScrobbleTokenKey(u));
+    if (staleToken) {
+      await env.CONFIGS.delete(scrobbleTokenKey(staleToken));
+      keysCleared++;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: could not revoke the scrobble token", e);
+  }
+
   // Everything else the account owns, under the key names actually in use
   // today, plus the legacy ones (harmless if absent) so an old account
   // still gets fully cleaned.
@@ -1729,6 +2123,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // which was simply wrong about it.
     `creatortrack:${u}`,
     `scrobbleseenusers:${u}`,
+    // The reverse index only. The token key itself is keyed BY TOKEN, so it
+    // cannot be reached from a username prefix -- it is deleted explicitly
+    // just above this list.
+    creatorScrobbleTokenKey(u),
     // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,

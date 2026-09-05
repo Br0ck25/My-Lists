@@ -91,6 +91,118 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // size the server accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
+// --- Bounds on the KV -> D1 backfill sweep ----------------------------------
+//
+// /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
+// publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
+// a D1 write on each key it keeps -- both of which count against
+// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
+// whole sweep in one request with no cap, so on a site big enough to need
+// migrating it aborted partway through with "Too many subrequests" and
+// backfilled only whatever it had reached.
+//
+// That failure is worse than it looks: per wrangler.toml, an account present
+// in KV but missing from D1 is exactly the case /api/creator/reset-key and
+// /admin/api/reset-creator-key handle incorrectly, because a D1 UPDATE
+// matching zero rows still reports success. So the endpoint whose job is to
+// prevent that state was itself the thing leaving accounts in it.
+//
+// It now runs in resumable chunks against migrated1:state, the same shape
+// /admin/api/migrate-day-counts and the public-index rebuild use. Every
+// section of the sweep is idempotent (DO NOTHING, or DO UPDATE to a value
+// derived only from KV), so re-processing a key across a chunk boundary is
+// harmless -- which is what makes chunking safe here.
+const MIGRATE_D1_STATE_KEY = "migrated1:state";
+const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+// This endpoint has its invocation to itself (it is admin-triggered, not
+// ridden along on the cron), so it can claim more of the 1,000 than the
+// index rebuild does -- but still well short of it, since a chunk that
+// throws saves no progress.
+const MIGRATE_D1_OPS_PER_RUN = 700;
+const MIGRATE_D1_PAGE = 200;
+// Errors accumulate across every chunk of a run and are handed back to the
+// admin panel, so they need a ceiling of their own.
+const MIGRATE_D1_ERROR_CAP = 50;
+
+// --- Recovery-answer strength and throttle ----------------------------------
+//
+// A Creator Key is ~60 bits of entropy and infeasible to guess. The optional
+// recovery answer that can REPLACE it via /api/creator/reset-key is not: it
+// is free text a human picks, usually the answer to an implicit security
+// question, and it is lowercased before hashing. That endpoint hands back a
+// brand-new working key on a match, so the recovery answer is a second,
+// far weaker credential for full account takeover.
+//
+// It used to be throttled by IP alone (10/day). IPs are cheap and rotate;
+// the account being attacked does not. Rotating source IPs took over a test
+// account in five guesses. Two things follow from that:
+//
+//   * the throttle has to count per ACCOUNT, not just per source, so the
+//     budget an attacker is spending belongs to the thing being attacked;
+//   * the answer needs a floor on its length, because no rate limit rescues
+//     a secret with a handful of plausible values.
+//
+// Only the per-account failure budget defends existing accounts, so it is
+// the load-bearing half. The minimum length applies to newly set answers.
+const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
+const RECOVERY_ANSWER_MIN_LENGTH = 8;
+
+// --- Bound on /api/channel-logo's inlined image ------------------------------
+//
+// That endpoint fetches a TMDB image and base64-encodes it into an SVG,
+// holding the whole thing in memory twice (a byte array, then a binary
+// string) before encoding. It is unauthenticated, so the size of what it
+// will buffer needs a ceiling rather than being whatever the upstream
+// happens to return. A w500 poster is tens of kilobytes.
+const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
+// --- Connecting the env-backed API key globals -------------------------------
+//
+// The `let` globals below are the names every helper in this add-on
+// references (TMDB_API_KEY, TRAKT_CLIENT_ID, ...). They start empty and have
+// to be pointed at whatever this Worker owner configured. This is the one
+// place that does it, so the fetch and scheduled entry points cannot drift.
+//
+// scheduled() has to call it too, and did not. Nothing is broken today only
+// because both cron functions happen to read env.X directly and thread it
+// down -- but 36 bare references to these globals exist across 03_, 05_,
+// 06_ and 07_, and the first cron-reachable call into any of them would have
+// silently used an empty key: no crash, no error, just a provider quietly
+// returning nothing. Three lines here retires the whole class.
+//
+// `|| ""` guards against `env` not carrying the property at all, which is
+// how a missing Worker secret or var normally reads.
+function applyEnvApiKeys(env) {
+  TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+  TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
+  SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
+  SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
+  MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
+  MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
+  MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+}
+
+// --- Daily failure budgets on the credential endpoints -----------------------
+//
+// /admin/login and /api/creator/restore each already carry a 60-second
+// per-IP bucket in KV. Those bound a burst, but KV reads are edge-cached and
+// KV has no atomic increment, so a determined caller can read a stale count
+// and slip past. That is acceptable as burst-shaping and NOT as the only
+// thing standing in front of a credential.
+//
+// So both also carry a per-IP DAILY budget, spent only on failures and
+// backed by D1's atomic upsert wherever D1 is bound (see noteAuthFailure,
+// 02_http-and-creator-utils.js). Successes never consume it, so a legitimate
+// admin or someone restoring on a run of new devices is unaffected; the
+// ceilings are set far above any plausible honest failure count and reset
+// daily on their own.
+//
+// The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
+// Creator Key is ~60 bits -- so this is defence in depth, not the load-
+// bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
+const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -1591,9 +1703,11 @@ function isPublicCorsPath(path) {
 //
 // CSP is deliberately not the strict, script-src-locked-down kind: this
 // app relies on plenty of inline <script> blocks and inline onclick=/
-// onchange= handlers throughout the builder/admin pages (see the
-// verification pipeline's own "onclick/onchange handler resolution check"
-// step), which only work with 'unsafe-inline' on script-src. Tightening
+// onchange= handlers throughout the builder/admin pages, which only work
+// with 'unsafe-inline' on script-src. (That trade is only reasonable if the
+// handlers actually resolve, which html_checks.py now verifies across all
+// 733 of them -- for a long time this comment cited that step before it
+// existed.) Tightening
 // that further would mean a nonce- or hash-based rewrite of every inline
 // handler -- a real project of its own, not a header tweak. What this CSP
 // still buys, even with 'unsafe-inline' allowed: no loading of scripts/
@@ -2792,6 +2906,74 @@ async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 
   return false;
 }
 
+// --- Per-account authentication failure budget -------------------------------
+//
+// consumeRateLimit above counts per IP, which is the right dimension for
+// abuse of an expensive endpoint and the wrong one for guessing one
+// account's secret: IPs are cheap and rotate, the account under attack does
+// not. /api/creator/reset-key needs both, because the secret it checks is a
+// recovery answer -- see RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+//
+// Counted per account per day and only on FAILURES, so someone who answers
+// correctly never spends their own budget, and a locked-out account frees
+// itself the next day rather than needing an admin.
+//
+// D1's upsert is atomic, so when it is bound a burst of concurrent guesses
+// cannot all read the same pre-increment value. KV cannot promise that (its
+// reads are edge-cached for up to a minute), so the KV path is looser -- but
+// that is a one-minute window against a 24-hour bucket, which bounds a burst
+// instead of leaving guesses unlimited the way having no per-account counter
+// at all did. Same "D1 when bound, KV otherwise" split as the counters.
+//
+// The KV copies expire on their own via expirationTtl. The D1 rows do not --
+// they are one row per (account that was guessed at, day), only ever read
+// for the current day, so old ones are inert rather than harmful. Worth a
+// sweep eventually if a deployment is attacked persistently; not worth a
+// migration today.
+const AUTH_FAIL_TTL_SEC = 86400;
+
+async function readAuthFailureCount(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(`authfail:${scope}`, day).all();
+      // The query SUCCEEDED, so no row means no failures yet. Deliberately
+      // not readStatCount's "no row -> fall through to KV" rule: that exists
+      // because a missing counter row can mean "not migrated yet", and
+      // applying it here would reset the failure count on every attempt.
+      return results && results.length ? (Number(results[0].n) || 0) : 0;
+    } catch {
+      // Table missing (migration 0002 not applied) or D1 unavailable --
+      // fall through to KV, which is also where the writes will land.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  return parseInt(await env.CONFIGS.get(`authfail:${scope}:${day}`), 10) || 0;
+}
+
+async function noteAuthFailure(env, scope, day) {
+  if (env && env.DB) {
+    try {
+      // d1BumpStat, not a hand-written INSERT. Its statement shape --
+      // VALUES (?, ?, ?) with DO UPDATE SET n = n + excluded.n -- is the one
+      // every other counter here uses, and it is the atomic part. Writing a
+      // near-miss variant of it by hand (DO UPDATE SET n = n + 1, with the
+      // amount inlined rather than bound) is exactly how this throttle
+      // silently counted nothing at all on D1-bound deployments the first
+      // time it was written.
+      await d1BumpStat(env, `authfail:${scope}`, [day], 1);
+      return;
+    } catch {
+      // Same fallback as the read above, so both halves stay on one store.
+    }
+  }
+  if (!env || !env.CONFIGS) return;
+  const key = `authfail:${scope}:${day}`;
+  const n = parseInt(await env.CONFIGS.get(key), 10) || 0;
+  await env.CONFIGS.put(key, String(n + 1), { expirationTtl: AUTH_FAIL_TTL_SEC });
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
   const ip = clientIpKey(request);
@@ -2816,24 +2998,37 @@ async function readLikeVoters(env, ledgerKey) {
 }
 
 // Applies one vote to a ledger key and returns the resulting count.
-// Returns null when the ledger is full (see LIKE_VOTER_CAP) and this would
-// be a new voter -- the caller keeps the existing count rather than
-// silently discarding the vote or growing the key without bound.
+// `capped: true` means the ledger is full (see LIKE_VOTER_CAP) and this
+// would have been a new voter -- the caller keeps the existing count rather
+// than silently discarding the vote or growing the key without bound.
 //
 // Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
 // here can lose a vote: two requests can both read the same snapshot, and
-// whichever PUT lands last in KV wins, silently dropping the other one.
-// Rather than a full lock (KV has no primitive to build one on reliably
-// either), this re-reads the ledger after writing and confirms this
-// voter's own membership actually stuck; if another write raced it in
-// between, it retries against that fresh state instead of just trusting
-// its own PUT. Bounded to a handful of attempts -- this only protects
-// against genuinely concurrent requests on one list, not a design that
-// needs to spin forever.
+// whichever PUT lands last wins. This writes, re-reads, and retries against
+// the fresh state if its own vote did not survive.
+//
+// The subtlety is WHEN to retry. KV does not promise read-your-writes -- its
+// reads are edge-cached -- so "my vote is not in the value I just read back"
+// has two completely different causes: another writer really did land on top
+// of us, or KV simply served a stale copy and nothing happened at all.
+// Retrying on both treats every stale read as contention, which on an
+// otherwise idle list spends several writes against a key KV limits to one
+// write per second, and can still report a count that does not match
+// storage.
+//
+// So the retry is gated on EVIDENCE of another writer: an id present now
+// that was not in our own pre-write snapshot and is not ours. A real
+// clobber leaves that trace (the other request wrote its own voter); a
+// stale read cannot, because a stale read is by definition the state we
+// already saw. No evidence means our PUT is good and the read was simply
+// behind, so we trust it and stop.
+const LIKE_VOTE_MAX_ATTEMPTS = 3;
+
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
-  const MAX_ATTEMPTS = 4;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  let lastCount = 0;
+  for (let attempt = 0; attempt < LIKE_VOTE_MAX_ATTEMPTS; attempt++) {
     const voters = await readLikeVoters(env, ledgerKey);
+    const before = new Set(voters);
     const set = new Set(voters);
     const had = set.has(voterId);
     if (liked) {
@@ -2842,26 +3037,150 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
     } else {
       set.delete(voterId);
     }
-    // No write at all when nothing changed -- KV allows one write per
-    // second per key, and a double-tap on a busy list should not burn
-    // that budget or race with a genuine vote.
-    if (set.size === voters.length && had === set.has(voterId)) {
+    lastCount = set.size;
+    // No write at all when nothing changed -- KV allows one write per second
+    // per key, and a double-tap on a busy list should not burn that budget.
+    // The size comparison also collapses a ledger that had duplicate
+    // entries, since `set` is deduplicated.
+    if (had === liked && set.size === voters.length) {
       return { count: set.size, capped: false };
     }
     await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
-    const verifyVoters = await readLikeVoters(env, ledgerKey);
-    if (new Set(verifyVoters).has(voterId) === liked) {
-      return { count: verifyVoters.length, capped: false };
+
+    const after = await readLikeVoters(env, ledgerKey);
+    const afterSet = new Set(after);
+    if (afterSet.has(voterId) === liked) {
+      // Our vote is visible in storage. Done.
+      return { count: after.length, capped: false };
     }
-    // Someone else's write landed on top of ours between the PUT and this
-    // re-read -- loop and retry against their (now current) state rather
-    // than reporting a count/liked state that isn't what's actually
-    // stored.
+    // Our vote is missing. Is there any trace of another writer?
+    const anotherWriterLanded = [...afterSet].some((id) => id !== voterId && !before.has(id));
+    if (!anotherWriterLanded) {
+      // No trace: this is a stale read of the state we already had, not a
+      // lost update. Trust our own PUT rather than writing it again.
+      return { count: lastCount, capped: false };
+    }
+    // Someone else's write really did land on top of ours -- loop and merge
+    // against their now-current state.
   }
-  // Exhausted retries under sustained contention on this one list: report
-  // whatever is actually in KV right now rather than guessing.
+  // Sustained genuine contention on this one list: report what is actually
+  // in KV rather than guessing.
   const finalVoters = await readLikeVoters(env, ledgerKey);
   return { count: finalVoters.length, capped: false };
+}
+
+// --- Scrobble tokens ---------------------------------------------------------
+//
+// A media-server webhook URL has to carry its credential in the query
+// string: Plex, Jellyfin and Emby let you paste a URL and nothing else. That
+// URL then lives in the media server's configuration, in its logs, and in
+// any request log along the way.
+//
+// It used to carry the Creator Key itself, which is the credential for the
+// whole account and has no expiry. Anyone who read that URL out of a log had
+// full access, and the only remedy was rotating the key -- which breaks
+// every other device the owner had signed in on.
+//
+// A scrobble token is a separate, revocable credential that authorises
+// exactly one thing: recording playback for one account. Regenerating it
+// invalidates the old webhook URL and touches nothing else. One per account,
+// stored both ways so it can be looked up by token on the hot path and
+// found by username for revocation and account deletion.
+function scrobbleTokenKey(token) {
+  return `scrobbletoken:${token}`;
+}
+function creatorScrobbleTokenKey(username) {
+  return `creatorscrobbletoken:${username}`;
+}
+
+// Returns the account's current token, minting one if it has none.
+// `rotate` forces a fresh token and revokes the previous one.
+async function getOrCreateScrobbleToken(env, username, rotate = false) {
+  if (!env || !env.CONFIGS) return "";
+  let existing = "";
+  try {
+    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+  } catch {
+    existing = "";
+  }
+  if (existing && !rotate) return existing;
+
+  // Same CSPRNG helper the OAuth state cookies use.
+  const token = generateShortId() + generateShortId();
+  await env.CONFIGS.put(scrobbleTokenKey(token), username);
+  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+  if (existing) {
+    // Revoke the old one, so a leaked webhook URL actually stops working.
+    try {
+      await env.CONFIGS.delete(scrobbleTokenKey(existing));
+    } catch {
+      // A stranded token is the one failure worth shouting about here, but
+      // it cannot be helped from inside this request; the reverse index no
+      // longer points at it either way.
+      console.error("scrobble token rotation: could not revoke the previous token");
+    }
+  }
+  return token;
+}
+
+// Resolves a presented token to the account it belongs to, or "" .
+async function usernameForScrobbleToken(env, token) {
+  if (!env || !env.CONFIGS) return "";
+  const t = String(token || "").trim();
+  // Shape check before touching KV, so a junk value cannot mint reads.
+  if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  try {
+    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+  } catch {
+    return "";
+  }
+}
+
+// --- Slug allocation ---------------------------------------------------------
+//
+// Picks a slug nothing has claimed yet, given an async predicate that says
+// whether a candidate is taken.
+//
+// Numbered suffixes first, because "-2"/"-3" make far nicer URLs than a
+// random token, but only a few of them: the numbered scan is O(n) in how
+// many lists already share a name, and at /api/publish-list each of those
+// checks is a KV read. 500 collisions meant 501 KV reads for one publish --
+// half of Cloudflare's per-invocation subrequest budget, on an
+// unauthenticated endpoint, and a condition anyone could manufacture just by
+// publishing the same list name repeatedly. After that it switches to a
+// random suffix, which needs one check regardless of how crowded the name is.
+//
+// Returns "" when it cannot find a free slug, and callers MUST treat that as
+// a failure. Both call sites previously ran a bounded numbered loop and then
+// used whatever slug it exited on -- which, once the bound was reached, was a
+// slug that WAS taken. The write then went straight over an existing list:
+// at /api/publish-list, publishing a 501st list called "Movies" silently
+// replaced the contents of movies-500, returned ok:true, and handed back
+// that list's URL as if it were yours.
+const SLUG_NUMBERED_ATTEMPTS = 10;
+const SLUG_RANDOM_ATTEMPTS = 5;
+
+// Uniqueness, not secrecy -- this only has to avoid colliding with other
+// lists sharing a name, so the slight modulo bias here does not matter.
+function randomSlugSuffix() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+async function pickFreeSlug(baseSlug, isTaken) {
+  if (!(await isTaken(baseSlug))) return baseSlug;
+  for (let attempt = 2; attempt <= SLUG_NUMBERED_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${attempt}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  for (let attempt = 0; attempt < SLUG_RANDOM_ATTEMPTS; attempt++) {
+    const candidate = `${baseSlug}-${randomSlugSuffix()}`;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  return "";
 }
 
 // --- External list URL validation --------------------------------------------
@@ -2965,6 +3284,50 @@ const PUBLIC_INDEX_KEY = "index:publiclists";
 // size. Beyond this the tail is dropped (least-liked first).
 const PUBLIC_INDEX_MAX = 20000;
 
+// --- Rebuild chunking --------------------------------------------------------
+//
+// A full rebuild costs roughly one KV read per list, plus (the first time a
+// given record is seen) one for its creator's display name and one to stamp a
+// missing visibility. Cloudflare caps a Worker invocation at 1,000
+// subrequests, so the old single-pass scan stopped working entirely somewhere
+// around 500 public lists: it threw partway through, and because every call
+// site runs it inside ctx.waitUntil(...).catch(...) the throw was swallowed,
+// the index was never written, and the directory fell back to the legacy
+// bounded scan -- the alphabetically-first 100 creators, forever, with no
+// error surfaced anywhere.
+//
+// It was also reachable on purpose. rebuildPublicListIndex reads each record
+// BEFORE testing visibility, so a list that never appears in the directory
+// still costs a read, and /api/publish-list mints permanent, private-by-
+// default records for anyone at 10/minute. ~900 of those were enough to push
+// a deployment holding only 20 real public lists past the limit for good.
+//
+// So a rebuild now runs in resumable chunks, the same shape
+// /admin/api/migrate-day-counts already uses: one page of keys per
+// invocation, progress parked in index:publiclists:build, and the finished
+// index published only once the final page lands. The cron ticks every 6
+// minutes, so a cold index converges on its own at any scale instead of
+// never completing at all.
+const PUBLIC_INDEX_BUILD_KEY = "index:publiclists:build";
+const PUBLIC_INDEX_BUILD_PREFIXES = ["creatorlist:", "publishedlist:user:"];
+// KV operations one chunk may spend. Deliberately a minority of the 1,000
+// available, because a chunk usually runs inside the cron invocation and
+// shares that budget with prewarmSharedCatalogs (~142 subrequests) and
+// checkForNewEpisodes (up to ~400: 25 accounts plus a 150-show check
+// budget). This has to be low enough that a chunk can never be the thing
+// that trips the limit -- a chunk that throws saves no progress, so an
+// over-generous budget would reproduce the exact "never completes" failure
+// this chunking exists to fix.
+const PUBLIC_INDEX_BUILD_OPS_PER_RUN = 300;
+// ...and the ceiling for a chunk kicked off by /admin/api/rebuild-public-index,
+// which has the invocation to itself.
+const PUBLIC_INDEX_BUILD_OPS_ADMIN = 800;
+const PUBLIC_INDEX_BUILD_PAGE = 400;
+// Records are fetched in parallel within a chunk. The old code awaited each
+// get in sequence, so even a rebuild that fit inside the limit was one
+// serialised round-trip per list.
+const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
+
 async function readPublicListIndex(env) {
   if (!env || !env.CONFIGS) return null;
   try {
@@ -3025,93 +3388,205 @@ async function updatePublicListIndex(env, id, entry) {
   }
 }
 
-// Full scan -> index. Expensive (one KV get per list), so it runs only when
-// the index is missing, and only one caller at a time via a short lock.
-async function rebuildPublicListIndex(env) {
-  const entries = [];
-  const seen = new Set();
+// Persisted progress for an in-flight rebuild. Anything unparseable, or from
+// an older shape, simply restarts the build rather than half-applying.
+function emptyPublicIndexBuildState() {
+  return { v: 1, phase: 0, cursor: "", pending: [], entries: [], names: {} };
+}
+
+async function readPublicIndexBuildState(env) {
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
+    if (!raw) return emptyPublicIndexBuildState();
+    const s = JSON.parse(raw);
+    if (!s || s.v !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
+      return emptyPublicIndexBuildState();
+    }
+    return {
+      v: 1,
+      phase: Number(s.phase) || 0,
+      cursor: typeof s.cursor === "string" ? s.cursor : "",
+      pending: s.pending.filter((k) => typeof k === "string"),
+      entries: s.entries.filter(Boolean),
+      names: s.names && typeof s.names === "object" ? s.names : {},
+    };
+  } catch {
+    return emptyPublicIndexBuildState();
+  }
+}
+
+// Runs ONE chunk of a rebuild and returns:
+//   { done: true,  entries }                     -- index written and published
+//   { done: false, entries: null, ... }          -- progress saved, call again
+//
+// Callers that need the finished article must keep calling (the cron does).
+// Until it reports done the live index key is left exactly as it was, so a
+// partial scan is never published as if it were complete.
+//
+// One caveat worth knowing: a list published *behind* the cursor while a
+// multi-chunk rebuild is in flight is not picked up by that rebuild. It lands
+// in the index the moment the build finishes and updatePublicListIndex takes
+// over again, or on the next rebuild. Directory visibility lagging a cold
+// start by a few minutes is the tradeoff for it converging at all.
+async function rebuildPublicListIndex(env, options = {}) {
+  const opBudget = Number(options.opBudget) || PUBLIC_INDEX_BUILD_OPS_PER_RUN;
+
+  // Every KV call this chunk makes goes through here, so the budget tracks
+  // what was actually spent rather than a worst-case guess -- which matters
+  // because the per-key cost varies (a cached display name and an
+  // already-stamped visibility cost nothing extra).
+  let ops = 0;
+  const kv = env.CONFIGS;
+  const counted = {
+    get: (...a) => { ops++; return kv.get(...a); },
+    put: (...a) => { ops++; return kv.put(...a); },
+    delete: (...a) => { ops++; return kv.delete(...a); },
+    list: (...a) => { ops++; return kv.list(...a); },
+  };
+  // stampListVisibilityIfNeeded and getCreator take an env, not a namespace.
+  const countedEnv = { ...env, CONFIGS: counted };
+
+  ops++; // readPublicIndexBuildState's own get
+  const state = await readPublicIndexBuildState(env);
+  const seen = new Set(state.entries.map((e) => e && e.id).filter(Boolean));
 
   // Search matches against the creator's display name too, so the index has
-  // to carry it. Cached per username: creators are far fewer than lists, and
-  // without this the rebuild would do a second get for every list.
-  const displayNameCache = new Map();
+  // to carry it. Cached across chunks in the build state -- creators are far
+  // fewer than lists, and without this the rebuild would do a second get for
+  // every list, every time.
+  const inFlightNames = new Map();
   async function resolveDisplayName(username) {
-    if (displayNameCache.has(username)) return displayNameCache.get(username);
-    let name = username;
+    if (Object.prototype.hasOwnProperty.call(state.names, username)) return state.names[username];
+    // Two workers in the same batch can miss on the same username; only one
+    // of them should pay for the lookup.
+    if (inFlightNames.has(username)) return inFlightNames.get(username);
+    const p = (async () => {
+      let name = username;
+      try {
+        const profileRaw = await getCreator(countedEnv, username);
+        if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+      } catch {
+        // fall back to the raw username slug
+      }
+      state.names[username] = name;
+      return name;
+    })();
+    inFlightNames.set(username, p);
     try {
-      const profileRaw = await getCreator(env, username);
-      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
-    } catch {
-      // fall back to the raw username slug
+      return await p;
+    } finally {
+      inFlightNames.delete(username);
     }
-    displayNameCache.set(username, name);
-    return name;
   }
 
-  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-  for (const k of creatorKeys.keys) {
-    const rest = k.name.slice("creatorlist:".length);
-    const sep = rest.indexOf(":");
-    if (sep === -1) continue;
-    const username = rest.slice(0, sep);
-    const slug = rest.slice(sep + 1);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  async function buildEntry(phase, keyName) {
+    const prefix = PUBLIC_INDEX_BUILD_PREFIXES[phase];
+    const rest = keyName.slice(prefix.length);
+    let username = "user";
+    let slug = rest;
+    let id = `a:${rest}`;
+    if (phase === 0) {
+      const sep = rest.indexOf(":");
+      if (sep === -1) return null;
+      username = rest.slice(0, sep);
+      slug = rest.slice(sep + 1);
+      id = `c:${username}:${slug}`;
+    }
+    if (seen.has(id)) return null;
+    const raw = await counted.get(keyName);
+    if (!raw) return null;
     try {
       const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `c:${username}:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
+      await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+      if (!isPublicListVisibility(data.visibility)) return null;
+      return {
         id,
-        isCreator: true,
+        isCreator: phase === 0,
         username,
-        creatorName: await resolveDisplayName(username),
+        ...(phase === 0 ? { creatorName: await resolveDisplayName(username) } : {}),
         slug,
         name: data.name || "List",
         type: data.type || "mixed",
-        itemCount,
+        itemCount: Array.isArray(data.items) ? data.items.length : (data.itemCount || 0),
         likes: data.likes || 0,
         updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      };
     } catch {
       // skip unparseable record
+      return null;
     }
   }
 
-  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-  for (const k of anonKeys.keys) {
-    const slug = k.name.slice("publishedlist:user:".length);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  let scanned = 0;
+
+  // Outer loop: keep taking work until the budget runs out or every prefix is
+  // exhausted. A small deployment finishes all of this in a single chunk, so
+  // its behaviour is exactly what it was before.
+  while (state.phase < PUBLIC_INDEX_BUILD_PREFIXES.length && ops < opBudget) {
+    if (!state.pending.length) {
+      if (state.cursor === null) {
+        // This prefix is finished; move to the next one.
+        state.phase++;
+        state.cursor = "";
+        continue;
+      }
+      const listOpts = { prefix: PUBLIC_INDEX_BUILD_PREFIXES[state.phase], limit: PUBLIC_INDEX_BUILD_PAGE };
+      if (state.cursor) listOpts.cursor = state.cursor;
+      const res = await counted.list(listOpts);
+      state.pending = (res.keys || []).map((k) => k.name);
+      state.cursor = (res.list_complete || !res.cursor) ? null : res.cursor;
+      if (!state.pending.length) continue;
+    }
+
+    // Claim keys from the head of `pending` in bounded-concurrency batches,
+    // stopping as soon as the budget is gone. Workers claim strictly in
+    // order, so everything before `next` was fully processed and everything
+    // from `next` on is still owed -- which is what gets persisted.
+    const phase = state.phase;
+    const batch = state.pending;
+    let next = 0;
+    const collected = [];
+    const worker = async () => {
+      while (next < batch.length && ops < opBudget) {
+        const keyName = batch[next++];
+        const entry = await buildEntry(phase, keyName);
+        if (entry) collected.push(entry);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PUBLIC_INDEX_BUILD_CONCURRENCY, batch.length) }, worker)
+    );
+    scanned += next;
+    state.pending = batch.slice(next);
+
+    for (const entry of collected) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      state.entries.push(entry);
+    }
+    // Bound the state blob the same way the published index is bounded, so a
+    // very large deployment cannot grow it past what KV will hold.
+    if (state.entries.length > PUBLIC_INDEX_MAX) {
+      state.entries = sortPublicIndexEntries(state.entries).slice(0, PUBLIC_INDEX_MAX);
+      seen.clear();
+      for (const e of state.entries) seen.add(e.id);
+    }
+  }
+
+  if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
+    const trimmed = await writePublicListIndex(env, state.entries);
     try {
-      const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `a:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
-        id,
-        isCreator: false,
-        username: "user",
-        slug,
-        name: data.name || "List",
-        type: data.type || "mixed",
-        itemCount,
-        likes: data.likes || 0,
-        updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      await kv.delete(PUBLIC_INDEX_BUILD_KEY);
     } catch {
-      // skip unparseable record
+      // A stranded build state is harmless: the next rebuild that starts
+      // from it simply resumes a scan whose result is already published,
+      // and readPublicListIndex short-circuits before ever getting there.
     }
+    return { done: true, entries: trimmed, scanned, ops, entriesSoFar: trimmed.length };
   }
 
-  return await writePublicListIndex(env, entries);
+  await kv.put(PUBLIC_INDEX_BUILD_KEY, JSON.stringify(state));
+  return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
 // Returns index entries, rebuilding if absent. `ctx` (optional) lets the
@@ -3136,19 +3611,36 @@ async function getPublicListIndex(env, ctx) {
   }
   if (!gotLock) return null;
 
+  // One chunk per call -- see rebuildPublicListIndex. A small deployment
+  // finishes in this one chunk and gets its index immediately; a large one
+  // makes bounded progress and is served the legacy scan meanwhile, with the
+  // cron carrying the build to completion.
+  const runChunk = async () => {
+    try {
+      return await rebuildPublicListIndex(env);
+    } catch (err) {
+      console.error("public list index rebuild failed:", err);
+      return null;
+    } finally {
+      // Released as soon as the chunk ends rather than left to expire: a
+      // rebuild now takes many chunks, and sitting on the lock for its full
+      // 60s TTL would cap progress at one chunk a minute for no benefit. The
+      // TTL stays as the backstop for a chunk that dies outright.
+      try {
+        await env.CONFIGS.delete("lock:publiclistindex");
+      } catch {
+        // Expiry will clear it.
+      }
+    }
+  };
+
   if (ctx && typeof ctx.waitUntil === "function") {
     // Rebuild in the background; serve this request from the legacy scan.
-    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
-      console.error("public list index rebuild failed:", err);
-    }));
+    ctx.waitUntil(runChunk());
     return null;
   }
-  try {
-    return await rebuildPublicListIndex(env);
-  } catch (err) {
-    console.error("public list index rebuild failed:", err);
-    return null;
-  }
+  const res = await runChunk();
+  return res && res.done ? res.entries : null;
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -3259,6 +3751,20 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   }
 
+  // The scrobble token is keyed by the token, not the username, so it has to
+  // be resolved through the reverse index before that index is deleted --
+  // otherwise a deleted or reset account leaves a live webhook credential
+  // behind that still authorises writes for it.
+  try {
+    const staleToken = await env.CONFIGS.get(creatorScrobbleTokenKey(u));
+    if (staleToken) {
+      await env.CONFIGS.delete(scrobbleTokenKey(staleToken));
+      keysCleared++;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: could not revoke the scrobble token", e);
+  }
+
   // Everything else the account owns, under the key names actually in use
   // today, plus the legacy ones (harmless if absent) so an old account
   // still gets fully cleaned.
@@ -3279,6 +3785,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // which was simply wrong about it.
     `creatortrack:${u}`,
     `scrobbleseenusers:${u}`,
+    // The reverse index only. The token key itself is keyed BY TOKEN, so it
+    // cannot be reached from a username prefix -- it is deleted explicitly
+    // just above this list.
+    creatorScrobbleTokenKey(u),
     // legacy names, harmless if absent
     `creatorpresets:${u}`,
     `creatorchannels:${u}`,
@@ -5447,11 +5957,6 @@ async function renderAdminDashboard(env) {
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
     }
 
-    // Alias for compatibility
-    function switchAdminTab(tabId) {
-      switchAdminSubTab(tabId);
-    }
-
     function restoreAdminActiveTab() {
       let targetTab = '';
       const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
@@ -5716,27 +6221,47 @@ async function renderAdminDashboard(env) {
       if (typeof loadSearchData === 'function') loadSearchData();
     }
 
-    // Unlike the two loops above, /admin/api/migrate-d1 does its entire
-    // sweep (creators, creator_lists, source_groups) in one request rather
-    // than resuming across repeated calls, so this is a single fetch.
+    // Like the loops above, /admin/api/migrate-d1 now does one bounded chunk
+    // per call rather than the whole sweep -- see its own comment for why a
+    // single pass could not survive a site large enough to need migrating --
+    // so this keeps calling until it reports done. The results object comes
+    // back cumulative for the whole run, so the final response already holds
+    // the totals and there is nothing to add up here.
+    //
+    // No backticks in this function, or anywhere else inside
+    // renderAdminDashboard's returned template literal: everything from that
+    // opening backtick onwards is string content, so one here would close the
+    // template early and break the whole admin page. (The module-scope
+    // helpers at the top of this file are ordinary JS and do use them.)
     async function runMigrateD1() {
       const btn = document.getElementById('migrateD1Btn');
       const status = document.getElementById('migrateD1Status');
       btn.disabled = true;
       status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) {
-          status.textContent = 'Failed: ' + (data.error || 'unknown error');
-        } else {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
           const r = data.results || {};
+          if (!data.done) {
+            status.textContent = 'Working\u2026 ' + (data.scanned || 0) + ' key' + ((data.scanned || 0) === 1 ? '' : 's') +
+              ' scanned, ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ' and ' +
+              (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ' migrated so far.';
+            continue;
+          }
           const errCount = (r.errors || []).length;
           status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
             (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
             (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
             (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
           if (errCount) console.error('migrate-d1 errors:', r.errors);
+          break;
         }
       } catch (e) {
         status.textContent = 'Failed: network error.';
@@ -5744,17 +6269,35 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    // The endpoint does one bounded chunk per call (see its own comment for
+    // why a rebuild cannot be one pass), so this loops until it reports
+    // done -- the same shape as runMigrateDayCounts above.
     async function runRebuildPublicIndex() {
       const btn = document.getElementById('rebuildIndexBtn');
       const status = document.getElementById('rebuildIndexStatus');
       btn.disabled = true;
       status.textContent = 'Working\u2026';
+      const started = Date.now();
+      let scanned = 0;
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
-        const data = await res.json();
-        status.textContent = data.ok
-          ? ('Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') + ' in ' + data.ms + 'ms.')
-          : ('Failed: ' + (data.error || 'unknown error'));
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
+          scanned += data.scanned || 0;
+          if (data.done) {
+            status.textContent = 'Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') +
+              ' from ' + scanned + ' record' + (scanned === 1 ? '' : 's') + ' in ' + (Date.now() - started) + 'ms.';
+            break;
+          }
+          status.textContent = 'Working\u2026 ' + scanned + ' record' + (scanned === 1 ? '' : 's') +
+            ' scanned, ' + data.count + ' indexed so far.';
+        }
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -5916,6 +6459,10 @@ async function renderAdminDashboard(env) {
       const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
       const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
       const isSelfLogged = f.creatorName === 'admin';
+      // Already escaped here, so every use of it below must NOT escape it
+      // again -- the reply placeholder did, and rendered a creator called
+      // A&B as A&amp;B. (No backticks in this function: everything from
+      // renderAdminDashboard's opening backtick onwards is string content.)
       const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
       const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
       const completed = !!f.completed;
@@ -5967,7 +6514,7 @@ async function renderAdminDashboard(env) {
         '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
         (!isSelfLogged ?
           '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
-            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + escapeHtmlAdmin(who) + '...">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + who + '...">' +
             '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
           '</div>' : ''
         ) +
@@ -14497,7 +15044,27 @@ ${seoHeadHtml}
     transform: scale(0.96);
   }
 /*MYLISTS_APP_CSS_END*/</style>
-<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<!-- fflate, for reading Trakt/Letterboxd export .zips entirely client-side.
+     Loaded from a CDN the CSP's script-src allows, so whatever this URL
+     returns runs with full page privileges -- and this page holds
+     myListAddon:creatorKey, mdblistAccessToken, simklAccessToken and the
+     provider API keys in localStorage, all readable by any script in it.
+     Pinning the version is not integrity checking; the integrity hash is.
+     It is a SHA-384 of the exact 32,665-byte 0.8.2 UMD bundle, so a
+     substituted or tampered response simply does not execute.
+     crossorigin="anonymous" is required for SRI on a cross-origin script
+     (jsDelivr serves access-control-allow-origin: *).
+     If this is ever repointed at a new version, the hash MUST be
+     regenerated with it:
+       curl -sS <url> | openssl dgst -sha384 -binary | openssl base64 -A
+     A mismatch blocks the script, which the callers already handle: every
+     use site checks for fflate being undefined and shows a real message
+     (see 18_client-copy-and-trakt-export.js).
+     NB: no backticks in this comment -- this whole file is string content
+     inside renderBuilder's template literal, so one would close it early. -->
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"
+        integrity="sha384-DT0Ls0mO7JmjTnT+oBuMhEJzYJO1zUqzuuMXNdnOmOQRIpN2BgSjvBV/j50NngIT"
+        crossorigin="anonymous"></script>
 </head>
 <body>
 <div class="page">
@@ -17029,6 +17596,26 @@ function saveUserFeedbackThreadId(threadId) {
   } catch (e) {}
 }
 
+// The signed-in identity to attach to a feedback message, but only when it
+// can actually be proven. /api/feedback authenticates any creatorName it is
+// given and ignores the claim when the key does not match, so a name without
+// a key buys nothing. Returns nulls when there is nothing provable, which the
+// server treats as an ordinary anonymous message.
+function feedbackCreatorAuth() {
+  const name = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName)
+    ? activeCreator.creatorName
+    : null;
+  if (!name) return { creatorName: null, creatorKey: null };
+  let key = '';
+  try {
+    key = localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    key = '';
+  }
+  if (!key) return { creatorName: null, creatorKey: null };
+  return { creatorName: name, creatorKey: key };
+}
+
 async function loadUserFeedbackThreads() {
   const threadIds = getUserFeedbackThreadIds();
   const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
@@ -17172,7 +17759,12 @@ async function sendUserFeedbackReply() {
   if (statusEl) statusEl.textContent = 'Sending reply\u2026';
 
   const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
-  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+  // Name AND key, or neither. The server proves any claimed identity before
+  // recording it (a bare name used to be taken on trust and rendered in the
+  // admin panel as the sender), so a name sent without a key is simply
+  // dropped there and the message is filed anonymously. Sending the pair
+  // when we have it is what keeps the thread attached to the account.
+  const creatorAuth = feedbackCreatorAuth();
 
   try {
     const res = await fetch(ORIGIN + '/api/feedback', {
@@ -17181,7 +17773,8 @@ async function sendUserFeedbackReply() {
       body: JSON.stringify({
         threadId: activeFeedbackThreadId,
         message: text,
-        creatorName: creatorName,
+        creatorName: creatorAuth.creatorName,
+        creatorKey: creatorAuth.creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -17224,7 +17817,9 @@ async function submitFeedback() {
         category: category,
         message: message,
         contact: contact,
-        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+        // See feedbackCreatorAuth: name and key travel together or not at all.
+        creatorName: feedbackCreatorAuth().creatorName,
+        creatorKey: feedbackCreatorAuth().creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -17557,68 +18152,6 @@ function setListSearchChip(filter, btn) {
       card.style.display = '';
     }
   });
-}
-
-function quickAddProvider(name) {
-  const providerData = {
-    'Netflix': {
-      top10Movie: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies',
-      top10Series: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/netflix-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/netflix-shows'
-    },
-    'Prime Video': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows'
-    },
-    'Apple TV+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/slimshizn/apple-tv-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows'
-    },
-    'Disney+': {
-      top10Movie: 'https://mdblist.com/lists/andykai/disney-top-10-no-hulu',
-      top10Series: 'https://mdblist.com/lists/andykai/disney-trending-no-hulu',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/disney-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/disney-shows'
-    },
-    'HBO Max': {
-      top10Movie: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q',
-      top10Series: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd',
-      movie: 'https://mdblist.com/lists/snoak/latest-max-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hbo-shows'
-    },
-    'Hulu': {
-      top10Movie: 'https://mdblist.com/lists/hulupiv/hulu-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/hulupiv/hulu-top-10-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/hulu-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hulu-shows'
-    },
-    'Paramount+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/snoak/latest-paramount-plus-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows'
-    },
-    'Peacock': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/peacock-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/peacockpiv/peacock-top-10-shows',
-      movie: 'https://mdblist.com/lists/tvgeniekodi/peacock-movies',
-      series: 'https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows'
-    }
-  };
-  const data = providerData[name];
-  if (data) {
-    if (data.top10Movie) addRow(name + ' Top 10', data.top10Movie, 'movie', true, 'Streaming Top 10');
-    if (data.top10Series) addRow(name + ' Top 10', data.top10Series, 'series', true, 'Streaming Top 10');
-    if (data.movie) addRow(name, data.movie, 'movie', true, name);
-    if (data.series) addRow(name, data.series, 'series', true, name);
-    saveState();
-    switchTab('catalogs');
-  }
 }
 
 // Kept as a no-op (not removed) -- the poster-click handler in
@@ -18074,22 +18607,6 @@ function addRow(name, url, type, enabled, group, channelId) {
 // here on, editable/removable a source at a time like any other.
 function addCombinedRow(name, urls, type, group) {
   addRow(name, urls.join('\\n'), type, true, group);
-}
-
-function addQuickAddRowsFromPairs(list, group, labelSuffix = "") {
-  list.forEach((p) => {
-    const label = labelSuffix ? p.name + " " + labelSuffix : p.name;
-    if (p.movieUrl) addRow(label, p.movieUrl, "movie", true, group);
-    if (p.showUrl) addRow(label, p.showUrl, "series", true, group);
-  });
-  saveState();
-}
-
-function addQuickAddRowsFromSimpleList(list, group) {
-  list.forEach((l) => {
-    addRow(l.name, l.url, l.type, true, group);
-  });
-  saveState();
 }
 
 ${buildAddAllFnJs("addAllMdblistCharts", buildAddAllPairsCallsJs(MDBLIST_OFFICIAL_CHARTS, "MDBList Charts", ""))}
@@ -19080,11 +19597,6 @@ async function startTraktDeviceLogin() {
 }
 
 let myPrivateTraktListsTimer = null;
-function scheduleMyPrivateTraktListsRefresh() {
-  clearTimeout(myPrivateTraktListsTimer);
-  myPrivateTraktListsTimer = setTimeout(runMyPrivateTraktLists, 200);
-}
-
 async function runMyPrivateTraktLists() {
   const box = document.getElementById('myPrivateTraktListsResult');
   if (!box) return;
@@ -19452,32 +19964,6 @@ function onTmdbKeyInputChanged() {
   }
   renderTmdbConnectStatus();
   scheduleMyTmdbListsRefresh();
-}
-
-async function testTmdbConnection() {
-  const input = document.getElementById('tmdbKeyInput');
-  const statusEl = document.getElementById('tmdbConnectStatus');
-  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-  if (!key) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">Please enter your TMDB API Key or Access Token first.</span>';
-    return;
-  }
-  if (statusEl) statusEl.innerHTML = '<span style="color:var(--muted);">Testing TMDB connection\u2026</span>';
-  try {
-    const res = await fetch(ORIGIN + '/api/tmdb-search-lists?q=star&tmdbKey=' + encodeURIComponent(key));
-    const data = await res.json();
-    if (data.ok) {
-      localStorage.setItem('myListAddon:tmdbKey', key);
-      saveState();
-      if (statusEl) statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB API Key verified and active.</span>';
-      renderTmdbConnectStatus();
-      scheduleMyTmdbListsRefresh();
-    } else {
-      if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Invalid TMDB Key: ' + escapeHtml(data.error || 'Check your key and try again.') + '</span>';
-    }
-  } catch (e) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:#ff6b6b;">\u2717 Network error testing TMDB key.</span>';
-  }
 }
 
 function startTmdbConnect() {
@@ -22428,31 +22914,6 @@ async function runUnifiedListImport() {
   if (resultBox) resultBox.innerHTML = summaryHtml;
 }
 
-
-function setListSearchFilter(filter, btn) {
-  if (btn) {
-    document.querySelectorAll('#listSearchTypeChips .subnav-pill').forEach(function(p) {
-      p.classList.remove('active');
-      const c = p.querySelector('.check-icon');
-      if (c) c.remove();
-    });
-    btn.classList.add('active');
-    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
-  }
-  const cards = document.querySelectorAll('#listSearchResult .list-card');
-  cards.forEach(function(card) {
-    const cardType = card.getAttribute('data-list-type') || 'movie';
-    if (filter === 'all') {
-      card.style.display = '';
-    } else if (filter === 'movie') {
-      card.style.display = (cardType === 'movie' || cardType === 'mixed') ? '' : 'none';
-    } else if (filter === 'series') {
-      card.style.display = (cardType === 'series' || cardType === 'mixed') ? '' : 'none';
-    } else {
-      card.style.display = '';
-    }
-  });
-}
 
 function guessNameFromUrl(u) {
   try {
@@ -30831,12 +31292,6 @@ async function spliceCrossoverEvent(eventId, btn) {
   }
 }
 
-function reverseChannelDraft() {
-  if (!channelDraftItems.length) return;
-  channelDraftItems.reverse();
-  renderChannelDraftList();
-}
-
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
   if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;
@@ -32817,36 +33272,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-async function runCustomListSearch() {
-  const q = document.getElementById('customListSearchInput').value.trim();
-  const searchType = document.getElementById('customListSearchType').value; // 'movie' or 'tv'
-  const box = document.getElementById('customListSearchResult');
-  if (!q) {
-    box.innerHTML = '';
-    return;
-  }
-  box.innerHTML = '<p><small>Searching\u2026</small></p>';
-  try {
-    fetch(ORIGIN + '/api/track-search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q }),
-      keepalive: true,
-    }).catch(() => {});
-  } catch (e) {}
-  try {
-    const res = await fetch(ORIGIN + '/api/title-search?q=' + encodeURIComponent(q) + '&type=' + searchType, { cache: 'no-store' });
-    const data = await res.json();
-    if (!data.ok) {
-      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Search failed.') + '</p>';
-      return;
-    }
-    renderCustomListSearchResults(data.results, searchType);
-  } catch (e) {
-    box.innerHTML = '<p class="testresult err">\u2717 Network error while searching.</p>';
-  }
-}
-
 function renderCustomListSearchResults(results, searchType) {
   const box = document.getElementById('customListSearchResult');
   if (!results.length) {
@@ -33574,11 +33999,6 @@ function updateCustomListSaveButtonLabel() {
 }
 
 
-
-function closeCreateListModal() {
-  document.getElementById('listsSubCreateList').style.display = 'none';
-  document.getElementById('listsSubMyLists').style.display = 'block';
-}
 
 function setCustomListDraftTypeToggle(type) {
   if (type === 'mixed') {
@@ -35707,11 +36127,6 @@ function getHiddenMyListsSections() {
   }
 }
 
-function isMyListsSectionHidden(section) {
-  if (!section) return false;
-  return getHiddenMyListsSections().includes(String(section));
-}
-
 // Applies the current hidden-sections state directly to each panel's own
 // display style -- no re-render needed the way per-list hiding requires,
 // since the section panels themselves are static markup (12_tab-custom-
@@ -36523,8 +36938,6 @@ function renderTrackPlaybackSection() {
   }
   let enabled = false;
   try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  const webhookUrl = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
 
   let filterUsers = false;
   let allowedUsers = '';
@@ -36549,8 +36962,9 @@ function renderTrackPlaybackSection() {
       '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
       '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
       '<div class="webhook-input-group">' +
-        '<input type="text" readonly id="scrobbleWebhookInput" value="' + escapeHtml(webhookUrl) + '" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="Loading\u2026" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
         '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
+        '<button type="button" class="secondary lc-btn" onclick="regenerateScrobbleWebhookUrl()" title="Issues a new webhook URL and stops the old one working. Use this if the URL has been shared or logged somewhere it should not have been." style="padding:8px 14px; font-size:0.84rem;">Regenerate</button>' +
       '</div>' +
 
       '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
@@ -36608,10 +37022,64 @@ function renderTrackPlaybackSection() {
 
   refreshTrackPlaybackStatus();
   loadScrobbleSeenUsers();
+  // Fills the webhook field in after the section is on screen. Deliberately
+  // not awaited: the URL now needs a round trip (it carries a scrobble token
+  // rather than the Creator Key), and the rest of the panel should not wait
+  // on it.
+  refreshScrobbleWebhookUrl(false);
 }
 
-function buildScrobbleWebhookUrl(creatorName, creatorKey) {
-  return ORIGIN + '/api/scrobble?creator=' + encodeURIComponent(creatorName) + '&key=' + encodeURIComponent(creatorKey);
+// The webhook URL ends up pasted into Plex/Jellyfin/Emby, stored in their
+// configuration and written to their logs, so what it carries matters. It
+// used to carry the Creator Key -- the credential for the whole account,
+// with no expiry -- which meant anyone who read that URL out of a log had
+// everything, and the only remedy was rotating the key and re-signing in on
+// every device. It now carries a scrobble token: revocable on its own,
+// good for nothing but recording playback for this account.
+function buildScrobbleWebhookUrl(scrobbleToken) {
+  return ORIGIN + '/api/scrobble?st=' + encodeURIComponent(scrobbleToken || '');
+}
+
+// Fetches (and on first use mints) this account's scrobble token.
+// rotate === true issues a fresh one and revokes the old webhook URL.
+async function fetchScrobbleToken(rotate) {
+  if (!activeCreator || !activeCreator.creatorName) return '';
+  let creatorKey = '';
+  try { creatorKey = localStorage.getItem('myListAddon:creatorKey') || ''; } catch (e) {}
+  if (!creatorKey) return '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, rotate: rotate === true }),
+    });
+    const data = await res.json().catch(() => null);
+    return (data && data.ok && data.token) ? data.token : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Fills the webhook field in. Kept out of the initial render so a dashboard
+// load does not block on it, and so a failure leaves a readable message in
+// the field rather than a half-built URL.
+async function refreshScrobbleWebhookUrl(rotate) {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input) return;
+  input.value = rotate ? 'Generating a new URL\u2026' : 'Loading\u2026';
+  const token = await fetchScrobbleToken(rotate);
+  const current = document.getElementById('scrobbleWebhookInput');
+  if (!current) return;
+  current.value = token
+    ? buildScrobbleWebhookUrl(token)
+    : 'Could not load your webhook URL \u2014 reload the page and try again.';
+  if (rotate && token && typeof showAddedToast === 'function') {
+    showAddedToast('New webhook URL generated \u2014 the old one no longer works \u2713');
+  }
+}
+
+async function regenerateScrobbleWebhookUrl() {
+  await refreshScrobbleWebhookUrl(true);
 }
 
 function onScrobbleFilterUsersToggle(cb) {
@@ -36645,12 +37113,7 @@ function onScrobbleBlockAnonChange(cb) {
   if (typeof pushTrackingSync === 'function') pushTrackingSync();
 }
 
-function _refreshScrobbleWebhookInput() {
-  const input = document.getElementById('scrobbleWebhookInput');
-  if (!input || !activeCreator) return;
-  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  input.value = buildScrobbleWebhookUrl(activeCreator.creatorName, creatorKey);
-}
+
 
 function syncScrobbleUserCheckboxes() {
   const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
@@ -38110,8 +38573,8 @@ function openCreateProfileModal() {
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
     '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
-    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional)"></div>' +
-    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. Use something only you know -- not a public username or anything someone could look up.</p>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional, 8+ characters)" minlength="8"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
     '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
@@ -38128,6 +38591,14 @@ async function submitCreateProfile() {
   const errBox = document.getElementById('createProfileError');
   if (!name) {
     errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
+    return;
+  }
+  // Mirrors the server's RECOVERY_ANSWER_MIN_LENGTH check so a too-short
+  // answer is caught here, next to the field, instead of coming back as a
+  // server error after the round trip. The server still enforces it -- this
+  // is the message, not the guard.
+  if (recoveryAnswer && recoveryAnswer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
   try {
@@ -40732,12 +41203,6 @@ function toggleLivePreviewEdit() {
   }
 }
 
-function toggleCompactView(btn) {
-  const container = document.getElementById('lists');
-  const isCompact = container.classList.toggle('compact');
-  btn.textContent = isCompact ? 'Full view' : 'Compact view';
-}
-
 function slugify(s) {
   return s.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'').slice(0,60);
 }
@@ -40792,55 +41257,6 @@ async function testSourceRow(btn) {
     resultEl.textContent = '\u2717 Network error testing this list.';
   } finally {
     btn.disabled = false;
-  }
-}
-
-// Runs every row's Test one panel at a time (well, CONCURRENCY at a time)
-// by just calling the exact same testSourceRow used for a single row --
-// same inline per-row result, same everything, just walking the whole
-// list instead of one button click. A summary alert at the end since
-// there's no single place on a long list where all the individual
-// testresult divs would be visible at once.
-async function testAllSources() {
-  const buttons = Array.from(document.querySelectorAll('#lists .btn-test'));
-  if (!buttons.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('No Lists', 'No lists to test yet -- add some above first.', false);
-    else alert('No lists to test yet -- add some above first.');
-    return;
-  }
-  const testAllBtn = document.getElementById('testAllBtn');
-  if (testAllBtn) {
-    testAllBtn.disabled = true;
-    testAllBtn.textContent = 'Testing all\u2026';
-  }
-
-  let idx = 0;
-  const CONCURRENCY = 4;
-  async function worker() {
-    while (idx < buttons.length) {
-      const i = idx++;
-      if (testAllBtn) testAllBtn.textContent = 'Testing all\u2026 (' + (i + 1) + '/' + buttons.length + ')';
-      await testSourceRow(buttons[i]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, buttons.length) }, () => worker()));
-
-  let okCount = 0;
-  let errCount = 0;
-  document.querySelectorAll('#lists .testresult').forEach((el) => {
-    if (el.classList.contains('ok')) okCount++;
-    else if (el.classList.contains('err')) errCount++;
-  });
-
-  if (testAllBtn) {
-    testAllBtn.disabled = false;
-    testAllBtn.textContent = 'Test all';
-  }
-  const summaryMsg = 'Tested ' + buttons.length + ' source' + (buttons.length === 1 ? '' : 's') + ' \u2014 ' + okCount + ' ok, ' + errCount + ' failed.';
-  if (typeof showAppAlert === 'function') {
-    showAppAlert(errCount > 0 ? 'Testing Complete (With Errors)' : 'Testing Complete', summaryMsg, errCount === 0);
-  } else {
-    alert(summaryMsg);
   }
 }
 
@@ -43156,20 +43572,6 @@ function rehydrateEntries(entries, customLists, channels) {
   return (entries || []).map((e) => rehydrateEntry(e, customLists, channels));
 }
 
-// Rows whose reference could not be resolved. Used to tell the person which
-// rows came back empty instead of letting them find out by scrolling past a
-// blank shelf.
-function unresolvedEntryNames(entries) {
-  const out = [];
-  (entries || []).forEach((e) => {
-    const split = splitPayloadUrl(e && e.url);
-    if (!split) return;
-    const p = split.payload;
-    if (p.itemsRef && !(Array.isArray(p.items) && p.items.length)) out.push(e.name || p.itemsRef);
-  });
-  return out;
-}
-
 window.dereferenceEntries = dereferenceEntries;
 window.rehydrateEntries = rehydrateEntries;
 
@@ -45018,12 +45420,6 @@ function copyLink(url) {
   });
 }
 
-function openInNuvio(installUrl, e) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(installUrl).catch(() => {});
-  }
-}
-
 async function generate() {
   const entries = collectEntries();
   if (!entries.length) { alert('Add at least one list.'); return; }
@@ -46665,23 +47061,11 @@ function isAllowedPosterUrl(raw) {
 }
 
 async function handleFetch(request, env, ctx) {
-    // Populate the env-backed API key globals declared in 00_constants.js
-    // for this request. Every helper function elsewhere in this add-on
-    // already references these five by name (TMDB_API_KEY, TRAKT_CLIENT_ID,
-    // etc.) -- this is the one place, run first, that actually connects
-    // them to whatever this Worker owner configured (or left unset, which
-    // is fine: every feature gated on one of these degrades to a clear
-    // in-app error message rather than a crash -- see each one's usage for
-    // that message). `|| ""` guards against `env` not having the property
-    // at all, same as a missing Worker secret/var normally reads as
-    // undefined rather than an empty string.
-    TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
-    TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
-    SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
-    SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
-    MDBLIST_API_KEY = (env && env.MDBLIST_API_KEY) || "";
-    MDBLIST_POPULAR_KEY = (env && env.MDBLIST_POPULAR_KEY) || "";
-    MDBLIST_CLIENT_ID = (env && env.MDBLIST_CLIENT_ID) || "";
+    // Point the env-backed API key globals (00_constants.js) at whatever
+    // this Worker owner configured, before anything can read them. A feature
+    // whose key is unset degrades to a clear in-app message rather than
+    // crashing -- see each key's usage for that message.
+    applyEnvApiKeys(env);
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -47512,18 +47896,24 @@ self.addEventListener('fetch', e => {
 
     // /api/channel-poster -> Returns branded SVG channel poster or landscape backdrop
     if (path === "/api/channel-poster") {
-      const name = url.searchParams.get("name") || "TV Channel";
+      // Bounded: the name is rendered into the SVG, and wrapSvgText does not
+      // break a single long word, so an unbounded value just inflates the
+      // response. 200 is far past any real channel name.
+      const name = (url.searchParams.get("name") || "TV Channel").slice(0, 200);
       const bg = url.searchParams.get("bg") || "";
       const format = url.searchParams.get("format") || "";
       const svg = format === "landscape"
         ? generateChannelBackdropSvg(name, bg)
         : generateChannelPosterSvg(name, bg);
+      // Deterministic for a given name/bg/format -- it is text on a
+      // generated background, with no per-viewer or time-varying content --
+      // so there is nothing to keep fresh. It was marked no-store, which
+      // meant every request re-rendered it at the edge and at the client for
+      // an image that never changes.
       return new Response(svg, {
         headers: {
           "Content-Type": "image/svg+xml; charset=utf-8",
-          "Cache-Control": "no-cache, no-store, must-revalidate",
-          "Pragma": "no-cache",
-          "Expires": "0",
+          "Cache-Control": "public, max-age=86400",
           ...corsHeaders(),
         },
       });
@@ -47605,6 +47995,14 @@ self.addEventListener('fetch', e => {
       const logoPath = url.searchParams.get("path");
       const format = url.searchParams.get("format") || "";
       if (!logoPath) return new Response("Missing path", { status: 400 });
+      // Only something shaped like a TMDB image path. The value is
+      // interpolated into an image.tmdb.org URL, and while URL parsing keeps
+      // the host pinned there (so this was never SSRF), an unvalidated path
+      // still made this a general fetch-and-base64 proxy for that host,
+      // reachable by anyone, for any path they cared to name.
+      if (!/^\/?[A-Za-z0-9._-]{1,128}\.(png|jpg|jpeg|webp|svg)$/i.test(logoPath)) {
+        return new Response("Bad path", { status: 400 });
+      }
       try {
         const tmdbUrl = `https://image.tmdb.org/t/p/w500${logoPath.startsWith("/") ? logoPath : "/" + logoPath}`;
         const tmdbRes = await fetch(tmdbUrl, {
@@ -47612,8 +48010,23 @@ self.addEventListener('fetch', e => {
           cf: { cacheTtl: 604800, cacheEverything: true },
         });
         if (!tmdbRes.ok) return new Response("Image not found", { status: 404 });
+        // Bound what gets buffered and base64'd. A w500 poster is tens of
+        // kilobytes; anything far past that is not a logo, and this endpoint
+        // holds the whole thing in memory twice (bytes, then a binary string)
+        // before encoding it.
+        const declaredLength = parseInt(tmdbRes.headers.get("content-length") || "", 10);
+        if (Number.isFinite(declaredLength) && declaredLength > CHANNEL_LOGO_MAX_BYTES) {
+          return new Response("Image too large", { status: 413 });
+        }
         const arrayBuffer = await tmdbRes.arrayBuffer();
+        if (arrayBuffer.byteLength > CHANNEL_LOGO_MAX_BYTES) {
+          // No content-length header, or it lied.
+          return new Response("Image too large", { status: 413 });
+        }
         const contentType = tmdbRes.headers.get("content-type") || "image/png";
+        // Escaped because it lands in an SVG attribute and comes from an
+        // upstream response header rather than from this Worker.
+        const safeContentType = escapeXml(contentType.split(";")[0].trim() || "image/png");
         const bytes = new Uint8Array(arrayBuffer);
         let binary = "";
         const len = bytes.byteLength;
@@ -47621,7 +48034,7 @@ self.addEventListener('fetch', e => {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64 = btoa(binary);
-        const dataUri = `data:${contentType};base64,${base64}`;
+        const dataUri = `data:${safeContentType};base64,${base64}`;
 
         const svg = format === "landscape"
           ? `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="338" viewBox="0 0 600 338">
@@ -47663,12 +48076,16 @@ self.addEventListener('fetch', e => {
   </g>
 </svg>`;
 
+        // Deterministic for a given path/format, and callers already append
+        // their own `v` cache-buster (see getPremadeChannelLogo,
+        // 05_catalog-core.js), so this can be cached hard. It was no-store,
+        // which meant every single request re-fetched the image from TMDB
+        // and re-base64'd it -- the whole cost of this endpoint, repeated
+        // for output that cannot change.
         return new Response(svg, {
           headers: {
             "Content-Type": "image/svg+xml; charset=utf-8",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
+            "Cache-Control": "public, max-age=604800, immutable",
             ...corsHeaders(),
           },
         });
@@ -48368,17 +48785,27 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
-      // Up to 24 ids, each costing a find + a recommendations call, so a
-      // single request is ~48 TMDB calls. Limited only when it falls back
-      // to the shared key, same reasoning as /api/details/batch above.
-      // The Discover tab issues one of these per load, so 30/minute is far
-      // more than any real session needs.
-      if (!body.tmdbKey) {
-        const recIp = clientIpKey(request);
-        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
-        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
-          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
-        }
+      // Up to 24 ids, each costing a find + a recommendations call (and a
+      // similar call when recommendations comes back empty), so a single
+      // request is up to ~72 outbound subrequests.
+      //
+      // This used to skip the limit ENTIRELY whenever the body carried a
+      // tmdbKey, on the reasoning that a caller spending their own quota
+      // needs no protecting. True of TMDB's quota; not true of this
+      // Worker's. The field was never validated, so `tmdbKey: "x"` bought
+      // unlimited invocations of that fan-out against this deployment's own
+      // subrequest, CPU and billing budget -- measured at 0 of 40 requests
+      // blocked, versus 10 of 40 without the field.
+      //
+      // So: always limited, only the ceiling differs. A visitor who really
+      // has their own key gets far more headroom (they are not competing for
+      // the shared key), while the endpoint stops being an open amplifier.
+      // The Discover tab issues one of these per load, so even 30/minute is
+      // well beyond what a real session needs.
+      const recIp = clientIpKey(request);
+      if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+      if (await consumeRateLimit(env, ctx, "recommendations", recIp, body.tmdbKey ? 120 : 30)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
       }
 
       const [movieLists, showLists] = await Promise.all([
@@ -51296,10 +51723,36 @@ self.addEventListener('fetch', e => {
       const allowedCategories = new Set(["bug", "improvement", "idea", "other"]);
       const category = allowedCategories.has(body.category) ? body.category : "other";
       const contact = String(body.contact || "").trim().slice(0, 200);
-      const creatorName = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
+      const claimedCreator = body.creatorName ? String(body.creatorName).trim().slice(0, 100) : null;
       const threadId = body.threadId ? String(body.threadId).trim() : null;
 
       const isAdmin = (await isAdminRequest(request, env)) && body.fromAdminPanel === true;
+
+      // A claimed creatorName used to be recorded, and rendered in the admin
+      // panel as the sender, on nothing but the caller's say-so -- so anyone
+      // could file or answer feedback wearing someone else's name. It is now
+      // proven before it is stored anywhere.
+      //
+      // An unprovable claim is DROPPED, not rejected. This is the support
+      // channel: the person whose key stopped working is exactly the person
+      // who needs to reach support, and 401ing them here would close the one
+      // door they have left. Their message still goes through, just as an
+      // anonymous one -- which is all "we could not verify who you are"
+      // honestly supports. (Replying to a thread that already belongs to an
+      // account is the separate, stricter case, handled below.)
+      //
+      // The admin panel is the one exemption: its "Log something yourself"
+      // button posts creatorName:"admin" with fromAdminPanel:true and no key
+      // (see submitAdminFeedback, 03_admin.js), and "admin" is a marker that
+      // feedbackCardHtml keys off, not a Creator Profile to authenticate.
+      let authedCreator = null;
+      if (!isAdmin && claimedCreator) {
+        const auth = await authenticateCreator(claimedCreator, body.creatorKey ? String(body.creatorKey) : "");
+        if (auth.ok) authedCreator = auth.username;
+      }
+      // What actually gets stored: the admin marker, a proven username, or
+      // nothing. Never the raw claim.
+      const creatorName = isAdmin ? claimedCreator : authedCreator;
       let rateLimitKey = null;
       let rateCount = 0;
       if (!isAdmin) {
@@ -51315,10 +51768,42 @@ self.addEventListener('fetch', e => {
 
       // If replying to an existing thread
       if (threadId) {
+        let entry = null;
         try {
           const raw = await env.CONFIGS.get(`feedback:${threadId}`);
-          if (raw) {
-            const entry = JSON.parse(raw);
+          if (raw) entry = JSON.parse(raw);
+        } catch (e) {
+          entry = null;
+        }
+
+        // A thread id is a capability, and for a thread nobody owns that is
+        // the whole design: an anonymous reporter has no account and follows
+        // up with nothing else. But a thread that DOES belong to an account
+        // is not a bare capability -- the id alone used to be enough for any
+        // stranger to append to it, reopen it, and pick their own display
+        // name, which the admin panel then rendered as the sender.
+        //
+        // A stored name that no longer normalises to a valid username (legacy
+        // free-text) cannot be authenticated as by anyone, so treating it as
+        // owned would strand the thread. Those stay id-capability threads.
+        if (entry && !isAdmin) {
+          const ownerRaw = entry.creatorName ? String(entry.creatorName).trim() : "";
+          let ownerNorm = "";
+          if (ownerRaw) {
+            const ownerV = validateCreatorUsername(ownerRaw);
+            if (ownerV && ownerV.ok) ownerNorm = ownerV.normalized;
+          }
+          if (ownerNorm && ownerNorm !== authedCreator) {
+            return json(
+              { ok: false, error: "That conversation belongs to an account. Sign in to reply to it." },
+              403,
+              { "Cache-Control": "no-store" }
+            );
+          }
+        }
+
+        try {
+          if (entry) {
             if (!Array.isArray(entry.messages) || !entry.messages.length) {
               entry.messages = [{
                 id: `msg_init`,
@@ -51331,7 +51816,11 @@ self.addEventListener('fetch', e => {
             const newMsg = {
               id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
               sender: isAdmin ? "admin" : "user",
-              senderName: isAdmin ? "Developer" : (creatorName || entry.creatorName || "User"),
+              // Derived, never taken from the request body. This is what
+              // the admin panel renders as the sender, so letting the
+              // caller choose it meant a stranger could plant a message
+              // signed "Developer" inside someone else's thread.
+              senderName: isAdmin ? "Developer" : (entry.creatorName || authedCreator || "User"),
               text: message,
               timestamp: Date.now()
             };
@@ -51340,6 +51829,9 @@ self.addEventListener('fetch', e => {
             entry.status = isAdmin ? "replied" : "open";
             entry.completed = false;
             if (contact && !entry.contact) entry.contact = contact;
+            // Claiming an unowned thread now takes proof, not just the id --
+            // otherwise anyone holding it could attach their own account to
+            // someone else's report.
             if (creatorName && !entry.creatorName) entry.creatorName = creatorName;
             await putFeedbackThread(env, `feedback:${threadId}`, entry);
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
@@ -51349,7 +51841,18 @@ self.addEventListener('fetch', e => {
       }
 
       // New Thread
-      const id = `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      //
+      // The id is a capability: /api/feedback/threads hands the whole thread
+      // -- every message plus the contact address the form asks for -- to
+      // anyone who presents it, deliberately, so anonymous reporters can
+      // follow up. It was minted with Math.random(), which is not a CSPRNG:
+      // V8's xorshift128+ state is recoverable from a handful of outputs, so
+      // filing a few reports of your own leaked the ids being handed to
+      // other people from the same isolate. generateShortId is the same
+      // crypto.getRandomValues helper the OAuth state cookies use.
+      // Date.now() stays as the prefix -- /admin/api/feedback relies on
+      // these keys sorting chronologically.
+      const id = `${Date.now()}:${generateShortId()}`;
       const entry = {
         id, category, message, contact: contact || null, creatorName,
         createdAt: Date.now(),
@@ -51360,6 +51863,8 @@ self.addEventListener('fetch', e => {
           {
             id: `msg_${Date.now()}_1`,
             sender: isAdmin ? "admin" : "user",
+            // creatorName here is the proven name (or the admin marker),
+            // never the raw claim -- see its assignment above.
             senderName: isAdmin ? "Developer" : (creatorName || "User"),
             text: message,
             timestamp: Date.now()
@@ -52128,14 +52633,17 @@ self.addEventListener('fetch', e => {
       if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
         return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
       }
-      let listSlug = baseSlug;
-      let plKey = "publishedlist:user:" + listSlug;
-      for (let attempt = 2; attempt <= 500; attempt++) {
-        const existing = await env.CONFIGS.get(plKey);
-        if (!existing) break;
-        listSlug = baseSlug + "-" + attempt;
-        plKey = "publishedlist:user:" + listSlug;
+      // Never falls through onto a slug that is taken -- see pickFreeSlug.
+      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
+        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
+      );
+      if (!listSlug) {
+        return json(
+          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+          409
+        );
       }
+      const plKey = "publishedlist:user:" + listSlug;
       const plVisibility = normalizeListVisibility(plBody.visibility);
       const plNow = Date.now();
       const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
@@ -52362,18 +52870,22 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
-      // Rate-limited only when this falls back to the Worker owner's shared
-      // TMDB key. A visitor who supplied their own is spending their own
-      // quota, so there is nothing here to protect them from -- and
-      // throttling them would break exactly the power users who set a key
-      // up. 60/minute leaves plenty of room for the real bulk caller
-      // (refreshAiringNext pages a large Watch History 60 ids at a time).
-      if (!reqBody.tmdbKey) {
-        const batchIp = clientIpKey(request);
-        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
-        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
-          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
-        }
+      // Same correction as /api/recommendations above: this used to skip the
+      // limit outright whenever the body carried a tmdbKey. Supplying your
+      // own key does mean you are spending your own TMDB quota, but it never
+      // meant you were spending your own subrequests -- and the field was
+      // never validated, so any non-empty string unlocked an unlimited
+      // 60-id fan-out against this Worker.
+      //
+      // Always limited now, with a much higher ceiling for a caller who
+      // brought a key, so the power users this exemption existed for keep
+      // their headroom. 60/minute already leaves plenty of room for the real
+      // bulk caller (refreshAiringNext pages a large Watch History 60 ids at
+      // a time).
+      const batchIp = clientIpKey(request);
+      if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, reqBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";
@@ -52907,11 +53419,23 @@ self.addEventListener('fetch', e => {
       const configParam = url.searchParams.get("config") || url.searchParams.get("token") || "";
       const queryCreator = url.searchParams.get("creator") || url.searchParams.get("user") || "";
       const queryKey = url.searchParams.get("key") || "";
+      // The preferred credential for this endpoint: a revocable token that
+      // authorises recording playback for one account and nothing else. A
+      // webhook URL necessarily carries its credential in the query string
+      // (Plex/Jellyfin/Emby accept a URL and nothing else), where it lands in
+      // the media server's config and logs -- so what it carries should not
+      // be the Creator Key. See getOrCreateScrobbleToken.
+      const scrobbleToken = url.searchParams.get("st") || "";
 
       let authUser = null;
       let effectiveTmdbKey = TMDB_API_KEY;
 
-      if (configParam) {
+      if (scrobbleToken) {
+        const tokenUser = await usernameForScrobbleToken(env, scrobbleToken);
+        if (tokenUser) authUser = tokenUser;
+      }
+
+      if (!authUser && configParam) {
         try {
           const resolved = await resolveConfig(configParam, env);
           if (resolved && resolved.trackCreatorName && resolved.trackCreatorKey) {
@@ -52932,6 +53456,11 @@ self.addEventListener('fetch', e => {
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      // creator+key still works: webhook URLs handed out before scrobble
+      // tokens existed are sitting in people's media servers, and breaking
+      // them would silently stop their history syncing with no error anyone
+      // would see. The dashboard only ever shows the token form now, so
+      // these age out as people re-copy the URL.
       await ensureTrackingMigrated(env, authUser);
 
       if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
@@ -53544,6 +54073,20 @@ self.addEventListener('fetch', e => {
       // self-service reset (/api/creator/reset-key) is the only thing
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      // Optional -- but if one is given it has to be long enough to be worth
+      // hashing. It is lowercased before hashing and it can replace the
+      // Creator Key outright via /api/creator/reset-key, so a three-character
+      // answer is a three-character password on the whole account. Rejected
+      // rather than silently accepted, since the person setting it is the
+      // only one who can pick a better one. Existing short answers are
+      // untouched; the per-account failure budget on reset-key is what
+      // protects those.
+      if (recoveryAnswerRaw && recoveryAnswerRaw.length < RECOVERY_ANSWER_MIN_LENGTH) {
+        return json({
+          ok: false,
+          error: `Recovery Answer must be at least ${RECOVERY_ANSWER_MIN_LENGTH} characters -- it can reset your key, so treat it like a password.`,
+        }, 400);
+      }
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
@@ -53635,8 +54178,33 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: genericError });
       }
       if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+
+      // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
+      // counter alone did not defend this endpoint at all: rotating source
+      // addresses is free, so it bought an attacker unlimited guesses at one
+      // account's recovery answer -- a secret weak enough to fall in a
+      // handful of tries, in exchange for a working Creator Key. See
+      // RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+      //
+      // Checked here, after the profile is known to exist and to have a
+      // recovery answer set, so a wrong or unknown username can never spend
+      // (or create a counter for) an account budget. Still before the
+      // PBKDF2 verification below, so a throttled attempt costs nothing.
+      const resetDay = statsToday();
+      const resetScope = `reset:${v.normalized}`;
+      if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
+        // Same generic message as every other failure path here, so this
+        // does not become a way to ask whether an account exists.
+        return json({ ok: false, error: genericError });
+      }
+
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
-      if (!matches) return json({ ok: false, error: genericError });
+      if (!matches) {
+        // Failures only: answering correctly must never consume the budget
+        // that protects you.
+        await noteAuthFailure(env, resetScope, resetDay);
+        return json({ ok: false, error: genericError });
+      }
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
@@ -53758,6 +54326,33 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, creatorKey });
     }
 
+    // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
+    //   -> { ok, token }
+    // Returns this account's media-server scrobble token, minting one on
+    // first use. `rotate: true` issues a fresh one and revokes the previous,
+    // which is what "regenerate" in the dashboard does when a webhook URL
+    // has been shared or logged somewhere it should not have been.
+    //
+    // Authenticated with the Creator Key, like every other account
+    // operation -- the token is what the WEBHOOK carries, not what this
+    // endpoint accepts.
+    if (path === "/api/creator/scrobble-token" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) {
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
+      const token = await getOrCreateScrobbleToken(env, auth.username, body.rotate === true);
+      if (!token) return json({ ok: false, error: "Could not issue a webhook token." }, 500);
+      return json({ ok: true, token }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
     if (path === "/api/creator/restore" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
@@ -53772,6 +54367,17 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Too many attempts. Please wait a minute and try again." }, 429);
       }
       await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+      // Same reasoning as /admin/login: the 60s bucket shapes a burst, this
+      // daily budget is what actually bounds guessing at a Creator Key over
+      // time. Spent on failures only, so restoring on a run of new devices
+      // costs nothing.
+      const restoreFailScope = `restore:${ip}`;
+      const restoreFailDay = statsToday();
+      if (await readAuthFailureCount(env, restoreFailScope, restoreFailDay) >= CREATOR_RESTORE_MAX_FAILURES_PER_DAY) {
+        return json({ ok: false, error: "Too many failed attempts today. Please try again tomorrow." }, 429);
+      }
+
       let body;
       try {
         body = await request.json();
@@ -53779,7 +54385,10 @@ self.addEventListener('fetch', e => {
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) {
+        if (auth.error !== "no-kv") await noteAuthFailure(env, restoreFailScope, restoreFailDay);
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
       return json({ ok: true, creatorName: auth.username, displayName: auth.displayName });
     }
 
@@ -53948,10 +54557,18 @@ self.addEventListener('fetch', e => {
         // someone-else/top-10 are unrelated), so the collision check and
         // auto-increment only look at this creator's own list keys.
         const baseSlug = slugifyServer(name) || "list";
-        slug = baseSlug;
-        for (let attempt = 2; attempt <= 500; attempt++) {
-          if (!order.includes(slug)) break;
-          slug = `${baseSlug}-${attempt}`;
+        // Checked against an in-memory array rather than KV, so this one was
+        // never a subrequest problem -- but it had the same fall-through:
+        // past the bound it kept a slug that WAS taken and saved over that
+        // list. Scoped to this creator's own namespace, so only their own
+        // list was ever at risk, but silently replacing it is still the
+        // wrong answer.
+        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        if (!slug) {
+          return json(
+            { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+            409
+          );
         }
       }
 
@@ -55690,168 +56307,265 @@ self.addEventListener('fetch', e => {
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
     }
 
-    // /admin/api/migrate-d1 (POST) -> { ok, results }
-    // Backfills creators, creator_lists, and source_groups from KV to D1.
+    // /admin/api/migrate-d1 (POST) -> { ok, done, results, thisCall, scanned }
+    // Backfills creators, creator_lists, published-list visibility stamps,
+    // source_groups and the stats counters from KV to D1.
+    //
+    // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
+    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // and the previous single-pass version simply aborted partway through on
+    // any site large enough to actually need migrating -- backfilling a
+    // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
+    // for why that particular half-finished state is dangerous rather than
+    // merely incomplete.
+    //
+    // Keep calling until `done` is true; runMigrateD1 (03_admin.js) does that
+    // loop. `results` is cumulative across the whole run, `thisCall` is just
+    // this chunk. Still safe to run repeatedly from scratch: every write here
+    // is idempotent.
     if (path === "/admin/api/migrate-d1" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
-      
-      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
-      // 1. Creators
-      const cKeys = await listAllKeys(env.CONFIGS, "creator:");
-      for (const k of cKeys.keys) {
-        const username = k.name.slice("creator:".length);
-        const raw = await env.CONFIGS.get(k.name);
-        if (raw) {
+      // Every KV read/write and every D1 statement goes through these, so the
+      // budget reflects what was actually spent rather than a guess.
+      let ops = 0;
+      const spent = () => ops >= MIGRATE_D1_OPS_PER_RUN;
+      const countedKv = {
+        get: (...a) => { ops++; return env.CONFIGS.get(...a); },
+        put: (...a) => { ops++; return env.CONFIGS.put(...a); },
+        delete: (...a) => { ops++; return env.CONFIGS.delete(...a); },
+        list: (...a) => { ops++; return env.CONFIGS.list(...a); },
+      };
+      // stampListVisibilityIfNeeded writes through env.CONFIGS itself.
+      const countedEnv = { ...env, CONFIGS: countedKv };
+      const d1Run = (stmt) => { ops++; return stmt.run(); };
+
+      ops++;
+      const stateRaw = await env.CONFIGS.get(MIGRATE_D1_STATE_KEY);
+      let state = null;
+      try {
+        state = stateRaw ? JSON.parse(stateRaw) : null;
+      } catch {
+        state = null;
+      }
+      // Anything unparseable or from an older shape restarts the sweep rather
+      // than resuming into the middle of it. Restarting is cheap here because
+      // every write is idempotent.
+      if (!state || state.v !== 1 || typeof state.phase !== "number" || !Array.isArray(state.pending) || !state.results) {
+        state = {
+          v: 1,
+          phase: 0,
+          cursor: "",
+          pending: [],
+          scanned: 0,
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+        };
+      }
+      const results = state.results;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      const noteError = (msg) => {
+        if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
+      };
+
+      async function migrateKey(phase, keyName) {
+        // 0. Creators
+        if (phase === 0) {
+          const username = keyName.slice("creator:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
           try {
             const data = JSON.parse(raw);
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
-            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0).run();
-            results.creators++;
+            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
+            results.creators++; thisCall.creators++;
           } catch (e) {
-            results.errors.push(`Creator ${username}: ` + e.message);
+            noteError(`Creator ${username}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2. Creator Lists
-      const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-      for (const k of lKeys.keys) {
-        // Two capture groups, so they are match[1] and match[2]. The old
-        // `[, , u, slug]` skipped one element too many: slug came out
-        // undefined, the `if (u && slug)` guard below rejected every key,
-        // and the migration silently reported "lists: 0" while claiming ok.
-        const [, u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
-        if (u && slug) {
-          const raw = await env.CONFIGS.get(k.name);
-          if (raw) {
-            try {
-              const data = JSON.parse(raw);
-              await stampListVisibilityIfNeeded(env, k.name, data);
-              const listId = `${u}:${slug}`;
-              const itemsJson = JSON.stringify(data.items || []);
-              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
-              // `likes` is carried across too. KV holds the authoritative
-              // count, so a migration that omitted it would silently reset
-              // every list to zero in D1. Visibility is rewritten as well
-              // so the fail-closed public index doesn't hide legacy lists
-              // that were served as public because they had no enum value.
-              await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
-              results.lists++;
-            } catch (e) {
-              results.errors.push(`List ${u}:${slug}: ` + e.message);
-            }
+        // 1. Creator Lists
+        if (phase === 1) {
+          // Two capture groups, so they are match[1] and match[2]. The old
+          // `[, , u, slug]` skipped one element too many: slug came out
+          // undefined, the `if (u && slug)` guard below rejected every key,
+          // and the migration silently reported "lists: 0" while claiming ok.
+          const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
+          if (!u || !slug) return;
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            const listId = `${u}:${slug}`;
+            const itemsJson = JSON.stringify(data.items || []);
+            const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
+            // `likes` is carried across too. KV holds the authoritative
+            // count, so a migration that omitted it would silently reset
+            // every list to zero in D1. Visibility is rewritten as well
+            // so the fail-closed public index doesn't hide legacy lists
+            // that were served as public because they had no enum value.
+            await d1Run(env.DB.prepare(
+              "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+            ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
+            results.lists++; thisCall.lists++;
+          } catch (e) {
+            noteError(`List ${u}:${slug}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2b. Anonymous published lists live only in KV. Stamp missing /
-      // garbage visibility the same way as creator lists so the inverted
-      // public-read checks don't hide currently-served lists.
-      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-      for (const k of pKeys.keys) {
-        const raw = await env.CONFIGS.get(k.name);
-        if (!raw) continue;
-        try {
-          const data = JSON.parse(raw);
-          await stampListVisibilityIfNeeded(env, k.name, data);
-        } catch (e) {
-          results.errors.push(`Published ${k.name}: ` + e.message);
+        // 2. Anonymous published lists live only in KV. Stamp missing /
+        // garbage visibility the same way as creator lists so the inverted
+        // public-read checks don't hide currently-served lists.
+        if (phase === 2) {
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            results.published++; thisCall.published++;
+          } catch (e) {
+            noteError(`Published ${keyName}: ` + e.message);
+          }
+          return;
         }
-      }
 
-      // 3. Source Groups
-      const sKeys = await listAllKeys(env.CONFIGS, "stats:sourcegroup:");
-      for (const k of sKeys.keys) {
-        if (k.name.endsWith(":total")) {
-          const groupName = k.name.slice("stats:sourcegroup:".length, -":total".length);
-          const raw = await env.CONFIGS.get(k.name);
+        // 3. Source Groups
+        if (phase === 3) {
+          if (!keyName.endsWith(":total")) return;
+          const groupName = keyName.slice("stats:sourcegroup:".length, -":total".length);
+          const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
-            ).bind(groupName, groupName, count).run();
-            results.sourcegroups++;
+            ).bind(groupName, groupName, count));
+            results.sourcegroups++; thisCall.sourcegroups++;
           } catch (e) {
-            results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
+            noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
-      //
-      // Until these are copied across, each counter falls back to its KV
-      // value rather than reporting zero (see readStatCount, 03_admin.js),
-      // so a dashboard's history never visibly vanishes just because D1 got
-      // bound. After this runs, D1 is authoritative and the KV copies are
-      // inert.
-      //
-      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
-      // safe to run more than once (the admin button can be pressed again,
-      // and the other three sections above are idempotent too), and an
-      // additive upsert here would double every counter on the second run.
-      // sourcegroup: is skipped -- section 3 above already migrated it into
-      // its own table, and copying it here too would count it twice in the
-      // Installed Catalogs panel, which sums both.
-      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
-      for (const k of statKeys.keys) {
-        const rest = k.name.slice("stats:".length);
+        // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+        //
+        // Until these are copied across, each counter falls back to its KV
+        // value rather than reporting zero (see readStatCount, 03_admin.js),
+        // so a dashboard's history never visibly vanishes just because D1 got
+        // bound. After this runs, D1 is authoritative and the KV copies are
+        // inert.
+        //
+        // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+        // safe to run more than once (the admin button can be pressed again,
+        // and every other section is idempotent too), and an additive upsert
+        // here would double every counter on the second run. sourcegroup: is
+        // skipped -- phase 3 above already migrated it into its own table,
+        // and copying it here too would count it twice in the Installed
+        // Catalogs panel, which sums both.
+        const rest = keyName.slice("stats:".length);
         const sep = rest.lastIndexOf(":");
-        if (sep === -1) continue;
+        if (sep === -1) return;
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
-        if (!kind || !bucket) continue;
-        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        if (!kind || !bucket) return;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
         // stats:genredecade:migrated is a sentinel -- none of them belong
         // in an integer column.
-        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
-        const raw = await env.CONFIGS.get(k.name);
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
+        const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) continue;
+        if (!Number.isFinite(n)) return;
         try {
-          await env.DB.prepare(
+          await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
-          ).bind(kind, bucket, n).run();
-          results.stats++;
+          ).bind(kind, bucket, n));
+          results.stats++; thisCall.stats++;
         } catch (e) {
-          results.errors.push(`Stat ${k.name}: ` + e.message);
+          noteError(`Stat ${keyName}: ` + e.message);
         }
       }
 
-      return json({ ok: true, results });
+      let scannedThisCall = 0;
+      while (state.phase < MIGRATE_D1_PREFIXES.length && !spent()) {
+        if (!state.pending.length) {
+          if (state.cursor === null) {
+            state.phase++;
+            state.cursor = "";
+            continue;
+          }
+          const listOpts = { prefix: MIGRATE_D1_PREFIXES[state.phase], limit: MIGRATE_D1_PAGE };
+          if (state.cursor) listOpts.cursor = state.cursor;
+          const listRes = await countedKv.list(listOpts);
+          state.pending = (listRes.keys || []).map((k) => k.name);
+          state.cursor = (listRes.list_complete || !listRes.cursor) ? null : listRes.cursor;
+          if (!state.pending.length) continue;
+        }
+        // shift() as we go, so whatever is left in `pending` when the budget
+        // runs out is exactly what this run still owes.
+        while (state.pending.length && !spent()) {
+          const keyName = state.pending.shift();
+          await migrateKey(state.phase, keyName);
+          scannedThisCall++;
+        }
+      }
+
+      state.scanned = (state.scanned || 0) + scannedThisCall;
+      const done = state.phase >= MIGRATE_D1_PREFIXES.length;
+      if (done) {
+        try {
+          await env.CONFIGS.delete(MIGRATE_D1_STATE_KEY);
+        } catch {
+          // A stranded state key only costs the next run a restart, and
+          // every write in the sweep is idempotent.
+        }
+      } else {
+        await env.CONFIGS.put(MIGRATE_D1_STATE_KEY, JSON.stringify(state));
+      }
+
+      return json({ ok: true, done, results, thisCall, scanned: state.scanned });
     }
 
-    // /admin/api/rebuild-public-index  (POST) -> { ok, count, ms }
-    // Forces an immediate, synchronous rebuild of index:publiclists (see
-    // getPublicListIndex/rebuildPublicListIndex, 02_http-and-creator-
-    // utils.js) instead of waiting for it to happen lazily. Without this,
-    // a fresh deployment -- or the index key being lost some other way --
-    // serves every visitor of /lists/public.json and list search a
-    // truncated, lexicographically-biased result (capped at 150/250/80
-    // keys) for however long the lazy background rebuild takes to finish,
-    // which scales with how many lists exist. scheduled() below also
-    // triggers this same rebuild automatically whenever the index is
-    // found missing (self-healing within one cron interval even with no
-    // admin action), so this endpoint is for an immediate, verifiable
-    // seed right after a fresh deploy rather than the only way it happens.
-    // Safe to run any time, repeatedly -- it's the exact same full rebuild
-    // the lazy/cron paths already do, just awaited here instead of
-    // deferred.
+    // /admin/api/rebuild-public-index  (POST) -> { ok, done, count, scanned, ms }
+    // Drives a rebuild of index:publiclists (see getPublicListIndex/
+    // rebuildPublicListIndex, 02_http-and-creator-utils.js) on demand
+    // instead of waiting for it to happen lazily. Without this, a fresh
+    // deployment -- or the index key being lost some other way -- serves
+    // every visitor of /lists/public.json and list search a truncated,
+    // lexicographically-biased result (capped at 150/250/80 keys) until
+    // the build finishes. scheduled() below drives the same build
+    // automatically whenever the index is found missing (self-healing
+    // without any admin action), so this endpoint is for an immediate,
+    // verifiable seed right after a fresh deploy rather than the only way
+    // it happens.
+    //
+    // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
+    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // several passes. Keep calling until `done` is true -- exactly like
+    // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
+    // does that loop for you. A chunk here gets a bigger op budget than the
+    // cron's, since this request has the invocation to itself. Safe to run
+    // any time, repeatedly: progress is idempotent and the live index is
+    // only replaced once the final chunk lands.
     if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
       const started = Date.now();
       try {
-        const entries = await rebuildPublicListIndex(env);
-        return json({ ok: true, count: (entries || []).length, ms: Date.now() - started });
+        const res = await rebuildPublicListIndex(env, { opBudget: PUBLIC_INDEX_BUILD_OPS_ADMIN });
+        return json({
+          ok: true,
+          done: !!res.done,
+          count: res.entriesSoFar,
+          scanned: res.scanned,
+          ms: Date.now() - started,
+        });
       } catch (e) {
         return json({ ok: false, error: "Rebuild failed: " + (e && e.message ? e.message : String(e)) }, 500);
       }
@@ -56375,6 +57089,10 @@ self.addEventListener('fetch', e => {
       // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
       // missing, same as restore, because there is no other safe
       // per-client identity to key a shared bucket on.
+      // Set inside the KV branch below and read again after the compare, so
+      // only a genuine wrong key spends the daily budget.
+      let adminLoginFailScope = "";
+      let adminLoginFailDay = "";
       if (env.CONFIGS) {
         const ip = clientIpKey(request);
         if (!ip) {
@@ -56392,6 +57110,19 @@ self.addEventListener('fetch', e => {
           });
         }
         await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+        // The 60s bucket above shapes a burst but leans on a KV counter that
+        // is edge-cached and non-atomic, so it is not the only thing that
+        // should stand in front of ADMIN_KEY. This daily budget is spent on
+        // failures only and is atomic wherever D1 is bound.
+        adminLoginFailScope = `adminlogin:${ip}`;
+        adminLoginFailDay = statsToday();
+        if (await readAuthFailureCount(env, adminLoginFailScope, adminLoginFailDay) >= ADMIN_LOGIN_MAX_FAILURES_PER_DAY) {
+          return new Response(renderAdminLoginPage("Too many failed attempts today. Please try again tomorrow."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
       }
       let submittedKey = "";
       try {
@@ -56401,6 +57132,10 @@ self.addEventListener('fetch', e => {
         // falls through with an empty key, which will fail the compare below
       }
       if (!timingSafeEqualHex(submittedKey, env.ADMIN_KEY)) {
+        // Failures only -- a correct key must never spend the budget that
+        // protects it, or an admin who logs in often would lock themselves
+        // out.
+        if (adminLoginFailScope) await noteAuthFailure(env, adminLoginFailScope, adminLoginFailDay);
         return new Response(renderAdminLoginPage("Incorrect key."), {
           status: 401,
           headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
@@ -56564,6 +57299,10 @@ export default {
   // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
   // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
+    // Same as the fetch handler above: nothing that runs below may see an
+    // empty API key just because this isolate's first event happened to be a
+    // cron tick rather than a request. See applyEnvApiKeys.
+    applyEnvApiKeys(env);
     ctx.waitUntil(
       Promise.all([
         checkForNewEpisodes(env),
@@ -56572,12 +57311,17 @@ export default {
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never
         // visits /admin from serving every visitor a truncated,
-        // lexicographically-biased directory/search result indefinitely:
-        // it self-heals within one cron interval instead of only on
-        // whichever live request happens to hit the cold index first. See
-        // getPublicListIndex's own comment; /admin/api/rebuild-public-index
-        // does the same rebuild on demand, synchronously, for an
-        // immediate/verifiable seed right after a fresh deploy.
+        // lexicographically-biased directory/search result indefinitely,
+        // instead of relying on whichever live request happens to hit the
+        // cold index first.
+        //
+        // One bounded chunk per tick, not a whole rebuild (see
+        // rebuildPublicListIndex): a small deployment is done on the first
+        // tick, a large one converges over the following few hours. That is
+        // the point -- the previous single-pass version simply threw and
+        // rebuilt nothing at all once there were more than ~500 lists.
+        // /admin/api/rebuild-public-index drives the same chunks back to
+        // back for an immediate seed right after a fresh deploy.
         getPublicListIndex(env, ctx),
       ])
     );

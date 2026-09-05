@@ -472,11 +472,23 @@
       const configParam = url.searchParams.get("config") || url.searchParams.get("token") || "";
       const queryCreator = url.searchParams.get("creator") || url.searchParams.get("user") || "";
       const queryKey = url.searchParams.get("key") || "";
+      // The preferred credential for this endpoint: a revocable token that
+      // authorises recording playback for one account and nothing else. A
+      // webhook URL necessarily carries its credential in the query string
+      // (Plex/Jellyfin/Emby accept a URL and nothing else), where it lands in
+      // the media server's config and logs -- so what it carries should not
+      // be the Creator Key. See getOrCreateScrobbleToken.
+      const scrobbleToken = url.searchParams.get("st") || "";
 
       let authUser = null;
       let effectiveTmdbKey = TMDB_API_KEY;
 
-      if (configParam) {
+      if (scrobbleToken) {
+        const tokenUser = await usernameForScrobbleToken(env, scrobbleToken);
+        if (tokenUser) authUser = tokenUser;
+      }
+
+      if (!authUser && configParam) {
         try {
           const resolved = await resolveConfig(configParam, env);
           if (resolved && resolved.trackCreatorName && resolved.trackCreatorKey) {
@@ -497,6 +509,11 @@
       if (!authUser) {
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
+      // creator+key still works: webhook URLs handed out before scrobble
+      // tokens existed are sitting in people's media servers, and breaking
+      // them would silently stop their history syncing with no error anyone
+      // would see. The dashboard only ever shows the token form now, so
+      // these age out as people re-copy the URL.
       await ensureTrackingMigrated(env, authUser);
 
       if (!effectiveTmdbKey && authUser && env && env.CONFIGS) {
@@ -1109,6 +1126,20 @@
       // self-service reset (/api/creator/reset-key) is the only thing
       // that ever reads it.
       const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      // Optional -- but if one is given it has to be long enough to be worth
+      // hashing. It is lowercased before hashing and it can replace the
+      // Creator Key outright via /api/creator/reset-key, so a three-character
+      // answer is a three-character password on the whole account. Rejected
+      // rather than silently accepted, since the person setting it is the
+      // only one who can pick a better one. Existing short answers are
+      // untouched; the per-account failure budget on reset-key is what
+      // protects those.
+      if (recoveryAnswerRaw && recoveryAnswerRaw.length < RECOVERY_ANSWER_MIN_LENGTH) {
+        return json({
+          ok: false,
+          error: `Recovery Answer must be at least ${RECOVERY_ANSWER_MIN_LENGTH} characters -- it can reset your key, so treat it like a password.`,
+        }, 400);
+      }
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
@@ -1200,8 +1231,33 @@
         return json({ ok: false, error: genericError });
       }
       if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+
+      // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
+      // counter alone did not defend this endpoint at all: rotating source
+      // addresses is free, so it bought an attacker unlimited guesses at one
+      // account's recovery answer -- a secret weak enough to fall in a
+      // handful of tries, in exchange for a working Creator Key. See
+      // RESET_KEY_ACCOUNT_MAX_FAILURES (00_constants.js).
+      //
+      // Checked here, after the profile is known to exist and to have a
+      // recovery answer set, so a wrong or unknown username can never spend
+      // (or create a counter for) an account budget. Still before the
+      // PBKDF2 verification below, so a throttled attempt costs nothing.
+      const resetDay = statsToday();
+      const resetScope = `reset:${v.normalized}`;
+      if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
+        // Same generic message as every other failure path here, so this
+        // does not become a way to ask whether an account exists.
+        return json({ ok: false, error: genericError });
+      }
+
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
-      if (!matches) return json({ ok: false, error: genericError });
+      if (!matches) {
+        // Failures only: answering correctly must never consume the budget
+        // that protects you.
+        await noteAuthFailure(env, resetScope, resetDay);
+        return json({ ok: false, error: genericError });
+      }
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
@@ -1323,6 +1379,33 @@
       return json({ ok: true, creatorKey });
     }
 
+    // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
+    //   -> { ok, token }
+    // Returns this account's media-server scrobble token, minting one on
+    // first use. `rotate: true` issues a fresh one and revokes the previous,
+    // which is what "regenerate" in the dashboard does when a webhook URL
+    // has been shared or logged somewhere it should not have been.
+    //
+    // Authenticated with the Creator Key, like every other account
+    // operation -- the token is what the WEBHOOK carries, not what this
+    // endpoint accepts.
+    if (path === "/api/creator/scrobble-token" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) {
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
+      const token = await getOrCreateScrobbleToken(env, auth.username, body.rotate === true);
+      if (!token) return json({ ok: false, error: "Could not issue a webhook token." }, 500);
+      return json({ ok: true, token }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /api/creator/restore  (POST)  { creatorName, creatorKey } -> { ok, creatorName, displayName }
     if (path === "/api/creator/restore" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
@@ -1337,6 +1420,17 @@
         return json({ ok: false, error: "Too many attempts. Please wait a minute and try again." }, 429);
       }
       await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+      // Same reasoning as /admin/login: the 60s bucket shapes a burst, this
+      // daily budget is what actually bounds guessing at a Creator Key over
+      // time. Spent on failures only, so restoring on a run of new devices
+      // costs nothing.
+      const restoreFailScope = `restore:${ip}`;
+      const restoreFailDay = statsToday();
+      if (await readAuthFailureCount(env, restoreFailScope, restoreFailDay) >= CREATOR_RESTORE_MAX_FAILURES_PER_DAY) {
+        return json({ ok: false, error: "Too many failed attempts today. Please try again tomorrow." }, 429);
+      }
+
       let body;
       try {
         body = await request.json();
@@ -1344,7 +1438,10 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) {
+        if (auth.error !== "no-kv") await noteAuthFailure(env, restoreFailScope, restoreFailDay);
+        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      }
       return json({ ok: true, creatorName: auth.username, displayName: auth.displayName });
     }
 
@@ -1513,10 +1610,18 @@
         // someone-else/top-10 are unrelated), so the collision check and
         // auto-increment only look at this creator's own list keys.
         const baseSlug = slugifyServer(name) || "list";
-        slug = baseSlug;
-        for (let attempt = 2; attempt <= 500; attempt++) {
-          if (!order.includes(slug)) break;
-          slug = `${baseSlug}-${attempt}`;
+        // Checked against an in-memory array rather than KV, so this one was
+        // never a subrequest problem -- but it had the same fall-through:
+        // past the bound it kept a slug that WAS taken and saved over that
+        // list. Scoped to this creator's own namespace, so only their own
+        // list was ever at risk, but silently replacing it is still the
+        // wrong answer.
+        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        if (!slug) {
+          return json(
+            { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
+            409
+          );
         }
       }
 
@@ -3255,168 +3360,265 @@
       return json({ ok: true, done: false, accountsThisCall: 1, titlesThisCall, username });
     }
 
-    // /admin/api/migrate-d1 (POST) -> { ok, results }
-    // Backfills creators, creator_lists, and source_groups from KV to D1.
+    // /admin/api/migrate-d1 (POST) -> { ok, done, results, thisCall, scanned }
+    // Backfills creators, creator_lists, published-list visibility stamps,
+    // source_groups and the stats counters from KV to D1.
+    //
+    // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
+    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // and the previous single-pass version simply aborted partway through on
+    // any site large enough to actually need migrating -- backfilling a
+    // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
+    // for why that particular half-finished state is dangerous rather than
+    // merely incomplete.
+    //
+    // Keep calling until `done` is true; runMigrateD1 (03_admin.js) does that
+    // loop. `results` is cumulative across the whole run, `thisCall` is just
+    // this chunk. Still safe to run repeatedly from scratch: every write here
+    // is idempotent.
     if (path === "/admin/api/migrate-d1" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
-      
-      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
-      // 1. Creators
-      const cKeys = await listAllKeys(env.CONFIGS, "creator:");
-      for (const k of cKeys.keys) {
-        const username = k.name.slice("creator:".length);
-        const raw = await env.CONFIGS.get(k.name);
-        if (raw) {
+      // Every KV read/write and every D1 statement goes through these, so the
+      // budget reflects what was actually spent rather than a guess.
+      let ops = 0;
+      const spent = () => ops >= MIGRATE_D1_OPS_PER_RUN;
+      const countedKv = {
+        get: (...a) => { ops++; return env.CONFIGS.get(...a); },
+        put: (...a) => { ops++; return env.CONFIGS.put(...a); },
+        delete: (...a) => { ops++; return env.CONFIGS.delete(...a); },
+        list: (...a) => { ops++; return env.CONFIGS.list(...a); },
+      };
+      // stampListVisibilityIfNeeded writes through env.CONFIGS itself.
+      const countedEnv = { ...env, CONFIGS: countedKv };
+      const d1Run = (stmt) => { ops++; return stmt.run(); };
+
+      ops++;
+      const stateRaw = await env.CONFIGS.get(MIGRATE_D1_STATE_KEY);
+      let state = null;
+      try {
+        state = stateRaw ? JSON.parse(stateRaw) : null;
+      } catch {
+        state = null;
+      }
+      // Anything unparseable or from an older shape restarts the sweep rather
+      // than resuming into the middle of it. Restarting is cheap here because
+      // every write is idempotent.
+      if (!state || state.v !== 1 || typeof state.phase !== "number" || !Array.isArray(state.pending) || !state.results) {
+        state = {
+          v: 1,
+          phase: 0,
+          cursor: "",
+          pending: [],
+          scanned: 0,
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+        };
+      }
+      const results = state.results;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      const noteError = (msg) => {
+        if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
+      };
+
+      async function migrateKey(phase, keyName) {
+        // 0. Creators
+        if (phase === 0) {
+          const username = keyName.slice("creator:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
           try {
             const data = JSON.parse(raw);
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
-            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0).run();
-            results.creators++;
+            ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
+            results.creators++; thisCall.creators++;
           } catch (e) {
-            results.errors.push(`Creator ${username}: ` + e.message);
+            noteError(`Creator ${username}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2. Creator Lists
-      const lKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-      for (const k of lKeys.keys) {
-        // Two capture groups, so they are match[1] and match[2]. The old
-        // `[, , u, slug]` skipped one element too many: slug came out
-        // undefined, the `if (u && slug)` guard below rejected every key,
-        // and the migration silently reported "lists: 0" while claiming ok.
-        const [, u, slug] = k.name.match(/^creatorlist:([^:]+):(.+)$/) || [];
-        if (u && slug) {
-          const raw = await env.CONFIGS.get(k.name);
-          if (raw) {
-            try {
-              const data = JSON.parse(raw);
-              await stampListVisibilityIfNeeded(env, k.name, data);
-              const listId = `${u}:${slug}`;
-              const itemsJson = JSON.stringify(data.items || []);
-              const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
-              // `likes` is carried across too. KV holds the authoritative
-              // count, so a migration that omitted it would silently reset
-              // every list to zero in D1. Visibility is rewritten as well
-              // so the fail-closed public index doesn't hide legacy lists
-              // that were served as public because they had no enum value.
-              await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
-              ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0).run();
-              results.lists++;
-            } catch (e) {
-              results.errors.push(`List ${u}:${slug}: ` + e.message);
-            }
+        // 1. Creator Lists
+        if (phase === 1) {
+          // Two capture groups, so they are match[1] and match[2]. The old
+          // `[, , u, slug]` skipped one element too many: slug came out
+          // undefined, the `if (u && slug)` guard below rejected every key,
+          // and the migration silently reported "lists: 0" while claiming ok.
+          const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
+          if (!u || !slug) return;
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            const listId = `${u}:${slug}`;
+            const itemsJson = JSON.stringify(data.items || []);
+            const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
+            // `likes` is carried across too. KV holds the authoritative
+            // count, so a migration that omitted it would silently reset
+            // every list to zero in D1. Visibility is rewritten as well
+            // so the fail-closed public index doesn't hide legacy lists
+            // that were served as public because they had no enum value.
+            await d1Run(env.DB.prepare(
+              "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
+            ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
+            results.lists++; thisCall.lists++;
+          } catch (e) {
+            noteError(`List ${u}:${slug}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 2b. Anonymous published lists live only in KV. Stamp missing /
-      // garbage visibility the same way as creator lists so the inverted
-      // public-read checks don't hide currently-served lists.
-      const pKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-      for (const k of pKeys.keys) {
-        const raw = await env.CONFIGS.get(k.name);
-        if (!raw) continue;
-        try {
-          const data = JSON.parse(raw);
-          await stampListVisibilityIfNeeded(env, k.name, data);
-        } catch (e) {
-          results.errors.push(`Published ${k.name}: ` + e.message);
+        // 2. Anonymous published lists live only in KV. Stamp missing /
+        // garbage visibility the same way as creator lists so the inverted
+        // public-read checks don't hide currently-served lists.
+        if (phase === 2) {
+          const raw = await countedKv.get(keyName);
+          if (!raw) return;
+          try {
+            const data = JSON.parse(raw);
+            await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+            results.published++; thisCall.published++;
+          } catch (e) {
+            noteError(`Published ${keyName}: ` + e.message);
+          }
+          return;
         }
-      }
 
-      // 3. Source Groups
-      const sKeys = await listAllKeys(env.CONFIGS, "stats:sourcegroup:");
-      for (const k of sKeys.keys) {
-        if (k.name.endsWith(":total")) {
-          const groupName = k.name.slice("stats:sourcegroup:".length, -":total".length);
-          const raw = await env.CONFIGS.get(k.name);
+        // 3. Source Groups
+        if (phase === 3) {
+          if (!keyName.endsWith(":total")) return;
+          const groupName = keyName.slice("stats:sourcegroup:".length, -":total".length);
+          const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await env.DB.prepare(
+            await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
-            ).bind(groupName, groupName, count).run();
-            results.sourcegroups++;
+            ).bind(groupName, groupName, count));
+            results.sourcegroups++; thisCall.sourcegroups++;
           } catch (e) {
-            results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
+            noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
+          return;
         }
-      }
 
-      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
-      //
-      // Until these are copied across, each counter falls back to its KV
-      // value rather than reporting zero (see readStatCount, 03_admin.js),
-      // so a dashboard's history never visibly vanishes just because D1 got
-      // bound. After this runs, D1 is authoritative and the KV copies are
-      // inert.
-      //
-      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
-      // safe to run more than once (the admin button can be pressed again,
-      // and the other three sections above are idempotent too), and an
-      // additive upsert here would double every counter on the second run.
-      // sourcegroup: is skipped -- section 3 above already migrated it into
-      // its own table, and copying it here too would count it twice in the
-      // Installed Catalogs panel, which sums both.
-      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
-      for (const k of statKeys.keys) {
-        const rest = k.name.slice("stats:".length);
+        // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+        //
+        // Until these are copied across, each counter falls back to its KV
+        // value rather than reporting zero (see readStatCount, 03_admin.js),
+        // so a dashboard's history never visibly vanishes just because D1 got
+        // bound. After this runs, D1 is authoritative and the KV copies are
+        // inert.
+        //
+        // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+        // safe to run more than once (the admin button can be pressed again,
+        // and every other section is idempotent too), and an additive upsert
+        // here would double every counter on the second run. sourcegroup: is
+        // skipped -- phase 3 above already migrated it into its own table,
+        // and copying it here too would count it twice in the Installed
+        // Catalogs panel, which sums both.
+        const rest = keyName.slice("stats:".length);
         const sep = rest.lastIndexOf(":");
-        if (sep === -1) continue;
+        if (sep === -1) return;
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
-        if (!kind || !bucket) continue;
-        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        if (!kind || !bucket) return;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
         // stats:genredecade:migrated is a sentinel -- none of them belong
         // in an integer column.
-        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
-        const raw = await env.CONFIGS.get(k.name);
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
+        const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) continue;
+        if (!Number.isFinite(n)) return;
         try {
-          await env.DB.prepare(
+          await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
-          ).bind(kind, bucket, n).run();
-          results.stats++;
+          ).bind(kind, bucket, n));
+          results.stats++; thisCall.stats++;
         } catch (e) {
-          results.errors.push(`Stat ${k.name}: ` + e.message);
+          noteError(`Stat ${keyName}: ` + e.message);
         }
       }
 
-      return json({ ok: true, results });
+      let scannedThisCall = 0;
+      while (state.phase < MIGRATE_D1_PREFIXES.length && !spent()) {
+        if (!state.pending.length) {
+          if (state.cursor === null) {
+            state.phase++;
+            state.cursor = "";
+            continue;
+          }
+          const listOpts = { prefix: MIGRATE_D1_PREFIXES[state.phase], limit: MIGRATE_D1_PAGE };
+          if (state.cursor) listOpts.cursor = state.cursor;
+          const listRes = await countedKv.list(listOpts);
+          state.pending = (listRes.keys || []).map((k) => k.name);
+          state.cursor = (listRes.list_complete || !listRes.cursor) ? null : listRes.cursor;
+          if (!state.pending.length) continue;
+        }
+        // shift() as we go, so whatever is left in `pending` when the budget
+        // runs out is exactly what this run still owes.
+        while (state.pending.length && !spent()) {
+          const keyName = state.pending.shift();
+          await migrateKey(state.phase, keyName);
+          scannedThisCall++;
+        }
+      }
+
+      state.scanned = (state.scanned || 0) + scannedThisCall;
+      const done = state.phase >= MIGRATE_D1_PREFIXES.length;
+      if (done) {
+        try {
+          await env.CONFIGS.delete(MIGRATE_D1_STATE_KEY);
+        } catch {
+          // A stranded state key only costs the next run a restart, and
+          // every write in the sweep is idempotent.
+        }
+      } else {
+        await env.CONFIGS.put(MIGRATE_D1_STATE_KEY, JSON.stringify(state));
+      }
+
+      return json({ ok: true, done, results, thisCall, scanned: state.scanned });
     }
 
-    // /admin/api/rebuild-public-index  (POST) -> { ok, count, ms }
-    // Forces an immediate, synchronous rebuild of index:publiclists (see
-    // getPublicListIndex/rebuildPublicListIndex, 02_http-and-creator-
-    // utils.js) instead of waiting for it to happen lazily. Without this,
-    // a fresh deployment -- or the index key being lost some other way --
-    // serves every visitor of /lists/public.json and list search a
-    // truncated, lexicographically-biased result (capped at 150/250/80
-    // keys) for however long the lazy background rebuild takes to finish,
-    // which scales with how many lists exist. scheduled() below also
-    // triggers this same rebuild automatically whenever the index is
-    // found missing (self-healing within one cron interval even with no
-    // admin action), so this endpoint is for an immediate, verifiable
-    // seed right after a fresh deploy rather than the only way it happens.
-    // Safe to run any time, repeatedly -- it's the exact same full rebuild
-    // the lazy/cron paths already do, just awaited here instead of
-    // deferred.
+    // /admin/api/rebuild-public-index  (POST) -> { ok, done, count, scanned, ms }
+    // Drives a rebuild of index:publiclists (see getPublicListIndex/
+    // rebuildPublicListIndex, 02_http-and-creator-utils.js) on demand
+    // instead of waiting for it to happen lazily. Without this, a fresh
+    // deployment -- or the index key being lost some other way -- serves
+    // every visitor of /lists/public.json and list search a truncated,
+    // lexicographically-biased result (capped at 150/250/80 keys) until
+    // the build finishes. scheduled() below drives the same build
+    // automatically whenever the index is found missing (self-healing
+    // without any admin action), so this endpoint is for an immediate,
+    // verifiable seed right after a fresh deploy rather than the only way
+    // it happens.
+    //
+    // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
+    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // several passes. Keep calling until `done` is true -- exactly like
+    // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
+    // does that loop for you. A chunk here gets a bigger op budget than the
+    // cron's, since this request has the invocation to itself. Safe to run
+    // any time, repeatedly: progress is idempotent and the live index is
+    // only replaced once the final chunk lands.
     if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
       const started = Date.now();
       try {
-        const entries = await rebuildPublicListIndex(env);
-        return json({ ok: true, count: (entries || []).length, ms: Date.now() - started });
+        const res = await rebuildPublicListIndex(env, { opBudget: PUBLIC_INDEX_BUILD_OPS_ADMIN });
+        return json({
+          ok: true,
+          done: !!res.done,
+          count: res.entriesSoFar,
+          scanned: res.scanned,
+          ms: Date.now() - started,
+        });
       } catch (e) {
         return json({ ok: false, error: "Rebuild failed: " + (e && e.message ? e.message : String(e)) }, 500);
       }
@@ -3940,6 +4142,10 @@
       // Failed closed when CONFIGS IS bound but CF-Connecting-IP is
       // missing, same as restore, because there is no other safe
       // per-client identity to key a shared bucket on.
+      // Set inside the KV branch below and read again after the compare, so
+      // only a genuine wrong key spends the daily budget.
+      let adminLoginFailScope = "";
+      let adminLoginFailDay = "";
       if (env.CONFIGS) {
         const ip = clientIpKey(request);
         if (!ip) {
@@ -3957,6 +4163,19 @@
           });
         }
         await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: 60 });
+
+        // The 60s bucket above shapes a burst but leans on a KV counter that
+        // is edge-cached and non-atomic, so it is not the only thing that
+        // should stand in front of ADMIN_KEY. This daily budget is spent on
+        // failures only and is atomic wherever D1 is bound.
+        adminLoginFailScope = `adminlogin:${ip}`;
+        adminLoginFailDay = statsToday();
+        if (await readAuthFailureCount(env, adminLoginFailScope, adminLoginFailDay) >= ADMIN_LOGIN_MAX_FAILURES_PER_DAY) {
+          return new Response(renderAdminLoginPage("Too many failed attempts today. Please try again tomorrow."), {
+            status: 429,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+          });
+        }
       }
       let submittedKey = "";
       try {
@@ -3966,6 +4185,10 @@
         // falls through with an empty key, which will fail the compare below
       }
       if (!timingSafeEqualHex(submittedKey, env.ADMIN_KEY)) {
+        // Failures only -- a correct key must never spend the budget that
+        // protects it, or an admin who logs in often would lock themselves
+        // out.
+        if (adminLoginFailScope) await noteAuthFailure(env, adminLoginFailScope, adminLoginFailDay);
         return new Response(renderAdminLoginPage("Incorrect key."), {
           status: 401,
           headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
@@ -4129,6 +4352,10 @@ export default {
   // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
   // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
+    // Same as the fetch handler above: nothing that runs below may see an
+    // empty API key just because this isolate's first event happened to be a
+    // cron tick rather than a request. See applyEnvApiKeys.
+    applyEnvApiKeys(env);
     ctx.waitUntil(
       Promise.all([
         checkForNewEpisodes(env),
@@ -4137,12 +4364,17 @@ export default {
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never
         // visits /admin from serving every visitor a truncated,
-        // lexicographically-biased directory/search result indefinitely:
-        // it self-heals within one cron interval instead of only on
-        // whichever live request happens to hit the cold index first. See
-        // getPublicListIndex's own comment; /admin/api/rebuild-public-index
-        // does the same rebuild on demand, synchronously, for an
-        // immediate/verifiable seed right after a fresh deploy.
+        // lexicographically-biased directory/search result indefinitely,
+        // instead of relying on whichever live request happens to hit the
+        // cold index first.
+        //
+        // One bounded chunk per tick, not a whole rebuild (see
+        // rebuildPublicListIndex): a small deployment is done on the first
+        // tick, a large one converges over the following few hours. That is
+        // the point -- the previous single-pass version simply threw and
+        // rebuilt nothing at all once there were more than ~500 lists.
+        // /admin/api/rebuild-public-index drives the same chunks back to
+        // back for an immediate seed right after a fresh deploy.
         getPublicListIndex(env, ctx),
       ])
     );

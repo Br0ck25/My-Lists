@@ -1053,6 +1053,26 @@ function saveUserFeedbackThreadId(threadId) {
   } catch (e) {}
 }
 
+// The signed-in identity to attach to a feedback message, but only when it
+// can actually be proven. /api/feedback authenticates any creatorName it is
+// given and ignores the claim when the key does not match, so a name without
+// a key buys nothing. Returns nulls when there is nothing provable, which the
+// server treats as an ordinary anonymous message.
+function feedbackCreatorAuth() {
+  const name = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName)
+    ? activeCreator.creatorName
+    : null;
+  if (!name) return { creatorName: null, creatorKey: null };
+  let key = '';
+  try {
+    key = localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    key = '';
+  }
+  if (!key) return { creatorName: null, creatorKey: null };
+  return { creatorName: name, creatorKey: key };
+}
+
 async function loadUserFeedbackThreads() {
   const threadIds = getUserFeedbackThreadIds();
   const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
@@ -1196,7 +1216,12 @@ async function sendUserFeedbackReply() {
   if (statusEl) statusEl.textContent = 'Sending reply\u2026';
 
   const thread = userFeedbackThreads.find((t) => t.id === activeFeedbackThreadId);
-  const creatorName = (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) ? activeCreator.creatorName : null;
+  // Name AND key, or neither. The server proves any claimed identity before
+  // recording it (a bare name used to be taken on trust and rendered in the
+  // admin panel as the sender), so a name sent without a key is simply
+  // dropped there and the message is filed anonymously. Sending the pair
+  // when we have it is what keeps the thread attached to the account.
+  const creatorAuth = feedbackCreatorAuth();
 
   try {
     const res = await fetch(ORIGIN + '/api/feedback', {
@@ -1205,7 +1230,8 @@ async function sendUserFeedbackReply() {
       body: JSON.stringify({
         threadId: activeFeedbackThreadId,
         message: text,
-        creatorName: creatorName,
+        creatorName: creatorAuth.creatorName,
+        creatorKey: creatorAuth.creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -1248,7 +1274,9 @@ async function submitFeedback() {
         category: category,
         message: message,
         contact: contact,
-        creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : null,
+        // See feedbackCreatorAuth: name and key travel together or not at all.
+        creatorName: feedbackCreatorAuth().creatorName,
+        creatorKey: feedbackCreatorAuth().creatorKey,
       }),
     });
     const data = await res.json().catch(() => null);
@@ -1581,68 +1609,6 @@ function setListSearchChip(filter, btn) {
       card.style.display = '';
     }
   });
-}
-
-function quickAddProvider(name) {
-  const providerData = {
-    'Netflix': {
-      top10Movie: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-movies',
-      top10Series: 'https://mdblist.com/lists/hdlists/netflix-top-10-trending-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/netflix-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/netflix-shows'
-    },
-    'Prime Video': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/diimaan/amazon-prime-top-10-tv-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/amazon-prime-shows'
-    },
-    'Apple TV+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/apple-tv-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/slimshizn/apple-tv-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-apple-tv-plus-tv-shows'
-    },
-    'Disney+': {
-      top10Movie: 'https://mdblist.com/lists/andykai/disney-top-10-no-hulu',
-      top10Series: 'https://mdblist.com/lists/andykai/disney-trending-no-hulu',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/disney-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/disney-shows'
-    },
-    'HBO Max': {
-      top10Movie: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-movies-m77r6mc20q',
-      top10Series: 'https://mdblist.com/lists/harmes7/hbo-max-top-10-series-cp45l27nhd',
-      movie: 'https://mdblist.com/lists/snoak/latest-max-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hbo-shows'
-    },
-    'Hulu': {
-      top10Movie: 'https://mdblist.com/lists/hulupiv/hulu-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/hulupiv/hulu-top-10-shows',
-      movie: 'https://mdblist.com/lists/garycrawfordgc/hulu-movies',
-      series: 'https://mdblist.com/lists/garycrawfordgc/hulu-shows'
-    },
-    'Paramount+': {
-      top10Movie: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-movies-today',
-      top10Series: 'https://mdblist.com/lists/ahmed2250/paramount-top-10-tv-shows-today',
-      movie: 'https://mdblist.com/lists/snoak/latest-paramount-plus-movies',
-      series: 'https://mdblist.com/lists/snoak/latest-paramount-plus-tv-shows'
-    },
-    'Peacock': {
-      top10Movie: 'https://mdblist.com/lists/diimaan/peacock-top-10-movies',
-      top10Series: 'https://mdblist.com/lists/peacockpiv/peacock-top-10-shows',
-      movie: 'https://mdblist.com/lists/tvgeniekodi/peacock-movies',
-      series: 'https://mdblist.com/lists/tvgeniekodi/peacock-tv-shows'
-    }
-  };
-  const data = providerData[name];
-  if (data) {
-    if (data.top10Movie) addRow(name + ' Top 10', data.top10Movie, 'movie', true, 'Streaming Top 10');
-    if (data.top10Series) addRow(name + ' Top 10', data.top10Series, 'series', true, 'Streaming Top 10');
-    if (data.movie) addRow(name, data.movie, 'movie', true, name);
-    if (data.series) addRow(name, data.series, 'series', true, name);
-    saveState();
-    switchTab('catalogs');
-  }
 }
 
 // Kept as a no-op (not removed) -- the poster-click handler in
@@ -2098,22 +2064,6 @@ function addRow(name, url, type, enabled, group, channelId) {
 // here on, editable/removable a source at a time like any other.
 function addCombinedRow(name, urls, type, group) {
   addRow(name, urls.join('\\n'), type, true, group);
-}
-
-function addQuickAddRowsFromPairs(list, group, labelSuffix = "") {
-  list.forEach((p) => {
-    const label = labelSuffix ? p.name + " " + labelSuffix : p.name;
-    if (p.movieUrl) addRow(label, p.movieUrl, "movie", true, group);
-    if (p.showUrl) addRow(label, p.showUrl, "series", true, group);
-  });
-  saveState();
-}
-
-function addQuickAddRowsFromSimpleList(list, group) {
-  list.forEach((l) => {
-    addRow(l.name, l.url, l.type, true, group);
-  });
-  saveState();
 }
 
 ${buildAddAllFnJs("addAllMdblistCharts", buildAddAllPairsCallsJs(MDBLIST_OFFICIAL_CHARTS, "MDBList Charts", ""))}
