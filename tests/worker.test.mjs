@@ -1627,3 +1627,103 @@ describe("audit fix 3: the Continue Watching cron cannot revert a concurrent sav
     }
   });
 });
+
+describe("audit fix 8: handlePosterImgError works for every call site's markup", () => {
+  // Minimal DOM stand-ins -- enough for the placeholder logic, no jsdom.
+  function makeEl(tag, className = "") {
+    const el = {
+      tagName: tag.toUpperCase(),
+      className,
+      style: {},
+      dataset: {},
+      children: [],
+      parentElement: null,
+      innerHTML: "",
+      get classList() {
+        const self = this;
+        return { contains: (c) => String(self.className).split(/\s+/).includes(c) };
+      },
+      get nextElementSibling() {
+        if (!this.parentElement) return null;
+        const sibs = this.parentElement.children;
+        return sibs[sibs.indexOf(this) + 1] || null;
+      },
+      appendChild(child) { child.parentElement = this; this.children.push(child); return child; },
+      closest() { return null; },
+      querySelector(sel) {
+        const want = sel.replace(":scope > ", "").replace(".", "");
+        return this.children.find((c) => String(c.className).split(/\s+/).includes(want)) || null;
+      },
+    };
+    return el;
+  }
+  function load() {
+    const doc = { createElement: (t) => makeEl(t) };
+    return loadOneClientFunction("23_client-list-management.js", "handlePosterImgError", {
+      document: doc,
+      ORIGIN: "https://example.test",
+      fetch: () => Promise.reject(new Error("no network")),
+      showPosterPlaceholderFor: loadOneClientFunction(
+        "23_client-list-management.js", "showPosterPlaceholderFor", { document: doc }
+      ),
+    });
+  }
+
+  it("reveals the existing placeholder when the markup provides one as the next sibling", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    const ph = wrap.appendChild(makeEl("div", "live-preview-poster live-preview-poster-placeholder"));
+    ph.style.display = "none";
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    assert.equal(ph.style.display, "flex", "the provided placeholder should be shown");
+    assert.equal(wrap.children.length, 2, "and no second placeholder should be created");
+  });
+
+  it("creates a placeholder when the markup has no placeholder sibling", () => {
+    const handle = load();
+    // The list-card mini tile shape: img, then a remove button, then a
+    // breakpoint-scoped count badge. Neither is a placeholder.
+    const wrap = makeEl("div", "list-card-mini-poster-img-wrap");
+    const img = wrap.appendChild(makeEl("img"));
+    const removeBtn = wrap.appendChild(makeEl("button", "cw-remove-btn"));
+    const countBadge = wrap.appendChild(makeEl("div", "list-card-count-overlay desktop-only"));
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    // The actual regression: the old code set display:flex on whatever sat
+    // next to the img. On the count badge that overrode the media query
+    // that hides it at the other breakpoint, and no placeholder ever
+    // appeared -- just an empty gap.
+    assert.equal(removeBtn.style.display, undefined, "must not touch the remove button");
+    assert.equal(countBadge.style.display, undefined, "must not override the badge's breakpoint CSS");
+    const created = wrap.children.find((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.ok(created, "a 'No poster' placeholder should have been created");
+    assert.equal(created.style.display, "flex");
+    assert.match(created.innerHTML, /No poster/);
+  });
+
+  it("does not stack placeholders when called twice", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    handle(img);
+    const phs = wrap.children.filter((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.equal(phs.length, 1);
+  });
+
+  it("handles an img with no sibling at all (the swapped-in fallback image)", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    assert.ok(wrap.children.some((c) => String(c.className).includes("live-preview-poster-placeholder")));
+  });
+});

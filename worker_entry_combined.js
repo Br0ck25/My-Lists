@@ -15795,12 +15795,13 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
 
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
-  );
-}
-function escapeAttr(s) { return escapeHtml(s); }
+// escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
+// They used to be declared here too; since every client module shares one
+// script scope in the browser, that later declaration won, and this copy
+// was dead. The two were not even equivalent -- this one used
+// String(s || ''), which turns a legitimate 0 into an empty string, while
+// the surviving one uses String(s == null ? '' : s) and renders "0". Both
+// are hoisted, so the survivor is available to every caller here.
 
 (function earlySubmenuSync() {
   try {
@@ -16534,39 +16535,14 @@ function showAddedToast(msg) {
   }, 2200);
 }
 
-function handlePosterImgError(img) {
-  if (!img || img.dataset.hasFailedFallback) {
-    if (img) {
-      img.style.display = 'none';
-      const parent = img.parentElement;
-      if (parent && !parent.querySelector('.live-preview-poster-placeholder')) {
-        const ph = document.createElement('div');
-        ph.className = 'live-preview-poster live-preview-poster-placeholder';
-        ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
-        parent.appendChild(ph);
-      }
-    }
-    return;
-  }
-  img.dataset.hasFailedFallback = '1';
-  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
-  const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-  const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-  const id = (card && card.dataset.id) || (card && card.dataset.imdbId) || '';
-  if (title || id) {
-    const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
-    const imdbId = id.startsWith('tt') ? id : '';
-    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
-      .then(r => r.json())
-      .then(data => {
-        if (data && data.ok && data.poster) {
-          img.src = data.poster;
-          img.style.display = '';
-        }
-      })
-      .catch(() => {});
-  }
-}
+// handlePosterImgError used to be defined here as well. Every client
+// module ends up in ONE script in the browser, so that second declaration
+// silently overrode this one (23_client-list-management.js is later in
+// build order) and this copy never ran -- editing it changed nothing,
+// which is exactly the trap a duplicate top-level declaration sets. The
+// surviving definition now covers both DOM shapes; see
+// showPosterPlaceholderFor there. html_checks.py fails the build if a
+// duplicate is ever reintroduced.
 
 function resolveMissingPostersInDom(rootEl) {
   const container = rootEl || document;
@@ -35859,21 +35835,11 @@ async function migrateLocalCustomListsToAccount() {
 
 let lastCreatorListsData = null; // cached result of the last dashboard fetch, so Edit/Share don't need a round-trip
 
-function showModal(innerHtml, extraClass) {
-  closeModal();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'activeModalOverlay';
-  overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) closeModal();
-  });
-  document.body.appendChild(overlay);
-}
-function closeModal() {
-  const existing = document.getElementById('activeModalOverlay');
-  if (existing) existing.remove();
-}
+// showModal/closeModal live in 16_client-row-core.js. Byte-identical copies
+// were declared here too; in the browser's single shared script scope that
+// meant one silently overrode the other. Same behaviour either way, so
+// nothing changed by removing them -- but a future edit to one copy would
+// have appeared to do nothing at all.
 
 function renderCreatorProfileBar() {
   const bar = document.getElementById('creatorProfileBar');
@@ -41047,12 +41013,53 @@ async function renderLivePreview() {
   await Promise.all(workers);
 }
 
+// Hides a poster that could not be loaded and shows a "No poster" tile in
+// its place.
+//
+// Two different markups reach here, and this used to assume only one of
+// them. livePreviewPosterHtml (below) emits a hidden placeholder as the
+// img's immediate next sibling, so revealing img.nextElementSibling was
+// right there. Every other call site emits no placeholder at all:
+// renderCatalogSearchResults (19_client-search-and-likes.js) follows the
+// img with .poster-add-overlay, the list-card mini tiles
+// (22_client-creator-profile.js) follow it with .cw-remove-btn and
+// .list-card-count-overlay, and the replacement <img> that
+// resolveMissingPostersInDom (16_client-row-core.js) swaps in has no
+// sibling whatsoever.
+//
+// At those sites the old code hid the poster and then set display:flex on
+// whatever happened to sit next to it, so no "No poster" tile ever
+// appeared -- just an empty gap -- and on the count badge, which is shown
+// and hidden per breakpoint by a media query, an inline display:flex
+// overrode that query and put the badge on screen at both widths at once.
+//
+// So: reveal a real placeholder when one exists, create one when it does
+// not, and never touch a sibling that is not a placeholder.
+function showPosterPlaceholderFor(img) {
+  if (!img) return;
+  img.style.display = 'none';
+  const parent = img.parentElement;
+  if (!parent) return;
+  let ph = null;
+  const sib = img.nextElementSibling;
+  if (sib && sib.classList && sib.classList.contains('live-preview-poster-placeholder')) {
+    ph = sib;
+  } else {
+    ph = parent.querySelector(':scope > .live-preview-poster-placeholder');
+  }
+  if (!ph) {
+    ph = document.createElement('div');
+    ph.className = 'live-preview-poster live-preview-poster-placeholder';
+    ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
+    parent.appendChild(ph);
+  }
+  ph.style.display = 'flex';
+}
+
 function handlePosterImgError(img) {
   if (!img) return;
   if (img.dataset.hasFailedFallback) {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
     return;
   }
   img.dataset.hasFailedFallback = '1';
@@ -41076,20 +41083,14 @@ function handlePosterImgError(img) {
           img.src = data.poster;
           img.style.display = '';
         } else {
-          img.style.display = 'none';
-          const ph = img.nextElementSibling;
-          if (ph) ph.style.display = 'flex';
+          showPosterPlaceholderFor(img);
         }
       })
       .catch(() => {
-        img.style.display = 'none';
-        const ph = img.nextElementSibling;
-        if (ph) ph.style.display = 'flex';
+        showPosterPlaceholderFor(img);
       });
   } else {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
   }
 }
 

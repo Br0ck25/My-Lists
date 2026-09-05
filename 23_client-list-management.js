@@ -822,12 +822,53 @@ async function renderLivePreview() {
   await Promise.all(workers);
 }
 
+// Hides a poster that could not be loaded and shows a "No poster" tile in
+// its place.
+//
+// Two different markups reach here, and this used to assume only one of
+// them. livePreviewPosterHtml (below) emits a hidden placeholder as the
+// img's immediate next sibling, so revealing img.nextElementSibling was
+// right there. Every other call site emits no placeholder at all:
+// renderCatalogSearchResults (19_client-search-and-likes.js) follows the
+// img with .poster-add-overlay, the list-card mini tiles
+// (22_client-creator-profile.js) follow it with .cw-remove-btn and
+// .list-card-count-overlay, and the replacement <img> that
+// resolveMissingPostersInDom (16_client-row-core.js) swaps in has no
+// sibling whatsoever.
+//
+// At those sites the old code hid the poster and then set display:flex on
+// whatever happened to sit next to it, so no "No poster" tile ever
+// appeared -- just an empty gap -- and on the count badge, which is shown
+// and hidden per breakpoint by a media query, an inline display:flex
+// overrode that query and put the badge on screen at both widths at once.
+//
+// So: reveal a real placeholder when one exists, create one when it does
+// not, and never touch a sibling that is not a placeholder.
+function showPosterPlaceholderFor(img) {
+  if (!img) return;
+  img.style.display = 'none';
+  const parent = img.parentElement;
+  if (!parent) return;
+  let ph = null;
+  const sib = img.nextElementSibling;
+  if (sib && sib.classList && sib.classList.contains('live-preview-poster-placeholder')) {
+    ph = sib;
+  } else {
+    ph = parent.querySelector(':scope > .live-preview-poster-placeholder');
+  }
+  if (!ph) {
+    ph = document.createElement('div');
+    ph.className = 'live-preview-poster live-preview-poster-placeholder';
+    ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
+    parent.appendChild(ph);
+  }
+  ph.style.display = 'flex';
+}
+
 function handlePosterImgError(img) {
   if (!img) return;
   if (img.dataset.hasFailedFallback) {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
     return;
   }
   img.dataset.hasFailedFallback = '1';
@@ -851,20 +892,14 @@ function handlePosterImgError(img) {
           img.src = data.poster;
           img.style.display = '';
         } else {
-          img.style.display = 'none';
-          const ph = img.nextElementSibling;
-          if (ph) ph.style.display = 'flex';
+          showPosterPlaceholderFor(img);
         }
       })
       .catch(() => {
-        img.style.display = 'none';
-        const ph = img.nextElementSibling;
-        if (ph) ph.style.display = 'flex';
+        showPosterPlaceholderFor(img);
       });
   } else {
-    img.style.display = 'none';
-    const ph = img.nextElementSibling;
-    if (ph) ph.style.display = 'flex';
+    showPosterPlaceholderFor(img);
   }
 }
 

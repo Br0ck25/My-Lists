@@ -58,12 +58,13 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
 
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
-  );
-}
-function escapeAttr(s) { return escapeHtml(s); }
+// escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
+// They used to be declared here too; since every client module shares one
+// script scope in the browser, that later declaration won, and this copy
+// was dead. The two were not even equivalent -- this one used
+// String(s || ''), which turns a legitimate 0 into an empty string, while
+// the surviving one uses String(s == null ? '' : s) and renders "0". Both
+// are hoisted, so the survivor is available to every caller here.
 
 (function earlySubmenuSync() {
   try {
@@ -797,39 +798,14 @@ function showAddedToast(msg) {
   }, 2200);
 }
 
-function handlePosterImgError(img) {
-  if (!img || img.dataset.hasFailedFallback) {
-    if (img) {
-      img.style.display = 'none';
-      const parent = img.parentElement;
-      if (parent && !parent.querySelector('.live-preview-poster-placeholder')) {
-        const ph = document.createElement('div');
-        ph.className = 'live-preview-poster live-preview-poster-placeholder';
-        ph.innerHTML = '<small style="color:var(--muted); font-size:0.7rem;">No poster</small>';
-        parent.appendChild(ph);
-      }
-    }
-    return;
-  }
-  img.dataset.hasFailedFallback = '1';
-  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
-  const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-  const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-  const id = (card && card.dataset.id) || (card && card.dataset.imdbId) || '';
-  if (title || id) {
-    const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
-    const imdbId = id.startsWith('tt') ? id : '';
-    fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
-      .then(r => r.json())
-      .then(data => {
-        if (data && data.ok && data.poster) {
-          img.src = data.poster;
-          img.style.display = '';
-        }
-      })
-      .catch(() => {});
-  }
-}
+// handlePosterImgError used to be defined here as well. Every client
+// module ends up in ONE script in the browser, so that second declaration
+// silently overrode this one (23_client-list-management.js is later in
+// build order) and this copy never ran -- editing it changed nothing,
+// which is exactly the trap a duplicate top-level declaration sets. The
+// surviving definition now covers both DOM shapes; see
+// showPosterPlaceholderFor there. html_checks.py fails the build if a
+// duplicate is ever reintroduced.
 
 function resolveMissingPostersInDom(rootEl) {
   const container = rootEl || document;
