@@ -150,6 +150,14 @@ function applyEnvApiKeys(env) {
 // The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
 // Creator Key is ~60 bits -- so this is defence in depth, not the load-
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+// How many of one creator's lists /admin/api/delete-creator-list will remove
+// in a single call. Each slug costs a KV read, a KV delete, a ledger delete
+// and (with D1 bound) a statement, so this keeps one call well inside
+// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// larger cleanup still completes -- it just arrives as several bounded calls,
+// the same shape the other maintenance tools use.
+const ADMIN_LIST_DELETE_MAX = 50;
+
 const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
 const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 

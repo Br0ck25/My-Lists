@@ -6265,7 +6265,7 @@ function openChannelDetailsPage(channelIdOrDivId) {
     const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
 
     return {
-      id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
+      id: channelItemId(it, idx),
       // Was hardcoded to 'series' unconditionally for every item -- fine
       // for a channel's actual episodes, but wrong for movie-saga channels
       // (MCU, Star Wars, etc.) where every item is a movie: clicking one
@@ -6283,6 +6283,35 @@ function openChannelDetailsPage(channelIdOrDivId) {
       year: it.year || (it.released ? it.released.slice(0, 4) : ''),
     };
   });
+
+// A channel item's id has to identify the EPISODE, not the show it belongs to.
+//
+// Every episode in a channel carries its show's imdbId/showId, so using that
+// directly gave all 40 episodes of one show the same id. The list-details grid
+// dedupes by id (appendItems, 23_client-list-management.js -- it is there to
+// stop a provider that ignores its skip parameter from rendering the same
+// page twice), so a channel collapsed to exactly one poster per distinct
+// show: a 120-episode
+// channel built from three shows showed three items, and no amount of adding
+// episodes changed that.
+//
+// showId:season:episode is the shape the rest of the app already uses for an
+// episode (handleSubtitlesTrack, fetchTmdbSeason), and every consumer that
+// needs the show back already splits on the first colon -- the poster click
+// handler in 19_client-search-and-likes.js and openItemDetailsModal in 23_
+// both do, for tt-prefixed and numeric TMDB ids alike.
+function channelItemId(it, idx) {
+  const showId = it.imdbId || it.showId || it.id || '';
+  if (showId && it.season != null && it.episode != null) {
+    return showId + ':' + it.season + ':' + it.episode;
+  }
+  // No episode numbering: a movie-saga channel's items are already distinct
+  // per show id, so it stands alone.
+  if (showId) return showId;
+  const fallbackName = it.showName || it.title || 'item';
+  const seasonEp = (it.season != null && it.episode != null) ? ('S' + it.season + 'E' + it.episode) : '';
+  return fallbackName + '-' + (seasonEp || idx);
+}
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {

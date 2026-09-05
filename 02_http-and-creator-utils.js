@@ -1474,6 +1474,99 @@ async function usernameForScrobbleToken(env, token) {
   }
 }
 
+// Drops a batch of ids from the public index in ONE write.
+//
+// Deliberately not one updatePublicListIndex call per list: that is a
+// read-modify-write on a single key, so a run of them loses each other's
+// updates and strands entries in the directory pointing at records that no
+// longer exist -- a list that advertises an item count and then 404s when
+// opened. That is not hypothetical: a bulk delete left 76 such entries in a
+// live deployment, and nothing ever cleaned them up because the index only
+// used to rebuild when it was MISSING, never when it was merely wrong (see
+// refreshPublicListIndexIfStale).
+async function removeListsFromPublicIndex(env, ids) {
+  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    if (!idx) return;
+    const gone = new Set(ids);
+    await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+  } catch (e) {
+    console.error("public list index cleanup failed", e);
+  }
+}
+
+// Deletes one or more of a creator's lists: the KV record, the D1 row, the
+// like ledger, the entry in their display order, and the directory index --
+// with a single index write and a single order write however many slugs are
+// passed.
+//
+// One function because the account purge and the per-list delete used to be
+// written out separately and drifted (see purgeCreatorData's own comment on
+// exactly that). The like ledger matters in particular: leaving
+// listlikevoters:{user}:{slug} behind means whoever next creates a list at
+// that same slug inherits a like count they never earned, and every voter in
+// the old ledger is silently unable to like it.
+async function deleteCreatorLists(env, username, slugs) {
+  const out = { deleted: [], missing: [] };
+  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
+
+  for (const slug of slugs) {
+    const key = `creatorlist:${username}:${slug}`;
+    let existed = false;
+    try {
+      existed = !!(await env.CONFIGS.get(key));
+    } catch {
+      existed = false;
+    }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+      } catch (dbErr) {
+        console.error("D1 write error (deleteCreatorLists):", dbErr);
+      }
+    }
+    // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
+    // skipping the KV delete on that basis leaves the list live in KV -- a
+    // delete that reports success and deletes nothing.
+    try {
+      await env.CONFIGS.delete(key);
+    } catch (e) {
+      console.error("deleteCreatorLists: could not delete", key, e);
+    }
+    try {
+      await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
+    } catch (e) {
+      // A stranded ledger is untidy, not harmful on its own.
+    }
+    (existed ? out.deleted : out.missing).push(slug);
+  }
+
+  // Every slug asked for comes out of the index, including ones whose record
+  // was already gone -- those phantom entries are the whole reason an admin
+  // reaches for this.
+  await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`));
+
+  try {
+    const orderRaw = await env.CONFIGS.get(`creatorlistorder:${username}`);
+    let order = [];
+    try {
+      order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+    } catch {
+      order = [];
+    }
+    const gone = new Set(slugs);
+    const next = order.filter((s) => !gone.has(s));
+    if (next.length !== order.length || orderRaw) {
+      await env.CONFIGS.put(`creatorlistorder:${username}`, JSON.stringify({ order: next }));
+    }
+  } catch (e) {
+    console.error("deleteCreatorLists: could not update list order", e);
+  }
+
+  return out;
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -1927,15 +2020,10 @@ async function rebuildPublicListIndex(env, options = {}) {
   return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
-// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
-// rebuild run after the response so the requesting user doesn't pay for it.
-async function getPublicListIndex(env, ctx) {
-  const idx = await readPublicListIndex(env);
-  if (idx) return idx.entries;
-
-  // Rebuilding is a full scan; a burst of traffic against a cold index must
-  // not start one per request. First caller takes a 60s lock and rebuilds,
-  // the rest fall through to the bounded legacy scan for this one request.
+// Runs ONE rebuild chunk under a shared short lock, so a burst of traffic
+// against a cold or stale index cannot start a rebuild per request. Returns
+// the finished entries when this chunk completed the build, else null.
+async function advancePublicListIndexBuild(env, ctx) {
   let gotLock = false;
   try {
     const lock = await env.CONFIGS.get("lock:publiclistindex");
@@ -1944,15 +2032,10 @@ async function getPublicListIndex(env, ctx) {
       gotLock = true;
     }
   } catch {
-    // If the lock read fails, fall through to the scan rather than risking
-    // a rebuild stampede.
+    // If the lock read fails, do nothing rather than risk a stampede.
   }
   if (!gotLock) return null;
 
-  // One chunk per call -- see rebuildPublicListIndex. A small deployment
-  // finishes in this one chunk and gets its index immediately; a large one
-  // makes bounded progress and is served the legacy scan meanwhile, with the
-  // cron carrying the build to completion.
   const runChunk = async () => {
     try {
       return await rebuildPublicListIndex(env);
@@ -1961,9 +2044,9 @@ async function getPublicListIndex(env, ctx) {
       return null;
     } finally {
       // Released as soon as the chunk ends rather than left to expire: a
-      // rebuild now takes many chunks, and sitting on the lock for its full
-      // 60s TTL would cap progress at one chunk a minute for no benefit. The
-      // TTL stays as the backstop for a chunk that dies outright.
+      // rebuild takes many chunks, and sitting on the lock for its full 60s
+      // TTL would cap progress at one chunk a minute for no benefit. The TTL
+      // stays as the backstop for a chunk that dies outright.
       try {
         await env.CONFIGS.delete("lock:publiclistindex");
       } catch {
@@ -1973,12 +2056,64 @@ async function getPublicListIndex(env, ctx) {
   };
 
   if (ctx && typeof ctx.waitUntil === "function") {
-    // Rebuild in the background; serve this request from the legacy scan.
     ctx.waitUntil(runChunk());
     return null;
   }
   const res = await runChunk();
   return res && res.done ? res.entries : null;
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+  // A small deployment finishes in this one chunk and gets its index
+  // immediately; a large one makes bounded progress and is served the legacy
+  // scan meanwhile, with the cron carrying the build to completion.
+  return await advancePublicListIndexBuild(env, ctx);
+}
+
+// The index is a DERIVED cache maintained incrementally by
+// updatePublicListIndex, which is a read-modify-write on one key -- so
+// concurrent or rapid-fire updates lose each other. Its own comment accepts
+// that on the grounds that a lost entry costs one list's visibility "until
+// the next rebuild". The gap was that nothing ever caused one: a rebuild
+// only ever ran when the index was MISSING, never when it was merely wrong,
+// so a lost update was permanent.
+//
+// It was: a bulk delete left 76 entries in a live directory advertising item
+// counts for records that no longer existed, and they stayed there. This is
+// what closes that -- the cron re-derives the whole index from the
+// authoritative creatorlist:/publishedlist: keys once a day, so anything
+// stranded is gone within one cycle without anyone having to notice.
+//
+// The live index keeps serving untouched while a refresh runs: the chunked
+// rebuild only writes when its final chunk lands, so readers never see a
+// half-scanned directory.
+const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+async function refreshPublicListIndexIfStale(env, ctx) {
+  if (!env || !env.CONFIGS) return;
+  const idx = await readPublicListIndex(env);
+  if (!idx) {
+    // Cold start -- same path as a live request would take.
+    await advancePublicListIndexBuild(env, ctx);
+    return;
+  }
+  // A build already part-way through has to keep being advanced, or it stalls
+  // forever at whatever chunk it reached: the read path above returns early
+  // while an index exists, so the cron is the only thing driving it.
+  let building = false;
+  try {
+    building = !!(await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY));
+  } catch {
+    building = false;
+  }
+  const age = idx.updatedAt ? (Date.now() - idx.updatedAt) : Infinity;
+  if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
+    await advancePublicListIndexBuild(env, ctx);
+  }
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -2077,17 +2212,7 @@ async function purgeCreatorData(env, username, options = {}) {
   // One index write for the whole account rather than one per list --
   // deleting an account with 200 lists should not be 200 read-modify-writes
   // against the same key (KV allows 1 write/sec/key).
-  if (purgedListIds.length) {
-    try {
-      const idx = await readPublicListIndex(env);
-      if (idx) {
-        const gone = new Set(purgedListIds);
-        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
-      }
-    } catch (e) {
-      console.error("purgeCreatorData: index cleanup failed", e);
-    }
-  }
+  await removeListsFromPublicIndex(env, purgedListIds);
 
   // The scrobble token is keyed by the token, not the username, so it has to
   // be resolved through the reverse index before that index is deleted --

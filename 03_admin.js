@@ -1956,9 +1956,21 @@ async function renderAdminDashboard(env) {
 
     <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
-      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It rebuilds itself automatically (on every publish/like, and once per cron run if it's ever found missing), so this is only for forcing an immediate, verifiable rebuild right now -- e.g. right after first setting this Worker up.</p>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
       <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Delete a creator&rsquo;s lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Removes specific lists belonging to one Creator Profile: the list itself, its likes, its place in that creator&rsquo;s order, and its directory entry. Use it for content a creator cannot or will not remove themselves. A slug whose list is already gone is still cleared from the directory, which is how you get rid of an entry that shows an item count but opens empty.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list. Prefer &ldquo;Rebuild Public List Index&rdquo; above first &mdash; if the lists are only phantom directory entries, that fixes them without deleting anything.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListUserInput" class="admin-select" placeholder="Creator username" style="margin-right:6px;">
+        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:260px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
+      <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
   </div>
 
@@ -2328,6 +2340,62 @@ async function renderAdminDashboard(env) {
           if (errCount) console.error('migrate-d1 errors:', r.errors);
           break;
         }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Irreversible, so it asks first and names exactly what it is about to
+    // remove. The endpoint caps each call (ADMIN_LIST_DELETE_MAX), so a bigger
+    // cleanup is sent as several batches here rather than rejected.
+    async function runDeleteCreatorLists() {
+      const btn = document.getElementById('deleteListBtn');
+      const status = document.getElementById('deleteListStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      const rawSlugs = (document.getElementById('deleteListSlugsInput').value || '').trim();
+      if (!username || !rawSlugs) {
+        status.textContent = 'Enter a username and at least one slug.';
+        return;
+      }
+      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
+        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\n\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      let remaining = null;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-creator-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+          remaining = data.remaining;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
+          ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
+          (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

@@ -2843,6 +2843,95 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
 }
 window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
 
+// Uploads local lists the account does not have yet, and -- the part that
+// matters -- writes the slug the server actually used back into the local
+// store.
+//
+// The previous version was a forEach firing an unawaited fetch per list with
+// .catch(() => {}) and no .then, from a block that runs on EVERY dashboard
+// render. Three things went wrong at once:
+//
+//   1. The reply was thrown away, so the local copy never learned which slug
+//      the account now holds. The test that decides whether to upload could
+//      therefore never start passing on its own.
+//   2. Every list went out simultaneously, and each save rewrites the single
+//      creatorlistorder: key read-modify-write. KV has no compare-and-swap,
+//      so 22 concurrent saves left 1 order entry standing and lost 21.
+//   3. Losing an order entry made that list invisible to /api/creator/lists,
+//      which is where serverSlugs comes from -- so the next render uploaded
+//      it again. The account gained one visible list per render and a fresh
+//      duplicate record for every other one, forever.
+//
+// One account ended up with 129 list records for 22 real lists: 44 copies of
+// the same 462-item list (coming-of-age-3 .. coming-of-age-53), 29 of another.
+//
+// So: one list at a time, awaited, the returned slug recorded, and one run at
+// a time across the whole page. The server side is fixed too (it now honours
+// the slug asked for instead of silently minting a new one, and no longer
+// treats the order key as the last word on what exists) -- either half alone
+// stops the runaway; both together also make it self-correcting.
+let _uploadingMissingLists = false;
+// Bounded so that a server which somehow never reports a list back can cost a
+// handful of rounds rather than spinning for as long as the tab is open. The
+// fixes above mean one round is enough; this is the backstop, not the plan.
+let _missingListUploadRounds = 0;
+const MISSING_LIST_UPLOAD_MAX_ROUNDS = 5;
+async function uploadMissingLocalListsToAccount(lists, creatorKey) {
+  if (_uploadingMissingLists || !activeCreator || !creatorKey || !lists || !lists.length) return 0;
+  if (_missingListUploadRounds >= MISSING_LIST_UPLOAD_MAX_ROUNDS) return 0;
+  _uploadingMissingLists = true;
+  _missingListUploadRounds++;
+  const assigned = [];
+  try {
+    for (const l of lists) {
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slug: l.creatorSlug || l.slug,
+            name: l.name || l.slug,
+            type: l.type || 'movie',
+            items: l.items || [],
+            visibility: l.visibility || 'private',
+          }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.slug) continue;
+        l.creatorSlug = data.slug;
+        assigned.push({ localSlug: l.slug, creatorSlug: data.slug });
+      } catch (e) {
+        // One list failing (a dropped connection, say) must not abandon the
+        // rest, and must not retry here -- a persistent failure retried in
+        // place is the same runaway by another route. The next render tries
+        // again, and the save is idempotent now, so that costs nothing.
+      }
+    }
+  } finally {
+    _uploadingMissingLists = false;
+  }
+  // One write at the end rather than one per list: these maps run to
+  // megabytes and each save is a full JSON.stringify on the main thread. An
+  // interrupted run simply re-uploads next time, which is harmless now that
+  // asking for the same slug twice yields the same list.
+  if (assigned.length) {
+    try {
+      const map = loadLocalCustomLists();
+      let touched = false;
+      assigned.forEach((a) => {
+        const entry = map[a.localSlug];
+        if (entry && entry.creatorSlug !== a.creatorSlug) { entry.creatorSlug = a.creatorSlug; touched = true; }
+      });
+      if (touched) saveLocalCustomListsMap(map);
+    } catch (e) {}
+    renderCreatorDashboard({ silent: true });
+  }
+  return assigned.length;
+}
+window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -3036,30 +3125,27 @@ async function renderCreatorDashboard(options) {
     // Merge any local/restored custom lists that are not yet on the server
     const serverSlugs = new Set((data.lists || []).map(l => l.slug));
     const localRestoredCustomLists = [];
+    const needUploading = [];
     Object.keys(localMapForCreator || {}).forEach((k) => {
       if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
       const l = localMapForCreator[k];
       if (!l) return;
       if (!l.slug) l.slug = k;
-      if (!serverSlugs.has(l.slug)) {
+      // Test against the slug the SERVER gave this list last time, when we
+      // know it, not the local key. The two are usually the same and the
+      // fallback keeps that case working -- but when they differ, comparing
+      // the local key is what made this block think an uploaded list was
+      // still missing and upload it all over again.
+      if (!serverSlugs.has(l.creatorSlug || l.slug)) {
         localRestoredCustomLists.push(l);
-        if (activeCreator && creatorKey) {
-          fetch(ORIGIN + '/api/creator/lists/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              creatorName: activeCreator.creatorName,
-              creatorKey: creatorKey,
-              slug: l.slug,
-              name: l.name || l.slug,
-              type: l.type || 'movie',
-              items: l.items || [],
-              visibility: l.visibility || 'private',
-            })
-          }).catch(() => {});
-        }
+        if (activeCreator && creatorKey) needUploading.push(l);
       }
     });
+    // A render that finds everything already on the account is the signal
+    // that the two sides agree again -- give the round budget back, so a
+    // later genuine upload is not blocked by an earlier bad patch.
+    if (!needUploading.length) _missingListUploadRounds = 0;
+    else uploadMissingLocalListsToAccount(needUploading, creatorKey);
 
     const allDashboardLists = [
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
@@ -4492,7 +4578,13 @@ function removeWatchHistoryItemDirect(id, btn) {
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
     window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
     if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
-      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      // Update the open See All page in place. Rebuilding it -- which is what
+      // renderWatchHistoryGrid does, starting from innerHTML = '' -- blanked
+      // the grid, re-requested every poster and scrolled back to the top on
+      // every single removal. The full render stays as the fallback for the
+      // one case that really does need re-laying out (grouped by show).
+      const handled = (typeof updateWatchHistoryGridAfterRemoval === 'function') && updateWatchHistoryGridAfterRemoval();
+      if (!handled && typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
     }
   }
 }

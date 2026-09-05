@@ -924,6 +924,379 @@ describe("audit fix: the cron connects the API key globals too", () => {
   });
 });
 
+// A 24/7 channel is a flat list of EPISODES, but every episode carries the
+// imdbId/showId of the show it came from. Both places that built a channel's
+// "See All" items used that show id as the item id, and the list-details grid
+// dedupes by id (appendItems -- there to stop a provider that ignores its skip
+// parameter from rendering the same page twice). So a channel collapsed to one
+// poster per distinct show, and adding episodes changed nothing.
+describe("bug: My Channels See All showed one item per show, not per episode", () => {
+  const channelItemId = loadOneClientFunction("20_client-channel-builder.js", "channelItemId");
+
+  // Exactly how appendItems (23_client-list-management.js) dedupes.
+  function afterGridDedupe(items) {
+    const seen = new Set();
+    const kept = [];
+    items.forEach((it) => {
+      const key = it && (it.id != null ? String(it.id) : null);
+      if (key === null || !seen.has(key)) {
+        if (key !== null) seen.add(key);
+        kept.push(it);
+      }
+    });
+    return kept;
+  }
+
+  function buildChannel(shows, seasons, episodes) {
+    const items = [];
+    shows.forEach((show) => {
+      for (let s = 1; s <= seasons; s++) {
+        for (let e = 1; e <= episodes; e++) {
+          items.push({ imdbId: show.imdbId, showName: show.name, season: s, episode: e, kind: "series" });
+        }
+      }
+    });
+    return items;
+  }
+
+  it("keeps every episode of a multi-show channel", () => {
+    const shows = [
+      { name: "The Office", imdbId: "tt0386676" },
+      { name: "Parks and Rec", imdbId: "tt1266020" },
+      { name: "Brooklyn Nine-Nine", imdbId: "tt2467372" },
+    ];
+    const channelItems = buildChannel(shows, 4, 10); // 120 episodes, 3 shows
+    const sample = channelItems.map((it, idx) => ({ id: channelItemId(it, idx) }));
+
+    assert.equal(sample.length, 120);
+    assert.equal(new Set(sample.map((x) => x.id)).size, 120, "episode ids are not unique");
+    // The actual regression: this used to be 3.
+    assert.equal(afterGridDedupe(sample).length, 120, "the grid still collapses episodes to one per show");
+  });
+
+  it("uses the show:season:episode shape every other consumer already expects", () => {
+    const id = channelItemId({ imdbId: "tt0386676", showName: "The Office", season: 2, episode: 7 }, 0);
+    assert.equal(id, "tt0386676:2:7");
+    // The poster click handler (19_client-search-and-likes.js) and
+    // openItemDetailsModal (23_) both recover the show by splitting on the
+    // first colon -- for tt-prefixed and numeric TMDB ids alike.
+    assert.equal(id.split(":")[0], "tt0386676");
+    const numeric = channelItemId({ showId: "1418", showName: "Big Bang", season: 3, episode: 1 }, 0);
+    assert.equal(numeric, "1418:3:1");
+    assert.equal(numeric.split(":")[0], "1418");
+  });
+
+  it("leaves items that carry no episode numbering alone", () => {
+    // A movie-saga channel (MCU, Star Wars): each item is a distinct film and
+    // its own id is already unique, so it must not gain a suffix.
+    const films = [
+      { imdbId: "tt0371746", showName: "Iron Man" },
+      { imdbId: "tt0800080", showName: "The Incredible Hulk" },
+      { imdbId: "tt1228705", showName: "Iron Man 2" },
+    ];
+    const sample = films.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.deepEqual(sample.map((x) => x.id), ["tt0371746", "tt0800080", "tt1228705"]);
+    assert.equal(afterGridDedupe(sample).length, 3);
+  });
+
+  it("still yields distinct ids when an item has no id at all", () => {
+    const nameless = [{ showName: "Mystery" }, { showName: "Mystery" }];
+    const sample = nameless.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.equal(new Set(sample.map((x) => x.id)).size, 2, "id-less items collapsed together");
+  });
+});
+
+// Discover's popular-lists feed types each entry, and that type is what the
+// poster preview and See All are fetched with. /api/trakt-popular-lists used
+// to answer "movie" for every single list, and to build the list URL from
+// Trakt's DISPLAY username rather than the API-addressable slug.
+describe("bug: Trakt popular lists were all typed movie, with display-name URLs", () => {
+  // Trakt's /lists/popular payload, shaped the way their API really returns it.
+  const traktPopularPayload = [
+    { list: { name: "IMDB: Top Rated TV Shows", ids: { slug: "imdb-top-rated-tv-shows" }, item_count: 245, likes: 4350,
+              user: { username: "justin", ids: { slug: "justin" } } } },
+    { list: { name: "Shut Up, And Watch", ids: { slug: "shut-up-and-watch" }, item_count: 132, likes: 1538,
+              user: { username: "CanConfirm", ids: { slug: "canconfirm" } } } },
+    { list: { name: "A24", ids: { slug: "a24" }, item_count: 216, likes: 1420,
+              user: { username: "Fidel.cb", ids: { slug: "fidel-cb" } } } },
+    { list: { name: "Great Popular Shows", ids: { slug: "great-popular-shows" }, item_count: 534, likes: 1221,
+              user: { username: "Spell3ound", ids: { slug: "spell3ound" } } } },
+    { list: { name: "Best Movies of 2024", ids: { slug: "best-movies-2024" }, item_count: 50, likes: 900,
+              user: { username: "someone", ids: { slug: "someone" } } } },
+  ];
+
+  async function popularLists() {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      if (String(typeof u === "string" ? u : u.url).includes("/lists/popular")) {
+        return new Response(JSON.stringify(traktPopularPayload), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      // makeEnv only carries CONFIGS/ADMIN_KEY/DB through, so the provider key
+      // has to be set on the env object itself or the route short-circuits to
+      // { ok: false } before it ever calls Trakt.
+      const env = { ...makeEnv(), TRAKT_CLIENT_ID: "test-trakt-key" };
+      const r = await call(env, "/api/trakt-popular-lists");
+      assert.equal(r.body.ok, true, "route returned no lists -- is the Trakt key set on env?");
+      return r.body.lists;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("does not report every popular list as movies", async () => {
+    const lists = await popularLists();
+    const byName = Object.fromEntries(lists.map((l) => [l.name, l]));
+    // A shows-only list previewed as movies returns zero items, which is why
+    // these rendered with no posters and a "No items found" See All.
+    assert.equal(byName["IMDB: Top Rated TV Shows"].type, "series");
+    assert.equal(byName["Great Popular Shows"].type, "series");
+    assert.equal(byName["Best Movies of 2024"].type, "movie");
+    // Ambiguous names must not be guessed at: "mixed" makes the client fetch
+    // movies AND series and merge them, the same thing it already does for an
+    // ambiguous search result.
+    assert.equal(byName["Shut Up, And Watch"].type, "mixed");
+    assert.equal(byName["A24"].type, "mixed");
+    assert.ok(!lists.every((l) => l.type === "movie"), "every list is still typed movie");
+  });
+
+  it("addresses users by their API slug, not their display name", async () => {
+    const lists = await popularLists();
+    const a24 = lists.find((l) => l.name === "A24");
+    // "Fidel.cb" is the display name; Trakt's API needs "fidel-cb". Building
+    // the URL from the display name made this list fail to load entirely.
+    assert.equal(a24.url, "https://trakt.tv/users/fidel-cb/lists/a24");
+    assert.equal(a24.user, "Fidel.cb", "the display name should still be shown to the reader");
+
+    for (const l of lists) {
+      const userPart = l.url.split("/users/")[1].split("/")[0];
+      assert.ok(!userPart.includes("."), `list URL still carries a display name: ${l.url}`);
+    }
+  });
+
+  it("carries contentType so the search path agrees with the feed", async () => {
+    // renderListSearchResults reads contentType first; without it a popular
+    // list fell back to the same hardcoded type the feed had.
+    const lists = await popularLists();
+    assert.equal(lists.find((l) => l.name === "Great Popular Shows").contentType, "series");
+    assert.equal(lists.find((l) => l.name === "Best Movies of 2024").contentType, "movie");
+    assert.equal(lists.find((l) => l.name === "A24").contentType, "unknown");
+  });
+});
+
+// The public index is a derived cache maintained by a read-modify-write on a
+// single key, so a burst of updates loses some of them. Nothing used to repair
+// that: a rebuild only ever ran when the index was MISSING, never when it was
+// merely wrong. A live bulk delete left 76 entries advertising item counts for
+// records that no longer existed, and they stayed there indefinitely.
+describe("bug: a stale public index never repaired itself", () => {
+  function seedWithPhantoms(phantomCount) {
+    const kv = makeKv();
+    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
+    const entries = [];
+    const order = [];
+    for (const [slug, n] of [["hgtv", 79], ["travel", 47]]) {
+      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
+        name: slug, slug, type: "series", visibility: "public",
+        items: Array.from({ length: n }, (_, i) => ({ id: "tt" + i })), likes: 0, updatedAt: 1,
+      }));
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "series", itemCount: n, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    // Entries whose record is gone: the directory shows a count, opening 404s.
+    for (let i = 0; i < phantomCount; i++) {
+      const slug = `ghost-${i}`;
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
+    return { kv, entries };
+  }
+
+  async function runCron(env, kv, maxTicks = 40) {
+    for (let t = 1; t <= maxTicks; t++) {
+      kv._store.delete("lock:publiclistindex");
+      const pending = [];
+      await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+      await Promise.all(pending);
+      if (!kv._store.has("index:publiclists:build")) return t;
+    }
+    return -1;
+  }
+
+  it("re-derives a stale index and drops entries whose record is gone", async () => {
+    const { kv, entries } = seedWithPhantoms(76);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
+    const env = makeEnv({ CONFIGS: kv });
+
+    const before = await call(env, "/lists/public.json?limit=500");
+    assert.equal(before.body.total, 78, "expected the phantom entries to start out visible");
+
+    assert.notEqual(await runCron(env, kv), -1, "the refresh never completed");
+
+    const after = await call(env, "/lists/public.json?limit=500");
+    assert.equal(after.body.total, 2, "phantom entries survived the refresh");
+    assert.deepEqual((after.body.lists || []).map((l) => l.slug).sort(), ["hgtv", "travel"]);
+    // The real lists must come through intact, not merely survive.
+    assert.equal(after.body.lists.find((l) => l.slug === "hgtv").itemCount, 79);
+  });
+
+  it("leaves a fresh index alone", async () => {
+    // Re-deriving on every tick would be a full scan of every list, forever.
+    const { kv, entries } = seedWithPhantoms(3);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+    const env = makeEnv({ CONFIGS: kv });
+    const snapshot = kv._store.get("index:publiclists");
+
+    const pending = [];
+    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+    await Promise.all(pending);
+
+    assert.equal(kv._store.get("index:publiclists"), snapshot, "a fresh index was rebuilt needlessly");
+  });
+
+  it("keeps serving the old index while a multi-chunk refresh is in flight", async () => {
+    // A partial scan must never be published as though it were the whole
+    // directory, or the listing would shrink and grow while it runs.
+    const { kv, entries } = seedWithPhantoms(400);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
+    const env = makeEnv({ CONFIGS: kv });
+
+    kv._store.delete("lock:publiclistindex");
+    const pending = [];
+    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+    await Promise.all(pending);
+
+    if (kv._store.has("index:publiclists:build")) {
+      const mid = await call(env, "/lists/public.json?limit=500");
+      assert.equal(mid.body.total, 402, "the directory changed mid-refresh");
+    }
+    assert.notEqual(await runCron(env, kv), -1);
+    const after = await call(env, "/lists/public.json?limit=500");
+    assert.equal(after.body.total, 2);
+  });
+});
+
+describe("admin: deleting a creator's lists", () => {
+  async function setup(phantoms = 2) {
+    const kv = makeKv();
+    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
+    const entries = [];
+    const order = [];
+    for (const slug of ["keepme", "deleteme"]) {
+      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
+        name: slug, slug, type: "series", visibility: "public",
+        items: [{ id: "tt1" }], likes: 2, updatedAt: 1,
+      }));
+      kv._store.set(`listlikevoters:someone:${slug}`, JSON.stringify(["a:one", "a:two"]));
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "series", itemCount: 1, likes: 2, updatedAt: 1 });
+      order.push(slug);
+    }
+    for (let i = 0; i < phantoms; i++) {
+      const slug = `ghost-${i}`;
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+    const env = makeEnv({ CONFIGS: kv });
+    return { kv, env, cookie: await adminCookie(env) };
+  }
+
+  it("requires admin auth", async () => {
+    const { env } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.status, 401);
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "the list was deleted anyway");
+  });
+
+  it("removes the list, its likes, its order entry and its directory entry", async () => {
+    const { kv, env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, ["deleteme"]);
+
+    assert.equal(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "record left behind");
+    // A stranded ledger means whoever next takes that slug inherits its likes.
+    assert.equal(await env.CONFIGS.get("listlikevoters:someone:deleteme"), null, "like ledger left behind");
+    assert.equal(JSON.parse(kv._store.get("creatorlistorder:someone")).order.includes("deleteme"), false);
+
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => l.slug === "deleteme"), false, "still in the directory");
+    // ...and the untouched list is untouched.
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:keepme"), null);
+    assert.notEqual(await env.CONFIGS.get("listlikevoters:someone:keepme"), null);
+  });
+
+  it("clears a phantom entry whose record is already gone", async () => {
+    // The whole reason an admin reaches for this: an entry that advertises an
+    // item count and then opens empty. It is reported as missing, not failed.
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["ghost-0", "ghost-1"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, []);
+    assert.deepEqual(r.body.missing.sort(), ["ghost-0", "ghost-1"]);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => String(l.slug).startsWith("ghost-")), false);
+  });
+
+  it("bounds how many lists one call may delete", async () => {
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie,
+      json: { username: "someone", slugs: Array.from({ length: 60 }, (_, i) => "x" + i) },
+    });
+    assert.equal(r.status, 413);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("rejects a bad username or an empty slug list", async () => {
+    const { env, cookie } = await setup();
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "", slugs: ["x"] } })).status, 400);
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: [] } })).status, 400);
+  });
+
+  it("the creator's own delete route cleans up the same way", async () => {
+    // Both go through deleteCreatorLists so an admin deletion and an owner
+    // deletion cannot clean up differently -- the like ledger in particular
+    // used to survive the owner's own delete.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedel2");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+              name: "Temp", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const slug = saved.body.slug;
+    await env.CONFIGS.put(`listlikevoters:${alice.creatorName}:${slug}`, JSON.stringify(["a:one"]));
+
+    const del = await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug },
+    });
+    assert.equal(del.body.ok, true);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:${slug}`), null);
+    assert.equal(await env.CONFIGS.get(`listlikevoters:${alice.creatorName}:${slug}`), null,
+      "the owner's own delete still leaves the like ledger behind");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();
@@ -3248,5 +3621,355 @@ describe("audit fix 7: error messages are useful but cannot carry a secret", () 
       assert.doesNotMatch(src, /String\((?:err|e)\.message \|\| (?:err|e)\)/,
         `${f} still returns a raw exception message; use safeErrorMessage()`);
     }
+  });
+});
+
+// The duplicate-list bug: an account reached 129 list records for 22 real
+// lists -- 44 copies of the same 462-item list, coming-of-age-3 through
+// coming-of-age-53, every copy with an identical item count. Three defects
+// compounded; each of these covers one, plus one covering the whole loop.
+describe("duplicate lists: a save asked for a slug gets that slug", () => {
+  it("honours an explicit slug instead of silently minting a different one", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "slugowner");
+    // Occupy the slug this list's NAME would produce, so the old code had a
+    // collision to route around.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "other" }], visibility: "public",
+    }});
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "my-own-slug", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.slug, "my-own-slug",
+      "a save that names a slug must store it under that slug, not report ok:true for a different one");
+  });
+
+  it("is idempotent: asking for the same slug six times yields one list, not six", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "idem");
+    // The precondition the runaway needs: the slug this list's NAME produces
+    // belongs to a different list, so the old code had to route around it and
+    // routed somewhere new every single time.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "someone-elses" }], visibility: "public",
+    }});
+    const save = () => call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "coming-of-age-mine", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    for (let i = 0; i < 6; i++) {
+      const r = await save();
+      assert.equal(r.body.slug, "coming-of-age-mine", `save ${i + 1} drifted to ${r.body.slug}`);
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:idem:" })).keys;
+    assert.equal(keys.length, 2,
+      `six identical saves of one list left ${keys.length} records: ${keys.map((k) => k.name).join(", ")}`);
+  });
+
+  it("sanitises the slug it is handed -- it now reaches a KV key and a URL", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "sanitise");
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "../../creator:someone-else", name: "Nice List", type: "movie",
+      items: [], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.match(r.body.slug, /^[a-z0-9-]+$/, `unsanitised slug stored: ${r.body.slug}`);
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:" })).keys.map((k) => k.name);
+    assert.ok(keys.every((k) => k.startsWith("creatorlist:sanitise:")),
+      `a slug escaped its own namespace: ${keys.join(", ")}`);
+  });
+});
+
+describe("duplicate lists: creatorlistorder: is not the last word on what exists", () => {
+  it("a list whose order entry was lost still appears on the dashboard", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "lostorder");
+    for (const name of ["Coming of Age", "Food Network", "HGTV"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [{ id: "tt1" }], visibility: "public",
+      }});
+    }
+    // What a clobbered read-modify-write leaves behind: the records are all
+    // there, the order key remembers one of them.
+    await env.CONFIGS.put("creatorlistorder:lostorder", JSON.stringify({ order: ["coming-of-age"] }));
+
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const slugs = (r.body.lists || []).map((l) => l.slug).sort();
+    assert.deepEqual(slugs, ["coming-of-age", "food-network", "hgtv"],
+      "records with no order entry were dropped from the dashboard, which is what made the client re-upload them");
+    const items = (r.body.lists || []).find((l) => l.slug === "hgtv");
+    assert.equal(items.items.length, 1, "a recovered list must come back with its items, not as an empty shell");
+  });
+
+  it("repairs the order key so the drift does not persist", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "repairorder");
+    for (const name of ["One", "Two"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [], visibility: "public",
+      }});
+    }
+    await env.CONFIGS.put("creatorlistorder:repairorder", JSON.stringify({ order: [] }));
+    await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const order = JSON.parse(await env.CONFIGS.get("creatorlistorder:repairorder")).order.sort();
+    assert.deepEqual(order, ["one", "two"], "order was left broken after the read path had already found the records");
+  });
+
+  it("allocating a new slug checks KV, not just order, so it cannot land on a live record", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "noclobber");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "original" }], visibility: "public",
+    }});
+    // Order forgets it; the record is still live.
+    await env.CONFIGS.put("creatorlistorder:noclobber", JSON.stringify({ order: [] }));
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "different" }], visibility: "public",
+    }});
+    assert.notEqual(r.body.slug, "coming-of-age",
+      "a new list was allocated a slug whose record already existed, writing over it");
+    const original = JSON.parse(await env.CONFIGS.get("creatorlist:noclobber:coming-of-age"));
+    assert.equal(original.items[0].id, "original", "the existing list was overwritten");
+  });
+});
+
+describe("duplicate lists: the dashboard upload loop terminates", () => {
+  // Drives the shape of renderCreatorDashboard's "merge any local list not
+  // yet on the server" block against the real routes: read the account, save
+  // whatever the local store has that the account does not, repeat. Before
+  // the fix this gained one visible list per round and a duplicate record for
+  // every other one; it must now settle after a single round.
+  it("22 local lists converge to 22 records and stay there", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "converge");
+    // Give KV a real await boundary between read and write. The mock is
+    // otherwise fast enough to serialise every handler, which hides the whole
+    // problem: nothing about the read-modify-write on creatorlistorder: is
+    // atomic, and on a real edge these saves overlap.
+    const rawGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const rawPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const tick = () => new Promise((r) => setTimeout(r, 1));
+    env.CONFIGS.get = async (...a) => { await tick(); return rawGet(...a); };
+    env.CONFIGS.put = async (...a) => { await tick(); return rawPut(...a); };
+    const names = ["Coming of Age", "Food Network", "HGTV", "Oxygen", "Acorn TV", "Britbox",
+      "Travel", "Christmas", "Miniseries", "Discovery ID", "Animal Planet", "Nordic Noir",
+      "Chick Flicks", "TV", "Currently Watching", "Movies Watchlist", "National Geographic",
+      "Music Docs", "Mystery Documentary", "Documentary Reality TV", "TV Shows Horror",
+      "Hallmark Movies"];
+    const local = names.map((n) => ({ slug: n.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: n }));
+
+    for (let round = 0; round < 4; round++) {
+      const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+      }});
+      const have = new Set((listsRes.body.lists || []).map((l) => l.slug));
+      const missing = local.filter((l) => !have.has(l.creatorSlug || l.slug));
+      if (round > 0) {
+        assert.equal(missing.length, 0,
+          `round ${round + 1} still thought ${missing.length} lists were missing -- the loop does not terminate`);
+      }
+      // Deliberately the OLD client shape: all at once, replies discarded.
+      // The server side has to survive this on its own, because a browser
+      // running a cached copy of the page will keep doing exactly this.
+      await Promise.all(missing.map((l) => call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        slug: l.creatorSlug || l.slug, name: l.name, type: "movie",
+        items: [{ id: "tt1" }], visibility: "public",
+      }})));
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:converge:" })).keys;
+    assert.equal(keys.length, 22, `4 dashboard rounds left ${keys.length} records for 22 lists`);
+    assert.equal(keys.filter((k) => /-\d+$/.test(k.name)).length, 0,
+      "numbered duplicate slugs were minted: " + keys.map((k) => k.name).join(", "));
+  });
+});
+
+// Removing one item from Watch History's See All page used to call
+// renderWatchHistoryGrid(), which starts with gridEl.innerHTML = '' and
+// rebuilds every tile -- so deleting one thing blanked the grid, re-requested
+// every poster and scrolled back to the top. It now updates in place.
+describe("watch history See All: removing an item does not rebuild the grid", () => {
+  function makeCard(removeId) {
+    const card = { style: {}, parentNode: null };
+    const btn = {
+      dataset: { removeType: "history", removeId: String(removeId) },
+      closest: (sel) => (sel.includes("live-preview-poster-card") ? card : null),
+    };
+    card.btn = btn;
+    return card;
+  }
+  function makeDom(cards, opts = {}) {
+    const grid = {
+      innerHTML: "<!-- rendered once -->",
+      cards: cards.slice(),
+      querySelectorAll() { return this.cards.map((c) => c.btn); },
+    };
+    grid.cards.forEach((c) => {
+      c.parentNode = { removeChild: (x) => { grid.cards = grid.cards.filter((k) => k !== x); x.parentNode = null; } };
+    });
+    const sub = { textContent: "" };
+    const status = { innerHTML: "" };
+    const tab = { hasAttribute: (a) => (a === "hidden" ? !!opts.hidden : false) };
+    return {
+      grid, sub, status,
+      document: { getElementById: (id) => ({
+        detailGrid: grid, detailSubtitle: sub, detailStatus: status, "content-list-details": tab,
+      }[id] || null) },
+    };
+  }
+  function load(dom, win, grouped) {
+    return loadOneClientFunction("23_client-list-management.js", "updateWatchHistoryGridAfterRemoval", {
+      document: dom.document,
+      window: win,
+      localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (grouped ? "true" : "false") : null) },
+      watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+        watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      }),
+    });
+  }
+
+  it("leaves the surviving tiles and the grid markup untouched", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2"), makeCard("tt3")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    // The person removed tt2; the raw list has already dropped it and its own
+    // handler is fading its tile out.
+    cards[1].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }, { id: "tt3" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true, "should report that it handled the update itself");
+    assert.equal(dom.grid.innerHTML, before, "the grid was rebuilt -- that is the reload the person sees");
+    assert.equal(dom.grid.cards.length, 3, "the fading tile must be left to its own animation, not yanked");
+    assert.equal(dom.sub.textContent, "2 items");
+  });
+
+  it("drops any other tile the removal took with it, without a rebuild", () => {
+    const cards = [makeCard("tt1"), makeCard("s1:1:1"), makeCard("s1:1:2")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    cards[1].style.opacity = "0";
+    // Removing a show clears every episode of it from the raw list.
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.innerHTML, before, "the grid must not be rebuilt to drop a stale tile");
+    assert.deepEqual(dom.grid.cards.map((c) => c.btn.dataset.removeId), ["tt1", "s1:1:1"],
+      "the stale episode tile should be gone; the fading one left alone");
+    assert.equal(dom.sub.textContent, "1 item");
+  });
+
+  it("counts against the active filter pill, not the whole history", () => {
+    const dom = makeDom([makeCard("tt1"), makeCard("s1:1:1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1", type: "movie" }, { id: "s1:1:1", showId: "s1" }],
+      _watchHistoryFilter: "movie",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "1 item");
+    assert.equal(dom.status.innerHTML, "");
+  });
+
+  it("says so, rather than guessing, when the last item goes", () => {
+    const cards = [makeCard("tt1")];
+    const dom = makeDom(cards);
+    cards[0].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "0 items");
+    assert.match(dom.status.innerHTML, /No matching items/);
+  });
+
+  it("hands grouped-by-show mode back to the full render, which really does need it", () => {
+    const dom = makeDom([makeCard("s1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "s1:1:1", showId: "s1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win, true)(), false,
+      "a show tile's episode count changes and the tile can disappear -- that needs re-laying out");
+  });
+
+  it("does nothing to a See All page showing some other list", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2")];
+    const dom = makeDom(cards);
+    const win = {
+      _currentListDetailsParams: { listUrl: "trakt:history", name: "Trakt History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.cards.length, 2, "another list's tiles must not be touched");
+    assert.equal(dom.sub.textContent, "", "nor its subtitle rewritten");
+  });
+});
+
+describe("watch history See All: the remove handler stops rebuilding the grid", () => {
+  // The one that reproduces the reported behaviour rather than covering the
+  // new helper: removeWatchHistoryItemDirect used to call renderWatchHistoryGrid
+  // unconditionally whenever the See All page was open.
+  function run({ grouped = false } = {}) {
+    const calls = { fullRender: 0, inPlace: 0 };
+    const map = { "watch-history": { items: [{ id: "tt1" }, { id: "tt2" }] } };
+    const win = {};
+    const detailTab = { hidden: false };
+    const remove = loadOneClientFunction("22_client-creator-profile.js", "removeWatchHistoryItemDirect", {
+      window: win,
+      document: { getElementById: (id) => (id === "content-list-details" ? detailTab : null) },
+      loadLocalCustomLists: () => map,
+      saveLocalCustomListsMap: () => true,
+      scheduleCreatorSyncSave: () => {},
+      renderCreatorDashboard: () => {},
+      showAddedToast: () => {},
+      syncAiringNextWatchState: () => {},
+      renderWatchHistoryGrid: () => { calls.fullRender++; },
+      updateWatchHistoryGridAfterRemoval: () => { calls.inPlace++; return !grouped; },
+    });
+    win._rawWatchHistoryItems = [{ id: "tt1" }, { id: "tt2" }];
+    remove("tt2", null);
+    return { calls, win, map };
+  }
+
+  it("updates in place instead of re-rendering every tile", () => {
+    const { calls, win, map } = run();
+    assert.equal(calls.inPlace, 1, "the in-place update should be attempted");
+    assert.equal(calls.fullRender, 0,
+      "the grid was rebuilt from scratch -- that is the whole list reloading on a single removal");
+    assert.deepEqual(win._rawWatchHistoryItems.map((i) => i.id), ["tt1"], "the item must still actually be removed");
+    assert.deepEqual(map["watch-history"].items.map((i) => i.id), ["tt1"]);
+  });
+
+  it("still falls back to the full render when the in-place update cannot cope", () => {
+    const { calls } = run({ grouped: true });
+    assert.equal(calls.inPlace, 1);
+    assert.equal(calls.fullRender, 1, "grouped-by-show needs the layout recomputing and must not be left stale");
   });
 });

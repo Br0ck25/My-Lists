@@ -2128,16 +2128,44 @@ self.addEventListener('fetch', e => {
               .map((r) => r.list || r)
               .filter((l) => l && l.ids && l.ids.slug && l.user && (l.user.username || (l.user.ids && l.user.ids.slug)))
               .map((l) => {
-                const username = l.user.username || l.user.ids.slug;
+                // ids.slug FIRST, username only as a fallback. username is
+                // Trakt's DISPLAY name and is not always addressable by their
+                // API: "Fidel.cb" has to be fetched as "fidel-cb", and
+                // building the URL from the display name made that list fail
+                // to load at all ("Couldn't load that list."). searchTraktLists
+                // (04_config-resolution.js) already prefers the slug for
+                // exactly this reason -- which is why the same list has always
+                // worked when found through search and not from here.
+                const userSlug = (l.user.ids && l.user.ids.slug) || l.user.username;
+                const displayName = l.user.username || userSlug;
                 const slug = l.ids.slug;
+                const name = l.name || slug;
+                // Trakt's popular-lists payload carries no media type, and
+                // this used to answer "movie" for every single entry. A
+                // shows-only list previewed as movies comes back with zero
+                // items, so on the Discover feed it rendered with no posters
+                // at all and its See All said "No items found" -- for
+                // "IMDB: Top Rated TV Shows", "Great Popular Shows" and
+                // "Rolling Stone's 100 Greatest TV Shows of All Time" among
+                // others, all of which hold 100+ shows.
+                //
+                // Same name heuristic searchTraktLists uses, including its
+                // "unknown" for anything ambiguous. Reported as `type:
+                // "mixed"` so the client previews movies AND series and
+                // merges them, which is what it already does for an
+                // ambiguous search result.
+                const isMovie = /\bmovie(s)?\b/i.test(name);
+                const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+                const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
                 return {
                   name: l.name,
-                  user: username,
+                  user: displayName,
                   slug: slug,
                   items: l.item_count || 0,
                   likes: l.likes || 0,
-                  url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(slug)}`,
-                  type: "movie",
+                  contentType,
+                  url: `https://trakt.tv/users/${encodeURIComponent(userSlug)}/lists/${encodeURIComponent(slug)}`,
+                  type: contentType === "unknown" ? "mixed" : contentType,
                 };
               });
           },

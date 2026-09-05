@@ -1489,6 +1489,73 @@
         )
       ).filter(Boolean);
 
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order now decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      const orderedSlugs = new Set(lists.map((l) => l.slug));
+      const recovered = [];
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) recovered.push(s);
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        const restored = (
+          await Promise.all(
+            recovered.map(async (slug) => {
+              const raw = await getCreatorList(env, auth.username, slug);
+              if (!raw) return null;
+              try {
+                const data = JSON.parse(raw);
+                return {
+                  slug,
+                  name: data.name,
+                  type: data.type,
+                  items: data.items || [],
+                  itemCount: (data.items || []).length,
+                  likes: data.likes || 0,
+                  visibility: effectiveListVisibility(data.visibility),
+                  url: `${url.origin}/lists/${auth.username}/${slug}`,
+                };
+              } catch {
+                return null;
+              }
+            })
+          )
+        ).filter(Boolean);
+        for (const l of restored) {
+          lists.push(l);
+          order.push(l.slug);
+        }
+        if (restored.length) {
+          ctx.waitUntil(
+            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+          );
+        }
+      }
+
       const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
       if (!hasWatchlistInLists) {
         const wlRaw = await getCreatorList(env, auth.username, "watchlist");
@@ -1597,7 +1664,37 @@
         order = [];
       }
 
-      const editingSlug = body.slug && order.includes(body.slug) ? body.slug : null;
+      // A caller that names a slug gets that slug.
+      //
+      // This used to be `order.includes(body.slug) ? body.slug : null`, so a
+      // request to save AS a particular slug was honoured only if that slug
+      // already appeared in creatorlistorder:{user} -- and silently discarded
+      // otherwise, with a brand-new slug minted from the name and ok:true
+      // returned as though the request had been carried out. That is the
+      // whole duplicate-list bug:
+      //
+      //   creatorlistorder: is one KV key, rewritten read-modify-write by
+      //   every save, and KV has no compare-and-swap. renderCreatorDashboard
+      //   fires one save per local list missing from the account, all at
+      //   once, so a browser holding 22 lists fired 22 concurrent saves and
+      //   21 of the resulting order entries were lost. The records existed;
+      //   order (and therefore the dashboard) could not see them; so the next
+      //   render fired them again. Each round the client asked for its own
+      //   slug and was given a different one it never learned about. One
+      //   account reached 129 list records for 22 real lists -- 44 copies of
+      //   the same 462-item list, coming-of-age-3 through coming-of-age-53.
+      //
+      // The slug namespace is per-creator and this request is authenticated
+      // as its owner, so there is no one else's list to collide with: an
+      // explicit slug is theirs to claim whether or not order has caught up.
+      // Honouring it makes the save idempotent -- ask twice, get one list --
+      // which is what stops the loop. Only a request that names NO slug goes
+      // on to allocate a fresh one.
+      //
+      // Run through slugifyServer because it now reaches a KV key name and a
+      // URL path from an arbitrary body field; previously it could only be a
+      // value this Worker had itself written into order.
+      const editingSlug = slugifyServer(body.slug) || null;
       let slug;
       if (editingSlug) {
         // Editing keeps its existing URL even if the name changed --
@@ -1616,7 +1713,13 @@
         // list. Scoped to this creator's own namespace, so only their own
         // list was ever at risk, but silently replacing it is still the
         // wrong answer.
-        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        // Checked against KV as well as order, not order alone: order is a
+        // single key that concurrent saves clobber (see the note above), so
+        // a slug absent from it may still have a live record behind it, and
+        // allocating it would write straight over that list.
+        slug = await pickFreeSlug(baseSlug, async (candidate) =>
+          order.includes(candidate) || !!(await env.CONFIGS.get(`creatorlist:${auth.username}:${candidate}`))
+        );
         if (!slug) {
           return json(
             { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
@@ -1695,29 +1798,11 @@
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      if (env.DB) {
-        try {
-          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
-        } catch (dbErr) {
-          console.error("D1 write error (creatorlist delete):", dbErr);
-        }
-      }
-
-      // Unconditional, for the same reason as the key rotation above: a
-      // DELETE matching zero D1 rows still "succeeds", and skipping the KV
-      // delete on that basis left the list live in KV -- a delete that
-      // reported ok:true and deleted nothing.
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
-      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
-      let order = [];
-      try {
-        order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
-      } catch {
-        order = [];
-      }
-      order = order.filter((s) => s !== slug);
-      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
+      // Shared with /admin/api/delete-creator-list so the two cannot drift --
+      // the same lesson purgeCreatorData records about itself. It also drops
+      // the like ledger, which this route used to leave behind for whoever
+      // next created a list at the same slug to inherit.
+      await deleteCreatorLists(env, auth.username, [slug]);
       return json({ ok: true });
     }
 
@@ -3640,6 +3725,71 @@
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
+    //   -> { ok, deleted: [...], missing: [...], remaining }
+    // Admin-only removal of one creator's lists, for cleaning up content the
+    // owner cannot or will not remove themselves -- and, in particular, for
+    // clearing PHANTOM directory entries: a list whose index entry survived
+    // but whose record is gone advertises an item count and then 404s when
+    // opened, and until now there was no way to get rid of one at all. Slugs
+    // whose record has already vanished still come out of the index, and are
+    // reported back under `missing` rather than treated as an error.
+    //
+    // Deliberately per-list rather than per-creator: "delete this account's
+    // lists" is what /api/creator/delete-account already does, with the
+    // account's own key. This is a scalpel, and it is irreversible -- there is
+    // no undo and no backup of a deleted list.
+    //
+    // Goes through the same deleteCreatorLists the creator's own delete route
+    // uses, so an admin deletion cannot clean up differently (or less
+    // thoroughly) than the owner's does.
+    if (path === "/admin/api/delete-creator-list" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+
+      // Accepts one slug or many; both shapes end up as a bounded list.
+      const rawSlugs = Array.isArray(body.slugs)
+        ? body.slugs
+        : (body.slug ? [body.slug] : []);
+      const slugs = [...new Set(
+        rawSlugs.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean)
+      )];
+      if (!slugs.length) return json({ ok: false, error: "No slugs given." }, 400);
+      if (slugs.length > ADMIN_LIST_DELETE_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (limit ${ADMIN_LIST_DELETE_MAX}). Send them in batches.`,
+        }, 413);
+      }
+
+      const result = await deleteCreatorLists(env, v.normalized, slugs);
+      // How many that creator has left, so the caller can tell when a
+      // multi-batch cleanup is finished without guessing.
+      let remaining = null;
+      try {
+        const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
+        remaining = listed.keys.length;
+      } catch (e) {
+        remaining = null;
+      }
+      return json({
+        ok: true,
+        username: v.normalized,
+        deleted: result.deleted,
+        missing: result.missing,
+        remaining,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
@@ -4375,7 +4525,14 @@ export default {
         // rebuilt nothing at all once there were more than ~500 lists.
         // /admin/api/rebuild-public-index drives the same chunks back to
         // back for an immediate seed right after a fresh deploy.
-        getPublicListIndex(env, ctx),
+        //
+        // This also re-derives the index once a day even when one already
+        // exists. The index is maintained incrementally by a read-modify-write
+        // on a single key, so rapid updates lose each other -- and nothing
+        // used to repair that, because a rebuild only ever ran when the index
+        // was MISSING, never when it was merely wrong. See
+        // refreshPublicListIndexIfStale.
+        refreshPublicListIndexIfStale(env, ctx),
       ])
     );
   },

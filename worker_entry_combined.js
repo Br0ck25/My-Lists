@@ -200,6 +200,14 @@ function applyEnvApiKeys(env) {
 // The secrets behind these are strong -- ADMIN_KEY is a chosen secret and a
 // Creator Key is ~60 bits -- so this is defence in depth, not the load-
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
+// How many of one creator's lists /admin/api/delete-creator-list will remove
+// in a single call. Each slug costs a KV read, a KV delete, a ledger delete
+// and (with D1 bound) a statement, so this keeps one call well inside
+// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// larger cleanup still completes -- it just arrives as several bounded calls,
+// the same shape the other maintenance tools use.
+const ADMIN_LIST_DELETE_MAX = 50;
+
 const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
 const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 
@@ -3136,6 +3144,99 @@ async function usernameForScrobbleToken(env, token) {
   }
 }
 
+// Drops a batch of ids from the public index in ONE write.
+//
+// Deliberately not one updatePublicListIndex call per list: that is a
+// read-modify-write on a single key, so a run of them loses each other's
+// updates and strands entries in the directory pointing at records that no
+// longer exist -- a list that advertises an item count and then 404s when
+// opened. That is not hypothetical: a bulk delete left 76 such entries in a
+// live deployment, and nothing ever cleaned them up because the index only
+// used to rebuild when it was MISSING, never when it was merely wrong (see
+// refreshPublicListIndexIfStale).
+async function removeListsFromPublicIndex(env, ids) {
+  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  try {
+    const idx = await readPublicListIndex(env);
+    if (!idx) return;
+    const gone = new Set(ids);
+    await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+  } catch (e) {
+    console.error("public list index cleanup failed", e);
+  }
+}
+
+// Deletes one or more of a creator's lists: the KV record, the D1 row, the
+// like ledger, the entry in their display order, and the directory index --
+// with a single index write and a single order write however many slugs are
+// passed.
+//
+// One function because the account purge and the per-list delete used to be
+// written out separately and drifted (see purgeCreatorData's own comment on
+// exactly that). The like ledger matters in particular: leaving
+// listlikevoters:{user}:{slug} behind means whoever next creates a list at
+// that same slug inherits a like count they never earned, and every voter in
+// the old ledger is silently unable to like it.
+async function deleteCreatorLists(env, username, slugs) {
+  const out = { deleted: [], missing: [] };
+  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
+
+  for (const slug of slugs) {
+    const key = `creatorlist:${username}:${slug}`;
+    let existed = false;
+    try {
+      existed = !!(await env.CONFIGS.get(key));
+    } catch {
+      existed = false;
+    }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+      } catch (dbErr) {
+        console.error("D1 write error (deleteCreatorLists):", dbErr);
+      }
+    }
+    // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
+    // skipping the KV delete on that basis leaves the list live in KV -- a
+    // delete that reports success and deletes nothing.
+    try {
+      await env.CONFIGS.delete(key);
+    } catch (e) {
+      console.error("deleteCreatorLists: could not delete", key, e);
+    }
+    try {
+      await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
+    } catch (e) {
+      // A stranded ledger is untidy, not harmful on its own.
+    }
+    (existed ? out.deleted : out.missing).push(slug);
+  }
+
+  // Every slug asked for comes out of the index, including ones whose record
+  // was already gone -- those phantom entries are the whole reason an admin
+  // reaches for this.
+  await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`));
+
+  try {
+    const orderRaw = await env.CONFIGS.get(`creatorlistorder:${username}`);
+    let order = [];
+    try {
+      order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+    } catch {
+      order = [];
+    }
+    const gone = new Set(slugs);
+    const next = order.filter((s) => !gone.has(s));
+    if (next.length !== order.length || orderRaw) {
+      await env.CONFIGS.put(`creatorlistorder:${username}`, JSON.stringify({ order: next }));
+    }
+  } catch (e) {
+    console.error("deleteCreatorLists: could not update list order", e);
+  }
+
+  return out;
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -3589,15 +3690,10 @@ async function rebuildPublicListIndex(env, options = {}) {
   return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
-// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
-// rebuild run after the response so the requesting user doesn't pay for it.
-async function getPublicListIndex(env, ctx) {
-  const idx = await readPublicListIndex(env);
-  if (idx) return idx.entries;
-
-  // Rebuilding is a full scan; a burst of traffic against a cold index must
-  // not start one per request. First caller takes a 60s lock and rebuilds,
-  // the rest fall through to the bounded legacy scan for this one request.
+// Runs ONE rebuild chunk under a shared short lock, so a burst of traffic
+// against a cold or stale index cannot start a rebuild per request. Returns
+// the finished entries when this chunk completed the build, else null.
+async function advancePublicListIndexBuild(env, ctx) {
   let gotLock = false;
   try {
     const lock = await env.CONFIGS.get("lock:publiclistindex");
@@ -3606,15 +3702,10 @@ async function getPublicListIndex(env, ctx) {
       gotLock = true;
     }
   } catch {
-    // If the lock read fails, fall through to the scan rather than risking
-    // a rebuild stampede.
+    // If the lock read fails, do nothing rather than risk a stampede.
   }
   if (!gotLock) return null;
 
-  // One chunk per call -- see rebuildPublicListIndex. A small deployment
-  // finishes in this one chunk and gets its index immediately; a large one
-  // makes bounded progress and is served the legacy scan meanwhile, with the
-  // cron carrying the build to completion.
   const runChunk = async () => {
     try {
       return await rebuildPublicListIndex(env);
@@ -3623,9 +3714,9 @@ async function getPublicListIndex(env, ctx) {
       return null;
     } finally {
       // Released as soon as the chunk ends rather than left to expire: a
-      // rebuild now takes many chunks, and sitting on the lock for its full
-      // 60s TTL would cap progress at one chunk a minute for no benefit. The
-      // TTL stays as the backstop for a chunk that dies outright.
+      // rebuild takes many chunks, and sitting on the lock for its full 60s
+      // TTL would cap progress at one chunk a minute for no benefit. The TTL
+      // stays as the backstop for a chunk that dies outright.
       try {
         await env.CONFIGS.delete("lock:publiclistindex");
       } catch {
@@ -3635,12 +3726,64 @@ async function getPublicListIndex(env, ctx) {
   };
 
   if (ctx && typeof ctx.waitUntil === "function") {
-    // Rebuild in the background; serve this request from the legacy scan.
     ctx.waitUntil(runChunk());
     return null;
   }
   const res = await runChunk();
   return res && res.done ? res.entries : null;
+}
+
+// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
+// rebuild run after the response so the requesting user doesn't pay for it.
+async function getPublicListIndex(env, ctx) {
+  const idx = await readPublicListIndex(env);
+  if (idx) return idx.entries;
+  // A small deployment finishes in this one chunk and gets its index
+  // immediately; a large one makes bounded progress and is served the legacy
+  // scan meanwhile, with the cron carrying the build to completion.
+  return await advancePublicListIndexBuild(env, ctx);
+}
+
+// The index is a DERIVED cache maintained incrementally by
+// updatePublicListIndex, which is a read-modify-write on one key -- so
+// concurrent or rapid-fire updates lose each other. Its own comment accepts
+// that on the grounds that a lost entry costs one list's visibility "until
+// the next rebuild". The gap was that nothing ever caused one: a rebuild
+// only ever ran when the index was MISSING, never when it was merely wrong,
+// so a lost update was permanent.
+//
+// It was: a bulk delete left 76 entries in a live directory advertising item
+// counts for records that no longer existed, and they stayed there. This is
+// what closes that -- the cron re-derives the whole index from the
+// authoritative creatorlist:/publishedlist: keys once a day, so anything
+// stranded is gone within one cycle without anyone having to notice.
+//
+// The live index keeps serving untouched while a refresh runs: the chunked
+// rebuild only writes when its final chunk lands, so readers never see a
+// half-scanned directory.
+const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+async function refreshPublicListIndexIfStale(env, ctx) {
+  if (!env || !env.CONFIGS) return;
+  const idx = await readPublicListIndex(env);
+  if (!idx) {
+    // Cold start -- same path as a live request would take.
+    await advancePublicListIndexBuild(env, ctx);
+    return;
+  }
+  // A build already part-way through has to keep being advanced, or it stalls
+  // forever at whatever chunk it reached: the read path above returns early
+  // while an index exists, so the cron is the only thing driving it.
+  let building = false;
+  try {
+    building = !!(await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY));
+  } catch {
+    building = false;
+  }
+  const age = idx.updatedAt ? (Date.now() - idx.updatedAt) : Infinity;
+  if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
+    await advancePublicListIndexBuild(env, ctx);
+  }
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -3739,17 +3882,7 @@ async function purgeCreatorData(env, username, options = {}) {
   // One index write for the whole account rather than one per list --
   // deleting an account with 200 lists should not be 200 read-modify-writes
   // against the same key (KV allows 1 write/sec/key).
-  if (purgedListIds.length) {
-    try {
-      const idx = await readPublicListIndex(env);
-      if (idx) {
-        const gone = new Set(purgedListIds);
-        await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
-      }
-    } catch (e) {
-      console.error("purgeCreatorData: index cleanup failed", e);
-    }
-  }
+  await removeListsFromPublicIndex(env, purgedListIds);
 
   // The scrobble token is keyed by the token, not the username, so it has to
   // be resolved through the reverse index before that index is deleted --
@@ -5891,9 +6024,21 @@ async function renderAdminDashboard(env) {
 
     <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
-      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It rebuilds itself automatically (on every publish/like, and once per cron run if it's ever found missing), so this is only for forcing an immediate, verifiable rebuild right now -- e.g. right after first setting this Worker up.</p>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
       <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Delete a creator&rsquo;s lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Removes specific lists belonging to one Creator Profile: the list itself, its likes, its place in that creator&rsquo;s order, and its directory entry. Use it for content a creator cannot or will not remove themselves. A slug whose list is already gone is still cleared from the directory, which is how you get rid of an entry that shows an item count but opens empty.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list. Prefer &ldquo;Rebuild Public List Index&rdquo; above first &mdash; if the lists are only phantom directory entries, that fixes them without deleting anything.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListUserInput" class="admin-select" placeholder="Creator username" style="margin-right:6px;">
+        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:260px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
+      <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
   </div>
 
@@ -6263,6 +6408,62 @@ async function renderAdminDashboard(env) {
           if (errCount) console.error('migrate-d1 errors:', r.errors);
           break;
         }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Irreversible, so it asks first and names exactly what it is about to
+    // remove. The endpoint caps each call (ADMIN_LIST_DELETE_MAX), so a bigger
+    // cleanup is sent as several batches here rather than rejected.
+    async function runDeleteCreatorLists() {
+      const btn = document.getElementById('deleteListBtn');
+      const status = document.getElementById('deleteListStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      const rawSlugs = (document.getElementById('deleteListSlugsInput').value || '').trim();
+      if (!username || !rawSlugs) {
+        status.textContent = 'Enter a username and at least one slug.';
+        return;
+      }
+      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
+        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\n\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      let remaining = null;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-creator-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+          remaining = data.remaining;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
+          ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
+          (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -32428,7 +32629,7 @@ function openChannelDetailsPage(channelIdOrDivId) {
     const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
 
     return {
-      id: it.imdbId || it.id || (showName + '-' + (seasonEp || idx)),
+      id: channelItemId(it, idx),
       // Was hardcoded to 'series' unconditionally for every item -- fine
       // for a channel's actual episodes, but wrong for movie-saga channels
       // (MCU, Star Wars, etc.) where every item is a movie: clicking one
@@ -32446,6 +32647,35 @@ function openChannelDetailsPage(channelIdOrDivId) {
       year: it.year || (it.released ? it.released.slice(0, 4) : ''),
     };
   });
+
+// A channel item's id has to identify the EPISODE, not the show it belongs to.
+//
+// Every episode in a channel carries its show's imdbId/showId, so using that
+// directly gave all 40 episodes of one show the same id. The list-details grid
+// dedupes by id (appendItems, 23_client-list-management.js -- it is there to
+// stop a provider that ignores its skip parameter from rendering the same
+// page twice), so a channel collapsed to exactly one poster per distinct
+// show: a 120-episode
+// channel built from three shows showed three items, and no amount of adding
+// episodes changed that.
+//
+// showId:season:episode is the shape the rest of the app already uses for an
+// episode (handleSubtitlesTrack, fetchTmdbSeason), and every consumer that
+// needs the show back already splits on the first colon -- the poster click
+// handler in 19_client-search-and-likes.js and openItemDetailsModal in 23_
+// both do, for tt-prefixed and numeric TMDB ids alike.
+function channelItemId(it, idx) {
+  const showId = it.imdbId || it.showId || it.id || '';
+  if (showId && it.season != null && it.episode != null) {
+    return showId + ':' + it.season + ':' + it.episode;
+  }
+  // No episode numbering: a movie-saga channel's items are already distinct
+  // per show id, so it stands alone.
+  if (showId) return showId;
+  const fallbackName = it.showName || it.title || 'item';
+  const seasonEp = (it.season != null && it.episode != null) ? ('S' + it.season + 'E' + it.episode) : '';
+  return fallbackName + '-' + (seasonEp || idx);
+}
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {
@@ -39011,6 +39241,95 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
 }
 window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
 
+// Uploads local lists the account does not have yet, and -- the part that
+// matters -- writes the slug the server actually used back into the local
+// store.
+//
+// The previous version was a forEach firing an unawaited fetch per list with
+// .catch(() => {}) and no .then, from a block that runs on EVERY dashboard
+// render. Three things went wrong at once:
+//
+//   1. The reply was thrown away, so the local copy never learned which slug
+//      the account now holds. The test that decides whether to upload could
+//      therefore never start passing on its own.
+//   2. Every list went out simultaneously, and each save rewrites the single
+//      creatorlistorder: key read-modify-write. KV has no compare-and-swap,
+//      so 22 concurrent saves left 1 order entry standing and lost 21.
+//   3. Losing an order entry made that list invisible to /api/creator/lists,
+//      which is where serverSlugs comes from -- so the next render uploaded
+//      it again. The account gained one visible list per render and a fresh
+//      duplicate record for every other one, forever.
+//
+// One account ended up with 129 list records for 22 real lists: 44 copies of
+// the same 462-item list (coming-of-age-3 .. coming-of-age-53), 29 of another.
+//
+// So: one list at a time, awaited, the returned slug recorded, and one run at
+// a time across the whole page. The server side is fixed too (it now honours
+// the slug asked for instead of silently minting a new one, and no longer
+// treats the order key as the last word on what exists) -- either half alone
+// stops the runaway; both together also make it self-correcting.
+let _uploadingMissingLists = false;
+// Bounded so that a server which somehow never reports a list back can cost a
+// handful of rounds rather than spinning for as long as the tab is open. The
+// fixes above mean one round is enough; this is the backstop, not the plan.
+let _missingListUploadRounds = 0;
+const MISSING_LIST_UPLOAD_MAX_ROUNDS = 5;
+async function uploadMissingLocalListsToAccount(lists, creatorKey) {
+  if (_uploadingMissingLists || !activeCreator || !creatorKey || !lists || !lists.length) return 0;
+  if (_missingListUploadRounds >= MISSING_LIST_UPLOAD_MAX_ROUNDS) return 0;
+  _uploadingMissingLists = true;
+  _missingListUploadRounds++;
+  const assigned = [];
+  try {
+    for (const l of lists) {
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slug: l.creatorSlug || l.slug,
+            name: l.name || l.slug,
+            type: l.type || 'movie',
+            items: l.items || [],
+            visibility: l.visibility || 'private',
+          }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.slug) continue;
+        l.creatorSlug = data.slug;
+        assigned.push({ localSlug: l.slug, creatorSlug: data.slug });
+      } catch (e) {
+        // One list failing (a dropped connection, say) must not abandon the
+        // rest, and must not retry here -- a persistent failure retried in
+        // place is the same runaway by another route. The next render tries
+        // again, and the save is idempotent now, so that costs nothing.
+      }
+    }
+  } finally {
+    _uploadingMissingLists = false;
+  }
+  // One write at the end rather than one per list: these maps run to
+  // megabytes and each save is a full JSON.stringify on the main thread. An
+  // interrupted run simply re-uploads next time, which is harmless now that
+  // asking for the same slug twice yields the same list.
+  if (assigned.length) {
+    try {
+      const map = loadLocalCustomLists();
+      let touched = false;
+      assigned.forEach((a) => {
+        const entry = map[a.localSlug];
+        if (entry && entry.creatorSlug !== a.creatorSlug) { entry.creatorSlug = a.creatorSlug; touched = true; }
+      });
+      if (touched) saveLocalCustomListsMap(map);
+    } catch (e) {}
+    renderCreatorDashboard({ silent: true });
+  }
+  return assigned.length;
+}
+window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -39204,30 +39523,27 @@ async function renderCreatorDashboard(options) {
     // Merge any local/restored custom lists that are not yet on the server
     const serverSlugs = new Set((data.lists || []).map(l => l.slug));
     const localRestoredCustomLists = [];
+    const needUploading = [];
     Object.keys(localMapForCreator || {}).forEach((k) => {
       if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
       const l = localMapForCreator[k];
       if (!l) return;
       if (!l.slug) l.slug = k;
-      if (!serverSlugs.has(l.slug)) {
+      // Test against the slug the SERVER gave this list last time, when we
+      // know it, not the local key. The two are usually the same and the
+      // fallback keeps that case working -- but when they differ, comparing
+      // the local key is what made this block think an uploaded list was
+      // still missing and upload it all over again.
+      if (!serverSlugs.has(l.creatorSlug || l.slug)) {
         localRestoredCustomLists.push(l);
-        if (activeCreator && creatorKey) {
-          fetch(ORIGIN + '/api/creator/lists/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              creatorName: activeCreator.creatorName,
-              creatorKey: creatorKey,
-              slug: l.slug,
-              name: l.name || l.slug,
-              type: l.type || 'movie',
-              items: l.items || [],
-              visibility: l.visibility || 'private',
-            })
-          }).catch(() => {});
-        }
+        if (activeCreator && creatorKey) needUploading.push(l);
       }
     });
+    // A render that finds everything already on the account is the signal
+    // that the two sides agree again -- give the round budget back, so a
+    // later genuine upload is not blocked by an earlier bad patch.
+    if (!needUploading.length) _missingListUploadRounds = 0;
+    else uploadMissingLocalListsToAccount(needUploading, creatorKey);
 
     const allDashboardLists = [
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
@@ -40660,7 +40976,13 @@ function removeWatchHistoryItemDirect(id, btn) {
   if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
     window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
     if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
-      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      // Update the open See All page in place. Rebuilding it -- which is what
+      // renderWatchHistoryGrid does, starting from innerHTML = '' -- blanked
+      // the grid, re-requested every poster and scrolled back to the top on
+      // every single removal. The full render stays as the fallback for the
+      // one case that really does need re-laying out (grouped by show).
+      const handled = (typeof updateWatchHistoryGridAfterRemoval === 'function') && updateWatchHistoryGridAfterRemoval();
+      if (!handled && typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
     }
   }
 }
@@ -42220,6 +42542,71 @@ window.toggleWatchHistoryGroupShows = function(checked) {
   if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
 };
 
+// The type a raw Watch History entry shows up as in the ungrouped grid, and
+// whether it survives the current filter pill. Shared so that the full render
+// below and the in-place update beside it cannot disagree about what "3 items"
+// means.
+function watchHistoryGridType(it) {
+  return (it && it.showId) ? 'series' : ((it && it.type) || 'movie');
+}
+function watchHistoryPassesFilter(it, filter) {
+  const t = watchHistoryGridType(it);
+  if (filter === 'movie') return t === 'movie';
+  if (filter === 'series') return t === 'series' || t === 'episode';
+  return true;
+}
+
+// Called after ONE item has been taken out of Watch History while the See All
+// page is open. Returns true if it brought the page up to date on its own.
+//
+// This exists because the removal used to call renderWatchHistoryGrid(), and
+// that starts with gridEl.innerHTML = '' -- so deleting a single item blanked
+// the grid and rebuilt every tile from scratch, re-requesting every poster and
+// throwing the person back to the top of a list they had scrolled into. On a
+// history of any real size that reads as the whole list reloading, which is
+// exactly what it was.
+//
+// Nothing about the surviving tiles changed, so nothing about them needs to be
+// re-rendered: the clicked tile is already being faded out by the handler that
+// got us here, anything else the removal took with it is dropped in place, and
+// the counts are recomputed from the raw items. Grouped-by-show mode is the one
+// case that genuinely needs the layout recomputing (a show tile's episode count
+// changes, and the tile disappears entirely at zero), so it says so and lets the
+// caller fall back.
+function updateWatchHistoryGridAfterRemoval() {
+  const gridEl = document.getElementById('detailGrid');
+  const detailTab = document.getElementById('content-list-details');
+  // Not on screen -- reopening the page renders it fresh from
+  // _rawWatchHistoryItems anyway, so there is nothing to keep in step here.
+  if (!gridEl || !detailTab || detailTab.hasAttribute('hidden')) return true;
+  const p = window._currentListDetailsParams;
+  if (!p) return true;
+  const isLocalHist = (!p.listUrl && p.name && p.name.toLowerCase().includes('watch history')) || p.listUrl === 'watch-history' || p.listUrl === 'custom:watch-history' || p.listUrl === 'autotrack:watch-history';
+  if (!isLocalHist) return true;
+  if (localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true') return false;
+
+  const live = new Set();
+  (window._rawWatchHistoryItems || []).forEach((it) => {
+    if (it) live.add(String(it.id || it.imdbId || ''));
+  });
+  gridEl.querySelectorAll('.cw-remove-btn[data-remove-type="history"]').forEach((b) => {
+    if (live.has(String(b.dataset.removeId || ''))) return;
+    const card = b.closest('.live-preview-poster-card');
+    // Leave the one already mid-fade to its own animation.
+    if (!card || card.style.opacity === '0') return;
+    if (card.parentNode) card.parentNode.removeChild(card);
+  });
+
+  const filter = window._watchHistoryFilter || 'all';
+  const remaining = (window._rawWatchHistoryItems || []).filter((it) => watchHistoryPassesFilter(it, filter)).length;
+  const subEl = document.getElementById('detailSubtitle');
+  if (subEl) subEl.textContent = remaining + ' item' + (remaining === 1 ? '' : 's');
+  const statusEl = document.getElementById('detailStatus');
+  if (statusEl) statusEl.innerHTML = remaining ? '' : '<small>No matching items found.</small>';
+  return true;
+}
+window.updateWatchHistoryGridAfterRemoval = updateWatchHistoryGridAfterRemoval;
+
 window.renderWatchHistoryGrid = function() {
   const gridEl = document.getElementById('detailGrid');
   const statusEl = document.getElementById('detailStatus');
@@ -42318,7 +42705,7 @@ window.renderWatchHistoryGrid = function() {
       const label = (typeof formatWatchItemLabel === 'function') ? formatWatchItemLabel(it) : { title: it.title || it.name || '', subtitle: '' };
       return {
         id: it.showId || it.imdbId || it.id,
-        type: it.showId ? 'series' : (it.type || 'movie'),
+        type: watchHistoryGridType(it),
         name: label.title,
         subtitle: label.subtitle,
         poster: it.poster || it.showPoster || '',
@@ -42329,6 +42716,8 @@ window.renderWatchHistoryGrid = function() {
     });
   }
 
+  // Same predicate as watchHistoryPassesFilter, against the processed tiles
+  // (grouping rewrites an episode's type, so this cannot read the raw item).
   if (filter === 'movie') {
     processed = processed.filter((it) => it.type === 'movie');
   } else if (filter === 'series') {
@@ -42573,7 +42962,9 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
             const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
             return {
-              id: it.showId || it.id || ('channel_item_' + idx),
+              // Same collapse as openChannelDetailsPage had -- see channelItemId
+              // (20_client-channel-builder.js) for why the show id alone is not enough.
+              id: (typeof channelItemId === 'function') ? channelItemId(it, idx) : (it.showId || it.id || ('channel_item_' + idx)),
               type: it.type || (it.season != null ? 'episode' : 'series'),
               name: displayTitle,
               fullTitle: fullTitle,
@@ -49156,16 +49547,44 @@ self.addEventListener('fetch', e => {
               .map((r) => r.list || r)
               .filter((l) => l && l.ids && l.ids.slug && l.user && (l.user.username || (l.user.ids && l.user.ids.slug)))
               .map((l) => {
-                const username = l.user.username || l.user.ids.slug;
+                // ids.slug FIRST, username only as a fallback. username is
+                // Trakt's DISPLAY name and is not always addressable by their
+                // API: "Fidel.cb" has to be fetched as "fidel-cb", and
+                // building the URL from the display name made that list fail
+                // to load at all ("Couldn't load that list."). searchTraktLists
+                // (04_config-resolution.js) already prefers the slug for
+                // exactly this reason -- which is why the same list has always
+                // worked when found through search and not from here.
+                const userSlug = (l.user.ids && l.user.ids.slug) || l.user.username;
+                const displayName = l.user.username || userSlug;
                 const slug = l.ids.slug;
+                const name = l.name || slug;
+                // Trakt's popular-lists payload carries no media type, and
+                // this used to answer "movie" for every single entry. A
+                // shows-only list previewed as movies comes back with zero
+                // items, so on the Discover feed it rendered with no posters
+                // at all and its See All said "No items found" -- for
+                // "IMDB: Top Rated TV Shows", "Great Popular Shows" and
+                // "Rolling Stone's 100 Greatest TV Shows of All Time" among
+                // others, all of which hold 100+ shows.
+                //
+                // Same name heuristic searchTraktLists uses, including its
+                // "unknown" for anything ambiguous. Reported as `type:
+                // "mixed"` so the client previews movies AND series and
+                // merges them, which is what it already does for an
+                // ambiguous search result.
+                const isMovie = /\bmovie(s)?\b/i.test(name);
+                const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+                const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
                 return {
                   name: l.name,
-                  user: username,
+                  user: displayName,
                   slug: slug,
                   items: l.item_count || 0,
                   likes: l.likes || 0,
-                  url: `https://trakt.tv/users/${encodeURIComponent(username)}/lists/${encodeURIComponent(slug)}`,
-                  type: "movie",
+                  contentType,
+                  url: `https://trakt.tv/users/${encodeURIComponent(userSlug)}/lists/${encodeURIComponent(slug)}`,
+                  type: contentType === "unknown" ? "mixed" : contentType,
                 };
               });
           },
@@ -54436,6 +54855,73 @@ self.addEventListener('fetch', e => {
         )
       ).filter(Boolean);
 
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order now decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      const orderedSlugs = new Set(lists.map((l) => l.slug));
+      const recovered = [];
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) recovered.push(s);
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        const restored = (
+          await Promise.all(
+            recovered.map(async (slug) => {
+              const raw = await getCreatorList(env, auth.username, slug);
+              if (!raw) return null;
+              try {
+                const data = JSON.parse(raw);
+                return {
+                  slug,
+                  name: data.name,
+                  type: data.type,
+                  items: data.items || [],
+                  itemCount: (data.items || []).length,
+                  likes: data.likes || 0,
+                  visibility: effectiveListVisibility(data.visibility),
+                  url: `${url.origin}/lists/${auth.username}/${slug}`,
+                };
+              } catch {
+                return null;
+              }
+            })
+          )
+        ).filter(Boolean);
+        for (const l of restored) {
+          lists.push(l);
+          order.push(l.slug);
+        }
+        if (restored.length) {
+          ctx.waitUntil(
+            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+          );
+        }
+      }
+
       const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
       if (!hasWatchlistInLists) {
         const wlRaw = await getCreatorList(env, auth.username, "watchlist");
@@ -54544,7 +55030,37 @@ self.addEventListener('fetch', e => {
         order = [];
       }
 
-      const editingSlug = body.slug && order.includes(body.slug) ? body.slug : null;
+      // A caller that names a slug gets that slug.
+      //
+      // This used to be `order.includes(body.slug) ? body.slug : null`, so a
+      // request to save AS a particular slug was honoured only if that slug
+      // already appeared in creatorlistorder:{user} -- and silently discarded
+      // otherwise, with a brand-new slug minted from the name and ok:true
+      // returned as though the request had been carried out. That is the
+      // whole duplicate-list bug:
+      //
+      //   creatorlistorder: is one KV key, rewritten read-modify-write by
+      //   every save, and KV has no compare-and-swap. renderCreatorDashboard
+      //   fires one save per local list missing from the account, all at
+      //   once, so a browser holding 22 lists fired 22 concurrent saves and
+      //   21 of the resulting order entries were lost. The records existed;
+      //   order (and therefore the dashboard) could not see them; so the next
+      //   render fired them again. Each round the client asked for its own
+      //   slug and was given a different one it never learned about. One
+      //   account reached 129 list records for 22 real lists -- 44 copies of
+      //   the same 462-item list, coming-of-age-3 through coming-of-age-53.
+      //
+      // The slug namespace is per-creator and this request is authenticated
+      // as its owner, so there is no one else's list to collide with: an
+      // explicit slug is theirs to claim whether or not order has caught up.
+      // Honouring it makes the save idempotent -- ask twice, get one list --
+      // which is what stops the loop. Only a request that names NO slug goes
+      // on to allocate a fresh one.
+      //
+      // Run through slugifyServer because it now reaches a KV key name and a
+      // URL path from an arbitrary body field; previously it could only be a
+      // value this Worker had itself written into order.
+      const editingSlug = slugifyServer(body.slug) || null;
       let slug;
       if (editingSlug) {
         // Editing keeps its existing URL even if the name changed --
@@ -54563,7 +55079,13 @@ self.addEventListener('fetch', e => {
         // list. Scoped to this creator's own namespace, so only their own
         // list was ever at risk, but silently replacing it is still the
         // wrong answer.
-        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        // Checked against KV as well as order, not order alone: order is a
+        // single key that concurrent saves clobber (see the note above), so
+        // a slug absent from it may still have a live record behind it, and
+        // allocating it would write straight over that list.
+        slug = await pickFreeSlug(baseSlug, async (candidate) =>
+          order.includes(candidate) || !!(await env.CONFIGS.get(`creatorlist:${auth.username}:${candidate}`))
+        );
         if (!slug) {
           return json(
             { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
@@ -54642,29 +55164,11 @@ self.addEventListener('fetch', e => {
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
-      if (env.DB) {
-        try {
-          await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${auth.username}:${slug}`).run();
-        } catch (dbErr) {
-          console.error("D1 write error (creatorlist delete):", dbErr);
-        }
-      }
-
-      // Unconditional, for the same reason as the key rotation above: a
-      // DELETE matching zero D1 rows still "succeeds", and skipping the KV
-      // delete on that basis left the list live in KV -- a delete that
-      // reported ok:true and deleted nothing.
-      await env.CONFIGS.delete(`creatorlist:${auth.username}:${slug}`);
-      ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, null));
-      const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
-      let order = [];
-      try {
-        order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
-      } catch {
-        order = [];
-      }
-      order = order.filter((s) => s !== slug);
-      await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
+      // Shared with /admin/api/delete-creator-list so the two cannot drift --
+      // the same lesson purgeCreatorData records about itself. It also drops
+      // the like ledger, which this route used to leave behind for whoever
+      // next created a list at the same slug to inherit.
+      await deleteCreatorLists(env, auth.username, [slug]);
       return json({ ok: true });
     }
 
@@ -56587,6 +57091,71 @@ self.addEventListener('fetch', e => {
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
+    //   -> { ok, deleted: [...], missing: [...], remaining }
+    // Admin-only removal of one creator's lists, for cleaning up content the
+    // owner cannot or will not remove themselves -- and, in particular, for
+    // clearing PHANTOM directory entries: a list whose index entry survived
+    // but whose record is gone advertises an item count and then 404s when
+    // opened, and until now there was no way to get rid of one at all. Slugs
+    // whose record has already vanished still come out of the index, and are
+    // reported back under `missing` rather than treated as an error.
+    //
+    // Deliberately per-list rather than per-creator: "delete this account's
+    // lists" is what /api/creator/delete-account already does, with the
+    // account's own key. This is a scalpel, and it is irreversible -- there is
+    // no undo and no backup of a deleted list.
+    //
+    // Goes through the same deleteCreatorLists the creator's own delete route
+    // uses, so an admin deletion cannot clean up differently (or less
+    // thoroughly) than the owner's does.
+    if (path === "/admin/api/delete-creator-list" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const v = validateCreatorUsername(body.username);
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+
+      // Accepts one slug or many; both shapes end up as a bounded list.
+      const rawSlugs = Array.isArray(body.slugs)
+        ? body.slugs
+        : (body.slug ? [body.slug] : []);
+      const slugs = [...new Set(
+        rawSlugs.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean)
+      )];
+      if (!slugs.length) return json({ ok: false, error: "No slugs given." }, 400);
+      if (slugs.length > ADMIN_LIST_DELETE_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (limit ${ADMIN_LIST_DELETE_MAX}). Send them in batches.`,
+        }, 413);
+      }
+
+      const result = await deleteCreatorLists(env, v.normalized, slugs);
+      // How many that creator has left, so the caller can tell when a
+      // multi-batch cleanup is finished without guessing.
+      let remaining = null;
+      try {
+        const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
+        remaining = listed.keys.length;
+      } catch (e) {
+        remaining = null;
+      }
+      return json({
+        ok: true,
+        username: v.normalized,
+        deleted: result.deleted,
+        missing: result.missing,
+        remaining,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
@@ -57322,7 +57891,14 @@ export default {
         // rebuilt nothing at all once there were more than ~500 lists.
         // /admin/api/rebuild-public-index drives the same chunks back to
         // back for an immediate seed right after a fresh deploy.
-        getPublicListIndex(env, ctx),
+        //
+        // This also re-derives the index once a day even when one already
+        // exists. The index is maintained incrementally by a read-modify-write
+        // on a single key, so rapid updates lose each other -- and nothing
+        // used to repair that, because a rebuild only ever ran when the index
+        // was MISSING, never when it was merely wrong. See
+        // refreshPublicListIndexIfStale.
+        refreshPublicListIndexIfStale(env, ctx),
       ])
     );
   },
