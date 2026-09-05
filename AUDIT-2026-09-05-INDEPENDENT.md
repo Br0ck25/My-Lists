@@ -46,6 +46,7 @@ Everything else is meaningful but not release-blocking.
 | **Confidence** | Confirmed by execution |
 | **File** | `02_http-and-creator-utils.js` |
 | **Function** | `rebuildPublicListIndex` (line 1480), reached via `getPublicListIndex` (`03_admin.js`) |
+| **Status** | **FIXED** — see "Resolution" at the end of this finding |
 
 **Problem.** `rebuildPublicListIndex` calls `listAllKeys(env.CONFIGS, "creatorlist:")` with **no
 `maxKeys` cap**, then issues **one sequential `env.CONFIGS.get()` per list** (line 1508), plus one per
@@ -113,6 +114,42 @@ rebuild only needs to be a cold-start/repair path — it does not need to comple
 
 **Test.** Seed 1,200 public lists plus 900 private ones against a KV mock that throws after 1,000
 operations; assert the index key is written and that `/lists/public.json?offset=1000` returns the tail.
+
+### Resolution (applied)
+
+The rebuild is now resumable and budget-bounded, in the same shape as the existing
+`/admin/api/migrate-day-counts`: one page of keys per invocation, progress parked in
+`index:publiclists:build`, and the finished index published only once the final page lands. Records
+are fetched with bounded concurrency instead of one serialised round-trip each, and every KV call the
+chunk makes is counted so the budget reflects what was actually spent.
+
+- `PUBLIC_INDEX_BUILD_OPS_PER_RUN = 300` — a chunk usually shares its invocation with the cron, so it
+  gets a minority of the 1,000. A chunk that throws saves no progress, so an over-generous budget
+  would have reproduced the very failure being fixed.
+- `PUBLIC_INDEX_BUILD_OPS_ADMIN = 800` — `/admin/api/rebuild-public-index` has the invocation to
+  itself. It now returns `{ done, count, scanned }` and the admin UI loops it until done, matching
+  `runMigrateDayCounts`.
+
+Measured after the change, against a KV that enforces the real 1,000-subrequest limit:
+
+| Scenario | Before | After |
+|---|---|---|
+| 20 lists | 1 tick, fine | 1 tick — unchanged |
+| 20 real + 900 private junk | **never completes** | 31 ticks, all 20 listed |
+| 1,000 public lists | **never completes**, 100 visible | 7 ticks, all 1,000 listed |
+| 3,000 public lists | **never completes**, 100 visible | 20 ticks, all 3,000 listed |
+
+Peak subrequests in any single invocation: **418** (was unbounded). Six regression tests were added
+under `audit fix: the public list index rebuilds at any scale` covering scale, the invisible-record
+attack, single-publication and state cleanup, recovery from corrupt/stale resume state, concurrent
+chunk attempts, and the admin loop. **Verified they fail against the pre-fix code** (3 failures) and
+pass after. Full suite: 112/112, `verify.sh` green.
+
+**Not fixed, same bug class:** `/admin/api/migrate-d1` (`26_…:3268–3366`) does the identical unbounded
+`listAllKeys` + per-key `get` sweep across four prefixes in one invocation, and hits the same cliff.
+It is admin-only and manually triggered, so it is lower severity, but it needs the same chunking —
+and per `wrangler.toml` its failure is what leaves an account in KV but not D1, which the key-rotation
+endpoints then handle incorrectly. Tracked as a follow-up rather than folded into this change.
 
 ---
 
@@ -678,7 +715,7 @@ byte-exact concatenation, CI-gated against drift.
 ## FILE-BY-FILE PUNCH LIST
 
 ### `02_http-and-creator-utils.js`
-- 🔴 `rebuildPublicListIndex:1480` — cap and paginate the scan; read records in bounded batches; persist a cursor and resume across cron ticks. **(Finding 1)**
+- ✅ `rebuildPublicListIndex:1480` — **DONE.** Chunked, resumable, budget-bounded; records read with bounded concurrency. **(Finding 1)**
 - 🟡 `applyLikeVote:1283` — remove the PUT-then-verify retry loop; KV has no read-your-writes. **(9)**
 - 🟡 `consumeRateLimit:1234` — `await` the write; move security-critical buckets to D1. **(7)**
 - 🔵 `timingSafeEqualHex:346` — compare fixed-length digests, not raw lengths. **(12)**
@@ -718,8 +755,9 @@ byte-exact concatenation, CI-gated against drift.
 ## Change Grouping
 
 **🔴 PHASE 1 — MUST FIX BEFORE PRODUCTION**
-1. Bounded, resumable public-list index rebuild (finding 1)
+1. ~~Bounded, resumable public-list index rebuild (finding 1)~~ — **DONE**
 2. Per-account throttle + answer entropy on `/api/creator/reset-key` (finding 2)
+3. Apply the same chunking to `/admin/api/migrate-d1` (same bug class as 1, admin-only)
 
 **🟠 PHASE 2 — SHOULD FIX SOON**
 3. CSPRNG thread ids (3) · 4. Thread append authorization (4) · 5. Rate-limit bypass (5) ·
@@ -795,7 +833,7 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 
 ## TOP 10 FIXES
 
-1. **Bound and resume the public-list index rebuild** — the only permanent, silent, remotely-triggerable data-visibility failure. (Finding 1)
+1. ~~**Bound and resume the public-list index rebuild**~~ — **DONE.** (Finding 1)
 2. **Per-account throttle on `/api/creator/reset-key`** — the only proven account-takeover path. (2)
 3. **Minimum entropy on recovery answers at creation** — the other half of 2.
 4. **`generateShortId()` for feedback thread ids** — one-line change to a token already treated as a capability. (3)

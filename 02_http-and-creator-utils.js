@@ -1415,6 +1415,50 @@ const PUBLIC_INDEX_KEY = "index:publiclists";
 // size. Beyond this the tail is dropped (least-liked first).
 const PUBLIC_INDEX_MAX = 20000;
 
+// --- Rebuild chunking --------------------------------------------------------
+//
+// A full rebuild costs roughly one KV read per list, plus (the first time a
+// given record is seen) one for its creator's display name and one to stamp a
+// missing visibility. Cloudflare caps a Worker invocation at 1,000
+// subrequests, so the old single-pass scan stopped working entirely somewhere
+// around 500 public lists: it threw partway through, and because every call
+// site runs it inside ctx.waitUntil(...).catch(...) the throw was swallowed,
+// the index was never written, and the directory fell back to the legacy
+// bounded scan -- the alphabetically-first 100 creators, forever, with no
+// error surfaced anywhere.
+//
+// It was also reachable on purpose. rebuildPublicListIndex reads each record
+// BEFORE testing visibility, so a list that never appears in the directory
+// still costs a read, and /api/publish-list mints permanent, private-by-
+// default records for anyone at 10/minute. ~900 of those were enough to push
+// a deployment holding only 20 real public lists past the limit for good.
+//
+// So a rebuild now runs in resumable chunks, the same shape
+// /admin/api/migrate-day-counts already uses: one page of keys per
+// invocation, progress parked in index:publiclists:build, and the finished
+// index published only once the final page lands. The cron ticks every 6
+// minutes, so a cold index converges on its own at any scale instead of
+// never completing at all.
+const PUBLIC_INDEX_BUILD_KEY = "index:publiclists:build";
+const PUBLIC_INDEX_BUILD_PREFIXES = ["creatorlist:", "publishedlist:user:"];
+// KV operations one chunk may spend. Deliberately a minority of the 1,000
+// available, because a chunk usually runs inside the cron invocation and
+// shares that budget with prewarmSharedCatalogs (~142 subrequests) and
+// checkForNewEpisodes (up to ~400: 25 accounts plus a 150-show check
+// budget). This has to be low enough that a chunk can never be the thing
+// that trips the limit -- a chunk that throws saves no progress, so an
+// over-generous budget would reproduce the exact "never completes" failure
+// this chunking exists to fix.
+const PUBLIC_INDEX_BUILD_OPS_PER_RUN = 300;
+// ...and the ceiling for a chunk kicked off by /admin/api/rebuild-public-index,
+// which has the invocation to itself.
+const PUBLIC_INDEX_BUILD_OPS_ADMIN = 800;
+const PUBLIC_INDEX_BUILD_PAGE = 400;
+// Records are fetched in parallel within a chunk. The old code awaited each
+// get in sequence, so even a rebuild that fit inside the limit was one
+// serialised round-trip per list.
+const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
+
 async function readPublicListIndex(env) {
   if (!env || !env.CONFIGS) return null;
   try {
@@ -1475,93 +1519,205 @@ async function updatePublicListIndex(env, id, entry) {
   }
 }
 
-// Full scan -> index. Expensive (one KV get per list), so it runs only when
-// the index is missing, and only one caller at a time via a short lock.
-async function rebuildPublicListIndex(env) {
-  const entries = [];
-  const seen = new Set();
+// Persisted progress for an in-flight rebuild. Anything unparseable, or from
+// an older shape, simply restarts the build rather than half-applying.
+function emptyPublicIndexBuildState() {
+  return { v: 1, phase: 0, cursor: "", pending: [], entries: [], names: {} };
+}
+
+async function readPublicIndexBuildState(env) {
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
+    if (!raw) return emptyPublicIndexBuildState();
+    const s = JSON.parse(raw);
+    if (!s || s.v !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
+      return emptyPublicIndexBuildState();
+    }
+    return {
+      v: 1,
+      phase: Number(s.phase) || 0,
+      cursor: typeof s.cursor === "string" ? s.cursor : "",
+      pending: s.pending.filter((k) => typeof k === "string"),
+      entries: s.entries.filter(Boolean),
+      names: s.names && typeof s.names === "object" ? s.names : {},
+    };
+  } catch {
+    return emptyPublicIndexBuildState();
+  }
+}
+
+// Runs ONE chunk of a rebuild and returns:
+//   { done: true,  entries }                     -- index written and published
+//   { done: false, entries: null, ... }          -- progress saved, call again
+//
+// Callers that need the finished article must keep calling (the cron does).
+// Until it reports done the live index key is left exactly as it was, so a
+// partial scan is never published as if it were complete.
+//
+// One caveat worth knowing: a list published *behind* the cursor while a
+// multi-chunk rebuild is in flight is not picked up by that rebuild. It lands
+// in the index the moment the build finishes and updatePublicListIndex takes
+// over again, or on the next rebuild. Directory visibility lagging a cold
+// start by a few minutes is the tradeoff for it converging at all.
+async function rebuildPublicListIndex(env, options = {}) {
+  const opBudget = Number(options.opBudget) || PUBLIC_INDEX_BUILD_OPS_PER_RUN;
+
+  // Every KV call this chunk makes goes through here, so the budget tracks
+  // what was actually spent rather than a worst-case guess -- which matters
+  // because the per-key cost varies (a cached display name and an
+  // already-stamped visibility cost nothing extra).
+  let ops = 0;
+  const kv = env.CONFIGS;
+  const counted = {
+    get: (...a) => { ops++; return kv.get(...a); },
+    put: (...a) => { ops++; return kv.put(...a); },
+    delete: (...a) => { ops++; return kv.delete(...a); },
+    list: (...a) => { ops++; return kv.list(...a); },
+  };
+  // stampListVisibilityIfNeeded and getCreator take an env, not a namespace.
+  const countedEnv = { ...env, CONFIGS: counted };
+
+  ops++; // readPublicIndexBuildState's own get
+  const state = await readPublicIndexBuildState(env);
+  const seen = new Set(state.entries.map((e) => e && e.id).filter(Boolean));
 
   // Search matches against the creator's display name too, so the index has
-  // to carry it. Cached per username: creators are far fewer than lists, and
-  // without this the rebuild would do a second get for every list.
-  const displayNameCache = new Map();
+  // to carry it. Cached across chunks in the build state -- creators are far
+  // fewer than lists, and without this the rebuild would do a second get for
+  // every list, every time.
+  const inFlightNames = new Map();
   async function resolveDisplayName(username) {
-    if (displayNameCache.has(username)) return displayNameCache.get(username);
-    let name = username;
+    if (Object.prototype.hasOwnProperty.call(state.names, username)) return state.names[username];
+    // Two workers in the same batch can miss on the same username; only one
+    // of them should pay for the lookup.
+    if (inFlightNames.has(username)) return inFlightNames.get(username);
+    const p = (async () => {
+      let name = username;
+      try {
+        const profileRaw = await getCreator(countedEnv, username);
+        if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+      } catch {
+        // fall back to the raw username slug
+      }
+      state.names[username] = name;
+      return name;
+    })();
+    inFlightNames.set(username, p);
     try {
-      const profileRaw = await getCreator(env, username);
-      if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
-    } catch {
-      // fall back to the raw username slug
+      return await p;
+    } finally {
+      inFlightNames.delete(username);
     }
-    displayNameCache.set(username, name);
-    return name;
   }
 
-  const creatorKeys = await listAllKeys(env.CONFIGS, "creatorlist:");
-  for (const k of creatorKeys.keys) {
-    const rest = k.name.slice("creatorlist:".length);
-    const sep = rest.indexOf(":");
-    if (sep === -1) continue;
-    const username = rest.slice(0, sep);
-    const slug = rest.slice(sep + 1);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  async function buildEntry(phase, keyName) {
+    const prefix = PUBLIC_INDEX_BUILD_PREFIXES[phase];
+    const rest = keyName.slice(prefix.length);
+    let username = "user";
+    let slug = rest;
+    let id = `a:${rest}`;
+    if (phase === 0) {
+      const sep = rest.indexOf(":");
+      if (sep === -1) return null;
+      username = rest.slice(0, sep);
+      slug = rest.slice(sep + 1);
+      id = `c:${username}:${slug}`;
+    }
+    if (seen.has(id)) return null;
+    const raw = await counted.get(keyName);
+    if (!raw) return null;
     try {
       const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `c:${username}:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
+      await stampListVisibilityIfNeeded(countedEnv, keyName, data);
+      if (!isPublicListVisibility(data.visibility)) return null;
+      return {
         id,
-        isCreator: true,
+        isCreator: phase === 0,
         username,
-        creatorName: await resolveDisplayName(username),
+        ...(phase === 0 ? { creatorName: await resolveDisplayName(username) } : {}),
         slug,
         name: data.name || "List",
         type: data.type || "mixed",
-        itemCount,
+        itemCount: Array.isArray(data.items) ? data.items.length : (data.itemCount || 0),
         likes: data.likes || 0,
         updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      };
     } catch {
       // skip unparseable record
+      return null;
     }
   }
 
-  const anonKeys = await listAllKeys(env.CONFIGS, "publishedlist:user:");
-  for (const k of anonKeys.keys) {
-    const slug = k.name.slice("publishedlist:user:".length);
-    const raw = await env.CONFIGS.get(k.name);
-    if (!raw) continue;
+  let scanned = 0;
+
+  // Outer loop: keep taking work until the budget runs out or every prefix is
+  // exhausted. A small deployment finishes all of this in a single chunk, so
+  // its behaviour is exactly what it was before.
+  while (state.phase < PUBLIC_INDEX_BUILD_PREFIXES.length && ops < opBudget) {
+    if (!state.pending.length) {
+      if (state.cursor === null) {
+        // This prefix is finished; move to the next one.
+        state.phase++;
+        state.cursor = "";
+        continue;
+      }
+      const listOpts = { prefix: PUBLIC_INDEX_BUILD_PREFIXES[state.phase], limit: PUBLIC_INDEX_BUILD_PAGE };
+      if (state.cursor) listOpts.cursor = state.cursor;
+      const res = await counted.list(listOpts);
+      state.pending = (res.keys || []).map((k) => k.name);
+      state.cursor = (res.list_complete || !res.cursor) ? null : res.cursor;
+      if (!state.pending.length) continue;
+    }
+
+    // Claim keys from the head of `pending` in bounded-concurrency batches,
+    // stopping as soon as the budget is gone. Workers claim strictly in
+    // order, so everything before `next` was fully processed and everything
+    // from `next` on is still owed -- which is what gets persisted.
+    const phase = state.phase;
+    const batch = state.pending;
+    let next = 0;
+    const collected = [];
+    const worker = async () => {
+      while (next < batch.length && ops < opBudget) {
+        const keyName = batch[next++];
+        const entry = await buildEntry(phase, keyName);
+        if (entry) collected.push(entry);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PUBLIC_INDEX_BUILD_CONCURRENCY, batch.length) }, worker)
+    );
+    scanned += next;
+    state.pending = batch.slice(next);
+
+    for (const entry of collected) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      state.entries.push(entry);
+    }
+    // Bound the state blob the same way the published index is bounded, so a
+    // very large deployment cannot grow it past what KV will hold.
+    if (state.entries.length > PUBLIC_INDEX_MAX) {
+      state.entries = sortPublicIndexEntries(state.entries).slice(0, PUBLIC_INDEX_MAX);
+      seen.clear();
+      for (const e of state.entries) seen.add(e.id);
+    }
+  }
+
+  if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
+    const trimmed = await writePublicListIndex(env, state.entries);
     try {
-      const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(env, k.name, data);
-      if (!isPublicListVisibility(data.visibility)) continue;
-      const itemCount = Array.isArray(data.items) ? data.items.length : (data.itemCount || 0);
-      const id = `a:${slug}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      entries.push({
-        id,
-        isCreator: false,
-        username: "user",
-        slug,
-        name: data.name || "List",
-        type: data.type || "mixed",
-        itemCount,
-        likes: data.likes || 0,
-        updatedAt: data.updatedAt || data.createdAt || null,
-      });
+      await kv.delete(PUBLIC_INDEX_BUILD_KEY);
     } catch {
-      // skip unparseable record
+      // A stranded build state is harmless: the next rebuild that starts
+      // from it simply resumes a scan whose result is already published,
+      // and readPublicListIndex short-circuits before ever getting there.
     }
+    return { done: true, entries: trimmed, scanned, ops, entriesSoFar: trimmed.length };
   }
 
-  return await writePublicListIndex(env, entries);
+  await kv.put(PUBLIC_INDEX_BUILD_KEY, JSON.stringify(state));
+  return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
 }
 
 // Returns index entries, rebuilding if absent. `ctx` (optional) lets the
@@ -1586,19 +1742,36 @@ async function getPublicListIndex(env, ctx) {
   }
   if (!gotLock) return null;
 
+  // One chunk per call -- see rebuildPublicListIndex. A small deployment
+  // finishes in this one chunk and gets its index immediately; a large one
+  // makes bounded progress and is served the legacy scan meanwhile, with the
+  // cron carrying the build to completion.
+  const runChunk = async () => {
+    try {
+      return await rebuildPublicListIndex(env);
+    } catch (err) {
+      console.error("public list index rebuild failed:", err);
+      return null;
+    } finally {
+      // Released as soon as the chunk ends rather than left to expire: a
+      // rebuild now takes many chunks, and sitting on the lock for its full
+      // 60s TTL would cap progress at one chunk a minute for no benefit. The
+      // TTL stays as the backstop for a chunk that dies outright.
+      try {
+        await env.CONFIGS.delete("lock:publiclistindex");
+      } catch {
+        // Expiry will clear it.
+      }
+    }
+  };
+
   if (ctx && typeof ctx.waitUntil === "function") {
     // Rebuild in the background; serve this request from the legacy scan.
-    ctx.waitUntil(rebuildPublicListIndex(env).catch((err) => {
-      console.error("public list index rebuild failed:", err);
-    }));
+    ctx.waitUntil(runChunk());
     return null;
   }
-  try {
-    return await rebuildPublicListIndex(env);
-  } catch (err) {
-    console.error("public list index rebuild failed:", err);
-    return null;
-  }
+  const res = await runChunk();
+  return res && res.done ? res.entries : null;
 }
 
 // Pages a whole prefix, following the cursor to completion.

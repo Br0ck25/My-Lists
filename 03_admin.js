@@ -2319,17 +2319,35 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    // The endpoint does one bounded chunk per call (see its own comment for
+    // why a rebuild cannot be one pass), so this loops until it reports
+    // done -- the same shape as runMigrateDayCounts above.
     async function runRebuildPublicIndex() {
       const btn = document.getElementById('rebuildIndexBtn');
       const status = document.getElementById('rebuildIndexStatus');
       btn.disabled = true;
       status.textContent = 'Working\u2026';
+      const started = Date.now();
+      let scanned = 0;
+      let safetyCounter = 0;
       try {
-        const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
-        const data = await res.json();
-        status.textContent = data.ok
-          ? ('Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') + ' in ' + data.ms + 'ms.')
-          : ('Failed: ' + (data.error || 'unknown error'));
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
+          scanned += data.scanned || 0;
+          if (data.done) {
+            status.textContent = 'Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') +
+              ' from ' + scanned + ' record' + (scanned === 1 ? '' : 's') + ' in ' + (Date.now() - started) + 'ms.';
+            break;
+          }
+          status.textContent = 'Working\u2026 ' + scanned + ' record' + (scanned === 1 ? '' : 's') +
+            ' scanned, ' + data.count + ' indexed so far.';
+        }
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

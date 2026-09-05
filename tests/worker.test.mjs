@@ -583,6 +583,179 @@ describe("directory pagination", () => {
   });
 });
 
+// Cloudflare aborts a Worker invocation after 1,000 subrequests, and KV
+// reads count. The index rebuild used to be a single unbounded pass at
+// roughly two reads per list, so past ~500 public lists it threw partway,
+// the throw was swallowed by the ctx.waitUntil(...).catch(...) at its only
+// call sites, the index was never written, and /lists/public.json fell back
+// to the legacy bounded scan -- the alphabetically-first 100 creators,
+// permanently, with nothing logged that a user or operator would ever see.
+//
+// These tests run the rebuild against a KV that enforces the real limit, so
+// a regression to any single-pass scan fails here instead of silently in
+// production.
+describe("audit fix: the public list index rebuilds at any scale", () => {
+  // Throws exactly the way the runtime does once an invocation has spent
+  // its subrequest budget. Reset between invocations, never within one.
+  function cappedKv(initial = {}, cap = 1000) {
+    const inner = makeKv(initial);
+    let n = 0;
+    let peak = 0;
+    const charge = () => {
+      n += 1;
+      if (n > peak) peak = n;
+      if (n > cap) throw new Error("Too many subrequests.");
+    };
+    return {
+      _store: inner._store,
+      _resetInvocation: () => { n = 0; },
+      _peak: () => peak,
+      async get(...a) { charge(); return inner.get(...a); },
+      async put(...a) { charge(); return inner.put(...a); },
+      async delete(...a) { charge(); return inner.delete(...a); },
+      async list(...a) { charge(); return inner.list(...a); },
+    };
+  }
+
+  function seedPublicLists(store, count) {
+    for (let i = 0; i < count; i++) {
+      const username = `user${String(i).padStart(5, "0")}`;
+      store.set(`creator:${username}`, JSON.stringify({
+        displayName: `Real ${username}`, keyHash: "pbkdf2:1:00:00", createdAt: 1,
+      }));
+      store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: i % 7, createdAt: 1, updatedAt: 1,
+      }));
+    }
+  }
+
+  // Drives cron-shaped ticks until the index lands. Each tick is a separate
+  // invocation, so each gets a fresh subrequest budget -- which is the whole
+  // point of chunking the rebuild.
+  async function driveToCompletion(env, kv, maxTicks = 200) {
+    for (let tick = 1; tick <= maxTicks; tick++) {
+      kv._resetInvocation();
+      kv._store.delete("lock:publiclistindex");
+      await call(env, "/lists/public.json");
+      if (kv._store.has("index:publiclists")) return tick;
+    }
+    return -1;
+  }
+
+  it("indexes every list past the point a single-pass scan died", async () => {
+    const n = 1000;
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+
+    const ticks = await driveToCompletion(env, kv);
+    assert.notEqual(ticks, -1, "index never completed");
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+
+    kv._resetInvocation();
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n, `directory reports ${listing.body.total} of ${n} lists`);
+  });
+
+  it("survives invisible records that cost a read but never reach the directory", async () => {
+    // rebuildPublicListIndex must read a record before it can test
+    // visibility, so a private list costs the same as a public one.
+    // /api/publish-list is unauthenticated and its records default to
+    // private, which made this a way to break the directory on purpose:
+    // ~900 of them took a 20-list deployment past the limit for good.
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, 20);
+    for (let i = 0; i < 900; i++) {
+      kv._store.set(`publishedlist:user:junk-${i}`, JSON.stringify({
+        name: "junk", visibility: "private", items: [{ id: "tt0111161" }],
+      }));
+    }
+    const env = makeEnv({ CONFIGS: kv });
+
+    assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+
+    kv._resetInvocation();
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, 20, "the 20 real lists must still all be listed");
+  });
+
+  it("publishes the index only once, and cleans up after itself", async () => {
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, 700);
+    const env = makeEnv({ CONFIGS: kv });
+
+    await driveToCompletion(env, kv);
+    // A partial scan must never be published as though it were complete,
+    // and the resume state must not outlive the build that used it.
+    assert.equal(kv._store.has("index:publiclists:build"), false, "build state leaked");
+    const settled = kv._store.get("index:publiclists");
+    for (let i = 0; i < 3; i++) {
+      kv._resetInvocation();
+      await call(env, "/lists/public.json");
+    }
+    assert.equal(kv._store.get("index:publiclists"), settled, "a completed index was rebuilt needlessly");
+  });
+
+  it("restarts cleanly from unparseable or stale resume state", async () => {
+    for (const bad of ["{not json", JSON.stringify({ v: 0, phase: 99 })]) {
+      const kv = cappedKv({}, 1000);
+      seedPublicLists(kv._store, 200);
+      kv._store.set("index:publiclists:build", bad);
+      const env = makeEnv({ CONFIGS: kv });
+      assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
+      kv._resetInvocation();
+      const listing = await call(env, "/lists/public.json?limit=500");
+      assert.equal(listing.body.total, 200, `stale state ${bad.slice(0, 12)} lost lists`);
+    }
+  });
+
+  it("loses nothing and duplicates nothing under concurrent rebuild attempts", async () => {
+    const n = 900;
+    // Deliberately NOT the capped KV here: five concurrent requests are five
+    // separate Worker invocations with five separate subrequest budgets, and
+    // a single shared counter would model that wrongly. The budget is
+    // covered by the tests above; this one is about the lock and the resume
+    // state holding up when chunks race.
+    const kv = makeKv();
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+
+    for (let round = 0; round < 60 && !kv._store.has("index:publiclists"); round++) {
+      kv._store.delete("lock:publiclistindex");
+      await Promise.all([0, 1, 2, 3, 4].map(() => call(env, "/lists/public.json")));
+    }
+    const entries = JSON.parse(kv._store.get("index:publiclists") || '{"entries":[]}').entries;
+    assert.equal(entries.length, n);
+    assert.equal(new Set(entries.map((e) => e.id)).size, n, "duplicate entries in the index");
+  });
+
+  it("/admin/api/rebuild-public-index reports progress and finishes across calls", async () => {
+    const n = 1500;
+    const kv = cappedKv({}, 1000);
+    seedPublicLists(kv._store, n);
+    const env = makeEnv({ CONFIGS: kv });
+    const cookie = await adminCookie(env);
+
+    let calls = 0;
+    let scanned = 0;
+    let last;
+    do {
+      calls += 1;
+      kv._resetInvocation();
+      last = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+      assert.equal(last.body.ok, true);
+      scanned += last.body.scanned || 0;
+    } while (!last.body.done && calls < 100);
+
+    assert.equal(last.body.done, true, "rebuild never reported done");
+    assert.equal(last.body.count, n);
+    assert.ok(scanned >= n, `scanned ${scanned}, expected at least ${n}`);
+    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+  });
+});
+
 describe("likes and preview guards", () => {
   it("rejects like-external URLs off the provider allowlist", async () => {
     const env = makeEnv();

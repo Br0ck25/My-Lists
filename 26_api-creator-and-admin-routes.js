@@ -3393,30 +3393,41 @@
       return json({ ok: true, results });
     }
 
-    // /admin/api/rebuild-public-index  (POST) -> { ok, count, ms }
-    // Forces an immediate, synchronous rebuild of index:publiclists (see
-    // getPublicListIndex/rebuildPublicListIndex, 02_http-and-creator-
-    // utils.js) instead of waiting for it to happen lazily. Without this,
-    // a fresh deployment -- or the index key being lost some other way --
-    // serves every visitor of /lists/public.json and list search a
-    // truncated, lexicographically-biased result (capped at 150/250/80
-    // keys) for however long the lazy background rebuild takes to finish,
-    // which scales with how many lists exist. scheduled() below also
-    // triggers this same rebuild automatically whenever the index is
-    // found missing (self-healing within one cron interval even with no
-    // admin action), so this endpoint is for an immediate, verifiable
-    // seed right after a fresh deploy rather than the only way it happens.
-    // Safe to run any time, repeatedly -- it's the exact same full rebuild
-    // the lazy/cron paths already do, just awaited here instead of
-    // deferred.
+    // /admin/api/rebuild-public-index  (POST) -> { ok, done, count, scanned, ms }
+    // Drives a rebuild of index:publiclists (see getPublicListIndex/
+    // rebuildPublicListIndex, 02_http-and-creator-utils.js) on demand
+    // instead of waiting for it to happen lazily. Without this, a fresh
+    // deployment -- or the index key being lost some other way -- serves
+    // every visitor of /lists/public.json and list search a truncated,
+    // lexicographically-biased result (capped at 150/250/80 keys) until
+    // the build finishes. scheduled() below drives the same build
+    // automatically whenever the index is found missing (self-healing
+    // without any admin action), so this endpoint is for an immediate,
+    // verifiable seed right after a fresh deploy rather than the only way
+    // it happens.
+    //
+    // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
+    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // several passes. Keep calling until `done` is true -- exactly like
+    // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
+    // does that loop for you. A chunk here gets a bigger op budget than the
+    // cron's, since this request has the invocation to itself. Safe to run
+    // any time, repeatedly: progress is idempotent and the live index is
+    // only replaced once the final chunk lands.
     if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
       const started = Date.now();
       try {
-        const entries = await rebuildPublicListIndex(env);
-        return json({ ok: true, count: (entries || []).length, ms: Date.now() - started });
+        const res = await rebuildPublicListIndex(env, { opBudget: PUBLIC_INDEX_BUILD_OPS_ADMIN });
+        return json({
+          ok: true,
+          done: !!res.done,
+          count: res.entriesSoFar,
+          scanned: res.scanned,
+          ms: Date.now() - started,
+        });
       } catch (e) {
         return json({ ok: false, error: "Rebuild failed: " + (e && e.message ? e.message : String(e)) }, 500);
       }
@@ -4137,12 +4148,17 @@ export default {
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never
         // visits /admin from serving every visitor a truncated,
-        // lexicographically-biased directory/search result indefinitely:
-        // it self-heals within one cron interval instead of only on
-        // whichever live request happens to hit the cold index first. See
-        // getPublicListIndex's own comment; /admin/api/rebuild-public-index
-        // does the same rebuild on demand, synchronously, for an
-        // immediate/verifiable seed right after a fresh deploy.
+        // lexicographically-biased directory/search result indefinitely,
+        // instead of relying on whichever live request happens to hit the
+        // cold index first.
+        //
+        // One bounded chunk per tick, not a whole rebuild (see
+        // rebuildPublicListIndex): a small deployment is done on the first
+        // tick, a large one converges over the following few hours. That is
+        // the point -- the previous single-pass version simply threw and
+        // rebuilt nothing at all once there were more than ~500 lists.
+        // /admin/api/rebuild-public-index drives the same chunks back to
+        // back for an immediate seed right after a fresh deploy.
         getPublicListIndex(env, ctx),
       ])
     );
