@@ -3954,6 +3954,32 @@
       if (!bulkBody || !Array.isArray(bulkBody.items)) {
         return json({ ok: false, error: "Expected an `items` array." }, 400);
       }
+      // Unauthenticated, and unlike every other TMDB route here this one
+      // has no per-user key override at all -- it ALWAYS spends the Worker
+      // owner's shared TMDB_API_KEY (see the comment on tmdbCallCount
+      // below). Two things were missing:
+      //
+      // 1. A bound on `items`. The loop below issues up to two TMDB calls
+      //    per item, so a single request with a few thousand items blew
+      //    straight past Cloudflare's per-invocation subrequest limit --
+      //    which meant large Letterboxd imports were already failing here
+      //    -- while spending the owner's TMDB quota on the way.
+      // 2. A rate limit, so the same request cannot simply be repeated.
+      //
+      // The cap rejects rather than truncates: silently resolving the
+      // first N films of an import and dropping the rest is exactly the
+      // kind of quiet data loss this audit was about. The client chunks
+      // its own requests to this size (see resolveViaBulkResolve,
+      // 18_client-copy-and-trakt-export.js), so a real import of any size
+      // still completes -- it just arrives as several bounded calls.
+      const bulkIp = clientIpKey(request);
+      if (!bulkIp) return json({ ok: false, error: "Could not resolve those titles." }, 400);
+      if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
+        return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
+      }
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
+      }
       try {
         const body = bulkBody;
         const items = body.items || [];

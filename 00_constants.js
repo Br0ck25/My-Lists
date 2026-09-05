@@ -32,6 +32,15 @@ const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
+// --- Bound on /api/bulk-resolve's fan-out ------------------------------------
+//
+// That endpoint issues up to two TMDB calls per item and always uses the
+// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
+// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
+// the request. Shared with the client so the chunk size it sends and the
+// size the server accepts cannot drift apart.
+const BULK_RESOLVE_ITEMS_MAX = 200;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

@@ -1098,6 +1098,32 @@ function clientIpKey(request) {
   return ip.toLowerCase();
 }
 
+// --- Shared per-IP rate limiter --------------------------------------------
+//
+// The same IP-keyed 60-second KV slot /api/preview, /api/creator/create,
+// /api/creator/restore and /admin/login each grew their own copy of. Pulled
+// out because the endpoints that spend THIS Worker owner's provider quota
+// (rather than the caller's own key) all need it and all want it to behave
+// identically.
+//
+// Returns true when the caller is over budget and the request should stop.
+// Follows the convention the existing call sites already established:
+// skipped entirely when CONFIGS isn't bound (every KV-optional feature here
+// degrades rather than fails closed), and the increment rides on
+// ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
+// request it is protecting. Callers check for a missing client IP
+// themselves, since what to return in that case is route-specific.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+  if (!env || !env.CONFIGS || !ip) return false;
+  const key = `ratelimit:${bucket}:${ip}`;
+  const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
+  if (used >= maxPerWindow) return true;
+  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
+  else await write;
+  return false;
+}
+
 async function likeVoterId(request, env, creatorUsername, scopeId) {
   if (creatorUsername) return `u:${creatorUsername}`;
   const ip = clientIpKey(request);

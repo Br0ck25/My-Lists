@@ -1727,3 +1727,101 @@ describe("audit fix 8: handlePosterImgError works for every call site's markup",
     assert.ok(wrap.children.some((c) => String(c.className).includes("live-preview-poster-placeholder")));
   });
 });
+
+describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
+  it("rejects a bulk-resolve request larger than the server's fan-out cap", async () => {
+    const env = makeEnv();
+    const items = Array.from({ length: 500 }, (_, i) => ({ title: "Film " + i, year: 2000 }));
+    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items } });
+    // Two TMDB calls per item: 500 items would have been ~1,000 subrequests,
+    // past Cloudflare's per-invocation limit, on the owner's shared key.
+    assert.equal(r.status, 413);
+  });
+
+  it("rate-limits repeated bulk-resolve calls from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 25; i++) {
+      const r = await call(env, "/api/bulk-resolve", {
+        method: "POST", ip, json: { items: [{ title: "X", year: 2000 }] },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 25 rapid calls");
+  });
+
+  it("rate-limits /api/details/batch only when it falls back to the shared TMDB key", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let sharedLimited = 0;
+    for (let i = 0; i < 70; i++) {
+      const r = await call(env, "/api/details/batch", { method: "POST", ip, json: { ids: ["tt1"] } });
+      if (r.status === 429) sharedLimited++;
+    }
+    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+
+    // A visitor who supplied their own key spends their own quota, so the
+    // limit must not apply to them -- throttling them would penalise
+    // exactly the users who bothered to configure a key.
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 70; i++) {
+      const r = await call(env, "/api/details/batch", {
+        method: "POST", ip: ownKeyIp, json: { ids: ["tt1"], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0, "callers using their own TMDB key must never be rate-limited");
+  });
+
+  it("rate-limits /api/recommendations only when it falls back to the shared TMDB key", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", { method: "POST", ip, json: { movieIds: [] } });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0);
+  });
+
+  it("client chunks bulk-resolve to exactly the size the server accepts", () => {
+    // The chunk size is interpolated from the same server constant the
+    // route validates against, so the two cannot drift apart.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "18_client-copy-and-trakt-export.js"), "utf8");
+    assert.match(src, /const CHUNK = \$\{BULK_RESOLVE_ITEMS_MAX\};/,
+      "the client chunk size must come from BULK_RESOLVE_ITEMS_MAX, not a hardcoded number");
+    const constants = fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8");
+    const m = constants.match(/const BULK_RESOLVE_ITEMS_MAX = (\d+);/);
+    assert.ok(m, "BULK_RESOLVE_ITEMS_MAX should be defined in 00_constants.js");
+    // ~2 TMDB calls per item must stay well inside Cloudflare's 1,000
+    // subrequests per invocation.
+    assert.ok(Number(m[1]) * 2 < 900, "the cap must leave subrequest headroom");
+  });
+
+  it("leaves caller-credentialed provider endpoints unthrottled", async () => {
+    // These spend the CALLER's provider quota (they 400 without a token),
+    // so a limit here would only break large legitimate history syncs.
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 30; i++) {
+      const r = await call(env, "/api/trakt-history-raw", {
+        method: "POST", ip, json: { accessToken: "" },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.equal(limited, 0);
+  });
+});

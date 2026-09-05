@@ -82,6 +82,15 @@ const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
+// --- Bound on /api/bulk-resolve's fan-out ------------------------------------
+//
+// That endpoint issues up to two TMDB calls per item and always uses the
+// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
+// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
+// the request. Shared with the client so the chunk size it sends and the
+// size the server accepts cannot drift apart.
+const BULK_RESOLVE_ITEMS_MAX = 200;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -2637,6 +2646,32 @@ function clientIpKey(request) {
     return prefix.join(":") + "::/64";
   }
   return ip.toLowerCase();
+}
+
+// --- Shared per-IP rate limiter --------------------------------------------
+//
+// The same IP-keyed 60-second KV slot /api/preview, /api/creator/create,
+// /api/creator/restore and /admin/login each grew their own copy of. Pulled
+// out because the endpoints that spend THIS Worker owner's provider quota
+// (rather than the caller's own key) all need it and all want it to behave
+// identically.
+//
+// Returns true when the caller is over budget and the request should stop.
+// Follows the convention the existing call sites already established:
+// skipped entirely when CONFIGS isn't bound (every KV-optional feature here
+// degrades rather than fails closed), and the increment rides on
+// ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
+// request it is protecting. Callers check for a missing client IP
+// themselves, since what to return in that case is route-specific.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+  if (!env || !env.CONFIGS || !ip) return false;
+  const key = `ratelimit:${bucket}:${ip}`;
+  const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
+  if (used >= maxPerWindow) return true;
+  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
+  else await write;
+  return false;
 }
 
 async function likeVoterId(request, env, creatorUsername, scopeId) {
@@ -20919,6 +20954,39 @@ async function markSimklListAllWatched(btn) {
   }
 }
 
+// Sends an arbitrarily large title list to /api/bulk-resolve in bounded
+// chunks and returns every resolved row together.
+//
+// That endpoint issues up to two TMDB calls per item and always spends the
+// Worker owner's shared key, so it now caps a single request at
+// BULK_RESOLVE_ITEMS_MAX (see 00_constants.js). Sending a whole category
+// in one request, as this used to, exceeded Cloudflare's per-invocation
+// subrequest limit well before the cap existed -- so a big Letterboxd
+// import did not partly work, it failed the category outright. Chunking
+// makes an import of any size succeed as several bounded calls, and the
+// chunk size comes from the same constant the server validates against so
+// the two cannot drift apart.
+//
+// Throws on the first failed chunk, matching the previous single-request
+// behaviour: each caller already has its own catch that reports the
+// category as failed rather than silently importing half of it.
+async function bulkResolveInChunks(items) {
+  const list = Array.isArray(items) ? items : [];
+  const CHUNK = ${BULK_RESOLVE_ITEMS_MAX};
+  const out = [];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const res = await fetch(ORIGIN + '/api/bulk-resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: list.slice(i, i + CHUNK) }),
+    });
+    const data = await res.json();
+    if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
+    if (Array.isArray(data.resolved)) out.push.apply(out, data.resolved);
+  }
+  return out;
+}
+
 // --- Import from Trakt export --------------------------------------------
 //
 // Trakt VIP's own export (Settings > Data > Export on trakt.tv) is a .zip
@@ -21422,15 +21490,9 @@ window.runLetterboxdExportImport = async function() {
     // Bulk resolve
     const resolvedItems = [];
     try {
-      const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: uniqueItems }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'unknown error');
-      
-      for (const m of data.resolved) {
+      const resolvedAll = await bulkResolveInChunks(uniqueItems);
+
+      for (const m of resolvedAll) {
         if (!m.imdbId) continue;
         resolvedItems.push({
           imdbId: m.imdbId,
@@ -22032,29 +22094,25 @@ async function runUnifiedListImport() {
     const toResolve = rawItems.filter(it => !it.imdbId && it.title);
     if (toResolve.length > 0) {
       try {
-        const res = await fetch(ORIGIN + '/api/bulk-resolve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: toResolve }),
+        const resolvedAll = await bulkResolveInChunks(toResolve);
+        const resolvedMap = new Map();
+        resolvedAll.forEach(r => {
+          if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
         });
-        const data = await res.json();
-        if (data.ok && Array.isArray(data.resolved)) {
-          const resolvedMap = new Map();
-          data.resolved.forEach(r => {
-            if (r.title) resolvedMap.set((r.title + '|' + (r.year || '')).toLowerCase(), r);
-          });
-          rawItems.forEach(it => {
-            if (!it.imdbId && it.title) {
-              const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
-              if (found && found.imdbId) {
-                it.imdbId = found.imdbId;
-                it.id = found.imdbId;
-                it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
-              }
+        rawItems.forEach(it => {
+          if (!it.imdbId && it.title) {
+            const found = resolvedMap.get((it.title + '|' + it.year).toLowerCase());
+            if (found && found.imdbId) {
+              it.imdbId = found.imdbId;
+              it.id = found.imdbId;
+              it.poster = 'https://images.metahub.space/poster/medium/' + found.imdbId + '/img';
             }
-          });
-        }
-      } catch (e) {}
+          }
+        });
+      } catch (e) {
+        // Same as before: an unresolved title keeps whatever metadata it
+        // already had and the import continues.
+      }
     }
 
     const finalItems = rawItems.map(it => ({
@@ -48106,6 +48164,18 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
+      // Up to 24 ids, each costing a find + a recommendations call, so a
+      // single request is ~48 TMDB calls. Limited only when it falls back
+      // to the shared key, same reasoning as /api/details/batch above.
+      // The Discover tab issues one of these per load, so 30/minute is far
+      // more than any real session needs.
+      if (!body.tmdbKey) {
+        const recIp = clientIpKey(request);
+        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
+          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+        }
+      }
 
       const [movieLists, showLists] = await Promise.all([
         Promise.all(movieIds.map(async (rawId) => {
@@ -52088,6 +52158,19 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
+      // Rate-limited only when this falls back to the Worker owner's shared
+      // TMDB key. A visitor who supplied their own is spending their own
+      // quota, so there is nothing here to protect them from -- and
+      // throttling them would break exactly the power users who set a key
+      // up. 60/minute leaves plenty of room for the real bulk caller
+      // (refreshAiringNext pages a large Watch History 60 ids at a time).
+      if (!reqBody.tmdbKey) {
+        const batchIp = clientIpKey(request);
+        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
+          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
+        }
+      }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";
       const region = reqBody.region || "";
@@ -56101,6 +56184,32 @@ self.addEventListener('fetch', e => {
       }
       if (!bulkBody || !Array.isArray(bulkBody.items)) {
         return json({ ok: false, error: "Expected an `items` array." }, 400);
+      }
+      // Unauthenticated, and unlike every other TMDB route here this one
+      // has no per-user key override at all -- it ALWAYS spends the Worker
+      // owner's shared TMDB_API_KEY (see the comment on tmdbCallCount
+      // below). Two things were missing:
+      //
+      // 1. A bound on `items`. The loop below issues up to two TMDB calls
+      //    per item, so a single request with a few thousand items blew
+      //    straight past Cloudflare's per-invocation subrequest limit --
+      //    which meant large Letterboxd imports were already failing here
+      //    -- while spending the owner's TMDB quota on the way.
+      // 2. A rate limit, so the same request cannot simply be repeated.
+      //
+      // The cap rejects rather than truncates: silently resolving the
+      // first N films of an import and dropping the rest is exactly the
+      // kind of quiet data loss this audit was about. The client chunks
+      // its own requests to this size (see resolveViaBulkResolve,
+      // 18_client-copy-and-trakt-export.js), so a real import of any size
+      // still completes -- it just arrives as several bounded calls.
+      const bulkIp = clientIpKey(request);
+      if (!bulkIp) return json({ ok: false, error: "Could not resolve those titles." }, 400);
+      if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
+        return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
+      }
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+        return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       try {
         const body = bulkBody;

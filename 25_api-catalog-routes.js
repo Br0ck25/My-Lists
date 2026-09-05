@@ -1736,6 +1736,18 @@ self.addEventListener('fetch', e => {
       const movieIds = Array.isArray(body.movieIds) ? body.movieIds.slice(0, 12) : [];
       const showIds = Array.isArray(body.showIds) ? body.showIds.slice(0, 12) : [];
       const tmdbKey = body.tmdbKey || TMDB_API_KEY;
+      // Up to 24 ids, each costing a find + a recommendations call, so a
+      // single request is ~48 TMDB calls. Limited only when it falls back
+      // to the shared key, same reasoning as /api/details/batch above.
+      // The Discover tab issues one of these per load, so 30/minute is far
+      // more than any real session needs.
+      if (!body.tmdbKey) {
+        const recIp = clientIpKey(request);
+        if (!recIp) return json({ ok: false, error: "Could not load recommendations." }, 400);
+        if (await consumeRateLimit(env, ctx, "recommendations", recIp, 30)) {
+          return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+        }
+      }
 
       const [movieLists, showLists] = await Promise.all([
         Promise.all(movieIds.map(async (rawId) => {
@@ -5718,6 +5730,19 @@ self.addEventListener('fetch', e => {
       if (!ids.length) return json({ ok: false, error: "Missing ids" }, 400);
 
       const tmdbKey = reqBody.tmdbKey || TMDB_API_KEY;
+      // Rate-limited only when this falls back to the Worker owner's shared
+      // TMDB key. A visitor who supplied their own is spending their own
+      // quota, so there is nothing here to protect them from -- and
+      // throttling them would break exactly the power users who set a key
+      // up. 60/minute leaves plenty of room for the real bulk caller
+      // (refreshAiringNext pages a large Watch History 60 ids at a time).
+      if (!reqBody.tmdbKey) {
+        const batchIp = clientIpKey(request);
+        if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
+        if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, 60)) {
+          return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
+        }
+      }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
       const wantType = reqBody.type || "";
       const region = reqBody.region || "";
