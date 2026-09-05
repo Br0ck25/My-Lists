@@ -12,9 +12,9 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 9 of 16 findings closed** (all 4 production blockers, the client-bundle
+**Progress: 10 of 16 findings closed** (all 4 production blockers, the client-bundle
 duplicate-declaration class, the shared-key fan-out endpoints, the admin Community Lists
-panel, the undocumented secret, and the build-header fragility).
+panel, the counter atomicity, the undocumented secret, and the build-header fragility).
 
 ---
 
@@ -31,6 +31,7 @@ panel, the undocumented secret, and the build-header fragility).
 | 5 | Unauthenticated endpoints spending the Worker owner's shared provider quota were unbounded; `/api/bulk-resolve` also had no cap on `items` at all | 🟠 Medium | 2026-09-05 | `f2aea3a` | `audit fix 5` (6 tests) |
 | 10 | Admin "Top Community Lists" was permanently **empty** without D1, and mis-ranked when it wasn't | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 10` (3 tests) |
 | 14 | `MDBLIST_CLIENT_SECRET` required but documented nowhere | 🟠 Medium | 2026-09-05 | `cab9aab` | `audit fix 14` (2 tests, incl. an all-env-vars guard) |
+| 9 | Stat counters were non-atomic read-modify-writes; 20 concurrent requests recorded as 1 | 🟠 Med-High | 2026-09-05 | `7321e7c` | `audit fix 9` (6 tests) |
 
 ### What changed, per fix
 
@@ -92,16 +93,41 @@ Two bugs, and the worse one was not the one originally reported.
 **14 — `MDBLIST_CLIENT_SECRET`** (`README.md`, `wrangler.toml`)
 Required by `/api/mdblist/oauth/callback`, absent from both setup docs, so following them exactly still produced "not configured". Now documented in both — and a test asserts **every** `env.*` var the Worker reads is named in the docs, closing the class rather than the instance.
 
+**9 — counter atomicity** (`schema.sql`, `migrations/0002`, `03_admin.js`, `26_`, `tests/harness.mjs`)
+Took option 3, the D1 fix. Measured lost-update rate before and after:
+
+| concurrent page views | KV records | D1 records |
+|---|---|---|
+| 5  | 1 (20%) | 5 (100%) |
+| 20 | 1 (5%)  | 20 (100%) |
+| 50 | 1 (2%)  | 50 (100%) |
+
+- `INSERT ... ON CONFLICT(kind, day) DO UPDATE SET n = n + excluded.n` — the shape `source_groups` has always used. That branch is left alone; it was already correct and has its own table, read path and migration.
+- Reads are D1-authoritative with a KV fallback **when the row is absent**, so binding D1 does not blank an existing dashboard before "Migrate KV → D1" runs. Deliberately *not* D1+KV summed — `migrate-d1` copies the value across, so summing would double every migrated counter.
+- `migrate-d1` gained a stats section using `DO NOTHING`, so pressing the button twice cannot double counts. Skips `sourcegroup:` (already migrated to its own table) and the JSON blobs at `stats:genres:alltime` / `stats:decades:alltime`.
+- Fixed a latent bug the change surfaced: the Installed Catalogs panel read `sourcegroup` counts from KV in both modes, so **with D1 bound the source-group installs it writes to `source_groups` never appeared there**. Both families now read through one helper that knows about both stores.
+
+> **Residual limitation, deliberate:** KV-only deployments (no `DB` binding) still use the
+> lossy read-modify-write. KV genuinely cannot do atomic increment, so the honest options
+> there are to bind D1 or read the numbers as approximate. A test pins that path so it
+> keeps working.
+>
+> **Still open within this finding:** `recordTrackedEvent` and `recordSearchQuery` remain
+> KV read-modify-writes. They store a JSON day-map blob plus a capped index array rather
+> than a plain integer, so moving them to D1 is a schema redesign rather than the same
+> one-line upsert — and their read fan-out is already bounded by `EVT_DAY_INDEX_CAP` /
+> `SEARCH_DAY_INDEX_CAP`. Tracked below.
+
 ---
 
 ## ⬜ Open — next up, in recommended order
 
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
-| 9 | Stat counters are non-atomic read-modify-writes | 🟠 Med-High | `03_admin.js` `bumpStat`/`bumpStatBy`/`recordTrackedEvent`/`recordSearchQuery` | 20 concurrent requests recorded as 1. Worsens with traffic (KV edge-cached reads + 1 write/sec/key). Fix = shard hot keys, or move counters to D1, or label the panels approximate. Needs a migration — the largest of the remaining items. |
 | 13 | No timeout on any of ~135 outbound fetches | 🟠 Medium | `02_` `fetchWithPerUserCacheUncoalesced`, `fetchTraktWithRetry` | A hung upstream stalls the request; the stale-fallback tiers only trigger on rejection. Fix = `AbortSignal.timeout` at the two shared helpers, not 135 call sites. |
 | 11 | N+1 KV reads on every playback ping | 🟠 Medium | `26_:~410` | Enumerates and reads every one of the creator's lists to find the watchlist; also has no cursor, so it truncates at 1,000. Fix = read `creatorlist:{u}:watchlist` directly, scan only as fallback. |
 | 12 | Orphaned KV on account deletion | 🟠 Low-Med | `02_` `purgeCreatorData` | `listlikevoters:{u}:*` and `scrobbleseenusers:{u}` survive deletion, so a recycled username inherits stale like counts. Also: the `creatortrack:` "legacy" comment is wrong — it is a live key. |
+| 9b | `recordTrackedEvent` / `recordSearchQuery` still use KV read-modify-write | 🟡 Low | `03_admin.js` | Carved out of finding 9: they store a JSON day-map blob plus a capped index array, so D1 means a schema redesign, not the same upsert. Read fan-out is already capped, so the leaderboards undercount rather than break. |
 | 6 | Creator key travels in the `/api/scrobble` query string | 🟡 Low | `26_:~448` | Largely forced (Plex/Jellyfin webhooks can't set headers). Fix = document the trade and the rotation path, don't redesign. |
 | 7 | ~40 handlers return raw `String(err.message)` | 🟡 Low | `25_`, `26_` | Leaks nothing today (all `throw`s are status-only) but contradicts the policy stated at `/api/bulk-resolve`. |
 | 15 | `FUNCTION-MAP.md` line numbers 26% stale (211 of 811) | 🟡 Low | `FUNCTION-MAP.md`, `gen_map.py` | Nothing regenerates or validates it. Fix = add to `verify.sh`/CI, or drop line numbers. |
