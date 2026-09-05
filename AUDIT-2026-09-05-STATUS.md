@@ -12,8 +12,8 @@ fix, so "what is still open" is always answerable from `main` alone.
 | ⬜ OPEN | Not started |
 | 🔎 ACCEPTED | Understood and deliberately not changing — reason recorded |
 
-**Progress: 6 of 16 findings closed** (all 4 production blockers, plus the client-bundle
-duplicate-declaration class and the build-header fragility).
+**Progress: 7 of 16 findings closed** (all 4 production blockers, the client-bundle
+duplicate-declaration class, the shared-key fan-out endpoints, and the build-header fragility).
 
 ---
 
@@ -27,6 +27,7 @@ duplicate-declaration class and the build-header fragility).
 | 4 | `/api/publish-list` + `/api/save`: unauthenticated, uncapped, permanent KV writes | 🔴 High | 2026-09-05 | `ff9cbfe` | `audit fix 4` (4 tests) |
 | 16 | `build.py` recovered its header from its own previous output, so editing `00_constants.js` made the build unrunnable | 🟡 Low | 2026-09-05 | `ff9cbfe` | `verify.sh` step 2 (header now in `header.js`, proven byte-identical) |
 | 8 | Duplicate `handlePosterImgError` in the client bundle; the losing definition was the one most call sites were written for | 🟠 Medium | 2026-09-05 | `ae5c52d` | `audit fix 8` (4 tests) + `html_checks.py` duplicate-declaration guard |
+| 5 | Unauthenticated endpoints spending the Worker owner's shared provider quota were unbounded; `/api/bulk-resolve` also had no cap on `items` at all | 🟠 Medium | 2026-09-05 | `f2aea3a` | `audit fix 5` (6 tests) |
 
 ### What changed, per fix
 
@@ -58,13 +59,24 @@ duplicate-declaration class and the build-header fragility).
 > that query and put the badge on screen at both widths at once. The fix and its
 > priority are unchanged.
 
+**5 — shared-key fan-out endpoints** (`00_`, `02_`, `18_`, `25_`, `26_`)
+- `/api/bulk-resolve` was the real problem, and worse than a missing rate limit: no per-user key override at all (always the owner's TMDB key) and **no cap on `items`**. At ~2 TMDB calls per item, a few thousand titles exceeded Cloudflare's per-invocation subrequest limit — so large Letterboxd imports were *already failing*, after spending the quota. Now capped at `BULK_RESOLVE_ITEMS_MAX` (200) and rate-limited.
+- The cap rejects rather than truncates, so the client chunks: `bulkResolveInChunks` (`18_`) sends any size as several bounded calls and merges results, using the same constant the server validates against. **An import that previously failed outright now completes.**
+- `/api/details/batch` and `/api/recommendations` are limited **only when they fall back to the shared key** — a caller using their own TMDB key spends their own quota, and throttling them would penalise exactly the users who configured one.
+- Added `consumeRateLimit` (`02_`), the shared version of the per-IP bucket that `/api/preview`, creator create/restore and `/admin/login` had each grown separately. Existing call sites left alone.
+
+> **Deliberately not rate-limited**, with a test asserting they stay that way:
+> `/api/external-list/*`, `/api/external-sync/history`, `/api/trakt-my-private-lists`,
+> `/api/trakt-history-raw`, `/api/mdblist-history-raw`. Each returns 400 without a
+> caller-supplied provider token, so they spend the **caller's** quota, not the
+> owner's. A limit there would only break large legitimate history syncs.
+
 ---
 
 ## ⬜ Open — next up, in recommended order
 
 | # | Finding | Severity | File / location | Why it matters |
 |---|---|---|---|---|
-| 5 | Missing rate limits on the remaining unauthenticated write and shared-key fan-out endpoints | 🟠 Medium | `25_`: `/api/details/batch`, `/api/bulk-resolve`, `/api/recommendations`, `/api/external-list/*` | Anonymous callers can burn the operator's TMDB/Trakt/MDBList quota. Same per-IP pattern now used in four places. |
 | 10 | Admin "Top Community Lists" ranks the alphabetically-first 100 in KV-only mode | 🟠 Medium | `03_admin.js:~833` | Reports a lexicographic sample as "top". Fix = rank from `index:publiclists`, which already carries likes and is already sorted — also removes ~100 KV reads per dashboard load. |
 | 9 | Stat counters are non-atomic read-modify-writes | 🟠 Med-High | `03_admin.js` `bumpStat`/`bumpStatBy`/`recordTrackedEvent`/`recordSearchQuery` | 20 concurrent requests recorded as 1. Worsens with traffic (KV edge-cached reads + 1 write/sec/key). Fix = shard hot keys, or move counters to D1, or label the panels approximate. Needs a migration — the largest of the remaining items. |
 | 13 | No timeout on any of ~135 outbound fetches | 🟠 Medium | `02_` `fetchWithPerUserCacheUncoalesced`, `fetchTraktWithRetry` | A hung upstream stalls the request; the stale-fallback tiers only trigger on rejection. Fix = `AbortSignal.timeout` at the two shared helpers, not 135 call sites. |
