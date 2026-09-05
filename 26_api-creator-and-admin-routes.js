@@ -1489,6 +1489,73 @@
         )
       ).filter(Boolean);
 
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order now decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      const orderedSlugs = new Set(lists.map((l) => l.slug));
+      const recovered = [];
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) recovered.push(s);
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        const restored = (
+          await Promise.all(
+            recovered.map(async (slug) => {
+              const raw = await getCreatorList(env, auth.username, slug);
+              if (!raw) return null;
+              try {
+                const data = JSON.parse(raw);
+                return {
+                  slug,
+                  name: data.name,
+                  type: data.type,
+                  items: data.items || [],
+                  itemCount: (data.items || []).length,
+                  likes: data.likes || 0,
+                  visibility: effectiveListVisibility(data.visibility),
+                  url: `${url.origin}/lists/${auth.username}/${slug}`,
+                };
+              } catch {
+                return null;
+              }
+            })
+          )
+        ).filter(Boolean);
+        for (const l of restored) {
+          lists.push(l);
+          order.push(l.slug);
+        }
+        if (restored.length) {
+          ctx.waitUntil(
+            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+          );
+        }
+      }
+
       const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
       if (!hasWatchlistInLists) {
         const wlRaw = await getCreatorList(env, auth.username, "watchlist");
@@ -1597,7 +1664,37 @@
         order = [];
       }
 
-      const editingSlug = body.slug && order.includes(body.slug) ? body.slug : null;
+      // A caller that names a slug gets that slug.
+      //
+      // This used to be `order.includes(body.slug) ? body.slug : null`, so a
+      // request to save AS a particular slug was honoured only if that slug
+      // already appeared in creatorlistorder:{user} -- and silently discarded
+      // otherwise, with a brand-new slug minted from the name and ok:true
+      // returned as though the request had been carried out. That is the
+      // whole duplicate-list bug:
+      //
+      //   creatorlistorder: is one KV key, rewritten read-modify-write by
+      //   every save, and KV has no compare-and-swap. renderCreatorDashboard
+      //   fires one save per local list missing from the account, all at
+      //   once, so a browser holding 22 lists fired 22 concurrent saves and
+      //   21 of the resulting order entries were lost. The records existed;
+      //   order (and therefore the dashboard) could not see them; so the next
+      //   render fired them again. Each round the client asked for its own
+      //   slug and was given a different one it never learned about. One
+      //   account reached 129 list records for 22 real lists -- 44 copies of
+      //   the same 462-item list, coming-of-age-3 through coming-of-age-53.
+      //
+      // The slug namespace is per-creator and this request is authenticated
+      // as its owner, so there is no one else's list to collide with: an
+      // explicit slug is theirs to claim whether or not order has caught up.
+      // Honouring it makes the save idempotent -- ask twice, get one list --
+      // which is what stops the loop. Only a request that names NO slug goes
+      // on to allocate a fresh one.
+      //
+      // Run through slugifyServer because it now reaches a KV key name and a
+      // URL path from an arbitrary body field; previously it could only be a
+      // value this Worker had itself written into order.
+      const editingSlug = slugifyServer(body.slug) || null;
       let slug;
       if (editingSlug) {
         // Editing keeps its existing URL even if the name changed --
@@ -1616,7 +1713,13 @@
         // list. Scoped to this creator's own namespace, so only their own
         // list was ever at risk, but silently replacing it is still the
         // wrong answer.
-        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        // Checked against KV as well as order, not order alone: order is a
+        // single key that concurrent saves clobber (see the note above), so
+        // a slug absent from it may still have a live record behind it, and
+        // allocating it would write straight over that list.
+        slug = await pickFreeSlug(baseSlug, async (candidate) =>
+          order.includes(candidate) || !!(await env.CONFIGS.get(`creatorlist:${auth.username}:${candidate}`))
+        );
         if (!slug) {
           return json(
             { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },

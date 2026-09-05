@@ -3623,3 +3623,179 @@ describe("audit fix 7: error messages are useful but cannot carry a secret", () 
     }
   });
 });
+
+// The duplicate-list bug: an account reached 129 list records for 22 real
+// lists -- 44 copies of the same 462-item list, coming-of-age-3 through
+// coming-of-age-53, every copy with an identical item count. Three defects
+// compounded; each of these covers one, plus one covering the whole loop.
+describe("duplicate lists: a save asked for a slug gets that slug", () => {
+  it("honours an explicit slug instead of silently minting a different one", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "slugowner");
+    // Occupy the slug this list's NAME would produce, so the old code had a
+    // collision to route around.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "other" }], visibility: "public",
+    }});
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "my-own-slug", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.slug, "my-own-slug",
+      "a save that names a slug must store it under that slug, not report ok:true for a different one");
+  });
+
+  it("is idempotent: asking for the same slug six times yields one list, not six", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "idem");
+    // The precondition the runaway needs: the slug this list's NAME produces
+    // belongs to a different list, so the old code had to route around it and
+    // routed somewhere new every single time.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "someone-elses" }], visibility: "public",
+    }});
+    const save = () => call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "coming-of-age-mine", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    for (let i = 0; i < 6; i++) {
+      const r = await save();
+      assert.equal(r.body.slug, "coming-of-age-mine", `save ${i + 1} drifted to ${r.body.slug}`);
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:idem:" })).keys;
+    assert.equal(keys.length, 2,
+      `six identical saves of one list left ${keys.length} records: ${keys.map((k) => k.name).join(", ")}`);
+  });
+
+  it("sanitises the slug it is handed -- it now reaches a KV key and a URL", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "sanitise");
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "../../creator:someone-else", name: "Nice List", type: "movie",
+      items: [], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.match(r.body.slug, /^[a-z0-9-]+$/, `unsanitised slug stored: ${r.body.slug}`);
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:" })).keys.map((k) => k.name);
+    assert.ok(keys.every((k) => k.startsWith("creatorlist:sanitise:")),
+      `a slug escaped its own namespace: ${keys.join(", ")}`);
+  });
+});
+
+describe("duplicate lists: creatorlistorder: is not the last word on what exists", () => {
+  it("a list whose order entry was lost still appears on the dashboard", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "lostorder");
+    for (const name of ["Coming of Age", "Food Network", "HGTV"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [{ id: "tt1" }], visibility: "public",
+      }});
+    }
+    // What a clobbered read-modify-write leaves behind: the records are all
+    // there, the order key remembers one of them.
+    await env.CONFIGS.put("creatorlistorder:lostorder", JSON.stringify({ order: ["coming-of-age"] }));
+
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const slugs = (r.body.lists || []).map((l) => l.slug).sort();
+    assert.deepEqual(slugs, ["coming-of-age", "food-network", "hgtv"],
+      "records with no order entry were dropped from the dashboard, which is what made the client re-upload them");
+    const items = (r.body.lists || []).find((l) => l.slug === "hgtv");
+    assert.equal(items.items.length, 1, "a recovered list must come back with its items, not as an empty shell");
+  });
+
+  it("repairs the order key so the drift does not persist", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "repairorder");
+    for (const name of ["One", "Two"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [], visibility: "public",
+      }});
+    }
+    await env.CONFIGS.put("creatorlistorder:repairorder", JSON.stringify({ order: [] }));
+    await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const order = JSON.parse(await env.CONFIGS.get("creatorlistorder:repairorder")).order.sort();
+    assert.deepEqual(order, ["one", "two"], "order was left broken after the read path had already found the records");
+  });
+
+  it("allocating a new slug checks KV, not just order, so it cannot land on a live record", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "noclobber");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "original" }], visibility: "public",
+    }});
+    // Order forgets it; the record is still live.
+    await env.CONFIGS.put("creatorlistorder:noclobber", JSON.stringify({ order: [] }));
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "different" }], visibility: "public",
+    }});
+    assert.notEqual(r.body.slug, "coming-of-age",
+      "a new list was allocated a slug whose record already existed, writing over it");
+    const original = JSON.parse(await env.CONFIGS.get("creatorlist:noclobber:coming-of-age"));
+    assert.equal(original.items[0].id, "original", "the existing list was overwritten");
+  });
+});
+
+describe("duplicate lists: the dashboard upload loop terminates", () => {
+  // Drives the shape of renderCreatorDashboard's "merge any local list not
+  // yet on the server" block against the real routes: read the account, save
+  // whatever the local store has that the account does not, repeat. Before
+  // the fix this gained one visible list per round and a duplicate record for
+  // every other one; it must now settle after a single round.
+  it("22 local lists converge to 22 records and stay there", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "converge");
+    // Give KV a real await boundary between read and write. The mock is
+    // otherwise fast enough to serialise every handler, which hides the whole
+    // problem: nothing about the read-modify-write on creatorlistorder: is
+    // atomic, and on a real edge these saves overlap.
+    const rawGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const rawPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const tick = () => new Promise((r) => setTimeout(r, 1));
+    env.CONFIGS.get = async (...a) => { await tick(); return rawGet(...a); };
+    env.CONFIGS.put = async (...a) => { await tick(); return rawPut(...a); };
+    const names = ["Coming of Age", "Food Network", "HGTV", "Oxygen", "Acorn TV", "Britbox",
+      "Travel", "Christmas", "Miniseries", "Discovery ID", "Animal Planet", "Nordic Noir",
+      "Chick Flicks", "TV", "Currently Watching", "Movies Watchlist", "National Geographic",
+      "Music Docs", "Mystery Documentary", "Documentary Reality TV", "TV Shows Horror",
+      "Hallmark Movies"];
+    const local = names.map((n) => ({ slug: n.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: n }));
+
+    for (let round = 0; round < 4; round++) {
+      const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+      }});
+      const have = new Set((listsRes.body.lists || []).map((l) => l.slug));
+      const missing = local.filter((l) => !have.has(l.creatorSlug || l.slug));
+      if (round > 0) {
+        assert.equal(missing.length, 0,
+          `round ${round + 1} still thought ${missing.length} lists were missing -- the loop does not terminate`);
+      }
+      // Deliberately the OLD client shape: all at once, replies discarded.
+      // The server side has to survive this on its own, because a browser
+      // running a cached copy of the page will keep doing exactly this.
+      await Promise.all(missing.map((l) => call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        slug: l.creatorSlug || l.slug, name: l.name, type: "movie",
+        items: [{ id: "tt1" }], visibility: "public",
+      }})));
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:converge:" })).keys;
+    assert.equal(keys.length, 22, `4 dashboard rounds left ${keys.length} records for 22 lists`);
+    assert.equal(keys.filter((k) => /-\d+$/.test(k.name)).length, 0,
+      "numbered duplicate slugs were minted: " + keys.map((k) => k.name).join(", "));
+  });
+});

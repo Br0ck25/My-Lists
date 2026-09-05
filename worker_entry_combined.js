@@ -39241,6 +39241,95 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
 }
 window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
 
+// Uploads local lists the account does not have yet, and -- the part that
+// matters -- writes the slug the server actually used back into the local
+// store.
+//
+// The previous version was a forEach firing an unawaited fetch per list with
+// .catch(() => {}) and no .then, from a block that runs on EVERY dashboard
+// render. Three things went wrong at once:
+//
+//   1. The reply was thrown away, so the local copy never learned which slug
+//      the account now holds. The test that decides whether to upload could
+//      therefore never start passing on its own.
+//   2. Every list went out simultaneously, and each save rewrites the single
+//      creatorlistorder: key read-modify-write. KV has no compare-and-swap,
+//      so 22 concurrent saves left 1 order entry standing and lost 21.
+//   3. Losing an order entry made that list invisible to /api/creator/lists,
+//      which is where serverSlugs comes from -- so the next render uploaded
+//      it again. The account gained one visible list per render and a fresh
+//      duplicate record for every other one, forever.
+//
+// One account ended up with 129 list records for 22 real lists: 44 copies of
+// the same 462-item list (coming-of-age-3 .. coming-of-age-53), 29 of another.
+//
+// So: one list at a time, awaited, the returned slug recorded, and one run at
+// a time across the whole page. The server side is fixed too (it now honours
+// the slug asked for instead of silently minting a new one, and no longer
+// treats the order key as the last word on what exists) -- either half alone
+// stops the runaway; both together also make it self-correcting.
+let _uploadingMissingLists = false;
+// Bounded so that a server which somehow never reports a list back can cost a
+// handful of rounds rather than spinning for as long as the tab is open. The
+// fixes above mean one round is enough; this is the backstop, not the plan.
+let _missingListUploadRounds = 0;
+const MISSING_LIST_UPLOAD_MAX_ROUNDS = 5;
+async function uploadMissingLocalListsToAccount(lists, creatorKey) {
+  if (_uploadingMissingLists || !activeCreator || !creatorKey || !lists || !lists.length) return 0;
+  if (_missingListUploadRounds >= MISSING_LIST_UPLOAD_MAX_ROUNDS) return 0;
+  _uploadingMissingLists = true;
+  _missingListUploadRounds++;
+  const assigned = [];
+  try {
+    for (const l of lists) {
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slug: l.creatorSlug || l.slug,
+            name: l.name || l.slug,
+            type: l.type || 'movie',
+            items: l.items || [],
+            visibility: l.visibility || 'private',
+          }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.slug) continue;
+        l.creatorSlug = data.slug;
+        assigned.push({ localSlug: l.slug, creatorSlug: data.slug });
+      } catch (e) {
+        // One list failing (a dropped connection, say) must not abandon the
+        // rest, and must not retry here -- a persistent failure retried in
+        // place is the same runaway by another route. The next render tries
+        // again, and the save is idempotent now, so that costs nothing.
+      }
+    }
+  } finally {
+    _uploadingMissingLists = false;
+  }
+  // One write at the end rather than one per list: these maps run to
+  // megabytes and each save is a full JSON.stringify on the main thread. An
+  // interrupted run simply re-uploads next time, which is harmless now that
+  // asking for the same slug twice yields the same list.
+  if (assigned.length) {
+    try {
+      const map = loadLocalCustomLists();
+      let touched = false;
+      assigned.forEach((a) => {
+        const entry = map[a.localSlug];
+        if (entry && entry.creatorSlug !== a.creatorSlug) { entry.creatorSlug = a.creatorSlug; touched = true; }
+      });
+      if (touched) saveLocalCustomListsMap(map);
+    } catch (e) {}
+    renderCreatorDashboard({ silent: true });
+  }
+  return assigned.length;
+}
+window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -39434,30 +39523,27 @@ async function renderCreatorDashboard(options) {
     // Merge any local/restored custom lists that are not yet on the server
     const serverSlugs = new Set((data.lists || []).map(l => l.slug));
     const localRestoredCustomLists = [];
+    const needUploading = [];
     Object.keys(localMapForCreator || {}).forEach((k) => {
       if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
       const l = localMapForCreator[k];
       if (!l) return;
       if (!l.slug) l.slug = k;
-      if (!serverSlugs.has(l.slug)) {
+      // Test against the slug the SERVER gave this list last time, when we
+      // know it, not the local key. The two are usually the same and the
+      // fallback keeps that case working -- but when they differ, comparing
+      // the local key is what made this block think an uploaded list was
+      // still missing and upload it all over again.
+      if (!serverSlugs.has(l.creatorSlug || l.slug)) {
         localRestoredCustomLists.push(l);
-        if (activeCreator && creatorKey) {
-          fetch(ORIGIN + '/api/creator/lists/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              creatorName: activeCreator.creatorName,
-              creatorKey: creatorKey,
-              slug: l.slug,
-              name: l.name || l.slug,
-              type: l.type || 'movie',
-              items: l.items || [],
-              visibility: l.visibility || 'private',
-            })
-          }).catch(() => {});
-        }
+        if (activeCreator && creatorKey) needUploading.push(l);
       }
     });
+    // A render that finds everything already on the account is the signal
+    // that the two sides agree again -- give the round budget back, so a
+    // later genuine upload is not blocked by an earlier bad patch.
+    if (!needUploading.length) _missingListUploadRounds = 0;
+    else uploadMissingLocalListsToAccount(needUploading, creatorKey);
 
     const allDashboardLists = [
       ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
@@ -54696,6 +54782,73 @@ self.addEventListener('fetch', e => {
         )
       ).filter(Boolean);
 
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order now decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      const orderedSlugs = new Set(lists.map((l) => l.slug));
+      const recovered = [];
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) recovered.push(s);
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        const restored = (
+          await Promise.all(
+            recovered.map(async (slug) => {
+              const raw = await getCreatorList(env, auth.username, slug);
+              if (!raw) return null;
+              try {
+                const data = JSON.parse(raw);
+                return {
+                  slug,
+                  name: data.name,
+                  type: data.type,
+                  items: data.items || [],
+                  itemCount: (data.items || []).length,
+                  likes: data.likes || 0,
+                  visibility: effectiveListVisibility(data.visibility),
+                  url: `${url.origin}/lists/${auth.username}/${slug}`,
+                };
+              } catch {
+                return null;
+              }
+            })
+          )
+        ).filter(Boolean);
+        for (const l of restored) {
+          lists.push(l);
+          order.push(l.slug);
+        }
+        if (restored.length) {
+          ctx.waitUntil(
+            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+          );
+        }
+      }
+
       const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
       if (!hasWatchlistInLists) {
         const wlRaw = await getCreatorList(env, auth.username, "watchlist");
@@ -54804,7 +54957,37 @@ self.addEventListener('fetch', e => {
         order = [];
       }
 
-      const editingSlug = body.slug && order.includes(body.slug) ? body.slug : null;
+      // A caller that names a slug gets that slug.
+      //
+      // This used to be `order.includes(body.slug) ? body.slug : null`, so a
+      // request to save AS a particular slug was honoured only if that slug
+      // already appeared in creatorlistorder:{user} -- and silently discarded
+      // otherwise, with a brand-new slug minted from the name and ok:true
+      // returned as though the request had been carried out. That is the
+      // whole duplicate-list bug:
+      //
+      //   creatorlistorder: is one KV key, rewritten read-modify-write by
+      //   every save, and KV has no compare-and-swap. renderCreatorDashboard
+      //   fires one save per local list missing from the account, all at
+      //   once, so a browser holding 22 lists fired 22 concurrent saves and
+      //   21 of the resulting order entries were lost. The records existed;
+      //   order (and therefore the dashboard) could not see them; so the next
+      //   render fired them again. Each round the client asked for its own
+      //   slug and was given a different one it never learned about. One
+      //   account reached 129 list records for 22 real lists -- 44 copies of
+      //   the same 462-item list, coming-of-age-3 through coming-of-age-53.
+      //
+      // The slug namespace is per-creator and this request is authenticated
+      // as its owner, so there is no one else's list to collide with: an
+      // explicit slug is theirs to claim whether or not order has caught up.
+      // Honouring it makes the save idempotent -- ask twice, get one list --
+      // which is what stops the loop. Only a request that names NO slug goes
+      // on to allocate a fresh one.
+      //
+      // Run through slugifyServer because it now reaches a KV key name and a
+      // URL path from an arbitrary body field; previously it could only be a
+      // value this Worker had itself written into order.
+      const editingSlug = slugifyServer(body.slug) || null;
       let slug;
       if (editingSlug) {
         // Editing keeps its existing URL even if the name changed --
@@ -54823,7 +55006,13 @@ self.addEventListener('fetch', e => {
         // list. Scoped to this creator's own namespace, so only their own
         // list was ever at risk, but silently replacing it is still the
         // wrong answer.
-        slug = await pickFreeSlug(baseSlug, async (candidate) => order.includes(candidate));
+        // Checked against KV as well as order, not order alone: order is a
+        // single key that concurrent saves clobber (see the note above), so
+        // a slug absent from it may still have a live record behind it, and
+        // allocating it would write straight over that list.
+        slug = await pickFreeSlug(baseSlug, async (candidate) =>
+          order.includes(candidate) || !!(await env.CONFIGS.get(`creatorlist:${auth.username}:${candidate}`))
+        );
         if (!slug) {
           return json(
             { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
