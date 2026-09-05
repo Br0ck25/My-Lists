@@ -3838,9 +3838,10 @@ describe("watch history See All: removing an item does not rebuild the grid", ()
       document: dom.document,
       window: win,
       localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (grouped ? "true" : "false") : null) },
-      watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
-      watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
-        watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      watchHistoryTileCount: loadOneClientFunction("23_client-list-management.js", "watchHistoryTileCount", {
+        watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+          watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+        }),
       }),
     });
   }
@@ -3907,15 +3908,43 @@ describe("watch history See All: removing an item does not rebuild the grid", ()
     assert.match(dom.status.innerHTML, /No matching items/);
   });
 
-  it("hands grouped-by-show mode back to the full render, which really does need it", () => {
-    const dom = makeDom([makeCard("s1")]);
+  it("keeps a grouped show tile while any episode of it remains", () => {
+    const cards = [makeCard("s1"), makeCard("s2")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
     const win = {
+      // s1 still has an episode; every episode of s2 has gone.
       _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
-      _rawWatchHistoryItems: [{ id: "s1:1:1", showId: "s1" }],
+      _rawWatchHistoryItems: [{ id: "s1:1:2", showId: "s1" }],
       _watchHistoryFilter: "all",
     };
-    assert.equal(load(dom, win, true)(), false,
-      "a show tile's episode count changes and the tile can disappear -- that needs re-laying out");
+    assert.equal(load(dom, win, true)(), true);
+    assert.equal(dom.grid.innerHTML, before, "grouped mode must not rebuild either");
+    assert.deepEqual(dom.grid.cards.map((c) => c.btn.dataset.removeId), ["s1"]);
+    assert.equal(dom.sub.textContent, "1 item", "grouped counts tiles, not raw items");
+  });
+
+  it("counts grouped tiles, not the episodes behind them", () => {
+    const dom = makeDom([makeCard("s1"), makeCard("tt9")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [
+        { id: "s1:1:1", showId: "s1" }, { id: "s1:1:2", showId: "s1" }, { id: "s1:2:1", showId: "s1" },
+        { id: "tt9", type: "movie" },
+      ],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win, true)(), true);
+    assert.equal(dom.sub.textContent, "2 items", "3 episodes of one show plus a movie is 2 tiles");
+  });
+
+  it("falls back to the full render when there is no item list to reconcile against", () => {
+    const dom = makeDom([makeCard("tt1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), false);
   });
 
   it("does nothing to a See All page showing some other list", () => {
@@ -3971,5 +4000,98 @@ describe("watch history See All: the remove handler stops rebuilding the grid", 
     const { calls } = run({ grouped: true });
     assert.equal(calls.inPlace, 1);
     assert.equal(calls.fullRender, 1, "grouped-by-show needs the layout recomputing and must not be left stale");
+  });
+});
+
+// In grouped-by-show mode the grid built its show tiles with removeShowId.
+// livePreviewPosterHtml reads that field as "this is a Continue Watching
+// tile" -- it tests for it before removeHistoryId, and isCwItem keys off it
+// too -- so the x on a grouped Watch History show was labelled "Remove from
+// Continue Watching", dispatched to dismissContinueWatchingShow, left the
+// watch history untouched, and picked up Continue Watching's poster badges.
+describe("watch history: grouped show tiles remove from Watch History", () => {
+  function renderGrouped(rawItems, opts = {}) {
+    let captured = null;
+    const sub = { textContent: "" };
+    const status = { innerHTML: "" };
+    const els = {
+      detailGrid: { innerHTML: "" },
+      detailSubtitle: sub,
+      detailStatus: status,
+      "content-list-details": { hasAttribute: () => false },
+    };
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: rawItems,
+      _watchHistoryFilter: opts.filter || "all",
+      _watchHistorySort: "recent",
+    };
+    const render = loadOneClientFunction("23_client-list-management.js", "renderWatchHistoryGrid", {
+      document: { getElementById: (id) => els[id] || null },
+      window: win,
+      localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (opts.grouped ? "true" : "false") : null) },
+      formatWatchItemLabel: (it) => ({ title: it.title || it.name || "", subtitle: "" }),
+      watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      renderPosterGridChunked: (_grid, items) => { captured = items; },
+    });
+    render();
+    return { tiles: captured, sub, status };
+  }
+
+  const HISTORY = [
+    { id: "s1:1:1", showId: "s1", showTitle: "A Show", type: "episode", watchedAt: 3 },
+    { id: "s1:1:2", showId: "s1", showTitle: "A Show", type: "episode", watchedAt: 2 },
+    { id: "tt9", title: "A Movie", type: "movie", watchedAt: 1 },
+  ];
+
+  it("builds the show tile with a history remove target, not a Continue Watching one", () => {
+    const { tiles } = renderGrouped(HISTORY, { grouped: true });
+    const show = tiles.find((t) => t.type === "series");
+    assert.ok(show, "expected a grouped show tile");
+    assert.equal(show.removeShowId, undefined,
+      "removeShowId makes livePreviewPosterHtml render a Continue Watching button and treat the tile as a CW item");
+    assert.equal(show.removeHistoryId, "s1", "the tile should remove the show from Watch History");
+  });
+
+  it("removing that tile clears every watched episode of the show", () => {
+    const map = { "watch-history": { items: HISTORY.slice() } };
+    const win = {};
+    const remove = loadOneClientFunction("22_client-creator-profile.js", "removeWatchHistoryItemDirect", {
+      window: win,
+      document: { getElementById: () => null },
+      loadLocalCustomLists: () => map,
+      saveLocalCustomListsMap: () => true,
+      scheduleCreatorSyncSave: () => {},
+      renderCreatorDashboard: () => {},
+      showAddedToast: () => {},
+      syncAiringNextWatchState: () => {},
+      renderWatchHistoryGrid: () => {},
+      updateWatchHistoryGridAfterRemoval: () => true,
+    });
+    const { tiles } = renderGrouped(HISTORY, { grouped: true });
+    remove(tiles.find((t) => t.type === "series").removeHistoryId, null);
+    assert.deepEqual(map["watch-history"].items.map((i) => i.id), ["tt9"],
+      "both episodes of the show should be gone, the movie untouched");
+  });
+
+  it("leaves the ungrouped tiles removing one item each", () => {
+    const { tiles } = renderGrouped(HISTORY, { grouped: false });
+    assert.deepEqual(tiles.map((t) => t.removeHistoryId).sort(), ["s1:1:1", "s1:1:2", "tt9"]);
+    assert.ok(tiles.every((t) => t.removeShowId === undefined));
+  });
+
+  it("agrees with watchHistoryTileCount about how many tiles there are", () => {
+    const count = loadOneClientFunction("23_client-list-management.js", "watchHistoryTileCount", {
+      watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+        watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      }),
+    });
+    for (const grouped of [false, true]) {
+      for (const filter of ["all", "movie", "series"]) {
+        const { tiles } = renderGrouped(HISTORY, { grouped, filter });
+        assert.equal(count(HISTORY, filter, grouped), tiles.length,
+          `helper and renderer disagree (grouped=${grouped}, filter=${filter})`);
+      }
+    }
   });
 });
