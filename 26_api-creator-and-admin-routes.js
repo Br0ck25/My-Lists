@@ -3237,7 +3237,7 @@
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
       
-      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
       // 1. Creators
       const cKeys = await listAllKeys(env.CONFIGS, "creator:");
@@ -3320,6 +3320,48 @@
           } catch (e) {
             results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
           }
+        }
+      }
+
+      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+      //
+      // Until these are copied across, each counter falls back to its KV
+      // value rather than reporting zero (see readStatCount, 03_admin.js),
+      // so a dashboard's history never visibly vanishes just because D1 got
+      // bound. After this runs, D1 is authoritative and the KV copies are
+      // inert.
+      //
+      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+      // safe to run more than once (the admin button can be pressed again,
+      // and the other three sections above are idempotent too), and an
+      // additive upsert here would double every counter on the second run.
+      // sourcegroup: is skipped -- section 3 above already migrated it into
+      // its own table, and copying it here too would count it twice in the
+      // Installed Catalogs panel, which sums both.
+      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
+      for (const k of statKeys.keys) {
+        const rest = k.name.slice("stats:".length);
+        const sep = rest.lastIndexOf(":");
+        if (sep === -1) continue;
+        const kind = rest.slice(0, sep);
+        const bucket = rest.slice(sep + 1);
+        if (!kind || !bucket) continue;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        // Only the numeric counters. stats:genres:alltime and
+        // stats:decades:alltime are JSON blobs, and
+        // stats:genredecade:migrated is a sentinel -- none of them belong
+        // in an integer column.
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
+        const raw = await env.CONFIGS.get(k.name);
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n)) continue;
+        try {
+          await env.DB.prepare(
+            "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
+          ).bind(kind, bucket, n).run();
+          results.stats++;
+        } catch (e) {
+          results.errors.push(`Stat ${k.name}: ` + e.message);
         }
       }
 

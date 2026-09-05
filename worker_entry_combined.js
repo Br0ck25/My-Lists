@@ -3315,9 +3315,49 @@ function statsToday() {
   return easternDateKey(new Date());
 }
 
+// --- Counter storage ---------------------------------------------------------
+//
+// Every counter here used to be a KV read-modify-write: GET, add one, PUT.
+// KV has no atomic increment and no compare-and-swap, so two overlapping
+// requests both read the same number and both write the same number+1, and
+// one is silently lost. Measured against this Worker: twenty concurrent
+// requests recorded as ONE.
+//
+// Production is worse than that measurement, in two ways that compound with
+// traffic: KV reads are edge-cached, so every request inside a cache window
+// can read the same stale value; and KV allows roughly one write per second
+// per key, which the hot keys (stats:pageviews:total and each day bucket)
+// are. The dashboard therefore drifts further from reality the busier the
+// deployment gets -- downward, silently, while still rendering a confident,
+// precise-looking number.
+//
+// SQLite's upsert is atomic and removes the class outright. This is the same
+// shape the source_groups counter has always used (see bumpStatBy below) --
+// every other counter now works the way that one already did.
+//
+// D1 stays OPTIONAL, exactly as it is everywhere else in this codebase: with
+// no DB bound the KV path below runs unchanged, lost updates and all. That
+// is a real remaining limitation for KV-only deployments, not an oversight
+// -- KV genuinely cannot do this correctly, and the honest options there are
+// to bind D1 or to read the numbers as approximate.
+async function d1BumpStat(env, kind, buckets, amount) {
+  // One statement per bucket, sent as a batch so the whole bump is a single
+  // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
+  const stmts = buckets.map((bucket) =>
+    env.DB.prepare(
+      "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO UPDATE SET n = n + excluded.n"
+    ).bind(kind, bucket, amount)
+  );
+  await env.DB.batch(stmts);
+}
+
 async function bumpStat(env, kind) {
   if (!env || !env.CONFIGS) return;
   try {
+    if (env.DB) {
+      await d1BumpStat(env, kind, ["total", statsToday()], 1);
+      return;
+    }
     const totalKey = `stats:${kind}:total`;
     const dayKey = `stats:${kind}:${statsToday()}`;
     const [totalRaw, dayRaw] = await Promise.all([env.CONFIGS.get(totalKey), env.CONFIGS.get(dayKey)]);
@@ -3344,10 +3384,18 @@ async function bumpStatBy(env, kind, amount) {
     const totalKey = `stats:${kind}:total`;
     
     if (env.DB && kind.startsWith("sourcegroup:")) {
+      // Left exactly as it was: source groups have their own table, their
+      // own read path in renderAdminDashboard, and their own branch in
+      // /admin/api/migrate-d1. It was already atomic -- it is the precedent
+      // the rest of this now follows, not something to re-route.
       const groupName = kind.slice("sourcegroup:".length);
       await env.DB.prepare(
         "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = source_groups.install_count + excluded.install_count"
       ).bind(groupName, groupName, amount).run();
+    } else if (env.DB) {
+      // Total only, no day bucket -- see this function's own comment on why
+      // per-source-group counters are all-time.
+      await d1BumpStat(env, kind, ["total"], amount);
     } else {
       const totalRaw = await env.CONFIGS.get(totalKey);
       const total = (parseInt(totalRaw, 10) || 0) + amount;
@@ -4061,29 +4109,17 @@ async function computeCatalogAndCommunityLeaderboards(env, ctx) {
   if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
 
   // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
-  const [catalogList, sourceGroupList] = await Promise.all([
-    listAllKeys(env.CONFIGS, "stats:catalog_add:", STAT_KEY_SCAN_CAP),
-    listAllKeys(env.CONFIGS, "stats:sourcegroup:", STAT_KEY_SCAN_CAP),
-  ]);
-
   const catalogMap = new Map();
-  const totalCatalogKeys = (catalogList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
-  const totalSourceGroupKeys = (sourceGroupList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
-
-  await Promise.all([
-    ...totalCatalogKeys.map(async (k) => {
-      const name = k.name.slice("stats:catalog_add:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      const count = parseInt(raw, 10) || 0;
-      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
-    }),
-    ...totalSourceGroupKeys.map(async (k) => {
-      const name = k.name.slice("stats:sourcegroup:".length, -":total".length);
-      const raw = await env.CONFIGS.get(k.name);
-      const count = parseInt(raw, 10) || 0;
-      if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
-    }),
+  const [catalogTotals, sourceGroupTotals] = await Promise.all([
+    readStatTotalsByPrefix(env, "catalog_add:"),
+    readSourceGroupTotals(env),
   ]);
+  for (const [name, count] of catalogTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
+  for (const [name, count] of sourceGroupTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
 
   const catalogEntries = Array.from(catalogMap.entries()).map(([name, count]) => ({ name, count }));
   catalogEntries.sort((a, b) => b.count - a.count);
@@ -4096,20 +4132,9 @@ async function computeCatalogAndCommunityLeaderboards(env, ctx) {
   // never been copied have no key) rather than doing one get per list --
   // that per-list fan-out (plus the reads below) is what made this panel
   // cost ~2 subrequests per list and eventually cross the 1,000 cap.
-  const copiesBySlug = new Map();
+  let copiesBySlug = new Map();
   try {
-    const copyList = await listAllKeys(env.CONFIGS, "stats:list_copy:", STAT_KEY_SCAN_CAP);
-    const copyTotalKeys = (copyList.keys || []).filter((k) => k.name.endsWith(":total")).slice(0, STAT_TOTALS_READ_CAP);
-    await Promise.all(
-      copyTotalKeys.map(async (k) => {
-        const raw = await env.CONFIGS.get(k.name);
-        const count = parseInt(raw, 10) || 0;
-        if (count > 0) {
-          const slug = k.name.slice("stats:list_copy:".length, -":total".length);
-          copiesBySlug.set(slug, count);
-        }
-      })
-    );
+    copiesBySlug = await readStatTotalsByPrefix(env, "list_copy:");
   } catch (e) {
     // best-effort: copy counts are a ranking tiebreak, not load-bearing
   }
@@ -4229,17 +4254,14 @@ async function computeAudienceAnalytics(env) {
   // comment), a no-op single read on every call after that.
   await migrateGenreDecadeStatsIfNeeded(env);
 
-  const [movieRaw, seriesRaw, episodeRaw, genreBlobRaw, decadeBlobRaw] = await Promise.all([
-    env.CONFIGS.get("stats:watch_type:movie:total"),
-    env.CONFIGS.get("stats:watch_type:series:total"),
-    env.CONFIGS.get("stats:watch_type:episode:total"),
+  const [movies, series, episodes, genreBlobRaw, decadeBlobRaw] = await Promise.all([
+    readStatCount(env, "watch_type:movie", "total"),
+    readStatCount(env, "watch_type:series", "total"),
+    readStatCount(env, "watch_type:episode", "total"),
     env.CONFIGS.get("stats:genres:alltime"),
     env.CONFIGS.get("stats:decades:alltime"),
   ]);
 
-  const movies = parseInt(movieRaw, 10) || 0;
-  const series = parseInt(seriesRaw, 10) || 0;
-  const episodes = parseInt(episodeRaw, 10) || 0;
   const totalWatch = movies + series + episodes;
 
   let genreCounts = {};
@@ -4355,11 +4377,121 @@ function recordListCopySlug(rawId, origin) {
   return /^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) ? slug : null;
 }
 
+// --- Counter reads -----------------------------------------------------------
+//
+// D1 is authoritative when bound, and falls back to KV when the row is
+// ABSENT rather than reporting zero. A missing row means "not migrated
+// yet", not "never happened" -- the same rule getCreator already applies to
+// accounts, and the reason binding D1 does not make a dashboard's history
+// vanish before the operator presses "Migrate KV -> D1". Once the migration
+// has run (or once new activity lands), D1 wins and the KV copy is inert.
+//
+// Deliberately NOT "D1 + KV summed": /admin/api/migrate-d1 COPIES the KV
+// value into D1, so summing would double every migrated counter.
+async function readStatCount(env, kind, bucket) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(kind, bucket).all();
+      if (results && results.length) return Number(results[0].n) || 0;
+    } catch (e) {
+      // Table missing (migration 0002 not applied yet) or D1 unavailable --
+      // fall through to KV rather than showing zeroes.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  const raw = await env.CONFIGS.get(`stats:${kind}:${bucket}`);
+  return parseInt(raw, 10) || 0;
+}
+
+// All-time totals for a family of counters ("catalog_add:", "list_copy:"),
+// as a Map of the name after the prefix -> count.
+//
+// With D1 this is one indexed query. Without it, it is the prefix scan it
+// always was, still bounded by STAT_KEY_SCAN_CAP / STAT_TOTALS_READ_CAP so
+// a large key space cannot push this request past Cloudflare's subrequest
+// limit (see computeCatalogAndCommunityLeaderboards' own comment).
+async function readStatTotalsByPrefix(env, prefix) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ORDER BY n DESC LIMIT ?"
+      ).bind(prefix + "%", STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) {
+          const name = String(row.kind).slice(prefix.length);
+          if (name) out.set(name, Number(row.n) || 0);
+        }
+        return out;
+      }
+      // No rows: fall through to KV, same "not migrated yet" rule as
+      // readStatCount.
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to KV.
+    }
+  }
+  const listed = await listAllKeys(env.CONFIGS, `stats:${prefix}`, STAT_KEY_SCAN_CAP);
+  const totalKeys = (listed.keys || [])
+    .filter((k) => k.name.endsWith(":total"))
+    .slice(0, STAT_TOTALS_READ_CAP);
+  await Promise.all(
+    totalKeys.map(async (k) => {
+      const raw = await env.CONFIGS.get(k.name);
+      const count = parseInt(raw, 10) || 0;
+      const name = k.name.slice(`stats:${prefix}`.length, -":total".length);
+      if (name) out.set(name, count);
+    })
+  );
+  return out;
+}
+
+// Source groups keep their own table and their own migrate-d1 branch (see
+// bumpStatBy), so they are read separately from the generic stats table --
+// this mirrors the split renderAdminDashboard already makes.
+async function readSourceGroupTotals(env) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT name, install_count FROM source_groups ORDER BY install_count DESC LIMIT ?"
+      ).bind(STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) out.set(row.name, Number(row.install_count) || 0);
+        return out;
+      }
+    } catch (e) {
+      // fall through to KV
+    }
+  }
+  return readStatTotalsByPrefix({ CONFIGS: env.CONFIGS }, "sourcegroup:");
+}
+
 // Reads every stats:{kind}:YYYY-MM-DD entry via a prefix list (there's no
 // KV range-query, so this is the only way to enumerate them) and returns a
 // { "YYYY-MM-DD": count } map, skipping the :total key itself.
 async function loadStatsByDay(env, kind) {
   if (!env || !env.CONFIGS) return {};
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT day, n FROM stats WHERE kind = ? AND day != 'total'"
+      ).bind(kind).all();
+      // Same fallback rule as readStatCount: no rows at all means this
+      // counter has not been migrated yet, so read KV instead of drawing an
+      // empty chart. One real day bucket is enough to trust D1.
+      if (results && results.length) {
+        const byDay = {};
+        for (const row of results) byDay[row.day] = Number(row.n) || 0;
+        return byDay;
+      }
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to the KV scan.
+    }
+  }
   const prefix = `stats:${kind}:`;
   const result = await listAllKeys(env.CONFIGS, prefix);
   const byDay = {};
@@ -4571,12 +4703,12 @@ async function renderAdminDashboard(env) {
     pvByDay, inByDay, ppByDay,
     creatorResult, sourceGroupResult
   ] = await Promise.all([
-    env.CONFIGS.get("stats:pageviews:total"),
-    env.CONFIGS.get(`stats:pageviews:${today}`),
-    env.CONFIGS.get("stats:installs:total"),
-    env.CONFIGS.get(`stats:installs:${today}`),
-    env.CONFIGS.get("stats:playback_pings:total"),
-    env.CONFIGS.get(`stats:playback_pings:${today}`),
+    readStatCount(env, "pageviews", "total"),
+    readStatCount(env, "pageviews", today),
+    readStatCount(env, "installs", "total"),
+    readStatCount(env, "installs", today),
+    readStatCount(env, "playback_pings", "total"),
+    readStatCount(env, "playback_pings", today),
     loadStatsByDay(env, "pageviews"),
     loadStatsByDay(env, "installs"),
     loadStatsByDay(env, "playback_pings"),
@@ -4874,12 +5006,12 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel active" data-admin-panel="last30">
     <div class="stat-cards">
-      <div class="stat-card"><div class="stat-value">${parseInt(totalPV, 10) || 0}</div><div class="stat-label">Total page views</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayPV, 10) || 0}</div><div class="stat-label">Page views today</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(totalIN, 10) || 0}</div><div class="stat-label">Total install links</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayIN, 10) || 0}</div><div class="stat-label">Install links today</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(totalPP, 10) || 0}</div><div class="stat-label">Total playback streams</div></div>
-      <div class="stat-card"><div class="stat-value">${parseInt(todayPP, 10) || 0}</div><div class="stat-label">Streams today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalPV) || 0}</div><div class="stat-label">Total page views</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPV) || 0}</div><div class="stat-label">Page views today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalIN) || 0}</div><div class="stat-label">Total install links</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayIN) || 0}</div><div class="stat-label">Install links today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalPP) || 0}</div><div class="stat-label">Total playback streams</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPP) || 0}</div><div class="stat-label">Streams today</div></div>
     </div>
     <div class="table-wrap">
       <table>
@@ -55509,7 +55641,7 @@ self.addEventListener('fetch', e => {
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       if (!env || !env.DB || !env.CONFIGS) return json({ ok: false, error: "No D1 or KV binding." }, 500);
       
-      const results = { creators: 0, lists: 0, sourcegroups: 0, errors: [] };
+      const results = { creators: 0, lists: 0, sourcegroups: 0, stats: 0, errors: [] };
 
       // 1. Creators
       const cKeys = await listAllKeys(env.CONFIGS, "creator:");
@@ -55592,6 +55724,48 @@ self.addEventListener('fetch', e => {
           } catch (e) {
             results.errors.push(`Sourcegroup ${groupName}: ` + e.message);
           }
+        }
+      }
+
+      // 4. Counters (stats:{kind}:{total|YYYY-MM-DD} -> the stats table)
+      //
+      // Until these are copied across, each counter falls back to its KV
+      // value rather than reporting zero (see readStatCount, 03_admin.js),
+      // so a dashboard's history never visibly vanishes just because D1 got
+      // bound. After this runs, D1 is authoritative and the KV copies are
+      // inert.
+      //
+      // DO NOTHING on conflict, not "n = n + excluded.n": this endpoint is
+      // safe to run more than once (the admin button can be pressed again,
+      // and the other three sections above are idempotent too), and an
+      // additive upsert here would double every counter on the second run.
+      // sourcegroup: is skipped -- section 3 above already migrated it into
+      // its own table, and copying it here too would count it twice in the
+      // Installed Catalogs panel, which sums both.
+      const statKeys = await listAllKeys(env.CONFIGS, "stats:");
+      for (const k of statKeys.keys) {
+        const rest = k.name.slice("stats:".length);
+        const sep = rest.lastIndexOf(":");
+        if (sep === -1) continue;
+        const kind = rest.slice(0, sep);
+        const bucket = rest.slice(sep + 1);
+        if (!kind || !bucket) continue;
+        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") continue;
+        // Only the numeric counters. stats:genres:alltime and
+        // stats:decades:alltime are JSON blobs, and
+        // stats:genredecade:migrated is a sentinel -- none of them belong
+        // in an integer column.
+        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) continue;
+        const raw = await env.CONFIGS.get(k.name);
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n)) continue;
+        try {
+          await env.DB.prepare(
+            "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
+          ).bind(kind, bucket, n).run();
+          results.stats++;
+        } catch (e) {
+          results.errors.push(`Stat ${k.name}: ` + e.message);
         }
       }
 

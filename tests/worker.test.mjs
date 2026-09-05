@@ -1907,3 +1907,88 @@ describe("audit fix 14: every env var the code requires is documented", () => {
     assert.deepEqual(undocumented, [], `undocumented env vars: ${undocumented.join(", ")}`);
   });
 });
+
+
+describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
+  it("records every one of 20 concurrent page views (the KV path records ~1)", async () => {
+    const kvOnly = makeEnv();
+    await Promise.all(Array.from({ length: 20 }, () => call(kvOnly, "/")));
+    const kvCount = parseInt(kvOnly.CONFIGS._store.get("stats:pageviews:total") || "0", 10);
+
+    const withD1 = makeEnv({ DB: makeD1() });
+    await Promise.all(Array.from({ length: 20 }, () => call(withD1, "/")));
+    const d1Count = withD1.DB._stat("pageviews", "total") || 0;
+
+    // The KV read-modify-write loses almost all of them: every concurrent
+    // request reads the same value and writes the same value+1.
+    assert.ok(kvCount < 20, `KV path is expected to lose updates, got ${kvCount}`);
+    // The D1 upsert increments inside the statement, so none are lost.
+    assert.equal(d1Count, 20, `D1 path must record all 20, got ${d1Count}`);
+  });
+
+  it("writes both the all-time and the per-day bucket", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await call(env, "/");
+    const buckets = env.DB._statBuckets("pageviews");
+    assert.equal(buckets.length, 2);
+    assert.ok(buckets.includes("total"));
+    assert.ok(buckets.some((b) => /^\d{4}-\d{2}-\d{2}$/.test(b)), "expected a YYYY-MM-DD day bucket");
+  });
+
+  it("the admin dashboard treats D1 as authoritative over a stale KV copy", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    for (let i = 0; i < 7; i++) await call(env, "/");
+    // A leftover KV value from before D1 was bound must NOT win: it is the
+    // undercounted one, and reading it is what this fix exists to stop.
+    await env.CONFIGS.put("stats:pageviews:total", "3");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">7<\/div>/, "expected the D1 count (7), not the stale KV copy (3)");
+    assert.doesNotMatch(r.text, /<div class="stat-value">3<\/div>\s*<div class="stat-label">Total page views<\/div>/);
+  });
+
+  it("falls back to the KV count when D1 has no row yet (not migrated)", async () => {
+    // Binding D1 must not make an existing dashboard's history vanish
+    // before the operator presses "Migrate KV -> D1".
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "4242");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">4242<\/div>/);
+  });
+
+  it("migrate-d1 copies KV counters across, and is safe to run twice", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "100");
+    await env.CONFIGS.put("stats:pageviews:2026-09-01", "40");
+    // Non-counter stats keys must not be dragged into an integer column.
+    await env.CONFIGS.put("stats:genres:alltime", JSON.stringify({ Drama: 3 }));
+    await env.CONFIGS.put("stats:genredecade:migrated", "1");
+
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    const first = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(first.body.ok, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 100);
+    assert.equal(env.DB._stat("pageviews", "2026-09-01"), 40);
+    assert.equal(env.DB._stat("genres", "alltime"), undefined, "JSON blobs must not be migrated as counters");
+
+    // Re-running must not double the counts (DO NOTHING, not n = n + ...).
+    await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(env.DB._stat("pageviews", "total"), 100, "a second migration must not double counts");
+  });
+
+  it("keeps counting correctly in KV-only deployments", async () => {
+    // D1 is optional here; nothing above may break the no-DB path.
+    const env = makeEnv();
+    await call(env, "/");
+    assert.equal(env.CONFIGS._store.get("stats:pageviews:total"), "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">1<\/div>/);
+  });
+});

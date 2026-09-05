@@ -45,8 +45,26 @@ export function makeKv(initial = {}) {
 export function makeD1() {
   const creators = new Map();
   const lists = new Map();
+  // Keyed "kind\u0000day" -> n. Models the real table's PRIMARY KEY
+  // (kind, day) and, crucially, the atomicity of its upsert: the increment
+  // happens inside this one synchronous call, so two overlapping callers
+  // cannot both read the same value and both write value+1 the way the KV
+  // read-modify-write path can.
+  const stats = new Map();
+  const statKey = (kind, day) => `${kind}\u0000${day}`;
   function run(sql, args) {
     const s = String(sql);
+    if (/INSERT INTO stats/i.test(s)) {
+      const [kind, day, n] = args;
+      const k = statKey(kind, day);
+      if (stats.has(k)) {
+        if (/DO UPDATE SET n = n \+ excluded\.n/i.test(s)) stats.set(k, stats.get(k) + Number(n));
+        // DO NOTHING: leave the existing row alone (migrate-d1 is re-runnable)
+      } else {
+        stats.set(k, Number(n));
+      }
+      return { meta: { changes: 1 }, success: true };
+    }
     if (/INSERT INTO creators/i.test(s)) {
       const [username, display_name, key_hash, recovery_answer_hash, created_at] = args;
       if (creators.has(username) && /ON CONFLICT/i.test(s)) return { meta: { changes: 0 }, success: true };
@@ -88,6 +106,32 @@ export function makeD1() {
   }
   function all(sql, args) {
     const s = String(sql);
+    if (/SELECT n FROM stats WHERE kind = \? AND day = \?/i.test(s)) {
+      const k = statKey(args[0], args[1]);
+      return { results: stats.has(k) ? [{ n: stats.get(k) }] : [] };
+    }
+    if (/SELECT day, n FROM stats WHERE kind = \? AND day != 'total'/i.test(s)) {
+      const out = [];
+      for (const [k, n] of stats) {
+        const [kind, day] = k.split("\u0000");
+        if (kind === args[0] && day !== "total") out.push({ day, n });
+      }
+      return { results: out };
+    }
+    if (/SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE \?/i.test(s)) {
+      const prefix = String(args[0]).replace(/%$/, "");
+      const limit = Number(args[1]) || 1000;
+      const out = [];
+      for (const [k, n] of stats) {
+        const [kind, day] = k.split("\u0000");
+        if (day === "total" && kind.startsWith(prefix)) out.push({ kind, n });
+      }
+      out.sort((a, b) => b.n - a.n);
+      return { results: out.slice(0, limit) };
+    }
+    if (/SELECT name, install_count FROM source_groups/i.test(s)) {
+      return { results: [] };
+    }
     if (/SELECT \* FROM creators WHERE username/i.test(s)) {
       const row = creators.get(args[0]);
       return { results: row ? [row] : [] };
@@ -106,6 +150,11 @@ export function makeD1() {
   return {
     _creators: creators,
     _lists: lists,
+    _stats: stats,
+    // Readable accessors so tests never have to know the composite-key encoding.
+    _stat: (kind, day) => stats.get(statKey(kind, day)),
+    _statBuckets: (kind) =>
+      [...stats.keys()].map((k) => k.split("\u0000")).filter(([kk]) => kk === kind).map(([, d]) => d),
     prepare(sql) {
       // Real D1's PreparedStatement exposes run()/all() directly, not only
       // after .bind() -- bind() is only needed when the query actually has

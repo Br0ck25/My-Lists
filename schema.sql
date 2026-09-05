@@ -40,6 +40,20 @@ CREATE TABLE source_groups (
     install_count INTEGER NOT NULL DEFAULT 0
 );
 
+DROP TABLE IF EXISTS stats;
+CREATE TABLE stats (
+    -- 'pageviews', 'installs', 'apiuse:tmdb', 'list_copy:top-ten', ...
+    -- i.e. the same {kind} that used to sit inside a stats:{kind}:{bucket}
+    -- KV key name.
+    kind TEXT NOT NULL,
+    -- 'YYYY-MM-DD' (Eastern calendar day, see easternDateKey) for a daily
+    -- bucket, or the literal 'total' for the all-time one. Same two shapes
+    -- the KV keys always had.
+    day  TEXT NOT NULL,
+    n    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, day)
+);
+
 -- Indexes for fast querying
 CREATE INDEX idx_creator_lists_username ON creator_lists(username);
 CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
