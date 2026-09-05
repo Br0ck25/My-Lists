@@ -167,6 +167,24 @@ If you configure OAuth authentication for Trakt, Simkl, MDBList, or TMDB, set th
 - **MDBList**: `https://your-worker-name.your-subdomain.workers.dev/api/mdblist/oauth/callback`
 - **TMDB**: `https://your-worker-name.your-subdomain.workers.dev/api/tmdb/oauth/callback`
 
+#### A note on media-server scrobble URLs
+
+The Plex / Jellyfin / Emby webhook endpoint (`/api/scrobble`) authenticates from the
+URL itself — either `?config=<your install id>` or `?creator=<name>&key=<your Creator
+Key>`. That is forced by the webhook senders, which cannot attach custom headers, but
+it does mean **the key travels in a URL** and so may be recorded in server logs, proxy
+logs, and your media server's own configuration screen.
+
+Practical consequences:
+
+- Treat a scrobble URL like a password. Don't paste it into screenshots, issues, or
+  support threads.
+- If one leaks, rotate it: **Account &rarr; Reset Creator Key** in the app (or
+  `POST /api/creator/reset-key`). The old key stops working immediately and any
+  webhook still using it will simply stop being accepted.
+- Prefer the `?config=` form where you can — it points at a stored install config
+  rather than spelling the Creator Key out in the URL.
+
 ---
 
 ### Step 6 - (Optional) Configure Admin Dashboard

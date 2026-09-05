@@ -117,33 +117,6 @@ const STREAMING_ALL = [
   },
 ];
 
-// Builds the static HTML rows for a streaming quick-add panel from one of
-// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
-function getProviderIconBadge(name, group) {
-  const n = (name || '').toLowerCase();
-  if (group === 'Combined Charts' || n === 'popular' || n === 'trending' || n.includes('(all services)')) {
-    return '<span class="provider-chip-icon" style="background:var(--accent);color:#fff;font-weight:800;font-size:0.7rem;letter-spacing:-0.02em;">ML</span>';
-  }
-  if (group === 'MDBList Charts' || n.includes('mdblist') || n.includes('streaming charts') || n.includes('moviemeter') || n.includes('us daily')) {
-    return '<span class="provider-chip-icon" style="background:#007AFF;color:#fff;font-weight:700;">M</span>';
-  }
-  if (n.includes('netflix')) return '<span class="provider-chip-icon netflix">N</span>';
-  if (n.includes('prime') || n.includes('amazon')) return '<span class="provider-chip-icon prime">P</span>';
-  if (n.includes('apple')) return '<span class="provider-chip-icon apple">A</span>';
-  if (n.includes('disney')) return '<span class="provider-chip-icon disney">D+</span>';
-  if (n.includes('max') || n.includes('hbo')) return '<span class="provider-chip-icon max">M</span>';
-  if (n.includes('hulu')) return '<span class="provider-chip-icon hulu">h</span>';
-  if (n.includes('paramount')) return '<span class="provider-chip-icon paramount">P+</span>';
-  if (n.includes('peacock')) return '<span class="provider-chip-icon peacock">P</span>';
-  if (n.includes('discovery')) return '<span class="provider-chip-icon discovery">D</span>';
-  if (n.includes('tmdb')) return '<span class="provider-chip-icon" style="background:#01b4e4;color:#fff;">T</span>';
-  if (n.includes('trakt')) return '<span class="provider-chip-icon" style="background:#ed1c24;color:#fff;">T</span>';
-  if (n.includes('simkl')) return '<span class="provider-chip-icon" style="background:#000;border:1px solid #333;color:#fff;">S</span>';
-  if (group === 'Kids') return '<span class="provider-chip-icon" style="background:#FF9900;color:#fff;">K</span>';
-  if (group === 'Genres') return '<span class="provider-chip-icon" style="background:#5856D6;color:#fff;">G</span>';
-  return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
-}
-
 function buildStreamingRowsHtml(list, labelSuffix, group) {
   const rows = list.map((p) => {
     const label = labelSuffix ? `${p.name} ${labelSuffix}` : p.name;

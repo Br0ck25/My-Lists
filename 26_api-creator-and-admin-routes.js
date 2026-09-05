@@ -2786,7 +2786,7 @@
           });
         return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -3868,7 +3868,7 @@
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         return json({ ok: true, region, providerId, movies, shows }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -3918,7 +3918,7 @@
         results = results.slice(0, 40).map((p) => ({ id: p.id, name: p.name }));
         return json({ ok: true, results }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 

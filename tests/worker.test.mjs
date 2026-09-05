@@ -2122,3 +2122,62 @@ describe("audit fix 12: deleting an account leaves nothing behind", () => {
     assert.equal(like.body.likes, 1, "a brand-new list must start from zero, not inherit the old ledger");
   });
 });
+
+
+describe("audit fix 7: error messages are useful but cannot carry a secret", () => {
+  const load = () => loadSourceFunctions("02_http-and-creator-utils.js").safeErrorMessage;
+
+  it("keeps the genuinely useful upstream message", () => {
+    const safeErrorMessage = load();
+    // This is how someone learns their own API key is wrong -- blanking it
+    // would be a product regression, not a security win.
+    assert.equal(safeErrorMessage(new Error("Trakt request failed (HTTP 401).")),
+      "Trakt request failed (HTTP 401).");
+  });
+
+  it("strips a URL that a future careless throw might include", () => {
+    const safeErrorMessage = load();
+    const msg = safeErrorMessage(new Error("fetch failed for https://api.themoviedb.org/3/movie/1?api_key=abcdef123456"));
+    assert.doesNotMatch(msg, /themoviedb\.org/);
+    assert.doesNotMatch(msg, /abcdef123456/);
+    assert.match(msg, /\[url\]/);
+  });
+
+  it("redacts a labelled key or token even without a URL", () => {
+    const safeErrorMessage = load();
+    for (const raw of [
+      "bad request: api_key=sk_live_9f8e7d6c5b4a3210",
+      "auth failed, access_token: ya29.aVeryLongOpaqueTokenValue",
+      "client_secret=hunter2hunter2hunter2",
+    ]) {
+      const msg = safeErrorMessage(new Error(raw));
+      assert.match(msg, /\[redacted\]/, `expected redaction in: ${msg}`);
+      assert.doesNotMatch(msg, /sk_live|ya29\.|hunter2/);
+    }
+  });
+
+  it("redacts a long unlabelled opaque token", () => {
+    const safeErrorMessage = load();
+    const token = "A".repeat(40);
+    assert.doesNotMatch(safeErrorMessage(new Error("upstream said " + token)), /AAAA/);
+  });
+
+  it("falls back to a generic message when there is nothing safe to say", () => {
+    const safeErrorMessage = load();
+    assert.match(safeErrorMessage(null), /Something went wrong/);
+    assert.match(safeErrorMessage(new Error("")), /Something went wrong/);
+  });
+
+  it("bounds the length so a huge message cannot be echoed back", () => {
+    const safeErrorMessage = load();
+    assert.ok(safeErrorMessage(new Error("x".repeat(5000))).length <= 201);
+  });
+
+  it("no route still returns a raw exception message", () => {
+    for (const f of ["25_api-catalog-routes.js", "26_api-creator-and-admin-routes.js"]) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      assert.doesNotMatch(src, /String\((?:err|e)\.message \|\| (?:err|e)\)/,
+        `${f} still returns a raw exception message; use safeErrorMessage()`);
+    }
+  });
+});

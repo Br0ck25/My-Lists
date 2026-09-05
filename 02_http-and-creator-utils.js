@@ -134,6 +134,56 @@ function jsonPublic(data, status = 200, extraHeaders = {}) {
   return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
+// Turns an exception into something safe to hand back to a caller, and logs
+// the original.
+//
+// Dozens of routes used to return `String(err.message || err)` verbatim.
+// That is not as bad as it sounds today -- every `throw` in this codebase
+// is deliberately status-only ("Trakt request failed (HTTP 401).") with no
+// URL or key in it, which is checked, and those messages are genuinely
+// useful: a 401 surfaced to the user is how they learn their own API key is
+// wrong. Blanking every one of them to "something went wrong" would be a
+// real regression in the product, not a security win.
+//
+// The problem is that it is one careless `throw new Error(someUrl)` away
+// from shipping an API key to the client, and /api/bulk-resolve already
+// states the rule for the whole file: "the message can carry upstream URLs
+// and internal detail that the caller has no business seeing."
+//
+// So this keeps the message and removes the parts that could ever carry a
+// secret -- any URL, any explicit key/token parameter, and any long opaque
+// token -- rather than choosing between useful and safe. The unredacted
+// error still goes to the log, where the operator can see it.
+function safeErrorMessage(err, fallback = "Something went wrong. Please try again.") {
+  try {
+    console.error("handled error:", err);
+  } catch {
+    // logging must never be the thing that throws
+  }
+  let msg = "";
+  try {
+    // Deliberately not `err.message || err`: an Error with an empty message
+    // would fall through to String(err) and surface the literal word
+    // "Error", which tells the caller nothing and looks like a bug.
+    if (err && typeof err.message === "string") msg = err.message;
+    else if (typeof err === "string") msg = err;
+    else if (err) msg = String(err);
+  } catch {
+    return fallback;
+  }
+  msg = msg.trim();
+  // String(someObject) gives "[object Object]" -- no better than the fallback.
+  if (!msg || msg === "[object Object]") return fallback;
+  msg = msg
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(/\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|key)\b\s*[=:]\s*\S+/gi, "$1=[redacted]")
+    // Anything long and opaque enough to be a credential, even unlabelled.
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+    .trim();
+  if (!msg) return fallback;
+  return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
+}
+
 // Detect whether a request is a top-level browser page load (someone tapping
 // "Configure" and being sent to the manifest URL) vs. a JSON fetch by wako/
 // Stremio itself. We check two independent signals and trust either one:

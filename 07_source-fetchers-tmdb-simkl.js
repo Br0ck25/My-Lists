@@ -346,39 +346,6 @@ function trailerStreamsFor(ytKey) {
   return ytKey ? [{ title: "Trailer", ytId: ytKey }] : undefined;
 }
 
-// For items that only carry an IMDB id (mdblist/Trakt sources never expose
-// a TMDB id), resolving a trailer needs an extra round trip: TMDB's /find
-// endpoint to translate imdb_id -> tmdb_id, then a /videos call on that id.
-// Both legs are hard-cached at Cloudflare's edge (shared across every user
-// of the add-on, same as fetchTmdbDetails below), so this only costs a real
-// TMDB request the first time any list anywhere references a given title.
-// Best-effort: any failure just means no trailer, never a broken catalog.
-async function fetchTrailerForImdb(imdbId, type, apiKey) {
-  if (!apiKey || !imdbId) return null;
-  try {
-    const findRes = await fetch(
-      `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(apiKey)}&external_source=imdb_id`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!findRes.ok) return null;
-    const findData = await findRes.json();
-    const kind = type === "series" ? "tv" : "movie";
-    const resultsKey = kind === "tv" ? "tv_results" : "movie_results";
-    const match = (findData[resultsKey] || [])[0];
-    if (!match) return null;
-
-    const videosRes = await fetch(
-      `https://api.themoviedb.org/3/${kind}/${match.id}/videos?api_key=${encodeURIComponent(apiKey)}`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!videosRes.ok) return null;
-    const videosData = await videosRes.json();
-    return pickTrailerKey(videosData.results);
-  } catch {
-    return null;
-  }
-}
-
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
 // fetchTmdbDetails's append_to_response=videos, see below).

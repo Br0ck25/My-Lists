@@ -1684,6 +1684,56 @@ function jsonPublic(data, status = 200, extraHeaders = {}) {
   return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
+// Turns an exception into something safe to hand back to a caller, and logs
+// the original.
+//
+// Dozens of routes used to return `String(err.message || err)` verbatim.
+// That is not as bad as it sounds today -- every `throw` in this codebase
+// is deliberately status-only ("Trakt request failed (HTTP 401).") with no
+// URL or key in it, which is checked, and those messages are genuinely
+// useful: a 401 surfaced to the user is how they learn their own API key is
+// wrong. Blanking every one of them to "something went wrong" would be a
+// real regression in the product, not a security win.
+//
+// The problem is that it is one careless `throw new Error(someUrl)` away
+// from shipping an API key to the client, and /api/bulk-resolve already
+// states the rule for the whole file: "the message can carry upstream URLs
+// and internal detail that the caller has no business seeing."
+//
+// So this keeps the message and removes the parts that could ever carry a
+// secret -- any URL, any explicit key/token parameter, and any long opaque
+// token -- rather than choosing between useful and safe. The unredacted
+// error still goes to the log, where the operator can see it.
+function safeErrorMessage(err, fallback = "Something went wrong. Please try again.") {
+  try {
+    console.error("handled error:", err);
+  } catch {
+    // logging must never be the thing that throws
+  }
+  let msg = "";
+  try {
+    // Deliberately not `err.message || err`: an Error with an empty message
+    // would fall through to String(err) and surface the literal word
+    // "Error", which tells the caller nothing and looks like a bug.
+    if (err && typeof err.message === "string") msg = err.message;
+    else if (typeof err === "string") msg = err;
+    else if (err) msg = String(err);
+  } catch {
+    return fallback;
+  }
+  msg = msg.trim();
+  // String(someObject) gives "[object Object]" -- no better than the fallback.
+  if (!msg || msg === "[object Object]") return fallback;
+  msg = msg
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(/\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|key)\b\s*[=:]\s*\S+/gi, "$1=[redacted]")
+    // Anything long and opaque enough to be a credential, even unlabelled.
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+    .trim();
+  if (!msg) return fallback;
+  return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
+}
+
 // Detect whether a request is a top-level browser page load (someone tapping
 // "Configure" and being sent to the manifest URL) vs. a JSON fetch by wako/
 // Stremio itself. We check two independent signals and trust either one:
@@ -6661,47 +6711,6 @@ async function fetchTopLists(apikey, env = null, ctx = null) {
   });
 }
 
-// Searches trakt.tv's public lists by name via their official search API.
-// Only needs the fixed TRAKT_CLIENT_ID (same key used for fetching list
-// items) — no user auth required for public list search.
-// Peeks at a small sample of a Trakt list's items (unfiltered by type) to
-// determine whether it's a movies list, a shows list, or genuinely mixed --
-// used so the "Search Lists" results can offer just one relevant Add
-// button instead of always defensively offering both. A shallow sample
-// (not the whole list) is a deliberate trade-off: correct for the
-// overwhelmingly common case of a single-type list, and falls back to
-// "unknown" (both buttons, the previous always-safe behavior) for anything
-// ambiguous or genuinely mixed.
-async function classifyTraktListContentType(user, slug, traktKey, accessToken) {
-  const src = `https://api.trakt.tv/users/${encodeURIComponent(user)}/lists/${encodeURIComponent(
-    slug
-  )}/items?limit=20`;
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": traktKey || TRAKT_CLIENT_ID,
-      "User-Agent": `my-list-addon/${ADDON_VERSION}`,
-    };
-    if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-    const res = await fetchTraktWithRetry(src, {
-      headers,
-      cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 86400, cacheEverything: true },
-    });
-    if (!res.ok) return "unknown";
-    const data = await res.json();
-    const items = Array.isArray(data) ? data : [];
-    const hasMovie = items.some((it) => it.movie);
-    const hasShow = items.some((it) => it.show);
-    if (hasMovie && hasShow) return "mixed";
-    if (hasMovie) return "movie";
-    if (hasShow) return "series";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 async function searchTraktLists(query, traktKeyOverride) {
   const rawQ = (query || "").trim();
   if (!rawQ) return [];
@@ -7244,11 +7253,6 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <circle cx="76" cy="25" r="2.5" fill="#AF52DE" opacity="0.8" />
   </g>
 </svg>`;
-}
-
-function getPaddedChannelLogo(rawPoster, origin) {
-  if (!rawPoster) return origin ? `${origin}/icon.png` : undefined;
-  return rawPoster;
 }
 
 function getChannelBackdropUrl(payload) {
@@ -9391,39 +9395,6 @@ function trailerStreamsFor(ytKey) {
   return ytKey ? [{ title: "Trailer", ytId: ytKey }] : undefined;
 }
 
-// For items that only carry an IMDB id (mdblist/Trakt sources never expose
-// a TMDB id), resolving a trailer needs an extra round trip: TMDB's /find
-// endpoint to translate imdb_id -> tmdb_id, then a /videos call on that id.
-// Both legs are hard-cached at Cloudflare's edge (shared across every user
-// of the add-on, same as fetchTmdbDetails below), so this only costs a real
-// TMDB request the first time any list anywhere references a given title.
-// Best-effort: any failure just means no trailer, never a broken catalog.
-async function fetchTrailerForImdb(imdbId, type, apiKey) {
-  if (!apiKey || !imdbId) return null;
-  try {
-    const findRes = await fetch(
-      `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(apiKey)}&external_source=imdb_id`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!findRes.ok) return null;
-    const findData = await findRes.json();
-    const kind = type === "series" ? "tv" : "movie";
-    const resultsKey = kind === "tv" ? "tv_results" : "movie_results";
-    const match = (findData[resultsKey] || [])[0];
-    if (!match) return null;
-
-    const videosRes = await fetch(
-      `https://api.themoviedb.org/3/${kind}/${match.id}/videos?api_key=${encodeURIComponent(apiKey)}`,
-      { headers: { "User-Agent": "my-list-addon/1.14" }, cf: { cacheTtl: 604800, cacheEverything: true } }
-    );
-    if (!videosRes.ok) return null;
-    const videosData = await videosRes.json();
-    return pickTrailerKey(videosData.results);
-  } catch {
-    return null;
-  }
-}
-
 // Attaches trailerStreams to a batch of already-built metas (mdblist/Trakt
 // sources only -- TMDB-sourced metas already get theirs for free via
 // fetchTmdbDetails's append_to_response=videos, see below).
@@ -11146,33 +11117,6 @@ const STREAMING_ALL = [
     showUrl: "tmdb:chart:peacock",
   },
 ];
-
-// Builds the static HTML rows for a streaming quick-add panel from one of
-// the tables above. `labelSuffix` is appended to the row name (e.g. "Top
-function getProviderIconBadge(name, group) {
-  const n = (name || '').toLowerCase();
-  if (group === 'Combined Charts' || n === 'popular' || n === 'trending' || n.includes('(all services)')) {
-    return '<span class="provider-chip-icon" style="background:var(--accent);color:#fff;font-weight:800;font-size:0.7rem;letter-spacing:-0.02em;">ML</span>';
-  }
-  if (group === 'MDBList Charts' || n.includes('mdblist') || n.includes('streaming charts') || n.includes('moviemeter') || n.includes('us daily')) {
-    return '<span class="provider-chip-icon" style="background:#007AFF;color:#fff;font-weight:700;">M</span>';
-  }
-  if (n.includes('netflix')) return '<span class="provider-chip-icon netflix">N</span>';
-  if (n.includes('prime') || n.includes('amazon')) return '<span class="provider-chip-icon prime">P</span>';
-  if (n.includes('apple')) return '<span class="provider-chip-icon apple">A</span>';
-  if (n.includes('disney')) return '<span class="provider-chip-icon disney">D+</span>';
-  if (n.includes('max') || n.includes('hbo')) return '<span class="provider-chip-icon max">M</span>';
-  if (n.includes('hulu')) return '<span class="provider-chip-icon hulu">h</span>';
-  if (n.includes('paramount')) return '<span class="provider-chip-icon paramount">P+</span>';
-  if (n.includes('peacock')) return '<span class="provider-chip-icon peacock">P</span>';
-  if (n.includes('discovery')) return '<span class="provider-chip-icon discovery">D</span>';
-  if (n.includes('tmdb')) return '<span class="provider-chip-icon" style="background:#01b4e4;color:#fff;">T</span>';
-  if (n.includes('trakt')) return '<span class="provider-chip-icon" style="background:#ed1c24;color:#fff;">T</span>';
-  if (n.includes('simkl')) return '<span class="provider-chip-icon" style="background:#000;border:1px solid #333;color:#fff;">S</span>';
-  if (group === 'Kids') return '<span class="provider-chip-icon" style="background:#FF9900;color:#fff;">K</span>';
-  if (group === 'Genres') return '<span class="provider-chip-icon" style="background:#5856D6;color:#fff;">G</span>';
-  return '<span class="provider-chip-icon" style="background:#8e8e93;color:#fff;">&#x2605;</span>';
-}
 
 function buildStreamingRowsHtml(list, labelSuffix, group) {
   const rows = list.map((p) => {
@@ -47378,7 +47322,7 @@ self.addEventListener('fetch', e => {
         }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
-        const errMsg = String(err.message || err);
+        const errMsg = safeErrorMessage(err);
         if (isUserPersonal) {
           console.error("User personal catalog fetch error:", errMsg);
           return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
@@ -47628,7 +47572,7 @@ self.addEventListener('fetch', e => {
           const meta = buildChannelMeta(matchedEntry, url.origin);
           return jsonPublic({ meta: meta || null });
         } catch (err) {
-          return jsonPublic({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: safeErrorMessage(err) });
         }
       }
 
@@ -47645,7 +47589,7 @@ self.addEventListener('fetch', e => {
             { "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800" }
           );
         } catch (err) {
-          return jsonPublic({ meta: null, error: String(err.message || err) });
+          return jsonPublic({ meta: null, error: safeErrorMessage(err) });
         }
       }
 
@@ -47747,7 +47691,7 @@ self.addEventListener('fetch', e => {
         const lists = await fetchTopLists(MDBLIST_POPULAR_KEY, env, ctx);
         return json({ ok: true, lists });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -47919,7 +47863,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, results });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48064,7 +48008,7 @@ self.addEventListener('fetch', e => {
           seasons,
         });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48095,7 +48039,7 @@ self.addEventListener('fetch', e => {
         }));
         return json({ ok: true, episodes });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48377,7 +48321,7 @@ self.addEventListener('fetch', e => {
         if (!resolved.length) return json({ ok: false, error: "Couldn't resolve any shows in that list to TMDB." });
         return json({ ok: true, shows: resolved });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48392,7 +48336,7 @@ self.addEventListener('fetch', e => {
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
         return json({ ok: true, imdbId: details.imdbId });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48408,7 +48352,7 @@ self.addEventListener('fetch', e => {
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this show." });
         return json({ ok: true, imdbId: details.imdbId });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48725,7 +48669,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists: results.slice(0, 30) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err), lists: [] });
+        return json({ ok: false, error: safeErrorMessage(err), lists: [] });
       }
     }
 
@@ -48742,7 +48686,7 @@ self.addEventListener('fetch', e => {
         if (!traktKey) ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 1 + lists.length));
         return json({ ok: true, lists });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -48957,7 +48901,7 @@ self.addEventListener('fetch', e => {
         if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
         return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -49176,7 +49120,7 @@ self.addEventListener('fetch', e => {
         }
         return json({ ok: true, ...data });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -49250,7 +49194,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, access_token: data.access_token, username: traktUsername });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -49396,7 +49340,7 @@ self.addEventListener('fetch', e => {
           },
         });
       } catch (err) {
-        return failWith("network", String(err.message || err));
+        return failWith("network", safeErrorMessage(err));
       }
     }
 
@@ -49511,7 +49455,7 @@ self.addEventListener('fetch', e => {
           },
         });
       } catch (err) {
-        return failWith("network", String(err.message || err));
+        return failWith("network", safeErrorMessage(err));
       }
     }
 
@@ -49681,7 +49625,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists, username: simklUsername });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) }, 500);
+        return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
     }
 
@@ -49808,7 +49752,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", action, target, data: tData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49889,7 +49833,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("simkl", safeUserHash(token));
           return json({ ok: true, provider: "simkl", action, target: targetStatus, data: sData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -49925,7 +49869,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "watchlist", data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -49948,7 +49892,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "favorite", data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -49971,7 +49915,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("tmdb", safeUserHash(sessionId || v4Token));
             return json({ ok: true, provider: "tmdb", action, target: "custom", listId, data: tmdbData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
       }
@@ -50039,7 +49983,7 @@ self.addEventListener('fetch', e => {
                 lastErr = mData.error || `MDBList error (HTTP ${mRes.status})`;
               }
             } catch (err) {
-              lastErr = String(err.message || err);
+              lastErr = safeErrorMessage(err);
             }
           }
           if (!success) {
@@ -50075,7 +50019,7 @@ self.addEventListener('fetch', e => {
             invalidatePerUserCache("mdblist", safeUserHash(token));
             return json({ ok: true, provider: "mdblist", action, target: "history", data: mData });
           } catch (err) {
-            return json({ ok: false, error: String(err.message || err) }, 500);
+            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
         }
 
@@ -50110,7 +50054,7 @@ self.addEventListener('fetch', e => {
                 lastErr = mData.error || `MDBList error (HTTP ${mRes.status})`;
               }
             } catch (err) {
-              lastErr = String(err.message || err);
+              lastErr = safeErrorMessage(err);
             }
           }
           if (!success) {
@@ -50268,7 +50212,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", syncedCount: items.length, data: tData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50347,7 +50291,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("simkl", safeUserHash(token));
           return json({ ok: true, provider: "simkl", syncedCount: items.length, data: sData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50431,7 +50375,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("mdblist", safeUserHash(token));
           return json({ ok: true, provider: "mdblist", syncedCount: items.length, data: mData });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50505,7 +50449,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50547,7 +50491,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50593,7 +50537,7 @@ self.addEventListener('fetch', e => {
             }
           });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50661,7 +50605,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("trakt", safeUserHash(token));
           return json({ ok: true, provider: "trakt", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50686,7 +50630,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("tmdb", safeUserHash(sessionId));
           return json({ ok: true, provider: "tmdb", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -50752,7 +50696,7 @@ self.addEventListener('fetch', e => {
           invalidatePerUserCache("mdblist", safeUserHash(token));
           return json({ ok: true, provider: "mdblist", listId });
         } catch (err) {
-          return json({ ok: false, error: String(err.message || err) }, 500);
+          return json({ ok: false, error: safeErrorMessage(err) }, 500);
         }
       }
 
@@ -51277,7 +51221,7 @@ self.addEventListener('fetch', e => {
         const username = (result && result.username) || "";
         return json({ ok: true, lists, username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51332,7 +51276,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, items: historyResult.items || [], hasMore: !!historyResult.hasMore });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51878,7 +51822,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -51960,7 +51904,7 @@ self.addEventListener('fetch', e => {
                 hasMore = false;
               }
             } catch (e) {
-              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: String(e.message || e) });
+              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: safeErrorMessage(e) });
               break;
             }
           }
@@ -52008,7 +51952,7 @@ self.addEventListener('fetch', e => {
                 hasMore = false;
               }
             } catch (e) {
-              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: String(e.message || e) });
+              logs.push({ url: pageUrl.replace(apikey, "***").replace(accessToken, "***"), error: safeErrorMessage(e) });
               break;
             }
           }
@@ -52016,7 +51960,7 @@ self.addEventListener('fetch', e => {
 
         return json({ ok: true, items: allItems, debug: logs });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -52065,7 +52009,7 @@ self.addEventListener('fetch', e => {
           traktAccessToken
         });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -55277,7 +55221,7 @@ self.addEventListener('fetch', e => {
           });
         return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -56359,7 +56303,7 @@ self.addEventListener('fetch', e => {
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         return json({ ok: true, region, providerId, movies, shows }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
@@ -56409,7 +56353,7 @@ self.addEventListener('fetch', e => {
         results = results.slice(0, 40).map((p) => ({ id: p.id, name: p.name }));
         return json({ ok: true, results }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
-        return json({ ok: false, error: String(err.message || err) });
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
