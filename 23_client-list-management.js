@@ -1310,6 +1310,26 @@ function watchHistoryPassesFilter(it, filter) {
   return true;
 }
 
+// How many tiles the grid shows for a set of raw items. Mirrors the grouping
+// and filtering renderWatchHistoryGrid does below -- the count only, because
+// rebuilding the tiles themselves is the thing being avoided. Kept next to it
+// so the pair stay in step.
+function watchHistoryTileCount(items, filter, grouped) {
+  if (!grouped) {
+    return (items || []).filter((it) => watchHistoryPassesFilter(it, filter)).length;
+  }
+  const shows = new Set();
+  let movies = 0;
+  (items || []).forEach((it) => {
+    if (!it) return;
+    if (it.type === 'episode' || !!it.showId) shows.add(String(it.showId || it.showTitle || it.id));
+    else movies++;
+  });
+  if (filter === 'movie') return movies;
+  if (filter === 'series') return shows.size;
+  return shows.size + movies;
+}
+
 // Called after ONE item has been taken out of Watch History while the See All
 // page is open. Returns true if it brought the page up to date on its own.
 //
@@ -1323,10 +1343,14 @@ function watchHistoryPassesFilter(it, filter) {
 // Nothing about the surviving tiles changed, so nothing about them needs to be
 // re-rendered: the clicked tile is already being faded out by the handler that
 // got us here, anything else the removal took with it is dropped in place, and
-// the counts are recomputed from the raw items. Grouped-by-show mode is the one
-// case that genuinely needs the layout recomputing (a show tile's episode count
-// changes, and the tile disappears entirely at zero), so it says so and lets the
-// caller fall back.
+// the counts are recomputed from the raw items.
+//
+// That holds in grouped-by-show mode too. Every tile there stands for a
+// disjoint set of raw items -- one show, or one movie -- so removing one can
+// never change another's episode count; and there is no way to remove a single
+// episode while grouped, because the grid has no episode tiles. Toggling the
+// grouping re-renders on its own (toggleWatchHistoryGroupShows), so a count
+// that went stale in the other mode is recomputed on the way in.
 function updateWatchHistoryGridAfterRemoval() {
   const gridEl = document.getElementById('detailGrid');
   const detailTab = document.getElementById('content-list-details');
@@ -1337,11 +1361,19 @@ function updateWatchHistoryGridAfterRemoval() {
   if (!p) return true;
   const isLocalHist = (!p.listUrl && p.name && p.name.toLowerCase().includes('watch history')) || p.listUrl === 'watch-history' || p.listUrl === 'custom:watch-history' || p.listUrl === 'autotrack:watch-history';
   if (!isLocalHist) return true;
-  if (localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true') return false;
+  // No usable item list to reconcile against -- say so and let the full render
+  // work it out from whatever state there is.
+  if (!Array.isArray(window._rawWatchHistoryItems)) return false;
+  const grouped = localStorage.getItem('myListAddon:watchHistoryGroupShows') === 'true';
 
+  // Both tile identities: an ungrouped tile carries the item's own id, a
+  // grouped show tile carries the show id. A show keeps its tile for as long
+  // as any episode of it is still in the history.
   const live = new Set();
-  (window._rawWatchHistoryItems || []).forEach((it) => {
-    if (it) live.add(String(it.id || it.imdbId || ''));
+  window._rawWatchHistoryItems.forEach((it) => {
+    if (!it) return;
+    live.add(String(it.id || it.imdbId || ''));
+    if (it.showId) live.add(String(it.showId));
   });
   gridEl.querySelectorAll('.cw-remove-btn[data-remove-type="history"]').forEach((b) => {
     if (live.has(String(b.dataset.removeId || ''))) return;
@@ -1352,7 +1384,7 @@ function updateWatchHistoryGridAfterRemoval() {
   });
 
   const filter = window._watchHistoryFilter || 'all';
-  const remaining = (window._rawWatchHistoryItems || []).filter((it) => watchHistoryPassesFilter(it, filter)).length;
+  const remaining = watchHistoryTileCount(window._rawWatchHistoryItems, filter, grouped);
   const subEl = document.getElementById('detailSubtitle');
   if (subEl) subEl.textContent = remaining + ' item' + (remaining === 1 ? '' : 's');
   const statusEl = document.getElementById('detailStatus');
@@ -1361,7 +1393,7 @@ function updateWatchHistoryGridAfterRemoval() {
 }
 window.updateWatchHistoryGridAfterRemoval = updateWatchHistoryGridAfterRemoval;
 
-window.renderWatchHistoryGrid = function() {
+function renderWatchHistoryGrid() {
   const gridEl = document.getElementById('detailGrid');
   const statusEl = document.getElementById('detailStatus');
   const subEl = document.getElementById('detailSubtitle');
@@ -1418,7 +1450,17 @@ window.renderWatchHistoryGrid = function() {
             year: it.year,
             watchedCount: 0,
             watchedAt: it.watchedAt || 0,
-            removeShowId: sId || it.id,
+            // removeHistoryId, NOT removeShowId. livePreviewPosterHtml reads
+            // removeShowId as "this is a Continue Watching tile" -- it tests
+            // for it first, and isCwItem keys off it too -- so a grouped Watch
+            // History show tile rendered a button labelled "Remove from
+            // Continue Watching" that dispatched to dismissContinueWatchingShow
+            // and left the watch history untouched, while also picking up
+            // Continue Watching's poster badge settings. removeWatchHistoryItemDirect
+            // already matches on showId as well as item id, so handing it the
+            // show id removes exactly what this tile stands for: every watched
+            // episode of that show.
+            removeHistoryId: sId || it.id,
           });
         }
         const entry = showMap.get(showKey);
@@ -1496,7 +1538,8 @@ window.renderWatchHistoryGrid = function() {
   if (statusEl) {
     statusEl.innerHTML = processed.length ? '' : '<small>No matching items found.</small>';
   }
-};
+}
+window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
 window.switchListDetailsType = function(newType) {
   if (!window._currentListDetailsParams) return;
