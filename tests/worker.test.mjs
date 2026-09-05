@@ -924,6 +924,88 @@ describe("audit fix: the cron connects the API key globals too", () => {
   });
 });
 
+// A 24/7 channel is a flat list of EPISODES, but every episode carries the
+// imdbId/showId of the show it came from. Both places that built a channel's
+// "See All" items used that show id as the item id, and the list-details grid
+// dedupes by id (appendItems -- there to stop a provider that ignores its skip
+// parameter from rendering the same page twice). So a channel collapsed to one
+// poster per distinct show, and adding episodes changed nothing.
+describe("bug: My Channels See All showed one item per show, not per episode", () => {
+  const channelItemId = loadOneClientFunction("20_client-channel-builder.js", "channelItemId");
+
+  // Exactly how appendItems (23_client-list-management.js) dedupes.
+  function afterGridDedupe(items) {
+    const seen = new Set();
+    const kept = [];
+    items.forEach((it) => {
+      const key = it && (it.id != null ? String(it.id) : null);
+      if (key === null || !seen.has(key)) {
+        if (key !== null) seen.add(key);
+        kept.push(it);
+      }
+    });
+    return kept;
+  }
+
+  function buildChannel(shows, seasons, episodes) {
+    const items = [];
+    shows.forEach((show) => {
+      for (let s = 1; s <= seasons; s++) {
+        for (let e = 1; e <= episodes; e++) {
+          items.push({ imdbId: show.imdbId, showName: show.name, season: s, episode: e, kind: "series" });
+        }
+      }
+    });
+    return items;
+  }
+
+  it("keeps every episode of a multi-show channel", () => {
+    const shows = [
+      { name: "The Office", imdbId: "tt0386676" },
+      { name: "Parks and Rec", imdbId: "tt1266020" },
+      { name: "Brooklyn Nine-Nine", imdbId: "tt2467372" },
+    ];
+    const channelItems = buildChannel(shows, 4, 10); // 120 episodes, 3 shows
+    const sample = channelItems.map((it, idx) => ({ id: channelItemId(it, idx) }));
+
+    assert.equal(sample.length, 120);
+    assert.equal(new Set(sample.map((x) => x.id)).size, 120, "episode ids are not unique");
+    // The actual regression: this used to be 3.
+    assert.equal(afterGridDedupe(sample).length, 120, "the grid still collapses episodes to one per show");
+  });
+
+  it("uses the show:season:episode shape every other consumer already expects", () => {
+    const id = channelItemId({ imdbId: "tt0386676", showName: "The Office", season: 2, episode: 7 }, 0);
+    assert.equal(id, "tt0386676:2:7");
+    // The poster click handler (19_client-search-and-likes.js) and
+    // openItemDetailsModal (23_) both recover the show by splitting on the
+    // first colon -- for tt-prefixed and numeric TMDB ids alike.
+    assert.equal(id.split(":")[0], "tt0386676");
+    const numeric = channelItemId({ showId: "1418", showName: "Big Bang", season: 3, episode: 1 }, 0);
+    assert.equal(numeric, "1418:3:1");
+    assert.equal(numeric.split(":")[0], "1418");
+  });
+
+  it("leaves items that carry no episode numbering alone", () => {
+    // A movie-saga channel (MCU, Star Wars): each item is a distinct film and
+    // its own id is already unique, so it must not gain a suffix.
+    const films = [
+      { imdbId: "tt0371746", showName: "Iron Man" },
+      { imdbId: "tt0800080", showName: "The Incredible Hulk" },
+      { imdbId: "tt1228705", showName: "Iron Man 2" },
+    ];
+    const sample = films.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.deepEqual(sample.map((x) => x.id), ["tt0371746", "tt0800080", "tt1228705"]);
+    assert.equal(afterGridDedupe(sample).length, 3);
+  });
+
+  it("still yields distinct ids when an item has no id at all", () => {
+    const nameless = [{ showName: "Mystery" }, { showName: "Mystery" }];
+    const sample = nameless.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.equal(new Set(sample.map((x) => x.id)).size, 2, "id-less items collapsed together");
+  });
+});
+
 describe("data isolation", () => {
   it("one creator cannot read or delete another creator's lists", async () => {
     const env = makeEnv();

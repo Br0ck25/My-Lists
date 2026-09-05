@@ -1649,7 +1649,9 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             const displayTitle = seasonEp ? (showName + ' ' + seasonEp) : showName;
             const fullTitle = showName + (seasonEp ? ' ' + seasonEp : '') + (epName ? ' \u2014 ' + epName : '');
             return {
-              id: it.showId || it.id || ('channel_item_' + idx),
+              // Same collapse as openChannelDetailsPage had -- see channelItemId
+              // (20_client-channel-builder.js) for why the show id alone is not enough.
+              id: (typeof channelItemId === 'function') ? channelItemId(it, idx) : (it.showId || it.id || ('channel_item_' + idx)),
               type: it.type || (it.season != null ? 'episode' : 'series'),
               name: displayTitle,
               fullTitle: fullTitle,
