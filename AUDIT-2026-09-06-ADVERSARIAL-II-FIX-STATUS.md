@@ -9,8 +9,16 @@ now passes, and the defect reintroduced by mutation makes the test suite fail.
 A fix whose mutation leaves the suite green does not have a real regression
 test, and is called out as such below rather than counted as done.
 
-Suite: **250 tests, 249 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **253 tests, 252 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
+
+One mutation did survive on the first pass — reverting N4's purge-on-create
+left the suite green, because the test for it asserted a clean slate after a
+*clean* delete, which is clean with or without the purge. Replaced with one
+that seeds account-owned keys under a username with no identity and then
+registers it; reverting the purge now fails. Recorded rather than quietly
+corrected, because "the mutation survived" is the only signal that a
+regression test is decorative.
 
 ---
 
@@ -87,14 +95,13 @@ storage-missing, throttled, and not-authenticated distinguishable.
 
 ---
 
-## Deliberately not done
+### Confirmed after the report was written
 
-**§11.1 — empty upstream replies cached as chart data.** Filed unconfirmed and
-still unconfirmed: an upstream answering `200 {}` demonstrably writes 48 empty
-chart caches at a 24h TTL, but I could not show it *overwrites* good data,
-which is the part that would decide the fix. Guessing at a "don't cache an
-empty result" rule without knowing whether an empty result is ever legitimate
-for these endpoints risks suppressing a genuinely empty chart.
+| ID | Fix | Verified by |
+|---|---|---|
+| **§11.1** | The audit filed this unconfirmed because it could show empty chart caches being *written* but not that they *overwrote good data*. They do: the write gate is only "not null and not undefined", so an empty array or object counts as a successful refresh and lands on all three tiers — isolate memo, KV copy, edge copy. That destroys the last-known-good data those tiers exist to hold, at exactly the moment the circuit breaker needs it, so a provider blip stopped being "slightly stale rows" and became "empty rows". Now refused, **opt-in**: a trending chart is never legitimately empty, but someone's Trakt watchlist is, so the four shared chart/collection fetchers opt in and every per-user fetcher deliberately does not. | `/tmp` probe reproduced in the suite; two tests, one pinning the split |
+
+## Deliberately not done
 
 **§11.3 — `creatorlistorder:` lost updates.** A single-key read-modify-write
 loses entries under concurrency (3 of 12 measured). The dashboard's orphan
