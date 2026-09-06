@@ -6,6 +6,12 @@ directory is imported by the Worker, the build, `verify.sh` or CI — `build.py`
 globs `[0-9][0-9]_*.js` at the repo root and CI runs `tests/*.test.mjs`, neither
 of which reaches here.
 
+**These scripts are the original pre-fix reproductions.** They are kept as written so
+the findings stay checkable, which means their narration describes the OLD behaviour --
+run against the current tree they now demonstrate the fixes instead. `t22_inherit.mjs`
+still prints "the username is now free to reclaim", for instance, on a run where the
+delete correctly refuses and reports `ok: false`. Read the output, not the labels.
+
 Run from this directory with Node 22+ (`node:sqlite` is required):
 
 ```

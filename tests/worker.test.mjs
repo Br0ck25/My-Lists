@@ -5066,3 +5066,105 @@ describe("P3: hygiene findings", () => {
     assert.equal(db._lists.has("p3fk:mirrored"), true, "and the list should have reached the mirror");
   });
 });
+
+// The four mutations that still survived the suite after the P0/P1 fixes.
+// Each of these is the test that kills one.
+describe("Test-suite blind spots named by the audit", () => {
+  it("listAllKeys follows the cursor past the first page", async () => {
+    const kv = makeKv();
+    // KV-only on purpose: with D1 bound the dashboard counts with SELECT
+    // COUNT(*) and never touches listAllKeys. The KV fallback is the path
+    // that pages, and KV pages at 1000, so this only comes out right if the
+    // cursor is followed.
+    const env = makeEnv({ CONFIGS: kv });
+    const n = 1500;
+    for (let i = 0; i < n; i++) {
+      kv._store.set(`creator:user${String(i).padStart(5, "0")}`, JSON.stringify({
+        displayName: `User ${i}`, keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+      }));
+    }
+    const cookie = await adminCookie(env);
+    const page = await call(env, "/admin", { cookie });
+    assert.equal(page.status, 200);
+    assert.match(page.text, new RegExp(`\\b${n}\\b`),
+      `the dashboard must count all ${n} creators, not just the first KV page`);
+  });
+
+  it("the index rebuild picks up anonymously published lists, not only creator ones", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const pub = await call(env, "/api/publish-list", {
+      method: "POST", ip: "198.51.77.7",
+      json: { name: "Anon Picks", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(pub.body.ok, true, JSON.stringify(pub.body));
+    const cookie = await adminCookie(env);
+    let done = false;
+    for (let i = 0; i < 20 && !done; i++) {
+      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
+    }
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.some((l) => l.slug === "anon-picks"), true,
+      "a rebuild that misses the publishedlist:user: prefix silently empties half the directory");
+  });
+
+  // Driving this through the API cannot reach the exhausted branch: the
+  // random-suffix attempts essentially never collide, so pickFreeSlug returns
+  // on the first one every time. The contract it documents -- "returns '' when
+  // it cannot find a free slug, and callers MUST treat that as a failure" --
+  // is therefore only testable directly, and it is worth testing: both call
+  // sites used to run a bounded loop and then use whatever slug it exited on,
+  // which past the bound was a slug that WAS taken, so publishing wrote
+  // straight over someone's existing list.
+  it("pickFreeSlug returns empty rather than a taken slug when it runs out", async () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8");
+    const grab = (name) => {
+      let start = src.indexOf(`function ${name}`);
+      // Keep a leading `async`, or the extracted body loses its await.
+      if (src.slice(Math.max(0, start - 6), start) === "async ") start -= 6;
+      let i = src.indexOf("{", start), d = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === "{") d++;
+        else if (src[i] === "}") { d--; if (!d) { i++; break; } }
+      }
+      return src.slice(start, i);
+    };
+    const consts = ["SLUG_NUMBERED_ATTEMPTS", "SLUG_RANDOM_ATTEMPTS"]
+      .map((n) => src.match(new RegExp(`const ${n}\\s*=\\s*[^;]+;`))[0]).join("\n");
+    const pickFreeSlug = new Function(
+      "crypto",
+      `${consts}\n${grab("randomSlugSuffix")}\n${grab("pickFreeSlug")}\nreturn pickFreeSlug;`
+    )(globalThis.crypto);
+
+    assert.equal(await pickFreeSlug("movies", async () => true), "",
+      "everything taken must yield '', never a slug the caller would then overwrite");
+    assert.equal(await pickFreeSlug("movies", async () => false), "movies");
+    const taken = new Set(["movies"]);
+    assert.equal(await pickFreeSlug("movies", async (c) => taken.has(c)), "movies-2");
+  });
+
+  it("slug allocation never hands back a slug that is already taken", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "slugs1");
+    const K = { creatorName: "slugs1", creatorKey: u.creatorKey };
+    // Past SLUG_NUMBERED_ATTEMPTS the allocator switches to random suffixes;
+    // past those it must FAIL rather than reuse one. Either way, no save may
+    // ever land on another list's slug.
+    const slugs = [];
+    for (let i = 0; i < 20; i++) {
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: { ...K, name: "Movies", type: "movie", visibility: "private", items: [{ id: "tt" + i }] },
+      });
+      if (r.body.ok) slugs.push(r.body.slug);
+      else assert.equal(r.status, 409, "the only acceptable failure here is 'no free slug'");
+    }
+    assert.equal(new Set(slugs).size, slugs.length, "two lists were given the same slug");
+    assert.ok(slugs.length >= 10, "the numbered suffixes should have carried most of these");
+    for (const [i, slug] of slugs.entries()) {
+      const raw = env.CONFIGS._store.get(`creatorlist:slugs1:${slug}`);
+      assert.ok(raw, `${slug} was returned but never stored`);
+      assert.deepEqual(JSON.parse(raw).items, [{ id: "tt" + i }],
+        `${slug} holds another list's items, so a save overwrote one`);
+    }
+  });
+});

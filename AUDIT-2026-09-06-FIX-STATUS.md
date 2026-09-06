@@ -100,13 +100,46 @@ The audit's headline test-suite finding was that 7 of 12 controlled bugs survive
 suite. Re-run after the P0/P1 fixes, with two new mutations aimed at the fixes
 themselves:
 
-| Mutation | Before | Now |
+**All twelve are now killed**, plus two new ones aimed at the fixes themselves.
+
+| Mutation | Audit | Now |
 |---|---|---|
-| skip the D1 write in `lists/save` entirely | **survived** | killed (3 fail) |
-| `/api/lists/like` writes `0` to D1 instead of the real count | **survived** | killed (1 fail) |
-| account purge deletes every list row in the database | **survived** | killed (2 fail) |
-| rotation swallows an unrecoverable D1 failure and reports success | — | killed (2 fail) |
-| `purgeCreatorData` always returns `ok: true` | — | killed (3 fail) |
+| skip the D1 write in `lists/save` entirely | **survived** | killed |
+| `/api/lists/like` writes `0` to D1 instead of the real count | **survived** | killed |
+| account purge widened to every list row in the database | **survived** | killed |
+| `listAllKeys` stops following the cursor after page 1 | **survived** | killed |
+| index-rebuild prefix `publishedlist:user:` → `publishedlist:usr:` | **survived** | killed |
+| `pickFreeSlug` returns a taken slug when it runs out | **survived** | killed |
+| `PUBLISHED_LIST_ITEMS_MAX` off by one | **survived** | killed |
+| `authenticateCreator` accepts a wrong key | killed | killed |
+| `isPublicListVisibility` inverted | killed | killed |
+| skip the KV write in `lists/save` | killed | killed |
+| remove the 409 conflict check | killed | killed |
+| `removeListsFromPublicIndex` becomes a no-op | killed | killed |
+| *new:* rotation swallows an unrecoverable D1 failure and reports success | — | killed |
+| *new:* `purgeCreatorData` always returns `ok: true` | — | killed |
+
+`pickFreeSlug`'s is worth a note. Driving it through the API cannot reach the exhausted
+branch — the random-suffix attempts essentially never collide, so it returns on the
+first one every time — so that mutation survived an end-to-end test and is killed by a
+direct test of the contract it documents instead. A mutation surviving is not always a
+coverage hole; sometimes it means the mutated path is unreachable, and the honest answer
+is to test the contract rather than contort a scenario.
+
+## Verification against the audit's own reproductions
+
+Re-run from `audit/adversarial-2026-09-06/` against the fixed tree:
+
+| Check | Audit | Now |
+|---|---|---|
+| `t20_faultinject.mjs` — 120 random ops, D1 failing 15% and 40% | **5 of 6 seeds diverged** | **all 6 consistent** |
+| `t19_stateful.mjs` — 10 seeds × 120 ops, model-checked after every op | clean | still clean |
+| `t07_differential.mjs` — KV-only vs KV+D1 | 0 differences | 0 differences |
+| `t01` cross-account delete | victim's rows destroyed | victim's row and like count intact |
+| `t03` likes after an edit | 5 → 0 in both stores | 5 throughout |
+| `t06` rotation with D1 failing | old key lives, new key dead | old key dead, new key works |
+| `t17` unpublish during a rebuild | re-published to directory + search | stays unpublished |
+| `t21`/`t22` failed deletes | `ok:true`, data inherited by a stranger | `ok:false`, nothing removed, name not reclaimable |
 
 `m6` (KV pagination cursor), `m7` (index-rebuild prefix), `m10` (slug fallback) and
 `m11` (cap off-by-one) are still open; they belong to the P2 batch.
