@@ -4595,3 +4595,127 @@ describe("A7/A8: unpublishing must actually remove a list from public discovery"
       "a list that is public again must be listed again");
   });
 });
+
+describe("A9/A10: concurrent devices must not silently overwrite each other", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+
+  // A9(a) -- Date.now() is frozen for the duration of a Workers request and
+  // only advances on I/O, so two saves genuinely can stamp the same
+  // millisecond. `current.updatedAt > expected` then cannot tell a stale
+  // write from a current one.
+  it("a stale save is still rejected when both writes land in the same millisecond", async () => {
+    const { env, K } = await mk("alice9");
+    const realNow = Date.now;
+    Date.now = () => 1_700_000_000_000;
+    try {
+      const a = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+      const b = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "B-newer" }], expectedUpdatedAt: a.body.updatedAt },
+      });
+      assert.equal(b.body.ok, true, "the up-to-date save must be accepted");
+      const c = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "C-stale" }], expectedUpdatedAt: a.body.updatedAt },
+      });
+      assert.equal(c.status, 409, "the stale save must conflict");
+      assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9")).config[0].url, "B-newer");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  // A9(b) -- Number.isFinite("1788650901055") is false, so a client that
+  // round-trips the stamp through localStorage or a dataset attribute sent a
+  // string and got last-write-wins with no error at all.
+  it("a malformed expectedUpdatedAt is rejected, not silently ignored", async () => {
+    for (const bad of ["", "not-a-number", {}, [], true]) {
+      const { env, K } = await mk("alice9b");
+      await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "ORIGINAL" }] } });
+      await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "NEWER" }] } });
+      const r = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "STALE" }], expectedUpdatedAt: bad },
+      });
+      assert.equal(r.status, 400, `expectedUpdatedAt=${JSON.stringify(bad)} must be a client error`);
+      assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9b")).config[0].url, "NEWER",
+        `expectedUpdatedAt=${JSON.stringify(bad)} silently disabled the guard`);
+    }
+  });
+
+  it("a numeric string is still honoured as a version", async () => {
+    const { env, K } = await mk("alice9c");
+    const a = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+    await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "B" }] } });
+    const stale = await call(env, "/api/creator/sync/save", {
+      method: "POST", json: { ...K, config: [{ url: "C" }], expectedUpdatedAt: String(a.body.updatedAt) },
+    });
+    assert.equal(stale.status, 409);
+  });
+
+  it("an absent expectedUpdatedAt keeps the old last-write-wins behaviour", async () => {
+    const { env, K } = await mk("alice9d");
+    await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+    const r = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "B" }] } });
+    assert.equal(r.body.ok, true, "an older client must not start failing");
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9d")).config[0].url, "B");
+  });
+
+  // A10 -- presets and channels are the blobs the code itself calls the one
+  // piece of synced state that can genuinely grow large, and they had no
+  // guard at all.
+  for (const [route, key, payloadA, payloadB, probe] of [
+    ["/api/creator/sync/save-presets", "creatorsyncpresets", { presets: { keep: { a: 1 } } }, { presets: { other: { b: 2 } } }, (o) => Object.keys(o.presets)],
+    ["/api/creator/sync/save-channels", "creatorsyncchannels", { channels: { keep: { a: 1 } } }, { channels: { other: { b: 2 } } }, (o) => Object.keys(o.channels)],
+  ]) {
+    it(`${route} rejects a stale device instead of replacing the whole blob`, async () => {
+      const { env, K } = await mk("alice10");
+      const first = await call(env, route, { method: "POST", json: { ...K, ...payloadA } });
+      assert.equal(first.body.ok, true);
+      assert.ok(Number.isFinite(first.body.updatedAt), "must hand back a version to build on");
+
+      const onTime = await call(env, route, {
+        method: "POST", json: { ...K, ...payloadB, expectedUpdatedAt: first.body.updatedAt },
+      });
+      assert.equal(onTime.body.ok, true, "an up-to-date save still works");
+
+      const stale = await call(env, route, {
+        method: "POST", json: { ...K, ...payloadA, expectedUpdatedAt: first.body.updatedAt },
+      });
+      assert.equal(stale.status, 409, "a stale device must not silently replace the blob");
+      assert.deepEqual(probe(JSON.parse(env.CONFIGS._store.get(`${key}:alice10`))), ["other"]);
+    });
+  }
+
+  // A10 -- save-tracking guards every array it carries except the watchlist,
+  // which overwrites both the tracking blob and the Watchlist custom list.
+  it("an empty watchlist from a stale device does not wipe a non-empty one", async () => {
+    const { env, K } = await mk("alice10b");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [], watchlist: [{ id: "tt0111161" }, { id: "tt0068646" }] },
+    });
+    const stored = () => JSON.parse(env.CONFIGS._store.get("creatorsynctracking:alice10b")).watchlist;
+    assert.equal(stored().length, 2);
+
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [] },
+    });
+    assert.equal(stored().length, 2, "a browser that has not loaded yet must not empty the watchlist");
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:alice10b:watchlist")).items.length, 2,
+      "and must not empty the Watchlist custom list either");
+  });
+
+  it("an intentional clear still empties the watchlist", async () => {
+    const { env, K } = await mk("alice10c");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [{ id: "tt0111161" }] },
+    });
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [], intentionalRemoval: true },
+    });
+    assert.deepEqual(JSON.parse(env.CONFIGS._store.get("creatorsynctracking:alice10c")).watchlist, []);
+    assert.deepEqual(JSON.parse(env.CONFIGS._store.get("creatorlist:alice10c:watchlist")).items, []);
+  });
+});

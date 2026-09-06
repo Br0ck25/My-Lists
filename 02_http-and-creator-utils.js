@@ -2258,6 +2258,54 @@ async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   return { keys, list_complete: true };
 }
 
+// --- Optimistic concurrency for the synced blobs -----------------------------
+//
+// Every /api/creator/sync/save* endpoint stores one wholesale blob per
+// account, and a second device autosaving a stale snapshot replaces it. The
+// guard for that is the client sending back the updatedAt its edits are
+// built on; these two helpers are the parts of it that were wrong or
+// missing.
+//
+// parseExpectedUpdatedAt distinguishes ABSENT from MALFORMED. Absent means an
+// older client, which keeps its previous last-write-wins behaviour on
+// purpose -- this was always meant to be additive. Malformed used to mean
+// the same thing, because the check was `Number.isFinite(body.
+// expectedUpdatedAt)` and Number.isFinite("1788650901055") is false: a
+// client that round-tripped the stamp through localStorage, a dataset
+// attribute or a form field sent a string and got last-write-wins with no
+// error anywhere. A value that is present but unusable is a client bug, and
+// silently dropping the only protection against overwriting someone else's
+// work is the worst available response to it.
+function parseExpectedUpdatedAt(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (typeof raw === "string" && raw.trim() === "") return { ok: false };
+  if (typeof raw !== "string" && typeof raw !== "number") return { ok: false };
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return { ok: false };
+  return { ok: true, value: n };
+}
+
+// nextSyncVersion makes the stamp strictly increasing.
+//
+// Date.now() is frozen for the duration of a Workers request and only
+// advances on I/O, so two saves genuinely can carry the same millisecond.
+// With a bare timestamp as the version, `stored.updatedAt > expected` then
+// cannot tell a stale write from a current one, and the stale one wins --
+// silently, with both requests answering 200. Comparing with >= instead is
+// not the fix: expected === stored is the NORMAL case (my edits are built on
+// exactly the version that is stored), so >= would reject every legitimate
+// save.
+//
+// Advancing past the stored value by at least one instead means a write
+// always produces a version no earlier write can claim, which is what the
+// comparison needs. It also makes the guard survive a clock that moves
+// backwards.
+function nextSyncVersion(currentUpdatedAt) {
+  const now = Date.now();
+  const prev = Number(currentUpdatedAt);
+  return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
+}
+
 // --- Account data purge (shared by reset and delete) -------------------------
 //
 // /api/creator/account/reset and /api/creator/delete-account are the same

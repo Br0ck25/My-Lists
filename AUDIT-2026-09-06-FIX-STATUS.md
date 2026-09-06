@@ -60,8 +60,8 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 |---|---|---|---|---|
 | **A7** | In-flight rebuild re-publishes a list just made private | MEDIUM | ✅ | removals recorded + re-verified before the rebuild publishes |
 | **A8** | Unpublish `ok:true` while the index removal fails silently | MEDIUM | ✅ | removal is awaited and reported; adding stays fire-and-forget |
-| **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ⬜ | |
-| **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ⬜ | |
+| **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ✅ | `parseExpectedUpdatedAt` + `nextSyncVersion` (02_) |
+| **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ✅ | guards on save-presets/save-channels + client; watchlist empty-guard |
 | **A11** | No size bound on the authenticated list write | MEDIUM | ⬜ | |
 | **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ⬜ | |
 | **A13** | No global exception boundary | MEDIUM | ⬜ | |

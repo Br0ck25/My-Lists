@@ -2006,22 +2006,31 @@
       // send expectedUpdatedAt at all gets exactly its previous behavior
       // (last-write-wins) -- this is purely additive, not a breaking
       // change to the request shape.
-      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
-      if (expectedUpdatedAt !== null) {
-        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
-        if (currentRaw) {
-          try {
-            const current = JSON.parse(currentRaw);
-            if (Number(current.updatedAt) > expectedUpdatedAt) {
-              // Purely for visibility -- this was previously invisible even
-              // to us; now it's at least countable on the admin dashboard.
-              ctx.waitUntil(bumpStat(env, "sync_conflict"));
-              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
-            }
-          } catch {
-            // Existing blob unreadable -- nothing coherent to protect
-            // against; fall through and write normally.
+      // Present-but-malformed is a client error, not a reason to drop the
+      // guard -- see parseExpectedUpdatedAt (02_http-and-creator-utils.js).
+      const expected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!expected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const expectedUpdatedAt = expected.value;
+      // Read unconditionally now, because the stamp below has to be strictly
+      // newer than whatever is stored, not merely Date.now() -- see
+      // nextSyncVersion.
+      const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+      let currentUpdatedAt = 0;
+      if (currentRaw) {
+        try {
+          const current = JSON.parse(currentRaw);
+          currentUpdatedAt = Number(current.updatedAt) || 0;
+          if (expectedUpdatedAt !== null && currentUpdatedAt > expectedUpdatedAt) {
+            // Purely for visibility -- this was previously invisible even
+            // to us; now it's at least countable on the admin dashboard.
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
           }
+        } catch {
+          // Existing blob unreadable -- nothing coherent to protect
+          // against; fall through and write normally.
         }
       }
 
@@ -2032,7 +2041,7 @@
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
         hiddenLists: Array.isArray(body.hiddenLists) ? body.hiddenLists.map(String) : [],
         hiddenMyListsSections: Array.isArray(body.hiddenMyListsSections) ? body.hiddenMyListsSections.map(String) : [],
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(currentUpdatedAt),
       };
       const serialized = JSON.stringify(blob);
       // Workers KV hard-caps a value at 25MB. Presets/Channels and tracking
@@ -2203,6 +2212,30 @@
                (Array.isArray(storedRecs.shows) && storedRecs.shows.length));
             if (incomingRecsEmpty && storedRecsPresent) {
               body.curatedRecommendations = storedRecs;
+            }
+
+            // The watchlist is the one array in this payload that had
+            // neither a merge nor an empty-guard, and it overwrites two
+            // records: the tracking blob AND creatorlist:{user}:watchlist
+            // (in KV and D1). pushTrackingSync always sends the browser's
+            // full local copy, so a second device that has not finished
+            // loading -- or one whose localStorage was cleared -- pushed an
+            // empty array and the account's Watchlist was gone from
+            // everywhere at once.
+            //
+            // Same rule the derived lists just above already use: an empty
+            // incoming array never replaces a non-empty stored one. A real
+            // change still sends a non-empty array, and a deliberate clear
+            // sets intentionalRemoval and skips this whole block -- which is
+            // exactly the distinction that field exists to draw.
+            if ((!Array.isArray(body.watchlist) || !body.watchlist.length) &&
+                Array.isArray(existingBlob.watchlist) && existingBlob.watchlist.length) {
+              body.watchlist = existingBlob.watchlist;
+              // Keep the stamp with the data it belongs to, or the record
+              // would claim this browser's clock for someone else's items.
+              if (Number(existingBlob.watchlistUpdatedAt)) {
+                body.watchlistUpdatedAt = Number(existingBlob.watchlistUpdatedAt);
+              }
             }
 
             // fullyWatchedShowIds: union
@@ -2397,10 +2430,34 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      // Same conflict guard as /api/creator/sync/save. Presets are the blob
+      // this codebase itself calls "the one piece of synced state that can
+      // genuinely grow large" -- a TV Channel's url is its entire episode
+      // list -- and it had no guard at all, so a second device autosaving a
+      // stale snapshot silently replaced the whole set. Additive: a client
+      // that sends no expectedUpdatedAt keeps the previous behaviour.
+      const presetsExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!presetsExpected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const presetsCurrentRaw = await env.CONFIGS.get(`creatorsyncpresets:${auth.username}`);
+      let presetsCurrentUpdatedAt = 0;
+      if (presetsCurrentRaw) {
+        try {
+          const cur = JSON.parse(presetsCurrentRaw);
+          presetsCurrentUpdatedAt = Number(cur.updatedAt) || 0;
+          if (presetsExpected.value !== null && presetsCurrentUpdatedAt > presetsExpected.value) {
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: cur.updatedAt }, 409);
+          }
+        } catch {
+          // Unreadable -- nothing coherent to protect; write normally.
+        }
+      }
       const presetsBlob = {
         presets: body.presets && typeof body.presets === "object" ? body.presets : {},
         presetsB64: body.presetsB64 || null,
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(presetsCurrentUpdatedAt),
       };
       const serialized = JSON.stringify(presetsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -2411,7 +2468,9 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // Handed back so the client can advance its baseline without a
+      // separate /sync/meta round trip, exactly as /sync/save does.
+      return json({ ok: true, updatedAt: presetsBlob.updatedAt });
     }
 
     // /api/creator/sync/save-channels (POST) { creatorName, creatorKey, channels, mergedChannels }
@@ -2424,10 +2483,29 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      // Same conflict guard and the same reasoning as save-presets above.
+      const channelsExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!channelsExpected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const channelsCurrentRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      let channelsCurrentUpdatedAt = 0;
+      if (channelsCurrentRaw) {
+        try {
+          const cur = JSON.parse(channelsCurrentRaw);
+          channelsCurrentUpdatedAt = Number(cur.updatedAt) || 0;
+          if (channelsExpected.value !== null && channelsCurrentUpdatedAt > channelsExpected.value) {
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: cur.updatedAt }, 409);
+          }
+        } catch {
+          // Unreadable -- nothing coherent to protect; write normally.
+        }
+      }
       const channelsBlob = {
         channels: body.channels && typeof body.channels === "object" ? body.channels : {},
         mergedChannels: body.mergedChannels && typeof body.mergedChannels === "object" ? body.mergedChannels : {},
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(channelsCurrentUpdatedAt),
       };
       const serialized = JSON.stringify(channelsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -2438,7 +2516,7 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      return json({ ok: true, updatedAt: channelsBlob.updatedAt });
     }
 
     // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
