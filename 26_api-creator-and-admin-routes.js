@@ -1180,7 +1180,10 @@
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
-      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey });
+      // no-store: this is the one and only moment the plaintext Creator Key
+      // exists outside whoever is holding it. Same reasoning
+      // /api/creator/scrobble-token already applied to its own token.
+      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/reset-key  (POST)  { username, recoveryAnswer } -> { ok, creatorKey }
@@ -1286,7 +1289,7 @@
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
+      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/reset-creator-key  (POST)  { username } -> { ok, creatorKey }
@@ -1347,7 +1350,7 @@
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorKey });
+      return json({ ok: true, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
@@ -4643,7 +4646,27 @@
 // see handleFetch's own opening comment for why it's split this way.
 export default {
   async fetch(request, env, ctx) {
-    const response = await handleFetch(request, env, ctx);
+    let response;
+    try {
+      response = await handleFetch(request, env, ctx);
+    } catch (err) {
+      // The boundary this file did not have. handleFetch has no top-level
+      // try, so any uncaught throw -- a KV put hitting its 1-write-per-second
+      // limit, an upstream answering 200 with a truncated body, a bug in a
+      // route -- escaped the Worker entirely, and Cloudflare answered with
+      // its own 1101 error page: not JSON, no CORS, none of the security
+      // headers below. A fetch() in the builder page saw an unparseable
+      // response and could only report "check your connection".
+      //
+      // /api/creator/sync/save already wrapped its own KV write and returned
+      // a clean 500; its sibling /api/creator/lists/save did not. One
+      // boundary here is worth more than remembering to do that at every
+      // future call site.
+      //
+      // safeErrorMessage logs the original and strips URLs, labelled secrets
+      // and long opaque tokens from what goes back.
+      response = json({ ok: false, error: safeErrorMessage(err) }, 500);
+    }
     return withSecurityHeaders(response);
   },
 

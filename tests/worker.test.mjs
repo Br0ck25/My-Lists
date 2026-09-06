@@ -4813,3 +4813,139 @@ describe("A15: a fresh schema.sql and a migrated database must be the same shape
     }
   });
 });
+
+describe("A12: a response that should never be cached must say so", () => {
+  it("an admin 401 is not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    for (const p of ["/admin/api/analytics", "/admin/api/feedback", "/admin/api/leaderboard", "/admin/api/apiusage"]) {
+      const r = await call(env, p);
+      assert.equal(r.status, 401);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} cached its 401, so a probe from any page breaks the dashboard for an hour`);
+    }
+  });
+
+  it("no error response is cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cases = [
+      ["/api/creator/lists/save", { creatorName: "nobody", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+      ["/api/creator/restore", { creatorName: "nobody", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+      ["/api/lists/like", { username: "nobody", slug: "nothing" }],
+    ];
+    for (const [p, body] of cases) {
+      const r = await call(env, p, { method: "POST", json: body });
+      assert.ok(r.status >= 400, `${p} was expected to fail`);
+      assert.match(r.headers.get("cache-control") || "", /no-store/, `${p} cached a ${r.status}`);
+    }
+  });
+
+  it("the two responses that carry a plaintext Creator Key are not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const created = await call(env, "/api/creator/create", {
+      method: "POST", json: { creatorName: "cache12", recoveryAnswer: "purple mountains" },
+    });
+    assert.ok(created.body.creatorKey);
+    assert.match(created.headers.get("cache-control") || "", /no-store/);
+
+    const reset = await call(env, "/api/creator/reset-key", {
+      method: "POST", json: { username: "cache12", recoveryAnswer: "purple mountains" },
+    });
+    assert.ok(reset.body.creatorKey);
+    assert.match(reset.headers.get("cache-control") || "", /no-store/);
+
+    const cookie = await adminCookie(env);
+    const admin = await call(env, "/admin/api/reset-creator-key", {
+      method: "POST", cookie, json: { username: "cache12" },
+    });
+    assert.ok(admin.body.creatorKey);
+    assert.match(admin.headers.get("cache-control") || "", /no-store/);
+  });
+
+  it("a GET that answers for one person's provider account is not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    for (const p of [
+      "/api/trakt-my-lists?token=SECRET&username=someone",
+      "/api/mdblist-my-lists?apikey=SECRET",
+      "/api/simkl/my-lists?token=SECRET",
+      "/api/tmdb-my-lists?session_id=SECRET&account_id=1",
+    ]) {
+      const r = await call(env, p);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} is a per-person answer keyed on a credential in the URL`);
+    }
+  });
+
+  it("genuinely public responses keep their caching", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "cache12b");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "cache12b", creatorKey: u.creatorKey, name: "Pub", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.match(dir.headers.get("cache-control") || "", /max-age=120/);
+    const one = await call(env, "/lists/cache12b/pub.json");
+    assert.match(one.headers.get("cache-control") || "", /max-age=300/);
+  });
+});
+
+describe("A13: an unhandled exception must not escape the Worker", () => {
+  it("a KV failure becomes a JSON 500 with security headers, not a Cloudflare error page", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "boom13");
+    env.CONFIGS._hooks.beforePut = async (key) => {
+      if (key.startsWith("creatorlist:")) throw new Error("KV 429 rate limited");
+    };
+    let r;
+    try {
+      r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: { creatorName: "boom13", creatorKey: u.creatorKey, name: "X", type: "movie", visibility: "public", items: [] },
+      });
+    } catch (e) {
+      assert.fail(`the exception escaped worker.fetch: ${e.message}`);
+    } finally {
+      env.CONFIGS._hooks.beforePut = null;
+    }
+    assert.equal(r.status, 500);
+    assert.equal(r.body.ok, false);
+    assert.ok(typeof r.body.error === "string" && r.body.error.length > 0);
+    assert.equal(r.headers.get("x-content-type-options"), "nosniff",
+      "the boundary must still run the response through withSecurityHeaders");
+  });
+
+  it("a redacting error message never leaks a URL or a long token", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "boom13b");
+    env.CONFIGS._hooks.beforePut = async () => {
+      throw new Error("failed calling https://api.themoviedb.org/3/x?api_key=abcdef0123456789abcdef0123456789");
+    };
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "boom13b", creatorKey: u.creatorKey, name: "X", type: "movie", visibility: "public", items: [] },
+    });
+    env.CONFIGS._hooks.beforePut = null;
+    assert.equal(r.status, 500);
+    assert.doesNotMatch(r.text, /themoviedb/, "a URL reached the client");
+    assert.doesNotMatch(r.text, /abcdef0123456789/, "a token reached the client");
+  });
+
+  it("an upstream that answers 200 with a truncated body is handled, not thrown", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), extra: { TMDB_API_KEY: "k" } });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const u = String(input && input.url ? input.url : input);
+      if (/themoviedb/.test(u)) {
+        return new Response("{not json", { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return realFetch(input, init);
+    };
+    try {
+      const r = await call(env, "/api/details?id=tt0111161");
+      assert.ok(r.status === 404 || r.status === 500, `got ${r.status}`);
+      assert.equal(typeof r.body === "object" && r.body !== null, true, "must be a JSON body");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});

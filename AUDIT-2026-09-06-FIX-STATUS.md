@@ -63,8 +63,8 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 | **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ✅ | `parseExpectedUpdatedAt` + `nextSyncVersion` (02_) |
 | **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ✅ | guards on save-presets/save-channels + client; watchlist empty-guard |
 | **A11** | No size bound on the authenticated list write | MEDIUM | ✅ | `CREATOR_LIST_BYTES_MAX` + shared item/name caps |
-| **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ⬜ | |
-| **A13** | No global exception boundary | MEDIUM | ⬜ | |
+| **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ✅ | errors (incl. `ok:false` 200s) → `no-store`; explicit on credential routes |
+| **A13** | No global exception boundary | MEDIUM | ✅ | `export default.fetch` try/catch; two unguarded `res.json()` wrapped |
 | **A15** | `schema.sql` vs migrations index drift | LOW | ✅ | index added; a test diffs both provisioning paths |
 
 ### P3 — hygiene, accuracy, documentation

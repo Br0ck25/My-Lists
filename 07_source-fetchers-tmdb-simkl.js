@@ -1158,14 +1158,19 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.movie_results && findData.movie_results.length > 0) {
+        // TMDB answering 200 with a body that is not JSON (a proxy error
+        // page, a truncated response) used to throw straight out of the
+        // Worker, because nothing above this catches. Treated as "no match"
+        // instead, which is what an unusable answer means here.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.movie_results && findData.movie_results.length > 0) {
           tmdbId = findData.movie_results[0].id;
           type = "movie";
-        } else if (findData.tv_results && findData.tv_results.length > 0) {
+        } else if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
           type = "tv";
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
           type = "tv";
         }
@@ -1487,10 +1492,12 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.tv_results && findData.tv_results.length > 0) {
+        // Same guard as the movie path above.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
         }
       }

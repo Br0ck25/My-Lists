@@ -121,7 +121,29 @@ function json(data, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "max-age=3600",
+      // An error is never worth caching, and caching one does real damage
+      // here: there is no `Vary: Cookie` on these responses, so an admin
+      // whose browser had already seen a 401 from /admin/api/analytics --
+      // which any cross-origin page can provoke with an <img> tag -- was
+      // served that cached 401 for an hour AFTER logging in, and the
+      // dashboard just said "Not authorized". A 404 from a list URL had the
+      // same shape: cached for an hour, so a list published a minute later
+      // stayed missing.
+      //
+      // `ok: false` counts as an error even with a 200 status, because that
+      // is this codebase's own convention -- most failure paths here return
+      // { ok: false, error } without changing the status code, and a status
+      // check alone would have missed every one of them.
+      //
+      // A successful 2xx keeps the previous default deliberately. Flipping it
+      // wholesale would strip edge caching from the catalog and provider
+      // endpoints this add-on leans on to stay inside upstream rate limits,
+      // which is a much larger change than the defect requires; the handful
+      // of successful responses that genuinely must not be cached set
+      // no-store explicitly at their call site instead.
+      "Cache-Control": (status >= 400 || (data && typeof data === "object" && data.ok === false))
+        ? "no-store"
+        : "max-age=3600",
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin

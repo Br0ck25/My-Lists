@@ -1817,7 +1817,29 @@ function json(data, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "max-age=3600",
+      // An error is never worth caching, and caching one does real damage
+      // here: there is no `Vary: Cookie` on these responses, so an admin
+      // whose browser had already seen a 401 from /admin/api/analytics --
+      // which any cross-origin page can provoke with an <img> tag -- was
+      // served that cached 401 for an hour AFTER logging in, and the
+      // dashboard just said "Not authorized". A 404 from a list URL had the
+      // same shape: cached for an hour, so a list published a minute later
+      // stayed missing.
+      //
+      // `ok: false` counts as an error even with a 200 status, because that
+      // is this codebase's own convention -- most failure paths here return
+      // { ok: false, error } without changing the status code, and a status
+      // check alone would have missed every one of them.
+      //
+      // A successful 2xx keeps the previous default deliberately. Flipping it
+      // wholesale would strip edge caching from the catalog and provider
+      // endpoints this add-on leans on to stay inside upstream rate limits,
+      // which is a much larger change than the defect requires; the handful
+      // of successful responses that genuinely must not be cached set
+      // no-store explicitly at their call site instead.
+      "Cache-Control": (status >= 400 || (data && typeof data === "object" && data.ok === false))
+        ? "no-store"
+        : "max-age=3600",
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin
@@ -11328,14 +11350,19 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.movie_results && findData.movie_results.length > 0) {
+        // TMDB answering 200 with a body that is not JSON (a proxy error
+        // page, a truncated response) used to throw straight out of the
+        // Worker, because nothing above this catches. Treated as "no match"
+        // instead, which is what an unusable answer means here.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.movie_results && findData.movie_results.length > 0) {
           tmdbId = findData.movie_results[0].id;
           type = "movie";
-        } else if (findData.tv_results && findData.tv_results.length > 0) {
+        } else if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
           type = "tv";
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
           type = "tv";
         }
@@ -11657,10 +11684,12 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.tv_results && findData.tv_results.length > 0) {
+        // Same guard as the movie path above.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
         }
       }
@@ -50191,7 +50220,11 @@ self.addEventListener('fetch', e => {
         };
 
         if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
-        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username });
+        // no-store. This is one person's Trakt account contents, and the
+        // request that produced it carries their access token in the query
+        // string -- so the URL that would be the cache key is itself the
+        // credential. json()'s cacheable default had no business on it.
+        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -50915,7 +50948,7 @@ self.addEventListener('fetch', e => {
           }
         } catch {}
 
-        return json({ ok: true, lists, username: simklUsername });
+        return json({ ok: true, lists, username: simklUsername }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
@@ -52296,7 +52329,7 @@ self.addEventListener('fetch', e => {
           }
         }
 
-        return json({ ok: true, lists, username: tmdbUsername, accountId });
+        return json({ ok: true, lists, username: tmdbUsername, accountId }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: "Failed to load TMDB lists: " + (err.message || String(err)) }, 500);
       }
@@ -53190,7 +53223,7 @@ self.addEventListener('fetch', e => {
           url: "mdblist:user:shows:airing-next",
         };
 
-        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username });
+        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -54992,7 +55025,10 @@ self.addEventListener('fetch', e => {
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
-      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey });
+      // no-store: this is the one and only moment the plaintext Creator Key
+      // exists outside whoever is holding it. Same reasoning
+      // /api/creator/scrobble-token already applied to its own token.
+      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/reset-key  (POST)  { username, recoveryAnswer } -> { ok, creatorKey }
@@ -55098,7 +55134,7 @@ self.addEventListener('fetch', e => {
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
+      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/reset-creator-key  (POST)  { username } -> { ok, creatorKey }
@@ -55159,7 +55195,7 @@ self.addEventListener('fetch', e => {
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorKey });
+      return json({ ok: true, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
@@ -58455,7 +58491,27 @@ self.addEventListener('fetch', e => {
 // see handleFetch's own opening comment for why it's split this way.
 export default {
   async fetch(request, env, ctx) {
-    const response = await handleFetch(request, env, ctx);
+    let response;
+    try {
+      response = await handleFetch(request, env, ctx);
+    } catch (err) {
+      // The boundary this file did not have. handleFetch has no top-level
+      // try, so any uncaught throw -- a KV put hitting its 1-write-per-second
+      // limit, an upstream answering 200 with a truncated body, a bug in a
+      // route -- escaped the Worker entirely, and Cloudflare answered with
+      // its own 1101 error page: not JSON, no CORS, none of the security
+      // headers below. A fetch() in the builder page saw an unparseable
+      // response and could only report "check your connection".
+      //
+      // /api/creator/sync/save already wrapped its own KV write and returned
+      // a clean 500; its sibling /api/creator/lists/save did not. One
+      // boundary here is worth more than remembering to do that at every
+      // future call site.
+      //
+      // safeErrorMessage logs the original and strips URLs, labelled secrets
+      // and long opaque tokens from what goes back.
+      response = json({ ok: false, error: safeErrorMessage(err) }, 500);
+    }
     return withSecurityHeaders(response);
   },
 
