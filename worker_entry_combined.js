@@ -3873,7 +3873,29 @@ async function purgeCreatorData(env, username, options = {}) {
 
   if (env.DB) {
     try {
-      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+      // `WHERE username = ?`, NOT `WHERE id LIKE '{u}:%'`.
+      //
+      // validateCreatorUsername allows [a-z0-9_-], and `_` is SQL LIKE's
+      // single-character wildcard. Interpolating the username into a LIKE
+      // pattern therefore made one account's purge a wildcard against every
+      // other account's list ids: a creator named `a_c-films` deleting their
+      // own account also deleted every D1 row belonging to `abc-films`,
+      // `axc-films`, `a1c-films` and so on -- silently, because KV still had
+      // the records so nothing visibly broke, while the D1 like counts were
+      // gone and the next ordinary edit wrote those zeroes back into KV.
+      //
+      // Usernames are 3-25 characters and `___` is a legal one, so the scaled
+      // version needed no credentials at all: register one all-underscore
+      // name per length, call the self-service /api/creator/account/reset on
+      // each, and creator_lists is empty for the whole deployment.
+      //
+      // The username column is what this actually means, it is indexed
+      // (idx_creator_lists_username), it is an equality rather than a scan,
+      // and it has no pattern syntax to escape. The FK's ON DELETE CASCADE
+      // covers the identity path too, so this is belt-and-braces there -- but
+      // it is the only thing covering account/reset, which keeps the creator
+      // row.
+      await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
     }
@@ -5185,6 +5207,20 @@ async function readStatCount(env, kind, bucket) {
   return parseInt(raw, 10) || 0;
 }
 
+// Escapes the LIKE metacharacters in a literal string so it can be used as a
+// prefix pattern. `%` and `_` are wildcards, and the escape character itself
+// has to be escaped first or `\%` would be produced from a lone backslash.
+// Pair it with `ESCAPE '\'` in the statement.
+//
+// SQL LIKE patterns built by concatenation are how the account purge came to
+// delete other creators' rows (see purgeCreatorData,
+// 02_http-and-creator-utils.js): the input there was a username, which may
+// contain `_`. Nothing reaches the call sites below from a request today, but
+// a helper is cheaper than remembering the rule at each new one.
+function escapeLikePrefix(s) {
+  return String(s == null ? "" : s).replace(/[\\%_]/g, "\\$&");
+}
+
 // All-time totals for a family of counters ("catalog_add:", "list_copy:"),
 // as a Map of the name after the prefix -> count.
 //
@@ -5197,9 +5233,17 @@ async function readStatTotalsByPrefix(env, prefix) {
   if (!env || !env.CONFIGS) return out;
   if (env.DB) {
     try {
+      // ESCAPE, because two of the three prefixes this is called with
+      // (`catalog_add:`, `list_copy:`, `sourcegroup:`) contain `_`, which is
+      // LIKE's single-character wildcard -- so `kind LIKE 'list_copy:%'` also
+      // matches `listXcopy:...`. Every kind here is generated internally
+      // today, so nothing is actually mismatched; this is the same defect
+      // class as the account purge's `id LIKE` (see purgeCreatorData,
+      // 02_http-and-creator-utils.js) and is closed the same day rather than
+      // left as the one instance that happens to be safe.
       const { results } = await env.DB.prepare(
-        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ORDER BY n DESC LIMIT ?"
-      ).bind(prefix + "%", STAT_TOTALS_READ_CAP).all();
+        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ESCAPE '\\' ORDER BY n DESC LIMIT ?"
+      ).bind(escapeLikePrefix(prefix) + "%", STAT_TOTALS_READ_CAP).all();
       if (results && results.length) {
         for (const row of results) {
           const name = String(row.kind).slice(prefix.length);

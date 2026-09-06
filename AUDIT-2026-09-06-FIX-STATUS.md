@@ -39,7 +39,7 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 
 | | Finding | Severity | Status | Commit |
 |---|---|---|---|---|
-| **A1** | Cross-account D1 delete via SQL `LIKE` wildcard | CRITICAL | ⬜ | |
+| **A1** | Cross-account D1 delete via SQL `LIKE` wildcard | CRITICAL | ✅ | `02_…:2206` → `WHERE username = ?`; `escapeLikePrefix` for `03_…:1133` |
 | **A5** | Key rotation reports success while rotating nothing | HIGH | ⬜ | |
 | **A3** | `delete-account` `ok:true`, account still authenticates | HIGH | ⬜ | |
 | **A4** | Failed purge frees the username while data survives | HIGH | ⬜ | |

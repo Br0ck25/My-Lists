@@ -4095,3 +4095,88 @@ describe("watch history: grouped show tiles remove from Watch History", () => {
     }
   });
 });
+
+// --- Adversarial audit 2026-09-06 ------------------------------------------
+//
+// One describe block per finding, each named for its finding id. Every one of
+// these was confirmed to FAIL against the code as it stood before its fix.
+
+describe("A1: an account purge must only ever touch its own lists", () => {
+  // validateCreatorUsername allows [a-z0-9_-], and `_` is SQL LIKE's
+  // single-character wildcard. The purge built its DELETE pattern by
+  // interpolating the username straight into `id LIKE '{u}:%'`, so a username
+  // containing `_` matched every other account whose name fit the pattern.
+  it("does not delete another creator's rows when the username contains _", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const victim = await createUser(env, "abc-films");
+    const other = await createUser(env, "a_c-films");
+
+    for (const u of [victim, other]) {
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: u.creatorName, creatorKey: u.creatorKey,
+          name: "Top Ten", type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body));
+    }
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: "203.0.113.9",
+      json: { username: "abc-films", slug: "top-ten" },
+    });
+    assert.equal(db._lists.size, 2);
+    assert.equal(db._lists.get("abc-films:top-ten").likes, 1);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: other.creatorName, creatorKey: other.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true);
+
+    assert.equal(db._lists.has("a_c-films:top-ten"), false, "the deleted account's own row must go");
+    assert.equal(db._lists.has("abc-films:top-ten"), true,
+      "a_c-films deleting their own account must not delete abc-films' list");
+    assert.equal(db._lists.get("abc-films:top-ten").likes, 1,
+      "and must not destroy its like count");
+  });
+
+  // The scaled form: usernames are 3-25 characters and `___` is legal, so one
+  // all-underscore name per length is a wildcard for every account on the
+  // deployment. Registering them is public and self-service.
+  it("survives an attacker registering all-underscore usernames and resetting them", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const victims = ["alice", "bobby", "carl", "dee-jay", "eve1", "frankie-films"];
+    for (const name of victims) {
+      const u = await createUser(env, name);
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: name, creatorKey: u.creatorKey,
+          name: "My List", type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+    }
+    assert.equal(db._lists.size, victims.length);
+
+    for (let len = 3; len <= 25; len++) {
+      const name = "_".repeat(len);
+      const u = await createUser(env, name);
+      // account/reset runs the same purge and, unlike delete-account, can be
+      // repeated forever on the same account.
+      const r = await call(env, "/api/creator/account/reset", {
+        method: "POST",
+        json: { creatorName: name, creatorKey: u.creatorKey, confirm: "RESET" },
+      });
+      assert.equal(r.body.ok, true);
+    }
+
+    assert.equal(db._lists.size, victims.length,
+      "23 self-service resets by a stranger must not empty creator_lists");
+    for (const name of victims) {
+      assert.equal(db._lists.has(`${name}:my-list`), true, `${name} lost their D1 row`);
+    }
+  });
+});

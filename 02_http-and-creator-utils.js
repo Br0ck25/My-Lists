@@ -2203,7 +2203,29 @@ async function purgeCreatorData(env, username, options = {}) {
 
   if (env.DB) {
     try {
-      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+      // `WHERE username = ?`, NOT `WHERE id LIKE '{u}:%'`.
+      //
+      // validateCreatorUsername allows [a-z0-9_-], and `_` is SQL LIKE's
+      // single-character wildcard. Interpolating the username into a LIKE
+      // pattern therefore made one account's purge a wildcard against every
+      // other account's list ids: a creator named `a_c-films` deleting their
+      // own account also deleted every D1 row belonging to `abc-films`,
+      // `axc-films`, `a1c-films` and so on -- silently, because KV still had
+      // the records so nothing visibly broke, while the D1 like counts were
+      // gone and the next ordinary edit wrote those zeroes back into KV.
+      //
+      // Usernames are 3-25 characters and `___` is a legal one, so the scaled
+      // version needed no credentials at all: register one all-underscore
+      // name per length, call the self-service /api/creator/account/reset on
+      // each, and creator_lists is empty for the whole deployment.
+      //
+      // The username column is what this actually means, it is indexed
+      // (idx_creator_lists_username), it is an equality rather than a scan,
+      // and it has no pattern syntax to escape. The FK's ON DELETE CASCADE
+      // covers the identity path too, so this is belt-and-braces there -- but
+      // it is the only thing covering account/reset, which keeps the creator
+      // row.
+      await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
     }
