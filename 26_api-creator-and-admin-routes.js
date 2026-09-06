@@ -1180,7 +1180,10 @@
       // The Creator Key is returned exactly once, right here -- it's never
       // stored anywhere (only its hash is), so this is the only moment it
       // will ever exist outside whoever's holding onto it themselves.
-      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey });
+      // no-store: this is the one and only moment the plaintext Creator Key
+      // exists outside whoever is holding it. Same reasoning
+      // /api/creator/scrobble-token already applied to its own token.
+      return json({ ok: true, creatorName: v.normalized, displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/reset-key  (POST)  { username, recoveryAnswer } -> { ok, creatorKey }
@@ -1261,46 +1264,32 @@
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+
+      // D1 first, and its outcome decides whether this rotation happens at
+      // all -- see rotateCreatorKeyHashInD1 (02_http-and-creator-utils.js).
+      // Nothing is written to KV until D1 is known to be either updated or
+      // unable to answer with the old hash.
+      const d1Rotation = await rotateCreatorKeyHashInD1(env, v.normalized, keyHash);
+      if (!d1Rotation.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't reset that key right now. Please try again in a moment -- your existing key still works.",
+        }, 503);
+      }
+
       // The previous key must stop working on a warm isolate the instant
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
-      
-      if (env.DB) {
-        try {
-          // meta.changes, not merely "did not throw". A D1 UPDATE that
-          // matches ZERO rows succeeds -- so for any account that exists
-          // in KV but was never migrated into D1 (i.e. every account
-          // created before /admin/api/migrate-d1 was first run), this used
-          // to report success, skip the KV write below, and rotate
-          // nothing at all: the caller got a brand-new key that would
-          // never work while the OLD key kept working forever. Exactly
-          // backwards for a credential rotation someone is performing
-          // because their key leaked.
-          const d1Res = await env.DB.prepare(
-            "UPDATE creators SET key_hash = ? WHERE username = ?"
-          ).bind(keyHash, v.normalized).run();
-          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
-            // Row absent from D1 (never migrated). Not an error -- the
-            // unconditional KV write below is the source of truth here --
-            // but worth surfacing, because it means this account is not
-            // in D1 and /admin/api/migrate-d1 has not been run for it.
-            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
-          }
-        } catch (dbErr) {
-          console.error("D1 write error (creator reset):", dbErr);
-        }
-      }
 
       // Written unconditionally, not only when D1 missed. getCreator()
-      // prefers D1 and falls back to KV, so leaving KV holding an older
-      // key_hash than D1 means two different valid passwords for one
-      // account depending on which store answers. Both stores always get
-      // the same hash.
+      // falls back to D1, so leaving KV holding an older key_hash than D1
+      // means two different valid passwords for one account depending on
+      // which store answers. Both stores always get the same hash.
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey });
+      return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/reset-creator-key  (POST)  { username } -> { ok, creatorKey }
@@ -1337,46 +1326,31 @@
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+
+      // Same contract as /api/creator/reset-key above: D1 has to be either
+      // updated or unable to answer with the old hash before KV is touched.
+      // See rotateCreatorKeyHashInD1 (02_http-and-creator-utils.js).
+      const d1Rotation = await rotateCreatorKeyHashInD1(env, v.normalized, keyHash);
+      if (!d1Rotation.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't reset that key right now. Please try again in a moment -- the creator's existing key still works.",
+        }, 503);
+      }
+
       // The previous key must stop working on a warm isolate the instant
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
-      
-      if (env.DB) {
-        try {
-          // meta.changes, not merely "did not throw". A D1 UPDATE that
-          // matches ZERO rows succeeds -- so for any account that exists
-          // in KV but was never migrated into D1 (i.e. every account
-          // created before /admin/api/migrate-d1 was first run), this used
-          // to report success, skip the KV write below, and rotate
-          // nothing at all: the caller got a brand-new key that would
-          // never work while the OLD key kept working forever. Exactly
-          // backwards for a credential rotation someone is performing
-          // because their key leaked.
-          const d1Res = await env.DB.prepare(
-            "UPDATE creators SET key_hash = ? WHERE username = ?"
-          ).bind(keyHash, v.normalized).run();
-          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
-            // Row absent from D1 (never migrated). Not an error -- the
-            // unconditional KV write below is the source of truth here --
-            // but worth surfacing, because it means this account is not
-            // in D1 and /admin/api/migrate-d1 has not been run for it.
-            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
-          }
-        } catch (dbErr) {
-          console.error("D1 write error (admin creator reset):", dbErr);
-        }
-      }
 
       // Written unconditionally, not only when D1 missed. getCreator()
-      // prefers D1 and falls back to KV, so leaving KV holding an older
-      // key_hash than D1 means two different valid passwords for one
-      // account depending on which store answers. Both stores always get
-      // the same hash.
+      // falls back to D1, so leaving KV holding an older key_hash than D1
+      // means two different valid passwords for one account depending on
+      // which store answers. Both stores always get the same hash.
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
-      return json({ ok: true, creatorKey });
+      return json({ ok: true, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
@@ -1655,6 +1629,17 @@
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
+      // The same bounds /api/publish-list has always had, which this
+      // authenticated sibling never picked up -- see CREATOR_LIST_BYTES_MAX
+      // (00_constants.js). Rejected rather than truncated, for the reason
+      // that file already spells out: quietly storing a shortened list is a
+      // worse bug than refusing an oversized one.
+      if (name.length > PUBLISHED_LIST_NAME_MAX) {
+        return json({ ok: false, error: "That list name is too long." }, 400);
+      }
+      if (items.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to save (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
 
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
@@ -1728,6 +1713,18 @@
         }
       }
 
+      // Item count alone is not a size bound -- items carry titles,
+      // overviews and poster URLs -- so this is checked on the exact bytes
+      // about to be stored, before a slug is allocated or anything is
+      // written.
+      const itemsJson = JSON.stringify(items || []);
+      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That list is too large to save. Try splitting it into more than one list.",
+        }, 413);
+      }
+
       const now = Date.now();
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
@@ -1744,12 +1741,47 @@
       if (env.DB) {
         try {
           const listId = `${auth.username}:${slug}`;
-          const itemsJson = JSON.stringify(items || []);
+          // `likes` is bound on the INSERT and deliberately absent from the
+          // DO UPDATE.
+          //
+          // It used to be absent from both, so a row created here took the
+          // column's DEFAULT 0 even though the true count was sitting in the
+          // KV record this same handler was about to write. Combined with
+          // getCreatorList preferring D1, one save made the count read 0 and
+          // the next save wrote that 0 into KV -- a rename silently
+          // destroying a real like count in every store and in the public
+          // directory. Same shape /admin/api/migrate-d1 has always used.
+          //
+          // Still out of the DO UPDATE, because there `likes` is not ours to
+          // write: /api/lists/like owns it, derives it from the voter ledger,
+          // and may well have moved it since this request read the record.
           await env.DB.prepare(
-            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-          ).bind(listId, auth.username, name, type, visibility, itemsJson, createdAt, now).run();
+            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+          ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
         } catch (dbErr) {
-          console.error("D1 write error (creatorlist put):", dbErr);
+          // The commonest cause is the foreign key: D1 enforces
+          // creator_lists.username -> creators.username, and an account that
+          // predates the D1 binding has no creators row yet, which is exactly
+          // the lazy-migration state getCreator is written to tolerate. The
+          // list is safe either way -- KV is authoritative and reads prefer
+          // it -- but leaving the mirror empty hides the list from the admin
+          // Community Lists panel until someone runs migrate-d1.
+          //
+          // So backfill the account row from KV and retry once. Costs nothing
+          // on the happy path (this only runs after a failure) and self-heals
+          // instead of waiting for a manual sweep.
+          const backfilled = await backfillCreatorRowInD1(env, auth.username);
+          if (backfilled) {
+            try {
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
+            } catch (retryErr) {
+              console.error("D1 write error (creatorlist put, after creator backfill):", retryErr);
+            }
+          } else {
+            console.error("D1 write error (creatorlist put):", dbErr);
+          }
         }
       }
       
@@ -1768,21 +1800,42 @@
       // Keep the directory index in step with this save. A list turned
       // private is removed rather than updated, otherwise unpublishing would
       // leave it listed publicly.
-      ctx.waitUntil(updatePublicListIndex(
-        env,
-        `c:${auth.username}:${slug}`,
-        isPublicListVisibility(visibility) ? {
-          isCreator: true,
-          username: auth.username,
-          creatorName: auth.displayName || auth.username,
-          slug,
-          name,
-          type: type || "mixed",
-          itemCount: Array.isArray(items) ? items.length : 0,
-          likes: likes || 0,
-          updatedAt: now,
-        } : null
-      ));
+      //
+      // The two directions get different treatment on purpose. Adding stays
+      // on ctx.waitUntil: a list that takes a moment to appear in the
+      // directory is cosmetic, and the daily rebuild repairs it. REMOVING is
+      // awaited and its result is reported, because it is the mechanism by
+      // which "make this private" stops the list being advertised -- and it
+      // used to be a fire-and-forget task whose failure was swallowed, so
+      // unpublishing answered ok:true while the list stayed in the directory
+      // AND in search until the next rebuild, up to a day later.
+      const indexEntry = isPublicListVisibility(visibility) ? {
+        isCreator: true,
+        username: auth.username,
+        creatorName: auth.displayName || auth.username,
+        slug,
+        name,
+        type: type || "mixed",
+        itemCount: Array.isArray(items) ? items.length : 0,
+        likes: likes || 0,
+        updatedAt: now,
+      } : null;
+      if (indexEntry) {
+        ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, indexEntry));
+      } else {
+        const removed = await updatePublicListIndex(env, `c:${auth.username}:${slug}`, null);
+        if (!removed) {
+          // The record IS private now -- the save above is unconditional and
+          // already landed, so /lists/:user/:slug already 404s. What failed is
+          // the directory listing, so say so rather than claiming the list is
+          // fully unpublished.
+          return json({
+            ok: false,
+            slug,
+            error: "Saved as private, but the public directory could not be updated just yet. It may keep listing this for a few minutes -- please try again.",
+          }, 500);
+        }
+      }
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
@@ -1816,7 +1869,18 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
-      const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
+      // Bounded, and no ":" -- that is the KV key separator, and slugifyServer
+      // (which produces every slug this app writes) can only emit
+      // [a-z0-9-] within 60 characters anyway. The array itself had no cap
+      // at all, so an authenticated caller could park an arbitrarily large
+      // value under one key; 5,000 is far above any real account, where the
+      // worst case ever observed was 129 records.
+      const newOrder = Array.isArray(body.order)
+        ? body.order
+            .map(String)
+            .filter((s) => s.length <= 60 && /^[a-zA-Z0-9._-]+$/.test(s))
+            .slice(0, CREATOR_LIST_ORDER_MAX)
+        : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
     }
@@ -1860,6 +1924,16 @@
       // callers on one function is what stops the two from drifting apart
       // again the way they had.
       const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: false });
+      // A sweep that threw is not a reset. Saying ok:true here would tell
+      // someone their account is empty while their lists are still live and
+      // still in the public directory.
+      if (!purged.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish clearing this account. Nothing has been lost -- please try again in a moment.",
+          cleared: { lists: purged.listsCleared, keys: purged.keysCleared },
+        }, 500);
+      }
 
       return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
@@ -1889,6 +1963,18 @@
       // the profile, the D1 row, and the last-seen marker go too, so the
       // key stops authenticating and the username becomes reclaimable.
       const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: true });
+      // Only a purge that actually removed everything, identity included, is
+      // a deletion. Anything else leaves the account signed-in-able so its
+      // owner can retry, and must say so rather than reporting success --
+      // this endpoint used to return ok:true while leaving every list live,
+      // public, and attached to a username anyone could then re-register.
+      if (!purged.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting this account. Nothing has been removed -- please try again in a moment.",
+          cleared: { lists: purged.listsCleared, keys: purged.keysCleared },
+        }, 500);
+      }
       return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
 
@@ -1978,22 +2064,31 @@
       // send expectedUpdatedAt at all gets exactly its previous behavior
       // (last-write-wins) -- this is purely additive, not a breaking
       // change to the request shape.
-      const expectedUpdatedAt = Number.isFinite(body.expectedUpdatedAt) ? body.expectedUpdatedAt : null;
-      if (expectedUpdatedAt !== null) {
-        const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
-        if (currentRaw) {
-          try {
-            const current = JSON.parse(currentRaw);
-            if (Number(current.updatedAt) > expectedUpdatedAt) {
-              // Purely for visibility -- this was previously invisible even
-              // to us; now it's at least countable on the admin dashboard.
-              ctx.waitUntil(bumpStat(env, "sync_conflict"));
-              return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
-            }
-          } catch {
-            // Existing blob unreadable -- nothing coherent to protect
-            // against; fall through and write normally.
+      // Present-but-malformed is a client error, not a reason to drop the
+      // guard -- see parseExpectedUpdatedAt (02_http-and-creator-utils.js).
+      const expected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!expected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const expectedUpdatedAt = expected.value;
+      // Read unconditionally now, because the stamp below has to be strictly
+      // newer than whatever is stored, not merely Date.now() -- see
+      // nextSyncVersion.
+      const currentRaw = await env.CONFIGS.get(`creatorsync:${auth.username}`);
+      let currentUpdatedAt = 0;
+      if (currentRaw) {
+        try {
+          const current = JSON.parse(currentRaw);
+          currentUpdatedAt = Number(current.updatedAt) || 0;
+          if (expectedUpdatedAt !== null && currentUpdatedAt > expectedUpdatedAt) {
+            // Purely for visibility -- this was previously invisible even
+            // to us; now it's at least countable on the admin dashboard.
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: current.updatedAt }, 409);
           }
+        } catch {
+          // Existing blob unreadable -- nothing coherent to protect
+          // against; fall through and write normally.
         }
       }
 
@@ -2004,7 +2099,7 @@
         likedLists: Array.isArray(body.likedLists) ? body.likedLists.map(String) : [],
         hiddenLists: Array.isArray(body.hiddenLists) ? body.hiddenLists.map(String) : [],
         hiddenMyListsSections: Array.isArray(body.hiddenMyListsSections) ? body.hiddenMyListsSections.map(String) : [],
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(currentUpdatedAt),
       };
       const serialized = JSON.stringify(blob);
       // Workers KV hard-caps a value at 25MB. Presets/Channels and tracking
@@ -2177,6 +2272,30 @@
               body.curatedRecommendations = storedRecs;
             }
 
+            // The watchlist is the one array in this payload that had
+            // neither a merge nor an empty-guard, and it overwrites two
+            // records: the tracking blob AND creatorlist:{user}:watchlist
+            // (in KV and D1). pushTrackingSync always sends the browser's
+            // full local copy, so a second device that has not finished
+            // loading -- or one whose localStorage was cleared -- pushed an
+            // empty array and the account's Watchlist was gone from
+            // everywhere at once.
+            //
+            // Same rule the derived lists just above already use: an empty
+            // incoming array never replaces a non-empty stored one. A real
+            // change still sends a non-empty array, and a deliberate clear
+            // sets intentionalRemoval and skips this whole block -- which is
+            // exactly the distinction that field exists to draw.
+            if ((!Array.isArray(body.watchlist) || !body.watchlist.length) &&
+                Array.isArray(existingBlob.watchlist) && existingBlob.watchlist.length) {
+              body.watchlist = existingBlob.watchlist;
+              // Keep the stamp with the data it belongs to, or the record
+              // would claim this browser's clock for someone else's items.
+              if (Number(existingBlob.watchlistUpdatedAt)) {
+                body.watchlistUpdatedAt = Number(existingBlob.watchlistUpdatedAt);
+              }
+            }
+
             // fullyWatchedShowIds: union
             if (Array.isArray(existingBlob.fullyWatchedShowIds) && existingBlob.fullyWatchedShowIds.length) {
               const incomingFW = new Set(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []);
@@ -2308,14 +2427,23 @@
           }
           wlObj.items = body.watchlist;
           wlObj.updatedAt = watchlistUpdatedAt;
+          // Same D1 row-size reasoning as /api/creator/lists/save: a
+          // watchlist over the ceiling cannot be mirrored, and a mirror that
+          // silently stops is how a missing D1 row comes about.
+          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+            return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
+          }
           
           if (env.DB) {
             try {
               const listId = `${auth.username}:watchlist`;
               const itemsJson = JSON.stringify(wlObj.items || []);
+              // Carries `likes` on the INSERT for the same reason the
+              // creator-list save above does -- a Watchlist is private by
+              // default but nothing stops one being shared and liked.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.createdAt, wlObj.updatedAt).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.likes || 0, wlObj.createdAt, wlObj.updatedAt).run();
             } catch (dbErr) {
               console.error("D1 write error (creatorlist watchlist):", dbErr);
             }
@@ -2366,10 +2494,34 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      // Same conflict guard as /api/creator/sync/save. Presets are the blob
+      // this codebase itself calls "the one piece of synced state that can
+      // genuinely grow large" -- a TV Channel's url is its entire episode
+      // list -- and it had no guard at all, so a second device autosaving a
+      // stale snapshot silently replaced the whole set. Additive: a client
+      // that sends no expectedUpdatedAt keeps the previous behaviour.
+      const presetsExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!presetsExpected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const presetsCurrentRaw = await env.CONFIGS.get(`creatorsyncpresets:${auth.username}`);
+      let presetsCurrentUpdatedAt = 0;
+      if (presetsCurrentRaw) {
+        try {
+          const cur = JSON.parse(presetsCurrentRaw);
+          presetsCurrentUpdatedAt = Number(cur.updatedAt) || 0;
+          if (presetsExpected.value !== null && presetsCurrentUpdatedAt > presetsExpected.value) {
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: cur.updatedAt }, 409);
+          }
+        } catch {
+          // Unreadable -- nothing coherent to protect; write normally.
+        }
+      }
       const presetsBlob = {
         presets: body.presets && typeof body.presets === "object" ? body.presets : {},
         presetsB64: body.presetsB64 || null,
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(presetsCurrentUpdatedAt),
       };
       const serialized = JSON.stringify(presetsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -2380,7 +2532,9 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      // Handed back so the client can advance its baseline without a
+      // separate /sync/meta round trip, exactly as /sync/save does.
+      return json({ ok: true, updatedAt: presetsBlob.updatedAt });
     }
 
     // /api/creator/sync/save-channels (POST) { creatorName, creatorKey, channels, mergedChannels }
@@ -2393,10 +2547,29 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      // Same conflict guard and the same reasoning as save-presets above.
+      const channelsExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!channelsExpected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+      const channelsCurrentRaw = await env.CONFIGS.get(`creatorsyncchannels:${auth.username}`);
+      let channelsCurrentUpdatedAt = 0;
+      if (channelsCurrentRaw) {
+        try {
+          const cur = JSON.parse(channelsCurrentRaw);
+          channelsCurrentUpdatedAt = Number(cur.updatedAt) || 0;
+          if (channelsExpected.value !== null && channelsCurrentUpdatedAt > channelsExpected.value) {
+            ctx.waitUntil(bumpStat(env, "sync_conflict"));
+            return json({ ok: false, error: "conflict", conflict: true, updatedAt: cur.updatedAt }, 409);
+          }
+        } catch {
+          // Unreadable -- nothing coherent to protect; write normally.
+        }
+      }
       const channelsBlob = {
         channels: body.channels && typeof body.channels === "object" ? body.channels : {},
         mergedChannels: body.mergedChannels && typeof body.mergedChannels === "object" ? body.mergedChannels : {},
-        updatedAt: Date.now(),
+        updatedAt: nextSyncVersion(channelsCurrentUpdatedAt),
       };
       const serialized = JSON.stringify(channelsBlob);
       if (serialized.length > 24 * 1024 * 1024) {
@@ -2407,7 +2580,7 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true });
+      return json({ ok: true, updatedAt: channelsBlob.updatedAt });
     }
 
     // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
@@ -3498,11 +3671,24 @@
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      if (typeof results.skipped !== "number") results.skipped = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0 };
+      // A key this sweep looked at and deliberately did not migrate. These
+      // used to vanish: `if (!raw) return;`, a key that failed its shape
+      // check, a counter whose value was not a number -- each returned with
+      // no counter touched and no error recorded, so the endpoint answered
+      // ok:true with an empty errors array whether or not records had been
+      // dropped on the floor.
+      const noteSkipped = () => { results.skipped++; thisCall.skipped++; };
+      // meta.changes, not "we got here". Every counter below used to
+      // increment once per key PROCESSED, including the ones that hit a
+      // DO NOTHING conflict and wrote nothing, so `{"creators": 60}` did not
+      // mean sixty rows had been written.
+      const wrote = (res) => !!(res && res.meta && res.meta.changes > 0);
       const noteError = (msg) => {
         if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
       };
@@ -3512,13 +3698,26 @@
         if (phase === 0) {
           const username = keyName.slice("creator:".length);
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
-            await d1Run(env.DB.prepare(
-              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+            // DO UPDATE, not DO NOTHING. This endpoint's stated job is to
+            // reconcile KV into D1, and DO NOTHING meant it could create a
+            // row but never correct one -- so a D1 `creators` row whose
+            // key_hash had drifted from KV stayed wrong forever, and since
+            // getCreator falls back to D1 the only tool for repairing that
+            // state could not repair it. Every column written here is
+            // derived purely from KV, which is authoritative for all three,
+            // so re-running remains idempotent.
+            //
+            // created_at is deliberately left out of the update: KV's
+            // createdAt may be missing on a legacy record, and `|| 0` would
+            // then overwrite a good creation date with zero. last_active is
+            // not written here at all, so it survives too.
+            const d1Res = await d1Run(env.DB.prepare(
+              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, key_hash=excluded.key_hash, recovery_answer_hash=excluded.recovery_answer_hash"
             ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
-            results.creators++; thisCall.creators++;
+            if (wrote(d1Res)) { results.creators++; thisCall.creators++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Creator ${username}: ` + e.message);
           }
@@ -3532,9 +3731,9 @@
           // undefined, the `if (u && slug)` guard below rejected every key,
           // and the migration silently reported "lists: 0" while claiming ok.
           const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
-          if (!u || !slug) return;
+          if (!u || !slug) { noteSkipped(); return; }
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -3546,10 +3745,10 @@
             // every list to zero in D1. Visibility is rewritten as well
             // so the fail-closed public index doesn't hide legacy lists
             // that were served as public because they had no enum value.
-            await d1Run(env.DB.prepare(
+            const listRes = await d1Run(env.DB.prepare(
               "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
             ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
-            results.lists++; thisCall.lists++;
+            if (wrote(listRes)) { results.lists++; thisCall.lists++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`List ${u}:${slug}: ` + e.message);
           }
@@ -3561,7 +3760,7 @@
         // public-read checks don't hide currently-served lists.
         if (phase === 2) {
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -3579,10 +3778,10 @@
           const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await d1Run(env.DB.prepare(
+            const sgRes = await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
             ).bind(groupName, groupName, count));
-            results.sourcegroups++; thisCall.sourcegroups++;
+            if (wrote(sgRes)) { results.sourcegroups++; thisCall.sourcegroups++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
@@ -3610,6 +3809,8 @@
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
         if (!kind || !bucket) return;
+        // Not "skipped": phase 3 has already migrated these into their own
+        // table, and counting them here would report them twice.
         if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
@@ -3618,12 +3819,14 @@
         if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
         const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) return;
+        if (!Number.isFinite(n)) { noteSkipped(); return; }
         try {
-          await d1Run(env.DB.prepare(
+          const statRes = await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
           ).bind(kind, bucket, n));
-          results.stats++; thisCall.stats++;
+          // DO NOTHING on conflict, so a second run legitimately writes
+          // nothing -- that is "already migrated", not "skipped".
+          if (wrote(statRes)) { results.stats++; thisCall.stats++; }
         } catch (e) {
           noteError(`Stat ${keyName}: ` + e.message);
         }
@@ -4493,7 +4696,27 @@
 // see handleFetch's own opening comment for why it's split this way.
 export default {
   async fetch(request, env, ctx) {
-    const response = await handleFetch(request, env, ctx);
+    let response;
+    try {
+      response = await handleFetch(request, env, ctx);
+    } catch (err) {
+      // The boundary this file did not have. handleFetch has no top-level
+      // try, so any uncaught throw -- a KV put hitting its 1-write-per-second
+      // limit, an upstream answering 200 with a truncated body, a bug in a
+      // route -- escaped the Worker entirely, and Cloudflare answered with
+      // its own 1101 error page: not JSON, no CORS, none of the security
+      // headers below. A fetch() in the builder page saw an unparseable
+      // response and could only report "check your connection".
+      //
+      // /api/creator/sync/save already wrapped its own KV write and returned
+      // a clean 500; its sibling /api/creator/lists/save did not. One
+      // boundary here is worth more than remembering to do that at every
+      // future call site.
+      //
+      // safeErrorMessage logs the original and strips URLs, labelled secrets
+      // and long opaque tokens from what goes back.
+      response = json({ ok: false, error: safeErrorMessage(err) }, 500);
+    }
     return withSecurityHeaders(response);
   },
 

@@ -2326,7 +2326,11 @@ self.addEventListener('fetch', e => {
         };
 
         if (!traktKeyParam) ctx.waitUntil(bumpStat(env, "apiuse:trakt"));
-        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username });
+        // no-store. This is one person's Trakt account contents, and the
+        // request that produced it carries their access token in the query
+        // string -- so the URL that would be the cache key is itself the
+        // credential. json()'s cacheable default had no business on it.
+        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...customLists], username }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -3050,7 +3054,7 @@ self.addEventListener('fetch', e => {
           }
         } catch {}
 
-        return json({ ok: true, lists, username: simklUsername });
+        return json({ ok: true, lists, username: simklUsername }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) }, 500);
       }
@@ -4431,7 +4435,7 @@ self.addEventListener('fetch', e => {
           }
         }
 
-        return json({ ok: true, lists, username: tmdbUsername, accountId });
+        return json({ ok: true, lists, username: tmdbUsername, accountId }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: "Failed to load TMDB lists: " + (err.message || String(err)) }, 500);
       }
@@ -5325,7 +5329,7 @@ self.addEventListener('fetch', e => {
           url: "mdblist:user:shows:airing-next",
         };
 
-        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username });
+        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }

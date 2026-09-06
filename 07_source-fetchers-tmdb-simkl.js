@@ -1158,14 +1158,19 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.movie_results && findData.movie_results.length > 0) {
+        // TMDB answering 200 with a body that is not JSON (a proxy error
+        // page, a truncated response) used to throw straight out of the
+        // Worker, because nothing above this catches. Treated as "no match"
+        // instead, which is what an unusable answer means here.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.movie_results && findData.movie_results.length > 0) {
           tmdbId = findData.movie_results[0].id;
           type = "movie";
-        } else if (findData.tv_results && findData.tv_results.length > 0) {
+        } else if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
           type = "tv";
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
           type = "tv";
         }
@@ -1487,10 +1492,12 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
         cf: { cacheTtl: 604800, cacheEverything: true },
       });
       if (findRes.ok) {
-        const findData = await findRes.json();
-        if (findData.tv_results && findData.tv_results.length > 0) {
+        // Same guard as the movie path above.
+        let findData = null;
+        try { findData = await findRes.json(); } catch { findData = null; }
+        if (findData && findData.tv_results && findData.tv_results.length > 0) {
           tmdbId = findData.tv_results[0].id;
-        } else if (findData.tv_episode_results && findData.tv_episode_results.length > 0) {
+        } else if (findData && findData.tv_episode_results && findData.tv_episode_results.length > 0) {
           tmdbId = findData.tv_episode_results[0].show_id;
         }
       }
@@ -1689,11 +1696,6 @@ async function checkForNewEpisodes(env) {
   if (cursorRaw) listOpts.cursor = cursorRaw;
   const listResult = await env.CONFIGS.list(listOpts);
 
-  // Cycle back to the start once the full account list has been swept,
-  // rather than stopping -- so the next run picks up fresh with account
-  // #1 again instead of sitting idle.
-  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
-
   let showChecksUsed = 0;
 
   for (const key of listResult.keys) {
@@ -1817,6 +1819,20 @@ async function checkForNewEpisodes(env) {
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
+
+  // The cursor advances only once this batch has actually been processed.
+  // It used to be written immediately after the list() call, before the loop
+  // -- so a tick that threw partway through, or ran out of CPU time, had
+  // already committed the move and those accounts were skipped entirely
+  // until the cursor wrapped all the way round. Self-healing over a full
+  // cycle, invisible in the meantime, and needless: the work is idempotent,
+  // so re-processing a batch after a failure costs a repeat rather than a
+  // gap.
+  //
+  // Cycle back to the start once the full account list has been swept,
+  // rather than stopping -- so the next run picks up fresh with account
+  // #1 again instead of sitting idle.
+  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
 }
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).

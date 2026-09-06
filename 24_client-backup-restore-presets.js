@@ -1106,13 +1106,22 @@ async function pushPresetsDirectly(presetsMap) {
         creatorKey: creatorKey,
         presets: presetsB64 ? undefined : leanPresets,
         presetsB64: presetsB64,
+        // See pushChannelsSync (22_client-creator-profile.js) -- the server
+        // now rejects a stale device rather than letting it replace the
+        // whole preset set.
+        expectedUpdatedAt: window._serverPresetsUpdatedAt,
       }),
     });
+    if (res.status === 409) {
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return { ok: false, error: null, status: 409, conflict: true };
+    }
     const data = await res.json().catch(() => null);
     if (!data || data.ok === false) {
       console.error('pushPresetsDirectly failed:', res.status, data);
       return { ok: false, error: (data && data.error) || null, status: res.status };
     }
+    if (typeof data.updatedAt === 'number') window._serverPresetsUpdatedAt = data.updatedAt;
     return { ok: true, error: null };
   } catch (e) {
     console.error('pushPresetsDirectly failed:', e);

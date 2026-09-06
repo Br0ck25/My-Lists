@@ -16,8 +16,21 @@ binding = "CONFIGS"
 id = "YOUR_KV_NAMESPACE_ID"
 
 # --- D1 (optional) -----------------------------------------------------------
-# Optional. Every accessor tries D1 first and falls back to KV, so the app
-# is fully functional with this block commented out. If you do enable it,
+# Optional. Every accessor reads KV first and falls back to D1, so the app
+# is fully functional with this block commented out.
+#
+# One thing to know before you add it and then remove it again: the DASHBOARD
+# COUNTERS do not survive that round trip. Accounts, lists and likes are
+# always written to KV, so they are safe either way -- but page views,
+# installs, playback pings and per-provider API usage are written to D1 ALONE
+# once it is bound (see bumpStat, 03_admin.js). That is deliberate: KV has no
+# atomic increment, so twenty concurrent requests used to record as one, and
+# routing counters through D1's upsert is the whole point of
+# migrations/0002. The cost is that unbinding D1 -- or rebuilding it from
+# schema.sql, which DROPs every table -- rolls every counter back to the KV
+# value it had when you first migrated. Everything else is untouched.
+#
+# If you do enable it,
 # run schema.sql first and then use the "Migrate KV -> D1" button under
 # /admin's Management & Tools -> Maintenance tab (or POST
 # /admin/api/migrate-d1 directly) to backfill existing KV accounts -- an

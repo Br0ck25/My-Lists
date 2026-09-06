@@ -54,6 +54,13 @@ CREATE TABLE stats (
     PRIMARY KEY (kind, day)
 );
 
--- Indexes for fast querying
+-- Indexes for fast querying.
+--
+-- These have to match what migrations/0001 and 0002 leave behind, or a
+-- database provisioned the documented way (run this file) ends up a different
+-- shape from one that grew through the migrations. idx_creator_lists_likes
+-- existed only in 0001, so a fresh deployment did not have it; there is a test
+-- that now diffs the two provisioning paths and fails on any such drift.
 CREATE INDEX idx_creator_lists_username ON creator_lists(username);
 CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
+CREATE INDEX idx_creator_lists_likes ON creator_lists(likes);

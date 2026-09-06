@@ -52,6 +52,16 @@ function statsToday() {
 // is a real remaining limitation for KV-only deployments, not an oversight
 // -- KV genuinely cannot do this correctly, and the honest options there are
 // to bind D1 or to read the numbers as approximate.
+//
+// Counters are the ONE data family where "D1 is optional and removable at any
+// time without data loss" -- true of accounts, lists and likes, which are
+// always written to KV -- does not hold. Once D1 is bound these write to D1
+// alone, because dual-writing would put the lost-update race straight back in
+// (and spend a second write per bump on a key KV rate-limits to one per
+// second). So unbinding D1, or rebuilding it from schema.sql, rolls every
+// counter back to the KV value it had at migration time. That trade is the
+// right one and is now stated in wrangler.toml where an operator will see it,
+// rather than being a surprise.
 async function d1BumpStat(env, kind, buckets, amount) {
   // One statement per bucket, sent as a batch so the whole bump is a single
   // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
@@ -1117,6 +1127,20 @@ async function readStatCount(env, kind, bucket) {
   return parseInt(raw, 10) || 0;
 }
 
+// Escapes the LIKE metacharacters in a literal string so it can be used as a
+// prefix pattern. `%` and `_` are wildcards, and the escape character itself
+// has to be escaped first or `\%` would be produced from a lone backslash.
+// Pair it with `ESCAPE '\'` in the statement.
+//
+// SQL LIKE patterns built by concatenation are how the account purge came to
+// delete other creators' rows (see purgeCreatorData,
+// 02_http-and-creator-utils.js): the input there was a username, which may
+// contain `_`. Nothing reaches the call sites below from a request today, but
+// a helper is cheaper than remembering the rule at each new one.
+function escapeLikePrefix(s) {
+  return String(s == null ? "" : s).replace(/[\\%_]/g, "\\$&");
+}
+
 // All-time totals for a family of counters ("catalog_add:", "list_copy:"),
 // as a Map of the name after the prefix -> count.
 //
@@ -1129,9 +1153,17 @@ async function readStatTotalsByPrefix(env, prefix) {
   if (!env || !env.CONFIGS) return out;
   if (env.DB) {
     try {
+      // ESCAPE, because two of the three prefixes this is called with
+      // (`catalog_add:`, `list_copy:`, `sourcegroup:`) contain `_`, which is
+      // LIKE's single-character wildcard -- so `kind LIKE 'list_copy:%'` also
+      // matches `listXcopy:...`. Every kind here is generated internally
+      // today, so nothing is actually mismatched; this is the same defect
+      // class as the account purge's `id LIKE` (see purgeCreatorData,
+      // 02_http-and-creator-utils.js) and is closed the same day rather than
+      // left as the one instance that happens to be safe.
       const { results } = await env.DB.prepare(
-        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ORDER BY n DESC LIMIT ?"
-      ).bind(prefix + "%", STAT_TOTALS_READ_CAP).all();
+        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ESCAPE '\\' ORDER BY n DESC LIMIT ?"
+      ).bind(escapeLikePrefix(prefix) + "%", STAT_TOTALS_READ_CAP).all();
       if (results && results.length) {
         for (const row of results) {
           const name = String(row.kind).slice(prefix.length);

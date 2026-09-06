@@ -32,6 +32,32 @@ const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
+// --- Bounds on the AUTHENTICATED list write ----------------------------------
+//
+// The two ceilings above bound /api/publish-list and /api/save, which anyone
+// at all can call. /api/creator/lists/save had no bound of any kind -- not on
+// items, not on the name, not on bytes -- even though a Creator Profile costs
+// one unauthenticated POST to create. The reasoning that produced the
+// anonymous limits applies here almost unchanged; it simply was not carried
+// across. Measured before this existed: one account parked 21.8 MB across
+// eight saves, and /api/creator/lists returns every list's FULL items array
+// on every dashboard render, so that came straight back down the wire.
+//
+// The item and name caps are deliberately the same numbers as the anonymous
+// ones -- there is no reason a signed-in list should be allowed to be larger
+// than a published one, and sharing the constants stops the two drifting.
+//
+// The byte ceiling is different, and lower, because of a limit the anonymous
+// path does not have to care about: D1's maximum string/row size is 2,000,000
+// bytes. A creator list is mirrored into creator_lists.items_json, and a
+// record over that limit cannot be written -- the failure lands in a catch
+// that logs and carries on, so the list simply stops being mirrored, silently,
+// which is exactly the state that made a missing D1 row destroy a real like
+// count. Rejecting at 1.8 MB keeps the mirror honest with room for the other
+// columns. Far above any genuine list: the largest observed in an account
+// export was ~1,200 items.
+const CREATOR_LIST_BYTES_MAX = 1_800_000;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
@@ -73,6 +99,16 @@ const MIGRATE_D1_PAGE = 200;
 // Errors accumulate across every chunk of a run and are handed back to the
 // admin panel, so they need a ceiling of their own.
 const MIGRATE_D1_ERROR_CAP = 50;
+
+// --- Bound on the display-order array ----------------------------------------
+//
+// /api/creator/lists/reorder writes whatever slugs it is handed into one KV
+// key, and had no cap on how many. Authenticated, so the blast radius is the
+// caller's own key -- hygiene rather than a vulnerability -- but an unbounded
+// authenticated write is still an unbounded write. Far above any real
+// account: the worst case ever observed on a live one was 129 records, and
+// that was the duplicate-list bug.
+const CREATOR_LIST_ORDER_MAX = 5000;
 
 // --- Recovery-answer strength and throttle ----------------------------------
 //

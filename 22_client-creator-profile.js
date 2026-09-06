@@ -1494,7 +1494,7 @@ async function pushChannelsSync() {
   try {
     const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
     const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
-    await fetch(ORIGIN + '/api/creator/sync/save-channels', {
+    const res = await fetch(ORIGIN + '/api/creator/sync/save-channels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1502,8 +1502,24 @@ async function pushChannelsSync() {
         creatorKey: creatorKey,
         channels: localChannels,
         mergedChannels: localMerged,
+        // Same conflict guard the main config blob has carried for a while,
+        // now that the server enforces one here too. A Channel's url is its
+        // entire episode list, so a second device autosaving a stale copy
+        // was the most expensive silent overwrite this app had.
+        expectedUpdatedAt: window._serverChannelsUpdatedAt,
       }),
     });
+    if (res.status === 409) {
+      // Another device saved first. Pull instead of clobbering; whatever is
+      // pending here is still in localStorage and goes up next time against
+      // the right baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverChannelsUpdatedAt = data.updatedAt;
+    }
   } catch (e) {
     // silently fail, it's a background sync
   }
@@ -1827,6 +1843,11 @@ async function loadCreatorSync(opts) {
     };
     const timeChanged = typeof window._serverSyncUpdatedAt === 'undefined' || (synced.updatedAt && synced.updatedAt > window._serverSyncUpdatedAt);
     if (synced.updatedAt !== undefined) window._serverSyncUpdatedAt = synced.updatedAt;
+    // The baselines the presets and channels pushes build on, adopted from
+    // the same load that adopts their data -- see pushPresetsDirectly and
+    // pushChannelsSync.
+    if (synced.presetsUpdatedAt !== undefined) window._serverPresetsUpdatedAt = Number(synced.presetsUpdatedAt) || 0;
+    if (synced.channelsUpdatedAt !== undefined) window._serverChannelsUpdatedAt = Number(synced.channelsUpdatedAt) || 0;
     
     const currentConfigStr = JSON.stringify(synced.config || []);
     const configDataChanged = currentConfigStr !== window._lastConfigStr;

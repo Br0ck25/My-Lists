@@ -121,7 +121,29 @@ function json(data, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "max-age=3600",
+      // An error is never worth caching, and caching one does real damage
+      // here: there is no `Vary: Cookie` on these responses, so an admin
+      // whose browser had already seen a 401 from /admin/api/analytics --
+      // which any cross-origin page can provoke with an <img> tag -- was
+      // served that cached 401 for an hour AFTER logging in, and the
+      // dashboard just said "Not authorized". A 404 from a list URL had the
+      // same shape: cached for an hour, so a list published a minute later
+      // stayed missing.
+      //
+      // `ok: false` counts as an error even with a 200 status, because that
+      // is this codebase's own convention -- most failure paths here return
+      // { ok: false, error } without changing the status code, and a status
+      // check alone would have missed every one of them.
+      //
+      // A successful 2xx keeps the previous default deliberately. Flipping it
+      // wholesale would strip edge caching from the catalog and provider
+      // endpoints this add-on leans on to stay inside upstream rate limits,
+      // which is a much larger change than the defect requires; the handful
+      // of successful responses that genuinely must not be cached set
+      // no-store explicitly at their call site instead.
+      "Cache-Control": (status >= 400 || (data && typeof data === "object" && data.ok === false))
+        ? "no-store"
+        : "max-age=3600",
       // Applied last so a caller (e.g. the admin dashboard's own JSON
       // endpoints -- see their own comment on why they need this) can
       // override the max-age default above, rather than every non-admin
@@ -216,8 +238,23 @@ function isBrowserNavigation(request) {
 // --- config encoding -------------------------------------------------
 
 // --- Deterministic 24-Hour Daily Randomizer --------------------------------
+//
+// The bucket is the EASTERN calendar day, the same one every stats counter
+// uses (see easternDateKey, 03_admin.js). It used to be
+// Math.floor(Date.now() / 86400000), a UTC day -- so the "daily" shuffle
+// rotated at 7 or 8pm Eastern, in the middle of the evening people actually
+// use this, while every other "day" in the app rolled over at midnight
+// Eastern. Two different definitions of the same word, and the one users felt
+// was the one that moved during peak hours.
+//
+// easternDateKey is declared in a later numbered file, which is fine: both
+// are top-level function declarations in one concatenated module, so
+// hoisting has them defined before any request runs.
 function getDailySeed(salt = "") {
-  const dayBucket = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  // new Date(Date.now()), not new Date(): they are equivalent in production,
+  // but only the first goes through Date.now, which is the one seam a test
+  // can hold still.
+  const dayBucket = easternDateKey(new Date(Date.now()));
   let hash = 0;
   const str = `${dayBucket}:${salt}`;
   for (let i = 0; i < str.length; i++) {
@@ -1485,14 +1522,21 @@ async function usernameForScrobbleToken(env, token) {
 // used to rebuild when it was MISSING, never when it was merely wrong (see
 // refreshPublicListIndexIfStale).
 async function removeListsFromPublicIndex(env, ids) {
-  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  if (!env || !env.CONFIGS || !ids || !ids.length) return true;
+  // Recorded before the index is touched, so an in-flight rebuild cannot
+  // republish these when it lands -- see noteRemovedFromPublicIndex.
+  await noteRemovedFromPublicIndex(env, ids);
   try {
     const idx = await readPublicListIndex(env);
-    if (!idx) return;
+    // No index at all: nothing is being advertised, so there is nothing to
+    // remove and this succeeded.
+    if (!idx) return true;
     const gone = new Set(ids);
     await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+    return true;
   } catch (e) {
     console.error("public list index cleanup failed", e);
+    return false;
   }
 }
 
@@ -1797,14 +1841,24 @@ async function writePublicListIndex(env, entries) {
 // the index is a rebuildable cache, a lost entry costs one list's directory
 // visibility until its next save or the next rebuild, and publishes are rare
 // and self-correcting. Like counts had no such backstop.
+// Returns true when the index now reflects `entry` (including "there is no
+// index, so there is nothing advertising this"), false when it does not.
+//
+// Callers may treat an ADDITION failing as non-fatal -- a list that is slow
+// to appear in the directory is a cosmetic problem and the daily rebuild
+// repairs it. A REMOVAL is different: it is the mechanism by which making a
+// list private stops it being advertised, so a caller that ignores a false
+// here is reporting a privacy change that did not happen.
 async function updatePublicListIndex(env, id, entry) {
-  if (!env || !env.CONFIGS) return;
+  if (!env || !env.CONFIGS) return false;
+  if (!entry) await noteRemovedFromPublicIndex(env, [id]);
   try {
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
     // would show exactly one list. Leave it absent so the read path falls
-    // back to a scan and rebuilds the whole thing.
-    if (!idx) return;
+    // back to a scan and rebuilds the whole thing. Nothing is advertised in
+    // that state, so a removal has already got what it wanted.
+    if (!idx) return true;
     const prev = idx.entries.find((e) => e && e.id === id);
     const entries = idx.entries.filter((e) => e && e.id !== id);
     // Merge onto the previous entry rather than replacing it: callers that
@@ -1812,11 +1866,103 @@ async function updatePublicListIndex(env, id, entry) {
     // instance) must not blank out fields they never loaded.
     if (entry) entries.push({ ...(prev || {}), ...entry, id });
     await writePublicListIndex(env, entries);
+    return true;
   } catch (err) {
-    // Non-fatal: the list itself is already saved. Worst case the directory
-    // is stale until the next rebuild.
     console.error("public list index update failed:", err);
+    return false;
   }
+}
+
+// --- Removals recorded against an in-flight rebuild --------------------------
+//
+// A rebuild scans the whole keyspace over many chunks, holds the result in
+// index:publiclists:build, and replaces the live index only when the final
+// chunk lands. That makes its snapshot older than the index it overwrites --
+// and a list unpublished after it was scanned was silently PUT BACK into the
+// directory and into search when the rebuild finished, for up to a day, with
+// the owner having been told (correctly, at the time) that it was removed.
+//
+// The rebuild's own comment documents the opposite case, a list published
+// behind the cursor being missed, and calls that an acceptable tradeoff. It is
+// not the same trade: missing a publish costs visibility, clobbering an
+// unpublish costs privacy.
+//
+// So every removal drops its id here, and the rebuild re-verifies those ids
+// against the authoritative record before it publishes. Re-verifying rather
+// than just subtracting is what keeps PUBLIC -> PRIVATE -> PUBLIC working: a
+// list that is public again passes the check and stays. The set is small (one
+// build window's removals), bounded, and expires on its own.
+const PUBLIC_INDEX_REMOVED_KEY = "index:publiclists:removed";
+const PUBLIC_INDEX_REMOVED_MAX = 500;
+// Comfortably longer than any rebuild -- the cron drives one chunk per tick,
+// so even a 20,000-list deployment converges well inside a day.
+const PUBLIC_INDEX_REMOVED_TTL_SEC = 24 * 60 * 60;
+
+async function noteRemovedFromPublicIndex(env, ids) {
+  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
+    let existing = [];
+    try {
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && Array.isArray(parsed.ids)) existing = parsed.ids.filter((x) => typeof x === "string");
+    } catch {
+      existing = [];
+    }
+    const merged = [...existing.filter((x) => !ids.includes(x)), ...ids];
+    const trimmed = merged.slice(-PUBLIC_INDEX_REMOVED_MAX);
+    await env.CONFIGS.put(
+      PUBLIC_INDEX_REMOVED_KEY,
+      JSON.stringify({ ids: trimmed }),
+      { expirationTtl: PUBLIC_INDEX_REMOVED_TTL_SEC }
+    );
+  } catch (e) {
+    // Best-effort. Worst case is the behaviour this exists to fix, which is
+    // bounded by the next rebuild rather than permanent.
+    console.error("could not record a public-index removal:", e);
+  }
+}
+
+// The authoritative key behind an index id. `c:{user}:{slug}` is a creator
+// list; anything else is an anonymous published one, indexed as `a:{slug}`.
+function publicIndexIdToRecordKey(id) {
+  const s = String(id || "");
+  if (s.startsWith("c:")) return "creatorlist:" + s.slice(2);
+  if (s.startsWith("a:")) return "publishedlist:user:" + s.slice(2);
+  return null;
+}
+
+// Drops entries whose record is no longer public, for the handful of ids
+// removed while this build was running. One KV read per such id, and only
+// for ids the build actually collected.
+async function dropStaleRemovalsFromEntries(env, entries) {
+  if (!entries || !entries.length) return entries;
+  let ids = [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Array.isArray(parsed.ids)) ids = parsed.ids;
+  } catch {
+    return entries;
+  }
+  if (!ids.length) return entries;
+  const suspect = new Set(ids);
+  const stillPublic = new Set();
+  const checked = new Set();
+  for (const entry of entries) {
+    if (!entry || !suspect.has(entry.id) || checked.has(entry.id)) continue;
+    checked.add(entry.id);
+    const key = publicIndexIdToRecordKey(entry.id);
+    if (!key) continue;
+    try {
+      const raw = await env.CONFIGS.get(key);
+      if (raw && isPublicListVisibility(JSON.parse(raw).visibility)) stillPublic.add(entry.id);
+    } catch {
+      // Unreadable right now -- leave it out rather than risk republishing
+      // something whose owner asked for it to be taken down.
+    }
+  }
+  return entries.filter((e) => e && (!suspect.has(e.id) || stillPublic.has(e.id)));
 }
 
 // Persisted progress for an in-flight rebuild. Anything unparseable, or from
@@ -2005,7 +2151,10 @@ async function rebuildPublicListIndex(env, options = {}) {
   }
 
   if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
-    const trimmed = await writePublicListIndex(env, state.entries);
+    // Anything unpublished or deleted while this build was running has to
+    // lose to the removal, not to this build's older snapshot.
+    const publishable = await dropStaleRemovalsFromEntries(env, state.entries);
+    const trimmed = await writePublicListIndex(env, publishable);
     try {
       await kv.delete(PUBLIC_INDEX_BUILD_KEY);
     } catch {
@@ -2146,6 +2295,54 @@ async function listAllKeys(namespace, prefix, maxKeys = Infinity) {
   return { keys, list_complete: true };
 }
 
+// --- Optimistic concurrency for the synced blobs -----------------------------
+//
+// Every /api/creator/sync/save* endpoint stores one wholesale blob per
+// account, and a second device autosaving a stale snapshot replaces it. The
+// guard for that is the client sending back the updatedAt its edits are
+// built on; these two helpers are the parts of it that were wrong or
+// missing.
+//
+// parseExpectedUpdatedAt distinguishes ABSENT from MALFORMED. Absent means an
+// older client, which keeps its previous last-write-wins behaviour on
+// purpose -- this was always meant to be additive. Malformed used to mean
+// the same thing, because the check was `Number.isFinite(body.
+// expectedUpdatedAt)` and Number.isFinite("1788650901055") is false: a
+// client that round-tripped the stamp through localStorage, a dataset
+// attribute or a form field sent a string and got last-write-wins with no
+// error anywhere. A value that is present but unusable is a client bug, and
+// silently dropping the only protection against overwriting someone else's
+// work is the worst available response to it.
+function parseExpectedUpdatedAt(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (typeof raw === "string" && raw.trim() === "") return { ok: false };
+  if (typeof raw !== "string" && typeof raw !== "number") return { ok: false };
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return { ok: false };
+  return { ok: true, value: n };
+}
+
+// nextSyncVersion makes the stamp strictly increasing.
+//
+// Date.now() is frozen for the duration of a Workers request and only
+// advances on I/O, so two saves genuinely can carry the same millisecond.
+// With a bare timestamp as the version, `stored.updatedAt > expected` then
+// cannot tell a stale write from a current one, and the stale one wins --
+// silently, with both requests answering 200. Comparing with >= instead is
+// not the fix: expected === stored is the NORMAL case (my edits are built on
+// exactly the version that is stored), so >= would reject every legitimate
+// save.
+//
+// Advancing past the stored value by at least one instead means a write
+// always produces a version no earlier write can claim, which is what the
+// comparison needs. It also makes the guard survive a clock that moves
+// backwards.
+function nextSyncVersion(currentUpdatedAt) {
+  const now = Date.now();
+  const prev = Number(currentUpdatedAt);
+  return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
+}
+
 // --- Account data purge (shared by reset and delete) -------------------------
 //
 // /api/creator/account/reset and /api/creator/delete-account are the same
@@ -2166,6 +2363,20 @@ async function purgeCreatorData(env, username, options = {}) {
   let listsCleared = 0;
   const purgedListIds = [];
   let keysCleared = 0;
+  // Anything that would leave account-owned data behind flips this. Every
+  // step below used to log its failure and carry on, which made a sweep that
+  // THREW indistinguishable from one that found nothing -- and the caller
+  // returned ok:true either way. That is how "delete my account" came to
+  // report success, leave every list live and public, and still free the
+  // username: whoever registered it next inherited the previous owner's
+  // lists, private ones and their contents included, via the orphan-recovery
+  // sweep in /api/creator/lists.
+  //
+  // The function's own comment already described the intent -- the identity
+  // goes last "so that a failure partway through leaves an account that can
+  // still sign in and retry" -- but nothing was actually watching for that
+  // failure. This is.
+  let dataSweepFailed = false;
 
   // Custom lists are one key each and list() pages -- keep going until the
   // cursor is exhausted rather than assuming a single page covers an
@@ -2199,13 +2410,37 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   } catch (e) {
     console.error("purgeCreatorData: list enumeration failed", e);
+    dataSweepFailed = true;
   }
 
   if (env.DB) {
     try {
-      await env.DB.prepare("DELETE FROM creator_lists WHERE id LIKE ?").bind(`${u}:%`).run();
+      // `WHERE username = ?`, NOT `WHERE id LIKE '{u}:%'`.
+      //
+      // validateCreatorUsername allows [a-z0-9_-], and `_` is SQL LIKE's
+      // single-character wildcard. Interpolating the username into a LIKE
+      // pattern therefore made one account's purge a wildcard against every
+      // other account's list ids: a creator named `a_c-films` deleting their
+      // own account also deleted every D1 row belonging to `abc-films`,
+      // `axc-films`, `a1c-films` and so on -- silently, because KV still had
+      // the records so nothing visibly broke, while the D1 like counts were
+      // gone and the next ordinary edit wrote those zeroes back into KV.
+      //
+      // Usernames are 3-25 characters and `___` is a legal one, so the scaled
+      // version needed no credentials at all: register one all-underscore
+      // name per length, call the self-service /api/creator/account/reset on
+      // each, and creator_lists is empty for the whole deployment.
+      //
+      // The username column is what this actually means, it is indexed
+      // (idx_creator_lists_username), it is an equality rather than a scan,
+      // and it has no pattern syntax to escape. The FK's ON DELETE CASCADE
+      // covers the identity path too, so this is belt-and-braces there -- but
+      // it is the only thing covering account/reset, which keeps the creator
+      // row.
+      await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
+      dataSweepFailed = true;
     }
   }
 
@@ -2226,6 +2461,10 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   } catch (e) {
     console.error("purgeCreatorData: could not revoke the scrobble token", e);
+    // A live webhook credential for an account that is about to stop
+    // existing is exactly the kind of leftover that must not be reported as
+    // a clean delete.
+    dataSweepFailed = true;
   }
 
   // Everything else the account owns, under the key names actually in use
@@ -2263,29 +2502,49 @@ async function purgeCreatorData(env, username, options = {}) {
       keysCleared++;
     } catch (e) {
       console.error("purgeCreatorData: could not delete", key, e);
+      dataSweepFailed = true;
     }
   }
 
+  let identityRemoved = false;
   if (deleteIdentity) {
     // Last, and only for delete-account: the identity itself. Done after
     // the data sweep so that a failure partway through leaves an account
     // that can still sign in and retry, rather than orphaned data with no
     // owner and a username nobody can ever reclaim.
-    try {
-      await env.CONFIGS.delete(`creator:${u}`);
-      keysCleared++;
-    } catch (e) {
-      console.error("purgeCreatorData: could not delete identity", e);
-    }
-    try {
-      await env.CONFIGS.delete(`creatorlastseen:${u}`);
-      keysCleared++;
-    } catch (e) {}
-    if (env.DB) {
-      try {
-        await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
-      } catch (dbErr) {
-        console.error("D1 write error (purgeCreatorData identity):", dbErr);
+    //
+    // Gated on the sweep having actually worked, because deleting the
+    // identity is what FREES THE USERNAME. Doing that while the account's
+    // lists are still sitting in KV hands them to whoever registers the name
+    // next -- the failure mode this used to have.
+    if (!dataSweepFailed) {
+      // D1 before KV, which is the opposite of the old order and the whole
+      // of the second half of this fix. getCreator falls back to D1, so a
+      // swallowed D1 failure after the KV row was already gone left a
+      // "deleted" account that still authenticated and could still write --
+      // while its owner had been told it was gone. Doing the store that can
+      // fail FIRST means a failure aborts before anything is destroyed.
+      let d1Ok = true;
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
+        } catch (dbErr) {
+          console.error("D1 write error (purgeCreatorData identity):", dbErr);
+          d1Ok = false;
+        }
+      }
+      if (d1Ok) {
+        try {
+          await env.CONFIGS.delete(`creator:${u}`);
+          keysCleared++;
+          identityRemoved = true;
+        } catch (e) {
+          console.error("purgeCreatorData: could not delete identity", e);
+        }
+        try {
+          await env.CONFIGS.delete(`creatorlastseen:${u}`);
+          keysCleared++;
+        } catch (e) {}
       }
     }
   }
@@ -2294,23 +2553,55 @@ async function purgeCreatorData(env, username, options = {}) {
   // the instant the account it refers to is reset or removed.
   try { invalidateCreatorAuthMemo(); } catch (e) {}
 
-  return { listsCleared, keysCleared };
+  // `ok` is the whole point: it is false when this call left something
+  // behind, and both callers turn that into an error rather than a 200.
+  return {
+    ok: !dataSweepFailed && (!deleteIdentity || identityRemoved),
+    listsCleared,
+    keysCleared,
+    identityRemoved,
+  };
 }
 
 // D1 is an optional accelerator in front of KV, never a replacement for it
 // -- KV remains the store every account is guaranteed to exist in (see the
 // unconditional KV writes in the create/rotate paths).
 //
-// This used to `return null` when D1 was bound and the row was absent,
-// instead of falling through to KV. That is only correct if every account
-// is guaranteed present in D1, which is exactly what is NOT true: D1 is
-// populated lazily by /admin/api/migrate-d1, so every account created
-// before that endpoint was first run has no D1 row. Binding DB therefore
-// locked all of those users out of their own accounts completely -- the
-// key was fine, the data was fine, the lookup just said "no such creator"
-// and every endpoint returned the generic "Username or Key is incorrect."
-// A missing row means "not migrated yet", not "does not exist".
+// KV IS READ FIRST. That sentence above was already the design; the code
+// contradicted it by asking D1 first, and the contradiction is what four
+// separate defects were made of. The asymmetry: every D1 WRITE in this
+// codebase is optional (wrapped in a catch that logs and carries on, because
+// KV is the store that matters), while every D1 READ was preferred. So any
+// dropped D1 write became a permanent, invisible lie that outranked the
+// truth:
+//
+//   * a rotation whose D1 update threw left the OLD key authenticating and
+//     the new one rejected, and no repair tool could fix it;
+//   * an account whose D1 delete threw kept authenticating and writing after
+//     its owner had been told it was deleted;
+//   * a list whose D1 row was missing reported 0 likes -- and the next
+//     ordinary save read that 0 back out and wrote it into KV, destroying a
+//     real count in the authoritative store;
+//   * a visibility change whose D1 write was dropped left the owner's own
+//     dashboard saying "private" about a list the world could read.
+//
+// Reading KV first removes all four at once, because KV is the store every
+// write path touches unconditionally. It is not slower either: this is one
+// edge-cached KV get instead of one D1 query.
+//
+// D1 stays as the FALLBACK, which is what keeps the earlier fix intact in
+// both directions. A missing row means "not migrated yet", not "does not
+// exist" -- and now a missing KV record means "ask the mirror" rather than
+// "no such creator", so an account is reachable as long as EITHER store has
+// it. Every field returned here also lives in KV, so nothing is lost by
+// preferring it.
 async function getCreator(env, username) {
+  try {
+    const raw = await env.CONFIGS.get(`creator:${username}`);
+    if (raw) return raw;
+  } catch (e) {
+    console.error("KV read error (getCreator), falling back to D1:", e);
+  }
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
@@ -2318,39 +2609,142 @@ async function getCreator(env, username) {
         const row = results[0];
         return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
       }
-      // fall through to KV -- not migrated (or D1 is behind)
     } catch(e) {
-      console.error("D1 read error (getCreator), falling back to KV:", e);
+      console.error("D1 read error (getCreator):", e);
     }
   }
-  return await env.CONFIGS.get(`creator:${username}`);
+  return null;
 }
 
-// Same lazy-migration hazard as getCreator above: a list absent from D1
-// must fall through to KV rather than being reported as nonexistent.
+// Copies an account's identity row from KV into D1, if it is not there
+// already. Returns true when D1 now has a row for this account.
+//
+// D1 enforces foreign keys by default, so creator_lists.username ->
+// creators.username rejects a list write for an account that has not been
+// migrated yet -- which is precisely the lazy-migration state the accessors
+// above are built to tolerate. The list itself is never at risk (KV is
+// authoritative and read first), but a mirror that quietly never fills is
+// how a list ends up invisible to the admin panel and to every D1-backed
+// query. This is the compensating write, used only after such a failure.
+async function backfillCreatorRowInD1(env, username) {
+  if (!env || !env.DB || !env.CONFIGS) return false;
+  try {
+    const raw = await env.CONFIGS.get(`creator:${username}`);
+    if (!raw) return false;
+    const profile = JSON.parse(raw);
+    await env.DB.prepare(
+      "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+    ).bind(
+      username,
+      profile.displayName || username,
+      profile.keyHash || "",
+      profile.recoveryAnswerHash || null,
+      profile.createdAt || 0
+    ).run();
+    return true;
+  } catch (e) {
+    console.error("could not backfill a creator row into D1:", e);
+    return false;
+  }
+}
+
+// Puts a rotated key hash into D1, or makes sure D1 cannot answer with the
+// OLD one -- and says which, so the caller can decide whether the rotation
+// actually happened.
+//
+// Both rotation endpoints used to wrap this statement in a catch that logged
+// and carried on, then wrote KV and returned ok:true with a brand-new key.
+// The zero-rows case was already handled (see meta.changes below); a THROW
+// was not. Because getCreator prefers D1, a swallowed throw left the old
+// hash answering every lookup: the caller got a key that would never work
+// while the key they were rotating BECAUSE IT LEAKED kept working forever,
+// and /admin/api/migrate-d1 could not repair it either. That is the worst
+// possible direction for this particular endpoint to fail in.
+//
+// So a throw is now compensated rather than ignored. Dropping the row is
+// enough and is safe: KV holds every account unconditionally and getCreator
+// falls back to it, so an account with no D1 row is a fully working account
+// (that is the lazy-migration state this codebase is built to tolerate) --
+// and /admin/api/migrate-d1 puts the row back.
+//
+// If even the DELETE fails, D1 is unreachable rather than merely unhappy, and
+// there is nothing that can stop it serving the old hash. Then the honest
+// answer is "this did not happen": the caller MUST NOT write KV, because
+// rotating KV while D1 keeps answering with the old hash would leave neither
+// key working and lock the owner out of their own account.
+async function rotateCreatorKeyHashInD1(env, username, keyHash) {
+  if (!env || !env.DB) return { ok: true };
+  try {
+    // meta.changes, not merely "did not throw". A D1 UPDATE that matches ZERO
+    // rows succeeds -- so for any account that exists in KV but was never
+    // migrated into D1, this used to report success, skip the KV write, and
+    // rotate nothing at all.
+    const res = await env.DB.prepare(
+      "UPDATE creators SET key_hash = ? WHERE username = ?"
+    ).bind(keyHash, username).run();
+    if (!(res && res.meta && res.meta.changes > 0)) {
+      // Row absent (never migrated). Not an error -- the unconditional KV
+      // write is the source of truth -- but worth surfacing.
+      console.warn("D1 key rotation matched no row for", username, "-- KV updated");
+    }
+    return { ok: true };
+  } catch (dbErr) {
+    console.error("D1 write error (key rotation):", dbErr);
+    try {
+      await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(username).run();
+      return { ok: true, droppedD1Row: true };
+    } catch (delErr) {
+      console.error("D1 key rotation could not be made consistent:", delErr);
+      return { ok: false };
+    }
+  }
+}
+
+// Same rule as getCreator above, and the same reasons: KV first, D1 as the
+// fallback for a record KV does not have.
+//
+// This one carried the sharpest version of the old asymmetry. `likes` is
+// denormalised onto the record from the voter ledger, and /api/lists/like
+// writes it to KV unconditionally but to D1 inside a swallowing catch -- so
+// a D1 row that was missing or behind reported a like count of 0, and
+// /api/creator/lists/save read that 0 back through here and wrote it into
+// the KV record. One rename, and a real count was gone from every store and
+// from the public directory. The public read paths (/lists/:user/:slug, the
+// directory, search) all read KV directly, so preferring D1 here also meant
+// the owner's dashboard and the public page could disagree indefinitely
+// about the same list.
+//
+// Note the slug: a D1 row's id is `{username}:{slug}`, and splitting on ":"
+// would truncate a slug containing one. slugifyServer cannot produce such a
+// slug, but the caller already knows the right answer, so use it.
 async function getCreatorList(env, username, slug) {
+  try {
+    const raw = await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+    if (raw) return raw;
+  } catch (e) {
+    console.error("KV read error (getCreatorList), falling back to D1:", e);
+  }
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
       if (results && results.length > 0) {
         const row = results[0];
-        return JSON.stringify({ 
-          slug: row.id.split(':')[1] || slug, 
-          name: row.name, 
-          type: row.type, 
-          visibility: row.visibility, 
-          items: JSON.parse(row.items_json || '[]'), 
-          createdAt: row.created_at, 
+        return JSON.stringify({
+          slug,
+          name: row.name,
+          type: row.type,
+          visibility: row.visibility,
+          items: JSON.parse(row.items_json || '[]'),
+          createdAt: row.created_at,
           updatedAt: row.updated_at,
           likes: row.likes || 0
         });
       }
-      // fall through to KV -- not migrated (or D1 is behind)
     } catch(e) {
-      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+      console.error("D1 read error (getCreatorList):", e);
     }
   }
-  return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+  return null;
 }
 
 function isEpisodeAired(airDateStr) {
