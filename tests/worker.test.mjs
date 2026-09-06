@@ -5615,6 +5615,24 @@ describe("test-suite blind spots the audit's mutation testing found", () => {
 
   // M11 -- nothing proved a rotated key stops working from a WARM isolate,
   // which is the case invalidateCreatorAuthMemo exists for.
+  //
+  // A note for whoever next runs mutation testing: making
+  // invalidateCreatorAuthMemo a no-op does NOT fail this test, and that is
+  // correct rather than a hole. Measured, with the clear disabled entirely:
+  // a rotated key still 401s in both KV-only and KV+D1 mode, and a deleted
+  // account still 401s. The memo key is a hash of username + presented key +
+  // STORED HASH, so a rotation changes the key and the old entry becomes
+  // unreachable on its own; a deleted account fails on the tombstone or the
+  // missing record long before the memo is consulted. The clear is
+  // belt-and-braces, exactly as its own comment says.
+  //
+  // So the test deliberately asserts the PROPERTY ("the old key stops
+  // working") and not the mechanism. Writing a test that fails when the clear
+  // is removed would mean pinning a redundant line, which is how a suite ends
+  // up describing the implementation instead of the behaviour -- the same
+  // mistake the source-text cron test made. A surviving mutation means either
+  // the test is decorative or the mutated code was redundant, and those need
+  // telling apart rather than papering over.
   it("M11: a rotated key stops working even after the old one was just verified", async () => {
     const env = makeEnv({ CONFIGS: makeKv() });
     const u = await createUser(env, "m11user", { recoveryAnswer: "a long recovery answer" });
