@@ -1261,41 +1261,27 @@
 
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+
+      // D1 first, and its outcome decides whether this rotation happens at
+      // all -- see rotateCreatorKeyHashInD1 (02_http-and-creator-utils.js).
+      // Nothing is written to KV until D1 is known to be either updated or
+      // unable to answer with the old hash.
+      const d1Rotation = await rotateCreatorKeyHashInD1(env, v.normalized, keyHash);
+      if (!d1Rotation.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't reset that key right now. Please try again in a moment -- your existing key still works.",
+        }, 503);
+      }
+
       // The previous key must stop working on a warm isolate the instant
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
-      
-      if (env.DB) {
-        try {
-          // meta.changes, not merely "did not throw". A D1 UPDATE that
-          // matches ZERO rows succeeds -- so for any account that exists
-          // in KV but was never migrated into D1 (i.e. every account
-          // created before /admin/api/migrate-d1 was first run), this used
-          // to report success, skip the KV write below, and rotate
-          // nothing at all: the caller got a brand-new key that would
-          // never work while the OLD key kept working forever. Exactly
-          // backwards for a credential rotation someone is performing
-          // because their key leaked.
-          const d1Res = await env.DB.prepare(
-            "UPDATE creators SET key_hash = ? WHERE username = ?"
-          ).bind(keyHash, v.normalized).run();
-          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
-            // Row absent from D1 (never migrated). Not an error -- the
-            // unconditional KV write below is the source of truth here --
-            // but worth surfacing, because it means this account is not
-            // in D1 and /admin/api/migrate-d1 has not been run for it.
-            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
-          }
-        } catch (dbErr) {
-          console.error("D1 write error (creator reset):", dbErr);
-        }
-      }
 
       // Written unconditionally, not only when D1 missed. getCreator()
-      // prefers D1 and falls back to KV, so leaving KV holding an older
-      // key_hash than D1 means two different valid passwords for one
-      // account depending on which store answers. Both stores always get
-      // the same hash.
+      // falls back to D1, so leaving KV holding an older key_hash than D1
+      // means two different valid passwords for one account depending on
+      // which store answers. Both stores always get the same hash.
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
@@ -1337,41 +1323,26 @@
       }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
+
+      // Same contract as /api/creator/reset-key above: D1 has to be either
+      // updated or unable to answer with the old hash before KV is touched.
+      // See rotateCreatorKeyHashInD1 (02_http-and-creator-utils.js).
+      const d1Rotation = await rotateCreatorKeyHashInD1(env, v.normalized, keyHash);
+      if (!d1Rotation.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't reset that key right now. Please try again in a moment -- the creator's existing key still works.",
+        }, 503);
+      }
+
       // The previous key must stop working on a warm isolate the instant
       // it is rotated -- see invalidateCreatorAuthMemo's own comment.
       invalidateCreatorAuthMemo();
-      
-      if (env.DB) {
-        try {
-          // meta.changes, not merely "did not throw". A D1 UPDATE that
-          // matches ZERO rows succeeds -- so for any account that exists
-          // in KV but was never migrated into D1 (i.e. every account
-          // created before /admin/api/migrate-d1 was first run), this used
-          // to report success, skip the KV write below, and rotate
-          // nothing at all: the caller got a brand-new key that would
-          // never work while the OLD key kept working forever. Exactly
-          // backwards for a credential rotation someone is performing
-          // because their key leaked.
-          const d1Res = await env.DB.prepare(
-            "UPDATE creators SET key_hash = ? WHERE username = ?"
-          ).bind(keyHash, v.normalized).run();
-          if (!(d1Res && d1Res.meta && d1Res.meta.changes > 0)) {
-            // Row absent from D1 (never migrated). Not an error -- the
-            // unconditional KV write below is the source of truth here --
-            // but worth surfacing, because it means this account is not
-            // in D1 and /admin/api/migrate-d1 has not been run for it.
-            console.warn("D1 key rotation matched no row for", v.normalized, "-- KV updated");
-          }
-        } catch (dbErr) {
-          console.error("D1 write error (admin creator reset):", dbErr);
-        }
-      }
 
       // Written unconditionally, not only when D1 missed. getCreator()
-      // prefers D1 and falls back to KV, so leaving KV holding an older
-      // key_hash than D1 means two different valid passwords for one
-      // account depending on which store answers. Both stores always get
-      // the same hash.
+      // falls back to D1, so leaving KV holding an older key_hash than D1
+      // means two different valid passwords for one account depending on
+      // which store answers. Both stores always get the same hash.
       await env.CONFIGS.put(
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
@@ -3515,8 +3486,21 @@
           if (!raw) return;
           try {
             const data = JSON.parse(raw);
+            // DO UPDATE, not DO NOTHING. This endpoint's stated job is to
+            // reconcile KV into D1, and DO NOTHING meant it could create a
+            // row but never correct one -- so a D1 `creators` row whose
+            // key_hash had drifted from KV stayed wrong forever, and since
+            // getCreator falls back to D1 the only tool for repairing that
+            // state could not repair it. Every column written here is
+            // derived purely from KV, which is authoritative for all three,
+            // so re-running remains idempotent.
+            //
+            // created_at is deliberately left out of the update: KV's
+            // createdAt may be missing on a legacy record, and `|| 0` would
+            // then overwrite a good creation date with zero. last_active is
+            // not written here at all, so it survives too.
             await d1Run(env.DB.prepare(
-              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+              "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, key_hash=excluded.key_hash, recovery_answer_hash=excluded.recovery_answer_hash"
             ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
             results.creators++; thisCall.creators++;
           } catch (e) {

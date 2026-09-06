@@ -4180,3 +4180,91 @@ describe("A1: an account purge must only ever touch its own lists", () => {
     }
   });
 });
+
+describe("A5: a key rotation must never report success without rotating", () => {
+  const rotationPaths = [
+    ["/api/creator/reset-key", (u) => ({ username: u.creatorName, recoveryAnswer: "purple mountains" })],
+    ["/admin/api/reset-creator-key", (u) => ({ username: u.creatorName })],
+  ];
+
+  for (const [path, body] of rotationPaths) {
+    it(`${path}: a failed D1 update must not leave the old key working`, async () => {
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+      const alice = await createUser(env, "alicerot5", { recoveryAnswer: "purple mountains" });
+      const cookie = await adminCookie(env);
+      assert.ok(db._creators.has("alicerot5"));
+
+      // D1 is having a bad minute exactly while the rotation runs.
+      db.failWhen((sql) => /UPDATE creators SET key_hash/i.test(sql));
+      const rot = await call(env, path, { method: "POST", cookie, json: body(alice) });
+      db.failWhen(null);
+
+      assert.equal(rot.body.ok, true, "the row can be dropped, so the rotation can still complete");
+      assert.ok(rot.body.creatorKey);
+
+      const oldKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "alicerot5", creatorKey: alice.creatorKey },
+      });
+      assert.equal(oldKey.status, 401, "the rotated-away key must stop working immediately");
+
+      const newKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "alicerot5", creatorKey: rot.body.creatorKey },
+      });
+      assert.equal(newKey.status, 200, "the key the caller was handed must actually work");
+    });
+
+    it(`${path}: reports failure rather than half-rotating when D1 is unreachable`, async () => {
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+      const alice = await createUser(env, "aliceoff5", { recoveryAnswer: "purple mountains" });
+      const cookie = await adminCookie(env);
+
+      // Neither the update nor the compensating delete can land.
+      db.failWhen((sql) => /creators/i.test(sql) && !/SELECT/i.test(sql));
+      const rot = await call(env, path, { method: "POST", cookie, json: body(alice) });
+      db.failWhen(null);
+
+      assert.notEqual(rot.body.ok, true, "must not claim success");
+      assert.equal(rot.body.creatorKey, undefined, "must not hand back a key it did not install");
+
+      const oldKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "aliceoff5", creatorKey: alice.creatorKey },
+      });
+      assert.equal(oldKey.status, 200,
+        "nothing rotated, so the existing key must keep working rather than locking the owner out");
+    });
+  }
+
+  it("migrate-d1 repairs a D1 row whose hash has drifted from KV", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const alice = await createUser(env, "alicedrift", { recoveryAnswer: "purple mountains" });
+    const cookie = await adminCookie(env);
+
+    // However it got there, D1 now holds a hash KV does not agree with.
+    await db.prepare("UPDATE creators SET key_hash = ?, display_name = ? WHERE username = ?")
+      .bind("pbkdf2:100000:dead:beef", "Stale Name", "alicedrift").run();
+    assert.equal(db._creators.get("alicedrift").key_hash, "pbkdf2:100000:dead:beef");
+
+    let done = false;
+    for (let i = 0; i < 20 && !done; i++) {
+      done = (await call(env, "/admin/api/migrate-d1", { method: "POST", cookie })).body.done;
+    }
+    assert.equal(done, true);
+
+    const kvHash = JSON.parse(env.CONFIGS._store.get("creator:alicedrift")).keyHash;
+    assert.equal(db._creators.get("alicedrift").key_hash, kvHash,
+      "the endpoint whose job is to reconcile KV into D1 must actually reconcile it");
+    assert.equal(db._creators.get("alicedrift").display_name, "alicedrift");
+
+    const ok = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: "alicedrift", creatorKey: alice.creatorKey },
+    });
+    assert.equal(ok.status, 200);
+  });
+});
