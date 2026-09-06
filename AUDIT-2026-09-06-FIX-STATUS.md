@@ -58,8 +58,8 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 
 | | Finding | Severity | Status | Commit |
 |---|---|---|---|---|
-| **A7** | In-flight rebuild re-publishes a list just made private | MEDIUM | ⬜ | |
-| **A8** | Unpublish `ok:true` while the index removal fails silently | MEDIUM | ⬜ | |
+| **A7** | In-flight rebuild re-publishes a list just made private | MEDIUM | ✅ | removals recorded + re-verified before the rebuild publishes |
+| **A8** | Unpublish `ok:true` while the index removal fails silently | MEDIUM | ✅ | removal is awaited and reported; adding stays fire-and-forget |
 | **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ⬜ | |
 | **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ⬜ | |
 | **A11** | No size bound on the authenticated list write | MEDIUM | ⬜ | |

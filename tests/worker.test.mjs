@@ -4477,3 +4477,121 @@ describe("A2/A6: D1 is an accelerator, so it must never overrule the store that 
     assert.equal(shown === "public", served, "dashboard and public path must agree");
   });
 });
+
+describe("A7/A8: unpublishing must actually remove a list from public discovery", () => {
+  const seedFiller = (kv, n) => {
+    for (let i = 0; i < n; i++) {
+      const slug = `filler${String(i).padStart(4, "0")}`;
+      kv._store.set(`creatorlist:alice7:${slug}`, JSON.stringify({
+        name: `F${i}`, slug, type: "movie", items: [], visibility: "public", likes: 0, createdAt: 1, updatedAt: 1,
+      }));
+    }
+  };
+
+  // A8 -- the index removal rode on ctx.waitUntil and swallowed its own
+  // failure, so unpublishing answered ok:true while the list stayed listed.
+  it("reports failure rather than ok:true when the index removal cannot be written", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal((await call(env, "/lists/public.json")).body.lists.length, 1);
+
+    env.CONFIGS._hooks.beforePut = async (key) => {
+      if (key === "index:publiclists") throw new Error("KV put failed");
+    };
+    const un = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "family-photos", name: "Family Photos", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    env.CONFIGS._hooks.beforePut = null;
+
+    assert.notEqual(un.body.ok, true,
+      "unpublishing cannot report success while the list is still in the directory");
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:alice7:family-photos")).visibility, "private",
+      "the record itself is still correctly private");
+  });
+
+  // A7 -- a rebuild carries a pre-change snapshot and overwrites the live
+  // index when it finishes, so a removal applied mid-build was undone.
+  it("an in-flight rebuild does not re-publish a list that was made private under it", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    seedFiller(kv, 900);
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const cookie = await adminCookie(env);
+    const inIndex = () => {
+      const raw = kv._store.get("index:publiclists");
+      return !!raw && JSON.parse(raw).entries.some((e) => e.id === "c:alice7:family-photos");
+    };
+
+    let done = false;
+    for (let i = 0; i < 50 && !done; i++) {
+      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
+    }
+    assert.equal(inIndex(), true, "precondition: it starts out listed");
+
+    // Start a fresh rebuild and stop after its first chunk.
+    kv._store.delete("index:publiclists:build");
+    const chunk1 = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal(chunk1.body.done, false, "precondition: the rebuild needs more than one chunk");
+
+    // Mid-rebuild, the owner unpublishes.
+    const un = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "family-photos", name: "Family Photos", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(un.body.ok, true);
+    assert.equal(inIndex(), false, "the live index drops it immediately");
+
+    done = false;
+    for (let i = 0; i < 50 && !done; i++) {
+      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
+    }
+    assert.equal(inIndex(), false, "the finishing rebuild must not put it back");
+    assert.equal((await call(env, "/lists/public.json?limit=500")).body.lists.some((l) => l.slug === "family-photos"),
+      false, "and it must not be advertised by the directory");
+    const search = await call(env, "/api/search-published-lists?q=family");
+    assert.deepEqual(search.body.lists, [], "nor returned by search");
+  });
+
+  // The inverse: a list unpublished and then published again during a later
+  // build must survive, so the fix cannot be "once removed, always removed".
+  it("a list republished after being unpublished still comes back", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "On Off", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+
+    for (const visibility of ["private", "public"]) {
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility, items: [{ id: "tt0111161" }] },
+      });
+      assert.equal(r.body.ok, true);
+    }
+    kv._store.delete("index:publiclists:build");
+    let done = false;
+    for (let i = 0; i < 50 && !done; i++) {
+      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
+    }
+    assert.equal((await call(env, "/lists/public.json")).body.lists.some((l) => l.slug === "on-off"), true,
+      "a list that is public again must be listed again");
+  });
+});

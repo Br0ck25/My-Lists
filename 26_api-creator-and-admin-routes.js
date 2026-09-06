@@ -1753,21 +1753,42 @@
       // Keep the directory index in step with this save. A list turned
       // private is removed rather than updated, otherwise unpublishing would
       // leave it listed publicly.
-      ctx.waitUntil(updatePublicListIndex(
-        env,
-        `c:${auth.username}:${slug}`,
-        isPublicListVisibility(visibility) ? {
-          isCreator: true,
-          username: auth.username,
-          creatorName: auth.displayName || auth.username,
-          slug,
-          name,
-          type: type || "mixed",
-          itemCount: Array.isArray(items) ? items.length : 0,
-          likes: likes || 0,
-          updatedAt: now,
-        } : null
-      ));
+      //
+      // The two directions get different treatment on purpose. Adding stays
+      // on ctx.waitUntil: a list that takes a moment to appear in the
+      // directory is cosmetic, and the daily rebuild repairs it. REMOVING is
+      // awaited and its result is reported, because it is the mechanism by
+      // which "make this private" stops the list being advertised -- and it
+      // used to be a fire-and-forget task whose failure was swallowed, so
+      // unpublishing answered ok:true while the list stayed in the directory
+      // AND in search until the next rebuild, up to a day later.
+      const indexEntry = isPublicListVisibility(visibility) ? {
+        isCreator: true,
+        username: auth.username,
+        creatorName: auth.displayName || auth.username,
+        slug,
+        name,
+        type: type || "mixed",
+        itemCount: Array.isArray(items) ? items.length : 0,
+        likes: likes || 0,
+        updatedAt: now,
+      } : null;
+      if (indexEntry) {
+        ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, indexEntry));
+      } else {
+        const removed = await updatePublicListIndex(env, `c:${auth.username}:${slug}`, null);
+        if (!removed) {
+          // The record IS private now -- the save above is unconditional and
+          // already landed, so /lists/:user/:slug already 404s. What failed is
+          // the directory listing, so say so rather than claiming the list is
+          // fully unpublished.
+          return json({
+            ok: false,
+            slug,
+            error: "Saved as private, but the public directory could not be updated just yet. It may keep listing this for a few minutes -- please try again.",
+          }, 500);
+        }
+      }
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 

@@ -3155,14 +3155,21 @@ async function usernameForScrobbleToken(env, token) {
 // used to rebuild when it was MISSING, never when it was merely wrong (see
 // refreshPublicListIndexIfStale).
 async function removeListsFromPublicIndex(env, ids) {
-  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  if (!env || !env.CONFIGS || !ids || !ids.length) return true;
+  // Recorded before the index is touched, so an in-flight rebuild cannot
+  // republish these when it lands -- see noteRemovedFromPublicIndex.
+  await noteRemovedFromPublicIndex(env, ids);
   try {
     const idx = await readPublicListIndex(env);
-    if (!idx) return;
+    // No index at all: nothing is being advertised, so there is nothing to
+    // remove and this succeeded.
+    if (!idx) return true;
     const gone = new Set(ids);
     await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
+    return true;
   } catch (e) {
     console.error("public list index cleanup failed", e);
+    return false;
   }
 }
 
@@ -3467,14 +3474,24 @@ async function writePublicListIndex(env, entries) {
 // the index is a rebuildable cache, a lost entry costs one list's directory
 // visibility until its next save or the next rebuild, and publishes are rare
 // and self-correcting. Like counts had no such backstop.
+// Returns true when the index now reflects `entry` (including "there is no
+// index, so there is nothing advertising this"), false when it does not.
+//
+// Callers may treat an ADDITION failing as non-fatal -- a list that is slow
+// to appear in the directory is a cosmetic problem and the daily rebuild
+// repairs it. A REMOVAL is different: it is the mechanism by which making a
+// list private stops it being advertised, so a caller that ignores a false
+// here is reporting a privacy change that did not happen.
 async function updatePublicListIndex(env, id, entry) {
-  if (!env || !env.CONFIGS) return;
+  if (!env || !env.CONFIGS) return false;
+  if (!entry) await noteRemovedFromPublicIndex(env, [id]);
   try {
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
     // would show exactly one list. Leave it absent so the read path falls
-    // back to a scan and rebuilds the whole thing.
-    if (!idx) return;
+    // back to a scan and rebuilds the whole thing. Nothing is advertised in
+    // that state, so a removal has already got what it wanted.
+    if (!idx) return true;
     const prev = idx.entries.find((e) => e && e.id === id);
     const entries = idx.entries.filter((e) => e && e.id !== id);
     // Merge onto the previous entry rather than replacing it: callers that
@@ -3482,11 +3499,103 @@ async function updatePublicListIndex(env, id, entry) {
     // instance) must not blank out fields they never loaded.
     if (entry) entries.push({ ...(prev || {}), ...entry, id });
     await writePublicListIndex(env, entries);
+    return true;
   } catch (err) {
-    // Non-fatal: the list itself is already saved. Worst case the directory
-    // is stale until the next rebuild.
     console.error("public list index update failed:", err);
+    return false;
   }
+}
+
+// --- Removals recorded against an in-flight rebuild --------------------------
+//
+// A rebuild scans the whole keyspace over many chunks, holds the result in
+// index:publiclists:build, and replaces the live index only when the final
+// chunk lands. That makes its snapshot older than the index it overwrites --
+// and a list unpublished after it was scanned was silently PUT BACK into the
+// directory and into search when the rebuild finished, for up to a day, with
+// the owner having been told (correctly, at the time) that it was removed.
+//
+// The rebuild's own comment documents the opposite case, a list published
+// behind the cursor being missed, and calls that an acceptable tradeoff. It is
+// not the same trade: missing a publish costs visibility, clobbering an
+// unpublish costs privacy.
+//
+// So every removal drops its id here, and the rebuild re-verifies those ids
+// against the authoritative record before it publishes. Re-verifying rather
+// than just subtracting is what keeps PUBLIC -> PRIVATE -> PUBLIC working: a
+// list that is public again passes the check and stays. The set is small (one
+// build window's removals), bounded, and expires on its own.
+const PUBLIC_INDEX_REMOVED_KEY = "index:publiclists:removed";
+const PUBLIC_INDEX_REMOVED_MAX = 500;
+// Comfortably longer than any rebuild -- the cron drives one chunk per tick,
+// so even a 20,000-list deployment converges well inside a day.
+const PUBLIC_INDEX_REMOVED_TTL_SEC = 24 * 60 * 60;
+
+async function noteRemovedFromPublicIndex(env, ids) {
+  if (!env || !env.CONFIGS || !ids || !ids.length) return;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
+    let existing = [];
+    try {
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && Array.isArray(parsed.ids)) existing = parsed.ids.filter((x) => typeof x === "string");
+    } catch {
+      existing = [];
+    }
+    const merged = [...existing.filter((x) => !ids.includes(x)), ...ids];
+    const trimmed = merged.slice(-PUBLIC_INDEX_REMOVED_MAX);
+    await env.CONFIGS.put(
+      PUBLIC_INDEX_REMOVED_KEY,
+      JSON.stringify({ ids: trimmed }),
+      { expirationTtl: PUBLIC_INDEX_REMOVED_TTL_SEC }
+    );
+  } catch (e) {
+    // Best-effort. Worst case is the behaviour this exists to fix, which is
+    // bounded by the next rebuild rather than permanent.
+    console.error("could not record a public-index removal:", e);
+  }
+}
+
+// The authoritative key behind an index id. `c:{user}:{slug}` is a creator
+// list; anything else is an anonymous published one, indexed as `a:{slug}`.
+function publicIndexIdToRecordKey(id) {
+  const s = String(id || "");
+  if (s.startsWith("c:")) return "creatorlist:" + s.slice(2);
+  if (s.startsWith("a:")) return "publishedlist:user:" + s.slice(2);
+  return null;
+}
+
+// Drops entries whose record is no longer public, for the handful of ids
+// removed while this build was running. One KV read per such id, and only
+// for ids the build actually collected.
+async function dropStaleRemovalsFromEntries(env, entries) {
+  if (!entries || !entries.length) return entries;
+  let ids = [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Array.isArray(parsed.ids)) ids = parsed.ids;
+  } catch {
+    return entries;
+  }
+  if (!ids.length) return entries;
+  const suspect = new Set(ids);
+  const stillPublic = new Set();
+  const checked = new Set();
+  for (const entry of entries) {
+    if (!entry || !suspect.has(entry.id) || checked.has(entry.id)) continue;
+    checked.add(entry.id);
+    const key = publicIndexIdToRecordKey(entry.id);
+    if (!key) continue;
+    try {
+      const raw = await env.CONFIGS.get(key);
+      if (raw && isPublicListVisibility(JSON.parse(raw).visibility)) stillPublic.add(entry.id);
+    } catch {
+      // Unreadable right now -- leave it out rather than risk republishing
+      // something whose owner asked for it to be taken down.
+    }
+  }
+  return entries.filter((e) => e && (!suspect.has(e.id) || stillPublic.has(e.id)));
 }
 
 // Persisted progress for an in-flight rebuild. Anything unparseable, or from
@@ -3675,7 +3784,10 @@ async function rebuildPublicListIndex(env, options = {}) {
   }
 
   if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
-    const trimmed = await writePublicListIndex(env, state.entries);
+    // Anything unpublished or deleted while this build was running has to
+    // lose to the removal, not to this build's older snapshot.
+    const publishable = await dropStaleRemovalsFromEntries(env, state.entries);
+    const trimmed = await writePublicListIndex(env, publishable);
     try {
       await kv.delete(PUBLIC_INDEX_BUILD_KEY);
     } catch {
@@ -55349,21 +55461,42 @@ self.addEventListener('fetch', e => {
       // Keep the directory index in step with this save. A list turned
       // private is removed rather than updated, otherwise unpublishing would
       // leave it listed publicly.
-      ctx.waitUntil(updatePublicListIndex(
-        env,
-        `c:${auth.username}:${slug}`,
-        isPublicListVisibility(visibility) ? {
-          isCreator: true,
-          username: auth.username,
-          creatorName: auth.displayName || auth.username,
-          slug,
-          name,
-          type: type || "mixed",
-          itemCount: Array.isArray(items) ? items.length : 0,
-          likes: likes || 0,
-          updatedAt: now,
-        } : null
-      ));
+      //
+      // The two directions get different treatment on purpose. Adding stays
+      // on ctx.waitUntil: a list that takes a moment to appear in the
+      // directory is cosmetic, and the daily rebuild repairs it. REMOVING is
+      // awaited and its result is reported, because it is the mechanism by
+      // which "make this private" stops the list being advertised -- and it
+      // used to be a fire-and-forget task whose failure was swallowed, so
+      // unpublishing answered ok:true while the list stayed in the directory
+      // AND in search until the next rebuild, up to a day later.
+      const indexEntry = isPublicListVisibility(visibility) ? {
+        isCreator: true,
+        username: auth.username,
+        creatorName: auth.displayName || auth.username,
+        slug,
+        name,
+        type: type || "mixed",
+        itemCount: Array.isArray(items) ? items.length : 0,
+        likes: likes || 0,
+        updatedAt: now,
+      } : null;
+      if (indexEntry) {
+        ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, indexEntry));
+      } else {
+        const removed = await updatePublicListIndex(env, `c:${auth.username}:${slug}`, null);
+        if (!removed) {
+          // The record IS private now -- the save above is unconditional and
+          // already landed, so /lists/:user/:slug already 404s. What failed is
+          // the directory listing, so say so rather than claiming the list is
+          // fully unpublished.
+          return json({
+            ok: false,
+            slug,
+            error: "Saved as private, but the public directory could not be updated just yet. It may keep listing this for a few minutes -- please try again.",
+          }, 500);
+        }
+      }
       return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
