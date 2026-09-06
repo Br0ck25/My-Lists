@@ -40,6 +40,17 @@
       // Verify against the store that can answer immediately -- see
       // authoritativeKeyHash (02_http-and-creator-utils.js). No-op unless D1
       // is bound.
+      //
+      // Resolved BEFORE the throttle below, which means a throttled request
+      // still pays for it. That is the right way round: the memo check the
+      // throttle depends on has to be keyed on the hash actually verified
+      // against, and probing it with the KV copy instead would let a memo
+      // entry made against a stale hash answer for a key that has since been
+      // rotated away -- reintroducing the thing this line exists to prevent.
+      // The cost of getting the order wrong is a rotation window; the cost of
+      // getting it right is one indexed lookup on the abuse path, against a
+      // PBKDF2 run that is roughly fifteen times more expensive and is what
+      // the throttle actually saves.
       const keyHash = await authoritativeKeyHash(env, v.normalized, profile.keyHash);
       // Every verification below runs PBKDF2 at 100,000 iterations, which is
       // ~15ms of CPU, and it runs BEFORE the caller has proved anything at
