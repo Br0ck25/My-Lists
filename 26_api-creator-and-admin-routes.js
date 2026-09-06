@@ -2015,14 +2015,12 @@
     // and Key keep working and the person stays signed in.
     //
     // Distinct from /api/creator/delete-account below, which removes the
-    // profile outright. Worth noting while looking at the two together: that
-    // one deletes `creatorprofile:`, `creatortrack:`, `creatorpresets:` and
-    // `creatorchannels:`, which are old key names this codebase no longer
-    // writes -- the live data is under `creator:`, `creatorsynctracking:`,
-    // `creatorsyncpresets:` and `creatorsyncchannels:`. So it currently
-    // leaves most of an account's data behind. Not changed here because
-    // deleting more on that path deserves its own decision, but this reset
-    // uses the names actually in use, plus the legacy ones for good measure.
+    // profile outright. The two share purgeCreatorData, so they cannot drift
+    // apart the way they once had -- the paragraph that used to sit here,
+    // warning that delete-account still named `creatorprofile:` /
+    // `creatorpresets:` / `creatorchannels:` and so "leaves most of an
+    // account's data behind", described a state that has not existed since
+    // both callers were moved onto one function.
     if (path === "/api/creator/account/reset" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "Database not configured." }, 500);
       let body;

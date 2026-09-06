@@ -4848,8 +4848,13 @@ describe("A15: a fresh schema.sql and a migrated database must be the same shape
       CREATE INDEX idx_creator_lists_username ON creator_lists(username);
       CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
     `);
-    migrated.exec(read("migrations/0001_add_likes_to_creator_lists.sql"));
-    migrated.exec(read("migrations/0002_add_stats_table.sql"));
+    // Every migration, in order, exactly as an operator would apply them.
+    // Read from the directory rather than listed by hand, so a migration
+    // added later cannot be silently left out of this comparison.
+    const migrationFiles = fs.readdirSync(path.join(REPO_ROOT, "migrations"))
+      .filter((f) => f.endsWith(".sql")).sort();
+    assert.ok(migrationFiles.length >= 4, `expected the migration set, got ${migrationFiles.join(", ")}`);
+    for (const f of migrationFiles) migrated.exec(read(`migrations/${f}`));
 
     assert.deepEqual(indexesOf(fresh), indexesOf(migrated),
       "a deployment provisioned from schema.sql must not be missing an index a migrated one has");
