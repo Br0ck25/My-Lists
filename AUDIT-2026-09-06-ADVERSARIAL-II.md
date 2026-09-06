@@ -1,5 +1,12 @@
 # ADVERSARIAL AUDIT II — CURRENT MAIN
 
+> **These findings have since been fixed.** This document is the audit record
+> and describes the code as it stood at `3d4c24f`; it is deliberately not
+> edited to match the repairs. See
+> **[`AUDIT-2026-09-06-ADVERSARIAL-II-FIX-STATUS.md`](AUDIT-2026-09-06-ADVERSARIAL-II-FIX-STATUS.md)**
+> for what was done about each one, what was deliberately left alone, and the
+> residuals that remain.
+
 Independent, invariant-driven, executed. Run against `claude/full-audit-urjcp9`
 at `3d4c24f` (the merge of the previous adversarial audit's fixes).
 

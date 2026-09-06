@@ -18,9 +18,12 @@ for (const [label, n] of [["CAP-1", 199], ["CAP", 200], ["CAP+1", 201]]) {
   console.log(`lists/save nameLen=${n} (${label}) -> ${r.status} ${JSON.stringify(r.body).slice(0, 110)}`);
 }
 // CREATOR_LIST_BYTES_MAX = 1_800_000 - build items whose JSON straddles the bound
+// Few items, each large, so the BYTE cap is what trips and not the 10,000
+// item cap -- the original fixture here used ~18,000 small items and so only
+// ever tested the item cap twice.
 function itemsOfBytes(target) {
-  const out = []; let cur = "[]";
-  while (JSON.stringify(out).length < target) out.push({ id: "tt" + out.length, t: "x".repeat(80) });
+  const out = [];
+  while (JSON.stringify(out).length < target) out.push({ id: "tt" + out.length, t: "x".repeat(4000) });
   return out;
 }
 {

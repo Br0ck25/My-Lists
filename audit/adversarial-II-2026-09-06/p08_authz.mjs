@@ -60,6 +60,10 @@ for(const [m,p] of adminRoutes){
   const noSess=await call(env,p,m==="GET"?{method:m}:{method:m,json:{}});
   const fake=await call(env,p,m==="GET"?{method:m,cookie:"admin_session=deadbeef"}:{method:m,cookie:"admin_session=deadbeef",json:{}});
   console.log(p.padEnd(42),String(noSess.status).padEnd(10),fake.status);
+  // /admin itself is the LOGIN PAGE and must render for a signed-out
+  // visitor -- p09_adminpage.mjs is the test that it leaks nothing while
+  // doing so. Every /admin/api/* route is the one that must refuse.
+  if(p==="/admin") continue;
   if(noSess.status===200&&!(noSess.body&&noSess.body.ok===false)) problems.push(`ADMIN route open without session: ${p} -> ${noSess.status}`);
   if(fake.status===200&&!(fake.body&&fake.body.ok===false)) problems.push(`ADMIN route accepts a forged cookie: ${p}`);
 }

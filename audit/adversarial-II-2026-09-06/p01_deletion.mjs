@@ -26,9 +26,13 @@ async function populate(env, u, key) {
   await populate(env, "alpha1", a.creatorKey);
   const before = [...kv._store.keys()].filter(k => k.includes("alpha1"));
   const del = await call(env, "/api/creator/delete-account", { method: "POST", json: { creatorName: "alpha1", creatorKey: a.creatorKey, confirm: "DELETE" } });
-  const left = [...kv._store.keys()].filter(k => k.includes("alpha1"));
+  // The deletion tombstone legitimately still names the account: it is a
+  // "this username is not available yet" marker, not account data, and it
+  // expires on its own. See the tombstone comment in 02_.
+  const left = [...kv._store.keys()].filter(k => k.includes("alpha1") && k !== "creatordeleted:alpha1");
   rec("delete-account returns ok", del.body && del.body.ok === true, JSON.stringify(del.body));
-  rec("no KV keys mention the deleted user", left.length === 0, `before=${before.length} left=${JSON.stringify(left)}`);
+  rec("no account data mentions the deleted user", left.length === 0, `before=${before.length} left=${JSON.stringify(left)}`);
+  rec("the username is tombstoned while stragglers finish", kv._store.has("creatordeleted:alpha1"), "");
   rec("D1 creators row gone", !db._creators.has("alpha1"), "");
   rec("D1 creator_lists gone", db.q("SELECT * FROM creator_lists WHERE username='alpha1'").length === 0, "");
   const idxRaw = kv._store.get("index:publiclists");
@@ -47,6 +51,8 @@ async function populate(env, u, key) {
   const a = await createUser(env, "reclaim1");
   await populate(env, "reclaim1", a.creatorKey);
   await call(env, "/api/creator/delete-account", { method: "POST", json: { creatorName: "reclaim1", creatorKey: a.creatorKey, confirm: "DELETE" } });
+  // The hold has to lapse before the name is available again.
+  kv._store.delete("creatordeleted:reclaim1");
   const b = await createUser(env, "reclaim1");
   const lists = await call(env, "/api/creator/lists", { method: "POST", json: { creatorName: "reclaim1", creatorKey: b.creatorKey } });
   rec("reclaimed account has no inherited lists", Array.isArray(lists.body.lists) && lists.body.lists.length === 0, JSON.stringify(lists.body.lists));
