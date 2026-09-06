@@ -5597,6 +5597,62 @@ describe("N10: a response carrying one account's private data is never cacheable
     // stopped returning it.
     assert.ok(maxAge <= 120, `search was cacheable for ${maxAge}s; the directory itself uses 120`);
   });
+
+  // Marking the individual routes was opt-in, and five of them were still
+  // opted out: sync/save, save-tracking, save-presets, save-channels and
+  // lists/delete all answered 200 with max-age=3600. Nothing was leaking --
+  // they are POSTs and browsers do not store a POST response -- but that is
+  // protection by accident of HTTP method, and a route added tomorrow starts
+  // out wrong the same way. So the rule now lives at the response boundary
+  // and this test walks the whole surface rather than a chosen list.
+  it("enforces no-store at the boundary, for every creator and admin path", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "boundary");
+    const K = { creatorName: "boundary", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "L", type: "movie", visibility: "public", items: [],
+    }});
+    const cookie = await adminCookie(env);
+
+    const leaky = [];
+    for (const p of ["/api/creator/sync/load", "/api/creator/sync/save", "/api/creator/lists",
+      "/api/creator/sync/meta", "/api/creator/restore", "/api/creator/track-status",
+      "/api/creator/scrobble-token", "/api/creator/sync/save-tracking", "/api/creator/sync/save-presets",
+      "/api/creator/sync/save-channels", "/api/creator/sync/share-tracking", "/api/creator/lists/delete",
+      // A path no route serves: the boundary must cover the 404 too, since
+      // that is the shape a future route arrives in.
+      "/api/creator/not-a-route-yet"]) {
+      const r = await call(env, p, { method: "POST", json: { ...K, slug: "l", shared: false } });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    for (const p of ["/admin", "/admin/api/published-lists", "/admin/api/leaderboard?type=trending&window=last30"]) {
+      const r = await call(env, p, { cookie });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    assert.deepEqual(leaky, [], "these account-scoped responses are storable");
+  });
+
+  // The half a blanket no-store would break. This add-on stays inside the
+  // upstream rate limits by being cacheable where it can be, so the rule has
+  // to be narrow enough to leave the public surface alone.
+  it("leaves the public, cacheable surface alone", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "pubcache");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "pubcache", creatorKey: u.creatorKey,
+      name: "Public List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (const p of ["/lists/public.json", "/lists/pubcache/public-list.json", "/icon.png"]) {
+      const r = await call(env, p);
+      assert.equal(r.status, 200, `${p} should be served`);
+      assert.match(r.headers.get("cache-control") || "", /max-age=\d+/,
+        `${p} must stay cacheable -- the rate-limit budget depends on it`);
+    }
+  });
 });
 
 describe("N11: verifying a Creator Key is bounded, not free", () => {

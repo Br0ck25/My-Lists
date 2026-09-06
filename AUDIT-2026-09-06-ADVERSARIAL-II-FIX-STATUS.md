@@ -10,7 +10,7 @@ A fix whose mutation leaves the suite green is called out below rather than
 counted as done — see "What the mutation run actually said", which is also
 where the one case of a *correctly* surviving mutation is explained.
 
-Suite: **262 tests, 261 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **264 tests, 263 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
 ### What the mutation run actually said
@@ -195,6 +195,34 @@ the same way the creator-list panel does. The paging contract has its own test:
 both of its failure modes -- a cursor that never goes null, and one that goes
 null early and shows the operator a truncated list -- are silent.
 
+## N10 finished properly: the rule moved to the boundary
+
+N10 was fixed route by route with `jsonPrivate()`, and marking routes
+individually is opt-in. Enumerating the whole surface afterwards found five
+still opted out and answering **200 with `max-age=3600`**:
+
+    /api/creator/sync/save
+    /api/creator/sync/save-tracking
+    /api/creator/sync/save-presets
+    /api/creator/sync/save-channels
+    /api/creator/lists/delete
+
+Nothing was leaking: those are POSTs and browsers do not store a POST response.
+But that is protection by accident of HTTP method rather than by design, it ends
+the day one of them gains a GET form, and a route added tomorrow starts out
+wrong the same way. So `isPrivateApiPath` now decides it once, where every
+response funnels back through, for `/api/creator/*` and `/admin*` — the same
+place `securityHeaders` already lives, and for the same reason: a route added
+later cannot forget to opt in, and the header is *set* rather than defaulted, so
+one cannot accidentally opt out either. A 404 under those prefixes is covered
+too, since that is the shape a future route arrives in.
+
+The narrowness is the other half of the fix, and is pinned by its own test. A
+blanket `no-store` would be wrong: this add-on stays inside the upstream rate
+limits by being cacheable where it can be. Both mutations are caught —
+disabling the rule fails the private test, widening it to every response fails
+the public one.
+
 ## Deliberately not done
 
 **Behavioural coverage of the client.** 35,225 of the 59,240 source lines are
@@ -214,7 +242,7 @@ expired rows safely.
 ## Verification
 
 ```bash
-node --test tests/*.test.mjs        # 262 tests, 261 pass, 1 skipped
+node --test tests/*.test.mjs        # 264 tests, 263 pass, 1 skipped
 bash verify.sh                      # build drift, syntax, page render, map, tests
 python3 check_sync.py               # byte-exact rebuild check on its own
 

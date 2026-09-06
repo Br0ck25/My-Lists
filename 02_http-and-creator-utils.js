@@ -26,6 +26,30 @@ function isPublicCorsPath(path) {
   return false;
 }
 
+// Paths whose responses are per-account or admin-only, and must never be
+// stored by a browser or by anything between it and this Worker.
+//
+// json() defaults to a cacheable max-age for a successful response, which is
+// right for the catalog and directory endpoints this add-on leans on to stay
+// inside upstream rate limits, and wrong for everything under these two
+// prefixes. Individual routes were given jsonPrivate() for N10, but that is
+// opt-in: the four sync/save* routes and lists/delete were still answering
+// 200 with max-age=3600, and a route added tomorrow starts out wrong too.
+//
+// Nothing is leaking today -- those are POSTs, and browsers do not store a
+// POST response -- but that is protection by accident of HTTP method rather
+// than by design, and it stops being true the day one of them gains a GET
+// form.
+//
+// Enforced at the single point every response funnels back through rather
+// than at each of the ~25 call sites, for the same reason securityHeaders is:
+// a route added later cannot forget to opt in. The header is SET, not
+// defaulted, so a route cannot accidentally opt out either.
+function isPrivateApiPath(path) {
+  const p = String(path || "");
+  return p.startsWith("/api/creator/") || p === "/admin" || p.startsWith("/admin/");
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -81,12 +105,14 @@ function securityHeaders() {
 // like Content-Type/Cache-Control/CORS) -- see securityHeaders' own
 // comment for why this is applied here, once, rather than at each call
 // site.
-function withSecurityHeaders(response) {
+function withSecurityHeaders(response, privatePath = false) {
   const headers = new Headers(response.headers);
   const extra = securityHeaders();
   for (const key in extra) {
     if (!headers.has(key)) headers.set(key, extra[key]);
   }
+  // Deliberately set rather than defaulted -- see isPrivateApiPath.
+  if (privatePath) headers.set("Cache-Control", "no-store");
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
