@@ -1,7 +1,8 @@
 # Adversarial audit — fix status
 
 Live tracker for the 20 findings in [`AUDIT-2026-09-06-ADVERSARIAL.md`](AUDIT-2026-09-06-ADVERSARIAL.md).
-Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
+All twenty landed in [#16](https://github.com/Br0ck25/My-Lists/pull/16); the two follow-ups
+below are the second PR.
 
 **Legend:** ✅ fixed & tested · 🔧 in progress · ⬜ not started
 
@@ -63,7 +64,7 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 | **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ✅ | `parseExpectedUpdatedAt` + `nextSyncVersion` (02_) |
 | **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ✅ | guards on save-presets/save-channels + client; watchlist empty-guard |
 | **A11** | No size bound on the authenticated list write | MEDIUM | ✅ | `CREATOR_LIST_BYTES_MAX` + shared item/name caps |
-| **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ✅ | errors (incl. `ok:false` 200s) → `no-store`; explicit on credential routes |
+| **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ✅ | errors (incl. `ok:false` 200s) → `no-store`; explicit on credential routes; **follow-up:** `isPrivateApiPath` choke point |
 | **A13** | No global exception boundary | MEDIUM | ✅ | `export default.fetch` try/catch; two unguarded `res.json()` wrapped |
 | **A15** | `schema.sql` vs migrations index drift | LOW | ✅ | index added; a test diffs both provisioning paths |
 
@@ -81,6 +82,34 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 | — | Stale comments (§16 F1/F2/F3) | — | ✅ | F1/F2 corrected in code; F3 is in a historical audit, left as written |
 
 ---
+
+## Follow-ups, after the first PR merged
+
+Two things I flagged as judgment calls when the twenty landed, and then acted on.
+
+**The A9 prescription in the audit report was wrong.** The report's *Minimal fix* said
+"use `>=`". The shipped code does not, and should not: `expected === stored` is the
+NORMAL case — my edits are built on exactly the version that is stored — so `>=` would
+409 every legitimate save. A bare timestamp cannot be a version when two writes can
+share a millisecond; the version has to change on every write, which is what
+`nextSyncVersion` does. Corrected in the report rather than left to mislead whoever
+reads it next, because a merged document that tells you to introduce a bug is worse
+than no document.
+
+**`/api/creator/*` and `/admin*` responses now say `no-store` at a choke point.** The
+first pass fixed the demonstrated harms — cached 401s, the two responses carrying a
+plaintext Creator Key, the four provider GETs whose URL contains an access token — and
+left successful per-account POSTs on `json()`'s cacheable default. Those were safe only
+because browsers do not cache a POST: protection by accident of HTTP method, not by
+design, and it stops being true the day one of them gains a GET form. `isPrivateApiPath`
++ `withSecurityHeaders` now sets the header for both prefixes at the single point every
+response funnels through, so a route added later cannot forget, and (because it *sets*
+rather than defaults) cannot accidentally opt out either.
+
+Still not doing the wholesale `json()` default flip. It would strip edge caching from
+the catalog and provider endpoints this add-on leans on to stay inside upstream rate
+limits, and with errors and both private prefixes now covered, what remains on the
+default is exactly the public, cacheable traffic it was written for.
 
 ## Deliberately not done
 

@@ -596,8 +596,31 @@ Failing open for an *absent* field is the documented, deliberate back-compat cho
 is fine. Failing open for a *present but malformed* one is not — it is silent data loss
 that looks like success.
 
-**Minimal fix.** `const raw = body.expectedUpdatedAt; if (raw !== undefined && raw !== null) { const n = Number(raw); if (!Number.isFinite(n)) return 400; … if (Number(current.updatedAt) >= n) → 409 }`. Use `>=`, and treat a
-present-but-unparseable value as a client error rather than as absence.
+**Minimal fix.** Two parts, and only one of them is what this report first proposed.
+
+For **(b)**: separate *absent* from *malformed*. `const raw = body.expectedUpdatedAt;
+if (raw !== undefined && raw !== null) { const n = Number(raw); if (!Number.isFinite(n))
+return 400; … }` — a present-but-unparseable value is a client error, not a licence to
+drop the guard.
+
+For **(a)**: ~~use `>=`~~ — **that was wrong, and is corrected here rather than left to
+mislead.** `expected === stored` is the *normal* case: my edits are built on exactly the
+version that is stored, so `>=` would reject every legitimate save. A bare timestamp
+simply cannot serve as a version when two writes can share a millisecond. The version
+has to *change* on every write instead:
+
+```js
+function nextSyncVersion(currentUpdatedAt) {
+  const now = Date.now();
+  const prev = Number(currentUpdatedAt);
+  return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
+}
+```
+
+Advancing past the stored value by at least one means a write always produces a version
+no earlier write can claim, which is what `>` needs to be meaningful. It also makes the
+guard survive a clock that moves backwards. Shipped in
+`02_http-and-creator-utils.js` alongside `parseExpectedUpdatedAt`.
 
 ---
 

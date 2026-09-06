@@ -5168,3 +5168,79 @@ describe("Test-suite blind spots named by the audit", () => {
     }
   });
 });
+
+describe("A12 follow-up: nothing per-account or admin-only is cacheable", () => {
+  // These were protected only by being POSTs. Browsers do not cache a POST, so
+  // nothing was leaking -- but that is protection by accident of HTTP method,
+  // and it stops being true the day one of them gains a GET form. Enforced at
+  // the single point every response funnels through, so a route added later
+  // cannot forget.
+  it("every /api/creator/* response says no-store, success or failure", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "priv12", { recoveryAnswer: "purple mountains" });
+    const K = { creatorName: "priv12", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST", json: { ...K, name: "Mine", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+
+    const routes = [
+      ["/api/creator/lists", K],
+      ["/api/creator/sync/load", K],
+      ["/api/creator/sync/meta", K],
+      ["/api/creator/sync/save", { ...K, config: [] }],
+      ["/api/creator/sync/save-presets", { ...K, presets: {} }],
+      ["/api/creator/sync/save-channels", { ...K, channels: {} }],
+      ["/api/creator/sync/save-tracking", { ...K, watchHistory: [] }],
+      ["/api/creator/restore", K],
+      ["/api/creator/scrobble-token", K],
+      ["/api/creator/track-status", K],
+      ["/api/creator/lists/reorder", { ...K, order: ["mine"] }],
+      ["/api/creator/create", { creatorName: "priv12b" }],
+      ["/api/creator/reset-key", { username: "priv12", recoveryAnswer: "purple mountains" }],
+      // and the same routes failing
+      ["/api/creator/lists", { creatorName: "priv12", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+      ["/api/creator/sync/load", { creatorName: "nobody", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+    ];
+    for (const [p, body] of routes) {
+      const r = await call(env, p, { method: "POST", json: body });
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} answered ${r.status} with Cache-Control: ${r.headers.get("cache-control")}`);
+    }
+  });
+
+  it("every /admin* response says no-store, authorized or not", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cookie = await adminCookie(env);
+    for (const [method, p, ck] of [
+      ["GET", "/admin", cookie],
+      ["GET", "/admin", undefined],
+      ["GET", "/admin/api/analytics", cookie],
+      ["GET", "/admin/api/analytics", undefined],
+      ["GET", "/admin/api/feedback", cookie],
+      ["GET", "/admin/api/leaderboard", cookie],
+      ["GET", "/admin/api/apiusage", cookie],
+    ]) {
+      const r = await call(env, p, { method, cookie: ck });
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${method} ${p} (${ck ? "authed" : "anon"}) answered ${r.status} with Cache-Control: ${r.headers.get("cache-control")}`);
+    }
+  });
+
+  it("public endpoints keep the caching they are supposed to have", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "priv12c");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "priv12c", creatorKey: u.creatorKey, name: "Pub", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    for (const [p, want] of [
+      ["/lists/public.json", /max-age=120/],
+      ["/api/public-lists.json", /max-age=120/],
+      ["/lists/priv12c/pub.json", /max-age=300/],
+      ["/robots.txt", /max-age=86400/],
+    ]) {
+      const r = await call(env, p);
+      assert.match(r.headers.get("cache-control") || "", want, `${p} lost its caching`);
+    }
+  });
+});

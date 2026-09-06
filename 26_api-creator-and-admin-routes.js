@@ -4717,7 +4717,16 @@ export default {
       // and long opaque tokens from what goes back.
       response = json({ ok: false, error: safeErrorMessage(err) }, 500);
     }
-    return withSecurityHeaders(response);
+    // Parsed here rather than threaded down from handleFetch, so the answer
+    // is the same whether the response came from a route or from the catch
+    // above. Guarded because nothing in this boundary may itself throw.
+    let privatePath = false;
+    try {
+      privatePath = isPrivateApiPath(new URL(request.url).pathname);
+    } catch {
+      // An unparseable URL cannot have reached a private route anyway.
+    }
+    return withSecurityHeaders(response, privatePath);
   },
 
   // Runs on whatever schedule this Worker's owner configured under
