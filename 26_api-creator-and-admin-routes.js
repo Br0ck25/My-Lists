@@ -1716,9 +1716,23 @@
         try {
           const listId = `${auth.username}:${slug}`;
           const itemsJson = JSON.stringify(items || []);
+          // `likes` is bound on the INSERT and deliberately absent from the
+          // DO UPDATE.
+          //
+          // It used to be absent from both, so a row created here took the
+          // column's DEFAULT 0 even though the true count was sitting in the
+          // KV record this same handler was about to write. Combined with
+          // getCreatorList preferring D1, one save made the count read 0 and
+          // the next save wrote that 0 into KV -- a rename silently
+          // destroying a real like count in every store and in the public
+          // directory. Same shape /admin/api/migrate-d1 has always used.
+          //
+          // Still out of the DO UPDATE, because there `likes` is not ours to
+          // write: /api/lists/like owns it, derives it from the voter ledger,
+          // and may well have moved it since this request read the record.
           await env.DB.prepare(
-            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-          ).bind(listId, auth.username, name, type, visibility, itemsJson, createdAt, now).run();
+            "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+          ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
         } catch (dbErr) {
           console.error("D1 write error (creatorlist put):", dbErr);
         }
@@ -2306,9 +2320,12 @@
             try {
               const listId = `${auth.username}:watchlist`;
               const itemsJson = JSON.stringify(wlObj.items || []);
+              // Carries `likes` on the INSERT for the same reason the
+              // creator-list save above does -- a Watchlist is private by
+              // default but nothing stops one being shared and liked.
               await env.DB.prepare(
-                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.createdAt, wlObj.updatedAt).run();
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(listId, auth.username, wlObj.name, wlObj.type, wlObj.visibility, itemsJson, wlObj.likes || 0, wlObj.createdAt, wlObj.updatedAt).run();
             } catch (dbErr) {
               console.error("D1 write error (creatorlist watchlist):", dbErr);
             }

@@ -4368,3 +4368,112 @@ describe("A3/A4: a purge that failed must not report success", () => {
     assert.deepEqual(dash.body.lists, []);
   });
 });
+
+describe("A2/A6: D1 is an accelerator, so it must never overrule the store that is authoritative", () => {
+  // The precondition is ordinary: D1 knows the account but not this list yet.
+  // migrate-d1 always does `creator:` before `creatorlist:`, so every
+  // deployment large enough to need more than one chunk spends time in
+  // exactly this state, and a dropped D1 write produces it at any size.
+  const seedKvOnlyList = (env, user, likes) => {
+    env.CONFIGS._store.set(`creatorlist:${user}:top-ten`, JSON.stringify({
+      name: "Top Ten", slug: "top-ten", type: "movie", items: [{ id: "tt0111161" }],
+      visibility: "public", likes, createdAt: 1, updatedAt: 2,
+    }));
+    env.CONFIGS._store.set(`creatorlistorder:${user}`, JSON.stringify({ order: ["top-ten"] }));
+    env.CONFIGS._store.set(`listlikevoters:${user}:top-ten`, JSON.stringify(
+      Array.from({ length: likes }, (_, i) => `a:voter${i}`)
+    ));
+  };
+
+  it("an ordinary edit does not zero a like count that only KV knows about", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana2");
+    seedKvOnlyList(env, "dana2", 5);
+    assert.equal(db._lists.has("dana2:top-ten"), false, "precondition: D1 has no row for this list");
+
+    const dash = async () => {
+      const r = await call(env, "/api/creator/lists", {
+        method: "POST", json: { creatorName: "dana2", creatorKey: u.creatorKey },
+      });
+      return r.body.lists.find((l) => l.slug === "top-ten");
+    };
+    const kvLikes = () => JSON.parse(env.CONFIGS._store.get("creatorlist:dana2:top-ten")).likes;
+    assert.equal((await dash()).likes, 5);
+
+    for (let n = 1; n <= 2; n++) {
+      const save = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: "dana2", creatorKey: u.creatorKey, slug: "top-ten",
+          name: `Top Ten v${n}`, type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+      assert.equal(save.body.ok, true);
+      assert.equal(kvLikes(), 5, `edit ${n} destroyed the like count in KV`);
+      assert.equal(db._lists.get("dana2:top-ten").likes, 5, `edit ${n} wrote 0 likes into D1`);
+      assert.equal((await dash()).likes, 5, `edit ${n} made the dashboard report 0 likes`);
+    }
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.find((l) => l.slug === "top-ten").likes, 5);
+  });
+
+  it("a like whose D1 write failed does not get written back as zero by the next edit", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana6");
+    const K = { creatorName: "dana6", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Best Of", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+
+    db.failWhen((sql) => /UPDATE creator_lists SET likes/i.test(sql));
+    for (let i = 0; i < 4; i++) {
+      await call(env, "/api/lists/like", {
+        method: "POST", ip: `203.0.113.${20 + i}`,
+        json: { username: "dana6", slug: "best-of" },
+      });
+    }
+    db.failWhen(null);
+
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "best-of", name: "Best Of 2026", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:dana6:best-of")).likes, 4,
+      "four real likes must survive an edit that followed a failed D1 like-write");
+
+    const dash = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.equal(dash.body.lists.find((l) => l.slug === "best-of").likes, 4);
+  });
+
+  it("a dropped D1 write does not make the dashboard disagree with what is actually served", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana6b");
+    const K = { creatorName: "dana6b", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doc", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+
+    // The owner makes it public; the D1 mirror of that change is lost.
+    db.failWhen((sql) => /INSERT INTO creator_lists/i.test(sql));
+    const pub = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "doc", name: "Doc", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    db.failWhen(null);
+    assert.equal(pub.body.ok, true);
+
+    const dash = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const shown = dash.body.lists.find((l) => l.slug === "doc").visibility;
+    const served = (await call(env, "/lists/dana6b/doc.json")).status === 200;
+    assert.equal(shown, "public",
+      "the owner's dashboard must not report a list private while the world can read it");
+    assert.equal(served, true);
+    assert.equal(shown === "public", served, "dashboard and public path must agree");
+  });
+});

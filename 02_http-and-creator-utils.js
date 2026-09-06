@@ -2370,16 +2370,41 @@ async function purgeCreatorData(env, username, options = {}) {
 // -- KV remains the store every account is guaranteed to exist in (see the
 // unconditional KV writes in the create/rotate paths).
 //
-// This used to `return null` when D1 was bound and the row was absent,
-// instead of falling through to KV. That is only correct if every account
-// is guaranteed present in D1, which is exactly what is NOT true: D1 is
-// populated lazily by /admin/api/migrate-d1, so every account created
-// before that endpoint was first run has no D1 row. Binding DB therefore
-// locked all of those users out of their own accounts completely -- the
-// key was fine, the data was fine, the lookup just said "no such creator"
-// and every endpoint returned the generic "Username or Key is incorrect."
-// A missing row means "not migrated yet", not "does not exist".
+// KV IS READ FIRST. That sentence above was already the design; the code
+// contradicted it by asking D1 first, and the contradiction is what four
+// separate defects were made of. The asymmetry: every D1 WRITE in this
+// codebase is optional (wrapped in a catch that logs and carries on, because
+// KV is the store that matters), while every D1 READ was preferred. So any
+// dropped D1 write became a permanent, invisible lie that outranked the
+// truth:
+//
+//   * a rotation whose D1 update threw left the OLD key authenticating and
+//     the new one rejected, and no repair tool could fix it;
+//   * an account whose D1 delete threw kept authenticating and writing after
+//     its owner had been told it was deleted;
+//   * a list whose D1 row was missing reported 0 likes -- and the next
+//     ordinary save read that 0 back out and wrote it into KV, destroying a
+//     real count in the authoritative store;
+//   * a visibility change whose D1 write was dropped left the owner's own
+//     dashboard saying "private" about a list the world could read.
+//
+// Reading KV first removes all four at once, because KV is the store every
+// write path touches unconditionally. It is not slower either: this is one
+// edge-cached KV get instead of one D1 query.
+//
+// D1 stays as the FALLBACK, which is what keeps the earlier fix intact in
+// both directions. A missing row means "not migrated yet", not "does not
+// exist" -- and now a missing KV record means "ask the mirror" rather than
+// "no such creator", so an account is reachable as long as EITHER store has
+// it. Every field returned here also lives in KV, so nothing is lost by
+// preferring it.
 async function getCreator(env, username) {
+  try {
+    const raw = await env.CONFIGS.get(`creator:${username}`);
+    if (raw) return raw;
+  } catch (e) {
+    console.error("KV read error (getCreator), falling back to D1:", e);
+  }
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
@@ -2387,12 +2412,11 @@ async function getCreator(env, username) {
         const row = results[0];
         return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
       }
-      // fall through to KV -- not migrated (or D1 is behind)
     } catch(e) {
-      console.error("D1 read error (getCreator), falling back to KV:", e);
+      console.error("D1 read error (getCreator):", e);
     }
   }
-  return await env.CONFIGS.get(`creator:${username}`);
+  return null;
 }
 
 // Puts a rotated key hash into D1, or makes sure D1 cannot answer with the
@@ -2447,31 +2471,51 @@ async function rotateCreatorKeyHashInD1(env, username, keyHash) {
   }
 }
 
-// Same lazy-migration hazard as getCreator above: a list absent from D1
-// must fall through to KV rather than being reported as nonexistent.
+// Same rule as getCreator above, and the same reasons: KV first, D1 as the
+// fallback for a record KV does not have.
+//
+// This one carried the sharpest version of the old asymmetry. `likes` is
+// denormalised onto the record from the voter ledger, and /api/lists/like
+// writes it to KV unconditionally but to D1 inside a swallowing catch -- so
+// a D1 row that was missing or behind reported a like count of 0, and
+// /api/creator/lists/save read that 0 back through here and wrote it into
+// the KV record. One rename, and a real count was gone from every store and
+// from the public directory. The public read paths (/lists/:user/:slug, the
+// directory, search) all read KV directly, so preferring D1 here also meant
+// the owner's dashboard and the public page could disagree indefinitely
+// about the same list.
+//
+// Note the slug: a D1 row's id is `{username}:{slug}`, and splitting on ":"
+// would truncate a slug containing one. slugifyServer cannot produce such a
+// slug, but the caller already knows the right answer, so use it.
 async function getCreatorList(env, username, slug) {
+  try {
+    const raw = await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+    if (raw) return raw;
+  } catch (e) {
+    console.error("KV read error (getCreatorList), falling back to D1:", e);
+  }
   if (env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
       if (results && results.length > 0) {
         const row = results[0];
-        return JSON.stringify({ 
-          slug: row.id.split(':')[1] || slug, 
-          name: row.name, 
-          type: row.type, 
-          visibility: row.visibility, 
-          items: JSON.parse(row.items_json || '[]'), 
-          createdAt: row.created_at, 
+        return JSON.stringify({
+          slug,
+          name: row.name,
+          type: row.type,
+          visibility: row.visibility,
+          items: JSON.parse(row.items_json || '[]'),
+          createdAt: row.created_at,
           updatedAt: row.updated_at,
           likes: row.likes || 0
         });
       }
-      // fall through to KV -- not migrated (or D1 is behind)
     } catch(e) {
-      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+      console.error("D1 read error (getCreatorList):", e);
     }
   }
-  return await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+  return null;
 }
 
 function isEpisodeAired(airDateStr) {

@@ -51,8 +51,8 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 
 | | Finding | Severity | Status | Commit |
 |---|---|---|---|---|
-| **A2** | Ordinary edit zeroes a real like count in D1 then KV | HIGH | ⬜ | |
-| **A6** | Dropped D1 write diverges the dashboard permanently | MED-HIGH | ⬜ | |
+| **A2** | Ordinary edit zeroes a real like count in D1 then KV | HIGH | ✅ | `likes` bound on both INSERTs; KV-first reads |
+| **A6** | Dropped D1 write diverges the dashboard permanently | MED-HIGH | ✅ | `getCreator`/`getCreatorList` read KV first, D1 as fallback |
 
 ### P2 — real defects, no silent data loss
 
@@ -81,6 +81,23 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 | — | Stale comments (§16 F1/F2/F3) | — | ⬜ | |
 
 ---
+
+## Mutation testing, re-run against the fixed code
+
+The audit's headline test-suite finding was that 7 of 12 controlled bugs survived the
+suite. Re-run after the P0/P1 fixes, with two new mutations aimed at the fixes
+themselves:
+
+| Mutation | Before | Now |
+|---|---|---|
+| skip the D1 write in `lists/save` entirely | **survived** | killed (3 fail) |
+| `/api/lists/like` writes `0` to D1 instead of the real count | **survived** | killed (1 fail) |
+| account purge deletes every list row in the database | **survived** | killed (2 fail) |
+| rotation swallows an unrecoverable D1 failure and reports success | — | killed (2 fail) |
+| `purgeCreatorData` always returns `ok: true` | — | killed (3 fail) |
+
+`m6` (KV pagination cursor), `m7` (index-rebuild prefix), `m10` (slug fallback) and
+`m11` (cap off-by-one) are still open; they belong to the P2 batch.
 
 ## Gate for every commit
 
