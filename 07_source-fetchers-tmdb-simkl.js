@@ -57,6 +57,11 @@ async function fetchSimklChart(entry, skip, clientId, chartKey, env = null, ctx 
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "Simkl Chart",
     fetchFn: async () => {
       const src =
@@ -265,6 +270,11 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey, env = null, ctx 
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "Trakt Chart",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -557,6 +567,11 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
     freshTtlSec: 604800, // 7 days
     staleTtlSec: 30 * 86400,
     kvTtlSec: 604800,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "TMDB Collection",
     fetchFn: async () => {
       const src = `https://api.themoviedb.org/3/collection/${encodeURIComponent(collectionId)}?api_key=${encodeURIComponent(apiKey)}`;
@@ -754,6 +769,11 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigi
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "TMDB Chart",
     fetchFn: async () => {
       let chartPath;

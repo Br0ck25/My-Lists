@@ -2746,6 +2746,15 @@ async function fetchWithPerUserCacheAndCircuitBreaker(options) {
   }
 }
 
+// "Empty" for the purposes of refuseEmptyOverwrite below: an array with no
+// items, or a plain object with no keys. A string, number or boolean is never
+// treated as empty -- those are real answers.
+function isEmptyPayload(value) {
+  if (Array.isArray(value)) return value.length === 0;
+  if (value && typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
 async function fetchWithPerUserCacheUncoalesced({
   cacheKey,
   fetchFn,
@@ -2756,6 +2765,7 @@ async function fetchWithPerUserCacheUncoalesced({
   ctx = null,
   kvKey = "",
   kvTtlSec = 86400,
+  refuseEmptyOverwrite = false,
 }) {
   const cached = getPerUserCache(cacheKey);
   if (cached && cached.isFresh) {
@@ -2802,6 +2812,32 @@ async function fetchWithPerUserCacheUncoalesced({
     // withTimeout's own comment.
     const freshData = await withTimeout(fetchFn(), OUTBOUND_TIMEOUT_MS, providerLabel);
     if (freshData !== null && freshData !== undefined) {
+      // A provider that answers 200 with nothing in it must not be allowed to
+      // erase the last good copy -- for the caches where "nothing" cannot be
+      // the truth.
+      //
+      // The gate above is only "not null and not undefined", so an empty array
+      // or object counted as a successful refresh and was written over every
+      // tier: the isolate memo, the KV copy, and the edge copy. That destroys
+      // precisely the last-known-good data the three tiers exist to hold, so a
+      // provider blip stopped being "slightly stale rows" and became "empty
+      // rows", and the fallback below had nothing left to fall back to. It is
+      // not hypothetical: a soft-failed or rate-limited upstream answering
+      // `{}` or `{"results":[]}` is an ordinary incident shape, and
+      // prewarmSharedCatalogs re-runs every six minutes, so one bad window
+      // wrote empties across every shared chart at once.
+      //
+      // Opt-in, because emptiness is only suspicious for caches the PROVIDER
+      // owns. A trending chart is never legitimately empty. A person's Trakt
+      // watchlist absolutely is -- they cleared it -- and refusing that write
+      // would show them items they had just deleted. So the shared chart and
+      // collection call sites pass this and the per-user ones do not.
+      const refusingEmpty = refuseEmptyOverwrite && isEmptyPayload(freshData);
+      const lastGood = (cached && cached.data) || (kvData && kvData.data) || (edgeCacheData && edgeCacheData.data) || null;
+      if (refusingEmpty && lastGood && !isEmptyPayload(lastGood)) {
+        console.warn(`[CircuitBreaker] ${providerLabel} returned an empty result; keeping the last non-empty copy rather than caching the empty one.`);
+        return lastGood;
+      }
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
       
       const cachePayload = JSON.stringify({
@@ -10571,6 +10607,11 @@ async function fetchSimklChart(entry, skip, clientId, chartKey, env = null, ctx 
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "Simkl Chart",
     fetchFn: async () => {
       const src =
@@ -10779,6 +10820,11 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey, env = null, ctx 
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "Trakt Chart",
     fetchFn: async () => {
       const res = await fetchTraktWithRetry(src, {
@@ -11071,6 +11117,11 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
     freshTtlSec: 604800, // 7 days
     staleTtlSec: 30 * 86400,
     kvTtlSec: 604800,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "TMDB Collection",
     fetchFn: async () => {
       const src = `https://api.themoviedb.org/3/collection/${encodeURIComponent(collectionId)}?api_key=${encodeURIComponent(apiKey)}`;
@@ -11268,6 +11319,11 @@ async function fetchTmdbChart(entry, skip, apiKey, chartKey, region, hideNonDigi
     freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
+    // A shared, provider-owned chart is never legitimately empty, so an
+    // empty-but-successful reply is an upstream fault and must not be allowed
+    // to erase the last good copy -- see refuseEmptyOverwrite in
+    // fetchWithPerUserCacheUncoalesced (02_http-and-creator-utils.js).
+    refuseEmptyOverwrite: true,
     providerLabel: "TMDB Chart",
     fetchFn: async () => {
       let chartPath;

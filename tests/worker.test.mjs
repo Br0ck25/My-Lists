@@ -5672,3 +5672,99 @@ describe("test-suite blind spots the audit's mutation testing found", () => {
       ["movies", "movies-2", "movies-3", "movies-4", "movies-5", "movies-6", "movies-7", "movies-8", "movies-9", "movies-10"]);
   });
 });
+
+describe("audit II §11.1: a provider answering 200 with nothing must not erase the last good chart", () => {
+  const goodTraktChart = JSON.stringify([
+    { movie: { title: "Real Movie", year: 2020, ids: { imdb: "tt0000001", trakt: 1, tmdb: 11 } } },
+    { movie: { title: "Second", year: 2021, ids: { imdb: "tt0000002", trakt: 2, tmdb: 12 } } },
+  ]);
+
+  const tick = async (env, body) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const pending = [];
+      await worker.scheduled({ cron: "x" }, env, {
+        waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+      });
+      await Promise.all(pending);
+    } finally { globalThis.fetch = real; }
+  };
+
+  it("keeps the last non-empty copy of a shared chart", async () => {
+    const kv = makeKv();
+    const env = { CONFIGS: kv, TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m" };
+    await tick(env, goodTraktChart);
+    const key = [...kv._store.keys()].find((k) => k.startsWith("cache:trakt:chart:"));
+    assert.ok(key, "precondition: the prewarm cached a Trakt chart");
+    const healthy = String(kv._store.get(key));
+    assert.ok(!/"data":(\[\]|\{\})/.test(healthy), "precondition: the healthy tick cached real items");
+
+    await tick(env, "[]");
+    const after = String(kv._store.get(key));
+    // Before: the write gate was only "not null and not undefined", so an
+    // empty array counted as a successful refresh and was written over the
+    // isolate, KV and edge copies at once -- destroying the last-known-good
+    // data those tiers exist to hold, right when the provider needed it.
+    assert.ok(!/"data":(\[\]|\{\})/.test(after),
+      "an empty-but-successful upstream reply overwrote the good cached chart");
+    assert.equal(after, healthy, "the cached chart should be untouched");
+  });
+
+  it("still accepts an empty result for a cache the user owns", () => {
+    // Emptiness is only suspicious for a cache the PROVIDER owns. Someone who
+    // clears their own Trakt watchlist must not be shown the items they just
+    // deleted, so the per-user fetchers deliberately do not opt in.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "06_source-fetchers-mdblist-trakt.js"), "utf8");
+    assert.ok(!/refuseEmptyOverwrite/.test(src),
+      "the per-user Trakt/MDBList caches must not refuse an empty result");
+    const shared = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const optedIn = (shared.match(/refuseEmptyOverwrite: true/g) || []).length;
+    assert.equal(optedIn, 4,
+      "the four shared chart/collection caches should opt in (Simkl, Trakt, TMDB charts and TMDB collections)");
+  });
+});
+
+describe("N4: a new account starts clean however data got under its username", () => {
+  it("registering a username purges anything already sitting under it", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+
+    // The state a straggler leaves: account-owned keys with no identity to
+    // own them. Reachable when a write that authenticated before a purge
+    // lands after it, and the tombstone has since lapsed -- so the reclaim
+    // path cannot assume the previous delete finished cleanly.
+    kv._store.set("creatorsync:orphaned", JSON.stringify({
+      config: [{ previousOwner: true }], keys: { tmdbKey: "PREVIOUS-OWNERS-KEY" }, updatedAt: 1,
+    }));
+    kv._store.set("creatorsynctracking:orphaned", JSON.stringify({ watchHistory: [{ id: "tt-private" }] }));
+    kv._store.set("creatorsyncpresets:orphaned", JSON.stringify({ presets: { p: { name: "p" } } }));
+    kv._store.set("creatorlist:orphaned:leftover", JSON.stringify({
+      name: "Leftover", slug: "leftover", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+      likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+    kv._store.set("creatorlistorder:orphaned", JSON.stringify({ order: ["leftover"] }));
+    kv._store.set("creatorscrobbletoken:orphaned", "OLD-WEBHOOK-TOKEN");
+    kv._store.set("scrobbletoken:OLD-WEBHOOK-TOKEN", "orphaned");
+
+    const fresh = await createUser(env, "orphaned");
+    const K = { creatorName: "orphaned", creatorKey: fresh.creatorKey };
+
+    const load = await call(env, "/api/creator/sync/load", { method: "POST", json: K });
+    const d = load.body.data || {};
+    assert.deepEqual(d.config || [], [], "a new account must not inherit the previous config");
+    assert.deepEqual(d.keys || {}, {}, "and certainly not the previous owner's provider API keys");
+    assert.deepEqual(d.watchHistory || [], [], "nor their watch history");
+    assert.deepEqual(d.presets || {}, {}, "nor their presets");
+
+    const lists = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(lists.body.lists, [], "nor their lists");
+    assert.ok(!kv._store.has("creatorlist:orphaned:leftover"), "the leftover list record must be gone");
+
+    // A live webhook credential is the sharpest leftover: it authorises writes
+    // for this username without the Creator Key.
+    assert.ok(!kv._store.has("scrobbletoken:OLD-WEBHOOK-TOKEN"),
+      "the previous owner's scrobble token must not still resolve");
+  });
+});
