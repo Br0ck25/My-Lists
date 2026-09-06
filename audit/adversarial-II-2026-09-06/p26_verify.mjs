@@ -46,3 +46,13 @@ const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
 const tryDel = await call(env3, "/admin/api/delete-creator-list", { method: "POST", cookie, json: { username: "user", slug: "anon-list" } });
 console.log("\n4) admin delete of an anonymous published list ->", tryDel.status, JSON.stringify(tryDel.body));
 console.log("   publishedlist key still present:", kv3._store.has("publishedlist:user:anon-list"));
+console.log("   (still true and still correct: delete-creator-list validates the username and");
+console.log("    `user` is reserved, so it can never be pointed at these. That was the finding.)");
+
+// 4b. The route that closes it (R1). Enumerable, then deletable.
+const listed = await call(env3, "/admin/api/published-lists", { cookie });
+console.log("   /admin/api/published-lists ->", listed.status,
+  JSON.stringify((listed.body.lists || []).map(l => l.slug)), "cursor:", listed.body.cursor);
+const realDel = await call(env3, "/admin/api/delete-published-list", { method: "POST", cookie, json: { slug: "anon-list" } });
+console.log("   /admin/api/delete-published-list ->", realDel.status, JSON.stringify(realDel.body));
+console.log("   publishedlist key present after that:", kv3._store.has("publishedlist:user:anon-list"));

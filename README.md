@@ -53,6 +53,7 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 - Real-time telemetry: page views, installs, and live API usage counters for TMDB, Trakt, MDBList, and Simkl.
 - Catalog leaderboards and community feedback/issue tracking inbox (open/in-progress/closed).
 - Streaming provider lookup and Netflix catalog preview inspector.
+- Moderation tools: rebuild the public list index, delete a creator's lists, and browse/delete lists published anonymously (those have no owner to ask, so the dashboard is the only way to remove one).
 
 ### Progressive Web App (PWA)
 - Installable PWA with offline caching (`/sw.js`), modern web app manifest (`/app.webmanifest`), dark mode UI, clipboard shortcuts, and QR code sharing.
@@ -298,7 +299,7 @@ node --test tests/*.test.mjs
 | `/api/trakt/device/token` | `POST` | Poll Trakt device token status |
 | `/api/creator/*` | `POST` | Creator Profile authentication, list management, and cloud sync |
 | `/admin` | `GET` | Admin analytics dashboard UI |
-| `/admin/api/*` | `GET/POST` | Admin analytics, API usage counters, leaderboard & feedback API |
+| `/admin/api/*` | `GET/POST` | Admin analytics, API usage counters, leaderboard, feedback, and moderation API (list index rebuild, creator-list and anonymous-list deletion) |
 | `/sw.js` | `GET` | Service worker for offline PWA support |
 | `/app.webmanifest` | `GET` | Web App Manifest for mobile/desktop PWA installation |
 

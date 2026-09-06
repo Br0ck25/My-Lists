@@ -1750,6 +1750,30 @@ function isPublicCorsPath(path) {
   return false;
 }
 
+// Paths whose responses are per-account or admin-only, and must never be
+// stored by a browser or by anything between it and this Worker.
+//
+// json() defaults to a cacheable max-age for a successful response, which is
+// right for the catalog and directory endpoints this add-on leans on to stay
+// inside upstream rate limits, and wrong for everything under these two
+// prefixes. Individual routes were given jsonPrivate() for N10, but that is
+// opt-in: the four sync/save* routes and lists/delete were still answering
+// 200 with max-age=3600, and a route added tomorrow starts out wrong too.
+//
+// Nothing is leaking today -- those are POSTs, and browsers do not store a
+// POST response -- but that is protection by accident of HTTP method rather
+// than by design, and it stops being true the day one of them gains a GET
+// form.
+//
+// Enforced at the single point every response funnels back through rather
+// than at each of the ~25 call sites, for the same reason securityHeaders is:
+// a route added later cannot forget to opt in. The header is SET, not
+// defaulted, so a route cannot accidentally opt out either.
+function isPrivateApiPath(path) {
+  const p = String(path || "");
+  return p.startsWith("/api/creator/") || p === "/admin" || p.startsWith("/admin/");
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -1805,12 +1829,14 @@ function securityHeaders() {
 // like Content-Type/Cache-Control/CORS) -- see securityHeaders' own
 // comment for why this is applied here, once, rather than at each call
 // site.
-function withSecurityHeaders(response) {
+function withSecurityHeaders(response, privatePath = false) {
   const headers = new Headers(response.headers);
   const extra = securityHeaders();
   for (const key in extra) {
     if (!headers.has(key)) headers.set(key, extra[key]);
   }
+  // Deliberately set rather than defaulted -- see isPrivateApiPath.
+  if (privatePath) headers.set("Cache-Control", "no-store");
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -3440,6 +3466,59 @@ async function deleteCreatorLists(env, username, slugs) {
   return out;
 }
 
+// The same thing for an ANONYMOUS published list -- the ones /api/publish-list
+// mints under the literal `user` namespace.
+//
+// These had no delete path at all. Not "no convenient one": no route in this
+// Worker could remove a `publishedlist:user:{slug}` key once written, and the
+// admin creator-list endpoint could not reach them either, because it runs the
+// username through validateCreatorUsername and `user` is a reserved name. So a
+// list published anonymously -- by anyone, unauthenticated -- was permanent,
+// and an operator faced with abusive or infringing content had nothing to
+// reach for but the Cloudflare KV dashboard. Both prior audits recorded the
+// gap; this closes it.
+//
+// Kept separate from deleteCreatorLists rather than parameterised, because the
+// two differ in more than the prefix: an anonymous list has no owner, so there
+// is no display order to update and no D1 row to drop (they live only in KV).
+// What they share -- the like ledger, the directory entry, and reporting a
+// failure rather than swallowing it -- is shared here explicitly.
+async function deletePublishedLists(env, slugs) {
+  const out = { deleted: [], missing: [], ok: true };
+  if (!env || !env.CONFIGS || !slugs || !slugs.length) return out;
+
+  for (const slug of slugs) {
+    const key = `publishedlist:user:${slug}`;
+    let existed = false;
+    try {
+      existed = !!(await env.CONFIGS.get(key));
+    } catch {
+      existed = false;
+    }
+    try {
+      await env.CONFIGS.delete(key);
+    } catch (e) {
+      console.error("deletePublishedLists: could not delete", key, e);
+      out.ok = false;
+    }
+    // Keyed by the same {user}:{slug} scope /api/lists/like uses, which for an
+    // anonymous list is the literal "user".
+    try {
+      await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
+    } catch (e) {
+      // A stranded ledger is untidy, not harmful on its own.
+    }
+    (existed ? out.deleted : out.missing).push(slug);
+  }
+
+  // Anonymous lists are indexed as `a:{slug}`, not `c:{user}:{slug}`.
+  if (!(await removeListsFromPublicIndex(env, slugs.map((slug) => `a:${slug}`)))) {
+    out.ok = false;
+  }
+
+  return out;
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -4224,14 +4303,44 @@ function creatorTombstoneKey(username) {
 // Fails OPEN on a read error, deliberately. This gates ordinary sign-in, and a
 // KV blip must not lock every creator out of their own account; the sweep and
 // the reclaim check are the load-bearing parts, not this.
+//
+// The KV copy alone leaves one window open. KV reads are edge-cached, so a
+// colo that has seen neither this key nor the `creator:{u}` delete answers
+// both from its own cached copy -- and a deleted account keeps authenticating
+// until that window passes. D1 has no such window, so when it is bound it is
+// consulted too. The KV check stays first and is usually the only one that
+// runs: it is the cheaper read, and it is the whole answer for the many
+// deployments with no D1 at all.
+//
+// Note this cannot be inferred from `creators` instead. A missing row there
+// means "not migrated into D1 yet", which is the lazy-migration state every
+// accessor here tolerates -- deleted and not-yet-migrated are the same shape.
+// Hence a table whose rows mean one thing only. See migrations/0004.
 async function isCreatorTombstoned(env, username) {
-  if (!env || !env.CONFIGS || !username) return false;
-  try {
-    return !!(await env.CONFIGS.get(creatorTombstoneKey(username)));
-  } catch (e) {
-    console.error("could not read the deletion tombstone for", username, e);
-    return false;
+  if (!env || !username) return false;
+  if (env.CONFIGS) {
+    try {
+      if (await env.CONFIGS.get(creatorTombstoneKey(username))) return true;
+    } catch (e) {
+      console.error("could not read the deletion tombstone for", username, e);
+    }
   }
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT until FROM creator_tombstones WHERE username = ?"
+      ).bind(username).all();
+      if (results && results.length) {
+        // Expired rows are inert rather than a permanent block on
+        // re-registering the name, so an old one does not accumulate meaning.
+        return Number(results[0].until) > Date.now();
+      }
+    } catch (e) {
+      // Table missing (migration 0004 not applied) or D1 unavailable. The KV
+      // copy above is the fallback, exactly as it is for every other counter.
+    }
+  }
+  return false;
 }
 
 // --- Account data purge (shared by reset and delete) -------------------------
@@ -4281,6 +4390,19 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.put(creatorTombstoneKey(u), "1", { expirationTtl: CREATOR_TOMBSTONE_TTL_SEC });
     } catch (e) {
       console.error("purgeCreatorData: could not write the deletion tombstone", e);
+    }
+    // And in D1 when it is bound, which is the copy without a propagation
+    // window -- see isCreatorTombstoned. Best-effort like the KV one: a
+    // deployment with no D1, or an unapplied migration 0004, keeps exactly the
+    // KV behaviour.
+    if (env.DB) {
+      try {
+        await env.DB.prepare(
+          "INSERT INTO creator_tombstones (username, until) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET until = excluded.until"
+        ).bind(u, Date.now() + CREATOR_TOMBSTONE_TTL_SEC * 1000).run();
+      } catch (dbErr) {
+        console.error("purgeCreatorData: could not write the D1 deletion tombstone:", dbErr);
+      }
     }
   }
 
@@ -4522,6 +4644,13 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.delete(creatorTombstoneKey(u));
     } catch (e) {
       console.error("purgeCreatorData: could not clear the tombstone after a failed delete", e);
+    }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creator_tombstones WHERE username = ?").bind(u).run();
+      } catch (dbErr) {
+        console.error("purgeCreatorData: could not clear the D1 tombstone after a failed delete:", dbErr);
+      }
     }
   }
 
@@ -6804,6 +6933,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
       <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Anonymously published lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Lists published without a Creator Profile, under the shared <code>user</code> namespace. Anyone can create one and no owner exists to ask, so this is the only way to remove one. Browse to find a list, or type slugs directly if you already know them.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseAnonBtn" onclick="loadPublishedLists(true)">Browse</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseAnonMoreBtn" onclick="loadPublishedLists(false)" hidden>Load more</button>
+        <span id="anonListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="anonListResults" style="margin-bottom:8px;"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteAnonSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:320px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
+      <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
   </div>
 
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
@@ -7228,6 +7374,141 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
           ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
           (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Anonymous published lists (publishedlist:user:*). These have no owner,
+    // so runDeleteCreatorLists above cannot reach them -- it requires a
+    // creator username, and "user" is a reserved one. The keyspace is
+    // unbounded by construction, so this pages rather than scanning: the
+    // cursor is kept here between calls and "Load more" continues it.
+    let anonListCursor = null;
+    let anonListCount = 0;
+
+    async function loadPublishedLists(reset) {
+      const btn = document.getElementById('browseAnonBtn');
+      const moreBtn = document.getElementById('browseAnonMoreBtn');
+      const status = document.getElementById('anonListStatus');
+      const results = document.getElementById('anonListResults');
+      if (reset) {
+        anonListCursor = null;
+        anonListCount = 0;
+        results.innerHTML = '';
+        moreBtn.hidden = true;
+      }
+      btn.disabled = true;
+      moreBtn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const qs = '?limit=50' + (anonListCursor ? '&cursor=' + encodeURIComponent(anonListCursor) : '');
+        const res = await fetch('/admin/api/published-lists' + qs);
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          moreBtn.disabled = false;
+          return;
+        }
+        const lists = data.lists || [];
+        anonListCount += lists.length;
+        if (!anonListCount) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No anonymously published lists.</p>';
+        } else {
+          const rows = lists.map(function (L) {
+            const vis = L.visibility ? escapeHtmlAdmin(L.visibility) : 'unreadable';
+            return '<tr>' +
+              '<td style="padding:4px 8px 4px 0;"><button type="button" class="admin-select" data-anon-slug="' +
+                escapeHtmlAdmin(L.slug) + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem;">Select</button></td>' +
+              '<td style="padding:4px 8px 4px 0;"><code>' + escapeHtmlAdmin(L.slug) + '</code></td>' +
+              '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(L.name) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.itemCount) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.likes) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0;">' + vis + '</td>' +
+              '<td style="padding:4px 0;"><a href="' + escapeHtmlAdmin(L.url) + '" target="_blank" rel="noopener">open</a></td>' +
+              '</tr>';
+          }).join('');
+          if (reset || !results.querySelector('tbody')) {
+            results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+              '<thead><tr style="color:#8E8E93; text-align:left;">' +
+              '<th></th><th style="padding-right:8px;">Slug</th><th style="padding-right:8px;">Name</th>' +
+              '<th style="padding-right:8px; text-align:right;">Items</th>' +
+              '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+              '<th style="padding-right:8px;">Visibility</th><th></th>' +
+              '</tr></thead><tbody>' + rows + '</tbody></table>';
+          } else {
+            results.querySelector('tbody').insertAdjacentHTML('beforeend', rows);
+          }
+        }
+        anonListCursor = data.cursor || null;
+        moreBtn.hidden = !anonListCursor;
+        status.textContent = anonListCount + ' list' + (anonListCount === 1 ? '' : 's') + ' shown' +
+          (anonListCursor ? ', more available.' : '. That is all of them.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+      moreBtn.disabled = false;
+    }
+
+    // "Select" fills the slug box rather than deleting directly: a one-click
+    // delete next to a browse list is how the wrong list gets removed.
+    document.getElementById('anonListResults').addEventListener('click', function (ev) {
+      const btn = ev.target.closest('[data-anon-slug]');
+      if (!btn) return;
+      const input = document.getElementById('deleteAnonSlugsInput');
+      const slug = btn.getAttribute('data-anon-slug');
+      const current = (input.value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (current.indexOf(slug) === -1) current.push(slug);
+      input.value = current.join(', ');
+      document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
+    });
+
+    // Same shape as runDeleteCreatorLists: irreversible, so it names what it
+    // is about to remove, and batches to ADMIN_LIST_DELETE_MAX per call.
+    async function runDeletePublishedLists() {
+      const btn = document.getElementById('deleteAnonBtn');
+      const status = document.getElementById('deleteAnonStatus');
+      const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
+      const slugs = raw.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
+        (slugs.length === 1 ? '' : 's') + '?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\n\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-published-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', ' + missing +
+          ' slug' + (missing === 1 ? '' : 's') + ' had no list to remove.';
+        document.getElementById('deleteAnonSlugsInput').value = '';
+        if (anonListCount) await loadPublishedLists(true);
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -55629,6 +55910,17 @@ self.addEventListener('fetch', e => {
       await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
       if (env.DB) {
         try {
+          // Any deletion tombstone for this name is spent -- the check above
+          // already established it had lapsed, and the name now has an owner
+          // again. Dropped rather than left to sit expired, so the table does
+          // not accumulate a row per name ever deleted and so the state stays
+          // unambiguous: a row means deleted, full stop.
+          await env.DB.prepare("DELETE FROM creator_tombstones WHERE username = ?").bind(v.normalized).run();
+        } catch (dbErr) {
+          // An expired row is inert anyway (isCreatorTombstoned compares
+          // `until`), so failing to tidy it changes nothing.
+        }
+        try {
           await env.DB.prepare(
             "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?)"
           ).bind(v.normalized, displayName, keyHash, recoveryAnswerHash, nowMs).run();
@@ -56195,18 +56487,63 @@ self.addEventListener('fetch', e => {
       }
 
       const now = Date.now();
+      // The same conflict guard the four sync blobs got, on the one wholesale
+      // write that was left out of it.
+      //
+      // A list record is replaced entirely by this handler, so two devices
+      // editing the same list is last-write-wins with both answering 200 --
+      // the exact shape /api/creator/sync/save was given expectedUpdatedAt
+      // for. Whichever save lands second silently discards the other's edits,
+      // with no error anywhere.
+      //
+      // Additive, exactly as it is there: a client that sends no
+      // expectedUpdatedAt keeps the previous behaviour, so an older browser is
+      // not broken by this. Parsed here rather than inside the branch below so
+      // that a malformed value is rejected whether or not the record already
+      // exists -- present-but-unusable is a client bug, and silently dropping
+      // the only protection against overwriting someone's work is the worst
+      // available response to it (see parseExpectedUpdatedAt).
+      const listExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
+      if (!listExpected.ok) {
+        return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
+      }
+
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
       let likes = 0;
+      let storedUpdatedAt = 0;
+      let existingReadable = false;
       if (existingRaw) {
         try {
           const existing = JSON.parse(existingRaw);
           createdAt = existing.createdAt || now;
           likes = existing.likes || 0;
+          storedUpdatedAt = Number(existing.updatedAt) || 0;
+          existingReadable = true;
         } catch {
+          // Unreadable stored record -- nothing coherent to protect against,
+          // so the guard below is skipped and this save writes normally.
           createdAt = now;
         }
       }
+      if (existingReadable && listExpected.value !== null && storedUpdatedAt > listExpected.value) {
+        ctx.waitUntil(bumpStat(env, "sync_conflict"));
+        return json({
+          ok: false,
+          error: "conflict",
+          conflict: true,
+          slug,
+          updatedAt: storedUpdatedAt,
+        }, 409);
+      }
+      // Strictly newer than what is stored, not merely Date.now().
+      //
+      // Date.now() is frozen for the duration of a Workers request, so two
+      // saves genuinely can carry the same millisecond -- and with a bare
+      // timestamp as the version, `stored > expected` then cannot tell a stale
+      // write from a current one and the stale one wins. Same reasoning, and
+      // the same helper, as the sync blobs: see nextSyncVersion.
+      const updatedAt = nextSyncVersion(storedUpdatedAt);
       if (env.DB) {
         try {
           const listId = `${auth.username}:${slug}`;
@@ -56226,7 +56563,7 @@ self.addEventListener('fetch', e => {
           // and may well have moved it since this request read the record.
           await env.DB.prepare(
             "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-          ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
+          ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, updatedAt).run();
         } catch (dbErr) {
           // The commonest cause is the foreign key: D1 enforces
           // creator_lists.username -> creators.username, and an account that
@@ -56244,7 +56581,7 @@ self.addEventListener('fetch', e => {
             try {
               await env.DB.prepare(
                 "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
-              ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
+              ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, updatedAt).run();
             } catch (retryErr) {
               console.error("D1 write error (creatorlist put, after creator backfill):", retryErr);
             }
@@ -56259,10 +56596,49 @@ self.addEventListener('fetch', e => {
       // (/lists/:user/:slug, the directory, search) all read KV.
       await env.CONFIGS.put(
         `creatorlist:${auth.username}:${slug}`,
-        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt: now })
+        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt })
       );
       if (!order.includes(slug)) {
-        order.push(slug);
+        // Re-read and MERGE rather than writing back the array this handler
+        // read at the top.
+        //
+        // `creatorlistorder:{u}` is one key, rewritten read-modify-write by
+        // every save, and KV has no compare-and-swap -- so concurrent saves
+        // each write back a snapshot taken before the others landed, and every
+        // entry added in between is dropped. Measured with the reads forced to
+        // interleave: twelve concurrent creations produced twelve records and
+        // nine order entries. The records were never at risk (each is its own
+        // key), so what is lost is the user's ordering, silently.
+        //
+        // Everything between reading `order` and here is real work -- a size
+        // check, a slug allocation that hits KV, a D1 upsert, the record write
+        // -- so the window is wide. Re-reading immediately before the write
+        // and unioning shrinks it to the gap between these two lines, and
+        // unioning rather than replacing means a concurrent writer's entry
+        // survives even when it does land inside that gap.
+        //
+        // Not a full fix: two writers can still interleave between the get and
+        // the put. Only moving ordering off a single key removes that, which
+        // is a data-model change. This turns a routine loss into a rare one.
+        try {
+          const freshRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+          const fresh = freshRaw ? (JSON.parse(freshRaw).order || []) : [];
+          if (Array.isArray(fresh) && fresh.length) {
+            // Preserve the stored order and append anything only this request
+            // knows about, so a concurrent writer's positions are not
+            // reshuffled by ours.
+            const merged = [...fresh];
+            for (const s of order) if (!merged.includes(s)) merged.push(s);
+            order = merged;
+            if (!order.includes(slug)) order.push(slug);
+          } else {
+            order.push(slug);
+          }
+        } catch {
+          // Unreadable right now -- fall back to the snapshot this handler
+          // already has rather than dropping the entry entirely.
+          if (!order.includes(slug)) order.push(slug);
+        }
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
 
@@ -56287,7 +56663,7 @@ self.addEventListener('fetch', e => {
         type: type || "mixed",
         itemCount: Array.isArray(items) ? items.length : 0,
         likes: likes || 0,
-        updatedAt: now,
+        updatedAt,
       } : null;
       if (indexEntry) {
         ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, indexEntry));
@@ -56305,7 +56681,9 @@ self.addEventListener('fetch', e => {
           }, 500);
         }
       }
-      return json({ ok: true, slug, url: `${url.origin}/lists/${auth.username}/${slug}` });
+      // updatedAt comes back so the client can advance its own baseline
+      // without a separate read, exactly as /api/creator/sync/save does.
+      return json({ ok: true, slug, updatedAt, url: `${url.origin}/lists/${auth.username}/${slug}` });
     }
 
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
@@ -58514,6 +58892,108 @@ self.addEventListener('fetch', e => {
       }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /admin/api/published-lists  (GET)  ?limit=&cursor=
+    //   -> { ok, lists: [{ slug, name, type, itemCount, likes, visibility,
+    //                      publishedAt, url }], cursor, done }
+    //
+    // The listing half of being able to moderate anonymous lists at all.
+    // /api/publish-list is unauthenticated and writes under the literal `user`
+    // namespace, so these have no owner to ask and appear in the admin panel's
+    // Community Lists only if they are public. Finding one to remove meant
+    // knowing its slug already; this makes them enumerable.
+    //
+    // Cursor-paged rather than a full scan: the keyspace is unbounded by
+    // construction (anyone can add to it), which is exactly why an operator
+    // needs to be able to walk it.
+    if (path === "/admin/api/published-lists" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+      const cursor = url.searchParams.get("cursor") || "";
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix: "publishedlist:user:", limit, ...(cursor ? { cursor } : {}) });
+      } catch (e) {
+        return json({ ok: false, error: "Could not read the published lists right now." }, 500, { "Cache-Control": "no-store" });
+      }
+      const lists = await Promise.all((listed.keys || []).map(async (k) => {
+        const slug = k.name.slice("publishedlist:user:".length);
+        let data = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          data = raw ? JSON.parse(raw) : null;
+        } catch {
+          data = null;
+        }
+        return {
+          slug,
+          // A record that will not parse is still reportable, and is the kind
+          // an admin most wants to be able to delete.
+          name: data ? (data.name || "(untitled)") : "(unreadable record)",
+          type: data ? (data.type || "mixed") : null,
+          itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
+          likes: data ? (data.likes || 0) : 0,
+          visibility: data ? effectiveListVisibility(data.visibility) : null,
+          publishedAt: data ? (data.publishedAt || null) : null,
+          url: `${url.origin}/lists/user/${slug}`,
+        };
+      }));
+      return json({
+        ok: true,
+        count: lists.length,
+        lists,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/delete-published-list  (POST)  { slug | slugs: [...] }
+    //
+    // The delete that did not exist. See deletePublishedLists
+    // (02_http-and-creator-utils.js) for why the creator-list endpoint could
+    // not be pointed at these: it validates the username, and `user` is
+    // reserved precisely so no creator can own that namespace.
+    if (path === "/admin/api/delete-published-list" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawSlugs = Array.isArray(body.slugs) ? body.slugs : (body.slug ? [body.slug] : []);
+      // Through slugifyServer, same as every other path that turns caller
+      // input into a KV key name -- these arrive from an admin rather than
+      // the public, but the rule is the rule.
+      const slugs = [...new Set(
+        rawSlugs.map((x) => slugifyServer(x)).filter(Boolean)
+      )];
+      if (!slugs.length) return json({ ok: false, error: "No slugs given." }, 400);
+      if (slugs.length > ADMIN_LIST_DELETE_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (limit ${ADMIN_LIST_DELETE_MAX}). Send them in batches.`,
+        }, 413);
+      }
+      const result = await deletePublishedLists(env, slugs);
+      if (!result.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting those lists. Some may still be visible -- please try again in a moment.",
+          deleted: result.deleted,
+          missing: result.missing,
+        }, 500, { "Cache-Control": "no-store" });
+      }
+      return json({
+        ok: true,
+        deleted: result.deleted,
+        missing: result.missing,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/admin/api/migrate-day-counts" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
@@ -59238,7 +59718,16 @@ export default {
       // and long opaque tokens from what goes back.
       response = json({ ok: false, error: safeErrorMessage(err) }, 500);
     }
-    return withSecurityHeaders(response);
+    // Parsed here rather than threaded down from handleFetch, so the answer
+    // is the same whether the response came from a route or from the catch
+    // above. Guarded because nothing in this boundary may itself throw.
+    let privatePath = false;
+    try {
+      privatePath = isPrivateApiPath(new URL(request.url).pathname);
+    } catch {
+      // An unparseable URL cannot have reached a private route anyway.
+    }
+    return withSecurityHeaders(response, privatePath);
   },
 
   // Runs on whatever schedule this Worker's owner configured under

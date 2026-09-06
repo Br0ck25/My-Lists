@@ -90,8 +90,30 @@ const R=[];const rec=(n,ok,d)=>{R.push({n,ok});console.log(ok?"PASS":"FAIL","-",
   const d1After=db._lists.get("splith1:l").likes;
   rec("a rename after D1 like-outage does not destroy the count",
       kvAfter===3, `kvBefore=${kvLikes} d1Before=${d1Likes} kvAfter=${kvAfter} d1After=${d1After}`);
-  rec("D1 mirror converges on the true like count after an outage",
-      d1After===3, `d1After=${d1After} (kv=${kvAfter})`);
+
+  // What the divergence actually costs, measured rather than assumed: every
+  // surface a person can see reads the true count, because KV is
+  // authoritative for likes and the read paths prefer it.
+  const dash=await call(env,"/api/creator/lists",{method:"POST",json:{creatorName:"splith1",creatorKey:u.creatorKey}});
+  const dir=await call(env,"/lists/public.json");
+  const dirEntry=(dir.body.entries||dir.body.lists||[]).find(e=>(e.slug||"")==="l");
+  rec("the stale D1 count is not visible on any read path",
+      (dash.body.lists||[]).every(l=>l.likes===3) && (!dirEntry || dirEntry.likes===3),
+      `dashboard=${JSON.stringify((dash.body.lists||[]).map(l=>l.likes))} directory=${dirEntry?dirEntry.likes:"(absent)"} d1=${d1After}`);
+
+  // A rename deliberately does NOT push likes into D1: /api/lists/like owns
+  // that column and may have moved it since this handler read the record, so
+  // lists/save binds `likes` on INSERT and leaves it out of the DO UPDATE.
+  // The repair is the documented one -- migrate-d1, which pushes KV over D1
+  // for every column it can derive. That is what N9 restored, and this is the
+  // assertion that says so. (The earlier version of this probe asserted the
+  // rename should converge, which is asserting the wrong mechanism.)
+  const login=await call(env,"/admin/login",{method:"POST",form:{key:env.ADMIN_KEY}});
+  const cookie=((login.headers.get("set-cookie")||"").match(/^([^=]+=[^;]+)/)||[])[1]||"";
+  for(let i=0;i<10;i++){ const r=await call(env,"/admin/api/migrate-d1",{method:"POST",cookie}); if(r.body.done) break; }
+  const d1Repaired=db._lists.get("splith1:l").likes;
+  rec("migrate-d1 converges the D1 mirror on the true like count",
+      d1Repaired===3, `before=${d1After} afterMigrate=${d1Repaired} (kv=${kvAfter})`);
 }
 
 console.log("\n"+R.filter(r=>!r.ok).length+" FAILURES of "+R.length);

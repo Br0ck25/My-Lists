@@ -26,6 +26,30 @@ function isPublicCorsPath(path) {
   return false;
 }
 
+// Paths whose responses are per-account or admin-only, and must never be
+// stored by a browser or by anything between it and this Worker.
+//
+// json() defaults to a cacheable max-age for a successful response, which is
+// right for the catalog and directory endpoints this add-on leans on to stay
+// inside upstream rate limits, and wrong for everything under these two
+// prefixes. Individual routes were given jsonPrivate() for N10, but that is
+// opt-in: the four sync/save* routes and lists/delete were still answering
+// 200 with max-age=3600, and a route added tomorrow starts out wrong too.
+//
+// Nothing is leaking today -- those are POSTs, and browsers do not store a
+// POST response -- but that is protection by accident of HTTP method rather
+// than by design, and it stops being true the day one of them gains a GET
+// form.
+//
+// Enforced at the single point every response funnels back through rather
+// than at each of the ~25 call sites, for the same reason securityHeaders is:
+// a route added later cannot forget to opt in. The header is SET, not
+// defaulted, so a route cannot accidentally opt out either.
+function isPrivateApiPath(path) {
+  const p = String(path || "");
+  return p.startsWith("/api/creator/") || p === "/admin" || p.startsWith("/admin/");
+}
+
 // --- security headers ----------------------------------------------------
 //
 // Applied once, globally, at the very edge of the fetch handler (see the
@@ -81,12 +105,14 @@ function securityHeaders() {
 // like Content-Type/Cache-Control/CORS) -- see securityHeaders' own
 // comment for why this is applied here, once, rather than at each call
 // site.
-function withSecurityHeaders(response) {
+function withSecurityHeaders(response, privatePath = false) {
   const headers = new Headers(response.headers);
   const extra = securityHeaders();
   for (const key in extra) {
     if (!headers.has(key)) headers.set(key, extra[key]);
   }
+  // Deliberately set rather than defaulted -- see isPrivateApiPath.
+  if (privatePath) headers.set("Cache-Control", "no-store");
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -1716,6 +1742,59 @@ async function deleteCreatorLists(env, username, slugs) {
   return out;
 }
 
+// The same thing for an ANONYMOUS published list -- the ones /api/publish-list
+// mints under the literal `user` namespace.
+//
+// These had no delete path at all. Not "no convenient one": no route in this
+// Worker could remove a `publishedlist:user:{slug}` key once written, and the
+// admin creator-list endpoint could not reach them either, because it runs the
+// username through validateCreatorUsername and `user` is a reserved name. So a
+// list published anonymously -- by anyone, unauthenticated -- was permanent,
+// and an operator faced with abusive or infringing content had nothing to
+// reach for but the Cloudflare KV dashboard. Both prior audits recorded the
+// gap; this closes it.
+//
+// Kept separate from deleteCreatorLists rather than parameterised, because the
+// two differ in more than the prefix: an anonymous list has no owner, so there
+// is no display order to update and no D1 row to drop (they live only in KV).
+// What they share -- the like ledger, the directory entry, and reporting a
+// failure rather than swallowing it -- is shared here explicitly.
+async function deletePublishedLists(env, slugs) {
+  const out = { deleted: [], missing: [], ok: true };
+  if (!env || !env.CONFIGS || !slugs || !slugs.length) return out;
+
+  for (const slug of slugs) {
+    const key = `publishedlist:user:${slug}`;
+    let existed = false;
+    try {
+      existed = !!(await env.CONFIGS.get(key));
+    } catch {
+      existed = false;
+    }
+    try {
+      await env.CONFIGS.delete(key);
+    } catch (e) {
+      console.error("deletePublishedLists: could not delete", key, e);
+      out.ok = false;
+    }
+    // Keyed by the same {user}:{slug} scope /api/lists/like uses, which for an
+    // anonymous list is the literal "user".
+    try {
+      await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
+    } catch (e) {
+      // A stranded ledger is untidy, not harmful on its own.
+    }
+    (existed ? out.deleted : out.missing).push(slug);
+  }
+
+  // Anonymous lists are indexed as `a:{slug}`, not `c:{user}:{slug}`.
+  if (!(await removeListsFromPublicIndex(env, slugs.map((slug) => `a:${slug}`)))) {
+    out.ok = false;
+  }
+
+  return out;
+}
+
 // --- Slug allocation ---------------------------------------------------------
 //
 // Picks a slug nothing has claimed yet, given an async predicate that says
@@ -2500,14 +2579,44 @@ function creatorTombstoneKey(username) {
 // Fails OPEN on a read error, deliberately. This gates ordinary sign-in, and a
 // KV blip must not lock every creator out of their own account; the sweep and
 // the reclaim check are the load-bearing parts, not this.
+//
+// The KV copy alone leaves one window open. KV reads are edge-cached, so a
+// colo that has seen neither this key nor the `creator:{u}` delete answers
+// both from its own cached copy -- and a deleted account keeps authenticating
+// until that window passes. D1 has no such window, so when it is bound it is
+// consulted too. The KV check stays first and is usually the only one that
+// runs: it is the cheaper read, and it is the whole answer for the many
+// deployments with no D1 at all.
+//
+// Note this cannot be inferred from `creators` instead. A missing row there
+// means "not migrated into D1 yet", which is the lazy-migration state every
+// accessor here tolerates -- deleted and not-yet-migrated are the same shape.
+// Hence a table whose rows mean one thing only. See migrations/0004.
 async function isCreatorTombstoned(env, username) {
-  if (!env || !env.CONFIGS || !username) return false;
-  try {
-    return !!(await env.CONFIGS.get(creatorTombstoneKey(username)));
-  } catch (e) {
-    console.error("could not read the deletion tombstone for", username, e);
-    return false;
+  if (!env || !username) return false;
+  if (env.CONFIGS) {
+    try {
+      if (await env.CONFIGS.get(creatorTombstoneKey(username))) return true;
+    } catch (e) {
+      console.error("could not read the deletion tombstone for", username, e);
+    }
   }
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT until FROM creator_tombstones WHERE username = ?"
+      ).bind(username).all();
+      if (results && results.length) {
+        // Expired rows are inert rather than a permanent block on
+        // re-registering the name, so an old one does not accumulate meaning.
+        return Number(results[0].until) > Date.now();
+      }
+    } catch (e) {
+      // Table missing (migration 0004 not applied) or D1 unavailable. The KV
+      // copy above is the fallback, exactly as it is for every other counter.
+    }
+  }
+  return false;
 }
 
 // --- Account data purge (shared by reset and delete) -------------------------
@@ -2557,6 +2666,19 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.put(creatorTombstoneKey(u), "1", { expirationTtl: CREATOR_TOMBSTONE_TTL_SEC });
     } catch (e) {
       console.error("purgeCreatorData: could not write the deletion tombstone", e);
+    }
+    // And in D1 when it is bound, which is the copy without a propagation
+    // window -- see isCreatorTombstoned. Best-effort like the KV one: a
+    // deployment with no D1, or an unapplied migration 0004, keeps exactly the
+    // KV behaviour.
+    if (env.DB) {
+      try {
+        await env.DB.prepare(
+          "INSERT INTO creator_tombstones (username, until) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET until = excluded.until"
+        ).bind(u, Date.now() + CREATOR_TOMBSTONE_TTL_SEC * 1000).run();
+      } catch (dbErr) {
+        console.error("purgeCreatorData: could not write the D1 deletion tombstone:", dbErr);
+      }
     }
   }
 
@@ -2798,6 +2920,13 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.delete(creatorTombstoneKey(u));
     } catch (e) {
       console.error("purgeCreatorData: could not clear the tombstone after a failed delete", e);
+    }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM creator_tombstones WHERE username = ?").bind(u).run();
+      } catch (dbErr) {
+        console.error("purgeCreatorData: could not clear the D1 tombstone after a failed delete:", dbErr);
+      }
     }
   }
 

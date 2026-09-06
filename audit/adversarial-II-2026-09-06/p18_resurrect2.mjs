@@ -1,7 +1,7 @@
 // N4, every authenticated write path. The question is not "did a stray key
 // survive" -- a straggler held open indefinitely will always land somewhere --
 // but "can the next owner of this username see any of it".
-import { makeKv, makeD1, makeEnv, call, createUser } from "../../tests/harness.mjs";
+import { makeKv, makeD1, makeEnv, call, createUser, lapseCreatorTombstone } from "../../tests/harness.mjs";
 
 const paths = [
   ["/api/creator/sync/save", b => ({ ...b, config: [{ x: 1 }], keys: { tmdbKey: "VICTIM-TMDB-KEY" } }), "creatorsync:"],
@@ -32,7 +32,7 @@ for (const [route, mk, prefix] of paths) {
   const reclaimBlocked = (await call(env, "/api/creator/create", { method: "POST", json: { creatorName: name } })).body.ok !== true;
 
   // Now let the hold lapse and see what a new owner actually gets.
-  kv._store.delete(`creatordeleted:${name}`);
+  lapseCreatorTombstone(env, name);
   const fresh = await call(env, "/api/creator/create", { method: "POST", json: { creatorName: name } });
   const NK = { creatorName: name, creatorKey: fresh.body.creatorKey };
   const load = await call(env, "/api/creator/sync/load", { method: "POST", json: NK });

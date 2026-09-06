@@ -4,7 +4,7 @@ import vm from "node:vm";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { call, createUser, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
+import { call, createUser, freshIsolate, lapseCreatorTombstone, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
 
 async function adminCookie(env) {
   const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
@@ -1384,7 +1384,7 @@ describe("account lifecycle", () => {
 
     // Once the tombstone lapses the name is free again, and the new account
     // inherits nothing.
-    env.CONFIGS._store.delete("creatordeleted:alicedel");
+    lapseCreatorTombstone(env, "alicedel");
     const again = await createUser(env, "alicedel");
     assert.equal(again.ok, true);
     assert.notEqual(again.creatorKey, alice.creatorKey);
@@ -3600,7 +3600,7 @@ describe("audit fix 12: deleting an account leaves nothing behind", () => {
 
     // Someone else claims the username once the deletion tombstone lapses,
     // and happens to pick the same slug.
-    env.CONFIGS._store.delete("creatordeleted:recycled");
+    lapseCreatorTombstone(env, "recycled");
     const bob = await createUser(env, "recycled");
     await call(env, "/api/creator/lists/save", { method: "POST", json: {
       creatorName: bob.creatorName, creatorKey: bob.creatorKey,
@@ -4413,7 +4413,7 @@ describe("A3/A4: a purge that failed must not report success", () => {
     );
     assert.ok(env.CONFIGS._store.has("creatordeleted:delme4c"), "the username is held while stragglers finish");
 
-    env.CONFIGS._store.delete("creatordeleted:delme4c");
+    lapseCreatorTombstone(env, "delme4c");
     const fresh = await createUser(env, "delme4c", { displayName: "Somebody Else" });
     const dash = await call(env, "/api/creator/lists", {
       method: "POST", json: { creatorName: "delme4c", creatorKey: fresh.creatorKey },
@@ -5525,6 +5525,45 @@ describe("N9: migrate-d1 must be able to repair a drifted list row", () => {
     assert.equal(row.name, "Correct Name", "migrate-d1 must repair a drifted name");
     assert.equal(row.items_json, JSON.stringify([{ id: "tt1" }]), "and drifted items");
   });
+
+  // The column that actually drifts in production. /api/lists/like writes KV
+  // first and D1 second inside a catch, so a D1 blip during a like leaves the
+  // mirror low forever: lists/save deliberately does not push likes (the like
+  // endpoint owns that column and may have moved it since), so a later rename
+  // will not repair it either. migrate-d1 is the only thing that can, which is
+  // the whole point of N9.
+  it("repairs a like count that a D1 outage left behind", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "n9likes");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9likes", creatorKey: u.creatorKey,
+      name: "L", type: "movie", visibility: "public", items: [],
+    }});
+    db.failWhen((sql) => /UPDATE creator_lists SET likes/i.test(sql));
+    for (const ip of ["198.18.0.1", "198.18.0.2", "198.18.0.3"]) {
+      await call(env, "/api/lists/like", { method: "POST", ip, json: { username: "n9likes", slug: "l" } });
+    }
+    db.failWhen(null);
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n9likes:l")).likes, 3, "KV holds the true count");
+    assert.equal(db._lists.get("n9likes:l").likes, 0, "and D1 is the one that drifted");
+
+    // A rename must not be expected to fix it -- that is a different owner's
+    // column -- and must not destroy the real count either.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9likes", creatorKey: u.creatorKey, slug: "l",
+      name: "Renamed", type: "movie", visibility: "public", items: [],
+    }});
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n9likes:l")).likes, 3,
+      "a rename must never write D1's stale zero back over the true count");
+
+    const cookie = await adminCookie(env);
+    let r, guard = 0;
+    do { r = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie, json: {} }); }
+    while (!r.body.done && ++guard < 30);
+    assert.equal(db._lists.get("n9likes:l").likes, 3, "migrate-d1 must converge the mirror");
+  });
 });
 
 describe("N10: a response carrying one account's private data is never cacheable", () => {
@@ -5557,6 +5596,62 @@ describe("N10: a response carrying one account's private data is never cacheable
     // inherited hour, a list made private stayed findable long after the API
     // stopped returning it.
     assert.ok(maxAge <= 120, `search was cacheable for ${maxAge}s; the directory itself uses 120`);
+  });
+
+  // Marking the individual routes was opt-in, and five of them were still
+  // opted out: sync/save, save-tracking, save-presets, save-channels and
+  // lists/delete all answered 200 with max-age=3600. Nothing was leaking --
+  // they are POSTs and browsers do not store a POST response -- but that is
+  // protection by accident of HTTP method, and a route added tomorrow starts
+  // out wrong the same way. So the rule now lives at the response boundary
+  // and this test walks the whole surface rather than a chosen list.
+  it("enforces no-store at the boundary, for every creator and admin path", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "boundary");
+    const K = { creatorName: "boundary", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "L", type: "movie", visibility: "public", items: [],
+    }});
+    const cookie = await adminCookie(env);
+
+    const leaky = [];
+    for (const p of ["/api/creator/sync/load", "/api/creator/sync/save", "/api/creator/lists",
+      "/api/creator/sync/meta", "/api/creator/restore", "/api/creator/track-status",
+      "/api/creator/scrobble-token", "/api/creator/sync/save-tracking", "/api/creator/sync/save-presets",
+      "/api/creator/sync/save-channels", "/api/creator/sync/share-tracking", "/api/creator/lists/delete",
+      // A path no route serves: the boundary must cover the 404 too, since
+      // that is the shape a future route arrives in.
+      "/api/creator/not-a-route-yet"]) {
+      const r = await call(env, p, { method: "POST", json: { ...K, slug: "l", shared: false } });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    for (const p of ["/admin", "/admin/api/published-lists", "/admin/api/leaderboard?type=trending&window=last30"]) {
+      const r = await call(env, p, { cookie });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    assert.deepEqual(leaky, [], "these account-scoped responses are storable");
+  });
+
+  // The half a blanket no-store would break. This add-on stays inside the
+  // upstream rate limits by being cacheable where it can be, so the rule has
+  // to be narrow enough to leave the public surface alone.
+  it("leaves the public, cacheable surface alone", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "pubcache");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "pubcache", creatorKey: u.creatorKey,
+      name: "Public List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (const p of ["/lists/public.json", "/lists/pubcache/public-list.json", "/icon.png"]) {
+      const r = await call(env, p);
+      assert.equal(r.status, 200, `${p} should be served`);
+      assert.match(r.headers.get("cache-control") || "", /max-age=\d+/,
+        `${p} must stay cacheable -- the rate-limit budget depends on it`);
+    }
   });
 });
 
@@ -5697,12 +5792,15 @@ describe("audit II §11.1: a provider answering 200 with nothing must not erase 
     { movie: { title: "Second", year: 2021, ids: { imdb: "tt0000002", trakt: 2, tmdb: 12 } } },
   ]);
 
-  const tick = async (env, body) => {
+  // `w` is the Worker instance to run the tick on, and `fetches` counts the
+  // upstream calls it made -- both matter, see the test below.
+  let fetches = 0;
+  const tick = async (w, env, body) => {
     const real = globalThis.fetch;
-    globalThis.fetch = async () => new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    globalThis.fetch = async () => { fetches++; return new Response(body, { status: 200, headers: { "content-type": "application/json" } }); };
     try {
       const pending = [];
-      await worker.scheduled({ cron: "x" }, env, {
+      await w.scheduled({ cron: "x" }, env, {
         waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
       });
       await Promise.all(pending);
@@ -5712,13 +5810,32 @@ describe("audit II §11.1: a provider answering 200 with nothing must not erase 
   it("keeps the last non-empty copy of a shared chart", async () => {
     const kv = makeKv();
     const env = { CONFIGS: kv, TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m" };
-    await tick(env, goodTraktChart);
+    await tick(worker, env, goodTraktChart);
     const key = [...kv._store.keys()].find((k) => k.startsWith("cache:trakt:chart:"));
     assert.ok(key, "precondition: the prewarm cached a Trakt chart");
     const healthy = String(kv._store.get(key));
     assert.ok(!/"data":(\[\]|\{\})/.test(healthy), "precondition: the healthy tick cached real items");
 
-    await tick(env, "[]");
+    // Two things have to be arranged or the second tick cannot touch the cache
+    // at all, and this test passes whether the guard exists or not. It did
+    // exactly that when first written: disabling the guard left it green.
+    //
+    //   1. Every KV copy has to be STALE, or the refresh is never attempted.
+    //   2. The tick has to run on a DIFFERENT isolate, because the first tick
+    //      left the result in this one's in-memory chart memo and would be
+    //      served from there without a fetch.
+    for (const k of [...kv._store.keys()].filter((x) => x.startsWith("cache:"))) {
+      try {
+        const v = JSON.parse(String(kv._store.get(k)));
+        v.freshUntil = Date.now() - 1;
+        kv._store.set(k, JSON.stringify(v));
+      } catch { /* not a cache record */ }
+    }
+    const coldIsolate = await freshIsolate();
+    fetches = 0;
+    await tick(coldIsolate, env, "[]");
+    assert.ok(fetches > 0, "precondition: the empty tick must actually reach the provider");
+
     const after = String(kv._store.get(key));
     // Before: the write gate was only "not null and not undefined", so an
     // empty array counted as a successful refresh and was written over the
@@ -5726,7 +5843,8 @@ describe("audit II §11.1: a provider answering 200 with nothing must not erase 
     // data those tiers exist to hold, right when the provider needed it.
     assert.ok(!/"data":(\[\]|\{\})/.test(after),
       "an empty-but-successful upstream reply overwrote the good cached chart");
-    assert.equal(after, healthy, "the cached chart should be untouched");
+    assert.deepEqual(JSON.parse(after).data, JSON.parse(healthy).data,
+      "the cached chart contents should be untouched");
   });
 
   it("still accepts an empty result for a cache the user owns", () => {
@@ -5785,4 +5903,226 @@ describe("N4: a new account starts clean however data got under its username", (
     assert.ok(!kv._store.has("scrobbletoken:OLD-WEBHOOK-TOKEN"),
       "the previous owner's scrobble token must not still resolve");
   });
+});
+
+// ---------------------------------------------------------------------------
+// The audit's remaining open items, closed after the report.
+// ---------------------------------------------------------------------------
+describe("R1: an anonymously published list can be removed", () => {
+  const publish = (env, name) => call(env, "/api/publish-list", {
+    method: "POST", ip: "203.0.113.1",
+    json: { name, type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+  });
+
+  it("an admin can enumerate and delete them", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    for (const n of ["Alpha List", "Beta List"]) await publish(env, n);
+    await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.9", json: { username: "user", slug: "alpha-list" } });
+    await call(env, "/lists/public.json");
+    const cookie = await adminCookie(env);
+
+    const listed = await call(env, "/admin/api/published-lists", { cookie });
+    assert.equal(listed.body.ok, true);
+    assert.deepEqual(listed.body.lists.map((l) => l.slug).sort(), ["alpha-list", "beta-list"]);
+
+    const del = await call(env, "/admin/api/delete-published-list", { method: "POST", cookie, json: { slug: "alpha-list" } });
+    assert.equal(del.body.ok, true);
+    // Before: no route in the Worker could remove one of these at all -- the
+    // creator-list endpoint validates the username and `user` is reserved --
+    // so anything published anonymously was permanent.
+    assert.ok(!env.CONFIGS._store.has("publishedlist:user:alpha-list"), "the record must be gone");
+    assert.ok(!env.CONFIGS._store.has("listlikevoters:user:alpha-list"), "and its like ledger");
+    assert.equal((await call(env, "/lists/user/alpha-list.json")).status, 404);
+    const dir = await call(env, "/lists/public.json");
+    assert.ok(!JSON.stringify(dir.body).includes("alpha-list"), "and the directory must stop advertising it");
+    assert.ok(env.CONFIGS._store.has("publishedlist:user:beta-list"), "the other list is untouched");
+  });
+
+  // The admin panel's "Load more" button walks this cursor. If the cursor
+  // never went null the button would never disappear; if it went null early
+  // the operator would be shown a truncated list and conclude the rest do not
+  // exist. Both failures are silent, so the paging contract gets its own test.
+  it("pages through more lists than one call returns", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    for (let i = 0; i < 7; i++) await publish(env, "Paged List " + i);
+    const cookie = await adminCookie(env);
+
+    const seen = [];
+    let cursor = "";
+    let calls = 0;
+    let last = null;
+    do {
+      assert.ok(++calls <= 10, "paging must terminate");
+      last = await call(env, "/admin/api/published-lists?limit=3" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""), { cookie });
+      assert.equal(last.body.ok, true);
+      assert.ok(last.body.lists.length <= 3, "a page must respect the limit");
+      for (const l of last.body.lists) seen.push(l.slug);
+      cursor = last.body.cursor || "";
+    } while (cursor);
+
+    assert.equal(last.body.done, true, "the final page must say it is the final page");
+    assert.equal(seen.length, 7, "every list must be reachable by paging");
+    assert.equal(new Set(seen).size, 7, "and none returned twice");
+  });
+
+  it("both routes need an admin session, and a failed delete says so", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    await publish(env, "Gamma List");
+    assert.equal((await call(env, "/admin/api/published-lists")).status, 401);
+    assert.equal((await call(env, "/admin/api/delete-published-list", { method: "POST", json: { slug: "gamma-list" } })).status, 401);
+
+    const cookie = await adminCookie(env);
+    kv._hooks.beforeDelete = async (k) => { if (k.startsWith("publishedlist:")) throw new Error("KV down"); };
+    const failed = await call(env, "/admin/api/delete-published-list", { method: "POST", cookie, json: { slug: "gamma-list" } });
+    kv._hooks.beforeDelete = null;
+    assert.notEqual(failed.body.ok, true, "a delete that deleted nothing must not report success");
+    assert.ok(kv._store.has("publishedlist:user:gamma-list"));
+  });
+});
+
+describe("R2: two devices editing one list do not silently overwrite each other", () => {
+  it("rejects a save built on a version that has since moved", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "r2guard");
+    const K = { creatorName: "r2guard", creatorKey: u.creatorKey };
+    const save = (extra) => call(env, "/api/creator/lists/save", {
+      method: "POST", json: { ...K, name: "Shared", type: "movie", visibility: "private", ...extra },
+    });
+
+    const first = await save({ items: [{ id: "1" }] });
+    assert.equal(typeof first.body.updatedAt, "number", "a save must hand back the version it wrote");
+    const { slug, updatedAt: v1 } = first.body;
+
+    const a = await save({ slug, items: [{ id: "1" }, { id: "2" }], expectedUpdatedAt: v1 });
+    assert.equal(a.body.ok, true);
+    const b = await save({ slug, items: [{ id: "1" }, { id: "3" }], expectedUpdatedAt: v1 });
+    // Before: both answered 200 and whichever landed second won, discarding
+    // the other's edits with no error anywhere.
+    assert.equal(b.status, 409, "the stale save must be refused");
+    assert.equal(b.body.conflict, true);
+    assert.deepEqual(JSON.parse(kv._store.get(`creatorlist:r2guard:${slug}`)).items, [{ id: "1" }, { id: "2" }],
+      "the first device's edit must survive");
+
+    const rebased = await save({ slug, items: [{ id: "1" }, { id: "3" }], expectedUpdatedAt: a.body.updatedAt });
+    assert.equal(rebased.body.ok, true, "and succeed once rebased on the current version");
+  });
+
+  it("stays additive, and a frozen clock does not defeat it", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "r2clock");
+    const K = { creatorName: "r2clock", creatorKey: u.creatorKey };
+    const save = (extra) => call(env, "/api/creator/lists/save", {
+      method: "POST", json: { ...K, name: "Shared", type: "movie", visibility: "private", ...extra },
+    });
+    const first = await save({ items: [] });
+    // A client that sends nothing keeps the previous last-write-wins.
+    assert.equal((await save({ slug: first.body.slug, items: [{ id: "x" }] })).body.ok, true);
+    // Present-but-malformed is a client bug, not a reason to drop the guard --
+    // and is rejected whether or not the record already exists.
+    assert.equal((await save({ slug: first.body.slug, items: [], expectedUpdatedAt: "" })).status, 400);
+    assert.equal((await save({ name: "Brand New", items: [], expectedUpdatedAt: {} })).status, 400);
+
+    // Date.now() is frozen for the duration of a Workers request, so a bare
+    // timestamp could not tell a stale write from a current one.
+    const realNow = Date.now;
+    Date.now = () => realNow();
+    const frozen = realNow();
+    Date.now = () => frozen;
+    try {
+      const a = await save({ slug: first.body.slug, items: [{ id: "a" }] });
+      await save({ slug: first.body.slug, items: [{ id: "b" }], expectedUpdatedAt: a.body.updatedAt });
+      const c = await save({ slug: first.body.slug, items: [{ id: "c" }], expectedUpdatedAt: a.body.updatedAt });
+      assert.equal(c.status, 409, "the second stale save must still be caught inside one millisecond");
+    } finally { Date.now = realNow; }
+  });
+});
+
+describe("R3: a deleted account cannot authenticate from a colo with a stale KV cache", () => {
+  it("is closed when D1 is bound, and honestly open when it is not", async () => {
+    for (const withD1 of [true, false]) {
+      const kv = makeKv();
+      const env = makeEnv({ CONFIGS: kv, DB: withD1 ? makeD1() : undefined });
+      const name = withD1 ? "stalewithd1" : "stalenod1";
+      const u = await createUser(env, name);
+      const K = { creatorName: name, creatorKey: u.creatorKey };
+      const beforeDelete = kv._store.get(`creator:${name}`);
+      await call(env, "/api/creator/delete-account", { method: "POST", json: { ...K, confirm: "DELETE" } });
+
+      // A colo whose KV cache predates both the tombstone write and the
+      // creator: delete -- it sees the account alive and no tombstone.
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k === `creator:${name}`) return t === "json" ? JSON.parse(beforeDelete) : beforeDelete;
+        if (k === `creatordeleted:${name}`) return null;
+        return origGet(k, t);
+      };
+      const restore = await call(env, "/api/creator/restore", { method: "POST", json: K });
+      kv.get = origGet;
+
+      if (withD1) {
+        // D1 is strongly consistent, so the tombstone the delete wrote there
+        // is visible from anywhere on the next request.
+        assert.equal(restore.status, 401, "with D1 bound this window must be closed");
+      } else {
+        // Without D1 there is no strongly-consistent store to ask. Asserted as
+        // a known limit so it is not mistaken for a regression, and so that if
+        // it ever starts passing without D1 somebody asks why.
+        assert.equal(restore.status, 200,
+          "KV-only cannot close this; it is bounded by KV propagation and the post-delete sweep");
+      }
+    }
+  });
+
+  it("a failed delete leaves no tombstone in either store", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "r3failed");
+    const K = { creatorName: "r3failed", creatorKey: u.creatorKey };
+    db.failWhen((sql) => /DELETE FROM creators WHERE/i.test(sql));
+    const del = await call(env, "/api/creator/delete-account", { method: "POST", json: { ...K, confirm: "DELETE" } });
+    db.failWhen(null);
+    assert.notEqual(del.body.ok, true);
+    assert.ok(!kv._store.has("creatordeleted:r3failed"), "no KV tombstone");
+    assert.equal(db.q("SELECT * FROM creator_tombstones WHERE username='r3failed'").length, 0, "no D1 tombstone");
+    assert.equal((await call(env, "/api/creator/restore", { method: "POST", json: K })).body.ok, true,
+      "and the account still works, so its owner can retry");
+  });
+});
+
+describe("R5: concurrent list creation does not lose the user's ordering", () => {
+  it("every record ends up in the persisted order", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "r5order");
+    const K = { creatorName: "r5order", creatorKey: u.creatorKey };
+    // Force the reads to interleave the way real KV latency does.
+    kv._hooks.beforeGet = async () => { await new Promise((r) => setTimeout(r, 1)); };
+    await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      call(env, "/api/creator/lists/save", {
+        method: "POST", json: { ...K, name: "List " + i, type: "movie", visibility: "private", items: [] },
+      })));
+    kv._hooks.beforeGet = null;
+
+    const order = JSON.parse(kv._store.get("creatorlistorder:r5order")).order;
+    const records = [...kv._store.keys()]
+      .filter((k) => k.startsWith("creatorlist:r5order:"))
+      .map((k) => k.slice("creatorlist:r5order:".length));
+    const missing = records.filter((s) => !order.includes(s));
+    // Before: the handler wrote back the array it had read at the top, so
+    // every entry added in between was dropped -- measured, 3 of 12.
+    assert.deepEqual(missing, [], `these records are missing from the persisted order: ${missing.join(", ")}`);
+    assert.equal(new Set(order).size, order.length, "and the order must not contain duplicates");
+  });
+
+  // What this test does NOT claim. Replace the latency above with a hard
+  // barrier -- every one of the twelve blocked until all twelve have read the
+  // key -- and the result is one order entry with the merge and one without
+  // it, because then the re-reads all happen before any of the writes. The
+  // merge shrinks the window; it does not close it. Only moving ordering off
+  // a single key does that, which is a data-model change. Recorded here so a
+  // later reader does not mistake this test for a proof of correctness under
+  // arbitrary interleaving.
 });

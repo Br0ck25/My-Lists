@@ -54,6 +54,14 @@ CREATE TABLE stats (
     PRIMARY KEY (kind, day)
 );
 
+-- A strongly-consistent "this account was deleted" marker -- see
+-- migrations/0004 for why a missing `creators` row cannot serve as one.
+DROP TABLE IF EXISTS creator_tombstones;
+CREATE TABLE creator_tombstones (
+    username TEXT PRIMARY KEY,
+    until    INTEGER NOT NULL
+);
+
 -- Indexes for fast querying.
 --
 -- These have to match what migrations/0001, 0002 and 0003 leave behind, or a
@@ -72,3 +80,9 @@ CREATE INDEX idx_creator_lists_likes ON creator_lists(likes);
 -- `creator_lists` and sorts it to return 200 rows.
 CREATE INDEX idx_creators_last_active ON creators(last_active DESC, created_at DESC);
 CREATE INDEX idx_creator_lists_vis_likes ON creator_lists(visibility, likes DESC, updated_at DESC);
+
+-- The dashboard's counter panels: WHERE day = 'total' AND kind LIKE ?
+-- ORDER BY n DESC. The (kind, day) primary key cannot serve that, so it was a
+-- full scan plus a sort -- over a table whose `kind` dimension is unbounded,
+-- because list_copy:{slug} mints one per list. See migrations/0005.
+CREATE INDEX idx_stats_day_totals ON stats(day, n DESC, kind);
