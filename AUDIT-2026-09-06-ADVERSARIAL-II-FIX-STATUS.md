@@ -6,19 +6,42 @@ edited to match the fixes; this one says what was done about it.
 
 Every fix is verified twice: the probe that originally demonstrated the defect
 now passes, and the defect reintroduced by mutation makes the test suite fail.
-A fix whose mutation leaves the suite green does not have a real regression
-test, and is called out as such below rather than counted as done.
+A fix whose mutation leaves the suite green is called out below rather than
+counted as done — see "What the mutation run actually said", which is also
+where the one case of a *correctly* surviving mutation is explained.
 
 Suite: **253 tests, 252 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
-One mutation did survive on the first pass — reverting N4's purge-on-create
-left the suite green, because the test for it asserted a clean slate after a
-*clean* delete, which is clean with or without the purge. Replaced with one
-that seeds account-owned keys under a username with no identity and then
-registers it; reverting the purge now fails. Recorded rather than quietly
-corrected, because "the mutation survived" is the only signal that a
-regression test is decorative.
+### What the mutation run actually said
+
+Seventeen mutations, one per fix. Fifteen were caught. Two survived, and they
+are two different things — which is the point of running it at all.
+
+**N4's purge-on-create: a decorative test.** Reverting it left the suite green,
+because the test asserted a clean slate after a *clean* delete, which is clean
+with or without the purge. Replaced with one that seeds account-owned keys
+under a username with no identity — the state a straggler leaves once the
+tombstone has lapsed — and then registers it. Reverting the purge now fails.
+
+**`invalidateCreatorAuthMemo`: redundant code, not a missing test.** Making it
+a no-op also left the suite green, and that is correct. Measured with the clear
+disabled entirely: a rotated key still 401s in both KV-only and KV+D1 mode, and
+a deleted account still 401s. The memo key is a hash of username + presented
+key + *stored hash*, so a rotation changes the key and the old entry becomes
+unreachable on its own; a deleted account fails on the tombstone or the missing
+record long before the memo is consulted. The clear is belt-and-braces, exactly
+as its own comment says.
+
+So the test for it deliberately asserts the property ("the old key stops
+working") rather than the mechanism. Writing one that fails when the clear is
+removed would mean pinning a redundant line — describing the implementation
+instead of the behaviour, which is the mistake the source-text cron test made.
+
+A surviving mutation means either the test is decorative or the mutated code
+was redundant. Telling those apart is the work; assuming the first and writing
+a brittle test to make the red go away is how a suite stops being worth
+running.
 
 ---
 
@@ -137,5 +160,7 @@ python3 check_sync.py               # byte-exact rebuild check on its own
 for f in audit/adversarial-II-2026-09-06/p*.mjs; do node "$f"; done
 ```
 
-Mutation testing, re-run against the fixed code: every fix above was reverted
-one at a time and the suite re-run. See the audit's §9 for the method.
+Mutation testing, re-run against the fixed code: seventeen mutations, one per
+fix, each reverted alone and the suite re-run. **15 caught, 2 survived** — one
+a decorative test since replaced, one a genuinely redundant line. Both are
+explained above. See the audit's §9 for the method.
