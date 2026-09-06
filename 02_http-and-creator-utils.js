@@ -1112,6 +1112,17 @@ async function fetchWithPerUserCacheUncoalesced({
       const lastGood = (cached && cached.data) || (kvData && kvData.data) || (edgeCacheData && edgeCacheData.data) || null;
       if (refusingEmpty && lastGood && !isEmptyPayload(lastGood)) {
         console.warn(`[CircuitBreaker] ${providerLabel} returned an empty result; keeping the last non-empty copy rather than caching the empty one.`);
+        // Re-stamp the last good copy as fresh in memory before returning it.
+        //
+        // Without this, refusing the write leaves nothing fresh, so the very
+        // next request goes upstream again -- and during exactly the incident
+        // this exists for, that turns one bad reply into a request per
+        // visitor against a provider already in trouble. Holding the good
+        // copy for one fresh window instead means the retry happens on the
+        // same cadence a successful refresh would have, and the durable KV and
+        // edge copies are deliberately left alone: they still hold the same
+        // data, and rewriting them would spend a KV write per empty reply.
+        setPerUserCache(cacheKey, lastGood, freshTtlSec, staleTtlSec);
         return lastGood;
       }
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
