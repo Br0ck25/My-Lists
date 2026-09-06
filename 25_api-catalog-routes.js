@@ -5697,6 +5697,27 @@ self.addEventListener('fetch', e => {
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
       await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
+      // A private list is not likeable, and this route is the only public
+      // path to a list record that did not say so.
+      //
+      // Visibility used to be consulted only much further down, to decide
+      // whether to touch the directory index -- so the vote itself was
+      // recorded either way. Three things came out of that. The 404-vs-200
+      // split told any anonymous caller exactly which private slugs a creator
+      // owned (and /lists/public.json publishes the usernames, so only the
+      // slug had to be guessed). A stranger could change the stored `likes`
+      // on a private record in both stores and mint a permanent
+      // listlikevoters: key for it. And because a save deliberately preserves
+      // `likes` across an edit, the count a stranger built up while the list
+      // was private carried straight into the public directory the moment its
+      // owner published it.
+      //
+      // The SAME error and status as a list that does not exist, deliberately
+      // -- a distinguishable response here is the oracle, not the vote.
+      if (!isPublicListVisibility(likeData.visibility)) {
+        return json({ ok: false, error: "List not found." }, 404);
+      }
+
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
       // one like, no matter how many times it POSTs. A creatorKey is

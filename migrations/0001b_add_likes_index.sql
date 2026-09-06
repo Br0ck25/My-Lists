@@ -1,0 +1,24 @@
+-- 0001b_add_likes_index.sql
+--
+-- The index half of what used to be a single 0001. Run it after 0001a.
+--
+-- Separated because 0001a is not idempotent and this is: as one file, an
+-- interrupted run could never be completed, because re-running stopped at
+-- 0001a's ALTER and this statement was never reached. See 0001a's own comment.
+--
+-- Safe to run against a live database, and safe to run any number of times.
+--
+-- Worth knowing what this index is and is not for. Its original comment said
+-- the public directory would otherwise be a full scan; that is not quite
+-- right. The directory's query filters on visibility first, and once
+-- idx_creator_lists_visibility exists SQLite prefers that one and sorts the
+-- result -- so this index is not chosen for it at all. migrations/0003 adds
+-- the composite index that query actually wants. This one still earns its
+-- place for ordering by popularity where visibility is not in the predicate.
+--
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: open this database's Console tab and paste/run the statement
+--   below (skip these comment lines).
+--   Wrangler:  npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001b_add_likes_index.sql
+
+CREATE INDEX IF NOT EXISTS idx_creator_lists_likes ON creator_lists(likes);

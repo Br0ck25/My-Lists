@@ -13,7 +13,23 @@
       if (!env || !env.CONFIGS) return { ok: false, error: "no-kv" };
       const v = validateCreatorUsername(creatorNameRaw);
       if (!v.ok) return { ok: false, error: "Username or Key is incorrect." };
-      const raw = await getCreator(env, v.normalized);
+      // A username being deleted right now stops authenticating, whatever the
+      // record says. Two things this catches that the record cannot: a request
+      // arriving mid-purge, which would otherwise write its key back after the
+      // sweep had passed; and a colo still serving the pre-deletion
+      // `creator:{u}` out of KV's read cache, where the record claims the
+      // account is alive because that copy is stale. See the tombstone comment
+      // in 02_http-and-creator-utils.js.
+      //
+      // Issued alongside the profile read rather than before it: this is the
+      // hottest authenticated path in the Worker (every autosave, every
+      // playback ping), and one extra round trip on it is worth avoiding even
+      // though the extra read is not.
+      const [tombstoned, raw] = await Promise.all([
+        isCreatorTombstoned(env, v.normalized),
+        getCreator(env, v.normalized),
+      ]);
+      if (tombstoned) return { ok: false, error: "Username or Key is incorrect." };
       if (!raw) return { ok: false, error: "Username or Key is incorrect." };
       let profile;
       try {
@@ -21,12 +37,57 @@
       } catch {
         return { ok: false, error: "Username or Key is incorrect." };
       }
+      // Verify against the store that can answer immediately -- see
+      // authoritativeKeyHash (02_http-and-creator-utils.js). No-op unless D1
+      // is bound.
+      //
+      // Resolved BEFORE the throttle below, which means a throttled request
+      // still pays for it. That is the right way round: the memo check the
+      // throttle depends on has to be keyed on the hash actually verified
+      // against, and probing it with the KV copy instead would let a memo
+      // entry made against a stale hash answer for a key that has since been
+      // rotated away -- reintroducing the thing this line exists to prevent.
+      // The cost of getting the order wrong is a rotation window; the cost of
+      // getting it right is one indexed lookup on the abuse path, against a
+      // PBKDF2 run that is roughly fifteen times more expensive and is what
+      // the throttle actually saves.
+      const keyHash = await authoritativeKeyHash(env, v.normalized, profile.keyHash);
+      // Every verification below runs PBKDF2 at 100,000 iterations, which is
+      // ~15ms of CPU, and it runs BEFORE the caller has proved anything at
+      // all. /api/creator/restore had a per-IP bucket and a daily failure
+      // budget; the fifteen other routes that verify a Creator Key --
+      // /api/creator/sync/load, /api/creator/lists/save,
+      // /api/scrobble?creator=&key=, all of them -- had neither, so an
+      // unauthenticated caller could drive unbounded Worker CPU through any
+      // of them, and route around restore's protection for guessing.
+      //
+      // Gating it HERE rather than at each route is the point: this is the one
+      // function every one of them goes through, so a route added later
+      // inherits the bound instead of having to remember it. The cap is
+      // deliberately generous -- a signed-in dashboard polls, autosaves and
+      // pings while simply open, and a shared IP behind CGNAT is several
+      // people -- because the aim is to bound abuse, not to shape normal use.
+      //
+      // Charged only when the memo will NOT answer, so the thing being bounded
+      // is the PBKDF2 run itself. A warm, signed-in client polling and
+      // autosaving never touches the bucket; a caller sending a different
+      // wrong key every time touches it on every request, which is the case
+      // that matters. `ip` absent (running outside Cloudflare) means there is
+      // no bucket to charge and the request is let through -- this is a cost
+      // control, and failing closed here would break every self-hoster off
+      // Cloudflare, exactly as the README already says of the other limiters.
+      const authIp = clientIpKey(request);
+      if (authIp && !(await isCreatorAuthMemoized(creatorKey || "", keyHash, v.normalized))) {
+        if (await consumeRateLimit(env, ctx, "creatorauth", authIp, CREATOR_AUTH_VERIFY_PER_MINUTE)) {
+          return { ok: false, error: "Too many attempts. Please wait a minute and try again.", throttled: true };
+        }
+      }
       // Memoized only after a successful PBKDF2 verification, in this
       // isolate's memory, for a few minutes -- see
       // verifyCreatorKeyMemoized (02_http-and-creator-utils.js) for why
       // that is not a weakening of the check. A wrong key still costs a
       // full PBKDF2 run every single time.
-      const valid = await verifyCreatorKeyMemoized(creatorKey || "", profile.keyHash, v.normalized);
+      const valid = await verifyCreatorKeyMemoized(creatorKey || "", keyHash, v.normalized);
       if (!valid) return { ok: false, error: "Username or Key is incorrect." };
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
@@ -38,6 +99,20 @@
     // deliberately -- "that name doesn't exist" vs "that key is wrong"
     // would let someone enumerate which creator names are already taken
     // just by trying to restore them.
+    //
+    // The one failure that is NOT generic is a throttle. Eighteen routes had
+    // this ternary written out inline, and every one of them replaced
+    // auth.error with the generic string -- so when the verification throttle
+    // started refusing requests, a person who had simply been polling too hard
+    // (or was sharing a CGNAT address with other users) was told their key was
+    // wrong. That is a misleading answer to a question they got right. One
+    // helper so the three cases stay distinguishable and cannot drift apart
+    // again: storage missing, throttled, or genuinely not authenticated.
+    function authFailureResponse(auth) {
+      if (auth.error === "no-kv") return json({ ok: false, error: "no-kv" }, 500);
+      if (auth.throttled) return json({ ok: false, error: auth.error }, 429);
+      return json({ ok: false, error: "Username or Key is incorrect." }, 401);
+    }
 
     // Handles a single "this just started playing" ping from the
     // /:config/subtitles/... route (25_api-catalog-routes.js) -- see
@@ -501,12 +576,21 @@
         } catch {}
       }
 
+      let authThrottled = false;
       if (!authUser && queryCreator && queryKey) {
         const auth = await authenticateCreator(queryCreator, queryKey);
         if (auth.ok) authUser = auth.username;
+        else if (auth.throttled) authThrottled = true;
       }
 
       if (!authUser) {
+        // A throttle is not a bad credential, and a media server retrying a
+        // webhook should be told to back off rather than that its key is
+        // wrong -- this endpoint is the one that gets hit on every play, and
+        // it was also the easiest way to drive unbounded PBKDF2 runs.
+        if (authThrottled) {
+          return json({ ok: false, error: "Too many attempts. Please wait a minute and try again." }, 429);
+        }
         return json({ ok: false, error: "Unauthorized: Invalid or missing user credentials / config parameter." }, 401);
       }
       // creator+key still works: webhook URLs handed out before scrobble
@@ -1033,7 +1117,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const raw = await env.CONFIGS.get(`creatortrack:${auth.username}`);
       let status = { lastPingAt: null, lastPingId: null, lastServer: null, lastUser: null, matched: null };
       if (raw) {
@@ -1043,7 +1127,7 @@
           // leave status as the empty default
         }
       }
-      return json({ ok: true, ...status });
+      return jsonPrivate({ ok: true, ...status });
     }
 
     // /api/creator/scrobble-seen-users  (POST)  { creatorName, creatorKey } ->
@@ -1060,7 +1144,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const raw = await env.CONFIGS.get(`scrobbleseenusers:${auth.username}`);
       let users = {};
       if (raw) {
@@ -1078,7 +1162,7 @@
           }
         } catch {}
       }
-      return json({ ok: true, users });
+      return jsonPrivate({ ok: true, users });
     }
 
     // /api/creator/create  (POST)  { creatorName, displayName?, recoveryAnswer? }
@@ -1115,6 +1199,18 @@
       if (existing) {
         return json({ ok: false, error: "That username is already taken." });
       }
+      // A username that was deleted moments ago is not available yet.
+      //
+      // This is the half of the tombstone that actually prevents disclosure.
+      // A purge is a sweep, so a request already in flight when it ran can put
+      // a key back after it finished -- and `creatorsync:{u}` holds the
+      // account's own provider API keys. Holding the name for a few minutes
+      // means the straggler has finished, and the second sweep has run, long
+      // before anyone else can claim it. Same message as a name that is simply
+      // taken, which is what it is for now.
+      if (await isCreatorTombstoned(env, v.normalized)) {
+        return json({ ok: false, error: "That username is already taken." });
+      }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
       // Recovery answer is optional and, unlike the Creator Key itself,
@@ -1143,6 +1239,31 @@
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
+
+      // A new account starts empty BY CONSTRUCTION, not because whatever
+      // happened to this username previously is assumed to have finished
+      // cleanly.
+      //
+      // The tombstone above holds a just-deleted name long enough for any
+      // in-flight write to land and for the post-deletion sweep to run, but
+      // "long enough" is a judgement about request duration, and inheriting a
+      // previous owner's synced config -- which carries their TMDB/Trakt API
+      // keys -- is too sharp an outcome to leave resting on one. Sweeping here
+      // as well means it does not matter how a stray key got there, or how
+      // long ago: nothing under this username survives into the new account.
+      //
+      // Cheap and safe: for a name that was never used this is one list() that
+      // returns nothing plus a handful of deletes against absent keys, on an
+      // endpoint already rate-limited to one call per IP per minute. It cannot
+      // touch a live account either, because the uniqueness check above has
+      // already established there is none.
+      const preCreatePurge = await purgeCreatorData(env, v.normalized, { deleteIdentity: false });
+      if (!preCreatePurge.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't set that Profile up just now. Please try again in a moment.",
+        }, 503);
+      }
       
       // KV is written ALWAYS, D1 only additionally. This used to write to
       // D1 *instead of* KV whenever DB was bound, which made the single
@@ -1373,7 +1494,7 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) {
-        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+        return authFailureResponse(auth);
       }
       const token = await getOrCreateScrobbleToken(env, auth.username, body.rotate === true);
       if (!token) return json({ ok: false, error: "Could not issue a webhook token." }, 500);
@@ -1414,9 +1535,9 @@
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) {
         if (auth.error !== "no-kv") await noteAuthFailure(env, restoreFailScope, restoreFailDay);
-        return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+        return authFailureResponse(auth);
       }
-      return json({ ok: true, creatorName: auth.username, displayName: auth.displayName });
+      return jsonPrivate({ ok: true, creatorName: auth.username, displayName: auth.displayName });
     }
 
     // /api/creator/lists  (POST)  { creatorName, creatorKey } -> { ok, displayName, lists }
@@ -1431,7 +1552,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -1604,9 +1725,9 @@
         // browser that stops seeing its own list changes.
       }
       if (listsVersion && body.knownVersion && body.knownVersion === listsVersion) {
-        return json({ ok: true, unchanged: true, version: listsVersion });
+        return jsonPrivate({ ok: true, unchanged: true, version: listsVersion });
       }
-      return json({ ...listsPayload, version: listsVersion });
+      return jsonPrivate({ ...listsPayload, version: listsVersion });
     }
 
     // /api/creator/lists/save  (POST)
@@ -1621,7 +1742,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       const type = (body.type === "series" || body.type === "mixed") ? body.type : (body.type === "movie" ? "movie" : null);
       const items = Array.isArray(body.items) ? body.items : [];
@@ -1848,14 +1969,26 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const slug = String(body.slug || "");
       if (!slug) return json({ ok: false, error: "Missing slug." }, 400);
       // Shared with /admin/api/delete-creator-list so the two cannot drift --
       // the same lesson purgeCreatorData records about itself. It also drops
       // the like ledger, which this route used to leave behind for whoever
       // next created a list at the same slug to inherit.
-      await deleteCreatorLists(env, auth.username, [slug]);
+      //
+      // `ok` is checked rather than assumed. This route used to return
+      // { ok: true } unconditionally, so a KV outage on the delete -- or a
+      // directory removal that failed -- answered "deleted" while the list
+      // stayed live at its public URL and in the directory, with nothing to
+      // retry it. See deleteCreatorLists' own comment.
+      const removal = await deleteCreatorLists(env, auth.username, [slug]);
+      if (!removal.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting that list. It may still be visible -- please try again in a moment.",
+        }, 500);
+      }
       return json({ ok: true });
     }
 
@@ -1868,7 +2001,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       // Bounded, and no ":" -- that is the KV key separator, and slugifyServer
       // (which produces every slug this app writes) can only emit
       // [a-z0-9-] within 60 characters anyway. The array itself had no cap
@@ -1893,14 +2026,12 @@
     // and Key keep working and the person stays signed in.
     //
     // Distinct from /api/creator/delete-account below, which removes the
-    // profile outright. Worth noting while looking at the two together: that
-    // one deletes `creatorprofile:`, `creatortrack:`, `creatorpresets:` and
-    // `creatorchannels:`, which are old key names this codebase no longer
-    // writes -- the live data is under `creator:`, `creatorsynctracking:`,
-    // `creatorsyncpresets:` and `creatorsyncchannels:`. So it currently
-    // leaves most of an account's data behind. Not changed here because
-    // deleting more on that path deserves its own decision, but this reset
-    // uses the names actually in use, plus the legacy ones for good measure.
+    // profile outright. The two share purgeCreatorData, so they cannot drift
+    // apart the way they once had -- the paragraph that used to sit here,
+    // warning that delete-account still named `creatorprofile:` /
+    // `creatorpresets:` / `creatorchannels:` and so "leaves most of an
+    // account's data behind", described a state that has not existed since
+    // both callers were moved onto one function.
     if (path === "/api/creator/account/reset" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "Database not configured." }, 500);
       let body;
@@ -1910,7 +2041,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       // A second, explicit confirmation carried in the request itself. The
       // key alone is enough to authenticate, but this is irreversible and
@@ -1949,7 +2080,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       // A second, explicit confirmation carried in the request itself,
       // matching /api/creator/account/reset. The key alone authenticates,
@@ -2004,7 +2135,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       // Same one-time forward migration, this time for tracking data
       // (watchHistory/continueWatching/fullyWatchedShowIds/
@@ -2151,7 +2282,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
 
       // Guard against a narrow but real race: handleSubtitlesTrack and
@@ -2493,7 +2624,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       // Same conflict guard as /api/creator/sync/save. Presets are the blob
       // this codebase itself calls "the one piece of synced state that can
       // genuinely grow large" -- a TV Channel's url is its entire episode
@@ -2546,7 +2677,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       // Same conflict guard and the same reasoning as save-presets above.
       const channelsExpected = parseExpectedUpdatedAt(body.expectedUpdatedAt);
       if (!channelsExpected.ok) {
@@ -2617,7 +2748,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       // Pulls "updatedAt": <number> out of a stored blob without parsing
       // it. Every blob these keys hold writes updatedAt as a plain number
@@ -2648,7 +2779,7 @@
         return json({ ok: false, error: "Could not read sync state right now." }, 500);
       }
 
-      return json({
+      return jsonPrivate({
         ok: true,
         exists: configRaw !== null || trackingRaw !== null,
         config: readUpdatedAtFromRaw(configRaw),
@@ -2673,7 +2804,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       await ensureTrackingMigrated(env, auth.username);
       // These five reads are independent of one another, and were awaited
       // one after the next -- so this endpoint paid five sequential KV
@@ -2882,7 +3013,7 @@
           }
         } catch {}
       }
-      return json({ ok: true, data });
+      return jsonPrivate({ ok: true, data });
     }
 
     // /api/creator/sync/like  (POST)  { creatorName, creatorKey, usernameSlug, liked } -> { ok }
@@ -2907,7 +3038,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
+      if (!auth.ok) return authFailureResponse(auth);
       const usernameSlug = String(body.usernameSlug || "").trim();
       if (!usernameSlug) return json({ ok: false, error: "Missing list reference." }, 400);
       const key = `creatorsync:${auth.username}`;
@@ -2952,7 +3083,7 @@
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
-      if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, 401);
+      if (!auth.ok) return authFailureResponse(auth);
 
       const shareKey = `creatorshare:${auth.username}`;
       let shared = {};
@@ -3060,7 +3191,13 @@
           // Response shape is identical to the scan path below: key is
           // `lists`, entries carry `source`, and only the non-"my lists"
           // search is capped at 50.
-          return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) });
+          // A GET, so unlike the account endpoints this one really is stored
+          // by browser and shared caches. At the inherited max-age=3600 a list
+          // its owner had just made private stayed findable by search for an
+          // hour after the API itself had stopped returning it. Matched to
+          // /lists/public.json's own 120s, which is the same data.
+          return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) },
+            200, { "Cache-Control": "public, max-age=60" });
         }
 
         const fetchLimit = isMyListsSearch ? 250 : 80;
@@ -3147,7 +3284,8 @@
             if (likesDiff !== 0) return likesDiff;
             return (b.items || 0) - (a.items || 0);
           });
-        return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) });
+        return json({ ok: true, lists: isMyListsSearch ? matches : matches.slice(0, 50) },
+          200, { "Cache-Control": "public, max-age=60" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -3740,14 +3878,34 @@
             const listId = `${u}:${slug}`;
             const itemsJson = JSON.stringify(data.items || []);
             const vis = isPublicListVisibility(data.visibility) ? "public" : "private";
-            // `likes` is carried across too. KV holds the authoritative
-            // count, so a migration that omitted it would silently reset
-            // every list to zero in D1. Visibility is rewritten as well
-            // so the fail-closed public index doesn't hide legacy lists
-            // that were served as public because they had no enum value.
+            // Every column this endpoint can derive from KV is rewritten on
+            // conflict, not just two of them.
+            //
+            // `likes` and `visibility` were always here -- omitting `likes`
+            // would reset every count to zero in D1, and rewriting
+            // `visibility` is what stops the fail-closed public index hiding
+            // legacy lists that had no enum value. `name`, `type`,
+            // `items_json` and `updated_at` were not, and that was the same
+            // DO NOTHING disease this endpoint's creators branch was fixed
+            // for, one branch further down: an existing row could be created
+            // but never corrected.
+            //
+            // It is reachable in ordinary operation. /api/creator/lists/save
+            // writes D1 inside a catch that logs and carries on, so one D1
+            // blip during an edit leaves the mirror holding the pre-edit name
+            // and items forever -- shown in the admin Community Lists panel
+            // and the leaderboard, and served by getCreatorList's fallback if
+            // the KV record is ever missing. The documented repair tool could
+            // not repair it.
+            //
+            // All six are derived purely from KV, which is authoritative for
+            // every one of them, so re-running is still idempotent.
+            // `created_at` stays out for the reason the creators branch gives:
+            // a legacy record with no createdAt would overwrite a good
+            // creation date with zero.
             const listRes = await d1Run(env.DB.prepare(
-              "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
-            ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
+              "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, likes=excluded.likes, updated_at=excluded.updated_at"
+            ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Math.max(0, Number(data.likes) || 0), data.createdAt || 0, data.updatedAt || 0));
             if (wrote(listRes)) { results.lists++; thisCall.lists++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`List ${u}:${slug}: ` + e.message);
@@ -3983,6 +4141,21 @@
         remaining = listed.keys.length;
       } catch (e) {
         remaining = null;
+      }
+      // Same rule as the creator-facing sibling: a sweep that left the record
+      // or the directory entry behind is not a deletion, and an admin
+      // clearing something up is the last person who should be told it
+      // worked when it did not. `deleted` is still reported so a partial
+      // batch is legible.
+      if (!result.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting those lists. Some may still be visible -- please try again in a moment.",
+          username: v.normalized,
+          deleted: result.deleted,
+          missing: result.missing,
+          remaining,
+        }, 500, { "Cache-Control": "no-store" });
       }
       return json({
         ok: true,
@@ -4725,14 +4898,28 @@ export default {
   // every 6 minutes with "*/6 * * * *") -- refreshes and pre-warms shared
   // Trakt, TMDB, Simkl, and MDBList charts into KV storage and sweeps newly-aired episodes for Continue Watching.
   async scheduled(event, env, ctx) {
+    // The boundary the fetch handler above has, which this did not.
+    //
+    // `ctx.waitUntil(Promise.all([...]))` rejects the moment any one task
+    // does, and there was no try -- so a failure in one task escaped the
+    // handler and Cloudflare recorded the whole invocation as failed, hiding
+    // which task actually broke. The tasks are independent, so each one gets
+    // its own catch and the tick is judged on whether it ran, not on whether
+    // everything inside it succeeded. Same argument as the fetch handler's:
+    // one boundary here is worth more than remembering to do this at every
+    // future call site.
+    const guard = (label, p) => Promise.resolve(p).catch((err) => {
+      console.error(`[Cron] ${label} failed:`, err);
+    });
+    try {
     // Same as the fetch handler above: nothing that runs below may see an
     // empty API key just because this isolate's first event happened to be a
     // cron tick rather than a request. See applyEnvApiKeys.
     applyEnvApiKeys(env);
     ctx.waitUntil(
       Promise.all([
-        checkForNewEpisodes(env),
-        prewarmSharedCatalogs(env, ctx),
+        guard("checkForNewEpisodes", checkForNewEpisodes(env)),
+        guard("prewarmSharedCatalogs", prewarmSharedCatalogs(env, ctx)),
         // Cheap when index:publiclists already exists (one KV get, no-op).
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never
@@ -4755,8 +4942,13 @@ export default {
         // used to repair that, because a rebuild only ever ran when the index
         // was MISSING, never when it was merely wrong. See
         // refreshPublicListIndexIfStale.
-        refreshPublicListIndexIfStale(env, ctx),
+        guard("refreshPublicListIndexIfStale", refreshPublicListIndexIfStale(env, ctx)),
       ])
     );
+    } catch (err) {
+      // Anything thrown synchronously before waitUntil was even reached --
+      // applyEnvApiKeys, or a task that threw rather than rejecting.
+      console.error("[Cron] scheduled() failed before its tasks were queued:", err);
+    }
   },
 };

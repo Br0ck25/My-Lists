@@ -56,7 +56,7 @@ CREATE TABLE stats (
 
 -- Indexes for fast querying.
 --
--- These have to match what migrations/0001 and 0002 leave behind, or a
+-- These have to match what migrations/0001, 0002 and 0003 leave behind, or a
 -- database provisioned the documented way (run this file) ends up a different
 -- shape from one that grew through the migrations. idx_creator_lists_likes
 -- existed only in 0001, so a fresh deployment did not have it; there is a test
@@ -64,3 +64,11 @@ CREATE TABLE stats (
 CREATE INDEX idx_creator_lists_username ON creator_lists(username);
 CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
 CREATE INDEX idx_creator_lists_likes ON creator_lists(likes);
+
+-- The two the admin dashboard's own queries actually need -- see
+-- migrations/0003 for the query plans. Without the first, listing accounts is
+-- a full scan of `creators` plus an in-memory sort on every dashboard load;
+-- without the second, the Community Lists panel reads roughly half of
+-- `creator_lists` and sorts it to return 200 rows.
+CREATE INDEX idx_creators_last_active ON creators(last_active DESC, created_at DESC);
+CREATE INDEX idx_creator_lists_vis_likes ON creator_lists(visibility, likes DESC, updated_at DESC);

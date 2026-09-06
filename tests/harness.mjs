@@ -89,10 +89,10 @@ export function makeD1({ foreignKeys = true } = {}) {
   const db = new DatabaseSync(":memory:");
   if (foreignKeys) db.exec("PRAGMA foreign_keys = ON;");
   db.exec(SCHEMA_SQL);
-  // schema.sql is the documented way to provision a fresh database; the likes
-  // index only ever existed in migrations/0001. Applied here too so the
-  // harness matches a migrated deployment as well as a fresh one.
-  db.exec("CREATE INDEX IF NOT EXISTS idx_creator_lists_likes ON creator_lists(likes);");
+  // schema.sql is the documented way to provision a fresh database and now
+  // carries every index the migrations leave behind, so there is nothing to
+  // add here -- the drift test in worker.test.mjs is what keeps the two
+  // provisioning paths identical.
 
   const state = { fail: null };
   const norm = (v) => (v === undefined ? null : typeof v === "boolean" ? (v ? 1 : 0) : v);

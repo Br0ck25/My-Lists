@@ -1,0 +1,47 @@
+-- 0003_add_missing_indexes.sql
+--
+-- Two indexes the admin dashboard's own queries need, and did not have.
+--
+-- EXPLAIN QUERY PLAN, run against the schema this repo ships:
+--
+--   SELECT username, display_name, created_at, last_active
+--     FROM creators ORDER BY last_active DESC, created_at DESC LIMIT ?
+--   -> SCAN creators + USE TEMP B-TREE FOR ORDER BY
+--
+-- There is no index on last_active at all, so the dashboard's account list
+-- reads every creator row and sorts the lot in memory to show the newest few
+-- -- on every single load. It is the hottest query the admin panel makes and
+-- the only one that is a full scan.
+--
+--   SELECT ... FROM creator_lists WHERE visibility = 'public'
+--     ORDER BY likes DESC, updated_at DESC LIMIT ?
+--   -> SEARCH creator_lists USING INDEX idx_creator_lists_visibility
+--      + USE TEMP B-TREE FOR ORDER BY
+--
+-- `visibility` has only two values, so that index selects roughly half the
+-- table and then sorts it to return 200 rows. Worth knowing while reading
+-- migrations/0001: the idx_creator_lists_likes it added "because the public
+-- directory orders by popularity" is never chosen for this query -- once a
+-- visibility index exists SQLite prefers that one, and without it the plan is
+-- a scan of the likes index instead. A composite over both columns is what
+-- the query actually wants, and turns it into a pure index seek with no sort:
+--
+--   -> SEARCH creator_lists USING INDEX idx_creator_lists_vis_likes
+--
+-- Safe to run against a live database, and safe to run twice: CREATE INDEX
+-- IF NOT EXISTS only adds, never rewrites a row, and holds no long lock on a
+-- table of this shape.
+--
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: open this database's Console tab and paste/run the two
+--   statements below (skip these comment lines).
+--   Wrangler:  npx wrangler d1 execute my-lists-db --remote --file=./migrations/0003_add_missing_indexes.sql
+--
+-- schema.sql carries both of these too, so a database provisioned the
+-- documented way and one that grew through the migrations end up the same
+-- shape. There is a test that diffs the two provisioning paths and fails on
+-- any drift.
+
+CREATE INDEX IF NOT EXISTS idx_creators_last_active ON creators(last_active DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_creator_lists_vis_likes ON creator_lists(visibility, likes DESC, updated_at DESC);
