@@ -1,5 +1,30 @@
 // Shared in-memory Worker harness for the production-audit test suite.
 // The Worker is a real ES module; we only stub KV, D1, caches, and waitUntil.
+//
+// D1 is backed by REAL SQLite (node:sqlite, Node 22.13+), loaded from the
+// committed schema.sql, with PRAGMA foreign_keys = ON to match D1's own
+// documented default ("D1 enforces that foreign key constraints are valid
+// within all queries and migrations"). It used to be a regex-matching mock,
+// and three of its shortcuts were each hiding a live defect:
+//
+//   * `SELECT * FROM creator_lists WHERE id = ?` was hardcoded to return no
+//     rows, so getCreatorList's D1 branch was never executed by ANY test in
+//     this suite. A mutation that removed the D1 write from
+//     /api/creator/lists/save outright left the whole suite green.
+//   * It could not throw, so no test ever covered "KV healthy, D1 fails" --
+//     which is the state where key rotation and account deletion both used
+//     to report success while doing nothing.
+//   * It could not enforce a primary key, a NOT NULL, a DEFAULT or a foreign
+//     key, so a column the code never binds (creator_lists.likes) silently
+//     read back as whatever the mock had stashed rather than as the column
+//     default the real database would apply.
+//
+// Real SQLite removes all three at once. `failWhen(fn)` is the fault
+// injector: any statement the predicate matches throws, the same way a D1
+// outage or a row-size violation does.
+
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 
 if (!globalThis.caches) {
   globalThis.caches = {
@@ -10,11 +35,19 @@ if (!globalThis.caches) {
 
 export const worker = (await import("../worker_entry_combined.js")).default;
 
+const SCHEMA_SQL = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+
 export function makeKv(initial = {}) {
   const store = new Map(Object.entries(initial));
+  // Fault injection, matching makeD1().failWhen: a hook that throws makes the
+  // corresponding KV call fail. Used to cover the partial-write paths where a
+  // route has to decide between reporting success and reporting the truth.
+  const hooks = { beforeGet: null, beforePut: null, beforeDelete: null, beforeList: null };
   return {
     _store: store,
+    _hooks: hooks,
     async get(key, type) {
+      if (hooks.beforeGet) await hooks.beforeGet(key);
       if (!store.has(key)) return null;
       const raw = store.get(key);
       if (type === "json") {
@@ -23,160 +56,138 @@ export function makeKv(initial = {}) {
       return raw;
     },
     async put(key, value) {
+      if (hooks.beforePut) await hooks.beforePut(key, value);
       store.set(key, typeof value === "string" ? value : JSON.stringify(value));
     },
     async delete(key) {
+      if (hooks.beforeDelete) await hooks.beforeDelete(key);
       store.delete(key);
     },
+    // Real KV cursors are opaque and positioned by KEY, not by offset. An
+    // integer offset into a freshly re-sorted array behaves differently the
+    // moment keys are added or removed mid-traversal -- which is exactly what
+    // happens during an index rebuild or an account purge -- so this models
+    // the real contract instead.
     async list({ prefix = "", limit = 1000, cursor } = {}) {
+      if (hooks.beforeList) await hooks.beforeList(prefix, cursor);
       const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
-      const start = cursor ? Number(cursor) || 0 : 0;
+      const after = cursor ? Buffer.from(cursor, "base64").toString("utf8") : null;
+      const found = after ? keys.findIndex((k) => k > after) : 0;
+      const start = found === -1 ? keys.length : found;
       const slice = keys.slice(start, start + limit);
-      const next = start + slice.length;
+      const complete = start + slice.length >= keys.length;
       return {
         keys: slice.map((name) => ({ name })),
-        list_complete: next >= keys.length,
-        cursor: next >= keys.length ? undefined : String(next),
+        list_complete: complete,
+        cursor: complete ? undefined : Buffer.from(slice[slice.length - 1]).toString("base64"),
       };
     },
   };
 }
 
-export function makeD1() {
-  const creators = new Map();
-  const lists = new Map();
-  // Keyed "kind\u0000day" -> n. Models the real table's PRIMARY KEY
-  // (kind, day) and, crucially, the atomicity of its upsert: the increment
-  // happens inside this one synchronous call, so two overlapping callers
-  // cannot both read the same value and both write value+1 the way the KV
-  // read-modify-write path can.
-  const stats = new Map();
-  const statKey = (kind, day) => `${kind}\u0000${day}`;
-  function run(sql, args) {
+export function makeD1({ foreignKeys = true } = {}) {
+  const db = new DatabaseSync(":memory:");
+  if (foreignKeys) db.exec("PRAGMA foreign_keys = ON;");
+  db.exec(SCHEMA_SQL);
+  // schema.sql is the documented way to provision a fresh database; the likes
+  // index only ever existed in migrations/0001. Applied here too so the
+  // harness matches a migrated deployment as well as a fresh one.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_creator_lists_likes ON creator_lists(likes);");
+
+  const state = { fail: null };
+  const norm = (v) => (v === undefined ? null : typeof v === "boolean" ? (v ? 1 : 0) : v);
+
+  function exec(sql, args) {
     const s = String(sql);
-    if (/INSERT INTO stats/i.test(s)) {
-      const [kind, day, n] = args;
-      const k = statKey(kind, day);
-      if (stats.has(k)) {
-        if (/DO UPDATE SET n = n \+ excluded\.n/i.test(s)) stats.set(k, stats.get(k) + Number(n));
-        // DO NOTHING: leave the existing row alone (migrate-d1 is re-runnable)
-      } else {
-        stats.set(k, Number(n));
-      }
-      return { meta: { changes: 1 }, success: true };
+    if (state.fail && state.fail(s, args)) {
+      const err = new Error("D1_ERROR: injected failure");
+      err.injected = true;
+      throw err;
     }
-    if (/INSERT INTO creators/i.test(s)) {
-      const [username, display_name, key_hash, recovery_answer_hash, created_at] = args;
-      if (creators.has(username) && /ON CONFLICT/i.test(s)) return { meta: { changes: 0 }, success: true };
-      creators.set(username, { username, display_name, key_hash, recovery_answer_hash, created_at, last_active: null });
-      return { meta: { changes: 1 }, success: true };
+    const stmt = db.prepare(s);
+    const bound = args.map(norm);
+    if (/^\s*(SELECT|PRAGMA|WITH)/i.test(s)) {
+      return { results: stmt.all(...bound), success: true, meta: { changes: 0 } };
     }
-    if (/UPDATE creators SET key_hash/i.test(s)) {
-      const [key_hash, username] = args;
-      const row = creators.get(username);
-      if (!row) return { meta: { changes: 0 }, success: true };
-      row.key_hash = key_hash;
-      return { meta: { changes: 1 }, success: true };
-    }
-    if (/DELETE FROM creators WHERE username/i.test(s)) {
-      const had = creators.delete(args[0]);
-      return { meta: { changes: had ? 1 : 0 }, success: true };
-    }
-    if (/INSERT INTO creator_lists/i.test(s)) {
-      const id = args[0];
-      lists.set(id, args);
-      return { meta: { changes: 1 }, success: true };
-    }
-    if (/DELETE FROM creator_lists WHERE id LIKE/i.test(s)) {
-      const like = String(args[0] || "").replace(/%/g, "");
-      let n = 0;
-      for (const id of [...lists.keys()]) {
-        if (id.startsWith(like)) { lists.delete(id); n++; }
-      }
-      return { meta: { changes: n }, success: true };
-    }
-    if (/DELETE FROM creator_lists WHERE id =/i.test(s)) {
-      const had = lists.delete(args[0]);
-      return { meta: { changes: had ? 1 : 0 }, success: true };
-    }
-    if (/UPDATE creator_lists SET likes/i.test(s)) {
-      return { meta: { changes: lists.has(args[1]) ? 1 : 0 }, success: true };
-    }
-    return { meta: { changes: 0 }, success: true };
+    const info = stmt.run(...bound);
+    return {
+      results: [],
+      success: true,
+      meta: { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid), duration: 0 },
+    };
   }
-  function all(sql, args) {
-    const s = String(sql);
-    if (/SELECT n FROM stats WHERE kind = \? AND day = \?/i.test(s)) {
-      const k = statKey(args[0], args[1]);
-      return { results: stats.has(k) ? [{ n: stats.get(k) }] : [] };
-    }
-    if (/SELECT day, n FROM stats WHERE kind = \? AND day != 'total'/i.test(s)) {
-      const out = [];
-      for (const [k, n] of stats) {
-        const [kind, day] = k.split("\u0000");
-        if (kind === args[0] && day !== "total") out.push({ day, n });
-      }
-      return { results: out };
-    }
-    if (/SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE \?/i.test(s)) {
-      const prefix = String(args[0]).replace(/%$/, "");
-      const limit = Number(args[1]) || 1000;
-      const out = [];
-      for (const [k, n] of stats) {
-        const [kind, day] = k.split("\u0000");
-        if (day === "total" && kind.startsWith(prefix)) out.push({ kind, n });
-      }
-      out.sort((a, b) => b.n - a.n);
-      return { results: out.slice(0, limit) };
-    }
-    if (/SELECT name, install_count FROM source_groups/i.test(s)) {
-      return { results: [] };
-    }
-    if (/SELECT \* FROM creators WHERE username/i.test(s)) {
-      const row = creators.get(args[0]);
-      return { results: row ? [row] : [] };
-    }
-    if (/SELECT COUNT\(\*\)/i.test(s)) {
-      return { results: [{ n: creators.size }] };
-    }
-    if (/SELECT username, display_name/i.test(s)) {
-      return { results: [...creators.values()] };
-    }
-    if (/SELECT \* FROM creator_lists WHERE id =/i.test(s)) {
-      return { results: [] };
-    }
-    return { results: [] };
-  }
+
+  const q = (sql, ...args) => db.prepare(sql).all(...args.map(norm));
+
+  // Map-shaped views over the real tables, so assertions that predate the
+  // SQLite backing (db._creators.size, db._lists.has(id)) keep reading
+  // naturally. Live queries, not snapshots.
+  const tableView = (table, idCol) => ({
+    get size() { return Number(q(`SELECT COUNT(*) AS n FROM ${table}`)[0].n); },
+    has: (id) => q(`SELECT 1 FROM ${table} WHERE ${idCol} = ?`, id).length > 0,
+    get: (id) => q(`SELECT * FROM ${table} WHERE ${idCol} = ?`, id)[0],
+    keys: () => q(`SELECT ${idCol} AS id FROM ${table}`).map((r) => r.id),
+    values: () => q(`SELECT * FROM ${table}`),
+  });
+
+  // Standalone (not `this`-bound): one test hands these to a wrapper object.
+  const _stat = (kind, day) => {
+    const rows = q("SELECT n FROM stats WHERE kind = ? AND day = ?", kind, day);
+    return rows.length ? Number(rows[0].n) : undefined;
+  };
+  const _statBuckets = (kind) => q("SELECT day FROM stats WHERE kind = ?", kind).map((r) => r.day);
+
   return {
-    _creators: creators,
-    _lists: lists,
-    _stats: stats,
-    // Readable accessors so tests never have to know the composite-key encoding.
-    _stat: (kind, day) => stats.get(statKey(kind, day)),
-    _statBuckets: (kind) =>
-      [...stats.keys()].map((k) => k.split("\u0000")).filter(([kk]) => kk === kind).map(([, d]) => d),
+    _db: db,
+    _creators: tableView("creators", "username"),
+    _lists: tableView("creator_lists", "id"),
+    _stat,
+    _statBuckets,
+    q,
+    // Make chosen statements throw. `fn(sql, args) => boolean`; null clears.
+    failWhen(fn) { state.fail = fn; },
     prepare(sql) {
-      // Real D1's PreparedStatement exposes run()/all() directly, not only
-      // after .bind() -- bind() is only needed when the query actually has
-      // placeholders. A mock that required .bind() unconditionally masked
-      // any code path calling .prepare(sql).all()/.run() on a parameterless
-      // query (renderAdminDashboard's creator COUNT(*), for one).
-      return {
-        bind(...args) {
-          return {
-            run: async () => run(sql, args),
-            all: async () => all(sql, args),
-          };
+      // Real D1 exposes run()/all() directly as well as after .bind(), since
+      // bind() is only needed for a query that actually has placeholders.
+      // `_spec` lets batch() run the statements itself, synchronously -- see
+      // batch's own comment.
+      const mk = (args) => ({
+        _spec: { sql, args },
+        async run() { const r = exec(sql, args); return { success: true, meta: r.meta }; },
+        async all() { const r = exec(sql, args); return { success: true, results: r.results, meta: r.meta }; },
+        async first(col) {
+          const row = exec(sql, args).results[0] || null;
+          return col && row ? row[col] : row;
         },
-        run: async () => run(sql, []),
-        all: async () => all(sql, []),
-      };
+        bind: (...a) => mk(a),
+      });
+      return mk([]);
     },
+    // Atomic, and synchronous once entered. node:sqlite's DatabaseSync is a
+    // single synchronous connection, so awaiting each statement inside an
+    // explicit BEGIN lets a second overlapping batch open a nested
+    // transaction and throw -- which, since every counter call site swallows
+    // its errors, silently dropped 19 of 20 concurrent bumps and made the
+    // atomic-counter test fail for a reason that has nothing to do with the
+    // Worker. Running the statements straight through models what D1
+    // actually guarantees: a batch is one transaction, and batches do not
+    // interleave with each other.
     async batch(stmts) {
-      for (const st of stmts) {
-        if (st && typeof st.run === "function") await st.run();
+      const specs = stmts.map((st) => st && st._spec).filter(Boolean);
+      db.exec("BEGIN");
+      try {
+        const out = specs.map((sp) => {
+          const r = exec(sp.sql, sp.args);
+          return { success: true, meta: r.meta, results: r.results };
+        });
+        db.exec("COMMIT");
+        return out;
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
       }
     },
+    async exec(sql) { db.exec(String(sql)); return { count: 0, duration: 0 }; },
   };
 }
 
