@@ -12,6 +12,23 @@ globalThis.fetch=realFetch;
 const keys=[...kv._store.keys()].filter(k=>k!=="index:publiclists");
 console.log("keys written by a prewarm against an upstream that answers 200 {}:",keys.length);
 for(const k of keys.slice(0,12)) console.log(`  ${k}  ttl=${ttls.get(k)}  value=${String(kv._store.get(k)).slice(0,90)}`);
-const empties=keys.filter(k=>{const v=String(kv._store.get(k));return v==="[]"||v==="{}"||/"items":\[\]/.test(v)||/^\{"ts":\d+,"items":\[\]\}$/.test(v);});
+// The first version of this matcher looked for `[]`, `{}` or `"items":[]` and
+// so matched nothing at all -- the cache format is `{"data":...,"freshUntil":...}`
+// -- which made the probe print "empty payloads: 0" over a KV full of them.
+const empties=keys.filter(k=>/"data":(\[\]|\{\})/.test(String(kv._store.get(k))));
 console.log("\nof those, empty payloads:",empties.length,"e.g.",JSON.stringify(empties.slice(0,5)));
-console.log("longest TTL among them:",Math.max(...empties.map(k=>ttls.get(k)||0)));
+console.log("longest KV TTL among them:",empties.length?Math.max(...empties.map(k=>ttls.get(k)||0)):"n/a");
+
+// The KV TTL is retention, not freshness. What decides how long a person is
+// shown an empty chart is `freshUntil`, and the prewarm re-runs every few
+// minutes, so an empty cached on a cold start is retried well before the
+// 24h TTL. Reporting the TTL alone reads like a day-long outage; it isn't.
+const now=Date.now();
+const windows=empties.map(k=>{try{return Math.round((JSON.parse(String(kv._store.get(k))).freshUntil-now)/1000);}catch{return null;}}).filter(x=>x!==null);
+if(windows.length) console.log(`freshness window of an empty entry: ${Math.min(...windows)}-${Math.max(...windows)}s (that is how long it is served before a refresh is attempted, not the ${Math.max(...empties.map(k=>ttls.get(k)||0))}s TTL)`);
+
+// This is the cold-start case: nothing good was cached, so an empty answer is
+// all there is to serve and refusing to write it would only mean refetching
+// the same nothing. refuseEmptyOverwrite protects an EXISTING good value --
+// see p21 for that half, which is the one that matters.
+console.log("\n(cold start: no previous value existed, so writing the empty result is correct here -- p21 covers the overwrite case)");

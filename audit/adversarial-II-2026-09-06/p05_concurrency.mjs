@@ -73,8 +73,16 @@ rec("config save does not destroy channels", d.channels&&Object.keys(d.channels)
   const B=call(env4,"/api/creator/lists/save",{method:"POST",json:{...K4,slug:"shared",name:"Shared",type:"movie",visibility:"private",items:[{id:"1"},{id:"3"}]}});
   await Promise.all([A,B]);
   const stored=JSON.parse(kv4._store.get("creatorlist:concur4:shared"));
-  rec("list save offers some staleness protection", false,
-      `INFO ONLY: concurrent list edits last-write-wins, stored items = ${JSON.stringify(stored.items)}; endpoint accepts no expectedUpdatedAt`);
+  // This was INFO ONLY when the audit ran -- list records were the one
+  // wholesale write left out of the expectedUpdatedAt work, so two devices
+  // editing one list was last-write-wins with both answering 200. Now guarded,
+  // so it is a real assertion.
+  const base=await call(env4,"/api/creator/lists/save",{method:"POST",json:{...K4,slug:"shared",name:"Shared",type:"movie",visibility:"private",items:[{id:"1"}]}});
+  const dA=await call(env4,"/api/creator/lists/save",{method:"POST",json:{...K4,slug:"shared",name:"Shared",type:"movie",visibility:"private",items:[{id:"1"},{id:"2"}],expectedUpdatedAt:base.body.updatedAt}});
+  const dB=await call(env4,"/api/creator/lists/save",{method:"POST",json:{...K4,slug:"shared",name:"Shared",type:"movie",visibility:"private",items:[{id:"1"},{id:"3"}],expectedUpdatedAt:base.body.updatedAt}});
+  rec("a list save built on a superseded version is rejected",
+      dA.body.ok===true && dB.status===409 && dB.body.conflict===true,
+      `A=${dA.status} B=${dB.status} ${JSON.stringify(dB.body)}; last-write-wins snapshot was ${JSON.stringify(stored.items)}`);
 }
 
 // G: reorder vs save race on the single creatorlistorder key

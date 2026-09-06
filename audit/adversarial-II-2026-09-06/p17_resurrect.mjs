@@ -8,7 +8,7 @@
 //      landed during the first one;
 //   3. a purge on account creation, so a new account starts empty by
 //      construction however a stray key got there.
-import { makeKv, makeD1, makeEnv, call, createUser } from "../../tests/harness.mjs";
+import { makeKv, makeD1, makeEnv, call, createUser, lapseCreatorTombstone } from "../../tests/harness.mjs";
 const R = []; const rec = (n, ok, d) => { R.push({ n, ok }); console.log(ok ? "PASS" : "FAIL", "-", n, d ? "\n    " + d : ""); };
 
 // ---- A. a request that authenticates DURING the purge is refused ----
@@ -57,7 +57,7 @@ const R = []; const rec = (n, ok, d) => { R.push({ n, ok }); console.log(ok ? "P
 
   // Once the hold lapses, creation must still not hand over anything the
   // straggler left behind -- that is what the purge-on-create is for.
-  kv._store.delete("creatordeleted:ghostb");
+  lapseCreatorTombstone(env, "ghostb");
   const b = await call(env, "/api/creator/create", { method: "POST", json: { creatorName: "ghostb" } });
   const load = await call(env, "/api/creator/sync/load", { method: "POST", json: { creatorName: "ghostb", creatorKey: b.body.creatorKey } });
   const inherited = JSON.stringify(load.body.data.config) !== "[]" || Object.keys(load.body.data.keys || {}).length > 0;

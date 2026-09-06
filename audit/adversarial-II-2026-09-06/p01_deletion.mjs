@@ -1,5 +1,5 @@
 // Phase 33 + 13: account deletion proof, username reclaim, inheritance.
-import { makeKv, makeD1, makeEnv, call, createUser, nextIp } from "../../tests/harness.mjs";
+import { makeKv, makeD1, makeEnv, call, createUser, lapseCreatorTombstone, nextIp } from "../../tests/harness.mjs";
 import assert from "node:assert";
 
 const results = [];
@@ -52,7 +52,7 @@ async function populate(env, u, key) {
   await populate(env, "reclaim1", a.creatorKey);
   await call(env, "/api/creator/delete-account", { method: "POST", json: { creatorName: "reclaim1", creatorKey: a.creatorKey, confirm: "DELETE" } });
   // The hold has to lapse before the name is available again.
-  kv._store.delete("creatordeleted:reclaim1");
+  lapseCreatorTombstone(env, "reclaim1");
   const b = await createUser(env, "reclaim1");
   const lists = await call(env, "/api/creator/lists", { method: "POST", json: { creatorName: "reclaim1", creatorKey: b.creatorKey } });
   rec("reclaimed account has no inherited lists", Array.isArray(lists.body.lists) && lists.body.lists.length === 0, JSON.stringify(lists.body.lists));

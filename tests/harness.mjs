@@ -35,6 +35,24 @@ if (!globalThis.caches) {
 
 export const worker = (await import("../worker_entry_combined.js")).default;
 
+// A SECOND, independent instance of the Worker -- a different isolate.
+//
+// The Worker keeps per-isolate memory: PER_USER_CACHE_MAP (the shared chart
+// memo), the verified-key memo, the page memos. In a single Node process every
+// call goes through one module instance, so a test that calls the cron twice
+// gets the second one served entirely from that memory and never reaches KV or
+// the network at all -- which quietly turns "the second tick did not damage the
+// cache" into "the second tick did nothing", and a test asserting the former
+// into one that cannot fail.
+//
+// Importing the same file under a distinct URL gives a fresh module instance
+// with empty memos and the same KV underneath, which is what a request landing
+// on a cold colo actually looks like.
+let __isolateSeq = 0;
+export async function freshIsolate() {
+  return (await import(`../worker_entry_combined.js?isolate=${++__isolateSeq}`)).default;
+}
+
 const SCHEMA_SQL = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
 
 export function makeKv(initial = {}) {
@@ -238,6 +256,27 @@ export async function call(env, path, opts = {}) {
   let body = text;
   try { body = JSON.parse(text); } catch { /* html / empty */ }
   return { status: res.status, body, headers: res.headers, text };
+}
+
+// Fast-forwards past the hold a deleted username is kept under, so a test can
+// exercise re-registration without waiting out CREATOR_TOMBSTONE_TTL_SEC.
+//
+// There are two tombstones and a test that clears only one still fails: KV is
+// the copy every deployment has, D1 the strongly-consistent one that closes
+// the read-cache window when it is bound (see isCreatorTombstoned). Expiring
+// the D1 row rather than deleting it is deliberate -- that is what actually
+// happens in production, and it keeps the test honest about `until` being what
+// the check reads.
+export function lapseCreatorTombstone(env, username) {
+  if (env.CONFIGS && env.CONFIGS._store) env.CONFIGS._store.delete(`creatordeleted:${username}`);
+  if (env.DB && env.DB._db) {
+    try {
+      env.DB._db.exec(`UPDATE creator_tombstones SET until = 1 WHERE username = '${username}'`);
+    } catch {
+      // Table absent (a database provisioned before migration 0004) -- the KV
+      // copy above is the whole of the hold in that case.
+    }
+  }
 }
 
 export async function createUser(env, name, extra = {}) {

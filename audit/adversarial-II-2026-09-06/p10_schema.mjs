@@ -6,6 +6,8 @@ const m1 = readFileSync("../../migrations/0001a_add_likes_column.sql","utf8")
   + "\n" + readFileSync("../../migrations/0001b_add_likes_index.sql","utf8");
 const m2 = readFileSync("../../migrations/0002_add_stats_table.sql","utf8");
 const m3 = readFileSync("../../migrations/0003_add_missing_indexes.sql","utf8");
+const m4 = readFileSync("../../migrations/0004_add_creator_tombstones.sql","utf8");
+const m5 = readFileSync("../../migrations/0005_index_stats_totals.sql","utf8");
 
 function dump(db){
   const out={};
@@ -28,17 +30,24 @@ const fresh=new DatabaseSync(":memory:"); fresh.exec(schema);
 
 // MIGRATED: the shape that predates every migration, then all of them in
 // order. Pre-0001 creator_lists had no `likes` and no likes index; pre-0002
-// there was no `stats` table; pre-0003 neither of the two composite indexes.
+// there was no `stats` table; pre-0003 neither of the two composite indexes;
+// pre-0004 no `creator_tombstones`; pre-0005 no index over the `total` rows.
+//
+// Order matters when stripping: idx_stats_day_totals is an index ON stats, so
+// it has to go before the stats table itself does, or the reconstruction
+// leaves an index referencing a table that no longer exists.
 const preSchema = schema
   .replace(/\n\s*likes INTEGER NOT NULL DEFAULT 0,/,"")
+  .replace(/CREATE INDEX idx_stats_day_totals[^;]*;/,"")
   .replace(/DROP TABLE IF EXISTS stats;[\s\S]*?PRIMARY KEY \(kind, day\)\n\);/,"")
+  .replace(/DROP TABLE IF EXISTS creator_tombstones;[\s\S]*?until\s+INTEGER NOT NULL\n\);/,"")
   .replace(/CREATE INDEX idx_creator_lists_likes ON creator_lists\(likes\);/,"")
   .replace(/CREATE INDEX idx_creators_last_active[^;]*;/,"")
   .replace(/CREATE INDEX idx_creator_lists_vis_likes[^;]*;/,"");
 const strip = (sql) => sql.split("\n").filter(l => !l.trim().startsWith("--")).join("\n");
 const migrated=new DatabaseSync(":memory:");
 migrated.exec(preSchema);
-for (const m of [m1, m2, m3]) migrated.exec(strip(m));
+for (const m of [m1, m2, m3, m4, m5]) migrated.exec(strip(m));
 
 const a=dump(fresh), b=dump(migrated);
 const A=JSON.stringify(a,null,1), B=JSON.stringify(b,null,1);
@@ -60,7 +69,7 @@ console.log(JSON.stringify(a,null,1));
 console.log("\n-- migration rerun behaviour --");
 // Migrations are ordered, so each is tested on a database that already has
 // its predecessors -- 0003's composite index needs the column 0001a adds.
-const ordered = [["0001a+b",m1],["0002",m2],["0003",m3]];
+const ordered = [["0001a+b",m1],["0002",m2],["0003",m3],["0004",m4],["0005",m5]];
 for(let k=0;k<ordered.length;k++){
   const [name,sql]=ordered[k];
   const db=new DatabaseSync(":memory:"); db.exec(preSchema);

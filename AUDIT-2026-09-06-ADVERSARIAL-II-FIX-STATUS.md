@@ -10,7 +10,7 @@ A fix whose mutation leaves the suite green is called out below rather than
 counted as done — see "What the mutation run actually said", which is also
 where the one case of a *correctly* surviving mutation is explained.
 
-Suite: **253 tests, 252 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **262 tests, 261 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
 ### What the mutation run actually said
@@ -42,6 +42,39 @@ A surviving mutation means either the test is decorative or the mutated code
 was redundant. Telling those apart is the work; assuming the first and writing
 a brittle test to make the red go away is how a suite stops being worth
 running.
+
+### A third decorative test, found by re-running the probes
+
+Re-running every probe against the fixed code turned up one more, and it is the
+subtlest of the three. **§11.1's behavioural test asserted nothing.** It ran the
+cron once against a healthy provider, once against a provider answering 200 with
+an empty body, and checked the cached chart was unchanged — and it passed with
+the guard disabled.
+
+The reason is per-isolate state. The Worker keeps a shared-chart memo
+(`PER_USER_CACHE_MAP`) in module memory, and the whole suite runs in one Node
+process, so the second cron tick was served from that memo and made **zero**
+upstream calls. The KV copy was also still inside its ~10 minute freshness
+window, so no refresh would have been attempted anyway. "The cache was not
+damaged" and "nothing happened" are indistinguishable from outside, and the test
+was measuring the second.
+
+Two things fix it, and both are needed: make every KV copy stale, and run the
+second tick on a *different* isolate. `tests/harness.mjs` now exports
+`freshIsolate()`, which imports the Worker under a distinct URL to get a module
+instance with empty memos over the same KV — what a request landing on a cold
+colo actually looks like. The test now counts the upstream calls and asserts
+there were some, so it can never silently go hollow again. Reverting
+`refuseEmptyOverwrite` now fails it; before, it did not.
+
+`p21_cachepoison.mjs` — recorded in the report as **inconclusive** — was
+inconclusive for the same reason and is now decisive: 12/12 good chart entries
+survive an empty-200 tick with the guard, 3/12 without it. `p20_emptycache.mjs`
+had a broken detector of its own: it looked for `[]` and `"items":[]` while the
+cache format is `{"data":…,"freshUntil":…}`, so it printed "empty payloads: 0"
+over a KV holding 46 of them. Fixed, and it now also prints the freshness window
+(592–3600s) next to the 24h KV TTL, because quoting the TTL alone makes a
+ten-minute cold-start gap read like a day-long outage.
 
 ---
 
@@ -124,43 +157,92 @@ storage-missing, throttled, and not-authenticated distinguishable.
 |---|---|---|
 | **§11.1** | The audit filed this unconfirmed because it could show empty chart caches being *written* but not that they *overwrote good data*. They do: the write gate is only "not null and not undefined", so an empty array or object counts as a successful refresh and lands on all three tiers — isolate memo, KV copy, edge copy. That destroys the last-known-good data those tiers exist to hold, at exactly the moment the circuit breaker needs it, so a provider blip stopped being "slightly stale rows" and became "empty rows". Now refused, **opt-in**: a trending chart is never legitimately empty, but someone's Trakt watchlist is, so the four shared chart/collection fetchers opt in and every per-user fetcher deliberately does not. | `/tmp` probe reproduced in the suite; two tests, one pinning the split |
 
+## The remaining open items, closed in a second pass
+
+Everything the report left for later, apart from the two noted below as still
+open. Same verification standard: the probe that demonstrated it passes, and
+reverting the fix by mutation fails the suite.
+
+| ID | Was | Now | Verified by |
+|---|---|---|---|
+| **R1** | `publishedlist:user:{slug}` had **no delete path in any route**. Anyone could publish, unauthenticated, and nothing could remove it -- the admin creator-list endpoint could not be pointed at them either, because it validates the username and `user` is reserved. An operator facing abusive or infringing content had nothing but the Cloudflare KV dashboard. | `/admin/api/published-lists` (cursor-paged, so an unbounded keyspace can actually be walked) and `/admin/api/delete-published-list`, sharing the record + ledger + directory sweep and the same failure semantics as the creator path, plus an admin panel that browses and deletes them. | 12-assertion probe; suite |
+| **R2** (§11.4) | Two devices editing one list was last-write-wins with both answering 200 -- the one wholesale write left out of the `expectedUpdatedAt` work. | The same guard the sync blobs have, additive so an older client is unaffected, with `nextSyncVersion` so a frozen clock cannot defeat it. `updatedAt` now comes back on save so a client can advance its baseline. | `p05`; suite |
+| **R3** (N5's deletion half) | A colo whose KV cache predated both the tombstone and the `creator:` delete kept authenticating a deleted account. A missing `creators` row could not serve as proof, because that is the lazy-migration state. | `creator_tombstones` (migration 0004) -- a table whose rows mean one thing only. D1 is strongly consistent, so the marker is visible from anywhere on the next request. | probe; suite |
+| **R4** | The dashboard's counter panels ran `WHERE day='total' AND kind LIKE ? ORDER BY n DESC` -> `SCAN stats` plus a sort, over a table whose `kind` dimension is unbounded (`list_copy:{slug}` mints one per list). | `idx_stats_day_totals (day, n DESC, kind)` (migration 0005) -> `SEARCH stats USING COVERING INDEX (day=?)`. The sort disappears entirely, so `LIMIT` stops early instead of ranking everything first. | `EXPLAIN QUERY PLAN` |
+| **R5** (§11.3) | The list-order key is one key rewritten read-modify-write, and the handler wrote back the array it read at the top -- so entries added in between were dropped. Measured: 12 concurrent creations, 12 records, **9** order entries. | Re-read and union immediately before the write. Same measurement now: **12 of 12**. | `p06`; suite |
+
+**R3 and R5 are narrowed, not eliminated, and the tests say so.** R3 is closed
+only where D1 is bound; a KV-only deployment has no strongly-consistent store
+to ask, and the test asserts that as a known limit rather than pretending
+otherwise. R5 still has a window between its own get and put -- only moving
+ordering off a single key removes that, which is a data-model change.
+
+R5's residual window now has a number rather than a caveat. Under realistic
+latency the merge takes twelve concurrent creations from nine order entries to
+twelve. Replace that latency with a hard barrier -- all twelve blocked until
+all twelve have read the key -- and the result is **one** entry with the merge
+and one without it, because then every re-read happens before any write. The
+test carries that measurement in a comment so it is not mistaken for a proof of
+correctness under arbitrary interleaving.
+
+**R1 needed a UI, not just two routes.** An endpoint an operator cannot reach
+is not a fix: `/admin/api/published-lists` is cursor-paged over an unbounded
+keyspace, and without something to walk it, finding an abusive list still meant
+knowing its slug in advance. The admin page now has an "Anonymously published
+lists" panel that browses (Load more follows the cursor until it goes null),
+selects into the slug box rather than deleting on click, and batches the delete
+the same way the creator-list panel does. The paging contract has its own test:
+both of its failure modes -- a cursor that never goes null, and one that goes
+null early and shows the operator a truncated list -- are silent.
+
 ## Deliberately not done
 
-**§11.3 — `creatorlistorder:` lost updates.** A single-key read-modify-write
-loses entries under concurrency (3 of 12 measured). The dashboard's orphan
-sweep already masks it, so the visible symptom is only that a user's chosen
-ordering loses positions. Fixing it properly means moving ordering off one key,
-which is a data-model change, not a patch.
+**Behavioural coverage of the client.** 35,225 of the 59,240 source lines are
+the builder UI (09-24). The suite reaches them through targeted
+function-loading tests and the render checks -- syntax, duplicate top-level
+declarations, inline handler resolution -- but nothing exercises the UI as a
+whole. Both audits have been server-side audits; this is where a different
+class of defect would be.
 
-**§11.4 — no staleness guard on `/api/creator/lists/save`.** Two devices
-editing the same list is last-write-wins. Extending `expectedUpdatedAt` to list
-records is a client-and-server change with its own compatibility story, and it
-was left out of the sync-blob work deliberately enough that it deserves its own
-decision.
-
-**Anonymous published lists cannot be deleted.** Already known and still open —
-`publishedlist:user:*` has no delete path in any route. It needs an admin
-endpoint and a decision about who may remove someone else's anonymous list.
-
-**N5's deletion half.** The D1 preference closes the rotation window. A colo
-that has seen neither the tombstone nor the deletion can still authenticate a
-deleted account briefly, because a missing D1 row is indistinguishable from
-"not migrated yet" by design. Closing it properly needs a deletion marker in
-D1, which is a schema change.
+**Pruning `creator_tombstones`.** Rows are inert once `until` has passed, and
+one row per deleted account is a rounding error next to the accounts
+themselves, so nothing sweeps them. A deployment that wants to can delete
+expired rows safely.
 
 ---
 
 ## Verification
 
 ```bash
-node --test tests/*.test.mjs        # 250 tests, 249 pass, 1 skipped
+node --test tests/*.test.mjs        # 262 tests, 261 pass, 1 skipped
 bash verify.sh                      # build drift, syntax, page render, map, tests
 python3 check_sync.py               # byte-exact rebuild check on its own
 
 for f in audit/adversarial-II-2026-09-06/p*.mjs; do node "$f"; done
 ```
 
+All 26 probes were re-run against the fixed code. Four needed changes, and none
+of them because a fix regressed:
+
+| Probe | Why it changed |
+|---|---|
+| `p04_kvd1.mjs` | asserted the D1 like count converges after a **rename**. It does not, deliberately — `/api/lists/like` owns that column, so `lists/save` binds `likes` on INSERT and leaves it out of the `DO UPDATE`. Now asserts what actually holds: no read path shows the stale count, and `migrate-d1` converges the mirror (0 → 3). That is the repair N9 restored, and it has a regression test now too. |
+| `p10_schema.mjs` | reconstructs the pre-migration schema by stripping from `schema.sql`; migrations 0004 and 0005 added a table and an index it did not know to strip, so it crashed on `no such table: main.stats`. Now strips and applies both, and checks their reruns. |
+| `p20_emptycache.mjs` | broken empty-payload detector, and TTL-vs-freshness (above). |
+| `p21_cachepoison.mjs` | inconclusive → decisive (above). |
+| `p26_verify.mjs` | its "nothing can delete an anonymous list" check is still true of `delete-creator-list` and still correct; it now also exercises the two routes R1 added. |
+
 Mutation testing, re-run against the fixed code: seventeen mutations, one per
 fix, each reverted alone and the suite re-run. **15 caught, 2 survived** — one
 a decorative test since replaced, one a genuinely redundant line. Both are
 explained above. See the audit's §9 for the method.
+
+The second pass has its own set, `audit/adversarial-II-2026-09-06/mutate4.sh`:
+eight mutations across R1, R2, R3, R5 and the paging cursor, **8 caught, 0
+survived**. R4 is an index, so a mutation is meaningless there — it is verified
+by `EXPLAIN QUERY PLAN` instead.
+
+One caution learned from running it: a mutation whose search string contains a
+backtick or `${...}` must be escaped, or the shell rewrites it, nothing matches,
+and the run prints `SKIP` — which is easy to read past as a result. R5's
+mutation did exactly that on the first run and was re-run by hand.

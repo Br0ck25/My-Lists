@@ -2004,6 +2004,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
       <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Anonymously published lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Lists published without a Creator Profile, under the shared <code>user</code> namespace. Anyone can create one and no owner exists to ask, so this is the only way to remove one. Browse to find a list, or type slugs directly if you already know them.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseAnonBtn" onclick="loadPublishedLists(true)">Browse</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseAnonMoreBtn" onclick="loadPublishedLists(false)" hidden>Load more</button>
+        <span id="anonListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="anonListResults" style="margin-bottom:8px;"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteAnonSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:320px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
+      <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
   </div>
 
   <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
@@ -2428,6 +2445,141 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
           ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
           (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Anonymous published lists (publishedlist:user:*). These have no owner,
+    // so runDeleteCreatorLists above cannot reach them -- it requires a
+    // creator username, and "user" is a reserved one. The keyspace is
+    // unbounded by construction, so this pages rather than scanning: the
+    // cursor is kept here between calls and "Load more" continues it.
+    let anonListCursor = null;
+    let anonListCount = 0;
+
+    async function loadPublishedLists(reset) {
+      const btn = document.getElementById('browseAnonBtn');
+      const moreBtn = document.getElementById('browseAnonMoreBtn');
+      const status = document.getElementById('anonListStatus');
+      const results = document.getElementById('anonListResults');
+      if (reset) {
+        anonListCursor = null;
+        anonListCount = 0;
+        results.innerHTML = '';
+        moreBtn.hidden = true;
+      }
+      btn.disabled = true;
+      moreBtn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const qs = '?limit=50' + (anonListCursor ? '&cursor=' + encodeURIComponent(anonListCursor) : '');
+        const res = await fetch('/admin/api/published-lists' + qs);
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          moreBtn.disabled = false;
+          return;
+        }
+        const lists = data.lists || [];
+        anonListCount += lists.length;
+        if (!anonListCount) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No anonymously published lists.</p>';
+        } else {
+          const rows = lists.map(function (L) {
+            const vis = L.visibility ? escapeHtmlAdmin(L.visibility) : 'unreadable';
+            return '<tr>' +
+              '<td style="padding:4px 8px 4px 0;"><button type="button" class="admin-select" data-anon-slug="' +
+                escapeHtmlAdmin(L.slug) + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem;">Select</button></td>' +
+              '<td style="padding:4px 8px 4px 0;"><code>' + escapeHtmlAdmin(L.slug) + '</code></td>' +
+              '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(L.name) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.itemCount) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.likes) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0;">' + vis + '</td>' +
+              '<td style="padding:4px 0;"><a href="' + escapeHtmlAdmin(L.url) + '" target="_blank" rel="noopener">open</a></td>' +
+              '</tr>';
+          }).join('');
+          if (reset || !results.querySelector('tbody')) {
+            results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+              '<thead><tr style="color:#8E8E93; text-align:left;">' +
+              '<th></th><th style="padding-right:8px;">Slug</th><th style="padding-right:8px;">Name</th>' +
+              '<th style="padding-right:8px; text-align:right;">Items</th>' +
+              '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+              '<th style="padding-right:8px;">Visibility</th><th></th>' +
+              '</tr></thead><tbody>' + rows + '</tbody></table>';
+          } else {
+            results.querySelector('tbody').insertAdjacentHTML('beforeend', rows);
+          }
+        }
+        anonListCursor = data.cursor || null;
+        moreBtn.hidden = !anonListCursor;
+        status.textContent = anonListCount + ' list' + (anonListCount === 1 ? '' : 's') + ' shown' +
+          (anonListCursor ? ', more available.' : '. That is all of them.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+      moreBtn.disabled = false;
+    }
+
+    // "Select" fills the slug box rather than deleting directly: a one-click
+    // delete next to a browse list is how the wrong list gets removed.
+    document.getElementById('anonListResults').addEventListener('click', function (ev) {
+      const btn = ev.target.closest('[data-anon-slug]');
+      if (!btn) return;
+      const input = document.getElementById('deleteAnonSlugsInput');
+      const slug = btn.getAttribute('data-anon-slug');
+      const current = (input.value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (current.indexOf(slug) === -1) current.push(slug);
+      input.value = current.join(', ');
+      document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
+    });
+
+    // Same shape as runDeleteCreatorLists: irreversible, so it names what it
+    // is about to remove, and batches to ADMIN_LIST_DELETE_MAX per call.
+    async function runDeletePublishedLists() {
+      const btn = document.getElementById('deleteAnonBtn');
+      const status = document.getElementById('deleteAnonStatus');
+      const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
+      const slugs = raw.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
+        (slugs.length === 1 ? '' : 's') + '?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\n\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-published-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', ' + missing +
+          ' slug' + (missing === 1 ? '' : 's') + ' had no list to remove.';
+        document.getElementById('deleteAnonSlugsInput').value = '';
+        if (anonListCount) await loadPublishedLists(true);
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
