@@ -5365,3 +5365,310 @@ describe("Test-suite blind spots named by the audit", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Second adversarial audit (AUDIT-2026-09-06-ADVERSARIAL-II.md).
+//
+// One test per finding, each written to fail on the code as it was rather than
+// to describe the fix. Where the audit's mutation testing found the suite
+// silent about something, the guard for it is here too.
+// ---------------------------------------------------------------------------
+describe("N1/N2: a delete that did not delete must not report success", () => {
+  const seedPublicList = async (env, user) => {
+    const u = await createUser(env, user);
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: user, creatorKey: u.creatorKey,
+      name: "Live List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    await call(env, "/lists/public.json"); // materialise the directory index
+    return u;
+  };
+  const inDirectory = (kv, frag) => {
+    const raw = kv._store.get("index:publiclists");
+    return raw ? JSON.parse(raw).entries.some((e) => String(e.id).includes(frag)) : false;
+  };
+
+  it("lists/delete reports failure when the KV record could not be removed", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await seedPublicList(env, "n1user");
+    kv._hooks.beforeDelete = async (k) => { if (k.startsWith("creatorlist:")) throw new Error("KV unavailable"); };
+    const r = await call(env, "/api/creator/lists/delete", { method: "POST", json: {
+      creatorName: "n1user", creatorKey: u.creatorKey, slug: "live-list",
+    }});
+    kv._hooks.beforeDelete = null;
+    // Before: {ok:true} while the record stayed in KV and the public page kept
+    // serving it -- with the D1 row gone, so the admin panel disagreed.
+    assert.notEqual(r.body.ok, true, "a delete that deleted nothing must not answer ok:true");
+    const page = await call(env, "/lists/n1user/live-list.json");
+    assert.ok(r.body.ok !== true || page.status === 404,
+      "if it claims success the list must actually be gone");
+  });
+
+  it("every account and list delete path reports a failed directory removal", async () => {
+    const cases = [
+      ["lists/delete", async (env, user, key) => call(env, "/api/creator/lists/delete", {
+        method: "POST", json: { creatorName: user, creatorKey: key, slug: "live-list" } })],
+      ["account/reset", async (env, user, key) => call(env, "/api/creator/account/reset", {
+        method: "POST", json: { creatorName: user, creatorKey: key, confirm: "RESET" } })],
+      ["delete-account", async (env, user, key) => call(env, "/api/creator/delete-account", {
+        method: "POST", json: { creatorName: user, creatorKey: key, confirm: "DELETE" } })],
+      ["make private", async (env, user, key) => call(env, "/api/creator/lists/save", {
+        method: "POST", json: { creatorName: user, creatorKey: key, slug: "live-list",
+          name: "Live List", type: "movie", visibility: "private", items: [{ id: "tt1" }] } })],
+    ];
+    for (const [label, run] of cases) {
+      const kv = makeKv();
+      const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+      const user = "n2" + label.replace(/[^a-z]/g, "").slice(0, 12);
+      const u = await seedPublicList(env, user);
+      kv._hooks.beforePut = async (k) => { if (k === "index:publiclists") throw new Error("KV unavailable"); };
+      const r = await run(env, user, u.creatorKey);
+      kv._hooks.beforePut = null;
+      // removeListsFromPublicIndex's own comment: "a caller that ignores a
+      // false here is reporting a privacy change that did not happen". Three
+      // of its four callers did exactly that.
+      assert.notEqual(r.body.ok, true,
+        `${label} claimed success while the list was still in the directory`);
+      assert.ok(inDirectory(kv, user), `precondition for ${label}: the removal really did fail`);
+    }
+  });
+
+  it("a removal the index write could not apply is still not served", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await seedPublicList(env, "n2serve");
+    kv._hooks.beforePut = async (k) => { if (k === "index:publiclists") throw new Error("KV unavailable"); };
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: {
+      creatorName: "n2serve", creatorKey: u.creatorKey, slug: "live-list",
+    }});
+    kv._hooks.beforePut = null;
+    // The entry is still physically in the index -- the write failed -- but
+    // the removal tombstone means the read path must not serve it, instead of
+    // advertising a deleted list until the next daily rebuild.
+    assert.ok(inDirectory(kv, "n2serve"), "precondition: the stale entry is still in the stored index");
+    const dir = await call(env, "/lists/public.json");
+    assert.ok(!JSON.stringify(dir.body).includes("n2serve"),
+      "the directory must not serve an entry whose removal was recorded");
+  });
+});
+
+describe("N3: /api/lists/like must not see past a list's visibility", () => {
+  it("answers a private list exactly as it answers one that does not exist", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "n3owner");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3owner", creatorKey: u.creatorKey,
+      name: "Secret Movies", type: "movie", visibility: "private", items: [{ id: "tt-secret" }],
+    }});
+
+    const missing = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.5",
+      json: { username: "n3owner", slug: "no-such-list-at-all" } });
+    const priv = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.6",
+      json: { username: "n3owner", slug: "secret-movies" } });
+
+    // Before: 404 vs 200, which told any anonymous caller which private slugs
+    // a creator owned. Usernames are published by /lists/public.json.
+    assert.equal(priv.status, missing.status, "a private list must not be distinguishable from a missing one");
+    assert.deepEqual(priv.body, missing.body);
+
+    const rec = JSON.parse(kv._store.get("creatorlist:n3owner:secret-movies"));
+    assert.equal(rec.likes || 0, 0, "a stranger must not be able to change a private list's like count");
+    assert.ok(!kv._store.has("listlikevoters:n3owner:secret-movies"),
+      "and must not mint a permanent ledger key for it");
+
+    // The count a stranger built up while it was private must not appear in
+    // the directory the moment the owner publishes.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3owner", creatorKey: u.creatorKey, slug: "secret-movies",
+      name: "Secret Movies", type: "movie", visibility: "public", items: [{ id: "tt-secret" }],
+    }});
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n3owner:secret-movies")).likes || 0, 0);
+  });
+
+  it("still lets a public list be liked", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "n3public");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3public", creatorKey: u.creatorKey,
+      name: "Open List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    const r = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.7",
+      json: { username: "n3public", slug: "open-list" } });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.likes, 1);
+  });
+});
+
+describe("N9: migrate-d1 must be able to repair a drifted list row", () => {
+  it("rewrites name, type, items and updatedAt from KV, not just likes", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "n9user");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9user", creatorKey: u.creatorKey,
+      name: "Correct Name", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    // The state a swallowed D1 write during an edit leaves behind.
+    db._db.exec("UPDATE creator_lists SET name='Stale Name', items_json='[]', updated_at=1 WHERE id='n9user:correct-name'");
+
+    const cookie = await adminCookie(env);
+    let r, guard = 0;
+    do { r = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie, json: {} }); }
+    while (!r.body.done && ++guard < 30);
+
+    const row = db._lists.get("n9user:correct-name");
+    // Before: DO UPDATE set only likes and visibility, so the documented
+    // repair tool could create a row but never correct one.
+    assert.equal(row.name, "Correct Name", "migrate-d1 must repair a drifted name");
+    assert.equal(row.items_json, JSON.stringify([{ id: "tt1" }]), "and drifted items");
+  });
+});
+
+describe("N10: a response carrying one account's private data is never cacheable", () => {
+  it("marks every account-scoped endpoint no-store", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "n10user");
+    const K = { creatorName: "n10user", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/sync/save", { method: "POST", json: {
+      ...K, config: [{ a: 1 }], keys: { tmdbKey: "SECRET" },
+    }});
+    for (const p of ["/api/creator/sync/load", "/api/creator/lists", "/api/creator/sync/meta",
+      "/api/creator/restore", "/api/creator/track-status"]) {
+      const r = await call(env, p, { method: "POST", json: K });
+      assert.equal(r.body.ok, true, `${p} should have succeeded`);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} returns account-private data under a cacheable header`);
+    }
+    // sync/load is the sharpest one: it hands back the account's own provider
+    // API keys.
+    const load = await call(env, "/api/creator/sync/load", { method: "POST", json: K });
+    assert.equal(load.body.data.keys.tmdbKey, "SECRET", "precondition: it really does return the keys");
+  });
+
+  it("does not let list search cache a list that has since been unpublished", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const r = await call(env, "/api/search-published-lists?q=anything");
+    const cc = r.headers.get("cache-control") || "";
+    const maxAge = Number((cc.match(/max-age=(\d+)/) || [])[1] || Infinity);
+    // A GET, so browsers and shared caches really do store it. At the
+    // inherited hour, a list made private stayed findable long after the API
+    // stopped returning it.
+    assert.ok(maxAge <= 120, `search was cacheable for ${maxAge}s; the directory itself uses 120`);
+  });
+});
+
+describe("N11: verifying a Creator Key is bounded, not free", () => {
+  // Read from the source rather than hardcoded, so raising the ceiling does
+  // not quietly turn this into a test of nothing. Not via
+  // loadSourceFunctions: a top-level `const` lives in the script's lexical
+  // scope and never becomes a property of the vm sandbox, so that would hand
+  // back undefined and the loop below would silently run zero times.
+  const CAP = Number(
+    /const CREATOR_AUTH_VERIFY_PER_MINUTE = (\d+)/.exec(
+      fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8"),
+    )[1],
+  );
+  assert.ok(Number.isFinite(CAP) && CAP > 0, "could not read the verification cap");
+
+  it("throttles a flood of key checks on a route that is not restore", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    await createUser(env, "n11user");
+    const ip = "203.0.113.99";
+    let throttled = 0;
+    for (let i = 0; i < CAP + 15; i++) {
+      const r = await call(env, "/api/creator/sync/load", { method: "POST", ip, json: {
+        creatorName: "n11user", creatorKey: "MYL-AAAA-BBBB-" + String(i).padStart(4, "0"),
+      }});
+      if (r.status === 429) throttled++;
+    }
+    // Before: every one of these ran PBKDF2 at 100k iterations -- ~15ms of CPU
+    // each -- unauthenticated and uncounted, on any of sixteen routes.
+    assert.ok(throttled > 0, "an unauthenticated flood of key checks must eventually be refused");
+  });
+
+  it("does not throttle a signed-in client whose key the isolate already verified", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "n11warm");
+    const K = { creatorName: "n11warm", creatorKey: u.creatorKey };
+    const ip = "203.0.113.98";
+    for (let i = 0; i < CAP + 40; i++) {
+      const r = await call(env, "/api/creator/sync/meta", { method: "POST", ip, json: K });
+      assert.equal(r.body.ok, true, `a memoized key must not be charged (failed at attempt ${i})`);
+    }
+  });
+});
+
+describe("test-suite blind spots the audit's mutation testing found", () => {
+  // M15 -- nothing covered the per-IP account creation limit at all.
+  it("M15: creating profiles is rate limited per IP", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ip = "203.0.113.150";
+    const first = await call(env, "/api/creator/create", { method: "POST", ip, json: { creatorName: "ratefirst" } });
+    assert.equal(first.body.ok, true);
+    const second = await call(env, "/api/creator/create", { method: "POST", ip, json: { creatorName: "ratesecond" } });
+    assert.equal(second.status, 429, "a second profile from the same IP inside the window must be refused");
+    assert.ok(!env.CONFIGS._store.has("creator:ratesecond"), "and must not have been created");
+  });
+
+  // M11 -- nothing proved a rotated key stops working from a WARM isolate,
+  // which is the case invalidateCreatorAuthMemo exists for.
+  it("M11: a rotated key stops working even after the old one was just verified", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "m11user", { recoveryAnswer: "a long recovery answer" });
+    // Verify the old key first, so it is sitting in this isolate's memo.
+    const warm = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: u.creatorKey,
+    }});
+    assert.equal(warm.body.ok, true, "precondition: the old key is memoized");
+
+    const rotated = await call(env, "/api/creator/reset-key", { method: "POST", json: {
+      username: "m11user", recoveryAnswer: "a long recovery answer",
+    }});
+    assert.equal(rotated.body.ok, true);
+
+    const old = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: u.creatorKey,
+    }});
+    assert.equal(old.status, 401, "the old key must stop working immediately, memo or no memo");
+    const fresh = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: rotated.body.creatorKey,
+    }});
+    assert.equal(fresh.body.ok, true, "and the new one must work");
+  });
+
+  // M22 -- the share allow-list had no test.
+  it("M22: only the three tracking slugs can be shared", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "m22user");
+    const K = { creatorName: "m22user", creatorKey: u.creatorKey };
+    const bad = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: {
+      ...K, slug: "anything-else", shared: true,
+    }});
+    assert.equal(bad.status, 400);
+    const stored = env.CONFIGS._store.get("creatorshare:m22user");
+    assert.ok(!stored || !JSON.parse(stored)["anything-else"],
+      "a slug outside the allow-list must not be recorded as shared");
+    for (const slug of ["watchlist", "watch-history", "continue-watching"]) {
+      const ok = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: { ...K, slug, shared: true } });
+      assert.equal(ok.body.ok, true, `${slug} must still be shareable`);
+    }
+  });
+
+  // M9 -- the numbered scan's exact bound was never pinned, so an off-by-one
+  // in how many candidates it tries went unnoticed.
+  it("M9: slug allocation tries every numbered candidate before falling back", async () => {
+    const { pickFreeSlug } = loadSourceFunctions("02_http-and-creator-utils.js");
+    const tried = [];
+    const slug = await pickFreeSlug("movies", async (candidate) => {
+      tried.push(candidate);
+      return candidate !== "movies-10"; // only the LAST numbered candidate is free
+    });
+    assert.equal(slug, "movies-10",
+      "the numbered scan must reach -10; a bound that stops earlier silently falls back to a random suffix");
+    assert.deepEqual(tried.slice(0, 10),
+      ["movies", "movies-2", "movies-3", "movies-4", "movies-5", "movies-6", "movies-7", "movies-8", "movies-9", "movies-10"]);
+  });
+});
