@@ -6,7 +6,7 @@ import { makeKv, makeD1, makeEnv, call, createUser } from "../../tests/harness.m
 const kv = makeKv(), db = makeD1(), env = makeEnv({ CONFIGS: kv, DB: db });
 const u = await createUser(env, "brute1");
 
-async function hammer(label, fn, n = 60) {
+async function hammer(label, fn, n = 90) {
   let accepted = 0, throttled = 0, rejected = 0;
   for (let i = 0; i < n; i++) {
     const r = await fn(i);
@@ -41,5 +41,22 @@ await hammer("/api/creator/sync/load (same IP)", i =>
 await hammer("/api/creator/reset-key (same IP)", i =>
   call(env, "/api/creator/reset-key", { method: "POST", ip, json: { username: "brute1", recoveryAnswer: "guess" + i } }));
 
-console.log("\nEvery row above with NO THROTTLE runs a full PBKDF2-100k verification per request,");
-console.log("unauthenticated and uncounted.");
+console.log(`
+Reading this output after the fix:
+
+  Rows that now throttle do so because authenticateCreator charges a per-IP
+  bucket for every verification the isolate memo cannot answer -- i.e. for
+  every real PBKDF2 run -- so the CPU, not the request, is what is bounded.
+
+  Two rows still report NO THROTTLE and both are expected:
+
+  * restore with ROTATING IPs. A per-IP bucket cannot see a rotating source
+    by construction. What it buys is that each address gets its own small CPU
+    budget rather than an unlimited one. Guessing is bounded by the key
+    itself: ~60 bits, which is not reachable. The recovery ANSWER is the weak
+    secret, and that one has a per-account budget as well as a per-IP one.
+
+  * reset-key. It never calls authenticateCreator -- it verifies the recovery
+    answer directly -- and is already capped at 10 attempts per IP per day
+    plus a per-account failure budget. It answers a refusal with 200 and
+    ok:false rather than 429, which is why this probe does not count it.`);

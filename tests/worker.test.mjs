@@ -5038,18 +5038,157 @@ describe("P3: hygiene findings", () => {
     assert.equal(again.body.results.stats, 0, "a second run must not claim to have migrated counters again");
   });
 
-  it("A17: the Continue Watching cron cursor does not advance past work it never did", async () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
-    const fn = src.slice(src.indexOf("async function checkForNewEpisodes"));
-    const next = fn.indexOf("\nasync function ", 1);
-    const body = next === -1 ? fn : fn.slice(0, next);
-    // The READ of the cursor legitimately comes first; it is the PUT that
-    // must not happen until the batch has been processed.
-    const cursorWrite = body.indexOf("CONFIGS.put('cron:continuewatching:cursor'");
-    const loopStart = body.indexOf("for (const key of listResult.keys)");
-    assert.ok(cursorWrite > 0 && loopStart > 0, "could not find the cursor write or the account loop");
-    assert.ok(cursorWrite > loopStart,
-      "the cursor must be committed after the batch is processed, not before it starts");
+  // This used to match on the source text -- it looked for the cursor PUT
+  // appearing after the account loop in the file. That is not a test of
+  // anything: it passed happily while the loop could still break out of a page
+  // it had not finished and let the cursor jump the rest of it, and a mutation
+  // that moved the write back above the loop was caught only because of where
+  // the characters were, not what the code did. Both are behavioural now.
+  it("A17/N6: the Continue Watching cron never advances past an account it did not sweep", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ episodes: [] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+    try {
+      const kv = makeKv();
+      // 30 accounts across two pages of 25. The first is a heavy user whose
+      // fully-watched list alone can exhaust the whole per-tick show budget.
+      for (let i = 0; i < 30; i++) {
+        const u = `cronfair${String(i).padStart(2, "0")}`;
+        kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "h", createdAt: 1 }));
+        const shows = i === 0 ? 200 : 1;
+        const ids = [], hist = [];
+        for (let s = 0; s < shows; s++) {
+          ids.push(`tt${i}_${s}`);
+          hist.push({ type: "episode", showId: `tt${i}_${s}`, seasonNum: 1, episodeNum: 1, showTitle: "S" });
+        }
+        kv._store.set(`creatorsynctracking:${u}`, JSON.stringify({
+          fullyWatchedShowIds: ids, watchHistory: hist, continueWatching: [], updatedAt: 1,
+        }));
+      }
+
+      const swept = new Set();
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k.startsWith("creatorsynctracking:")) swept.add(k.slice("creatorsynctracking:".length));
+        return origGet(k, t);
+      };
+
+      const env = { CONFIGS: kv, TMDB_API_KEY: "test-key" };
+      for (let tick = 0; tick < 8; tick++) {
+        const pending = [];
+        await worker.scheduled({ cron: "*/6 * * * *" }, env, {
+          waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+        });
+        await Promise.all(pending);
+      }
+      kv.get = origGet;
+
+      const never = [];
+      for (let i = 0; i < 30; i++) {
+        const u = `cronfair${String(i).padStart(2, "0")}`;
+        if (!swept.has(u)) never.push(u);
+      }
+      // Before: one heavy account exhausted the shared budget, the loop broke
+      // out of its page, and the cursor advanced to the end of that page
+      // anyway -- so accounts 01..24 were never swept on any cycle.
+      assert.deepEqual(never, [],
+        `every account must be reached; these never were: ${never.join(", ")}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("N7: one account that fails does not stop the sweep, and a rejected cursor does not wedge it", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ episodes: [] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+    try {
+      const kv = makeKv();
+      for (let i = 0; i < 5; i++) {
+        const u = `cronpoison${i}`;
+        kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "h", createdAt: 1 }));
+        kv._store.set(`creatorsynctracking:${u}`, JSON.stringify({
+          fullyWatchedShowIds: [`tt${i}`],
+          watchHistory: [{ type: "episode", showId: `tt${i}`, seasonNum: 1, episodeNum: 1 }],
+          continueWatching: [],
+        }));
+      }
+      // Account 2's tracking key will not read.
+      kv._hooks.beforeGet = async (k) => {
+        if (k === "creatorsynctracking:cronpoison2") throw new Error("KV get failed for this one key");
+      };
+      const reached = new Set();
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k.startsWith("creatorsynctracking:")) reached.add(k.slice("creatorsynctracking:".length));
+        return origGet(k, t);
+      };
+
+      const env = { CONFIGS: kv, TMDB_API_KEY: "test-key" };
+      const tick = async () => {
+        const pending = [];
+        await worker.scheduled({ cron: "x" }, env, {
+          waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+        });
+        await Promise.all(pending);
+      };
+      await tick();
+      kv.get = origGet;
+      kv._hooks.beforeGet = null;
+
+      // Before: the sweep threw at account 2 and the cursor was never written,
+      // so every later account was unreachable on every subsequent tick too.
+      assert.ok(reached.has("cronpoison3") && reached.has("cronpoison4"),
+        `the sweep must continue past a failing account; reached: ${[...reached].join(", ")}`);
+
+      // And a stored cursor KV rejects must be cleared rather than retried forever.
+      kv._store.set("cron:continuewatching:cursor", "NO-LONGER-A-VALID-CURSOR");
+      kv._hooks.beforeList = async (_prefix, cursor) => {
+        if (cursor) throw new Error("KV list failed: invalid cursor");
+      };
+      await tick();
+      kv._hooks.beforeList = null;
+      assert.notEqual(kv._store.get("cron:continuewatching:cursor"), "NO-LONGER-A-VALID-CURSOR",
+        "a cursor the binding rejects must be dropped so the next tick can start over");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("N8: scheduled() does not reject when everything inside it fails", async () => {
+    const dead = {
+      get: async () => { throw new Error("KV down"); },
+      put: async () => { throw new Error("KV down"); },
+      list: async () => { throw new Error("KV down"); },
+      delete: async () => { throw new Error("KV down"); },
+    };
+    const pending = [];
+    await worker.scheduled({ cron: "x" }, { CONFIGS: dead, TMDB_API_KEY: "k" }, {
+      waitUntil(p) { pending.push(p); },
+    });
+    // Before: checkForNewEpisodes had no error handling at all, so a dead KV
+    // rejected it, Promise.all rejected with it, and the rejection escaped the
+    // handler -- Cloudflare recorded the tick as failed with no indication of
+    // which task broke. Two independent changes now stop that: each task
+    // handles its own failure, and scheduled() wraps each one anyway.
+    await assert.doesNotReject(Promise.all(pending));
+
+    // The per-task wrappers are belt-and-braces at this point, so removing
+    // them alone would not fail the assertion above. What must not regress is
+    // the SYNCHRONOUS boundary -- before it, anything thrown before waitUntil
+    // was even reached escaped scheduled() directly.
+    const hostileEnv = new Proxy({ CONFIGS: dead, TMDB_API_KEY: "k" }, {
+      get(target, prop) {
+        if (prop === "TRAKT_CLIENT_ID") throw new Error("env access exploded");
+        return target[prop];
+      },
+    });
+    await assert.doesNotReject(
+      worker.scheduled({ cron: "x" }, hostileEnv, { waitUntil() {} }),
+      "a throw before the tasks are queued must not escape scheduled()",
+    );
   });
 
   it("A18: the daily shuffle rolls over on the same calendar day as every counter", async () => {

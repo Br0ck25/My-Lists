@@ -158,6 +158,26 @@ function jsonPublic(data, status = 200, extraHeaders = {}) {
   return json(data, status, { ...corsHeaders(), ...extraHeaders });
 }
 
+// For a response whose BODY belongs to one account: their lists (public and
+// private), their synced config, the provider API keys inside it, their
+// playback diagnostics, their identity.
+//
+// json() above defaults a successful 2xx to `max-age=3600` with no `Vary`,
+// and that default is deliberate -- it is what keeps the catalog and provider
+// endpoints inside upstream rate limits. The mistake was letting the
+// account-scoped endpoints inherit it. Failures were given `no-store`, and so
+// were the two routes that hand back a plaintext Creator Key and the admin
+// endpoints; /api/creator/sync/load, which returns the account's own TMDB /
+// Trakt / MDBList / Simkl credentials, was not.
+//
+// These are POSTs, so in practice the method is what stops a browser cache
+// storing them rather than the header -- which is exactly why this exists as
+// one helper rather than a note at each call site. Naming the property makes
+// it survive the next endpoint.
+function jsonPrivate(data, status = 200, extraHeaders = {}) {
+  return json(data, status, { "Cache-Control": "no-store", ...extraHeaders });
+}
+
 // Turns an exception into something safe to hand back to a caller, and logs
 // the original.
 //
@@ -471,6 +491,25 @@ async function verifyCreatorKeyMemoized(key, storedHash, username) {
     CREATOR_AUTH_MEMO.set(memoKey, now + CREATOR_AUTH_MEMO_TTL_MS);
   }
   return valid;
+}
+
+// Whether verifyCreatorKeyMemoized would answer this exact triple from the
+// memo, i.e. WITHOUT running PBKDF2.
+//
+// Only used to decide whether a request is about to spend ~15ms of CPU, so
+// that the throttle in authenticateCreator charges the expensive path and
+// leaves a warm, signed-in client alone. Deliberately not a shortcut past
+// verification: it reports on the memo, it does not consult it, and the real
+// check runs either way.
+async function isCreatorAuthMemoized(key, storedHash, username) {
+  if (!key || !storedHash) return false;
+  try {
+    const memoKey = await creatorAuthMemoKey(username || "", key, storedHash);
+    const hit = CREATOR_AUTH_MEMO.get(memoKey);
+    return hit !== undefined && Date.now() < hit;
+  } catch {
+    return false;
+  }
 }
 
 // Drops every memoized verification for one account. Called after any
@@ -2776,6 +2815,42 @@ async function getCreator(env, username) {
     }
   }
   return null;
+}
+
+// The key hash to actually verify against, preferring the store that can
+// answer immediately.
+//
+// getCreator reads KV first and falls back to D1 only on a MISS, which is the
+// right rule for reading a profile and the wrong one for authenticating.
+// KV reads are edge-cached, so for a while after a rotation a colo that did
+// not serve the write keeps answering with the pre-rotation record -- and a
+// hit is a hit, so the D1 fallback never runs. Measured against modelled KV
+// semantics: the rotated-away key still authenticated on such a colo, and the
+// NEW key was rejected there, which is a support-visible correctness bug as
+// well as a security one. Every rotation path writes D1 FIRST and only then
+// KV (see rotateCreatorKeyHashInD1), precisely so the authoritative answer
+// exists somewhere the instant the rotation is accepted; this is what reads
+// it.
+//
+// A missing D1 row still means "not migrated yet", never "no such account",
+// so KV remains the answer for it -- the lazy-migration state the accessors
+// are built to tolerate. D1 unavailable falls back to KV too: an outage in an
+// optional accelerator must not lock anyone out.
+//
+// The cost is one indexed primary-key lookup, and only for deployments that
+// have bound D1. The caller issues it alongside the KV read rather than after
+// it, so it costs a subrequest rather than a round trip.
+async function authoritativeKeyHash(env, username, kvKeyHash) {
+  if (!env || !env.DB) return kvKeyHash;
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT key_hash FROM creators WHERE username = ?"
+    ).bind(username).all();
+    if (results && results.length && results[0].key_hash) return results[0].key_hash;
+  } catch (e) {
+    console.error("D1 read error (authoritativeKeyHash), using the KV copy:", e);
+  }
+  return kvKeyHash;
 }
 
 // Copies an account's identity row from KV into D1, if it is not there

@@ -1691,16 +1691,91 @@ async function checkForNewEpisodes(env) {
   const ACCOUNT_BATCH_SIZE = 25;
   const SHOW_CHECK_BUDGET = 150;
 
-  const cursorRaw = await env.CONFIGS.get('cron:continuewatching:cursor');
+  // Sweep position is a page cursor PLUS an offset into that page.
+  //
+  // It used to be the cursor alone, and the show-check budget is spent across
+  // a whole page of accounts -- so when one heavy account exhausted it, the
+  // loop broke out of a page it had not finished and the cursor still jumped
+  // to the end of that page. KV pages are deterministic for a stable key set,
+  // so the same accounts sat behind the same heavy account on every cycle:
+  // measured, 24 of 30 accounts were never swept at all across six full ticks,
+  // silently and permanently.
+  //
+  // Holding the cursor instead would be worse -- an account with more shows
+  // than the budget would wedge its page forever and starve everything after
+  // it. Recording how far into the page we got fixes both: the next tick
+  // re-lists the same page and resumes exactly where this one stopped.
+  //
+  // Older deployments have a bare cursor string stored here; that is read as
+  // { c: <string>, o: 0 } so an upgrade resumes rather than restarting.
+  let sweep = { c: '', o: 0 };
+  try {
+    const raw = await env.CONFIGS.get('cron:continuewatching:cursor');
+    if (raw) {
+      let parsed = null;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (parsed && typeof parsed === 'object' && typeof parsed.c === 'string') {
+        sweep = { c: parsed.c, o: Number(parsed.o) || 0 };
+      } else {
+        sweep = { c: raw, o: 0 };
+      }
+    }
+  } catch (e) {
+    console.error('[Cron] could not read the Continue Watching cursor:', e);
+  }
+
   const listOpts = { prefix: 'creator:', limit: ACCOUNT_BATCH_SIZE };
-  if (cursorRaw) listOpts.cursor = cursorRaw;
-  const listResult = await env.CONFIGS.list(listOpts);
+  if (sweep.c) listOpts.cursor = sweep.c;
+  let listResult;
+  try {
+    listResult = await env.CONFIGS.list(listOpts);
+  } catch (e) {
+    // A stored cursor KV will not accept -- an expired one, or one left over
+    // from a rebound namespace -- used to end the sweep here on every single
+    // tick, forever: nothing caught the throw and nothing cleared the cursor,
+    // so Continue Watching simply stopped for the whole deployment with only
+    // a log line to show for it. Drop the position and let the next tick start
+    // from the beginning; the work is idempotent, so restarting costs a
+    // repeat rather than a gap.
+    console.error('[Cron] account listing failed, restarting the sweep from the beginning:', e);
+    if (sweep.c) {
+      try { await env.CONFIGS.put('cron:continuewatching:cursor', ''); } catch (e2) {}
+    }
+    return;
+  }
 
   let showChecksUsed = 0;
+  const pageKeys = listResult.keys || [];
+  // An offset past the end (the page shrank since last tick) means this page
+  // is done; fall through to the cursor advance below rather than looping.
+  let nextOffset = Math.min(Math.max(sweep.o, 0), pageKeys.length);
 
-  for (const key of listResult.keys) {
-    if (showChecksUsed >= SHOW_CHECK_BUDGET) break;
+  for (let i = nextOffset; i < pageKeys.length; i++) {
+    const key = pageKeys[i];
+    if (showChecksUsed >= SHOW_CHECK_BUDGET) {
+      // Out of budget BEFORE this account got its turn, so it is the one to
+      // resume at. An account that exhausted the budget from inside its own
+      // loop has already had its turn and i has moved past it -- which is what
+      // stops an account with more shows than the whole budget from being
+      // retried forever while everything behind it starves.
+      break;
+    }
+    nextOffset = i + 1;
     const username = key.name.slice('creator:'.length);
+    // One account must never be able to stop the sweep.
+    //
+    // There was no try/catch anywhere in this function, and the cursor is only
+    // written at the end -- so a single account whose tracking key would not
+    // read, or whose blob tripped anything below, aborted the whole tick
+    // before the cursor advanced. The next tick restarted and died at the same
+    // account, and every account behind it was never swept again. Measured:
+    // one unreadable key stopped Continue Watching for everyone after it,
+    // permanently.
+    //
+    // Isolating each account means a bad one costs itself and nothing else.
+    // It is skipped rather than retried because the next full cycle will come
+    // back to it anyway.
+    try {
     await ensureTrackingMigrated(env, username);
     const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
     if (!syncRaw) continue;
@@ -1818,21 +1893,30 @@ async function checkForNewEpisodes(env) {
       target.updatedAt = Date.now();
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
+    } catch (accountErr) {
+      // See the per-account try above: this account is skipped, the sweep
+      // carries on, and the next full cycle will come back to it.
+      console.error('[Cron] Continue Watching sweep skipped an account:', username, accountErr);
+    }
   }
 
-  // The cursor advances only once this batch has actually been processed.
-  // It used to be written immediately after the list() call, before the loop
-  // -- so a tick that threw partway through, or ran out of CPU time, had
-  // already committed the move and those accounts were skipped entirely
-  // until the cursor wrapped all the way round. Self-healing over a full
-  // cycle, invisible in the meantime, and needless: the work is idempotent,
-  // so re-processing a batch after a failure costs a repeat rather than a
-  // gap.
+  // The position advances only over accounts that were actually processed.
   //
-  // Cycle back to the start once the full account list has been swept,
-  // rather than stopping -- so the next run picks up fresh with account
-  // #1 again instead of sitting idle.
-  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
+  // Finished the page -> move to the next page (or back to the start, so the
+  // next run picks up with account #1 again instead of sitting idle). Stopped
+  // partway -> stay on this page and record where to resume, which is what
+  // stops the budget silently skipping everyone behind a heavy account.
+  //
+  // Written after the loop, not before it: a tick that throws or runs out of
+  // CPU must not have already committed a move it did not earn.
+  const nextSweep = nextOffset >= pageKeys.length
+    ? { c: listResult.list_complete ? '' : (listResult.cursor || ''), o: 0 }
+    : { c: sweep.c, o: nextOffset };
+  try {
+    await env.CONFIGS.put('cron:continuewatching:cursor', JSON.stringify(nextSweep));
+  } catch (e) {
+    console.error('[Cron] could not advance the Continue Watching cursor:', e);
+  }
 }
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).

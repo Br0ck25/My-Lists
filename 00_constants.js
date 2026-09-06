@@ -197,6 +197,24 @@ const ADMIN_LIST_DELETE_MAX = 50;
 const ADMIN_LOGIN_MAX_FAILURES_PER_DAY = 50;
 const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 
+// How many Creator Key verifications one IP may force per minute.
+//
+// Every one of them is PBKDF2 at 100,000 iterations -- about 15ms of CPU,
+// measured -- and it runs before the caller has proved anything, on any of the
+// sixteen routes that take a Creator Key. Only /api/creator/restore was
+// throttled, so /api/creator/sync/load or /api/scrobble?creator=&key= would
+// serve unbounded PBKDF2 runs to an anonymous caller: a cheap way to burn
+// Worker CPU, and a way around restore's own limit for guessing.
+//
+// Charged only when the per-isolate memo cannot answer (see
+// isCreatorAuthMemoized), so this counts real key checks rather than
+// requests. A signed-in dashboard polls, autosaves and pings continuously and
+// is memoized throughout, so the ceiling is deliberately far above anything a
+// person generates -- several people behind one CGNAT address should never
+// see it -- while still bounding a flood to something that cannot dominate an
+// invocation budget.
+const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
