@@ -82,6 +82,32 @@ const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
+// --- Bounds on the AUTHENTICATED list write ----------------------------------
+//
+// The two ceilings above bound /api/publish-list and /api/save, which anyone
+// at all can call. /api/creator/lists/save had no bound of any kind -- not on
+// items, not on the name, not on bytes -- even though a Creator Profile costs
+// one unauthenticated POST to create. The reasoning that produced the
+// anonymous limits applies here almost unchanged; it simply was not carried
+// across. Measured before this existed: one account parked 21.8 MB across
+// eight saves, and /api/creator/lists returns every list's FULL items array
+// on every dashboard render, so that came straight back down the wire.
+//
+// The item and name caps are deliberately the same numbers as the anonymous
+// ones -- there is no reason a signed-in list should be allowed to be larger
+// than a published one, and sharing the constants stops the two drifting.
+//
+// The byte ceiling is different, and lower, because of a limit the anonymous
+// path does not have to care about: D1's maximum string/row size is 2,000,000
+// bytes. A creator list is mirrored into creator_lists.items_json, and a
+// record over that limit cannot be written -- the failure lands in a catch
+// that logs and carries on, so the list simply stops being mirrored, silently,
+// which is exactly the state that made a missing D1 row destroy a real like
+// count. Rejecting at 1.8 MB keeps the mirror honest with room for the other
+// columns. Far above any genuine list: the largest observed in an account
+// export was ~1,200 items.
+const CREATOR_LIST_BYTES_MAX = 1_800_000;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
@@ -55412,6 +55438,17 @@ self.addEventListener('fetch', e => {
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
+      // The same bounds /api/publish-list has always had, which this
+      // authenticated sibling never picked up -- see CREATOR_LIST_BYTES_MAX
+      // (00_constants.js). Rejected rather than truncated, for the reason
+      // that file already spells out: quietly storing a shortened list is a
+      // worse bug than refusing an oversized one.
+      if (name.length > PUBLISHED_LIST_NAME_MAX) {
+        return json({ ok: false, error: "That list name is too long." }, 400);
+      }
+      if (items.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to save (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
 
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
@@ -55485,6 +55522,18 @@ self.addEventListener('fetch', e => {
         }
       }
 
+      // Item count alone is not a size bound -- items carry titles,
+      // overviews and poster URLs -- so this is checked on the exact bytes
+      // about to be stored, before a slug is allocated or anything is
+      // written.
+      const itemsJson = JSON.stringify(items || []);
+      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That list is too large to save. Try splitting it into more than one list.",
+        }, 413);
+      }
+
       const now = Date.now();
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
@@ -55501,7 +55550,6 @@ self.addEventListener('fetch', e => {
       if (env.DB) {
         try {
           const listId = `${auth.username}:${slug}`;
-          const itemsJson = JSON.stringify(items || []);
           // `likes` is bound on the INSERT and deliberately absent from the
           // DO UPDATE.
           //
@@ -56155,6 +56203,12 @@ self.addEventListener('fetch', e => {
           }
           wlObj.items = body.watchlist;
           wlObj.updatedAt = watchlistUpdatedAt;
+          // Same D1 row-size reasoning as /api/creator/lists/save: a
+          // watchlist over the ceiling cannot be mirrored, and a mirror that
+          // silently stops is how a missing D1 row comes about.
+          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+            return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
+          }
           
           if (env.DB) {
             try {

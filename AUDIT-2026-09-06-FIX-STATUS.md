@@ -62,10 +62,10 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 | **A8** | Unpublish `ok:true` while the index removal fails silently | MEDIUM | ✅ | removal is awaited and reported; adding stays fire-and-forget |
 | **A9** | Conflict guard: same-ms bypass + fails open on a non-number | MEDIUM | ✅ | `parseExpectedUpdatedAt` + `nextSyncVersion` (02_) |
 | **A10** | Presets/channels/tracking unguarded; watchlist has no merge | MEDIUM | ✅ | guards on save-presets/save-channels + client; watchlist empty-guard |
-| **A11** | No size bound on the authenticated list write | MEDIUM | ⬜ | |
+| **A11** | No size bound on the authenticated list write | MEDIUM | ✅ | `CREATOR_LIST_BYTES_MAX` + shared item/name caps |
 | **A12** | `json()` cacheable default; admin 401s cached for an hour | MEDIUM | ⬜ | |
 | **A13** | No global exception boundary | MEDIUM | ⬜ | |
-| **A15** | `schema.sql` vs migrations index drift | LOW | ⬜ | |
+| **A15** | `schema.sql` vs migrations index drift | LOW | ✅ | index added; a test diffs both provisioning paths |
 
 ### P3 — hygiene, accuracy, documentation
 

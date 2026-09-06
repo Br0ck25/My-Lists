@@ -4719,3 +4719,97 @@ describe("A9/A10: concurrent devices must not silently overwrite each other", ()
     assert.deepEqual(JSON.parse(env.CONFIGS._store.get("creatorlist:alice10c:watchlist")).items, []);
   });
 });
+
+describe("A11: the authenticated list write needs the bounds its anonymous sibling has", () => {
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { creatorName: K.creatorName, creatorKey: K.creatorKey, type: "movie", ...extra },
+  });
+
+  it("rejects an over-cap item count, and accepts the cap itself", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11");
+    const K = { creatorName: "big11", creatorKey: u.creatorKey };
+    const items = (n) => Array.from({ length: n }, (_, i) => ({ id: "tt" + i }));
+
+    const over = await save(env, K, { name: "Over", items: items(10001) });
+    assert.equal(over.status, 413, JSON.stringify(over.body).slice(0, 120));
+    const at = await save(env, K, { name: "At", items: items(10000) });
+    assert.equal(at.body.ok, true, "the cap itself must still be allowed");
+  });
+
+  it("rejects a payload too large for the D1 mirror rather than silently not mirroring it", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "big11b");
+    const K = { creatorName: "big11b", creatorKey: u.creatorKey };
+    const fat = Array.from({ length: 5000 }, (_, i) => ({ id: "tt" + i, overview: "o".repeat(400) }));
+    const r = await save(env, K, { name: "Fat", items: fat });
+    assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 160));
+    assert.equal(env.CONFIGS._store.get("creatorlist:big11b:fat"), undefined,
+      "nothing should have been stored");
+  });
+
+  it("rejects an over-long list name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11c");
+    const K = { creatorName: "big11c", creatorKey: u.creatorKey };
+    const over = await save(env, K, { name: "N".repeat(201), items: [] });
+    assert.equal(over.status, 400);
+    const at = await save(env, K, { name: "N".repeat(200), items: [] });
+    assert.equal(at.body.ok, true);
+  });
+
+  it("still accepts an ordinary list", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11d");
+    const K = { creatorName: "big11d", creatorKey: u.creatorKey };
+    const r = await save(env, K, {
+      name: "Normal", visibility: "public",
+      items: Array.from({ length: 1200 }, (_, i) => ({ id: "tt" + i, title: "A Film", year: 2001 })),
+    });
+    assert.equal(r.body.ok, true, "the largest genuine list observed was ~1,200 items");
+  });
+});
+
+describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {
+  it("schema.sql declares every index the migrations create", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const read = (rel) => fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
+    const indexesOf = (db) =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
+        .all().map((r) => r.name);
+
+    const fresh = new DatabaseSync(":memory:");
+    fresh.exec(read("schema.sql"));
+
+    // The shape migrations/0001 and 0002 were written against.
+    const migrated = new DatabaseSync(":memory:");
+    migrated.exec(`
+      CREATE TABLE creators (username TEXT PRIMARY KEY, display_name TEXT NOT NULL, key_hash TEXT NOT NULL,
+        recovery_answer_hash TEXT, created_at INTEGER NOT NULL, last_active INTEGER);
+      CREATE TABLE creator_lists (id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL,
+        type TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE);
+      CREATE TABLE source_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, install_count INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_creator_lists_username ON creator_lists(username);
+      CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
+    `);
+    migrated.exec(read("migrations/0001_add_likes_to_creator_lists.sql"));
+    migrated.exec(read("migrations/0002_add_stats_table.sql"));
+
+    assert.deepEqual(indexesOf(fresh), indexesOf(migrated),
+      "a deployment provisioned from schema.sql must not be missing an index a migrated one has");
+
+    const tables = (db) =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all().map((r) => r.name);
+    assert.deepEqual(tables(fresh), tables(migrated));
+
+    const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all()
+      .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value}`).sort();
+    for (const t of tables(fresh)) {
+      assert.deepEqual(cols(fresh, t), cols(migrated, t), `${t} differs between the two provisioning paths`);
+    }
+  });
+});

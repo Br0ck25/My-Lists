@@ -1626,6 +1626,17 @@
       const name = String(body.name || "").trim();
       if (!name) return json({ ok: false, error: "Missing a list name." }, 400);
       if (!type) return json({ ok: false, error: "Missing or invalid list type." }, 400);
+      // The same bounds /api/publish-list has always had, which this
+      // authenticated sibling never picked up -- see CREATOR_LIST_BYTES_MAX
+      // (00_constants.js). Rejected rather than truncated, for the reason
+      // that file already spells out: quietly storing a shortened list is a
+      // worse bug than refusing an oversized one.
+      if (name.length > PUBLISHED_LIST_NAME_MAX) {
+        return json({ ok: false, error: "That list name is too long." }, 400);
+      }
+      if (items.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to save (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
 
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
@@ -1699,6 +1710,18 @@
         }
       }
 
+      // Item count alone is not a size bound -- items carry titles,
+      // overviews and poster URLs -- so this is checked on the exact bytes
+      // about to be stored, before a slug is allocated or anything is
+      // written.
+      const itemsJson = JSON.stringify(items || []);
+      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That list is too large to save. Try splitting it into more than one list.",
+        }, 413);
+      }
+
       const now = Date.now();
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
@@ -1715,7 +1738,6 @@
       if (env.DB) {
         try {
           const listId = `${auth.username}:${slug}`;
-          const itemsJson = JSON.stringify(items || []);
           // `likes` is bound on the INSERT and deliberately absent from the
           // DO UPDATE.
           //
@@ -2369,6 +2391,12 @@
           }
           wlObj.items = body.watchlist;
           wlObj.updatedAt = watchlistUpdatedAt;
+          // Same D1 row-size reasoning as /api/creator/lists/save: a
+          // watchlist over the ceiling cannot be mirrored, and a mirror that
+          // silently stops is how a missing D1 row comes about.
+          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+            return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
+          }
           
           if (env.DB) {
             try {
