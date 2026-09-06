@@ -1696,11 +1696,6 @@ async function checkForNewEpisodes(env) {
   if (cursorRaw) listOpts.cursor = cursorRaw;
   const listResult = await env.CONFIGS.list(listOpts);
 
-  // Cycle back to the start once the full account list has been swept,
-  // rather than stopping -- so the next run picks up fresh with account
-  // #1 again instead of sitting idle.
-  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
-
   let showChecksUsed = 0;
 
   for (const key of listResult.keys) {
@@ -1824,6 +1819,20 @@ async function checkForNewEpisodes(env) {
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
+
+  // The cursor advances only once this batch has actually been processed.
+  // It used to be written immediately after the list() call, before the loop
+  // -- so a tick that threw partway through, or ran out of CPU time, had
+  // already committed the move and those accounts were skipped entirely
+  // until the cursor wrapped all the way round. Self-healing over a full
+  // cycle, invisible in the meantime, and needless: the work is idempotent,
+  // so re-processing a batch after a failure costs a repeat rather than a
+  // gap.
+  //
+  // Cycle back to the start once the full account list has been swept,
+  // rather than stopping -- so the next run picks up fresh with account
+  // #1 again instead of sitting idle.
+  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
 }
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).

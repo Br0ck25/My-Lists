@@ -4949,3 +4949,120 @@ describe("A13: an unhandled exception must not escape the Worker", () => {
     }
   });
 });
+
+describe("P3: hygiene findings", () => {
+  it("A14: migrate-d1 counts rows written, not keys looked at, and reports what it skipped", async () => {
+    const db = makeD1();
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    for (const u of ["p3a", "p3b"]) {
+      kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
+      kv._store.set(`creatorlist:${u}:one`, JSON.stringify({
+        name: "One", slug: "one", type: "movie", items: [], visibility: "public", likes: 3, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    // Records the sweep must skip and say so: a key with no readable record,
+    // and a counter whose stored value is not a number.
+    kv._store.set("creatorlist:p3c:orphan", JSON.stringify({ name: "X", type: "movie", items: [], visibility: "private" }));
+    kv._store.set("stats:pageviews:total", "not-a-number");
+    const cookie = await adminCookie(env);
+
+    let last;
+    for (let i = 0; i < 20; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+    assert.equal(last.body.results.creators, 2);
+    assert.equal(last.body.results.lists, 2, "p3c's list has no creator row, so it cannot be written");
+    assert.ok(last.body.results.skipped >= 1,
+      `records the sweep dropped must be counted, got ${last.body.results.skipped}`);
+    assert.ok(last.body.results.errors.length >= 1,
+      "and the orphaned list, which the foreign key rejects, must surface as an error");
+
+    // Re-running writes nothing new; the counters must not imply otherwise.
+    const again = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(again.body.results.stats, 0, "a second run must not claim to have migrated counters again");
+  });
+
+  it("A17: the Continue Watching cron cursor does not advance past work it never did", async () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const fn = src.slice(src.indexOf("async function checkForNewEpisodes"));
+    const next = fn.indexOf("\nasync function ", 1);
+    const body = next === -1 ? fn : fn.slice(0, next);
+    // The READ of the cursor legitimately comes first; it is the PUT that
+    // must not happen until the batch has been processed.
+    const cursorWrite = body.indexOf("CONFIGS.put('cron:continuewatching:cursor'");
+    const loopStart = body.indexOf("for (const key of listResult.keys)");
+    assert.ok(cursorWrite > 0 && loopStart > 0, "could not find the cursor write or the account loop");
+    assert.ok(cursorWrite > loopStart,
+      "the cursor must be committed after the batch is processed, not before it starts");
+  });
+
+  it("A18: the daily shuffle rolls over on the same calendar day as every counter", async () => {
+    // In the real build these are one concatenated module, so getDailySeed
+    // sees easternDateKey by hoisting. Recreate that here by evaluating both
+    // files into one sandbox.
+    const src02 = fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8");
+    const src03 = fs.readFileSync(path.join(REPO_ROOT, "03_admin.js"), "utf8");
+    const grab = (src, name) => {
+      const start = src.indexOf(`function ${name}`);
+      let i = src.indexOf("{", start), d = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === "{") d++;
+        else if (src[i] === "}") { d--; if (!d) { i++; break; } }
+      }
+      return src.slice(start, i);
+    };
+    const getDailySeed = new Function(
+      `${grab(src03, "easternDateKey")}\n${grab(src02, "getDailySeed")}\nreturn getDailySeed;`
+    )();
+    const realNow = Date.now;
+    try {
+      // 02:00 UTC on Jun 2 is still 22:00 Eastern on Jun 1.
+      Date.now = () => new Date("2026-06-02T02:00:00Z").getTime();
+      const lateEvening = getDailySeed("x");
+      Date.now = () => new Date("2026-06-01T16:00:00Z").getTime();  // noon Eastern, same Eastern day
+      assert.equal(getDailySeed("x"), lateEvening, "the seed must not change during a single Eastern day");
+      Date.now = () => new Date("2026-06-02T05:00:00Z").getTime();  // 01:00 Eastern, next Eastern day
+      assert.notEqual(getDailySeed("x"), lateEvening, "and must change once the Eastern day does");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("A19: lists/reorder is bounded and rejects a slug that could reach another key", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "p3order");
+    const K = { creatorName: "p3order", creatorKey: u.creatorKey };
+    const huge = await call(env, "/api/creator/lists/reorder", {
+      method: "POST", json: { ...K, order: Array.from({ length: 10000 }, (_, i) => "slug" + i) },
+    });
+    assert.equal(huge.body.ok, true);
+    assert.equal(huge.body.order.length, 5000, "the array must be capped");
+
+    const nasty = await call(env, "/api/creator/lists/reorder", {
+      method: "POST", json: { ...K, order: ["good-slug", "other:user:list", "x".repeat(300)] },
+    });
+    assert.deepEqual(nasty.body.order, ["good-slug"],
+      "a colon is the KV key separator and slugifyServer never emits one");
+  });
+
+  it("A20: a list write self-heals the missing creator row instead of leaving D1 empty", async () => {
+    const db = makeD1();
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3fk");
+    // Put the account back into the pre-migration state: KV has it, D1 does not.
+    await db.prepare("DELETE FROM creators WHERE username = ?").bind("p3fk").run();
+    assert.equal(db._creators.has("p3fk"), false);
+
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "p3fk", creatorKey: u.creatorKey, name: "Mirrored", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(r.body.ok, true);
+    assert.equal(db._creators.has("p3fk"), true, "the account row should have been backfilled");
+    assert.equal(db._lists.has("p3fk:mirrored"), true, "and the list should have reached the mirror");
+  });
+});

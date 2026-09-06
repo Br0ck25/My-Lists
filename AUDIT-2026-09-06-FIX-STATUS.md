@@ -71,16 +71,28 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 
 | | Finding | Severity | Status | Commit |
 |---|---|---|---|---|
-| **A14** | migrate-d1 cannot repair a stale row; counters count attempts | LOW-MED | ⬜ | |
-| **A16** | Counters are D1-only once bound, vs the "removable" promise | LOW | ⬜ | |
-| **A17** | Cron cursor advances before the work is done | LOW | ⬜ | |
-| **A18** | Daily seed rolls at UTC midnight, stats at Eastern midnight | LOW | ⬜ | |
-| **A19** | Unbounded, unvalidated `lists/reorder` array | LOW | ⬜ | |
-| **A20** | FK blocks list writes for a not-yet-migrated account | LOW-MED | ⬜ | |
-| — | `CHECK (visibility IN …)` hardening | — | ⬜ | |
-| — | Stale comments (§16 F1/F2/F3) | — | ⬜ | |
+| **A14** | migrate-d1 cannot repair a stale row; counters count attempts | LOW-MED | ✅ | `DO UPDATE` (with A5) + `meta.changes` counters + a `skipped` tally |
+| **A16** | Counters are D1-only once bound, vs the "removable" promise | LOW | ✅ | documented in `wrangler.toml` + `bumpStat`; behaviour deliberately kept |
+| **A17** | Cron cursor advances before the work is done | LOW | ✅ | cursor committed after the batch |
+| **A18** | Daily seed rolls at UTC midnight, stats at Eastern midnight | LOW | ✅ | `getDailySeed` uses `easternDateKey` |
+| **A19** | Unbounded, unvalidated `lists/reorder` array | LOW | ✅ | `CREATOR_LIST_ORDER_MAX`, per-slug length, no `:` |
+| **A20** | FK blocks list writes for a not-yet-migrated account | LOW-MED | ✅ | `backfillCreatorRowInD1` + one retry, on the failure path only |
+| — | `CHECK (visibility IN …)` hardening | — | ⏸️ | **deliberately not done** — see below |
+| — | Stale comments (§16 F1/F2/F3) | — | ✅ | F1/F2 corrected in code; F3 is in a historical audit, left as written |
 
 ---
+
+## Deliberately not done
+
+**`CHECK (visibility IN ('public','private'))` on `creator_lists`.** SQLite cannot add
+a constraint to an existing table without rebuilding it, so this could only go into
+`schema.sql` — which would make a *fresh* database a different shape from a *migrated*
+one, i.e. exactly the drift A15 just closed and now has a test forbidding. Doing it
+properly means a table-rebuild migration against live data, and the value is small:
+`normalizeListVisibility` already fails closed on every write and
+`isPublicListVisibility` fails closed on every read, so nothing in the app can produce
+a value the constraint would catch. Recorded rather than done, with the reasoning, so
+the next person does not re-derive it.
 
 ## Mutation testing, re-run against the fixed code
 

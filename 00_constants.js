@@ -100,6 +100,16 @@ const MIGRATE_D1_PAGE = 200;
 // admin panel, so they need a ceiling of their own.
 const MIGRATE_D1_ERROR_CAP = 50;
 
+// --- Bound on the display-order array ----------------------------------------
+//
+// /api/creator/lists/reorder writes whatever slugs it is handed into one KV
+// key, and had no cap on how many. Authenticated, so the blast radius is the
+// caller's own key -- hygiene rather than a vulnerability -- but an unbounded
+// authenticated write is still an unbounded write. Far above any real
+// account: the worst case ever observed on a live one was 129 records, and
+// that was the duplicate-list bug.
+const CREATOR_LIST_ORDER_MAX = 5000;
+
 // --- Recovery-answer strength and throttle ----------------------------------
 //
 // A Creator Key is ~60 bits of entropy and infeasible to guess. The optional

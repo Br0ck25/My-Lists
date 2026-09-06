@@ -1759,7 +1759,29 @@
             "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
           ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
         } catch (dbErr) {
-          console.error("D1 write error (creatorlist put):", dbErr);
+          // The commonest cause is the foreign key: D1 enforces
+          // creator_lists.username -> creators.username, and an account that
+          // predates the D1 binding has no creators row yet, which is exactly
+          // the lazy-migration state getCreator is written to tolerate. The
+          // list is safe either way -- KV is authoritative and reads prefer
+          // it -- but leaving the mirror empty hides the list from the admin
+          // Community Lists panel until someone runs migrate-d1.
+          //
+          // So backfill the account row from KV and retry once. Costs nothing
+          // on the happy path (this only runs after a failure) and self-heals
+          // instead of waiting for a manual sweep.
+          const backfilled = await backfillCreatorRowInD1(env, auth.username);
+          if (backfilled) {
+            try {
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
+            } catch (retryErr) {
+              console.error("D1 write error (creatorlist put, after creator backfill):", retryErr);
+            }
+          } else {
+            console.error("D1 write error (creatorlist put):", dbErr);
+          }
         }
       }
       
@@ -1847,7 +1869,18 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
-      const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
+      // Bounded, and no ":" -- that is the KV key separator, and slugifyServer
+      // (which produces every slug this app writes) can only emit
+      // [a-z0-9-] within 60 characters anyway. The array itself had no cap
+      // at all, so an authenticated caller could park an arbitrarily large
+      // value under one key; 5,000 is far above any real account, where the
+      // worst case ever observed was 129 records.
+      const newOrder = Array.isArray(body.order)
+        ? body.order
+            .map(String)
+            .filter((s) => s.length <= 60 && /^[a-zA-Z0-9._-]+$/.test(s))
+            .slice(0, CREATOR_LIST_ORDER_MAX)
+        : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
     }
@@ -3638,11 +3671,24 @@
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      if (typeof results.skipped !== "number") results.skipped = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0 };
+      // A key this sweep looked at and deliberately did not migrate. These
+      // used to vanish: `if (!raw) return;`, a key that failed its shape
+      // check, a counter whose value was not a number -- each returned with
+      // no counter touched and no error recorded, so the endpoint answered
+      // ok:true with an empty errors array whether or not records had been
+      // dropped on the floor.
+      const noteSkipped = () => { results.skipped++; thisCall.skipped++; };
+      // meta.changes, not "we got here". Every counter below used to
+      // increment once per key PROCESSED, including the ones that hit a
+      // DO NOTHING conflict and wrote nothing, so `{"creators": 60}` did not
+      // mean sixty rows had been written.
+      const wrote = (res) => !!(res && res.meta && res.meta.changes > 0);
       const noteError = (msg) => {
         if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
       };
@@ -3652,7 +3698,7 @@
         if (phase === 0) {
           const username = keyName.slice("creator:".length);
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             // DO UPDATE, not DO NOTHING. This endpoint's stated job is to
@@ -3668,10 +3714,10 @@
             // createdAt may be missing on a legacy record, and `|| 0` would
             // then overwrite a good creation date with zero. last_active is
             // not written here at all, so it survives too.
-            await d1Run(env.DB.prepare(
+            const d1Res = await d1Run(env.DB.prepare(
               "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, key_hash=excluded.key_hash, recovery_answer_hash=excluded.recovery_answer_hash"
             ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
-            results.creators++; thisCall.creators++;
+            if (wrote(d1Res)) { results.creators++; thisCall.creators++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Creator ${username}: ` + e.message);
           }
@@ -3685,9 +3731,9 @@
           // undefined, the `if (u && slug)` guard below rejected every key,
           // and the migration silently reported "lists: 0" while claiming ok.
           const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
-          if (!u || !slug) return;
+          if (!u || !slug) { noteSkipped(); return; }
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -3699,10 +3745,10 @@
             // every list to zero in D1. Visibility is rewritten as well
             // so the fail-closed public index doesn't hide legacy lists
             // that were served as public because they had no enum value.
-            await d1Run(env.DB.prepare(
+            const listRes = await d1Run(env.DB.prepare(
               "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
             ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
-            results.lists++; thisCall.lists++;
+            if (wrote(listRes)) { results.lists++; thisCall.lists++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`List ${u}:${slug}: ` + e.message);
           }
@@ -3714,7 +3760,7 @@
         // public-read checks don't hide currently-served lists.
         if (phase === 2) {
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -3732,10 +3778,10 @@
           const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await d1Run(env.DB.prepare(
+            const sgRes = await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
             ).bind(groupName, groupName, count));
-            results.sourcegroups++; thisCall.sourcegroups++;
+            if (wrote(sgRes)) { results.sourcegroups++; thisCall.sourcegroups++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
@@ -3763,6 +3809,8 @@
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
         if (!kind || !bucket) return;
+        // Not "skipped": phase 3 has already migrated these into their own
+        // table, and counting them here would report them twice.
         if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
@@ -3771,12 +3819,14 @@
         if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
         const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) return;
+        if (!Number.isFinite(n)) { noteSkipped(); return; }
         try {
-          await d1Run(env.DB.prepare(
+          const statRes = await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
           ).bind(kind, bucket, n));
-          results.stats++; thisCall.stats++;
+          // DO NOTHING on conflict, so a second run legitimately writes
+          // nothing -- that is "already migrated", not "skipped".
+          if (wrote(statRes)) { results.stats++; thisCall.stats++; }
         } catch (e) {
           noteError(`Stat ${keyName}: ` + e.message);
         }

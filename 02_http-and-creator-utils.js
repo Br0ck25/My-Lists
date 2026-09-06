@@ -238,8 +238,23 @@ function isBrowserNavigation(request) {
 // --- config encoding -------------------------------------------------
 
 // --- Deterministic 24-Hour Daily Randomizer --------------------------------
+//
+// The bucket is the EASTERN calendar day, the same one every stats counter
+// uses (see easternDateKey, 03_admin.js). It used to be
+// Math.floor(Date.now() / 86400000), a UTC day -- so the "daily" shuffle
+// rotated at 7 or 8pm Eastern, in the middle of the evening people actually
+// use this, while every other "day" in the app rolled over at midnight
+// Eastern. Two different definitions of the same word, and the one users felt
+// was the one that moved during peak hours.
+//
+// easternDateKey is declared in a later numbered file, which is fine: both
+// are top-level function declarations in one concatenated module, so
+// hoisting has them defined before any request runs.
 function getDailySeed(salt = "") {
-  const dayBucket = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  // new Date(Date.now()), not new Date(): they are equivalent in production,
+  // but only the first goes through Date.now, which is the one seam a test
+  // can hold still.
+  const dayBucket = easternDateKey(new Date(Date.now()));
   let hash = 0;
   const str = `${dayBucket}:${salt}`;
   for (let i = 0; i < str.length; i++) {
@@ -2599,6 +2614,38 @@ async function getCreator(env, username) {
     }
   }
   return null;
+}
+
+// Copies an account's identity row from KV into D1, if it is not there
+// already. Returns true when D1 now has a row for this account.
+//
+// D1 enforces foreign keys by default, so creator_lists.username ->
+// creators.username rejects a list write for an account that has not been
+// migrated yet -- which is precisely the lazy-migration state the accessors
+// above are built to tolerate. The list itself is never at risk (KV is
+// authoritative and read first), but a mirror that quietly never fills is
+// how a list ends up invisible to the admin panel and to every D1-backed
+// query. This is the compensating write, used only after such a failure.
+async function backfillCreatorRowInD1(env, username) {
+  if (!env || !env.DB || !env.CONFIGS) return false;
+  try {
+    const raw = await env.CONFIGS.get(`creator:${username}`);
+    if (!raw) return false;
+    const profile = JSON.parse(raw);
+    await env.DB.prepare(
+      "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+    ).bind(
+      username,
+      profile.displayName || username,
+      profile.keyHash || "",
+      profile.recoveryAnswerHash || null,
+      profile.createdAt || 0
+    ).run();
+    return true;
+  } catch (e) {
+    console.error("could not backfill a creator row into D1:", e);
+    return false;
+  }
 }
 
 // Puts a rotated key hash into D1, or makes sure D1 cannot answer with the

@@ -150,6 +150,16 @@ const MIGRATE_D1_PAGE = 200;
 // admin panel, so they need a ceiling of their own.
 const MIGRATE_D1_ERROR_CAP = 50;
 
+// --- Bound on the display-order array ----------------------------------------
+//
+// /api/creator/lists/reorder writes whatever slugs it is handed into one KV
+// key, and had no cap on how many. Authenticated, so the blast radius is the
+// caller's own key -- hygiene rather than a vulnerability -- but an unbounded
+// authenticated write is still an unbounded write. Far above any real
+// account: the worst case ever observed on a live one was 129 records, and
+// that was the duplicate-list bug.
+const CREATOR_LIST_ORDER_MAX = 5000;
+
 // --- Recovery-answer strength and throttle ----------------------------------
 //
 // A Creator Key is ~60 bits of entropy and infeasible to guess. The optional
@@ -1934,8 +1944,23 @@ function isBrowserNavigation(request) {
 // --- config encoding -------------------------------------------------
 
 // --- Deterministic 24-Hour Daily Randomizer --------------------------------
+//
+// The bucket is the EASTERN calendar day, the same one every stats counter
+// uses (see easternDateKey, 03_admin.js). It used to be
+// Math.floor(Date.now() / 86400000), a UTC day -- so the "daily" shuffle
+// rotated at 7 or 8pm Eastern, in the middle of the evening people actually
+// use this, while every other "day" in the app rolled over at midnight
+// Eastern. Two different definitions of the same word, and the one users felt
+// was the one that moved during peak hours.
+//
+// easternDateKey is declared in a later numbered file, which is fine: both
+// are top-level function declarations in one concatenated module, so
+// hoisting has them defined before any request runs.
 function getDailySeed(salt = "") {
-  const dayBucket = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  // new Date(Date.now()), not new Date(): they are equivalent in production,
+  // but only the first goes through Date.now, which is the one seam a test
+  // can hold still.
+  const dayBucket = easternDateKey(new Date(Date.now()));
   let hash = 0;
   const str = `${dayBucket}:${salt}`;
   for (let i = 0; i < str.length; i++) {
@@ -4297,6 +4322,38 @@ async function getCreator(env, username) {
   return null;
 }
 
+// Copies an account's identity row from KV into D1, if it is not there
+// already. Returns true when D1 now has a row for this account.
+//
+// D1 enforces foreign keys by default, so creator_lists.username ->
+// creators.username rejects a list write for an account that has not been
+// migrated yet -- which is precisely the lazy-migration state the accessors
+// above are built to tolerate. The list itself is never at risk (KV is
+// authoritative and read first), but a mirror that quietly never fills is
+// how a list ends up invisible to the admin panel and to every D1-backed
+// query. This is the compensating write, used only after such a failure.
+async function backfillCreatorRowInD1(env, username) {
+  if (!env || !env.DB || !env.CONFIGS) return false;
+  try {
+    const raw = await env.CONFIGS.get(`creator:${username}`);
+    if (!raw) return false;
+    const profile = JSON.parse(raw);
+    await env.DB.prepare(
+      "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO NOTHING"
+    ).bind(
+      username,
+      profile.displayName || username,
+      profile.keyHash || "",
+      profile.recoveryAnswerHash || null,
+      profile.createdAt || 0
+    ).run();
+    return true;
+  } catch (e) {
+    console.error("could not backfill a creator row into D1:", e);
+    return false;
+  }
+}
+
 // Puts a rotated key hash into D1, or makes sure D1 cannot answer with the
 // OLD one -- and says which, so the caller can decide whether the rotation
 // actually happened.
@@ -4493,6 +4550,16 @@ function statsToday() {
 // is a real remaining limitation for KV-only deployments, not an oversight
 // -- KV genuinely cannot do this correctly, and the honest options there are
 // to bind D1 or to read the numbers as approximate.
+//
+// Counters are the ONE data family where "D1 is optional and removable at any
+// time without data loss" -- true of accounts, lists and likes, which are
+// always written to KV -- does not hold. Once D1 is bound these write to D1
+// alone, because dual-writing would put the lost-update race straight back in
+// (and spend a second write per bump on a key KV rate-limits to one per
+// second). So unbinding D1, or rebuilding it from schema.sql, rolls every
+// counter back to the KV value it had at migration time. That trade is the
+// right one and is now stated in wrangler.toml where an operator will see it,
+// rather than being a surprise.
 async function d1BumpStat(env, kind, buckets, amount) {
   // One statement per bucket, sent as a batch so the whole bump is a single
   // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
@@ -11888,11 +11955,6 @@ async function checkForNewEpisodes(env) {
   if (cursorRaw) listOpts.cursor = cursorRaw;
   const listResult = await env.CONFIGS.list(listOpts);
 
-  // Cycle back to the start once the full account list has been swept,
-  // rather than stopping -- so the next run picks up fresh with account
-  // #1 again instead of sitting idle.
-  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
-
   let showChecksUsed = 0;
 
   for (const key of listResult.keys) {
@@ -12016,6 +12078,20 @@ async function checkForNewEpisodes(env) {
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
     }
   }
+
+  // The cursor advances only once this batch has actually been processed.
+  // It used to be written immediately after the list() call, before the loop
+  // -- so a tick that threw partway through, or ran out of CPU time, had
+  // already committed the move and those accounts were skipped entirely
+  // until the cursor wrapped all the way round. Self-healing over a full
+  // cycle, invisible in the meantime, and needless: the work is idempotent,
+  // so re-processing a batch after a failure costs a repeat rather than a
+  // gap.
+  //
+  // Cycle back to the start once the full account list has been swept,
+  // rather than stopping -- so the next run picks up fresh with account
+  // #1 again instead of sitting idle.
+  await env.CONFIGS.put('cron:continuewatching:cursor', listResult.list_complete ? '' : (listResult.cursor || ''));
 }
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).
@@ -55604,7 +55680,29 @@ self.addEventListener('fetch', e => {
             "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
           ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
         } catch (dbErr) {
-          console.error("D1 write error (creatorlist put):", dbErr);
+          // The commonest cause is the foreign key: D1 enforces
+          // creator_lists.username -> creators.username, and an account that
+          // predates the D1 binding has no creators row yet, which is exactly
+          // the lazy-migration state getCreator is written to tolerate. The
+          // list is safe either way -- KV is authoritative and reads prefer
+          // it -- but leaving the mirror empty hides the list from the admin
+          // Community Lists panel until someone runs migrate-d1.
+          //
+          // So backfill the account row from KV and retry once. Costs nothing
+          // on the happy path (this only runs after a failure) and self-heals
+          // instead of waiting for a manual sweep.
+          const backfilled = await backfillCreatorRowInD1(env, auth.username);
+          if (backfilled) {
+            try {
+              await env.DB.prepare(
+                "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
+              ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, now).run();
+            } catch (retryErr) {
+              console.error("D1 write error (creatorlist put, after creator backfill):", retryErr);
+            }
+          } else {
+            console.error("D1 write error (creatorlist put):", dbErr);
+          }
         }
       }
       
@@ -55692,7 +55790,18 @@ self.addEventListener('fetch', e => {
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return json({ ok: false, error: auth.error === "no-kv" ? "no-kv" : "Username or Key is incorrect." }, auth.error === "no-kv" ? 500 : 401);
-      const newOrder = Array.isArray(body.order) ? body.order.map(String).filter(s => /^[a-zA-Z0-9_.:-]+$/.test(s)) : [];
+      // Bounded, and no ":" -- that is the KV key separator, and slugifyServer
+      // (which produces every slug this app writes) can only emit
+      // [a-z0-9-] within 60 characters anyway. The array itself had no cap
+      // at all, so an authenticated caller could park an arbitrarily large
+      // value under one key; 5,000 is far above any real account, where the
+      // worst case ever observed was 129 records.
+      const newOrder = Array.isArray(body.order)
+        ? body.order
+            .map(String)
+            .filter((s) => s.length <= 60 && /^[a-zA-Z0-9._-]+$/.test(s))
+            .slice(0, CREATOR_LIST_ORDER_MAX)
+        : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
       return json({ ok: true, order: newOrder });
     }
@@ -57483,11 +57592,24 @@ self.addEventListener('fetch', e => {
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0 };
+      if (typeof results.skipped !== "number") results.skipped = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0 };
+      // A key this sweep looked at and deliberately did not migrate. These
+      // used to vanish: `if (!raw) return;`, a key that failed its shape
+      // check, a counter whose value was not a number -- each returned with
+      // no counter touched and no error recorded, so the endpoint answered
+      // ok:true with an empty errors array whether or not records had been
+      // dropped on the floor.
+      const noteSkipped = () => { results.skipped++; thisCall.skipped++; };
+      // meta.changes, not "we got here". Every counter below used to
+      // increment once per key PROCESSED, including the ones that hit a
+      // DO NOTHING conflict and wrote nothing, so `{"creators": 60}` did not
+      // mean sixty rows had been written.
+      const wrote = (res) => !!(res && res.meta && res.meta.changes > 0);
       const noteError = (msg) => {
         if (results.errors.length < MIGRATE_D1_ERROR_CAP) results.errors.push(msg);
       };
@@ -57497,7 +57619,7 @@ self.addEventListener('fetch', e => {
         if (phase === 0) {
           const username = keyName.slice("creator:".length);
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             // DO UPDATE, not DO NOTHING. This endpoint's stated job is to
@@ -57513,10 +57635,10 @@ self.addEventListener('fetch', e => {
             // createdAt may be missing on a legacy record, and `|| 0` would
             // then overwrite a good creation date with zero. last_active is
             // not written here at all, so it survives too.
-            await d1Run(env.DB.prepare(
+            const d1Res = await d1Run(env.DB.prepare(
               "INSERT INTO creators (username, display_name, key_hash, recovery_answer_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, key_hash=excluded.key_hash, recovery_answer_hash=excluded.recovery_answer_hash"
             ).bind(username, data.displayName || username, data.keyHash || "", data.recoveryAnswerHash || null, data.createdAt || 0));
-            results.creators++; thisCall.creators++;
+            if (wrote(d1Res)) { results.creators++; thisCall.creators++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Creator ${username}: ` + e.message);
           }
@@ -57530,9 +57652,9 @@ self.addEventListener('fetch', e => {
           // undefined, the `if (u && slug)` guard below rejected every key,
           // and the migration silently reported "lists: 0" while claiming ok.
           const [, u, slug] = keyName.match(/^creatorlist:([^:]+):(.+)$/) || [];
-          if (!u || !slug) return;
+          if (!u || !slug) { noteSkipped(); return; }
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -57544,10 +57666,10 @@ self.addEventListener('fetch', e => {
             // every list to zero in D1. Visibility is rewritten as well
             // so the fail-closed public index doesn't hide legacy lists
             // that were served as public because they had no enum value.
-            await d1Run(env.DB.prepare(
+            const listRes = await d1Run(env.DB.prepare(
               "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET likes=excluded.likes, visibility=excluded.visibility"
             ).bind(listId, u, data.name || "List", data.type || "mixed", vis, itemsJson, Number(data.likes) || 0, data.createdAt || 0, data.updatedAt || 0));
-            results.lists++; thisCall.lists++;
+            if (wrote(listRes)) { results.lists++; thisCall.lists++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`List ${u}:${slug}: ` + e.message);
           }
@@ -57559,7 +57681,7 @@ self.addEventListener('fetch', e => {
         // public-read checks don't hide currently-served lists.
         if (phase === 2) {
           const raw = await countedKv.get(keyName);
-          if (!raw) return;
+          if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
@@ -57577,10 +57699,10 @@ self.addEventListener('fetch', e => {
           const raw = await countedKv.get(keyName);
           const count = parseInt(raw || "0", 10);
           try {
-            await d1Run(env.DB.prepare(
+            const sgRes = await d1Run(env.DB.prepare(
               "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = excluded.install_count"
             ).bind(groupName, groupName, count));
-            results.sourcegroups++; thisCall.sourcegroups++;
+            if (wrote(sgRes)) { results.sourcegroups++; thisCall.sourcegroups++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Sourcegroup ${groupName}: ` + e.message);
           }
@@ -57608,6 +57730,8 @@ self.addEventListener('fetch', e => {
         const kind = rest.slice(0, sep);
         const bucket = rest.slice(sep + 1);
         if (!kind || !bucket) return;
+        // Not "skipped": phase 3 has already migrated these into their own
+        // table, and counting them here would report them twice.
         if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
         // Only the numeric counters. stats:genres:alltime and
         // stats:decades:alltime are JSON blobs, and
@@ -57616,12 +57740,14 @@ self.addEventListener('fetch', e => {
         if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
         const raw = await countedKv.get(keyName);
         const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) return;
+        if (!Number.isFinite(n)) { noteSkipped(); return; }
         try {
-          await d1Run(env.DB.prepare(
+          const statRes = await d1Run(env.DB.prepare(
             "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
           ).bind(kind, bucket, n));
-          results.stats++; thisCall.stats++;
+          // DO NOTHING on conflict, so a second run legitimately writes
+          // nothing -- that is "already migrated", not "skipped".
+          if (wrote(statRes)) { results.stats++; thisCall.stats++; }
         } catch (e) {
           noteError(`Stat ${keyName}: ` + e.message);
         }

@@ -52,6 +52,16 @@ function statsToday() {
 // is a real remaining limitation for KV-only deployments, not an oversight
 // -- KV genuinely cannot do this correctly, and the honest options there are
 // to bind D1 or to read the numbers as approximate.
+//
+// Counters are the ONE data family where "D1 is optional and removable at any
+// time without data loss" -- true of accounts, lists and likes, which are
+// always written to KV -- does not hold. Once D1 is bound these write to D1
+// alone, because dual-writing would put the lost-update race straight back in
+// (and spend a second write per bump on a key KV rate-limits to one per
+// second). So unbinding D1, or rebuilding it from schema.sql, rolls every
+// counter back to the KV value it had at migration time. That trade is the
+// right one and is now stated in wrangler.toml where an operator will see it,
+// rather than being a surprise.
 async function d1BumpStat(env, kind, buckets, amount) {
   // One statement per bucket, sent as a batch so the whole bump is a single
   // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
