@@ -3257,8 +3257,17 @@ async function removeListsFromPublicIndex(env, ids) {
 // listlikevoters:{user}:{slug} behind means whoever next creates a list at
 // that same slug inherits a like count they never earned, and every voter in
 // the old ledger is silently unable to like it.
+//
+// `ok` is the part callers must not ignore, and it is why this returns at all.
+// Both the KV delete and the directory removal used to log their failure and
+// carry on, and both callers returned ok:true regardless -- so a KV outage
+// during a delete answered "deleted" while the record stayed live and public
+// at /lists/:user/:slug, with the D1 row gone so the admin panel agreed it had
+// been deleted. Same lesson purgeCreatorData already records about itself, in
+// the one place that had not learned it: a delete that deleted nothing must
+// say so.
 async function deleteCreatorLists(env, username, slugs) {
-  const out = { deleted: [], missing: [] };
+  const out = { deleted: [], missing: [], ok: true };
   if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
 
   for (const slug of slugs) {
@@ -3283,6 +3292,9 @@ async function deleteCreatorLists(env, username, slugs) {
       await env.CONFIGS.delete(key);
     } catch (e) {
       console.error("deleteCreatorLists: could not delete", key, e);
+      // KV is the authoritative store and the one every public read path
+      // uses, so this is the failure that means the list is still out there.
+      out.ok = false;
     }
     try {
       await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
@@ -3295,7 +3307,14 @@ async function deleteCreatorLists(env, username, slugs) {
   // Every slug asked for comes out of the index, including ones whose record
   // was already gone -- those phantom entries are the whole reason an admin
   // reaches for this.
-  await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`));
+  //
+  // The result is checked, not discarded: removeListsFromPublicIndex's own
+  // comment says a caller that ignores a false here "is reporting a privacy
+  // change that did not happen", and this was one of the three call sites
+  // doing exactly that.
+  if (!(await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`)))) {
+    out.ok = false;
+  }
 
   try {
     const orderRaw = await env.CONFIGS.get(`creatorlistorder:${username}`);
@@ -3922,7 +3941,26 @@ async function advancePublicListIndexBuild(env, ctx) {
 // rebuild run after the response so the requesting user doesn't pay for it.
 async function getPublicListIndex(env, ctx) {
   const idx = await readPublicListIndex(env);
-  if (idx) return idx.entries;
+  // Removals are applied on the way OUT as well as on the way in.
+  //
+  // updatePublicListIndex records every removal as a tombstone and then
+  // rewrites the index. When that rewrite fails -- KV being unavailable, or
+  // rate-limiting this single hot key -- the caller is now told (see
+  // deleteCreatorLists and purgeCreatorData), but the entry is still sitting
+  // in the live index, and until this it kept being advertised by the
+  // directory and by search until the next daily rebuild.
+  //
+  // Filtering here makes the removal effective immediately regardless, which
+  // is what "make this private" and "delete this" are supposed to mean.
+  // dropStaleRemovalsFromEntries is the same function the rebuild uses and it
+  // RE-VERIFIES against the authoritative record rather than subtracting
+  // blindly, so a list that is public again (PRIVATE -> PUBLIC -> PRIVATE ->
+  // PUBLIC) is not hidden by its own stale tombstone.
+  //
+  // It costs one KV get for the tombstone set, and nothing more on the normal
+  // path: when the index write succeeded, the removed id is not in the index,
+  // so there is no suspect entry left to re-verify.
+  if (idx) return await dropStaleRemovalsFromEntries(env, idx.entries);
   // A small deployment finishes in this one chunk and gets its index
   // immediately; a large one makes bounded progress and is served the legacy
   // scan meanwhile, with the cron carrying the build to completion.
@@ -4049,6 +4087,49 @@ function nextSyncVersion(currentUpdatedAt) {
   return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
 }
 
+// --- Deleted-username tombstones ---------------------------------------------
+//
+// A purge is a sweep, and a sweep is a moment in time. Every authenticated
+// route verifies the key once at the top and then writes; nothing re-checked
+// that the account still existed by the time the write landed. So a request
+// that authenticated a moment before delete-account and finished a moment
+// after it PUT its key back, after the sweep had already gone past. The purge
+// had already reported success and freed the username -- so the next person to
+// register that name inherited whatever had been resurrected. Measured: all
+// seven authenticated write paths did it, and `creatorsync:{u}` carries
+// `keys`, which is where the account's own TMDB/Trakt/MDBList/Simkl
+// credentials live.
+//
+// The tombstone closes both halves. It is written BEFORE the sweep starts, so
+// any request that authenticates from then on is refused; and it is checked by
+// /api/creator/create, so the username cannot be re-registered while a
+// straggler might still be writing. Combined with the second sweep at the end
+// of purgeCreatorData, what is left is only a request that authenticated
+// before the tombstone AND is still running after the second sweep -- and even
+// that cannot reach a new owner, because the name is not available yet.
+//
+// Five minutes is chosen to comfortably outlast both an in-flight request and
+// KV's own propagation window, which is the other reason a just-deleted
+// account can still authenticate somewhere.
+const CREATOR_TOMBSTONE_TTL_SEC = 300;
+
+function creatorTombstoneKey(username) {
+  return `creatordeleted:${username}`;
+}
+
+// Fails OPEN on a read error, deliberately. This gates ordinary sign-in, and a
+// KV blip must not lock every creator out of their own account; the sweep and
+// the reclaim check are the load-bearing parts, not this.
+async function isCreatorTombstoned(env, username) {
+  if (!env || !env.CONFIGS || !username) return false;
+  try {
+    return !!(await env.CONFIGS.get(creatorTombstoneKey(username)));
+  } catch (e) {
+    console.error("could not read the deletion tombstone for", username, e);
+    return false;
+  }
+}
+
 // --- Account data purge (shared by reset and delete) -------------------------
 //
 // /api/creator/account/reset and /api/creator/delete-account are the same
@@ -4083,6 +4164,21 @@ async function purgeCreatorData(env, username, options = {}) {
   // still sign in and retry" -- but nothing was actually watching for that
   // failure. This is.
   let dataSweepFailed = false;
+
+  // Before anything is deleted, so that a request arriving from here on is
+  // refused rather than racing the sweep -- see the tombstone comment above.
+  // Only for a real deletion: account/reset keeps the identity and the account
+  // has to stay usable the moment it returns.
+  //
+  // Best-effort. If this write fails the purge still runs; what is lost is the
+  // narrowing, not the sweep.
+  if (deleteIdentity) {
+    try {
+      await env.CONFIGS.put(creatorTombstoneKey(u), "1", { expirationTtl: CREATOR_TOMBSTONE_TTL_SEC });
+    } catch (e) {
+      console.error("purgeCreatorData: could not write the deletion tombstone", e);
+    }
+  }
 
   // Custom lists are one key each and list() pages -- keep going until the
   // cursor is exhausted rather than assuming a single page covers an
@@ -4153,7 +4249,17 @@ async function purgeCreatorData(env, username, options = {}) {
   // One index write for the whole account rather than one per list --
   // deleting an account with 200 lists should not be 200 read-modify-writes
   // against the same key (KV allows 1 write/sec/key).
-  await removeListsFromPublicIndex(env, purgedListIds);
+  //
+  // Checked, not discarded. This is what stops the list being advertised, and
+  // ignoring it meant "delete my account" reported success, removed the
+  // identity, freed the username -- and left /lists/public.json and list
+  // search still listing the account's lists under a name nobody owned, until
+  // the next daily rebuild. The list-save path already treats a failed
+  // removal as a failure to report; the two account paths did not.
+  if (!(await removeListsFromPublicIndex(env, purgedListIds))) {
+    console.error("purgeCreatorData: the public directory still lists this account");
+    dataSweepFailed = true;
+  }
 
   // The scrobble token is keyed by the token, not the username, so it has to
   // be resolved through the reverse index before that index is deleted --
@@ -4258,6 +4364,62 @@ async function purgeCreatorData(env, username, options = {}) {
   // Any verification memoized in a warm isolate must stop being honoured
   // the instant the account it refers to is reset or removed.
   try { invalidateCreatorAuthMemo(); } catch (e) {}
+
+  // Second pass, after the identity is gone.
+  //
+  // The first pass ran while the account was still able to authenticate, so a
+  // request already past its own auth check could still be writing during it.
+  // The tombstone stops any request that STARTS from here on; this catches
+  // whatever landed in between. Cheap -- one list() and a handful of deletes
+  // against keys that are almost always already absent -- and it runs only on
+  // the deletion path, where a leftover is inheritable.
+  //
+  // Deliberately not folded into `dataSweepFailed`: the identity is already
+  // gone by now, so failing here cannot un-delete the account, and reporting
+  // failure would send the owner back to retry a delete that has in fact
+  // happened. Anything still stranded is unreachable (no identity, no key)
+  // and cannot be inherited either, because the tombstone holds the username
+  // for longer than any request can run.
+  if (deleteIdentity && identityRemoved) {
+    try {
+      let cursor;
+      for (let page = 0; page < 5; page++) {
+        const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
+        for (const k of res.keys) {
+          await env.CONFIGS.delete(k.name);
+          try { await env.CONFIGS.delete(`listlikevoters:${k.name.slice("creatorlist:".length)}`); } catch (e) {}
+          listsCleared++;
+        }
+        if (res.list_complete || !res.cursor) break;
+        cursor = res.cursor;
+      }
+      // Resolve the token through the reverse index again: a scrobble-token
+      // request that landed in between minted a NEW token, so the one the
+      // first pass revoked is not the one that now exists.
+      try {
+        const revived = await env.CONFIGS.get(creatorScrobbleTokenKey(u));
+        if (revived) await env.CONFIGS.delete(scrobbleTokenKey(revived));
+      } catch (e) {}
+      for (const key of dataKeys) {
+        await env.CONFIGS.delete(key);
+      }
+      await env.CONFIGS.delete(`creator:${u}`);
+      await env.CONFIGS.delete(`creatorlastseen:${u}`);
+    } catch (e) {
+      console.error("purgeCreatorData: the post-deletion sweep did not finish", e);
+    }
+  }
+
+  // A delete that did not happen must not keep the username reserved, or a
+  // failed attempt would lock the owner out of their own working account for
+  // the tombstone's lifetime.
+  if (deleteIdentity && !identityRemoved) {
+    try {
+      await env.CONFIGS.delete(creatorTombstoneKey(u));
+    } catch (e) {
+      console.error("purgeCreatorData: could not clear the tombstone after a failed delete", e);
+    }
+  }
 
   // `ok` is the whole point: it is false when this call left something
   // behind, and both callers turn that into an error rather than a 200.
@@ -53667,6 +53829,27 @@ self.addEventListener('fetch', e => {
       try { likeData = JSON.parse(likeRaw); } catch { return json({ ok: false, error: "Corrupted." }, 500); }
       await stampListVisibilityIfNeeded(env, likeKey, likeData);
 
+      // A private list is not likeable, and this route is the only public
+      // path to a list record that did not say so.
+      //
+      // Visibility used to be consulted only much further down, to decide
+      // whether to touch the directory index -- so the vote itself was
+      // recorded either way. Three things came out of that. The 404-vs-200
+      // split told any anonymous caller exactly which private slugs a creator
+      // owned (and /lists/public.json publishes the usernames, so only the
+      // slug had to be guessed). A stranger could change the stored `likes`
+      // on a private record in both stores and mint a permanent
+      // listlikevoters: key for it. And because a save deliberately preserves
+      // `likes` across an edit, the count a stranger built up while the list
+      // was private carried straight into the public directory the moment its
+      // owner published it.
+      //
+      // The SAME error and status as a list that does not exist, deliberately
+      // -- a distinguishable response here is the oracle, not the vote.
+      if (!isPublicListVisibility(likeData.visibility)) {
+        return json({ ok: false, error: "List not found." }, 404);
+      }
+
       // Signed-in visitors vote as themselves; everyone else votes as a
       // per-list hash of their IP. Either way one identity is worth exactly
       // one like, no matter how many times it POSTs. A creatorKey is
@@ -53934,7 +54117,23 @@ self.addEventListener('fetch', e => {
       if (!env || !env.CONFIGS) return { ok: false, error: "no-kv" };
       const v = validateCreatorUsername(creatorNameRaw);
       if (!v.ok) return { ok: false, error: "Username or Key is incorrect." };
-      const raw = await getCreator(env, v.normalized);
+      // A username being deleted right now stops authenticating, whatever the
+      // record says. Two things this catches that the record cannot: a request
+      // arriving mid-purge, which would otherwise write its key back after the
+      // sweep had passed; and a colo still serving the pre-deletion
+      // `creator:{u}` out of KV's read cache, where the record claims the
+      // account is alive because that copy is stale. See the tombstone comment
+      // in 02_http-and-creator-utils.js.
+      //
+      // Issued alongside the profile read rather than before it: this is the
+      // hottest authenticated path in the Worker (every autosave, every
+      // playback ping), and one extra round trip on it is worth avoiding even
+      // though the extra read is not.
+      const [tombstoned, raw] = await Promise.all([
+        isCreatorTombstoned(env, v.normalized),
+        getCreator(env, v.normalized),
+      ]);
+      if (tombstoned) return { ok: false, error: "Username or Key is incorrect." };
       if (!raw) return { ok: false, error: "Username or Key is incorrect." };
       let profile;
       try {
@@ -55036,6 +55235,18 @@ self.addEventListener('fetch', e => {
       if (existing) {
         return json({ ok: false, error: "That username is already taken." });
       }
+      // A username that was deleted moments ago is not available yet.
+      //
+      // This is the half of the tombstone that actually prevents disclosure.
+      // A purge is a sweep, so a request already in flight when it ran can put
+      // a key back after it finished -- and `creatorsync:{u}` holds the
+      // account's own provider API keys. Holding the name for a few minutes
+      // means the straggler has finished, and the second sweep has run, long
+      // before anyone else can claim it. Same message as a name that is simply
+      // taken, which is what it is for now.
+      if (await isCreatorTombstoned(env, v.normalized)) {
+        return json({ ok: false, error: "That username is already taken." });
+      }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
       // Recovery answer is optional and, unlike the Creator Key itself,
@@ -55064,6 +55275,31 @@ self.addEventListener('fetch', e => {
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
+
+      // A new account starts empty BY CONSTRUCTION, not because whatever
+      // happened to this username previously is assumed to have finished
+      // cleanly.
+      //
+      // The tombstone above holds a just-deleted name long enough for any
+      // in-flight write to land and for the post-deletion sweep to run, but
+      // "long enough" is a judgement about request duration, and inheriting a
+      // previous owner's synced config -- which carries their TMDB/Trakt API
+      // keys -- is too sharp an outcome to leave resting on one. Sweeping here
+      // as well means it does not matter how a stray key got there, or how
+      // long ago: nothing under this username survives into the new account.
+      //
+      // Cheap and safe: for a name that was never used this is one list() that
+      // returns nothing plus a handful of deletes against absent keys, on an
+      // endpoint already rate-limited to one call per IP per minute. It cannot
+      // touch a live account either, because the uniqueness check above has
+      // already established there is none.
+      const preCreatePurge = await purgeCreatorData(env, v.normalized, { deleteIdentity: false });
+      if (!preCreatePurge.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't set that Profile up just now. Please try again in a moment.",
+        }, 503);
+      }
       
       // KV is written ALWAYS, D1 only additionally. This used to write to
       // D1 *instead of* KV whenever DB was bound, which made the single
@@ -55776,7 +56012,19 @@ self.addEventListener('fetch', e => {
       // the same lesson purgeCreatorData records about itself. It also drops
       // the like ledger, which this route used to leave behind for whoever
       // next created a list at the same slug to inherit.
-      await deleteCreatorLists(env, auth.username, [slug]);
+      //
+      // `ok` is checked rather than assumed. This route used to return
+      // { ok: true } unconditionally, so a KV outage on the delete -- or a
+      // directory removal that failed -- answered "deleted" while the list
+      // stayed live at its public URL and in the directory, with nothing to
+      // retry it. See deleteCreatorLists' own comment.
+      const removal = await deleteCreatorLists(env, auth.username, [slug]);
+      if (!removal.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting that list. It may still be visible -- please try again in a moment.",
+        }, 500);
+      }
       return json({ ok: true });
     }
 
@@ -57904,6 +58152,21 @@ self.addEventListener('fetch', e => {
         remaining = listed.keys.length;
       } catch (e) {
         remaining = null;
+      }
+      // Same rule as the creator-facing sibling: a sweep that left the record
+      // or the directory entry behind is not a deletion, and an admin
+      // clearing something up is the last person who should be told it
+      // worked when it did not. `deleted` is still reported so a partial
+      // batch is legible.
+      if (!result.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting those lists. Some may still be visible -- please try again in a moment.",
+          username: v.normalized,
+          deleted: result.deleted,
+          missing: result.missing,
+          remaining,
+        }, 500, { "Cache-Control": "no-store" });
       }
       return json({
         ok: true,

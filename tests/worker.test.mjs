@@ -1368,9 +1368,31 @@ describe("account lifecycle", () => {
     const hist = await call(env, `/lists/${alice.creatorName}/watch-history.json`);
     assert.equal(hist.status, 404);
 
+    // The name is HELD for a few minutes, not released instantly.
+    //
+    // A purge is a sweep, so a request that authenticated just before it can
+    // land just after it and put its key back -- and `creatorsync:{u}` carries
+    // the account's own provider API keys. Holding the username until any such
+    // straggler has finished is what stops the next registrant inheriting it.
+    // See the tombstone comment in 02_http-and-creator-utils.js.
+    const tooSoon = await call(env, "/api/creator/create", {
+      method: "POST",
+      json: { creatorName: "alicedel" },
+    });
+    assert.equal(tooSoon.body.ok, false, "the name must not be re-registerable immediately after deletion");
+    assert.ok(env.CONFIGS._store.has("creatordeleted:alicedel"), "a deletion tombstone should be holding it");
+
+    // Once the tombstone lapses the name is free again, and the new account
+    // inherits nothing.
+    env.CONFIGS._store.delete("creatordeleted:alicedel");
     const again = await createUser(env, "alicedel");
     assert.equal(again.ok, true);
     assert.notEqual(again.creatorKey, alice.creatorKey);
+    const freshSync = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "alicedel", creatorKey: again.creatorKey },
+    });
+    assert.deepEqual(freshSync.body.data.watchHistory || [], [], "a reclaimed name must not inherit watch history");
   });
 });
 
@@ -3489,31 +3511,48 @@ describe("audit fix 13: outbound requests are bounded by a timeout", () => {
 
 describe("audit fix 11: a playback ping does not read every list the creator owns", () => {
   it("reads the watchlist directly instead of scanning", async () => {
-    const env = makeEnv();
-    const alice = await createUser(env, "pinguser");
-    // One watchlist plus a pile of unrelated lists.
-    await env.CONFIGS.put("creatorlist:pinguser:watchlist", JSON.stringify({
-      slug: "watchlist", name: "Watchlist", type: "movie", visibility: "private",
-      items: [{ id: "tt111" }, { id: "tt222" }],
-    }));
-    for (let i = 0; i < 40; i++) {
-      await env.CONFIGS.put(`creatorlist:pinguser:other-${i}`, JSON.stringify({
-        slug: `other-${i}`, name: "Other " + i, type: "movie", visibility: "private", items: [{ id: "tt999" }],
+    // The property that matters is that a ping costs a CONSTANT number of KV
+    // reads, not one per list the creator owns -- before the fix this was a
+    // list() plus a get() per list, so an account with 200 lists paid 200
+    // reads on every single play. Asserting a magic threshold only ever
+    // approximated that (and had to be nudged whenever an unrelated constant
+    // read was added), so this measures the same ping against two very
+    // different list counts and requires the cost not to move.
+    async function pingCost(listCount, username) {
+      const env = makeEnv();
+      const alice = await createUser(env, username);
+      await env.CONFIGS.put(`creatorlist:${username}:watchlist`, JSON.stringify({
+        slug: "watchlist", name: "Watchlist", type: "movie", visibility: "private",
+        items: [{ id: "tt111" }, { id: "tt222" }],
       }));
+      for (let i = 0; i < listCount; i++) {
+        await env.CONFIGS.put(`creatorlist:${username}:other-${i}`, JSON.stringify({
+          slug: `other-${i}`, name: "Other " + i, type: "movie", visibility: "private", items: [{ id: "tt999" }],
+        }));
+      }
+
+      let gets = 0;
+      const og = env.CONFIGS.get.bind(env.CONFIGS);
+      env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+
+      const config = Buffer.from(JSON.stringify({
+        entries: [], track: true, trackCreatorName: alice.creatorName, trackCreatorKey: alice.creatorKey,
+      })).toString("base64url");
+      await call(env, `/${config}/subtitles/movie/tt111.json`);
+      return { gets, env };
     }
 
-    let gets = 0;
-    const og = env.CONFIGS.get.bind(env.CONFIGS);
-    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+    const small = await pingCost(40, "pinguser");
+    const large = await pingCost(200, "pinguserbig");
+    assert.equal(
+      small.gets, large.gets,
+      `a ping must cost the same whether the account has 40 lists (${small.gets} reads) or 200 (${large.gets})`,
+    );
+    // Still a loose absolute ceiling, so an O(1) cost that quietly grew by an
+    // order of magnitude would also be caught.
+    assert.ok(small.gets < 25, `expected a handful of KV reads per ping, got ${small.gets}`);
 
-    const config = Buffer.from(JSON.stringify({
-      entries: [], track: true, trackCreatorName: alice.creatorName, trackCreatorKey: alice.creatorKey,
-    })).toString("base64url");
-    await call(env, `/${config}/subtitles/movie/tt111.json`);
-
-    // Before: one list() plus one get() per list (41 here) on every ping.
-    assert.ok(gets < 15, `expected a handful of KV reads per ping, got ${gets}`);
-    const wl = JSON.parse(env.CONFIGS._store.get("creatorlist:pinguser:watchlist"));
+    const wl = JSON.parse(small.env.CONFIGS._store.get("creatorlist:pinguser:watchlist"));
     assert.deepEqual(wl.items.map((i) => i.id), ["tt222"], "the watched item should still be removed");
   });
 });
@@ -3536,8 +3575,13 @@ describe("audit fix 12: deleting an account leaves nothing behind", () => {
     }});
     assert.equal(r.body.ok, true);
 
-    const leftovers = [...env.CONFIGS._store.keys()].filter((k) => k.includes("purgeuser"));
+    // The tombstone is the one key that legitimately still names the account:
+    // it is a marker saying "this username is not available yet", not account
+    // data, and it expires on its own. Everything else must be gone.
+    const leftovers = [...env.CONFIGS._store.keys()]
+      .filter((k) => k.includes("purgeuser") && k !== "creatordeleted:purgeuser");
     assert.deepEqual(leftovers, [], `nothing should reference the deleted account, found: ${leftovers.join(", ")}`);
+    assert.ok(env.CONFIGS._store.has("creatordeleted:purgeuser"), "the username should be tombstoned");
   });
 
   it("does not let a recycled username inherit the old like count", async () => {
@@ -3554,7 +3598,9 @@ describe("audit fix 12: deleting an account leaves nothing behind", () => {
       creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
     }});
 
-    // Someone else claims the freed username and happens to pick the same slug.
+    // Someone else claims the username once the deletion tombstone lapses,
+    // and happens to pick the same slug.
+    env.CONFIGS._store.delete("creatordeleted:recycled");
     const bob = await createUser(env, "recycled");
     await call(env, "/api/creator/lists/save", { method: "POST", json: {
       creatorName: bob.creatorName, creatorKey: bob.creatorKey,
@@ -4359,8 +4405,15 @@ describe("A3/A4: a purge that failed must not report success", () => {
     assert.equal(del.body.ok, true, JSON.stringify(del.body));
     assert.equal(db._creators.has("delme4c"), false);
     assert.equal(db._lists.size, 0);
-    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.includes("delme4c")).length, 0);
+    // Everything except the tombstone, which is a "not available yet" marker
+    // rather than account data and expires on its own.
+    assert.deepEqual(
+      [...env.CONFIGS._store.keys()].filter((k) => k.includes("delme4c") && k !== "creatordeleted:delme4c"),
+      [],
+    );
+    assert.ok(env.CONFIGS._store.has("creatordeleted:delme4c"), "the username is held while stragglers finish");
 
+    env.CONFIGS._store.delete("creatordeleted:delme4c");
     const fresh = await createUser(env, "delme4c", { displayName: "Somebody Else" });
     const dash = await call(env, "/api/creator/lists", {
       method: "POST", json: { creatorName: "delme4c", creatorKey: fresh.creatorKey },

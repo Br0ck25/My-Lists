@@ -13,7 +13,23 @@
       if (!env || !env.CONFIGS) return { ok: false, error: "no-kv" };
       const v = validateCreatorUsername(creatorNameRaw);
       if (!v.ok) return { ok: false, error: "Username or Key is incorrect." };
-      const raw = await getCreator(env, v.normalized);
+      // A username being deleted right now stops authenticating, whatever the
+      // record says. Two things this catches that the record cannot: a request
+      // arriving mid-purge, which would otherwise write its key back after the
+      // sweep had passed; and a colo still serving the pre-deletion
+      // `creator:{u}` out of KV's read cache, where the record claims the
+      // account is alive because that copy is stale. See the tombstone comment
+      // in 02_http-and-creator-utils.js.
+      //
+      // Issued alongside the profile read rather than before it: this is the
+      // hottest authenticated path in the Worker (every autosave, every
+      // playback ping), and one extra round trip on it is worth avoiding even
+      // though the extra read is not.
+      const [tombstoned, raw] = await Promise.all([
+        isCreatorTombstoned(env, v.normalized),
+        getCreator(env, v.normalized),
+      ]);
+      if (tombstoned) return { ok: false, error: "Username or Key is incorrect." };
       if (!raw) return { ok: false, error: "Username or Key is incorrect." };
       let profile;
       try {
@@ -1115,6 +1131,18 @@
       if (existing) {
         return json({ ok: false, error: "That username is already taken." });
       }
+      // A username that was deleted moments ago is not available yet.
+      //
+      // This is the half of the tombstone that actually prevents disclosure.
+      // A purge is a sweep, so a request already in flight when it ran can put
+      // a key back after it finished -- and `creatorsync:{u}` holds the
+      // account's own provider API keys. Holding the name for a few minutes
+      // means the straggler has finished, and the second sweep has run, long
+      // before anyone else can claim it. Same message as a name that is simply
+      // taken, which is what it is for now.
+      if (await isCreatorTombstoned(env, v.normalized)) {
+        return json({ ok: false, error: "That username is already taken." });
+      }
       const creatorKey = generateCreatorKey();
       const keyHash = await hashCreatorKey(creatorKey);
       // Recovery answer is optional and, unlike the Creator Key itself,
@@ -1143,6 +1171,31 @@
       const recoveryAnswerHash = recoveryAnswerRaw ? await hashCreatorKey(recoveryAnswerRaw.toLowerCase()) : null;
       const nowMs = Date.now();
       const profileObj = { displayName, keyHash, recoveryAnswerHash, createdAt: nowMs };
+
+      // A new account starts empty BY CONSTRUCTION, not because whatever
+      // happened to this username previously is assumed to have finished
+      // cleanly.
+      //
+      // The tombstone above holds a just-deleted name long enough for any
+      // in-flight write to land and for the post-deletion sweep to run, but
+      // "long enough" is a judgement about request duration, and inheriting a
+      // previous owner's synced config -- which carries their TMDB/Trakt API
+      // keys -- is too sharp an outcome to leave resting on one. Sweeping here
+      // as well means it does not matter how a stray key got there, or how
+      // long ago: nothing under this username survives into the new account.
+      //
+      // Cheap and safe: for a name that was never used this is one list() that
+      // returns nothing plus a handful of deletes against absent keys, on an
+      // endpoint already rate-limited to one call per IP per minute. It cannot
+      // touch a live account either, because the uniqueness check above has
+      // already established there is none.
+      const preCreatePurge = await purgeCreatorData(env, v.normalized, { deleteIdentity: false });
+      if (!preCreatePurge.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't set that Profile up just now. Please try again in a moment.",
+        }, 503);
+      }
       
       // KV is written ALWAYS, D1 only additionally. This used to write to
       // D1 *instead of* KV whenever DB was bound, which made the single
@@ -1855,7 +1908,19 @@
       // the same lesson purgeCreatorData records about itself. It also drops
       // the like ledger, which this route used to leave behind for whoever
       // next created a list at the same slug to inherit.
-      await deleteCreatorLists(env, auth.username, [slug]);
+      //
+      // `ok` is checked rather than assumed. This route used to return
+      // { ok: true } unconditionally, so a KV outage on the delete -- or a
+      // directory removal that failed -- answered "deleted" while the list
+      // stayed live at its public URL and in the directory, with nothing to
+      // retry it. See deleteCreatorLists' own comment.
+      const removal = await deleteCreatorLists(env, auth.username, [slug]);
+      if (!removal.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting that list. It may still be visible -- please try again in a moment.",
+        }, 500);
+      }
       return json({ ok: true });
     }
 
@@ -3983,6 +4048,21 @@
         remaining = listed.keys.length;
       } catch (e) {
         remaining = null;
+      }
+      // Same rule as the creator-facing sibling: a sweep that left the record
+      // or the directory entry behind is not a deletion, and an admin
+      // clearing something up is the last person who should be told it
+      // worked when it did not. `deleted` is still reported so a partial
+      // batch is legible.
+      if (!result.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting those lists. Some may still be visible -- please try again in a moment.",
+          username: v.normalized,
+          deleted: result.deleted,
+          missing: result.missing,
+          remaining,
+        }, 500, { "Cache-Control": "no-store" });
       }
       return json({
         ok: true,
