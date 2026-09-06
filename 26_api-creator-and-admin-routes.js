@@ -1831,6 +1831,16 @@
       // callers on one function is what stops the two from drifting apart
       // again the way they had.
       const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: false });
+      // A sweep that threw is not a reset. Saying ok:true here would tell
+      // someone their account is empty while their lists are still live and
+      // still in the public directory.
+      if (!purged.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish clearing this account. Nothing has been lost -- please try again in a moment.",
+          cleared: { lists: purged.listsCleared, keys: purged.keysCleared },
+        }, 500);
+      }
 
       return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
@@ -1860,6 +1870,18 @@
       // the profile, the D1 row, and the last-seen marker go too, so the
       // key stops authenticating and the username becomes reclaimable.
       const purged = await purgeCreatorData(env, auth.username, { deleteIdentity: true });
+      // Only a purge that actually removed everything, identity included, is
+      // a deletion. Anything else leaves the account signed-in-able so its
+      // owner can retry, and must say so rather than reporting success --
+      // this endpoint used to return ok:true while leaving every list live,
+      // public, and attached to a username anyone could then re-register.
+      if (!purged.ok) {
+        return json({
+          ok: false,
+          error: "Couldn't finish deleting this account. Nothing has been removed -- please try again in a moment.",
+          cleared: { lists: purged.listsCleared, keys: purged.keysCleared },
+        }, 500);
+      }
       return json({ ok: true, cleared: { lists: purged.listsCleared, keys: purged.keysCleared } });
     }
 

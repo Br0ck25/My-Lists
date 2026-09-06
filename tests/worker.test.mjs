@@ -4268,3 +4268,103 @@ describe("A5: a key rotation must never report success without rotating", () => 
     assert.equal(ok.status, 200);
   });
 });
+
+describe("A3/A4: a purge that failed must not report success", () => {
+  const setup = async (name) => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, name);
+    const K = { creatorName: name, creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Holiday Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Private Notes", type: "movie", visibility: "private", items: [{ id: "tt0068646" }] },
+    });
+    return { db, env, u, K };
+  };
+
+  // A3 -- the D1 identity DELETE used to be best-effort, and getCreator
+  // reads D1, so a swallowed failure left a "deleted" account authenticating.
+  it("delete-account fails loudly when the D1 identity row cannot be removed", async () => {
+    const { db, env, u, K } = await setup("delme3");
+    db.failWhen((sql) => /DELETE FROM creators/i.test(sql));
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    db.failWhen(null);
+
+    assert.notEqual(del.body.ok, true, "must not claim the account was deleted");
+    assert.ok(env.CONFIGS._store.get("creator:delme3"),
+      "the identity must survive so the owner can sign in and retry");
+    assert.equal(db._creators.has("delme3"), true);
+
+    const restore = await call(env, "/api/creator/restore", {
+      method: "POST", json: { creatorName: "delme3", creatorKey: u.creatorKey },
+    });
+    assert.equal(restore.status, 200, "a delete that failed leaves a working account, not a limbo one");
+  });
+
+  // A4 -- the list sweep was wrapped in a catch that logged and fell straight
+  // through to deleting the identity, which frees the username.
+  it("delete-account does not free the username when the list sweep failed", async () => {
+    const { env, u, K } = await setup("delme4");
+    env.CONFIGS._hooks.beforeList = async (prefix) => {
+      if (String(prefix).startsWith("creatorlist:delme4:")) throw new Error("KV list failed");
+    };
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    env.CONFIGS._hooks.beforeList = null;
+
+    assert.notEqual(del.body.ok, true, "must not claim the account was deleted");
+    assert.ok(env.CONFIGS._store.get("creatorlist:delme4:holiday-photos"), "the data is still there");
+    assert.ok(env.CONFIGS._store.get("creator:delme4"), "so the identity must still be there too");
+
+    const reclaim = await call(env, "/api/creator/create", {
+      method: "POST", json: { creatorName: "delme4", displayName: "Somebody Else" },
+    });
+    assert.notEqual(reclaim.body.ok, true,
+      "a stranger must not be able to claim a username whose data was never removed");
+
+    const stillMine = await call(env, "/api/creator/lists", {
+      method: "POST", json: { creatorName: "delme4", creatorKey: u.creatorKey },
+    });
+    assert.equal(stillMine.body.lists.length, 2, "the owner still owns their lists");
+  });
+
+  it("account/reset reports failure when it could not empty the account", async () => {
+    const { env, K } = await setup("delme4b");
+    env.CONFIGS._hooks.beforeList = async (prefix) => {
+      if (String(prefix).startsWith("creatorlist:delme4b:")) throw new Error("KV list failed");
+    };
+    const reset = await call(env, "/api/creator/account/reset", {
+      method: "POST", json: { ...K, confirm: "RESET" },
+    });
+    env.CONFIGS._hooks.beforeList = null;
+    assert.notEqual(reset.body.ok, true, "the account is not empty, so this did not succeed");
+    assert.ok(env.CONFIGS._store.get("creatorlist:delme4b:holiday-photos"));
+    assert.ok(env.CONFIGS._store.get("creator:delme4b"), "reset never removes the identity");
+  });
+
+  // The inverse, so the fix cannot be 'always fail': a healthy delete must
+  // still hand a reclaiming owner a completely empty account.
+  it("a healthy delete still frees the username, and the next owner inherits nothing", async () => {
+    const { db, env, K } = await setup("delme4c");
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body));
+    assert.equal(db._creators.has("delme4c"), false);
+    assert.equal(db._lists.size, 0);
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.includes("delme4c")).length, 0);
+
+    const fresh = await createUser(env, "delme4c", { displayName: "Somebody Else" });
+    const dash = await call(env, "/api/creator/lists", {
+      method: "POST", json: { creatorName: "delme4c", creatorKey: fresh.creatorKey },
+    });
+    assert.deepEqual(dash.body.lists, []);
+  });
+});

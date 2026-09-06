@@ -16,9 +16,12 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
    harness would mean landing five fixes nothing can prove.
 2. **A1** — the only finding an unauthenticated stranger can trigger, and it destroys
    other people's data. Nothing else outranks it.
-3. **A5, A3, A4** — the three `ok:true`-while-doing-nothing defects, in decreasing
-   order of how bad the lie is: a leaked key that still works > a deleted account that
-   still works > a deleted account whose data is inherited by a stranger.
+3. **A5, then A3 + A4 together** — the three `ok:true`-while-doing-nothing defects, in
+   decreasing order of how bad the lie is: a leaked key that still works > a deleted
+   account that still works > a deleted account whose data is inherited by a stranger.
+   A3 and A4 landed in one commit rather than two: both are `purgeCreatorData`
+   reporting success after failing, and splitting them would have left that one
+   function half-converted between commits.
 4. **A2 + A6** — one commit, because they are one root cause (D1 preferred on read over
    the store that is actually authoritative). Fixing A2's `likes` binding without
    fixing the read preference would leave A6 live and A2 reachable by another route.
@@ -41,8 +44,8 @@ Updated as each fix lands. Branch: `claude/full-audit-dzhmot`.
 |---|---|---|---|---|
 | **A1** | Cross-account D1 delete via SQL `LIKE` wildcard | CRITICAL | ✅ | `02_…:2206` → `WHERE username = ?`; `escapeLikePrefix` for `03_…:1133` |
 | **A5** | Key rotation reports success while rotating nothing | HIGH | ✅ | `rotateCreatorKeyHashInD1` (02_); both rotation routes; migrate-d1 `DO UPDATE` |
-| **A3** | `delete-account` `ok:true`, account still authenticates | HIGH | ⬜ | |
-| **A4** | Failed purge frees the username while data survives | HIGH | ⬜ | |
+| **A3** | `delete-account` `ok:true`, account still authenticates | HIGH | ✅ | `purgeCreatorData` identity: D1 before KV, abort on failure |
+| **A4** | Failed purge frees the username while data survives | HIGH | ✅ | `purgeCreatorData` returns `ok`; both callers 500 on failure |
 
 ### P1 — the structural cause
 

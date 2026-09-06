@@ -2166,6 +2166,20 @@ async function purgeCreatorData(env, username, options = {}) {
   let listsCleared = 0;
   const purgedListIds = [];
   let keysCleared = 0;
+  // Anything that would leave account-owned data behind flips this. Every
+  // step below used to log its failure and carry on, which made a sweep that
+  // THREW indistinguishable from one that found nothing -- and the caller
+  // returned ok:true either way. That is how "delete my account" came to
+  // report success, leave every list live and public, and still free the
+  // username: whoever registered it next inherited the previous owner's
+  // lists, private ones and their contents included, via the orphan-recovery
+  // sweep in /api/creator/lists.
+  //
+  // The function's own comment already described the intent -- the identity
+  // goes last "so that a failure partway through leaves an account that can
+  // still sign in and retry" -- but nothing was actually watching for that
+  // failure. This is.
+  let dataSweepFailed = false;
 
   // Custom lists are one key each and list() pages -- keep going until the
   // cursor is exhausted rather than assuming a single page covers an
@@ -2199,6 +2213,7 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   } catch (e) {
     console.error("purgeCreatorData: list enumeration failed", e);
+    dataSweepFailed = true;
   }
 
   if (env.DB) {
@@ -2228,6 +2243,7 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
+      dataSweepFailed = true;
     }
   }
 
@@ -2248,6 +2264,10 @@ async function purgeCreatorData(env, username, options = {}) {
     }
   } catch (e) {
     console.error("purgeCreatorData: could not revoke the scrobble token", e);
+    // A live webhook credential for an account that is about to stop
+    // existing is exactly the kind of leftover that must not be reported as
+    // a clean delete.
+    dataSweepFailed = true;
   }
 
   // Everything else the account owns, under the key names actually in use
@@ -2285,29 +2305,49 @@ async function purgeCreatorData(env, username, options = {}) {
       keysCleared++;
     } catch (e) {
       console.error("purgeCreatorData: could not delete", key, e);
+      dataSweepFailed = true;
     }
   }
 
+  let identityRemoved = false;
   if (deleteIdentity) {
     // Last, and only for delete-account: the identity itself. Done after
     // the data sweep so that a failure partway through leaves an account
     // that can still sign in and retry, rather than orphaned data with no
     // owner and a username nobody can ever reclaim.
-    try {
-      await env.CONFIGS.delete(`creator:${u}`);
-      keysCleared++;
-    } catch (e) {
-      console.error("purgeCreatorData: could not delete identity", e);
-    }
-    try {
-      await env.CONFIGS.delete(`creatorlastseen:${u}`);
-      keysCleared++;
-    } catch (e) {}
-    if (env.DB) {
-      try {
-        await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
-      } catch (dbErr) {
-        console.error("D1 write error (purgeCreatorData identity):", dbErr);
+    //
+    // Gated on the sweep having actually worked, because deleting the
+    // identity is what FREES THE USERNAME. Doing that while the account's
+    // lists are still sitting in KV hands them to whoever registers the name
+    // next -- the failure mode this used to have.
+    if (!dataSweepFailed) {
+      // D1 before KV, which is the opposite of the old order and the whole
+      // of the second half of this fix. getCreator falls back to D1, so a
+      // swallowed D1 failure after the KV row was already gone left a
+      // "deleted" account that still authenticated and could still write --
+      // while its owner had been told it was gone. Doing the store that can
+      // fail FIRST means a failure aborts before anything is destroyed.
+      let d1Ok = true;
+      if (env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM creators WHERE username = ?").bind(u).run();
+        } catch (dbErr) {
+          console.error("D1 write error (purgeCreatorData identity):", dbErr);
+          d1Ok = false;
+        }
+      }
+      if (d1Ok) {
+        try {
+          await env.CONFIGS.delete(`creator:${u}`);
+          keysCleared++;
+          identityRemoved = true;
+        } catch (e) {
+          console.error("purgeCreatorData: could not delete identity", e);
+        }
+        try {
+          await env.CONFIGS.delete(`creatorlastseen:${u}`);
+          keysCleared++;
+        } catch (e) {}
       }
     }
   }
@@ -2316,7 +2356,14 @@ async function purgeCreatorData(env, username, options = {}) {
   // the instant the account it refers to is reset or removed.
   try { invalidateCreatorAuthMemo(); } catch (e) {}
 
-  return { listsCleared, keysCleared };
+  // `ok` is the whole point: it is false when this call left something
+  // behind, and both callers turn that into an error rather than a 200.
+  return {
+    ok: !dataSweepFailed && (!deleteIdentity || identityRemoved),
+    listsCleared,
+    keysCleared,
+    identityRemoved,
+  };
 }
 
 // D1 is an optional accelerator in front of KV, never a replacement for it
