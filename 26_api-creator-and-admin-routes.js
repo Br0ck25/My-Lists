@@ -4274,6 +4274,32 @@
       }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /admin/api/schema-status  (GET)
+    //   -> { ok, bound, checked, missing: [...], pendingMigrations: [...] }
+    //
+    // Answers "is this Worker running ahead of its database", which nothing
+    // could answer before. A migration is applied by hand (see the README),
+    // nothing records that it happened, and the Worker degrades quietly when
+    // one is missing rather than refusing to start -- so the only way an
+    // operator learned they had skipped one was by noticing the behaviour it
+    // was supposed to provide had never worked.
+    if (path === "/admin/api/schema-status" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const status = await checkD1Schema(env);
+      return json({
+        ok: true,
+        bound: status.bound,
+        checked: status.checked,
+        upToDate: status.ok,
+        error: status.error,
+        missing: status.missing.map((m) => ({
+          migration: m.migration, kind: m.kind, name: m.name, consequence: m.consequence,
+        })),
+        pendingMigrations: status.pendingMigrations,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/published-lists  (GET)  ?limit=&cursor=
     //   -> { ok, lists: [{ slug, name, type, itemCount, likes, visibility,
     //                      publishedAt, url }], cursor, done }
@@ -5139,6 +5165,19 @@ export default {
       Promise.all([
         guard("checkForNewEpisodes", checkForNewEpisodes(env)),
         guard("prewarmSharedCatalogs", prewarmSharedCatalogs(env, ctx)),
+        // Cheap (one sqlite_master read per tick) and the only thing that puts
+        // "you have not run migration N" somewhere an operator will see it
+        // without going looking. The admin panel shows the same thing on
+        // demand; this is for the case where nobody thought to look.
+        guard("d1SchemaCheck", (async () => {
+          const status = await checkD1Schema(env);
+          if (status.bound && status.checked && !status.ok) {
+            console.warn(
+              `[Cron] This Worker is running ahead of its D1 schema. Unapplied migration(s): ${status.pendingMigrations.join(", ")}. ` +
+              status.missing.map((m) => `${m.name}: ${m.consequence}`).join(" | ")
+            );
+          }
+        })()),
         // Cheap when index:publiclists already exists (one KV get, no-op).
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never

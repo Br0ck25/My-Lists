@@ -3203,3 +3203,55 @@ function formatAirDateBadge(airDateStr) {
   return months[d.getMonth()] + ' ' + d.getDate();
 }
 
+
+// Which entries in D1_SCHEMA_MANIFEST this database actually has.
+//
+// One query. sqlite_master is a handful of rows here, and its stored `sql`
+// text is updated by ALTER TABLE ADD COLUMN, so the same read answers both
+// "does this table/index exist" and "does creator_lists have a likes column"
+// without a PRAGMA -- which keeps this to plain SQL that D1 is certain to
+// support.
+//
+// Returns { bound, ok, missing, pendingMigrations }, and never throws: a
+// database that will not answer is reported as unknown rather than as a
+// missing schema, because "I could not check" and "it is not there" are
+// different things and only one of them is an instruction to go run a
+// migration.
+async function checkD1Schema(env) {
+  if (!env || !env.DB) {
+    return { bound: false, ok: true, checked: false, missing: [], pendingMigrations: [] };
+  }
+  let rows = [];
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table','index')"
+    ).all();
+    rows = results || [];
+  } catch (e) {
+    console.error("checkD1Schema: could not read sqlite_master", e);
+    return { bound: true, ok: true, checked: false, error: safeErrorMessage(e), missing: [], pendingMigrations: [] };
+  }
+
+  const names = new Set(rows.map((r) => r && r.name));
+  const ddl = new Map(rows.map((r) => [r && r.name, String((r && r.sql) || "")]));
+  const missing = [];
+  for (const entry of D1_SCHEMA_MANIFEST) {
+    let present;
+    if (entry.kind === "column") {
+      const tableSql = ddl.get(entry.table) || "";
+      // Word-boundary match so a column named `likes` is not satisfied by
+      // `likes_count`, and so the table's own name cannot match its column.
+      present = new RegExp(`(^|[(,\\s])${entry.name}\\s`, "i").test(tableSql);
+    } else {
+      present = names.has(entry.name);
+    }
+    if (!present) missing.push(entry);
+  }
+  return {
+    bound: true,
+    checked: true,
+    ok: missing.length === 0,
+    missing,
+    pendingMigrations: [...new Set(missing.map((m) => m.migration))].sort(),
+  };
+}

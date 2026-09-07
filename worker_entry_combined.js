@@ -329,6 +329,58 @@ function buildRegionOptionsHtml(selectedRegion) {
 }
 
 
+
+// --- D1 schema manifest ------------------------------------------------------
+//
+// What each file under migrations/ adds, so the Worker can tell an operator
+// when it is running ahead of its own database.
+//
+// This exists because the failure is otherwise silent and measured: deploy the
+// Worker without running migration 0004 and account deletion still answers
+// ok:true, still writes its KV tombstone, and still refuses the deleted
+// account on a normal request -- but the strongly-consistent half of R3 is
+// gone, and a colo with a stale KV cache authenticates a deleted account. The
+// only trace is one line in the Worker's logs, which nobody reads until after
+// something has gone wrong.
+//
+// `consequence` is the point of the whole structure. "creator_tombstones is
+// missing" tells an operator nothing they can act on; "deleted accounts can
+// still authenticate from a colo whose KV cache is stale" tells them whether
+// it matters this afternoon.
+//
+// Kept in step with migrations/ by a test, not by discipline: adding a
+// migration without adding its objects here fails the suite, the same way
+// FUNCTION-MAP.md and the combined Worker are kept honest by a drift check.
+const D1_SCHEMA_MANIFEST = [
+  {
+    migration: "0001a", kind: "column", table: "creator_lists", name: "likes",
+    consequence: "Every list save and the whole D1 mirror fail -- creator_lists has no likes column to write.",
+  },
+  {
+    migration: "0001b", kind: "index", name: "idx_creator_lists_likes",
+    consequence: "Ordering public lists by likes scans the table instead of using an index. Slower, not broken.",
+  },
+  {
+    migration: "0002", kind: "table", name: "stats",
+    consequence: "Counters fall back to the older KV-only path. Admin totals still work; day-by-day history is thinner.",
+  },
+  {
+    migration: "0003", kind: "index", name: "idx_creators_last_active",
+    consequence: "The admin creators list sorts by scanning every row. Slower, not broken.",
+  },
+  {
+    migration: "0003", kind: "index", name: "idx_creator_lists_vis_likes",
+    consequence: "The public directory query sorts the whole table rather than walking an index. Slower, not broken.",
+  },
+  {
+    migration: "0004", kind: "table", name: "creator_tombstones",
+    consequence: "A deleted account can still authenticate from a colo whose KV cache predates the deletion. This is a security property, not a performance one -- apply this one.",
+  },
+  {
+    migration: "0005", kind: "index", name: "idx_stats_day_totals",
+    consequence: "The dashboard's counter panels scan and sort the whole stats table on every load. Slower, not broken.",
+  },
+];
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -4927,6 +4979,58 @@ function formatAirDateBadge(airDateStr) {
   return months[d.getMonth()] + ' ' + d.getDate();
 }
 
+
+// Which entries in D1_SCHEMA_MANIFEST this database actually has.
+//
+// One query. sqlite_master is a handful of rows here, and its stored `sql`
+// text is updated by ALTER TABLE ADD COLUMN, so the same read answers both
+// "does this table/index exist" and "does creator_lists have a likes column"
+// without a PRAGMA -- which keeps this to plain SQL that D1 is certain to
+// support.
+//
+// Returns { bound, ok, missing, pendingMigrations }, and never throws: a
+// database that will not answer is reported as unknown rather than as a
+// missing schema, because "I could not check" and "it is not there" are
+// different things and only one of them is an instruction to go run a
+// migration.
+async function checkD1Schema(env) {
+  if (!env || !env.DB) {
+    return { bound: false, ok: true, checked: false, missing: [], pendingMigrations: [] };
+  }
+  let rows = [];
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table','index')"
+    ).all();
+    rows = results || [];
+  } catch (e) {
+    console.error("checkD1Schema: could not read sqlite_master", e);
+    return { bound: true, ok: true, checked: false, error: safeErrorMessage(e), missing: [], pendingMigrations: [] };
+  }
+
+  const names = new Set(rows.map((r) => r && r.name));
+  const ddl = new Map(rows.map((r) => [r && r.name, String((r && r.sql) || "")]));
+  const missing = [];
+  for (const entry of D1_SCHEMA_MANIFEST) {
+    let present;
+    if (entry.kind === "column") {
+      const tableSql = ddl.get(entry.table) || "";
+      // Word-boundary match so a column named `likes` is not satisfied by
+      // `likes_count`, and so the table's own name cannot match its column.
+      present = new RegExp(`(^|[(,\\s])${entry.name}\\s`, "i").test(tableSql);
+    } else {
+      present = names.has(entry.name);
+    }
+    if (!present) missing.push(entry);
+  }
+  return {
+    bound: true,
+    checked: true,
+    ok: missing.length === 0,
+    missing,
+    pendingMigrations: [...new Set(missing.map((m) => m.migration))].sort(),
+  };
+}
 // --- Admin stats (page views, install links generated) -----------------
 //
 // Deliberately simple counters -- KV has no atomic increment (each bump is
@@ -6916,6 +7020,14 @@ async function renderAdminDashboard(env) {
     </div>
 
     <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Database schema</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Migrations are applied by hand and nothing records that it happened, so this Worker can end up running ahead of its own database. It degrades quietly when that happens rather than refusing to start &mdash; which is why this check exists. Run it after any deploy that shipped a new file under <code>migrations/</code>.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="schemaCheckBtn" onclick="runSchemaCheck()">Check schema</button>
+      <span id="schemaCheckStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <div id="schemaCheckResult" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
       <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
@@ -7509,6 +7621,66 @@ async function renderAdminDashboard(env) {
           ' slug' + (missing === 1 ? '' : 's') + ' had no list to remove.';
         document.getElementById('deleteAnonSlugsInput').value = '';
         if (anonListCount) await loadPublishedLists(true);
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Reports which files under migrations/ this database has not had run,
+    // and what each omission silently costs. The consequence text is the
+    // useful part: "creator_tombstones is missing" is not something an
+    // operator can act on.
+    async function runSchemaCheck() {
+      const btn = document.getElementById('schemaCheckBtn');
+      const status = document.getElementById('schemaCheckStatus');
+      const out = document.getElementById('schemaCheckResult');
+      btn.disabled = true;
+      status.textContent = 'Checking\u2026';
+      out.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/schema-status');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        if (!data.bound) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>';
+          btn.disabled = false;
+          return;
+        }
+        if (!data.checked) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
+            (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
+            ' This is not the same as a missing migration \u2014 try again.</p>';
+          btn.disabled = false;
+          return;
+        }
+        if (data.upToDate) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>';
+          btn.disabled = false;
+          return;
+        }
+        const rows = (data.missing || []).map(function (m) {
+          return '<tr>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.migration) + '</code></td>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.name) + '</code></td>' +
+            '<td style="padding:4px 0; vertical-align:top;">' + escapeHtmlAdmin(m.consequence) + '</td>' +
+            '</tr>';
+        }).join('');
+        status.textContent = '';
+        out.innerHTML = '<p style="color:#FF9500; margin:0 0 8px; font-size:0.82rem;"><strong>This Worker is running ahead of its database.</strong> ' +
+          'Unapplied migration' + ((data.pendingMigrations || []).length === 1 ? '' : 's') + ': ' +
+          escapeHtmlAdmin((data.pendingMigrations || []).join(', ')) +
+          '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
+          '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
+          '<tbody>' + rows + '</tbody></table></div>';
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -58959,6 +59131,32 @@ self.addEventListener('fetch', e => {
       }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /admin/api/schema-status  (GET)
+    //   -> { ok, bound, checked, missing: [...], pendingMigrations: [...] }
+    //
+    // Answers "is this Worker running ahead of its database", which nothing
+    // could answer before. A migration is applied by hand (see the README),
+    // nothing records that it happened, and the Worker degrades quietly when
+    // one is missing rather than refusing to start -- so the only way an
+    // operator learned they had skipped one was by noticing the behaviour it
+    // was supposed to provide had never worked.
+    if (path === "/admin/api/schema-status" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const status = await checkD1Schema(env);
+      return json({
+        ok: true,
+        bound: status.bound,
+        checked: status.checked,
+        upToDate: status.ok,
+        error: status.error,
+        missing: status.missing.map((m) => ({
+          migration: m.migration, kind: m.kind, name: m.name, consequence: m.consequence,
+        })),
+        pendingMigrations: status.pendingMigrations,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/published-lists  (GET)  ?limit=&cursor=
     //   -> { ok, lists: [{ slug, name, type, itemCount, likes, visibility,
     //                      publishedAt, url }], cursor, done }
@@ -59824,6 +60022,19 @@ export default {
       Promise.all([
         guard("checkForNewEpisodes", checkForNewEpisodes(env)),
         guard("prewarmSharedCatalogs", prewarmSharedCatalogs(env, ctx)),
+        // Cheap (one sqlite_master read per tick) and the only thing that puts
+        // "you have not run migration N" somewhere an operator will see it
+        // without going looking. The admin panel shows the same thing on
+        // demand; this is for the case where nobody thought to look.
+        guard("d1SchemaCheck", (async () => {
+          const status = await checkD1Schema(env);
+          if (status.bound && status.checked && !status.ok) {
+            console.warn(
+              `[Cron] This Worker is running ahead of its D1 schema. Unapplied migration(s): ${status.pendingMigrations.join(", ")}. ` +
+              status.missing.map((m) => `${m.name}: ${m.consequence}`).join(" | ")
+            );
+          }
+        })()),
         // Cheap when index:publiclists already exists (one KV get, no-op).
         // When it doesn't -- a fresh deployment, or the index key lost
         // some other way -- this is what keeps a self-hoster who never

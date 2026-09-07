@@ -10,7 +10,7 @@ A fix whose mutation leaves the suite green is called out below rather than
 counted as done — see "What the mutation run actually said", which is also
 where the one case of a *correctly* surviving mutation is explained.
 
-Suite: **273 tests, 272 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **281 tests, 280 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
 ### What the mutation run actually said
@@ -265,6 +265,56 @@ test sets an unrelated global the bundle never reads. `activeCreator` is a
 The harness exposes `get`/`set`/`call` that run inside the bundle's own scope
 through a direct `eval`, appended by the harness and never by a shipped source.
 
+## The fixes assume a migration nobody records having run
+
+Two of the fixes above ship a file under `migrations/`, applied by hand against
+the live database, with nothing anywhere recording that it happened. The Worker
+does not refuse to start when one is missing -- it degrades quietly, which is
+the right runtime behaviour and a terrible operational one. Measured:
+
+| D1 state | deleted account, from a colo with a stale KV cache |
+|---|---|
+| migration 0004 applied | `401` -- refused, R3 holds |
+| 0004 not applied | **`200` -- authenticated** |
+
+Everything else about that deployment looks healthy. `delete-account` answers
+`ok:true`, the KV tombstone is written, a normal request refuses the deleted
+account. The only trace is one line in the Worker log, which nobody reads until
+after something has gone wrong. R3 is a security property, and it was possible
+to have it silently switched off by a deploy that went fine.
+
+So the Worker can now say so. `D1_SCHEMA_MANIFEST` (`00_constants.js`) lists
+what every migration creates, `checkD1Schema` reports which of them the bound
+database is missing in one `sqlite_master` read, `/admin/api/schema-status` and
+an admin panel show it on demand, and the cron logs a warning each tick while
+the schema is behind.
+
+Three things that make it worth having rather than decorative:
+
+- **It reports the consequence, not the absence.** "creator_tombstones is
+  missing" tells an operator nothing they can act on; "a deleted account can
+  still authenticate from a colo whose KV cache predates the deletion -- apply
+  this one" tells them whether it matters this afternoon.
+- **It distinguishes "I could not check" from "it is not there."** A database
+  that will not answer is reported as unchecked, because only one of those is
+  an instruction to go run a migration.
+- **A KV-only deployment is not "seven migrations behind."** It is a supported
+  configuration, and reporting it as broken is how a warning becomes noise an
+  operator learns to scroll past.
+
+The manifest is kept in step with `migrations/` by a test that parses the
+directory, not by discipline -- the same way `FUNCTION-MAP.md` and the combined
+Worker are kept honest. Adding a migration without listing what it creates
+fails the suite.
+
+Six mutations, all caught, but only after a seventh was fixed. Degrading the
+column check from a word-boundary match to `includes` survived: no test
+distinguished them, because no table in the fixtures had a column whose name
+merely *contained* `likes`. That is the decorative-test pattern this document
+keeps returning to, so the test now builds a `creator_lists` with a
+`likes_count` and no `likes` -- the case where a substring match reports the
+schema healthy while every list save fails on a column that is not there.
+
 ## Deliberately not done
 
 **Behavioural coverage of the client, beyond the contract below.** 35,225 of
@@ -285,7 +335,7 @@ expired rows safely.
 ## Verification
 
 ```bash
-node --test tests/*.test.mjs        # 273 tests, 272 pass, 1 skipped
+node --test tests/*.test.mjs        # 281 tests, 280 pass, 1 skipped
 bash verify.sh                      # build drift, syntax, page render, map, tests
 python3 check_sync.py               # byte-exact rebuild check on its own
 

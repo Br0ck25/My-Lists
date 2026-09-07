@@ -54,6 +54,7 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 - Catalog leaderboards and community feedback/issue tracking inbox (open/in-progress/closed).
 - Streaming provider lookup and Netflix catalog preview inspector.
 - Moderation tools: rebuild the public list index, delete a creator's lists, and browse/delete lists published anonymously (those have no owner to ask, so the dashboard is the only way to remove one).
+- Database schema check: reports which files under `migrations/` the bound D1 database has not had run, and what each one silently breaks until it is applied.
 
 ### Progressive Web App (PWA)
 - Installable PWA with offline caching (`/sw.js`), modern web app manifest (`/app.webmanifest`), dark mode UI, clipboard shortcuts, and QR code sharing.
@@ -137,6 +138,8 @@ Every step below is doable entirely from the Cloudflare Dashboard -- nothing her
 If you already had Creator Profiles or Custom Lists in KV *before* adding D1 (i.e. you're enabling this on a site that's already been running), D1 starts out empty and needs a one-time copy. Log into `/admin`, open **Management & Tools &rarr; Maintenance**, and click **Migrate KV &rarr; D1**. (A brand-new site with no accounts yet can skip this -- there's nothing to copy.) This is safe to click more than once; KV stays the authoritative copy either way.
 
 **Applying a migration:** files under [`migrations/`](https://github.com/Br0ck25/My-Lists/tree/main/migrations) are small, additive changes to an already-live database (unlike `schema.sql`, they're safe to run with real data present). Open the file on GitHub, copy its `ALTER TABLE`/`CREATE INDEX`/etc. statements (skip the `--` comment lines), paste them into the same D1 Console used in step 2 above, and click **Run**. Apply them in filename order (`0001_...`, `0002_...`, and so on) -- each one assumes the ones before it already ran.
+
+**Which migrations does my deployment still need?** The Admin Dashboard's **Database schema** panel answers this: it reports every file under `migrations/` that has not been run against the bound database, and what each omission silently costs. Nothing records that a migration was applied, and this Worker degrades quietly rather than refusing to start when one is missing -- so after any deploy that shipped a new migration, check that panel. Worth being concrete about why: deploy without `0004_add_creator_tombstones.sql` and account deletion still reports success and still refuses the deleted account on a normal request, while a colo whose KV cache predates the deletion will happily authenticate it. **Apply migrations first, then deploy the Worker.**
 
 **Wrangler CLI alternative**, if you'd rather use a terminal: `npx wrangler d1 create my-lists-db`, then `npx wrangler d1 execute my-lists-db --file=schema.sql --remote` (or `--file=migrations/000X_....sql --remote` for a specific migration), then bind it the same way as steps 3.2-3.4 above.
 
