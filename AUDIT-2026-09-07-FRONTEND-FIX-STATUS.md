@@ -5,12 +5,13 @@ which describes the frontend as it stood at `be20b1b`. That document is left as
 the audit record and is not rewritten to match the fixes — except for one
 correction, noted below, where the audit itself was wrong.
 
-All ten of the report's **Top 10 Fixes** are done. Every one was verified the
-same way twice: the probe that demonstrated the defect now reports it gone, and
-the defect reintroduced by mutation makes the suite fail.
+**Every finding in the report is now fixed** — the ten ranked fixes first, then
+the four below the line. Each was verified the same way twice: the probe that
+demonstrated the defect now reports it gone, and the defect reintroduced by
+mutation makes the suite fail.
 
-Suite: **304 tests, 303 passing, 1 skipped** (network-gated), up from 286/285.
-`verify.sh` passes, including the byte-exact rebuild and the new admin-page step.
+Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
+`verify.sh` passes, including the byte-exact rebuild and three new steps.
 
 ---
 
@@ -30,13 +31,12 @@ Suite: **304 tests, 303 passing, 1 skipped** (network-gated), up from 286/285.
 | **FE-11** | `role="tablist"` containing no tabs | MEDIUM | ✅ | `53ac761` |
 | **FE-08** | Modal scroll lock has never worked | MEDIUM | ✅ | `53ac761` |
 | **FE-12** | One modal exit leaks the scroll lock | LOW | ✅ | `53ac761` |
-| **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ⬜ | not started |
-| **FE-14** | "Settings" label clipped at 320px | LOW | ⬜ | not started |
-| **FE-15** | No offline capability despite the README | MEDIUM | ⬜ | not started |
-| **FE-16** | Dead `renderCustomListSearchResults` | LOW | ⬜ | not started |
+| **FE-15** | No offline capability despite the README | MEDIUM | ✅ | `HEAD` |
+| **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ✅ | `HEAD` |
+| **FE-14** | "Settings" label clipped at 320px | LOW | ✅ | `HEAD` |
+| **FE-16** | Dead `renderCustomListSearchResults` | LOW | ✅ | `HEAD` |
 
-The four left open are the ones the report ranked below the top ten. Notes on
-each are at the end.
+Nothing from the report is left open.
 
 ---
 
@@ -252,25 +252,99 @@ does not trigger `:focus-visible`.)
 
 ---
 
-## Not started, and why
+## The last four
 
-| | Why it is below the line |
-|---|---|
-| **FE-13** — non-array `dashboardListOrder` crashes the dashboard | Same missing-type-check family as FE-07, but every writer is already `Array.isArray`-guarded, so it needs storage corrupted by hand rather than by any app path. A two-line `Array.isArray(parsed) ? parsed : []` at both sites when someone is next in that file. |
-| **FE-14** — "Settings" clipped at 320px | Cosmetic, one viewport, and the control stays tappable (`elementFromPoint` at its centre still hits the button). No horizontal page scroll at any width. |
-| **FE-15** — no offline capability | The largest of the four and the only one that is a feature rather than a defect: it needs the navigation response and `/app.css` cached under the same versioned scheme, plus a decision about what to serve when the shell is not cached. Worth doing deliberately, or correcting the README instead — a `standalone` PWA that cannot open offline is a poor experience either way. |
-| **FE-16** — dead `renderCustomListSearchResults` | One unreferenced function out of 496. Deleting it is safe (zero references in the bundle, the rendered markup, or `tests/`) but it is tidying, not a fix. |
+### FE-15 — the PWA now opens offline, and still cannot go stale
+
+`sw.js` cached `/app.js?v=<hash>` and nothing else, so an offline reload was the
+browser's error page — including for an installed `display: standalone` app,
+which is the case the README was advertising.
+
+Two caches, because the two kinds of thing have opposite needs.
+`/app.js?v=<hash>` and `/app.css?v=<hash>` are content-addressed: a change gets
+a different URL, so cache-first is safe by construction. The page is **not**
+content-addressed — it is served `no-cache` with an ETag, and it is the thing
+that *names* the current bundle hash. Cache-first on it would pin yesterday's
+page, which names yesterday's bundle, and hold the whole app a deploy behind:
+exactly the failure the versioned URLs exist to prevent. So the page is
+network-first, and its cached copy is reached only when the network does not
+answer.
+
+Install warms the page so the *first* offline load works rather than only one
+that follows an online visit. Activate drops caches outside the current set, so
+the rename does not orphan `mylists-app-v1` on everyone's disk. Only the plain
+`/` navigation is cached — a deep link renders per-request data that would be
+wrong to replay later.
+
+Measured, before and after:
+
+```
+before   OFFLINE reload: FAILED -> net::ERR_INTERNET_DISCONNECTED
+after    OFFLINE reload: status 200
+         {"tabs":12,"bundleRan":true,"cssApplied":"rgb(242, 242, 247)","visiblePanel":["discover"]}
+         *** the app booted offline ***
+```
+
+And the property that had to survive, tested by injecting a changed page while
+a cached one was present:
+
+```
+after activate   : [ 'mylists-shell-v2' ]          # mylists-app-v1 dropped
+after a 'deploy' : "DEPLOYED-N-PLUS-1"             # not the cached copy
+*** network-first holds: the new page wins over the cached one ***
+```
+
+**What this does and does not buy**, because the old README claim was the
+problem: the app *opens* offline and its interface works. It does not *work*
+offline — every API call still fails and the app shows the error states it
+already had, and the fonts and the zip reader come from other origins that are
+also unavailable. The README now says that rather than "offline caching".
+
+`/sw.js` was also, until now, the one emitted script nothing ever parsed —
+`node --check` on the combined Worker sees it as string content, exactly like
+the admin page. A broken service worker is quieter than a broken page: it fails
+to register and everything looks fine until offline stops working. So it is
+hoisted to `SERVICE_WORKER_JS` at module scope, `render_check.js` grew a `--sw`
+mode, and `verify.sh` a step 4c. Confirmed against a deliberate break: the
+combined Worker still parses, and the new step points at the broken line.
+
+### FE-13 — one reader for the saved dashboard order
+
+Both sites did `JSON.parse` in a `try/catch` — which covers malformed JSON —
+then tested `savedOrder && savedOrder.length` before `.map`. A string passes
+that and throws, taking the whole dashboard render with it. Now one
+`readDashboardListOrder()` that returns `[]` unless it really has an array, and
+keeps only string entries. Four tests; reverting the guard fails two.
+
+### FE-14 — six labels across 320px
+
+`.bottom-nav-item` is `flex: 1` with `white-space: nowrap`, and a flex item's
+default `min-width: auto` stops it shrinking below its own text — so at 320px
+the sixth item ran to x=344 and rendered as "Settin". `min-width: 0` lets them
+shrink, and a `max-width: 360px` rule brings the type down a step and the
+letter-spacing to zero so the labels stay *readable* rather than merely
+un-clipped. Measured after: Settings spans 267→320, `clipped: false`, and no
+viewport from 320 to 1920 has horizontal scroll.
+
+### FE-16 — the dead function
+
+`renderCustomListSearchResults` (25 lines) deleted after re-confirming zero
+references in the bundle, the rendered markup, the tests and the tooling. The
+only other mention was the generated `FUNCTION-MAP.md`, which regenerates.
+
+---
 
 ---
 
 ## Regression tests added
 
-Eighteen, in `tests/client.test.mjs`, taking the client suite from 12 to 30.
+Twenty-two, in `tests/client.test.mjs`, taking the client suite from 12 to 34.
 Each was mutation-checked — the fix reverted, the test observed to fail, the fix
 restored.
 
 | Fix | Tests |
 |---|---|
+| FE-13 | a normal order passes through; a non-array returns nothing; non-slug entries are dropped; malformed JSON and a missing key survive |
 | FE-02 | escaped handler parses to one call with one argument; ordinary ids pass through byte-identical; a name containing quotes survives (it used to be a syntax error); a hostile id is dropped at import while the rest of the file is kept |
 | FE-03 | three clicks produce one request; the guard re-arms for a later attempt; a form rejected before any request does not latch it |
 | FE-04 | a refusal raises the server's own message and leaves the membership index untouched; a real removal still confirms and records; a network failure is treated as a refusal |
@@ -279,9 +353,9 @@ restored.
 | FE-07 | non-string entries ignored on read; only strings stored on restore |
 | FE-06 | the older response landing later does not replace the newer results |
 
-The keyboard, focus and scroll-lock behaviours are browser-level and are covered
-by the committed probes rather than by the `vm` harness, which has no layout and
-no real focus model. `tests/client-harness.mjs` did need extending —
+The keyboard, focus, scroll-lock, layout and service-worker behaviours are
+browser-level and are covered by the committed probes rather than by the `vm`
+harness, which has no layout, no real focus model and no Cache Storage. `tests/client-harness.mjs` did need extending —
 `lockBackgroundScroll` reads and restores the scroll position around every
 modal, so the stub now has the viewport and scrolling properties every browser
 has.

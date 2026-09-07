@@ -6,6 +6,7 @@
 //
 //   node render_check.js rendered.html          -> the builder page
 //   node render_check.js admin.html --admin     -> the admin dashboard
+//   node render_check.js sw.js --sw             -> the service worker
 //
 // The admin page needs its own pass. It is a template literal like the builder
 // page, and a single backslash inside one is eaten before the browser sees it
@@ -18,6 +19,7 @@ const vm = require('vm');
 
 const outPath = process.argv[2] || 'rendered.html';
 const wantAdmin = process.argv.includes('--admin');
+const wantSw = process.argv.includes('--sw');
 let src = fs.readFileSync('worker_entry_combined.js', 'utf8');
 
 const idx = src.lastIndexOf('export default');
@@ -43,11 +45,32 @@ const sandbox = {
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 
+// Top-level `const` in a classic script lives in the script scope, not on
+// globalThis -- so SERVICE_WORKER_JS is invisible to the sandbox the way a
+// function declaration is not. One appended line, test-only, rather than
+// changing how the Worker declares it.
+src += '\n;try { globalThis.SERVICE_WORKER_JS = SERVICE_WORKER_JS; } catch (e) {}\n';
+
 try {
   vm.runInContext(src, sandbox, { filename: 'worker_entry_combined.js' });
 } catch (e) {
   console.error('FAIL: evaluating combined file threw:', e.message);
   process.exit(1);
+}
+
+// The service worker is a plain string, not a render function -- it is
+// emitted from a template literal like every other page here, so `node --check`
+// on the combined Worker cannot see inside it either. Written out so the caller
+// can check it the same way.
+if (wantSw) {
+  const sw = sandbox.SERVICE_WORKER_JS;
+  if (typeof sw !== 'string' || sw.length < 500) {
+    console.error('FAIL: SERVICE_WORKER_JS is missing or implausibly short, length =', sw && sw.length);
+    process.exit(1);
+  }
+  fs.writeFileSync(outPath, sw);
+  console.log('SERVICE_WORKER_JS OK  ->', outPath, sw.length, 'chars');
+  process.exit(0);
 }
 
 const fnName = wantAdmin ? 'renderAdminDashboard' : 'renderBuilder';

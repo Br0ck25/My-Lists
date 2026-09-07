@@ -32,6 +32,129 @@ function isAllowedPosterUrl(raw) {
   return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
 }
 
+// The service worker, hoisted to module scope for one reason: a string inside
+// a route handler is unreachable, and `node --check` on the combined Worker
+// sees this whole thing as string content either way. As a module-level
+// binding it can be pulled out of a vm sandbox and syntax-checked like any
+// other emitted script -- which is exactly the gap that let a SyntaxError sit
+// in the admin page for two days. See render_check.js --sw.
+//
+// Two caches, because the two kinds of thing here have opposite needs.
+//
+// /app.js?v=<hash> and /app.css?v=<hash> are content-addressed: a change gets
+// a different URL, so cache-first is safe by construction and the cache is
+// never consulted for a version it does not hold.
+//
+// The page itself is NOT content-addressed. It is served no-cache with an
+// ETag, and it is the thing that NAMES the current bundle hash. Cache-first on
+// it would pin yesterday's page, which names yesterday's bundle, and hold the
+// whole app a deploy behind -- the precise failure the versioned URLs exist to
+// prevent. So the page is network-first: the network wins whenever it answers,
+// and the copy in the cache is reached only when it does not.
+//
+// What this buys, stated honestly: the app OPENS offline instead of showing
+// the browser's error page. It does not work offline -- every API call still
+// fails, and the app shows the error states it already had. Fonts and the zip
+// reader come from other origins and are unavailable too, both of which the
+// page already degrades for.
+const SERVICE_WORKER_JS = `
+const ASSETS = 'mylists-assets-v2';
+const SHELL = 'mylists-shell-v2';
+const SHELL_URL = '/';
+const KEEP = [ASSETS, SHELL];
+
+self.addEventListener('install', (e) => e.waitUntil((async () => {
+  // Warm the page now, so the first offline load works rather than only one
+  // that happens to follow an online visit. Failure here is not fatal: the
+  // navigation handler caches it on the next successful load anyway.
+  try {
+    const cache = await caches.open(SHELL);
+    await cache.add(new Request(SHELL_URL, { cache: 'reload' }));
+  } catch (err) {}
+  await self.skipWaiting();
+})()));
+
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+  // Anything from an older naming scheme is orphaned the moment this
+  // activates, so drop it rather than leave it on the user's disk.
+  try {
+    for (const name of await caches.keys()) {
+      if (KEEP.indexOf(name) === -1) await caches.delete(name);
+    }
+  } catch (err) {}
+  await self.clients.claim();
+})()));
+
+function isImmutableAsset(url) {
+  return (url.pathname === '/app.js' || url.pathname === '/app.css')
+    && !!url.searchParams.get('v');
+}
+
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  let url;
+  try {
+    url = new URL(req.url);
+  } catch (err) {
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+
+  if (isImmutableAsset(url)) {
+    e.respondWith((async () => {
+      try {
+        const cache = await caches.open(ASSETS);
+        const key = url.pathname + url.search;
+        const hit = await cache.match(key);
+        if (hit) return hit;
+        const res = await fetch(req);
+        if (res && res.ok) {
+          // One entry per asset, not one entry total: this cache now holds two
+          // different files, and pruning everything would evict the other one
+          // on every deploy. A previous hash for THIS path is dead weight the
+          // moment it stops being asked for.
+          for (const k of await cache.keys()) {
+            if (new URL(k.url).pathname === url.pathname) await cache.delete(k);
+          }
+          await cache.put(key, res.clone());
+        }
+        return res;
+      } catch (err) {
+        // A cache that misbehaves must never be able to break the page. When
+        // it is the network that failed, this rethrows exactly as it would
+        // have with no service worker at all.
+        return fetch(req);
+      }
+    })());
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    e.respondWith((async () => {
+      try {
+        const res = await fetch(req);
+        // Only the plain page is worth keeping. A deep link renders
+        // per-request data, and replaying yesterday's copy of it later would
+        // be worse than not answering.
+        if (res && res.ok && url.pathname === SHELL_URL && !url.search) {
+          try {
+            const cache = await caches.open(SHELL);
+            await cache.put(SHELL_URL, res.clone());
+          } catch (err) {}
+        }
+        return res;
+      } catch (err) {
+        const cache = await caches.open(SHELL);
+        const cached = await cache.match(SHELL_URL);
+        if (cached) return cached;
+        throw err;
+      }
+    })());
+  }
+});
+`.trim();
+
 async function handleFetch(request, env, ctx) {
     // Point the env-backed API key globals (00_constants.js) at whatever
     // this Worker owner configured, before anything can read them. A feature
@@ -594,48 +717,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     if (path === "/sw.js") {
-      // The previous version of this worker was a no-op that still cost
-      // something: it intercepted every request, re-issued it, and on
-      // failure fell back to caches.match() -- against a cache nothing ever
-      // wrote to, so that fallback could never hit.
-      //
-      // It now does one useful thing and nothing else. /app.js?v=<hash> is
-      // content-addressed, so cache-first is safe by construction: a bundle
-      // that changes gets a different URL, and this cache is never consulted
-      // for it. Exactly one entry is kept, so old bundles cannot accumulate
-      // after repeated deploys. Every other request is passed straight
-      // through, untouched.
-      const sw = `
-const APP_CACHE = 'mylists-app-v1';
-self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  const isBundle = e.request.method === 'GET'
-    && url.origin === self.location.origin
-    && url.pathname === '/app.js'
-    && url.searchParams.get('v');
-  if (!isBundle) return; // everything else: no interception at all
-  e.respondWith((async () => {
-    try {
-      const cache = await caches.open(APP_CACHE);
-      const hit = await cache.match(e.request.url);
-      if (hit) return hit;
-      const res = await fetch(e.request);
-      if (res && res.ok) {
-        // Keep one bundle only -- a new deploy means a new URL, and the
-        // previous entry is dead weight the moment it stops being requested.
-        for (const key of await cache.keys()) await cache.delete(key);
-        await cache.put(e.request.url, res.clone());
-      }
-      return res;
-    } catch (err) {
-      return fetch(e.request);
-    }
-  })());
-});
-      `;
-      return new Response(sw.trim(), {
+      // The body lives in SERVICE_WORKER_JS at module scope so it can be
+      // syntax-checked; see the comment there for the caching contract.
+      return new Response(SERVICE_WORKER_JS, {
         headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" }
       });
     }

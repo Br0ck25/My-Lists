@@ -764,3 +764,42 @@ describe("client: an obsolete title search cannot replace a newer one", () => {
       "the older response landing later must not replace the newer results");
   });
 });
+
+// --- FE-13: the saved dashboard order is a list of slugs ------------------
+//
+// Both readers did JSON.parse inside a try/catch -- which covers malformed
+// JSON -- and then tested `savedOrder && savedOrder.length` before calling
+// .map on it. A STRING passes that ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: container type checked, element type
+// not.
+describe("client: a corrupted dashboard order cannot break the dashboard", () => {
+  // Spread into an array of THIS realm before comparing. The bundle runs in a
+  // vm context, so an array it constructs itself has that realm's
+  // Array.prototype and deepStrictEqual rejects it on identity alone -- while
+  // one that came back through the harness's own JSON.parse does not. That
+  // difference is an artefact of the sandbox, not of the code under test.
+  const order = (stored) => [...loadClient({
+    storage: stored === undefined ? {} : { "myListAddon:dashboardListOrder": stored },
+  }).call("readDashboardListOrder")];
+
+  it("reads a normal order through unchanged", () => {
+    assert.deepEqual(order(JSON.stringify(["b", "a", "c"])), ["b", "a", "c"]);
+  });
+
+  it("returns nothing for a value that is not an array", () => {
+    // The exact shape that threw: length-bearing, not mappable.
+    assert.deepEqual(order(JSON.stringify("nope")), []);
+    assert.deepEqual(order(JSON.stringify({ length: 3 })), []);
+    assert.deepEqual(order("42"), []);
+  });
+
+  it("drops entries that are not slugs, rather than throwing on them", () => {
+    assert.deepEqual(order(JSON.stringify(["a", null, 7, { slug: "b" }, "c"])), ["a", "c"]);
+  });
+
+  it("survives malformed JSON and a missing key", () => {
+    assert.deepEqual(order("{not json,,,"), []);
+    assert.deepEqual(order(undefined), []);
+  });
+});

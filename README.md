@@ -57,7 +57,8 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 - Database schema check: reports which files under `migrations/` the bound D1 database has not had run, and what each one silently breaks until it is applied.
 
 ### Progressive Web App (PWA)
-- Installable PWA with offline caching (`/sw.js`), modern web app manifest (`/app.webmanifest`), dark mode UI, clipboard shortcuts, and QR code sharing.
+- Installable PWA with an offline app shell (`/sw.js`): the page, its stylesheet and its bundle are cached, so the app opens and its interface works with no connection. Catalogs and lists still need the network — offline they show the same error states they would on a failed request. A new deployment is always picked up immediately: the page itself is fetched network-first, and the bundle is content-addressed, so the cache can never hold the app a version behind.
+- Modern web app manifest (`/app.webmanifest`), dark mode UI, clipboard shortcuts, and QR code sharing.
 - Stremio addon protocol compliance (Manifest v3, catalog pagination, stream/subtitle routing, shelf/item shuffling) -- works with Stremio, Wako, Nuvio, and any other app built on the same protocol.
 
 ---

@@ -3081,6 +3081,28 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
 }
 window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
 
+// The saved dashboard order, as the thing both readers assume it is.
+//
+// Both used to JSON.parse inside a try/catch -- which covers malformed JSON --
+// and then test savedOrder && savedOrder.length before calling .map on it.
+// A STRING passes that test ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: the container type was checked and
+// the element type was not.
+//
+// Every writer is Array.isArray-guarded today, so this needs storage edited by
+// hand to reach -- but the cost of being wrong is the entire My Lists tab, and
+// the guard is one line.
+function readDashboardListOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((s) => typeof s === 'string' && s);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -3320,11 +3342,9 @@ async function renderCreatorDashboard(options) {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      try {
-        savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-      } catch (e) {}
+      savedOrder = readDashboardListOrder();
     }
-    if (savedOrder && savedOrder.length) {
+    if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       visibleDashboardLists.sort((a, b) => {
         const slugA = (a && a.list && a.list.slug) || '';
@@ -3652,11 +3672,8 @@ function renderLocalCustomListsDashboard(box, silent) {
 
   const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
 
-  let savedOrder = [];
-  try {
-    savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-  } catch (e) {}
-  if (savedOrder && savedOrder.length) {
+  const savedOrder = readDashboardListOrder();
+  if (savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
     visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;

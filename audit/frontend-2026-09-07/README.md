@@ -64,14 +64,13 @@ PORT=8788 node /tmp/server_nod1.mjs &
 | `t12_syncrace.mjs` | **FE-09** | Alice's sync payload applied to Bob's signed-in session |
 | `t16_a11y.mjs` | **FE-10, FE-11** | Escape, focus, focus trap, ARIA, labels, live regions |
 | `t18b_resp.mjs` | **FE-14** | 9 viewports × 6 tabs; overflow and clipped-nav measurement |
-| `t15_pwa2.mjs`¹ | **FE-15** | Cache fills on visit 2; offline reload still fails |
+| `t44_offline.mjs` | **FE-15** | Offline reload: error page before, app booted after |
+| `t45_sw_freshness.mjs` | **FE-15** | Old cache dropped on activate; a deploy beats the cached page |
+| `t31_nav320.mjs` | **FE-14** | Every bottom-nav label fits inside a 320px viewport |
 | `t20_leaks.mjs` | — | 200 modals / 200 tab switches / 60 searches: no leak |
 | `t23_fault.mjs` | — | 7 injected failures; every one recovers |
 | `t25_storage.mjs` | — | Malformed JSON, wrong types, quota exhaustion |
 | `t21_url.mjs` | — | 14 malformed and hostile deep links |
-
-¹ Not copied here — it is four lines around `context.setOffline(true)`; see the
-PWA section of the report for the measured output.
 
 ## Seeding
 

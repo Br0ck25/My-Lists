@@ -709,6 +709,12 @@ ${seoHeadHtml}
       cursor: pointer;
       transition: color 0.12s ease;
       white-space: nowrap;
+      /* flex items default to min-width:auto, so with nowrap these six
+         cannot shrink below their own text and the last one overflows the
+         viewport -- measured at 320px, 'Settings' ran to x=344 and rendered
+         as 'Settin'. This lets them shrink; the narrow-width rule below
+         keeps the labels readable rather than merely clipped. */
+      min-width: 0;
       line-height: 1.1;
     }
     .bottom-nav-item svg {
@@ -719,6 +725,19 @@ ${seoHeadHtml}
     .bottom-nav-item.active { color: var(--accent); }
     .bottom-nav-item.active svg { transform: translateY(-1px); stroke-width: 2.2; }
     .bottom-nav-item:active { opacity: 0.6; }
+  }
+
+  /* Six labels across a 320px screen (iPhone SE 1st gen, Galaxy Fold cover).
+     At 0.78rem the widest of them does not fit in its 53px share, so the type
+     comes down a step and the letter-spacing goes to zero rather than the word
+     being cut in half. */
+  @media (max-width: 360px) {
+    .bottom-nav-item {
+      font-size: 0.68rem;
+      letter-spacing: 0;
+      padding: 4px 0;
+    }
+    .bottom-nav-item svg { width: 25px; height: 25px; }
   }
 
   .live-preview-poster-card.dragging {

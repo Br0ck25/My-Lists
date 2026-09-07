@@ -61,6 +61,15 @@ jobs:
           node render_check.js rendered-admin.html --admin
           python3 html_checks.py rendered-admin.html ci-admin
 
+      # /sw.js is a template literal as well, so `node --check` above sees it
+      # as string content. A broken service worker is quieter than a broken
+      # page: it just fails to register, and nothing looks wrong until offline
+      # stops working.
+      - name: Syntax-check the service worker
+        run: |
+          node render_check.js service-worker.js --sw
+          node --check service-worker.js
+
       # gen_map.py is deterministic, so the committed map should always be
       # exactly what it produces. Without this check it silently rotted --
       # 26% of its line numbers pointed at the wrong line.

@@ -43,6 +43,17 @@ python3 html_checks.py rendered-admin.html local-admin
 rm -f rendered-admin.html inner_local-admin.js
 
 echo
+echo "=== 4c. syntax-check the service worker ==="
+# /sw.js is emitted from a template literal too, so `node --check` on the
+# combined Worker sees it as string content -- the same blind spot that let a
+# SyntaxError sit in the admin page for two days. A broken service worker is
+# quieter still: it fails to register and the page carries on looking fine,
+# so nobody notices until offline stops working.
+node render_check.js service-worker.js --sw
+node --check service-worker.js && echo "  OK"
+rm -f service-worker.js
+
+echo
 echo "=== 5. FUNCTION-MAP.md drift ==="
 # gen_map.py is only useful if it is actually re-run. It was not: 26% of the
 # map's 811 line numbers pointed at a line that no longer held that symbol,

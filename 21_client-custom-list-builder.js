@@ -29,31 +29,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-function renderCustomListSearchResults(results, searchType) {
-  const box = document.getElementById('customListSearchResult');
-  if (!results.length) {
-    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
-    return;
-  }
-  const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
-      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
-    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
-      posterImg +
-      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
-        escapeHtml(r.title) +
-      '</div>' +
-      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
-      '<button type="button" class="lc-btn secondary customListAddBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-searchtype="' + searchType + '"' +
-      ' data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '"' +
-      ' data-poster="' + escapeAttr(r.poster || '') + '">+ Add</button>' +
-      '</div>';
-  }).join('');
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
-}
-
 const customListSearchBox = document.getElementById('customListSearchResult');
 if (customListSearchBox) {
   customListSearchBox.addEventListener('click', (e) => {

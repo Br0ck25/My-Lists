@@ -14325,6 +14325,12 @@ ${seoHeadHtml}
       cursor: pointer;
       transition: color 0.12s ease;
       white-space: nowrap;
+      /* flex items default to min-width:auto, so with nowrap these six
+         cannot shrink below their own text and the last one overflows the
+         viewport -- measured at 320px, 'Settings' ran to x=344 and rendered
+         as 'Settin'. This lets them shrink; the narrow-width rule below
+         keeps the labels readable rather than merely clipped. */
+      min-width: 0;
       line-height: 1.1;
     }
     .bottom-nav-item svg {
@@ -14335,6 +14341,19 @@ ${seoHeadHtml}
     .bottom-nav-item.active { color: var(--accent); }
     .bottom-nav-item.active svg { transform: translateY(-1px); stroke-width: 2.2; }
     .bottom-nav-item:active { opacity: 0.6; }
+  }
+
+  /* Six labels across a 320px screen (iPhone SE 1st gen, Galaxy Fold cover).
+     At 0.78rem the widest of them does not fit in its 53px share, so the type
+     comes down a step and the letter-spacing goes to zero rather than the word
+     being cut in half. */
+  @media (max-width: 360px) {
+    .bottom-nav-item {
+      font-size: 0.68rem;
+      letter-spacing: 0;
+      padding: 4px 0;
+    }
+    .bottom-nav-item svg { width: 25px; height: 25px; }
   }
 
   .live-preview-poster-card.dragging {
@@ -35221,31 +35240,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-function renderCustomListSearchResults(results, searchType) {
-  const box = document.getElementById('customListSearchResult');
-  if (!results.length) {
-    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
-    return;
-  }
-  const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
-      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
-    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
-      posterImg +
-      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
-        escapeHtml(r.title) +
-      '</div>' +
-      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
-      '<button type="button" class="lc-btn secondary customListAddBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-searchtype="' + searchType + '"' +
-      ' data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '"' +
-      ' data-poster="' + escapeAttr(r.poster || '') + '">+ Add</button>' +
-      '</div>';
-  }).join('');
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
-}
-
 const customListSearchBox = document.getElementById('customListSearchResult');
 if (customListSearchBox) {
   customListSearchBox.addEventListener('click', (e) => {
@@ -41248,6 +41242,28 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
 }
 window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
 
+// The saved dashboard order, as the thing both readers assume it is.
+//
+// Both used to JSON.parse inside a try/catch -- which covers malformed JSON --
+// and then test savedOrder && savedOrder.length before calling .map on it.
+// A STRING passes that test ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: the container type was checked and
+// the element type was not.
+//
+// Every writer is Array.isArray-guarded today, so this needs storage edited by
+// hand to reach -- but the cost of being wrong is the entire My Lists tab, and
+// the guard is one line.
+function readDashboardListOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((s) => typeof s === 'string' && s);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -41487,11 +41503,9 @@ async function renderCreatorDashboard(options) {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      try {
-        savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-      } catch (e) {}
+      savedOrder = readDashboardListOrder();
     }
-    if (savedOrder && savedOrder.length) {
+    if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       visibleDashboardLists.sort((a, b) => {
         const slugA = (a && a.list && a.list.slug) || '';
@@ -41819,11 +41833,8 @@ function renderLocalCustomListsDashboard(box, silent) {
 
   const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
 
-  let savedOrder = [];
-  try {
-    savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-  } catch (e) {}
-  if (savedOrder && savedOrder.length) {
+  const savedOrder = readDashboardListOrder();
+  if (savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
     visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
@@ -49575,6 +49586,129 @@ function isAllowedPosterUrl(raw) {
   return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
 }
 
+// The service worker, hoisted to module scope for one reason: a string inside
+// a route handler is unreachable, and `node --check` on the combined Worker
+// sees this whole thing as string content either way. As a module-level
+// binding it can be pulled out of a vm sandbox and syntax-checked like any
+// other emitted script -- which is exactly the gap that let a SyntaxError sit
+// in the admin page for two days. See render_check.js --sw.
+//
+// Two caches, because the two kinds of thing here have opposite needs.
+//
+// /app.js?v=<hash> and /app.css?v=<hash> are content-addressed: a change gets
+// a different URL, so cache-first is safe by construction and the cache is
+// never consulted for a version it does not hold.
+//
+// The page itself is NOT content-addressed. It is served no-cache with an
+// ETag, and it is the thing that NAMES the current bundle hash. Cache-first on
+// it would pin yesterday's page, which names yesterday's bundle, and hold the
+// whole app a deploy behind -- the precise failure the versioned URLs exist to
+// prevent. So the page is network-first: the network wins whenever it answers,
+// and the copy in the cache is reached only when it does not.
+//
+// What this buys, stated honestly: the app OPENS offline instead of showing
+// the browser's error page. It does not work offline -- every API call still
+// fails, and the app shows the error states it already had. Fonts and the zip
+// reader come from other origins and are unavailable too, both of which the
+// page already degrades for.
+const SERVICE_WORKER_JS = `
+const ASSETS = 'mylists-assets-v2';
+const SHELL = 'mylists-shell-v2';
+const SHELL_URL = '/';
+const KEEP = [ASSETS, SHELL];
+
+self.addEventListener('install', (e) => e.waitUntil((async () => {
+  // Warm the page now, so the first offline load works rather than only one
+  // that happens to follow an online visit. Failure here is not fatal: the
+  // navigation handler caches it on the next successful load anyway.
+  try {
+    const cache = await caches.open(SHELL);
+    await cache.add(new Request(SHELL_URL, { cache: 'reload' }));
+  } catch (err) {}
+  await self.skipWaiting();
+})()));
+
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+  // Anything from an older naming scheme is orphaned the moment this
+  // activates, so drop it rather than leave it on the user's disk.
+  try {
+    for (const name of await caches.keys()) {
+      if (KEEP.indexOf(name) === -1) await caches.delete(name);
+    }
+  } catch (err) {}
+  await self.clients.claim();
+})()));
+
+function isImmutableAsset(url) {
+  return (url.pathname === '/app.js' || url.pathname === '/app.css')
+    && !!url.searchParams.get('v');
+}
+
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  let url;
+  try {
+    url = new URL(req.url);
+  } catch (err) {
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+
+  if (isImmutableAsset(url)) {
+    e.respondWith((async () => {
+      try {
+        const cache = await caches.open(ASSETS);
+        const key = url.pathname + url.search;
+        const hit = await cache.match(key);
+        if (hit) return hit;
+        const res = await fetch(req);
+        if (res && res.ok) {
+          // One entry per asset, not one entry total: this cache now holds two
+          // different files, and pruning everything would evict the other one
+          // on every deploy. A previous hash for THIS path is dead weight the
+          // moment it stops being asked for.
+          for (const k of await cache.keys()) {
+            if (new URL(k.url).pathname === url.pathname) await cache.delete(k);
+          }
+          await cache.put(key, res.clone());
+        }
+        return res;
+      } catch (err) {
+        // A cache that misbehaves must never be able to break the page. When
+        // it is the network that failed, this rethrows exactly as it would
+        // have with no service worker at all.
+        return fetch(req);
+      }
+    })());
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    e.respondWith((async () => {
+      try {
+        const res = await fetch(req);
+        // Only the plain page is worth keeping. A deep link renders
+        // per-request data, and replaying yesterday's copy of it later would
+        // be worse than not answering.
+        if (res && res.ok && url.pathname === SHELL_URL && !url.search) {
+          try {
+            const cache = await caches.open(SHELL);
+            await cache.put(SHELL_URL, res.clone());
+          } catch (err) {}
+        }
+        return res;
+      } catch (err) {
+        const cache = await caches.open(SHELL);
+        const cached = await cache.match(SHELL_URL);
+        if (cached) return cached;
+        throw err;
+      }
+    })());
+  }
+});
+`.trim();
+
 async function handleFetch(request, env, ctx) {
     // Point the env-backed API key globals (00_constants.js) at whatever
     // this Worker owner configured, before anything can read them. A feature
@@ -50137,48 +50271,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     if (path === "/sw.js") {
-      // The previous version of this worker was a no-op that still cost
-      // something: it intercepted every request, re-issued it, and on
-      // failure fell back to caches.match() -- against a cache nothing ever
-      // wrote to, so that fallback could never hit.
-      //
-      // It now does one useful thing and nothing else. /app.js?v=<hash> is
-      // content-addressed, so cache-first is safe by construction: a bundle
-      // that changes gets a different URL, and this cache is never consulted
-      // for it. Exactly one entry is kept, so old bundles cannot accumulate
-      // after repeated deploys. Every other request is passed straight
-      // through, untouched.
-      const sw = `
-const APP_CACHE = 'mylists-app-v1';
-self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  const isBundle = e.request.method === 'GET'
-    && url.origin === self.location.origin
-    && url.pathname === '/app.js'
-    && url.searchParams.get('v');
-  if (!isBundle) return; // everything else: no interception at all
-  e.respondWith((async () => {
-    try {
-      const cache = await caches.open(APP_CACHE);
-      const hit = await cache.match(e.request.url);
-      if (hit) return hit;
-      const res = await fetch(e.request);
-      if (res && res.ok) {
-        // Keep one bundle only -- a new deploy means a new URL, and the
-        // previous entry is dead weight the moment it stops being requested.
-        for (const key of await cache.keys()) await cache.delete(key);
-        await cache.put(e.request.url, res.clone());
-      }
-      return res;
-    } catch (err) {
-      return fetch(e.request);
-    }
-  })());
-});
-      `;
-      return new Response(sw.trim(), {
+      // The body lives in SERVICE_WORKER_JS at module scope so it can be
+      // syntax-checked; see the comment there for the caching contract.
+      return new Response(SERVICE_WORKER_JS, {
         headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" }
       });
     }
