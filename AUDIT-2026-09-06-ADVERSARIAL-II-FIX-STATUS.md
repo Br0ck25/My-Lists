@@ -10,7 +10,7 @@ A fix whose mutation leaves the suite green is called out below rather than
 counted as done — see "What the mutation run actually said", which is also
 where the one case of a *correctly* surviving mutation is explained.
 
-Suite: **264 tests, 263 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **273 tests, 272 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
 ### What the mutation run actually said
@@ -223,14 +223,57 @@ limits by being cacheable where it can be. Both mutations are caught —
 disabling the rule fails the private test, widening it to every response fails
 the public one.
 
+## R2 was half a fix, and the half that shipped was the unreachable one
+
+The client-side coverage gap above was the acknowledged blind spot of both
+audits, so the next pass built a way to run the browser bundle
+(`tests/client-harness.mjs` -- renders the page through `renderBuilder`, pulls
+out the inline scripts, evaluates them in a `vm` against a small DOM stub; no
+new dependency, no CI change, ~300ms). The first thing it was pointed at was the
+newest client/server contract, R2. That contract did not work.
+
+**No client sent `expectedUpdatedAt` on a list save, and none could have.**
+Twelve call sites POST to `/api/creator/lists/save`; none cited a baseline, and
+`/api/creator/lists` did not report one -- the only version a browser could
+name is a version the server told it, and nothing did. So the guard could never
+fire, and two devices editing one list stayed last-write-wins in the product no
+matter what the Worker was capable of. The server-side conflict test passed
+throughout, because it sent a baseline the real client had no way to know.
+
+Both halves now exist. `/api/creator/lists` reports `updatedAt` per list --
+absent, not `0`, for a legacy record, since `parseExpectedUpdatedAt` reads
+absent as "no opinion" and `0` is an opinion and a wrong one. The two removal
+paths (`removeWatchlistItemDirect`, `removeCustomListItemDirect`) go through
+`saveCreatorListWithBaseline`, which cites the version, advances it from the
+save response, and on 409 **re-applies the edit** to what the other device
+saved rather than re-sending the array computed from the stale copy. That
+distinction is the fix: the edit is passed in as a function over items, not as
+a finished array, so "remove tt1" composes with "someone else added tt9"
+instead of silently undoing it. Retried once, then dropped.
+
+Six mutations across both halves, all caught. One of them is worth recording:
+naming the helper `saveCreatorListEdit` collided with an existing function of
+that name in `21_client-custom-list-builder.js`, and `html_checks.py`'s
+duplicate-declaration check caught it -- every client module shares one script
+scope, so the later declaration would have silently won.
+
+Writing those tests also surfaced a trap worth knowing about for the next
+person: a top-level `let`/`const` in a classic script lives in the *script*
+scope, not on `globalThis`, so setting `sandbox.lastCreatorListsData` from a
+test sets an unrelated global the bundle never reads. `activeCreator` is a
+`var` and does land on `globalThis`, which makes the difference easy to miss.
+The harness exposes `get`/`set`/`call` that run inside the bundle's own scope
+through a direct `eval`, appended by the harness and never by a shipped source.
+
 ## Deliberately not done
 
-**Behavioural coverage of the client.** 35,225 of the 59,240 source lines are
-the builder UI (09-24). The suite reaches them through targeted
-function-loading tests and the render checks -- syntax, duplicate top-level
-declarations, inline handler resolution -- but nothing exercises the UI as a
-whole. Both audits have been server-side audits; this is where a different
-class of defect would be.
+**Behavioural coverage of the client, beyond the contract below.** 35,225 of
+the 59,240 source lines are the builder UI (09-24). `tests/client-harness.mjs`
+now runs that bundle and `tests/client.test.mjs` exercises the list-edit
+protocol through it, but that is one flow. Rendering, layout and the bulk of
+the UI are still uncovered, and the harness's permissive DOM stub cannot reach
+them -- that needs a real browser, which is a dependency decision, not a
+test-writing one.
 
 **Pruning `creator_tombstones`.** Rows are inert once `until` has passed, and
 one row per deleted account is a rounding error next to the accounts
@@ -242,7 +285,7 @@ expired rows safely.
 ## Verification
 
 ```bash
-node --test tests/*.test.mjs        # 264 tests, 263 pass, 1 skipped
+node --test tests/*.test.mjs        # 273 tests, 272 pass, 1 skipped
 bash verify.sh                      # build drift, syntax, page render, map, tests
 python3 check_sync.py               # byte-exact rebuild check on its own
 

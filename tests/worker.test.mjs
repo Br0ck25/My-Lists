@@ -5981,6 +5981,58 @@ describe("R1: an anonymously published list can be removed", () => {
   });
 });
 
+describe("R2: the client is actually given a baseline to cite", () => {
+  // The guard and the field that arms it are two halves of one fix, and the
+  // guard shipped alone: /api/creator/lists did not return updatedAt, so the
+  // only version a browser could cite was one it had never been told. The
+  // server-side conflict test below passed the whole time, because it sent a
+  // baseline the real client had no way to know.
+  it("/api/creator/lists reports the version of each list", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "baseline");
+    const K = { creatorName: "baseline", creatorKey: u.creatorKey };
+    const saved = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "Faves", type: "movie", visibility: "private", items: [{ id: "tt1" }],
+    }});
+    assert.equal(saved.body.ok, true);
+
+    const listed = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listed.body.lists.find((l) => l.slug === "faves");
+    assert.ok(Number.isFinite(list.updatedAt), "a list must report the version its items are");
+    assert.equal(list.updatedAt, saved.body.updatedAt,
+      "and it must be the same version the save that produced it returned");
+
+    // The round trip that matters: what /lists reported is accepted as a
+    // baseline by /lists/save, rather than being rejected as stale.
+    const ok = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, slug: "faves", name: "Faves", type: "movie", visibility: "private",
+      items: [], expectedUpdatedAt: list.updatedAt,
+    }});
+    assert.equal(ok.status, 200, "the version the server just reported must be accepted");
+  });
+
+  it("reports no version for a legacy record rather than a misleading zero", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "legacyver");
+    const K = { creatorName: "legacyver", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "Old", type: "movie", visibility: "private", items: [],
+    }});
+    // The shape a record written before updatedAt existed still has in KV.
+    const raw = JSON.parse(kv._store.get("creatorlist:legacyver:old"));
+    delete raw.updatedAt;
+    kv._store.set("creatorlist:legacyver:old", JSON.stringify(raw));
+
+    const listed = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listed.body.lists.find((l) => l.slug === "old");
+    // Absent, not 0. parseExpectedUpdatedAt reads absent as "no opinion" and
+    // keeps the old last-write-wins behaviour, which is what additive means;
+    // 0 is an opinion, and a wrong one.
+    assert.ok(!("updatedAt" in list), `a legacy list must report no version, got ${list.updatedAt}`);
+  });
+});
+
 describe("R2: two devices editing one list do not silently overwrite each other", () => {
   it("rejects a save built on a version that has since moved", async () => {
     const kv = makeKv();

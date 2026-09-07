@@ -42060,6 +42060,84 @@ function deleteExternalListDirect(provider, listId, listName, btn) {
   );
 }
 
+
+// Save an edit to a server-hosted list without silently overwriting another
+// device's edit to the same list.
+//
+// The server grew the guard for this first (/api/creator/lists/save answers
+// 409 when the stored version is newer than the baseline the caller cites),
+// and nothing armed it: no client sent expectedUpdatedAt, and /api/creator/
+// lists did not return an updatedAt for one to send. Both halves exist now,
+// and this is the piece that uses them.
+//
+// removeItem(items) is the EDIT, not the result of it -- it takes a list of
+// items and returns the list with this change applied. That distinction is the
+// whole point. On a conflict the right answer is not "keep mine" or "keep
+// theirs" but "apply my change to theirs": re-running the removal against the
+// copy the other device just saved keeps both changes, where re-sending the
+// array computed from the stale copy would silently undo whatever they did.
+//
+// Retried once. A second conflict means a third device is writing to the same
+// list in the same instant; the edit is dropped rather than looping, and the
+// dashboard reload below shows what actually landed.
+async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
+  if (!list || typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  const send = async (target) => {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: target.slug,
+      name: target.name,
+      type: target.type || 'mixed',
+      items: target.items,
+      visibility: target.visibility || 'private',
+    };
+    // Only cite a baseline the server actually gave us. A legacy record has
+    // no updatedAt, and inventing one (0, Date.now()) would either reject
+    // every save or assert a version this browser never saw.
+    if (Number.isFinite(target.updatedAt)) body.expectedUpdatedAt = target.updatedAt;
+    return await fetch(ORIGIN + '/api/creator/lists/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  };
+
+  try {
+    let res = await send(list);
+    if (res.status === 409) {
+      // Someone else saved in between. Pull what they saved, re-apply this
+      // removal on top of it, and try once more.
+      let fresh = null;
+      try {
+        if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+        const data = await fetchCreatorListsOnce(creatorKey);
+        fresh = ((data && data.lists) || []).find((l) => l && l.slug === list.slug) || null;
+      } catch (e) {
+        fresh = null;
+      }
+      if (!fresh) return;
+      fresh.items = removeItem(Array.isArray(fresh.items) ? fresh.items : []);
+      // Keep the in-memory copy in step with what is about to be saved, so
+      // the dashboard does not re-render the pre-merge list.
+      list.items = fresh.items;
+      list.updatedAt = fresh.updatedAt;
+      res = await send(fresh);
+      if (res.status === 409) return;
+    }
+    const data = await res.json().catch(() => null);
+    // Advance the baseline, or the next edit in this session cites a version
+    // that is now stale and 409s against a write this browser made itself.
+    if (data && data.ok && Number.isFinite(data.updatedAt)) list.updatedAt = data.updatedAt;
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+  } catch (e) {
+    // Background save, same as before -- the edit is still in the DOM and in
+    // the local map, and the next load reconciles.
+  }
+}
+
 function removeWatchlistItemDirect(id, btn) {
   if (!id) return;
   if (btn) {
@@ -42074,6 +42152,11 @@ function removeWatchlistItemDirect(id, btn) {
     }
   }
   const targetId = String(id);
+  // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
+  // whatever another device saved instead of re-sending a stale array.
+  const removeMatching = (items) => (items || []).filter(
+    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+  );
   const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   let changed = false;
   Object.keys(map).forEach(key => {
@@ -42101,28 +42184,12 @@ function removeWatchlistItemDirect(id, btn) {
     const creatorWatchlist = lastCreatorListsData.find(l => l && (l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist')));
     if (creatorWatchlist && Array.isArray(creatorWatchlist.items)) {
       const initialLen = creatorWatchlist.items.length;
-      creatorWatchlist.items = creatorWatchlist.items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      creatorWatchlist.items = removeMatching(creatorWatchlist.items);
       if (creatorWatchlist.items.length !== initialLen) {
         if (typeof syncCustomListToCatalogRows === 'function') {
           syncCustomListToCatalogRows(creatorWatchlist.slug, creatorWatchlist.items, creatorWatchlist.name, creatorWatchlist.type || 'mixed');
         }
-        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-        fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            name: creatorWatchlist.name,
-            type: creatorWatchlist.type || 'mixed',
-            items: creatorWatchlist.items,
-            visibility: creatorWatchlist.visibility || 'private',
-            slug: creatorWatchlist.slug,
-          }),
-        }).then(() => {
-          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-          if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watchlist.');
-        }).catch(() => {});
+        saveCreatorListWithBaseline(creatorWatchlist, removeMatching, 'Removed item from Watchlist.');
       }
     }
   }
@@ -42187,10 +42254,15 @@ function removeCustomListItemDirect(id, slug, btn) {
     }
   }
   const targetId = String(id);
+  // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
+  // whatever another device saved instead of re-sending a stale array.
+  const removeMatching = (items) => (items || []).filter(
+    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+  );
   const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   if (map[slug] && Array.isArray(map[slug].items)) {
     const initialLen = map[slug].items.length;
-    map[slug].items = map[slug].items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+    map[slug].items = removeMatching(map[slug].items);
     if (map[slug].items.length !== initialLen) {
       map[slug].updatedAt = Date.now();
       if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
@@ -42216,28 +42288,12 @@ function removeCustomListItemDirect(id, slug, btn) {
     const creatorList = lastCreatorListsData.find(l => l && l.slug === slug);
     if (creatorList && Array.isArray(creatorList.items)) {
       const initialLen = creatorList.items.length;
-      creatorList.items = creatorList.items.filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      creatorList.items = removeMatching(creatorList.items);
       if (creatorList.items.length !== initialLen) {
         if (typeof syncCustomListToCatalogRows === 'function') {
           syncCustomListToCatalogRows(creatorList.slug, creatorList.items, creatorList.name, creatorList.type);
         }
-        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-        fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: creatorList.slug,
-            name: creatorList.name,
-            type: creatorList.type,
-            items: creatorList.items,
-            visibility: creatorList.visibility || 'public',
-          }),
-        }).then(() => {
-          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-          if (typeof showAddedToast === 'function') showAddedToast('Removed item from list.');
-        }).catch(() => {});
+        saveCreatorListWithBaseline(creatorList, removeMatching, 'Removed item from list.');
       }
     }
   }
@@ -56215,6 +56271,17 @@ self.addEventListener('fetch', e => {
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
+                // The version these items are, so an editor can send it back
+                // as expectedUpdatedAt and have lists/save refuse a write
+                // built on a copy another device has since replaced.
+                //
+                // The guard was added first and this was not, which made it
+                // unreachable: the only baseline a browser could cite is one
+                // the server told it about, and nothing did. A missing
+                // updatedAt on a legacy record stays undefined rather than
+                // becoming 0 -- lists/save treats a non-finite expected value
+                // as "no opinion", and 0 would be an opinion, and a wrong one.
+                updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {

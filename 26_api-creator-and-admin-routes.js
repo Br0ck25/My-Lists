@@ -1586,6 +1586,17 @@
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
+                // The version these items are, so an editor can send it back
+                // as expectedUpdatedAt and have lists/save refuse a write
+                // built on a copy another device has since replaced.
+                //
+                // The guard was added first and this was not, which made it
+                // unreachable: the only baseline a browser could cite is one
+                // the server told it about, and nothing did. A missing
+                // updatedAt on a legacy record stays undefined rather than
+                // becoming 0 -- lists/save treats a non-finite expected value
+                // as "no opinion", and 0 would be an opinion, and a wrong one.
+                updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
                 url: `${url.origin}/lists/${auth.username}/${slug}`,
               };
             } catch {
