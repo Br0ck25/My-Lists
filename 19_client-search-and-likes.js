@@ -1704,8 +1704,11 @@ function formatAirDateBadge(airDateStr) {
 function openEpisodeDetails(epNum) {
   const ep = window._episodeDataCache && window._episodeDataCache[epNum];
   if (!ep) return;
-  
-  const still = ep.still_path ? escapeAttr(ep.still_path) : '';
+
+  const d = window._currentItemDetails;
+  const seasonMeta = d && Array.isArray(d.seasonsData) ? d.seasonsData.find(s => Number(s.season_number) === Number(window._currentSeasonNum)) : null;
+  const fallbackStill = (seasonMeta && seasonMeta.poster_path ? 'https://image.tmdb.org/t/p/w200' + seasonMeta.poster_path : '') || (d && d.poster) || '';
+  const still = ep.still_path ? escapeAttr(ep.still_path) : (fallbackStill ? escapeAttr(fallbackStill) : '');
   const runtime = ep.runtime ? ep.runtime + ' min' : '';
   const date = ep.air_date ? ep.air_date : '';
   
@@ -2081,9 +2084,12 @@ async function openItemDetailsModal(id, type, opts) {
       seasonsHtml += '<div style="display:flex; flex-direction:column; gap:16px;">';
       d.seasonsData.forEach(season => {
         if (season.season_number === 0) return; // Skip specials usually
-        const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : '';
+        // TMDB doesn't always have a dedicated season poster (common for
+        // long-running / reality shows) -- fall back to the show's own
+        // poster rather than leaving a blank placeholder box.
+        const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : (d.poster || '');
         const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
-        seasonsHtml += 
+        seasonsHtml +=
           '<div class="season-card">' +
             '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
               '<div class="season-header-main">' +
@@ -2171,12 +2177,18 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
     window._seasonEpisodesMap[seasonNum] = data.season.episodes;
     
+    // Fall back to the season's own poster, then the show's poster, when
+    // an episode has no still (TMDB frequently lacks stills for reality/
+    // talk/game shows) so the grid doesn't show a blank tile.
+    const seasonMeta = d && Array.isArray(d.seasonsData) ? d.seasonsData.find(s => Number(s.season_number) === Number(seasonNum)) : null;
+    const fallbackStill = (seasonMeta && seasonMeta.poster_path ? 'https://image.tmdb.org/t/p/w200' + seasonMeta.poster_path : '') || (d && d.poster) || '';
+
     let epsHtml = '';
     if (!window._episodeDataCache) window._episodeDataCache = {};
     data.season.episodes.forEach(ep => {
       window._episodeDataCache[ep.episode_number] = ep;
-      const still = ep.still_path ? escapeAttr(ep.still_path) : '';
-      epsHtml += 
+      const still = ep.still_path ? escapeAttr(ep.still_path) : (fallbackStill ? escapeAttr(fallbackStill) : '');
+      epsHtml +=
         '<div class="clickable-episode" data-id="' + ep.id + '" data-season="' + seasonNum + '" data-episode="' + ep.episode_number + '" data-show-id="' + escapeAttr(imdbId || '') + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
           '<div style="width:100%; aspect-ratio:16/9; background:#222; border-radius:6px; overflow:hidden; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4);">' +
             (still ? '<img src="' + still + '" style="width:100%; height:100%; object-fit:cover;">' : '') +
