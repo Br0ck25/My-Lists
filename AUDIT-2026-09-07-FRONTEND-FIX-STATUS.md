@@ -5,10 +5,11 @@ which describes the frontend as it stood at `be20b1b`. That document is left as
 the audit record and is not rewritten to match the fixes — except for one
 correction, noted below, where the audit itself was wrong.
 
-**Every finding in the report is now fixed** — the ten ranked fixes first, then
-the four below the line. Each was verified the same way twice: the probe that
-demonstrated the defect now reports it gone, and the defect reintroduced by
-mutation makes the suite fail.
+**Every finding in the original report is now fixed** — the ten ranked fixes
+first, then the four below the line. Each was verified the same way twice: the
+probe that demonstrated the defect now reports it gone, and the defect
+reintroduced by mutation makes the suite fail. One finding found later, FE-17,
+is open; see the status table.
 
 Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
 `verify.sh` passes, including the byte-exact rebuild and three new steps.
@@ -35,8 +36,14 @@ Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
 | **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ✅ | `0ab30b8` |
 | **FE-14** | "Settings" label clipped at 320px | LOW | ✅ | `0ab30b8` |
 | **FE-16** | Dead `renderCustomListSearchResults` | LOW | ✅ | `0ab30b8` |
+| **FE-17** | Resumed PWA never refetches lists changed elsewhere | MEDIUM | ⬜ open | — |
 
-Nothing from the report is left open.
+FE-01 through FE-16 — every finding in the original report — are fixed.
+**FE-17 was found later** (2026-09-07, from a multi-device question about a
+backgrounded PWA) and is recorded but **not fixed**; it needs a decision between
+the two options the finding sets out. It costs no data — the `expectedUpdatedAt`
+guard added for FE-05 is what stops the stale copy being written over the other
+device's — but a resumed phone can keep showing a list that has moved on.
 
 ---
 

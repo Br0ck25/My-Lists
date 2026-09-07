@@ -71,6 +71,46 @@ PORT=8788 node /tmp/server_nod1.mjs &
 | `t23_fault.mjs` | — | 7 injected failures; every one recovers |
 | `t25_storage.mjs` | — | Malformed JSON, wrong types, quota exhaustion |
 | `t21_url.mjs` | — | 14 malformed and hostile deep links |
+| `t46_background_resume.mjs` | **FE-17** | Backgrounded PWA resumed: which desktop changes reach it |
+| `t47_stale_list_overwrite.mjs` | **FE-17** | The stale copy is never pushed over the desktop's — 409, warning, converge |
+| `t48_resume_variants.mjs` | **FE-17** | Foreground poll vs. cold start vs. recovery after the refused save |
+
+## Multi-device resume (t46 / t47 / t48)
+
+These three answer one question: a PWA left open in the background on a phone
+while another device makes changes — does the phone see them, or overwrite them?
+
+They need one seeded account each (they mutate its lists), created through the
+running rig:
+
+```bash
+node -e '
+const B="http://127.0.0.1:8787";const u=process.argv[1];
+(async()=>{const r=await(await fetch(B+"/api/creator/create",{method:"POST",
+  headers:{"content-type":"application/json"},body:JSON.stringify({creatorName:u})})).json();
+await fetch(B+"/api/creator/sync/save",{method:"POST",headers:{"content-type":"application/json"},
+  body:JSON.stringify({creatorName:u,creatorKey:r.creatorKey,
+    config:[{name:"ORIGINAL-ROW",url:"https://mdblist.com/lists/"+u+"/x",type:"movie",enabled:true}]})});
+await fetch(B+"/api/creator/lists/save",{method:"POST",headers:{"content-type":"application/json"},
+  body:JSON.stringify({creatorName:u,creatorKey:r.creatorKey,name:"Shared List",type:"movie",
+    visibility:"public",items:[{id:"tt0137523",type:"movie",title:"Fight Club",year:1999}]})});
+console.log(u,r.creatorKey);})()' erin
+node audit/frontend-2026-09-07/t46_background_resume.mjs erin <key>
+```
+
+Two things about how they work. Visibility is **emulated** — `document.visibilityState`
+and `hidden` are overridden and `visibilitychange`/`focus`/`pageshow` dispatched —
+because headless Chromium does not occlude a background tab, and `bringToFront()`
+leaves `visibilityState` at `visible` (the first cut of `t46` measured nothing for
+exactly that reason). The client only reads those two properties and those events,
+so this is what it observes on a real resume.
+
+Wall-clock time is **compressed**, and that is safe rather than assumed: nothing on
+the resume path is time-based, and `t46` holds the phone hidden across a full 60s
+poll interval and records that it makes zero requests the whole time. A 30-minute
+background and a 70-second one run the same code.
+
+`t46` and `t48` take ~90s each — most of it deliberate waiting.
 
 ## Seeding
 
