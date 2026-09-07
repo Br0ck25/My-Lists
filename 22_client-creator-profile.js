@@ -1298,7 +1298,7 @@ function openRestoreModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="restoreKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
     '<div id="restoreModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
+    '<button type="button" class="primary" id="restoreSubmitBtn" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
@@ -1313,6 +1313,11 @@ async function submitRestoreProfile() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Key.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('restoreProfile', '#restoreSubmitBtn', 'Signing in\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/restore', {
       method: 'POST',
@@ -1340,6 +1345,8 @@ async function submitRestoreProfile() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -1358,7 +1365,7 @@ function openForgotKeyModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
     '<div id="forgotKeyModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="primary" id="forgotKeySubmitBtn" onclick="submitForgotKey()">Reset Key</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
@@ -1373,6 +1380,11 @@ async function submitForgotKey() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('forgotKey', '#forgotKeySubmitBtn', 'Resetting\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/reset-key', {
       method: 'POST',
@@ -1399,6 +1411,8 @@ async function submitForgotKey() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -2450,10 +2464,48 @@ function openCreateProfileModal() {
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
+    '<button type="button" class="primary" id="createProfileSubmitBtn" onclick="submitCreateProfile()">Create Account</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Login</button>' +
     '</div>'
   );
+}
+
+// One credential request in flight at a time.
+//
+// Measured: two clicks on "Create Account" sent two POST /api/creator/create.
+// Both succeeded and returned DIFFERENT keys. KV keeps the last one; D1's
+// INSERT violates the primary key on the second and is swallowed as non-fatal,
+// so D1 keeps the FIRST; and reads prefer D1. The browser stores whichever
+// response lands last, so 6 out of 6 double-clicks produced an account whose
+// key does not authenticate -- with that dead key shown in the "save this
+// somewhere safe" modal and every later request 401ing.
+//
+// KV-only this was harmless: the last write won in the one store there was, so
+// the stored key was always the valid one. Adding D1 is what turned a missing
+// guard into a broken account, which is why something that was never needed
+// before is needed now.
+//
+// Keyed by name rather than held on the button, because these modals rebuild
+// their own markup -- a disabled button does not survive a re-render, the flag
+// does. The button is disabled too, for the person doing the clicking.
+const _submitsInFlight = new Set();
+
+function beginSubmit(key, btnSelector, busyLabel) {
+  if (_submitsInFlight.has(key)) return null;
+  _submitsInFlight.add(key);
+  const btn = btnSelector ? document.querySelector(btnSelector) : null;
+  const label = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    if (busyLabel) btn.textContent = busyLabel;
+  }
+  return function endSubmit() {
+    _submitsInFlight.delete(key);
+    if (btn) {
+      btn.disabled = false;
+      if (label !== null) btn.textContent = label;
+    }
+  };
 }
 
 async function submitCreateProfile() {
@@ -2474,6 +2526,11 @@ async function submitCreateProfile() {
     errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('createProfile', '#createProfileSubmitBtn', 'Creating\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
@@ -2520,6 +2577,8 @@ async function submitCreateProfile() {
     migrateLocalCustomListsToAccount();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 

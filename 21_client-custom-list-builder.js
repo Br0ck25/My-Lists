@@ -546,6 +546,14 @@ async function saveCreatorListEdit(name) {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const visSelect = document.getElementById('customListVisibilitySelect');
   const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+  // Same guard as the credential forms -- see beginSubmit
+  // (22_client-creator-profile.js). A double-click here sent the whole
+  // items array twice; the second overwrote the first with the same
+  // content, which was harmless, but it also spent a second write and
+  // raced the baseline the next save cites.
+  const endSubmit = beginSubmit('saveCreatorList', '#customListSaveBtn', 'Saving\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
@@ -595,6 +603,8 @@ async function saveCreatorListEdit(name) {
     } else {
       alert('Network error while saving.');
     }
+  } finally {
+    endSubmit();
   }
 }
 

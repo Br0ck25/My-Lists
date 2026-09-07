@@ -423,3 +423,80 @@ describe("client: an imported id cannot break out of an inline handler", () => {
     assert.equal(dropped.length, 1, "and the caller must be told, so it can be reported");
   });
 });
+
+// --- FE-03: an impatient click must not create the account twice -----------
+//
+// Two clicks on "Create Account" sent two POST /api/creator/create. Both
+// succeeded and returned different keys: KV keeps the last, D1's INSERT fails
+// on the second and is swallowed so D1 keeps the first, and reads prefer D1.
+// The browser stores the last, so the key it shows and saves is the one that
+// does not authenticate -- 6 out of 6 double-clicks in a real browser produced
+// an account nobody could sign into.
+//
+// KV-only the same double-click was harmless, which is why the guard was never
+// missed until D1 arrived.
+describe("client: a double-clicked credential form submits once", () => {
+  const creates = () => {
+    let n = 0;
+    return {
+      count: () => n,
+      routes: (saves) => ({
+        ...anonRoutes(saves),
+        [CREATE]: () => {
+          n += 1;
+          // Distinct keys, as the server really does return -- so a second
+          // request does not merely duplicate the first, it replaces the key
+          // this browser will keep.
+          return { json: { ok: true, creatorName: "bob", displayName: "Bob", creatorKey: "MYL-KEY-" + n } };
+        },
+      }),
+    };
+  };
+
+  it("sends one create however many times Create is clicked", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    fillCreateForm(client, "newbie");
+
+    // Not awaited between calls -- that is the whole point. Awaiting each one
+    // serialises them, and the server correctly answers "username taken" for
+    // the later ones; the damage only happens while the first is in flight.
+    const all = [client.call("submitCreateProfile"), client.call("submitCreateProfile"), client.call("submitCreateProfile")];
+    await Promise.all(all);
+    await settle();
+
+    assert.equal(c.count(), 1, "three clicks must produce one account, not three");
+    assert.equal(client.get("localStorage").getItem("myListAddon:creatorKey"), "MYL-KEY-1",
+      "and the key kept must be the one the single request returned");
+  });
+
+  it("re-arms after the request finishes, so a later attempt still works", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    fillCreateForm(client, "newbie");
+
+    await client.call("submitCreateProfile");
+    await settle();
+    await client.call("submitCreateProfile");
+    await settle();
+
+    // A guard that latches would be its own bug: the form would silently stop
+    // working after one use.
+    assert.equal(c.count(), 2, "a second, separate attempt must be allowed through");
+  });
+
+  it("does not latch when the form is rejected before any request", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    const d = client.get("document");
+    d.getElementById("createProfileNameInput").value = "";      // no username
+    await client.call("submitCreateProfile");
+    await settle();
+    assert.equal(c.count(), 0, "nothing should have been sent");
+
+    fillCreateForm(client, "newbie");
+    await client.call("submitCreateProfile");
+    await settle();
+    assert.equal(c.count(), 1, "and the corrected form must go through");
+  });
+});
