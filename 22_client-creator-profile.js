@@ -4323,6 +4323,34 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
+// Keeps a row's Live Preview shelf title (".shelf-title-text", set once at
+// addRow time -- see its own comment there) in sync with the Name field and
+// Movies/Shows selector above it. Without this, renaming a list left the
+// old name showing on its Live Preview shelf and See All page until the
+// whole preview was rebuilt (Refresh Preview, or reloading the page) --
+// editing the field did nothing visible where the person could actually see
+// it. Delegated the same way saveState is above, rather than a listener per
+// row: renumber()/addRow() never touch this element, so nothing else keeps
+// it current.
+document.getElementById('lists').addEventListener('input', (e) => {
+  if (!e.target.classList.contains('name')) return;
+  updateShelfTitleText(e.target.closest('.entry'));
+});
+document.getElementById('lists').addEventListener('change', (e) => {
+  if (!e.target.classList.contains('type')) return;
+  updateShelfTitleText(e.target.closest('.entry'));
+});
+function updateShelfTitleText(entryDOM) {
+  if (!entryDOM) return;
+  const titleEl = entryDOM.querySelector('.shelf-title-text');
+  if (!titleEl) return;
+  const nameInput = entryDOM.querySelector('.name');
+  const typeSelect = entryDOM.querySelector('.type');
+  const name = (nameInput && nameInput.value.trim()) || 'Unnamed';
+  const type = typeSelect ? typeSelect.value : 'movie';
+  titleEl.textContent = name + ' - ' + (type === 'series' ? 'Series' : 'Movies');
+}
+
 // The createListModal counterpart of closeSelectListModal. Its X and Cancel
 // buttons hid the modal and released nothing, which was the other half of the
 // latched scroll lock.

@@ -366,12 +366,14 @@ ${seoHeadHtml}
     color: var(--text-2);
   }
   /* Dark Mode state: show sun, hide moon */
+  /* No color override here -- matches the Guide page's theme toggle
+     (renderGuidePage, 24_client-backup-restore-presets.js), which never
+     colors its sun icon and just inherits the button's own text color. */
   :root.dark-theme .theme-toggle-btn .theme-icon-sun,
   html.dark-theme .theme-toggle-btn .theme-icon-sun,
   body.dark-theme .theme-toggle-btn .theme-icon-sun {
     opacity: 1;
     transform: translate(-50%, -50%) scale(1) rotate(0deg);
-    color: #FFC107;
   }
   :root.dark-theme .theme-toggle-btn .theme-icon-moon,
   html.dark-theme .theme-toggle-btn .theme-icon-moon,

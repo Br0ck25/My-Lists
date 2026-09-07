@@ -751,7 +751,7 @@ async function renderLivePreview() {
           postersContainer.innerHTML = '<p><small>No items found.</small></p>';
           continue;
         }
-        livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore };
+        livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems };
         const sliced = data.sample.slice(0, visibleCount);
         sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; });
         postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
@@ -2643,5 +2643,10 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 function openLivePreviewSeeAll(i) {
   const shelf = livePreviewShelfData[i];
   if (!shelf) return;
-  openListDetailsPage(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore });
+  // itemCount, not just the page-0 sample, so the header shows the list's
+  // real size right away instead of the first page's length (100, if the
+  // list has more) until scrolling has paged in the rest. The server
+  // already knows this from the same /api/preview call that fetched
+  // sample -- see /api/preview's own totalItems (25_api-catalog-routes.js).
+  openListDetailsPage(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore, itemCount: shelf.totalItems });
 }
