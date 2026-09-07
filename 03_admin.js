@@ -2415,15 +2415,15 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Enter a username and at least one slug.';
         return;
       }
-      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = rawSlugs.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
-        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        ' belonging to "' + username + '"?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;
@@ -2539,7 +2539,7 @@ async function renderAdminDashboard(env) {
       if (!btn) return;
       const input = document.getElementById('deleteAnonSlugsInput');
       const slug = btn.getAttribute('data-anon-slug');
-      const current = (input.value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const current = (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (current.indexOf(slug) === -1) current.push(slug);
       input.value = current.join(', ');
       document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
@@ -2551,15 +2551,15 @@ async function renderAdminDashboard(env) {
       const btn = document.getElementById('deleteAnonBtn');
       const status = document.getElementById('deleteAnonStatus');
       const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
-      const slugs = raw.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = raw.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
-        (slugs.length === 1 ? '' : 's') + '?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length === 1 ? '' : 's') + '?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;

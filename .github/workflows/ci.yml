@@ -49,6 +49,18 @@ jobs:
           node render_check.js rendered.html
           python3 html_checks.py rendered.html ci
 
+      # /admin is a template literal too, and got none of the above. A single
+      # backslash inside one is eaten before the browser sees it, so '\n\n'
+      # in a confirm() string became a real newline, split a single-quoted
+      # string across two lines, and made the entire 60KB dashboard script a
+      # SyntaxError. Every admin control was dead for two days. The step above
+      # cannot catch it -- it only renders the builder page -- and neither can
+      # `node --check`, which sees both pages as string content.
+      - name: Render + validate the admin dashboard
+        run: |
+          node render_check.js rendered-admin.html --admin
+          python3 html_checks.py rendered-admin.html ci-admin
+
       # gen_map.py is deterministic, so the committed map should always be
       # exactly what it produces. Without this check it silently rotted --
       # 26% of its line numbers pointed at the wrong line.
