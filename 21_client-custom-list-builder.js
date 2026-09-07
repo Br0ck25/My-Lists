@@ -29,31 +29,6 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
-function renderCustomListSearchResults(results, searchType) {
-  const box = document.getElementById('customListSearchResult');
-  if (!results.length) {
-    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
-    return;
-  }
-  const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
-      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
-    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
-      posterImg +
-      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
-        escapeHtml(r.title) +
-      '</div>' +
-      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
-      '<button type="button" class="lc-btn secondary customListAddBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-searchtype="' + searchType + '"' +
-      ' data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '"' +
-      ' data-poster="' + escapeAttr(r.poster || '') + '">+ Add</button>' +
-      '</div>';
-  }).join('');
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
-}
-
 const customListSearchBox = document.getElementById('customListSearchResult');
 if (customListSearchBox) {
   customListSearchBox.addEventListener('click', (e) => {
@@ -546,20 +521,65 @@ async function saveCreatorListEdit(name) {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const visSelect = document.getElementById('customListVisibilitySelect');
   const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+  // Same guard as the credential forms -- see beginSubmit
+  // (22_client-creator-profile.js). A double-click here sent the whole
+  // items array twice; the second overwrote the first with the same
+  // content, which was harmless, but it also spent a second write and
+  // raced the baseline the next save cites.
+  const endSubmit = beginSubmit('saveCreatorList', '#customListSaveBtn', 'Saving\u2026');
+  if (!endSubmit) return;
+
+  // The version this edit was built on, so the server can tell whether another
+  // device saved in between instead of this one silently winning.
+  //
+  // The guard has existed server-side for a while and only two call sites ever
+  // armed it, both of them remove-one-item paths -- so the main "save my edits
+  // to this list" button, the one that sends the WHOLE items array, was still
+  // last-write-wins. Two devices adding a different film each ended with one of
+  // them gone and both saves reporting ok.
+  //
+  // Only cite a baseline the server actually gave us: a legacy record has no
+  // updatedAt, and inventing one would either reject every save or assert a
+  // version this browser never saw.
+  const cached = Array.isArray(lastCreatorListsData)
+    ? lastCreatorListsData.find((l) => l && l.slug === editingCreatorListSlug)
+    : null;
+  const baseline = cached && Number.isFinite(cached.updatedAt) ? cached.updatedAt : null;
+
   try {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: editingCreatorListSlug,
+      name: name,
+      type: customListDraftType,
+      items: customListDraftItems,
+      visibility: visibility,
+    };
+    if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        slug: editingCreatorListSlug,
-        name: name,
-        type: customListDraftType,
-        items: customListDraftItems,
-        visibility: visibility,
-      }),
+      body: JSON.stringify(body),
     });
+    if (res.status === 409) {
+      // Another device saved this list since this browser loaded it. Unlike the
+      // remove-one-item paths, this edit is a whole replacement array built in
+      // the builder, so there is no change to re-apply on top of theirs -- only
+      // the person can say which they want. Pull what is actually stored so the
+      // dashboard stops showing a version that no longer exists, and leave the
+      // draft alone so nothing they typed is lost.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      const msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        'Your edits are still here. Reopen the list to see what the other device saved, then re-apply your changes.';
+      if (typeof showAppNoticeModal === 'function') {
+        showAppNoticeModal('This List Changed Elsewhere', msg, true);
+      } else {
+        alert(msg);
+      }
+      return;
+    }
     const data = await res.json();
     if (!data.ok) {
       if (typeof showAppNoticeModal === 'function') {
@@ -569,6 +589,9 @@ async function saveCreatorListEdit(name) {
       }
       return;
     }
+    // Advance the baseline, or a second edit in this session cites a version
+    // this browser has itself already replaced and 409s against its own write.
+    if (cached && Number.isFinite(data.updatedAt)) cached.updatedAt = data.updatedAt;
     if (editingCreatorListSlug === 'watchlist') {
       const map = loadLocalCustomLists();
       if (map['watchlist']) {
@@ -595,6 +618,8 @@ async function saveCreatorListEdit(name) {
     } else {
       alert('Network error while saving.');
     }
+  } finally {
+    endSubmit();
   }
 }
 

@@ -12,3 +12,4 @@ wrangler.d1test.toml
 rendered.html
 test.html
 inner_*.js
+audit/**/*.png

@@ -20,7 +20,7 @@
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Region</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
-      <select id="regionSelect" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+      <select id="regionSelect" aria-label="Streaming region" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
         ${buildRegionOptionsHtml(initialRegion)}
       </select>
     </div>
@@ -302,7 +302,7 @@
         <label style="display:block; font-weight:600; font-size:0.88rem; margin-bottom:6px; color:var(--text);">Select file(s)</label>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <button type="button" class="secondary lc-btn" onclick="document.getElementById('unifiedImportFileInput').click()" style="padding:8px 16px;">Select files&hellip;</button>
-          <input type="file" id="unifiedImportFileInput" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
+          <input type="file" id="unifiedImportFileInput" aria-label="Choose a file to import" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
           <span id="unifiedImportSelectedCount" style="font-size:0.85rem; color:var(--muted);">No files selected</span>
         </div>
       </div>
@@ -353,7 +353,7 @@
       <div id="newFeedbackFormWrap">
         <div class="row">
           <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Category</label>
-          <select id="feedbackCategorySelect">
+          <select id="feedbackCategorySelect" aria-label="Feedback category">
             <option value="bug">Bug Report</option>
             <option value="improvement">Improvement / Feature Request</option>
             <option value="idea">Idea / Suggestion</option>

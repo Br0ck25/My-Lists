@@ -1298,7 +1298,7 @@ function openRestoreModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="restoreKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
     '<div id="restoreModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
+    '<button type="button" class="primary" id="restoreSubmitBtn" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
@@ -1313,6 +1313,11 @@ async function submitRestoreProfile() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Key.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('restoreProfile', '#restoreSubmitBtn', 'Signing in\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/restore', {
       method: 'POST',
@@ -1332,6 +1337,12 @@ async function submitRestoreProfile() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
+    // Released here, not in the finally below: what follows is the sign-in
+    // tail, and loadCreatorSync can take as long as the network takes. Holding
+    // the guard across it would leave the Login button disabled for the whole
+    // of it and stop someone signing into a different account. Calling it twice
+    // is harmless.
+    endSubmit();
     renderCreatorProfileBar();
     renderAccountKeySection();
     renderWatchlistPreferencesSection();
@@ -1340,6 +1351,8 @@ async function submitRestoreProfile() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -1358,7 +1371,7 @@ function openForgotKeyModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
     '<div id="forgotKeyModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="primary" id="forgotKeySubmitBtn" onclick="submitForgotKey()">Reset Key</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
@@ -1373,6 +1386,11 @@ async function submitForgotKey() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('forgotKey', '#forgotKeySubmitBtn', 'Resetting\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/reset-key', {
       method: 'POST',
@@ -1390,6 +1408,9 @@ async function submitForgotKey() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     closeModal();
+    // Released before the sign-in tail, same reasoning as
+    // submitRestoreProfile -- see there.
+    endSubmit();
     showKeyRevealModal(data.displayName, data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -1399,6 +1420,8 @@ async function submitForgotKey() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -1829,13 +1852,28 @@ async function loadCreatorSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Who this load is for. Checked again after the await, because signing in as
+  // someone else calls clearLocalAccountData() and then starts a fresh load --
+  // and this one is still in flight. Measured: signing in as alice and then
+  // immediately as bob left alice's catalog rows and liked lists rendered under
+  // bob's name, because her slower response was simply the last writer and
+  // nothing told it that it had been superseded.
+  //
+  // The account itself was never contaminated -- the next push cited alice's
+  // updatedAt, the server answered 409 and the 409 handler pulled bob's state
+  // back. But that is the server catching it, and what was on screen in the
+  // meantime was another account's data.
+  const loadingFor = activeCreator.creatorName;
+  const isStale = () => !activeCreator || activeCreator.creatorName !== loadingFor;
   try {
     const res = await fetch(ORIGIN + '/api/creator/sync/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
     });
+    if (isStale()) return;
     const data = await res.json();
+    if (isStale()) return;
     if (!data.ok) return;
     window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
@@ -1977,7 +2015,11 @@ async function loadCreatorSync(opts) {
     }
     if (Array.isArray(synced.likedLists)) {
       try {
-        localStorage.setItem('myListAddon:likedLists', JSON.stringify(synced.likedLists));
+        // Strings only -- see getLikedListsSet. sync/save coerces with
+        // .map(String) server-side, so this is belt and braces for a record
+        // written before it did.
+        localStorage.setItem('myListAddon:likedLists',
+          JSON.stringify(synced.likedLists.filter((v) => typeof v === 'string' && v)));
       } catch (e) {
         // non-critical, see rememberLikedList's own comment
       }
@@ -2450,10 +2492,48 @@ function openCreateProfileModal() {
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
+    '<button type="button" class="primary" id="createProfileSubmitBtn" onclick="submitCreateProfile()">Create Account</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Login</button>' +
     '</div>'
   );
+}
+
+// One credential request in flight at a time.
+//
+// Measured: two clicks on "Create Account" sent two POST /api/creator/create.
+// Both succeeded and returned DIFFERENT keys. KV keeps the last one; D1's
+// INSERT violates the primary key on the second and is swallowed as non-fatal,
+// so D1 keeps the FIRST; and reads prefer D1. The browser stores whichever
+// response lands last, so 6 out of 6 double-clicks produced an account whose
+// key does not authenticate -- with that dead key shown in the "save this
+// somewhere safe" modal and every later request 401ing.
+//
+// KV-only this was harmless: the last write won in the one store there was, so
+// the stored key was always the valid one. Adding D1 is what turned a missing
+// guard into a broken account, which is why something that was never needed
+// before is needed now.
+//
+// Keyed by name rather than held on the button, because these modals rebuild
+// their own markup -- a disabled button does not survive a re-render, the flag
+// does. The button is disabled too, for the person doing the clicking.
+const _submitsInFlight = new Set();
+
+function beginSubmit(key, btnSelector, busyLabel) {
+  if (_submitsInFlight.has(key)) return null;
+  _submitsInFlight.add(key);
+  const btn = btnSelector ? document.querySelector(btnSelector) : null;
+  const label = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    if (busyLabel) btn.textContent = busyLabel;
+  }
+  return function endSubmit() {
+    _submitsInFlight.delete(key);
+    if (btn) {
+      btn.disabled = false;
+      if (label !== null) btn.textContent = label;
+    }
+  };
 }
 
 async function submitCreateProfile() {
@@ -2474,6 +2554,11 @@ async function submitCreateProfile() {
     errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('createProfile', '#createProfileSubmitBtn', 'Creating\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
@@ -2520,6 +2605,8 @@ async function submitCreateProfile() {
     migrateLocalCustomListsToAccount();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -2994,6 +3081,28 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
 }
 window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
 
+// The saved dashboard order, as the thing both readers assume it is.
+//
+// Both used to JSON.parse inside a try/catch -- which covers malformed JSON --
+// and then test savedOrder && savedOrder.length before calling .map on it.
+// A STRING passes that test ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: the container type was checked and
+// the element type was not.
+//
+// Every writer is Array.isArray-guarded today, so this needs storage edited by
+// hand to reach -- but the cost of being wrong is the entire My Lists tab, and
+// the guard is one line.
+function readDashboardListOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((s) => typeof s === 'string' && s);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -3121,7 +3230,7 @@ async function renderCreatorDashboard(options) {
           overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
         }
         const removeBtn = isWatchlist
-          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
           : '';
         const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
         const itemPoster = resolveItemPoster(it);
@@ -3233,11 +3342,9 @@ async function renderCreatorDashboard(options) {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      try {
-        savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-      } catch (e) {}
+      savedOrder = readDashboardListOrder();
     }
-    if (savedOrder && savedOrder.length) {
+    if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       visibleDashboardLists.sort((a, b) => {
         const slugA = (a && a.list && a.list.slug) || '';
@@ -3326,11 +3433,11 @@ function buildLocalListCardHtml(l) {
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
     if (l.slug === 'continue-watching' && it.showId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
     } else if (isWatchlist) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
     }
     const itemPoster = resolveItemPoster(it);
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
@@ -3565,11 +3672,8 @@ function renderLocalCustomListsDashboard(box, silent) {
 
   const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
 
-  let savedOrder = [];
-  try {
-    savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-  } catch (e) {}
-  if (savedOrder && savedOrder.length) {
+  const savedOrder = readDashboardListOrder();
+  if (savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
     visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
@@ -4165,6 +4269,17 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
+// The createListModal counterpart of closeSelectListModal. Its X and Cancel
+// buttons hid the modal and released nothing, which was the other half of the
+// latched scroll lock.
+function closeCreateListModal() {
+  const modal = document.getElementById('createListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeCreateListModal = closeCreateListModal;
+
 function openCreateListModal(presetDestination) {
   const destEl = document.getElementById('createListModalDestination');
   if (destEl) {
@@ -4208,6 +4323,7 @@ function openCreateListModal(presetDestination) {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 
@@ -4431,7 +4547,7 @@ async function submitCreateListModal() {
     }
 
     saveState();
-    document.getElementById('createListModal').style.display = 'none';
+    closeCreateListModal();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
     if (currentPendingItem && currentPendingItem.title) {

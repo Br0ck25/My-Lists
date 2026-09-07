@@ -1,4 +1,4 @@
-<div class="tab-panel" data-tab-panel="discover">
+<div class="tab-panel" data-tab-panel="discover" id="content-discover" role="tabpanel" aria-labelledby="tab-desktop-discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>

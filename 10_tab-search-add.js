@@ -1,4 +1,4 @@
-<div class="tab-panel" data-tab-panel="catalogs" hidden>
+<div class="tab-panel" data-tab-panel="catalogs" id="content-catalogs" role="tabpanel" aria-labelledby="tab-desktop-catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
@@ -20,7 +20,7 @@
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
       <input type="text" id="listFilterInput" placeholder="Filter catalogs by name..." oninput="filterLists()">
-      <select id="listGroupFilterSelect" onchange="filterLists()" style="flex:none; width:auto;">
+      <select id="listGroupFilterSelect" aria-label="Filter catalogs by group" onchange="filterLists()" style="flex:none; width:auto;">
         <option value="">All groups</option>
       </select>
     </div>

@@ -137,7 +137,8 @@ export function loadClient(opts = {}) {
   const byId = new Map();
   const documentStub = {
     readyState: "complete",
-    documentElement: makeElement(), body: makeElement(), head: makeElement(),
+    documentElement: Object.assign(makeElement(), { clientWidth: 1280, clientHeight: 800, scrollTop: 0 }),
+    body: makeElement(), head: makeElement(),
     createElement: makeElement, createTextNode: makeElement, createDocumentFragment: makeElement,
     getElementById(id) { if (!byId.has(id)) byId.set(id, makeElement()); return byId.get(id); },
     querySelector: () => makeElement(), querySelectorAll: () => [],
@@ -171,6 +172,15 @@ export function loadClient(opts = {}) {
     btoa: (s) => Buffer.from(s, "binary").toString("base64"),
     crypto: globalThis.crypto,
     addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
+    // Viewport and scrolling. lockBackgroundScroll (16_client-row-core.js) reads
+    // and restores the scroll position around every modal, so without these the
+    // stub throws on any test that opens one -- which is most of them now.
+    // Fixed numbers rather than 0 so the scrollbar-width compensation
+    // (innerWidth - documentElement.clientWidth) comes out plausible.
+    innerWidth: 1280, innerHeight: 800, pageYOffset: 0, pageXOffset: 0,
+    scrollX: 0, scrollY: 0,
+    scrollTo() {}, scroll() {}, scrollBy() {},
+    getComputedStyle: () => ({ getPropertyValue: () => "", display: "block", overflowY: "auto" }),
     Image: makeElement, Event: function Event() {}, CustomEvent: function CustomEvent() {},
     matchMedia: () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} }),
     Response, Request, Headers, AbortController,

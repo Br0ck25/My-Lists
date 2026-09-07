@@ -6757,10 +6757,15 @@ async function renderAdminDashboard(env) {
   <h1>Admin Dashboard</h1>
   <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
-  <div class="admin-main-tab-bar" role="tablist">
-    <button type="button" class="admin-main-tab-btn active" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
+  <!-- Not a tablist: these three buttons do not reveal panels, they choose
+       which row of sub-tabs is shown, and it is the sub-tab that selects
+       content. role="tablist" with nothing inside it carrying role="tab"
+       told assistive technology to expect tabs and hand it none, so this
+       is a labelled group of toggle buttons, which is what it is. -->
+  <div class="admin-main-tab-bar" role="group" aria-label="Dashboard sections">
+    <button type="button" class="admin-main-tab-btn active" aria-pressed="true" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
   </div>
 
   <div class="admin-subnav-bar" id="adminSubnavOverview">
@@ -7086,7 +7091,11 @@ async function renderAdminDashboard(env) {
     };
 
     function switchAdminMainTab(catId) {
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === catId));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === catId;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + catId.charAt(0).toUpperCase() + catId.slice(1)) ? 'flex' : 'none';
       });
@@ -7108,7 +7117,11 @@ async function renderAdminDashboard(env) {
       if (updateUrl && history.replaceState) {
         history.replaceState(null, '', '#' + tabId);
       }
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === cat));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === cat;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + cat.charAt(0).toUpperCase() + cat.slice(1)) ? 'flex' : 'none';
       });
@@ -7448,15 +7461,15 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Enter a username and at least one slug.';
         return;
       }
-      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = rawSlugs.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
-        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        ' belonging to "' + username + '"?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;
@@ -7572,7 +7585,7 @@ async function renderAdminDashboard(env) {
       if (!btn) return;
       const input = document.getElementById('deleteAnonSlugsInput');
       const slug = btn.getAttribute('data-anon-slug');
-      const current = (input.value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const current = (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (current.indexOf(slug) === -1) current.push(slug);
       input.value = current.join(', ');
       document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
@@ -7584,15 +7597,15 @@ async function renderAdminDashboard(env) {
       const btn = document.getElementById('deleteAnonBtn');
       const status = document.getElementById('deleteAnonStatus');
       const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
-      const slugs = raw.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = raw.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
-        (slugs.length === 1 ? '' : 's') + '?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length === 1 ? '' : 's') + '?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;
@@ -14312,6 +14325,12 @@ ${seoHeadHtml}
       cursor: pointer;
       transition: color 0.12s ease;
       white-space: nowrap;
+      /* flex items default to min-width:auto, so with nowrap these six
+         cannot shrink below their own text and the last one overflows the
+         viewport -- measured at 320px, 'Settings' ran to x=344 and rendered
+         as 'Settin'. This lets them shrink; the narrow-width rule below
+         keeps the labels readable rather than merely clipped. */
+      min-width: 0;
       line-height: 1.1;
     }
     .bottom-nav-item svg {
@@ -14322,6 +14341,19 @@ ${seoHeadHtml}
     .bottom-nav-item.active { color: var(--accent); }
     .bottom-nav-item.active svg { transform: translateY(-1px); stroke-width: 2.2; }
     .bottom-nav-item:active { opacity: 0.6; }
+  }
+
+  /* Six labels across a 320px screen (iPhone SE 1st gen, Galaxy Fold cover).
+     At 0.78rem the widest of them does not fit in its 53px share, so the type
+     comes down a step and the letter-spacing goes to zero rather than the word
+     being cut in half. */
+  @media (max-width: 360px) {
+    .bottom-nav-item {
+      font-size: 0.68rem;
+      letter-spacing: 0;
+      padding: 4px 0;
+    }
+    .bottom-nav-item svg { width: 25px; height: 25px; }
   }
 
   .live-preview-poster-card.dragging {
@@ -16636,13 +16668,13 @@ ${seoHeadHtml}
   </header>
 
   <!-- Top Tab Bar (Desktop View) -->
-  <div class="tab-bar" role="tablist">
-    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
-    <button type="button" class="tab-btn" data-tab="channels" onclick="switchTab('channels')">Channels</button>
-    <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
-    <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
-    <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  <div class="tab-bar" role="tablist" aria-label="Main navigation">
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')">Channels</button>
+    <button type="button" class="tab-btn active" role="tab" id="tab-desktop-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')">Discover</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')">Search</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')">Settings</button>
   </div>
 
   <!-- Unsaved Changes Floating Banner -->
@@ -16653,13 +16685,13 @@ ${seoHeadHtml}
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->
   <nav class="bottom-nav" role="tablist" aria-label="Main navigation">
-    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')" title="Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
@@ -16667,27 +16699,27 @@ ${seoHeadHtml}
       </svg>
       Lists
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="channels" onclick="switchTab('channels')" title="Channels">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')" title="Channels">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>
         <polyline points="17 2 12 7 7 2"></polyline>
       </svg>
       Channels
     </button>
-    <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
+    <button type="button" class="bottom-nav-item active" role="tab" id="tab-mobile-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect>
         <rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect>
       </svg>
       Discover
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="search" onclick="switchTab('search')" title="Search">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')" title="Search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
       Search
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="settings" onclick="switchTab('settings')" title="Settings">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')" title="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"></circle>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -16733,7 +16765,7 @@ ${seoHeadHtml}
   </script>
 
   <!-- Action Notification Toast -->
-  <div id="actionToast" class="action-toast"></div>
+  <div id="actionToast" class="action-toast" role="status" aria-live="polite"></div>
 
   <!-- List Details page ("See All" full list view) -->
   <div class="tab-panel list-details-page" data-tab-panel="list-details" id="content-list-details" hidden>
@@ -16798,16 +16830,16 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="createListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
-        <button type="button" class="modal-close-x" onclick="document.getElementById('createListModal').style.display = 'none';">&#x2715;</button>
+        <button type="button" class="modal-close-x" onclick="closeCreateListModal()">&#x2715;</button>
       </div>
 
       <div style="margin-bottom: 12px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Destination</label>
-        <select id="createListModalDestination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
+        <select id="createListModalDestination" aria-label="Destination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
           <option value="custom">Custom List</option>
           <option value="trakt">Trakt List</option>
           <option value="tmdb">TMDB List</option>
@@ -16828,7 +16860,7 @@ ${seoHeadHtml}
       
       <div style="margin-bottom: 14px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Content Type</label>
-        <select id="createListModalType" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
+        <select id="createListModalType" aria-label="Content type" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
           <option value="mixed">Mixed (Movies &amp; Shows)</option>
@@ -16844,14 +16876,14 @@ ${seoHeadHtml}
       </div>
       
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
+        <button type="button" class="lc-btn secondary" onclick="closeCreateListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="createListModalBtn" style="opacity: 0.5; min-width: 80px;" disabled onclick="submitCreateListModal()">Create</button>
       </div>
     </div>
   </div>
 
   <!-- Add Catalog Modal -->
-  <div id="addShelfModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
@@ -16866,7 +16898,7 @@ ${seoHeadHtml}
         
         <button type="button" class="lc-btn secondary" style="width: 100%; margin-bottom: 12px; font-size: 0.9rem;" onclick="addShelfModalAddLink()">+ Add another link (Combined List)</button>
         
-        <select id="addShelfModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
+        <select id="addShelfModalType" aria-label="Catalog type" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
         </select>
@@ -16879,7 +16911,7 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
       <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
         <div>
@@ -16892,14 +16924,14 @@ ${seoHeadHtml}
         <!-- Filled dynamically -->
       </div>
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="document.getElementById('selectListModal').style.display = 'none'; document.body.style.overflow = '';">Cancel</button>
+        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="closeSelectListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="addSelectedListsBtn" style="min-width: 90px;">Done</button>
       </div>
     </div>
   </div>
 
   <!-- Trakt Device Activation Modal -->
-  <div id="traktDeviceModal" class="modal-overlay" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
     <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
@@ -16945,7 +16977,7 @@ if ('serviceWorker' in navigator) {
 }
 </script>
 
-<div class="tab-panel" data-tab-panel="catalogs" hidden>
+<div class="tab-panel" data-tab-panel="catalogs" id="content-catalogs" role="tabpanel" aria-labelledby="tab-desktop-catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
@@ -16967,7 +16999,7 @@ if ('serviceWorker' in navigator) {
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
       <input type="text" id="listFilterInput" placeholder="Filter catalogs by name..." oninput="filterLists()">
-      <select id="listGroupFilterSelect" onchange="filterLists()" style="flex:none; width:auto;">
+      <select id="listGroupFilterSelect" aria-label="Filter catalogs by group" onchange="filterLists()" style="flex:none; width:auto;">
         <option value="">All groups</option>
       </select>
     </div>
@@ -17116,7 +17148,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<div class="tab-panel" data-tab-panel="discover">
+<div class="tab-panel" data-tab-panel="discover" id="content-discover" role="tabpanel" aria-labelledby="tab-desktop-discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
@@ -17188,7 +17220,7 @@ if ('serviceWorker' in navigator) {
     <div id="curatedListsFeed"></div>
   </div>
 </div>
-<div class="tab-panel" data-tab-panel="lists" hidden>
+<div class="tab-panel" data-tab-panel="lists" id="content-lists" role="tabpanel" aria-labelledby="tab-desktop-lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="my-lists" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
@@ -17343,7 +17375,7 @@ if ('serviceWorker' in navigator) {
 
 
 </div>
-<div class="tab-panel" data-tab-panel="channels" hidden>
+<div class="tab-panel" data-tab-panel="channels" id="content-channels" role="tabpanel" aria-labelledby="tab-desktop-channels" hidden>
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
@@ -17533,7 +17565,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<div class="tab-panel" data-tab-panel="search" hidden>
+<div class="tab-panel" data-tab-panel="search" id="content-search" role="tabpanel" aria-labelledby="tab-desktop-search" hidden>
   <div class="panel">
     <div class="shelf-header" style="margin-bottom:10px;">
       <h2 class="shelf-title">Search Movies, TV Shows &amp; Lists</h2>
@@ -17553,7 +17585,7 @@ if ('serviceWorker' in navigator) {
 
     <!-- Quick Filter Dropdowns for Movies & Shows -->
     <div id="catalogSearchFiltersRow" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center;">
-      <select id="catalogSearchGenreSelect" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchGenreSelect" aria-label="Filter by genre" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Genres</option>
         <option value="28,10759">Action &amp; Adventure</option>
         <option value="16">Animation</option>
@@ -17573,7 +17605,7 @@ if ('serviceWorker' in navigator) {
         <option value="37">Western</option>
       </select>
 
-      <select id="catalogSearchYearSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchYearSelect" aria-label="Filter by year" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Years</option>
         <option value="2026">2026</option>
         <option value="2025">2025</option>
@@ -17586,7 +17618,7 @@ if ('serviceWorker' in navigator) {
         <option value="<1990">1980s &amp; Older</option>
       </select>
 
-      <select id="catalogSearchRatingSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchRatingSelect" aria-label="Filter by minimum rating" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Ratings</option>
         <option value="8.0">8.0+ ⭐</option>
         <option value="7.0">7.0+ ⭐</option>
@@ -17600,7 +17632,7 @@ if ('serviceWorker' in navigator) {
     <div id="catalogSearchResult" style="margin-top:14px;"></div>
   </div>
 </div>
-<div class="tab-panel" data-tab-panel="settings" hidden>
+<div class="tab-panel" data-tab-panel="settings" id="content-settings" role="tabpanel" aria-labelledby="tab-desktop-settings" hidden>
   <!-- Settings Top Submenu Pills -->
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="account" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
@@ -17622,7 +17654,7 @@ if ('serviceWorker' in navigator) {
       </div>
       <div class="actions" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('presetFileInput').click()">Upload preset file</button>
-        <input type="file" id="presetFileInput" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
+        <input type="file" id="presetFileInput" aria-label="Choose a preset file to upload" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
       </div>
       <div id="presetsList" style="margin-top:10px;"></div>
     </div>
@@ -17636,7 +17668,7 @@ if ('serviceWorker' in navigator) {
         <button type="button" class="secondary lc-btn" onclick="importConfigJson()">Import JSON</button>
         <button type="button" class="secondary lc-btn" onclick="downloadConfigJson()">Download file</button>
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('configFileInput').click()">Upload file</button>
-        <input type="file" id="configFileInput" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
+        <input type="file" id="configFileInput" aria-label="Choose a backup file to restore" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
       </div>
 
       <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
@@ -17702,7 +17734,7 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Region</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
-      <select id="regionSelect" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+      <select id="regionSelect" aria-label="Streaming region" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
         ${buildRegionOptionsHtml(initialRegion)}
       </select>
     </div>
@@ -17984,7 +18016,7 @@ if ('serviceWorker' in navigator) {
         <label style="display:block; font-weight:600; font-size:0.88rem; margin-bottom:6px; color:var(--text);">Select file(s)</label>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <button type="button" class="secondary lc-btn" onclick="document.getElementById('unifiedImportFileInput').click()" style="padding:8px 16px;">Select files&hellip;</button>
-          <input type="file" id="unifiedImportFileInput" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
+          <input type="file" id="unifiedImportFileInput" aria-label="Choose a file to import" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
           <span id="unifiedImportSelectedCount" style="font-size:0.85rem; color:var(--muted);">No files selected</span>
         </div>
       </div>
@@ -18035,7 +18067,7 @@ if ('serviceWorker' in navigator) {
       <div id="newFeedbackFormWrap">
         <div class="row">
           <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Category</label>
-          <select id="feedbackCategorySelect">
+          <select id="feedbackCategorySelect" aria-label="Feedback category">
             <option value="bug">Bug Report</option>
             <option value="improvement">Improvement / Feature Request</option>
             <option value="idea">Idea / Suggestion</option>
@@ -18685,6 +18717,35 @@ async function decompressBase64ToJson(b64) {
 }
 
 // --- Tab & Submenu Navigation ---------------------------------------------
+// Arrow-key movement inside the two tab bars.
+//
+// role="tablist" was on both bars from the start, with no role="tab" beneath
+// it -- so assistive technology was told to expect tabs and found none. Adding
+// the roles without the keyboard behaviour they imply would be its own half
+// measure: a tablist is one tab stop, and the arrows move between the tabs.
+function handleTabBarKeydown(e) {
+  const btn = e.target && e.target.closest ? e.target.closest('.tab-btn, .bottom-nav-item') : null;
+  if (!btn) return;
+  const bar = btn.closest('[role="tablist"]');
+  if (!bar) return;
+  const tabs = [...bar.querySelectorAll('[role="tab"]')];
+  const i = tabs.indexOf(btn);
+  if (i === -1) return;
+  let next = -1;
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (i + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (i - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') next = 0;
+  else if (e.key === 'End') next = tabs.length - 1;
+  if (next === -1) return;
+  e.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleTabBarKeydown);
+}
+
 function switchTab(name) {
   if (name === 'backup') {
     switchTab('settings');
@@ -18726,15 +18787,25 @@ function switchTab(name) {
     const p = panels[i];
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
   }
+  // aria-selected alongside the class, and a roving tabindex, because both bars
+  // declare role="tablist" and their buttons now carry role="tab". A tab widget
+  // is one stop in the page's tab order; the arrow keys move within it (see
+  // handleTabBarKeydown).
   const tabBtns = document.querySelectorAll('.tab-btn');
   for (let i = 0; i < tabBtns.length; i++) {
     const b = tabBtns[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
   const navItems = document.querySelectorAll('.bottom-nav-item');
   for (let i = 0; i < navItems.length; i++) {
     const b = navItems[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
 
   if (name !== 'list-details' && name !== 'item-details') {
@@ -18869,6 +18940,10 @@ function showAddedToast(msg) {
     toast = document.createElement('div');
     toast.id = 'actionToast';
     toast.className = 'action-toast';
+    // Matches the static #actionToast in 09_page-shell.js, which is the copy
+    // that normally exists; this branch only runs if that one is missing.
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
     document.body.appendChild(toast);
   }
   toast.textContent = msg || 'Added to My Catalogs \u2713';
@@ -18917,21 +18992,192 @@ function resolveMissingPostersInDom(rootEl) {
   });
 }
 
+// Locking the page behind a modal.
+//
+// Every caller used to set document.body.style.overflow = 'hidden', and it has
+// never done anything. html { overflow-x: hidden } (09_page-shell.js) gives the
+// root element an explicit overflow-y of auto -- a non-visible value on one axis
+// computes the other from visible to auto -- and once <html> has its own
+// overflow, the body's stops propagating to the viewport. Measured: with a modal
+// open and body.style.overflow === 'hidden', a wheel event over the backdrop
+// still scrolled the page 900px.
+//
+// So the lock goes on the element that actually scrolls. The scrollbar it
+// removes would shift the layout, hence the compensating padding; the scroll
+// position is restored because setting overflow on <html> does not preserve it
+// the way body's did on browsers where body's had an effect.
+//
+// Counted, not boolean: two overlays can be open at once (a confirm raised from
+// a dialog), and the inner one closing must not unlock the page under the outer.
+let _scrollLockDepth = 0;
+let _scrollLockY = 0;
+
+function lockBackgroundScroll(on) {
+  const root = document.documentElement;
+  if (!root || !root.style) return;
+  if (on) {
+    _scrollLockDepth++;
+    if (_scrollLockDepth > 1) return;
+    _scrollLockY = window.pageYOffset || root.scrollTop || 0;
+    const barWidth = window.innerWidth - root.clientWidth;
+    root.style.overflow = 'hidden';
+    if (barWidth > 0) root.style.paddingRight = barWidth + 'px';
+    return;
+  }
+  if (_scrollLockDepth === 0) return;
+  _scrollLockDepth--;
+  if (_scrollLockDepth > 0) return;
+  root.style.overflow = '';
+  root.style.paddingRight = '';
+  window.scrollTo(0, _scrollLockY);
+}
+
+// Where the keyboard was, so it can be put back. A modal that steals focus and
+// never returns it leaves a keyboard or screen-reader user at the top of the
+// document with no idea what happened.
+let _modalReturnFocus = null;
+
+function focusableInModal(overlay) {
+  return [...overlay.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+// Escape, Tab and focus for every dynamic modal at once. There was none of
+// this: measured, Escape closed nothing, focus never entered the dialog, and
+// Tab from inside walked straight out into the page behind it.
+function handleModalKeydown(e) {
+  const overlay = document.getElementById('activeModalOverlay');
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeModal();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) {
+    // Nothing to move to, so keep the keyboard inside rather than letting it
+    // wander into the page the dialog is covering.
+    e.preventDefault();
+    return;
+  }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// Escape and focus for the four modals that predate showModal.
+//
+// createListModal, addShelfModal, selectListModal and traktDeviceModal are
+// static markup toggled with style.display, so none of showModal's handling
+// reached them: measured, Escape closed nothing and focus never entered any of
+// them. Rather than convert four dialogs to showModal -- which would mean
+// rebuilding markup that works -- this gives them the same three behaviours
+// from the outside.
+const STATIC_MODALS = [
+  { id: 'createListModal', close: 'closeCreateListModal' },
+  { id: 'selectListModal', close: 'closeSelectListModal' },
+  { id: 'addShelfModal', close: null },
+  { id: 'traktDeviceModal', close: 'closeTraktDeviceModal' },
+];
+
+function visibleStaticModal() {
+  for (let i = STATIC_MODALS.length - 1; i >= 0; i--) {
+    const el = document.getElementById(STATIC_MODALS[i].id);
+    if (el && el.style.display && el.style.display !== 'none') return STATIC_MODALS[i];
+  }
+  return null;
+}
+
+function closeStaticModal(entry) {
+  if (!entry) return;
+  if (entry.close && typeof window[entry.close] === 'function') {
+    window[entry.close]();
+    return;
+  }
+  const el = document.getElementById(entry.id);
+  if (el) el.style.display = 'none';
+  lockBackgroundScroll(false);
+}
+
+function handleStaticModalKeydown(e) {
+  // The dynamic overlay sits on top when both are open, and has its own
+  // handler -- leave it to that one.
+  if (document.getElementById('activeModalOverlay')) return;
+  const entry = visibleStaticModal();
+  if (!entry) return;
+  const overlay = document.getElementById(entry.id);
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeStaticModal(entry);
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) { e.preventDefault(); return; }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleStaticModalKeydown, true);
+}
+
 function showModal(innerHtml, extraClass) {
   closeModal();
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.id = 'activeModalOverlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) closeModal();
   });
+  _modalReturnFocus = (document.activeElement && document.activeElement !== document.body)
+    ? document.activeElement
+    : null;
   document.body.appendChild(overlay);
+  document.addEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(true);
+  // The heading first when there is one, so a screen reader announces what
+  // this dialog is before naming its buttons; otherwise the first control.
+  const items = focusableInModal(overlay);
+  const heading = overlay.querySelector('h2, h3');
+  if (heading) {
+    heading.setAttribute('tabindex', '-1');
+    heading.focus();
+  } else if (items.length) {
+    items[0].focus();
+  }
 }
 
 function closeModal() {
   const existing = document.getElementById('activeModalOverlay');
   if (existing) existing.remove();
+  document.removeEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(false);
+  if (_modalReturnFocus && typeof _modalReturnFocus.focus === 'function') {
+    try { _modalReturnFocus.focus(); } catch (e) {}
+  }
+  _modalReturnFocus = null;
 }
 
 function showAppAlert(title, message, isSuccess = false) {
@@ -19238,7 +19484,7 @@ function renderUserFeedbackThreadsUI() {
       const catLabel = t.category ? (t.category.charAt(0).toUpperCase() + t.category.slice(1)) : 'Support';
       const hasAdminReply = Array.isArray(t.messages) && t.messages.some((m) => m.sender === 'admin');
       const badge = hasAdminReply ? ' \uD83D\uDCAC' : '';
-      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeAttr(t.id) + '&quot;)">' +
+      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeJsAttr(t.id) + '&quot;)">' +
         escapeHtml(catLabel) + badge +
       '</button>';
     }).join('');
@@ -20109,7 +20355,7 @@ function addRow(name, url, type, enabled, group, channelId) {
             '<input type="text" placeholder="Name (e.g. Trending Movies)" class="name" value="' + escapeAttr(name || '') + '">' +
           '</div>' +
           '<div class="entry-type-row" style="width: auto;">' +
-            '<select class="type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
+            '<select class="type" aria-label="Catalog type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
               '<option value="movie" ' + ((type === 'movie' || (isCustomList && type === 'movie')) ? 'selected' : '') + '>Movies</option>' +
               '<option value="series" ' + ((type === 'series' || isChannel || (isCustomList && type === 'series')) ? 'selected' : '') + '>Shows</option>' +
             '</select>' +
@@ -22417,6 +22663,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
   const title = item.showTitle || item.title || item.name || '';
 
   const promises = [];
+  // Each of these mirrors a local change out to a connected provider. They
+  // used to be fired and forgotten, so an expired Trakt/Simkl/MDBList token
+  // meant "syncing to your connected accounts" silently stopped working and
+  // nothing ever said so. The local change is the user's own action and is
+  // kept either way -- this only makes the failure visible.
+  const mirrorFailures = [];
+  const noteMirror = (provider) => (res) => externalMutateError(res)
+    .then((err) => { if (err) mirrorFailures.push(provider.toUpperCase() + ': ' + err); })
+    .catch(() => {});
 
   if (traktSync && traktToken) {
     promises.push(
@@ -22437,7 +22692,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('trakt')).catch(() => {})
     );
   }
 
@@ -22460,7 +22715,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('mdblist')).catch(() => {})
     );
   }
 
@@ -22483,12 +22738,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('simkl')).catch(() => {})
     );
   }
 
   if (promises.length) {
-    Promise.allSettled(promises);
+    await Promise.allSettled(promises);
+    if (mirrorFailures.length && typeof showAppAlert === 'function') {
+      showAppAlert('Not Synced To Every Account', mirrorFailures.join('\\n'), false);
+    }
   }
 }
 
@@ -24608,6 +24866,43 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
+// escapeAttr is right for a plain attribute and WRONG for a JavaScript string
+// inside one, which is what every onclick="fn(&quot;VALUE&quot;)" handler in
+// this app builds. The HTML parser decodes attribute entities BEFORE the JS
+// parser runs, so escapeHtml's own output re-forms the delimiter it was meant
+// to neutralise -- escaping becomes the delivery mechanism:
+//
+//   value       ");alert(1);//
+//   escapeAttr  &quot;);alert(1);//
+//   markup      onclick="fn(&quot;&quot;);alert(1);//&quot;)"
+//   executed    fn("");alert(1);//")        <- the payload runs
+//
+// Measured, not theorised: a channel id carrying that shape, arriving through
+// a restored backup or a pasted install link, ran script and read the victim's
+// Creator Key out of localStorage.
+//
+// The value has to survive two decodings, so it needs escaping for both, in
+// that order: JS-string first, then HTML. Backslash-escaping the quote makes
+// the HTML decode yield \\\\" rather than ", which the JS parser reads as a
+// literal quote inside the string instead of the end of it.
+//
+// Not a replacement for escapeAttr -- a plain data-* or title attribute still
+// wants escapeAttr, and running this on one would leave visible backslashes.
+// Use this one only where the value lands inside quotes the browser will
+// execute.
+function escapeJsAttr(s) {
+  return escapeHtml(
+    String(s == null ? '' : s)
+      .replace(/\\\\/g, '\\\\\\\\')
+      .replace(/"/g, '\\\\"')
+      .replace(/'/g, "\\\\'")
+      .replace(/\\r/g, '\\\\r')
+      .replace(/\\n/g, '\\\\n')
+      .replace(/\\u2028/g, '\\\\u2028')
+      .replace(/\\u2029/g, '\\\\u2029')
+  );
+}
+
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
 }
@@ -24767,6 +25062,13 @@ function scoreListSearchMatch(list, rawQuery, intent) {
 
 window._unifiedSearchCache = window._unifiedSearchCache || new Map();
 let currentListSearchSequence = 0;
+// The same counter for the title search. It had none, so on a slow
+// connection the older of two in-flight searches simply won by landing
+// last: typing "batman", then "joker", showed batman's results under the
+// word joker -- and clearing the box mid-request showed results for a query
+// no longer on screen, because renderDefaultCatalogSearch re-checks the
+// input after its await and runCatalogSearch never did.
+let currentTitleSearchSequence = 0;
 
 async function executeUnifiedListSearch(rawQuery, targetBox) {
   const q = (rawQuery || '').trim();
@@ -25196,9 +25498,22 @@ async function populateSearchResultPosters() {
   Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
+// Every reader treats these as URL strings -- getLikedListsSet().has(url),
+// and a .split('/') in the Discover recommendations. A stored array of OBJECTS
+// therefore throws "u.split is not a function", which the Curated feed catches
+// and renders as its ordinary "like some lists to get recommendations" empty
+// state. Silent, permanent, and indistinguishable from having liked nothing.
+//
+// A restored backup could produce exactly that: applyImportedConfig accepted
+// settings.likedLists on Array.isArray alone, with no element check, while the
+// fullyWatchedShowIds beside it was correctly coerced. Filtering here as well
+// as at the write means an already-poisoned browser heals on next load rather
+// than needing its site data cleared by hand.
 function getLikedListsSet() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'));
+    const raw = JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]');
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((v) => typeof v === 'string' && v));
   } catch (e) {
     return new Set();
   }
@@ -26483,7 +26798,7 @@ async function openItemDetailsModal(id, type, opts) {
         const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
         seasonsHtml += 
           '<div class="season-card">' +
-            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
               '<div class="season-header-main">' +
                 (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
                 '<div class="season-header-info">' +
@@ -26517,7 +26832,7 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeAttr(d.id) + '&quot;)">' +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
                 (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
               '</button>'
               :
@@ -26639,6 +26954,26 @@ function isItemInExternalList(provider, target, listId, id, fallbackList) {
   return false;
 }
 
+// What /api/external-list/item-mutate actually said.
+//
+// All seven call sites used to throw the answer away -- an await inside an
+// empty catch, or Promise.allSettled with the results ignored -- and then show
+// a success message unconditionally. The endpoint answers
+//   400 {"ok":false,"error":"Please connect your Trakt account first."}
+// for a missing or expired provider token, which is the ordinary way this
+// fails, so a removal the provider refused still read as "Removed from TRAKT."
+// while the item stayed in the list and the local membership index recorded it
+// as gone -- which then hid it from the next attempt.
+//
+// Returns null when the write landed, or the message to show when it did not.
+async function externalMutateError(res) {
+  if (!res) return 'Network error.';
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (res.ok && (!data || data.ok !== false)) return null;
+  return (data && data.error) || ('That provider rejected the change (HTTP ' + res.status + ').');
+}
+
 async function removeSingleExternalItemDirect(provider, target, listId, id, type, btn) {
   if (!id) return;
   if (btn) {
@@ -26648,20 +26983,7 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
 
   const key1 = makeExternalKey(provider, target, listId, id);
   const key2 = makeExternalKey(provider, target, listId, String(id).replace(/^tmdb:/, ''));
-  setExternalListMembership(key1, false);
-  setExternalListMembership(key2, false);
-
   const row = btn ? btn.closest('.select-list-row') : null;
-  if (row) {
-    const cb = row.querySelector('.list-select-cb');
-    if (cb) {
-      cb.checked = false;
-      cb.dataset.initiallyChecked = 'false';
-    }
-    const badge = row.querySelector('.in-list-badge');
-    if (badge) badge.remove();
-    btn.style.display = 'none';
-  }
 
   const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
   const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -26674,8 +26996,9 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
   const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
+  let mutateError = null;
   try {
-    await fetch(ORIGIN + '/api/external-list/item-mutate', {
+    const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -26699,7 +27022,39 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
         mdblistKey: mdbKey
       })
     });
-  } catch(e) {}
+    mutateError = await externalMutateError(res);
+  } catch (e) {
+    mutateError = 'Network error.';
+  }
+
+  if (mutateError) {
+    // Nothing was changed here, so there is nothing to undo -- the row, the
+    // checkbox and the membership index are all still describing a list the
+    // item really is in.
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Remove';
+    }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Could Not Remove', mutateError, false);
+    } else {
+      showAddedToast('Could not remove: ' + mutateError);
+    }
+    return;
+  }
+
+  setExternalListMembership(key1, false);
+  setExternalListMembership(key2, false);
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    if (btn) btn.style.display = 'none';
+  }
 
   showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
 }
@@ -26724,6 +27079,23 @@ function removeSingleCustomItemDirect(listIdx, id, type, btn) {
   }
   showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
 }
+
+// One way out of the Add/Remove-from-Lists modal.
+//
+// It had four, and they did not agree. The "+ Create New List" button hid the
+// modal without releasing the scroll lock while the link eleven lines below it
+// did, and neither of createListModal's own Cancel and X buttons released it
+// either -- so that route left the lock latched with no modal on screen. It was
+// invisible only because the lock itself did nothing (see lockBackgroundScroll);
+// fixing that without this would have turned it into a page you cannot scroll
+// until you reload.
+function closeSelectListModal() {
+  const modal = document.getElementById('selectListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeSelectListModal = closeSelectListModal;
 
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
@@ -26845,7 +27217,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
             (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -26865,7 +27237,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>Trakt Watchlist</span>' +
           (inTraktWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTraktLists)) {
@@ -26879,7 +27251,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tl.name || 'Trakt List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -26909,7 +27281,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span>' + escapeHtml(st.label) + '</span>' +
             (isPresent ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -26929,7 +27301,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Watchlist</span>' +
           (inTmdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     const tmdbFav = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('favorites')) : null;
@@ -26941,7 +27313,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Favorites</span>' +
           (inTmdbFav ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTmdbLists)) {
@@ -26955,7 +27327,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tml.name || 'TMDB List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tml.id || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tml.id || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -26976,7 +27348,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>MDBList Watchlist</span>' +
           (inMdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myMdblistLists)) {
@@ -26990,7 +27362,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(ml.name || 'MDBList List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -26998,7 +27370,7 @@ function openSelectListModal(id, type, title, poster) {
 
   if (html) {
     html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
-      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="closeSelectListModal(); openCreateListModal();">+ Create New List</button>' +
     '</div>';
   }
 
@@ -27011,8 +27383,7 @@ function openSelectListModal(id, type, title, poster) {
       if (lnk) {
         lnk.onclick = function(e) {
           e.preventDefault();
-          document.getElementById('selectListModal').style.display = 'none';
-          document.body.style.overflow = '';
+          closeSelectListModal();
           if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
@@ -27023,7 +27394,7 @@ function openSelectListModal(id, type, title, poster) {
   
   body.innerHTML = html;
   modal.style.display = 'flex';
-  document.body.style.overflow = 'hidden';
+  lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {
@@ -27049,7 +27420,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27079,7 +27450,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27112,7 +27483,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27142,7 +27513,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27155,8 +27526,7 @@ function openSelectListModal(id, type, title, poster) {
 
 document.getElementById('selectListModal').addEventListener('click', (e) => {
   if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-    document.getElementById('selectListModal').style.display = 'none';
-    document.body.style.overflow = '';
+    closeSelectListModal();
   }
 });
 
@@ -27226,6 +27596,7 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   });
 
   // Execute external modifications concurrently
+  let externalMutateFailures = [];
   if (changedExternalOperations.length > 0) {
     const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
     const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -27241,8 +27612,11 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
     const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
     const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
-    await Promise.allSettled(changedExternalOperations.map(op => {
-      return fetch(ORIGIN + '/api/external-list/item-mutate', {
+    // allSettled's results used to be discarded, so "Added X to lists." was
+    // shown whether the providers accepted the change or refused every one of
+    // them. Collect the failures and name them below instead.
+    externalMutateFailures = await Promise.all(changedExternalOperations.map(async (op) => {
+      const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -27268,17 +27642,31 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
           mdblistAccessToken: mdbToken,
           mdblistKey: mdbKey
         })
-      });
-    }));
+      }).catch(() => null);
+      const err = await externalMutateError(res);
+      return err ? { provider: op.provider, error: err } : null;
+    })).then((r) => r.filter(Boolean));
   }
   
-  document.getElementById('selectListModal').style.display = 'none';
-  document.body.style.overflow = '';
+  closeSelectListModal();
   
   btn.disabled = false;
   btn.textContent = 'Done';
   
-  if (anyAdded) {
+  // A provider that refused the change is named rather than passed over. The
+  // custom-list half of this operation is local and did land, so this is a
+  // partial result, and saying so is the whole point -- the previous message
+  // claimed the lot had worked.
+  if (externalMutateFailures.length) {
+    const detail = externalMutateFailures
+      .map((f) => (f.provider ? f.provider.toUpperCase() + ': ' : '') + f.error)
+      .join('\\n');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Some Lists Were Not Updated', detail, false);
+    } else {
+      showAddedToast('Some lists were not updated.');
+    }
+  } else if (anyAdded) {
     showAddedToast('Added ' + title + ' to lists.');
     if (typeof trackEvent === 'function') trackEvent('list-add', finalImdbId, title, type);
   }
@@ -27617,12 +28005,18 @@ async function renderDefaultCatalogSearch() {
   const inputEl = document.getElementById('catalogSearchInput');
   if (inputEl && inputEl.value.trim()) return;
 
+  // Clearing the box is itself a search -- it supersedes anything already in
+  // flight. Without this, a slow response for the query the person just erased
+  // still landed on top of the default view.
+  const thisSeq = ++currentTitleSearchSequence;
+
   resEl.innerHTML = '<p><small>Loading top ' + (currentCatalogSearchType === 'lists' ? 'public lists' : (currentCatalogSearchType === 'tv' ? 'shows' : 'movies')) + '...</small></p>';
 
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
       const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
+      if (thisSeq !== currentTitleSearchSequence) return;
       if (inputEl && inputEl.value.trim()) return;
       const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
       if (!pubLists.length) {
@@ -27639,6 +28033,7 @@ async function renderDefaultCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
     const data = await res.json();
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
     if (!data.ok || !data.results || !data.results.length) {
       resEl.innerHTML = '<p><small>No titles found.</small></p>';
@@ -27663,6 +28058,7 @@ async function runCatalogSearch() {
     return executeUnifiedListSearch(q, resEl);
   }
 
+  const thisSeq = ++currentTitleSearchSequence;
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -27677,6 +28073,10 @@ async function runCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
     const data = await res.json();
+    // Superseded while this was in flight: a newer search, a type change, or
+    // the box being cleared. Say nothing and touch nothing -- whatever ran
+    // after this one owns the results area now.
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (!data.ok) {
       resEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
       return;
@@ -27690,6 +28090,7 @@ async function runCatalogSearch() {
     window._rawCatalogTitleItems = data.results;
     applySearchFilters();
   } catch (e) {
+    if (thisSeq !== currentTitleSearchSequence) return;
     resEl.innerHTML = '<p class="testresult err">✗ Network error.</p>';
   }
 }
@@ -32772,7 +33173,7 @@ function renderChannelCrossoverSuggestions() {
       '<p class="channel-crossover-desc">' + escapeHtml(event.description) + '</p>' +
       '<div class="channel-crossover-parts">' + chipsHtml + '</div>' +
       '<div class="channel-crossover-actions">' +
-        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
+        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
       '</div>' +
     '</div>';
   }).join('');
@@ -33350,14 +33751,14 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
       const isDesktopEnd = (i === previewPosters.length - 1 && totalCount >= 4);
       let overlays = '';
       if (isMobileEnd) {
-        overlays += '<div class="list-card-count-overlay mobile-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay mobile-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
       if (isDesktopEnd) {
-        overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
 
       return '<div class="list-card-mini-poster-tile">' +
-        '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)">' +
+        '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
           '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
           overlays +
         '</div>' +
@@ -33369,7 +33770,7 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
     return '<div class="list-card" data-universe-id="' + escapeAttr(event.id) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + escapeHtml(event.name) + '</div>' +
+          '<div class="list-card-title" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + escapeHtml(event.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + escapeHtml(event.franchise) + '</span>' +
             '<span class="list-card-meta-sep">&middot;</span>' +
@@ -33379,8 +33780,8 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn ' + (isAdded ? 'secondary is-added' : 'primary') + '" onclick="createInstantStorylineChannel(&quot;' + escapeAttr(event.id) + '&quot;, this)" ' + (isAdded ? 'style="color:var(--danger);"' : '') + '>' + (isAdded ? 'Remove' : '+ Add') + '</button>' +
-          '<button type="button" class="lc-btn secondary" onclick="loadStorylineToDraft(&quot;' + escapeAttr(event.id) + '&quot;, this)" title="Customize in Channel Builder">Customize</button>' +
+          '<button type="button" class="lc-btn ' + (isAdded ? 'secondary is-added' : 'primary') + '" onclick="createInstantStorylineChannel(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" ' + (isAdded ? 'style="color:var(--danger);"' : '') + '>' + (isAdded ? 'Remove' : '+ Add') + '</button>' +
+          '<button type="button" class="lc-btn secondary" onclick="loadStorylineToDraft(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" title="Customize in Channel Builder">Customize</button>' +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters">' +
@@ -34045,10 +34446,10 @@ function renderMyCreatedChannelsList() {
       const isDesktopEnd = (i === allPosters.length - 1 && allItems.length >= 4);
       let overlays = '';
       if (isMobileEnd) {
-        overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
       }
       if (isDesktopEnd) {
-        overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
       }
 
       const p = it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '';
@@ -34114,7 +34515,7 @@ function renderMyCreatedChannelsList() {
       const itemId = it.imdbId || it.id || '';
       const itemType = (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series';
       const posterClickAttr = itemId
-        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
+        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
         : '';
       
       return '<div class="list-card-mini-poster-tile">' +
@@ -34127,7 +34528,7 @@ function renderMyCreatedChannelsList() {
       '</div>';
     }).join('');
     
-    const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleChannelInCatalog(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' +
+    const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleChannelInCatalog(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' +
       (isAdded ? 'Remove' : '+ Add') +
     '</button>';
 
@@ -34140,8 +34541,8 @@ function renderMyCreatedChannelsList() {
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeAttr(ch.channelId) + '&quot;)">Edit</button>' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeAttr(ch.channelId) + '&quot;, &quot;' + escapeAttr(ch.name) + '&quot;)">Delete</button>' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
       '</div>' +
@@ -34733,7 +35134,7 @@ function renderChannelMergeList() {
           if (ch && Array.isArray(ch.items)) totalEpisodes += ch.items.length;
           return '<span class="badge" style="display:inline-flex; align-items:center; gap:5px; padding:3px 8px; font-size:0.8rem; background:var(--panel-strong); border:1px solid var(--border); border-radius:6px; margin:2px 4px 2px 0;">' +
             escapeHtml(chName) +
-            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, &quot;' + escapeAttr(chId) + '&quot;)">&times;</button>' +
+            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, &quot;' + escapeJsAttr(chId) + '&quot;)">&times;</button>' +
           '</span>';
         }).join('');
         
@@ -34742,7 +35143,7 @@ function renderChannelMergeList() {
         if (remainingChannels.length) {
           remainingChannels.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           const options = remainingChannels.map((c) => '<option value="' + escapeAttr(c.channelId) + '">' + escapeHtml(c.name) + ' (' + (c.items ? c.items.length : 0) + ' ep)</option>').join('');
-          addSelectHtml = '<select class="merge-add-channel-select" onchange="addChannelToMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, this.value); this.value=&quot;&quot;;">' +
+          addSelectHtml = '<select class="merge-add-channel-select" onchange="addChannelToMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, this.value); this.value=&quot;&quot;;">' +
             '<option value="">+ Add channel...</option>' +
             options +
           '</select>';
@@ -34755,7 +35156,7 @@ function renderChannelMergeList() {
         
         const countText = (merged.channelIds ? merged.channelIds.length : 0) + ' channels &middot; ' + totalEpisodes + ' episodes';
         
-        const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleMergedChannelInCatalog(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">' +
+        const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleMergedChannelInCatalog(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;)">' +
           (isAdded ? 'Remove' : '+ Add') +
         '</button>';
 
@@ -34771,7 +35172,7 @@ function renderChannelMergeList() {
               '</div>' +
             '</div>' +
             '<div class="list-card-actions">' +
-              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalMergedChannel(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">Delete</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalMergedChannel(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;)">Delete</button>' +
               addBtnHtml +
             '</div>' +
           '</div>' +
@@ -34837,31 +35238,6 @@ async function importCustomListFromLink(btn) {
   await copyListToCustomList(name, listUrl, 'unknown', btn, null, { sourceUrl: syncWithLink ? listUrl : '' });
   urlInput.value = '';
   nameInput.value = '';
-}
-
-function renderCustomListSearchResults(results, searchType) {
-  const box = document.getElementById('customListSearchResult');
-  if (!results.length) {
-    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No matches found.</small></p>';
-    return;
-  }
-  const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy">'
-      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
-    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
-      posterImg +
-      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(r.title) + '">' +
-        escapeHtml(r.title) +
-      '</div>' +
-      (r.year ? '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px;">' + escapeHtml(r.year) + '</div>' : '<div style="height:14px; margin-bottom:4px;"></div>') +
-      '<button type="button" class="lc-btn secondary customListAddBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-      ' data-tmdbid="' + r.tmdbId + '" data-searchtype="' + searchType + '"' +
-      ' data-title="' + escapeAttr(r.title) + '" data-year="' + escapeAttr(r.year || '') + '"' +
-      ' data-poster="' + escapeAttr(r.poster || '') + '">+ Add</button>' +
-      '</div>';
-  }).join('');
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
 }
 
 const customListSearchBox = document.getElementById('customListSearchResult');
@@ -35356,20 +35732,65 @@ async function saveCreatorListEdit(name) {
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const visSelect = document.getElementById('customListVisibilitySelect');
   const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+  // Same guard as the credential forms -- see beginSubmit
+  // (22_client-creator-profile.js). A double-click here sent the whole
+  // items array twice; the second overwrote the first with the same
+  // content, which was harmless, but it also spent a second write and
+  // raced the baseline the next save cites.
+  const endSubmit = beginSubmit('saveCreatorList', '#customListSaveBtn', 'Saving\u2026');
+  if (!endSubmit) return;
+
+  // The version this edit was built on, so the server can tell whether another
+  // device saved in between instead of this one silently winning.
+  //
+  // The guard has existed server-side for a while and only two call sites ever
+  // armed it, both of them remove-one-item paths -- so the main "save my edits
+  // to this list" button, the one that sends the WHOLE items array, was still
+  // last-write-wins. Two devices adding a different film each ended with one of
+  // them gone and both saves reporting ok.
+  //
+  // Only cite a baseline the server actually gave us: a legacy record has no
+  // updatedAt, and inventing one would either reject every save or assert a
+  // version this browser never saw.
+  const cached = Array.isArray(lastCreatorListsData)
+    ? lastCreatorListsData.find((l) => l && l.slug === editingCreatorListSlug)
+    : null;
+  const baseline = cached && Number.isFinite(cached.updatedAt) ? cached.updatedAt : null;
+
   try {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: editingCreatorListSlug,
+      name: name,
+      type: customListDraftType,
+      items: customListDraftItems,
+      visibility: visibility,
+    };
+    if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        slug: editingCreatorListSlug,
-        name: name,
-        type: customListDraftType,
-        items: customListDraftItems,
-        visibility: visibility,
-      }),
+      body: JSON.stringify(body),
     });
+    if (res.status === 409) {
+      // Another device saved this list since this browser loaded it. Unlike the
+      // remove-one-item paths, this edit is a whole replacement array built in
+      // the builder, so there is no change to re-apply on top of theirs -- only
+      // the person can say which they want. Pull what is actually stored so the
+      // dashboard stops showing a version that no longer exists, and leave the
+      // draft alone so nothing they typed is lost.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      const msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        'Your edits are still here. Reopen the list to see what the other device saved, then re-apply your changes.';
+      if (typeof showAppNoticeModal === 'function') {
+        showAppNoticeModal('This List Changed Elsewhere', msg, true);
+      } else {
+        alert(msg);
+      }
+      return;
+    }
     const data = await res.json();
     if (!data.ok) {
       if (typeof showAppNoticeModal === 'function') {
@@ -35379,6 +35800,9 @@ async function saveCreatorListEdit(name) {
       }
       return;
     }
+    // Advance the baseline, or a second edit in this session cites a version
+    // this browser has itself already replaced and 409s against its own write.
+    if (cached && Number.isFinite(data.updatedAt)) cached.updatedAt = data.updatedAt;
     if (editingCreatorListSlug === 'watchlist') {
       const map = loadLocalCustomLists();
       if (map['watchlist']) {
@@ -35405,6 +35829,8 @@ async function saveCreatorListEdit(name) {
     } else {
       alert('Network error while saving.');
     }
+  } finally {
+    endSubmit();
   }
 }
 
@@ -39033,7 +39459,7 @@ function openRestoreModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="restoreKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
     '<div id="restoreModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitRestoreProfile()">Login</button>' +
+    '<button type="button" class="primary" id="restoreSubmitBtn" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
@@ -39048,6 +39474,11 @@ async function submitRestoreProfile() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Key.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('restoreProfile', '#restoreSubmitBtn', 'Signing in\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/restore', {
       method: 'POST',
@@ -39067,6 +39498,12 @@ async function submitRestoreProfile() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
+    // Released here, not in the finally below: what follows is the sign-in
+    // tail, and loadCreatorSync can take as long as the network takes. Holding
+    // the guard across it would leave the Login button disabled for the whole
+    // of it and stop someone signing into a different account. Calling it twice
+    // is harmless.
+    endSubmit();
     renderCreatorProfileBar();
     renderAccountKeySection();
     renderWatchlistPreferencesSection();
@@ -39075,6 +39512,8 @@ async function submitRestoreProfile() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -39093,7 +39532,7 @@ function openForgotKeyModal() {
     '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
     '<div id="forgotKeyModalError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="primary" id="forgotKeySubmitBtn" onclick="submitForgotKey()">Reset Key</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
     '</div>' +
     '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
@@ -39108,6 +39547,11 @@ async function submitForgotKey() {
     errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('forgotKey', '#forgotKeySubmitBtn', 'Resetting\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/reset-key', {
       method: 'POST',
@@ -39125,6 +39569,9 @@ async function submitForgotKey() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     closeModal();
+    // Released before the sign-in tail, same reasoning as
+    // submitRestoreProfile -- see there.
+    endSubmit();
     showKeyRevealModal(data.displayName, data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -39134,6 +39581,8 @@ async function submitForgotKey() {
     await loadCreatorSync();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -39564,13 +40013,28 @@ async function loadCreatorSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Who this load is for. Checked again after the await, because signing in as
+  // someone else calls clearLocalAccountData() and then starts a fresh load --
+  // and this one is still in flight. Measured: signing in as alice and then
+  // immediately as bob left alice's catalog rows and liked lists rendered under
+  // bob's name, because her slower response was simply the last writer and
+  // nothing told it that it had been superseded.
+  //
+  // The account itself was never contaminated -- the next push cited alice's
+  // updatedAt, the server answered 409 and the 409 handler pulled bob's state
+  // back. But that is the server catching it, and what was on screen in the
+  // meantime was another account's data.
+  const loadingFor = activeCreator.creatorName;
+  const isStale = () => !activeCreator || activeCreator.creatorName !== loadingFor;
   try {
     const res = await fetch(ORIGIN + '/api/creator/sync/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
     });
+    if (isStale()) return;
     const data = await res.json();
+    if (isStale()) return;
     if (!data.ok) return;
     window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
@@ -39712,7 +40176,11 @@ async function loadCreatorSync(opts) {
     }
     if (Array.isArray(synced.likedLists)) {
       try {
-        localStorage.setItem('myListAddon:likedLists', JSON.stringify(synced.likedLists));
+        // Strings only -- see getLikedListsSet. sync/save coerces with
+        // .map(String) server-side, so this is belt and braces for a record
+        // written before it did.
+        localStorage.setItem('myListAddon:likedLists',
+          JSON.stringify(synced.likedLists.filter((v) => typeof v === 'string' && v)));
       } catch (e) {
         // non-critical, see rememberLikedList's own comment
       }
@@ -40185,10 +40653,48 @@ function openCreateProfileModal() {
     '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
     '<div id="createProfileError"></div>' +
     '<div class="actions" style="margin-top:14px;">' +
-    '<button type="button" class="primary" onclick="submitCreateProfile()">Create Account</button>' +
+    '<button type="button" class="primary" id="createProfileSubmitBtn" onclick="submitCreateProfile()">Create Account</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Login</button>' +
     '</div>'
   );
+}
+
+// One credential request in flight at a time.
+//
+// Measured: two clicks on "Create Account" sent two POST /api/creator/create.
+// Both succeeded and returned DIFFERENT keys. KV keeps the last one; D1's
+// INSERT violates the primary key on the second and is swallowed as non-fatal,
+// so D1 keeps the FIRST; and reads prefer D1. The browser stores whichever
+// response lands last, so 6 out of 6 double-clicks produced an account whose
+// key does not authenticate -- with that dead key shown in the "save this
+// somewhere safe" modal and every later request 401ing.
+//
+// KV-only this was harmless: the last write won in the one store there was, so
+// the stored key was always the valid one. Adding D1 is what turned a missing
+// guard into a broken account, which is why something that was never needed
+// before is needed now.
+//
+// Keyed by name rather than held on the button, because these modals rebuild
+// their own markup -- a disabled button does not survive a re-render, the flag
+// does. The button is disabled too, for the person doing the clicking.
+const _submitsInFlight = new Set();
+
+function beginSubmit(key, btnSelector, busyLabel) {
+  if (_submitsInFlight.has(key)) return null;
+  _submitsInFlight.add(key);
+  const btn = btnSelector ? document.querySelector(btnSelector) : null;
+  const label = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    if (busyLabel) btn.textContent = busyLabel;
+  }
+  return function endSubmit() {
+    _submitsInFlight.delete(key);
+    if (btn) {
+      btn.disabled = false;
+      if (label !== null) btn.textContent = label;
+    }
+  };
 }
 
 async function submitCreateProfile() {
@@ -40209,6 +40715,11 @@ async function submitCreateProfile() {
     errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
     return;
   }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('createProfile', '#createProfileSubmitBtn', 'Creating\u2026');
+  if (!endSubmit) return;
+
   try {
     const res = await fetch(ORIGIN + '/api/creator/create', {
       method: 'POST',
@@ -40255,6 +40766,8 @@ async function submitCreateProfile() {
     migrateLocalCustomListsToAccount();
   } catch (e) {
     errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
   }
 }
 
@@ -40729,6 +41242,28 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
 }
 window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
 
+// The saved dashboard order, as the thing both readers assume it is.
+//
+// Both used to JSON.parse inside a try/catch -- which covers malformed JSON --
+// and then test savedOrder && savedOrder.length before calling .map on it.
+// A STRING passes that test ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: the container type was checked and
+// the element type was not.
+//
+// Every writer is Array.isArray-guarded today, so this needs storage edited by
+// hand to reach -- but the cost of being wrong is the entire My Lists tab, and
+// the guard is one line.
+function readDashboardListOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((s) => typeof s === 'string' && s);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function renderCreatorDashboard(options) {
   const silent = !!(options && options.silent);
   const box = document.getElementById('creatorDashboard');
@@ -40856,7 +41391,7 @@ async function renderCreatorDashboard(options) {
           overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
         }
         const removeBtn = isWatchlist
-          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
           : '';
         const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
         const itemPoster = resolveItemPoster(it);
@@ -40968,11 +41503,9 @@ async function renderCreatorDashboard(options) {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      try {
-        savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-      } catch (e) {}
+      savedOrder = readDashboardListOrder();
     }
-    if (savedOrder && savedOrder.length) {
+    if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
       visibleDashboardLists.sort((a, b) => {
         const slugA = (a && a.list && a.list.slug) || '';
@@ -41061,11 +41594,11 @@ function buildLocalListCardHtml(l) {
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
     if (l.slug === 'continue-watching' && it.showId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
     } else if (isWatchlist) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
     }
     const itemPoster = resolveItemPoster(it);
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
@@ -41300,11 +41833,8 @@ function renderLocalCustomListsDashboard(box, silent) {
 
   const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
 
-  let savedOrder = [];
-  try {
-    savedOrder = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
-  } catch (e) {}
-  if (savedOrder && savedOrder.length) {
+  const savedOrder = readDashboardListOrder();
+  if (savedOrder.length) {
     const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
     visibleLists.sort((a, b) => {
       const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
@@ -41900,6 +42430,17 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
+// The createListModal counterpart of closeSelectListModal. Its X and Cancel
+// buttons hid the modal and released nothing, which was the other half of the
+// latched scroll lock.
+function closeCreateListModal() {
+  const modal = document.getElementById('createListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeCreateListModal = closeCreateListModal;
+
 function openCreateListModal(presetDestination) {
   const destEl = document.getElementById('createListModalDestination');
   if (destEl) {
@@ -41943,6 +42484,7 @@ function openCreateListModal(presetDestination) {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 
@@ -42166,7 +42708,7 @@ async function submitCreateListModal() {
     }
 
     saveState();
-    document.getElementById('createListModal').style.display = 'none';
+    closeCreateListModal();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
     if (currentPendingItem && currentPendingItem.title) {
@@ -43970,9 +44512,22 @@ function removeListItemFromDetails(btn) {
         mdblistAccessToken: mdbToken,
         mdblistKey: mdbKey
       })
-    }).catch(() => {});
+    }).then((res) => externalMutateError(res)).catch(() => 'Network error.')
+      .then((err) => {
+        // The tile has already gone from the page, and putting it back after
+        // the fact would be worse than saying what happened -- so this reports
+        // rather than reverts. Without it the toast said "Removed from TRAKT."
+        // for a removal Trakt refused, and the item was still there next time
+        // the list loaded.
+        if (!err) return;
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Remove From ' + (provider ? provider.toUpperCase() : 'List'), err, false);
+        } else {
+          showAddedToast('Could not remove: ' + err);
+        }
+      });
 
-    showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
+    showAddedToast('Removing from ' + (provider ? provider.toUpperCase() : 'List') + '\u2026');
   }
 }
 
@@ -45563,6 +46118,53 @@ function looksLikeTmdbKey(v) {
   return /^[0-9a-f]{32}$/i.test(String(v || '').trim());
 }
 
+// Ids and slugs that arrived from somewhere else.
+//
+// escapeJsAttr (19_client-search-and-likes.js) is what actually stops an
+// imported id executing; this is the second layer, and it is here because an
+// id is not free text. Every id this app produces is a slug, a "ch_<time>_<rand>",
+// a "tt…" or a "tmdb:…" -- none of which can contain a quote, an angle bracket,
+// a backslash or a control character. A value that does was not produced by
+// this app, and the honest thing to do with it is drop it and say so rather
+// than store it and hope the renderer holds.
+//
+// Dropped rather than rewritten on purpose: a row can reference a channel or
+// list BY KEY, so renaming the key would leave the row pointing at nothing --
+// a silently empty shelf, which is the failure this file exists to prevent.
+// Character codes rather than a regex literal on purpose. This whole file is
+// emitted from a template literal, which eats single backslashes -- that is
+// exactly how /[\\s,]+/ became /[s,]+/ in the admin page. A test written with
+// charCodeAt cannot be broken that way, and reads no worse.
+function hasUnsafeIdChar(v) {
+  const str = String(v == null ? '' : v);
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    //  control chars      "          '          <          >          backslash
+    if (c < 32 || c === 34 || c === 39 || c === 60 || c === 62 || c === 92) return true;
+  }
+  return false;
+}
+
+function dropUnsafeImportedIds(data) {
+  const dropped = [];
+  if (!data || typeof data !== 'object') return dropped;
+  ['customLists', 'channels', 'mergedChannels', 'presets'].forEach((field) => {
+    const map = data[field];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+    Object.keys(map).forEach((key) => {
+      const entry = map[key];
+      const inner = entry && typeof entry === 'object'
+        ? String(entry.channelId || entry.slug || '')
+        : '';
+      if (hasUnsafeIdChar(key) || (inner && hasUnsafeIdChar(inner))) {
+        delete map[key];
+        dropped.push(field + '/' + key.slice(0, 40));
+      }
+    });
+  });
+  return dropped;
+}
+
 function validateAndRepairBackup(data) {
   const notes = [];
   const warnings = [];
@@ -45649,6 +46251,14 @@ function validateAndRepairBackup(data) {
   });
   if (emptyRows.length) {
     warnings.push(emptyRows.length + ' row(s) have no items and nothing to load them from: ' + emptyRows.slice(0, 5).join(', ') + (emptyRows.length > 5 ? '...' : ''));
+  }
+
+  // 6. Ids that cannot have come from this app -- see dropUnsafeImportedIds.
+  const unsafeIds = dropUnsafeImportedIds(data);
+  if (unsafeIds.length) {
+    warnings.push('Removed ' + unsafeIds.length + ' list/channel(s) whose id contained characters this app never produces (' +
+      unsafeIds.slice(0, 3).join(', ') + (unsafeIds.length > 3 ? ', and others' : '') +
+      '). A backup from this app cannot contain those, so the file was edited or came from somewhere else.');
   }
 
   return { data: data, format: format, notes: notes, warnings: warnings };
@@ -45870,7 +46480,11 @@ function applyImportedConfig(data) {
     try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
   }
   if (Array.isArray(s.likedLists)) {
-    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+    // Strings only -- see getLikedListsSet. Array.isArray alone was the check
+    // here, and an array of objects got through and killed the Curated feed
+    // for good while the restore reported "Restore Complete".
+    const likedUrls = s.likedLists.filter((v) => typeof v === 'string' && v);
+    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(likedUrls)); } catch (e) {}
   }
   if (Array.isArray(s.fullyWatchedShowIds)) {
     window._fullyWatchedShowIds = new Set(s.fullyWatchedShowIds.map(String));
@@ -46029,6 +46643,10 @@ async function importFromLink() {
     renderChannelMergeList();
 
     // Rebuild & restore custom lists and channels from the imported link
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -46112,6 +46730,9 @@ async function importFromLink() {
       msg += '\\n\\nRestored ' + parts.join(' and ') + ' to your My Lists tab.';
       if (restoredListNames.length) msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
     }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
+    }
     if (typeof showAppAlert === 'function') showAppAlert('Import Complete', msg, true);
     else alert(msg);
   } catch (e) {
@@ -46135,6 +46756,10 @@ async function restoreListsFromLink() {
       return;
     }
 
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -46219,6 +46844,9 @@ async function restoreListsFromLink() {
     msg += ' from that link into your My Lists tab.';
     if (restoredListNames.length) {
       msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
     }
     if (typeof showAppAlert === 'function') showAppAlert('Custom Lists Rebuilt', msg, true);
     else alert(msg);
@@ -48958,6 +49586,129 @@ function isAllowedPosterUrl(raw) {
   return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
 }
 
+// The service worker, hoisted to module scope for one reason: a string inside
+// a route handler is unreachable, and `node --check` on the combined Worker
+// sees this whole thing as string content either way. As a module-level
+// binding it can be pulled out of a vm sandbox and syntax-checked like any
+// other emitted script -- which is exactly the gap that let a SyntaxError sit
+// in the admin page for two days. See render_check.js --sw.
+//
+// Two caches, because the two kinds of thing here have opposite needs.
+//
+// /app.js?v=<hash> and /app.css?v=<hash> are content-addressed: a change gets
+// a different URL, so cache-first is safe by construction and the cache is
+// never consulted for a version it does not hold.
+//
+// The page itself is NOT content-addressed. It is served no-cache with an
+// ETag, and it is the thing that NAMES the current bundle hash. Cache-first on
+// it would pin yesterday's page, which names yesterday's bundle, and hold the
+// whole app a deploy behind -- the precise failure the versioned URLs exist to
+// prevent. So the page is network-first: the network wins whenever it answers,
+// and the copy in the cache is reached only when it does not.
+//
+// What this buys, stated honestly: the app OPENS offline instead of showing
+// the browser's error page. It does not work offline -- every API call still
+// fails, and the app shows the error states it already had. Fonts and the zip
+// reader come from other origins and are unavailable too, both of which the
+// page already degrades for.
+const SERVICE_WORKER_JS = `
+const ASSETS = 'mylists-assets-v2';
+const SHELL = 'mylists-shell-v2';
+const SHELL_URL = '/';
+const KEEP = [ASSETS, SHELL];
+
+self.addEventListener('install', (e) => e.waitUntil((async () => {
+  // Warm the page now, so the first offline load works rather than only one
+  // that happens to follow an online visit. Failure here is not fatal: the
+  // navigation handler caches it on the next successful load anyway.
+  try {
+    const cache = await caches.open(SHELL);
+    await cache.add(new Request(SHELL_URL, { cache: 'reload' }));
+  } catch (err) {}
+  await self.skipWaiting();
+})()));
+
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+  // Anything from an older naming scheme is orphaned the moment this
+  // activates, so drop it rather than leave it on the user's disk.
+  try {
+    for (const name of await caches.keys()) {
+      if (KEEP.indexOf(name) === -1) await caches.delete(name);
+    }
+  } catch (err) {}
+  await self.clients.claim();
+})()));
+
+function isImmutableAsset(url) {
+  return (url.pathname === '/app.js' || url.pathname === '/app.css')
+    && !!url.searchParams.get('v');
+}
+
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  let url;
+  try {
+    url = new URL(req.url);
+  } catch (err) {
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+
+  if (isImmutableAsset(url)) {
+    e.respondWith((async () => {
+      try {
+        const cache = await caches.open(ASSETS);
+        const key = url.pathname + url.search;
+        const hit = await cache.match(key);
+        if (hit) return hit;
+        const res = await fetch(req);
+        if (res && res.ok) {
+          // One entry per asset, not one entry total: this cache now holds two
+          // different files, and pruning everything would evict the other one
+          // on every deploy. A previous hash for THIS path is dead weight the
+          // moment it stops being asked for.
+          for (const k of await cache.keys()) {
+            if (new URL(k.url).pathname === url.pathname) await cache.delete(k);
+          }
+          await cache.put(key, res.clone());
+        }
+        return res;
+      } catch (err) {
+        // A cache that misbehaves must never be able to break the page. When
+        // it is the network that failed, this rethrows exactly as it would
+        // have with no service worker at all.
+        return fetch(req);
+      }
+    })());
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    e.respondWith((async () => {
+      try {
+        const res = await fetch(req);
+        // Only the plain page is worth keeping. A deep link renders
+        // per-request data, and replaying yesterday's copy of it later would
+        // be worse than not answering.
+        if (res && res.ok && url.pathname === SHELL_URL && !url.search) {
+          try {
+            const cache = await caches.open(SHELL);
+            await cache.put(SHELL_URL, res.clone());
+          } catch (err) {}
+        }
+        return res;
+      } catch (err) {
+        const cache = await caches.open(SHELL);
+        const cached = await cache.match(SHELL_URL);
+        if (cached) return cached;
+        throw err;
+      }
+    })());
+  }
+});
+`.trim();
+
 async function handleFetch(request, env, ctx) {
     // Point the env-backed API key globals (00_constants.js) at whatever
     // this Worker owner configured, before anything can read them. A feature
@@ -49520,48 +50271,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     if (path === "/sw.js") {
-      // The previous version of this worker was a no-op that still cost
-      // something: it intercepted every request, re-issued it, and on
-      // failure fell back to caches.match() -- against a cache nothing ever
-      // wrote to, so that fallback could never hit.
-      //
-      // It now does one useful thing and nothing else. /app.js?v=<hash> is
-      // content-addressed, so cache-first is safe by construction: a bundle
-      // that changes gets a different URL, and this cache is never consulted
-      // for it. Exactly one entry is kept, so old bundles cannot accumulate
-      // after repeated deploys. Every other request is passed straight
-      // through, untouched.
-      const sw = `
-const APP_CACHE = 'mylists-app-v1';
-self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  const isBundle = e.request.method === 'GET'
-    && url.origin === self.location.origin
-    && url.pathname === '/app.js'
-    && url.searchParams.get('v');
-  if (!isBundle) return; // everything else: no interception at all
-  e.respondWith((async () => {
-    try {
-      const cache = await caches.open(APP_CACHE);
-      const hit = await cache.match(e.request.url);
-      if (hit) return hit;
-      const res = await fetch(e.request);
-      if (res && res.ok) {
-        // Keep one bundle only -- a new deploy means a new URL, and the
-        // previous entry is dead weight the moment it stops being requested.
-        for (const key of await cache.keys()) await cache.delete(key);
-        await cache.put(e.request.url, res.clone());
-      }
-      return res;
-    } catch (err) {
-      return fetch(e.request);
-    }
-  })());
-});
-      `;
-      return new Response(sw.trim(), {
+      // The body lives in SERVICE_WORKER_JS at module scope so it can be
+      // syntax-checked; see the comment there for the caching contract.
+      return new Response(SERVICE_WORKER_JS, {
         headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" }
       });
     }

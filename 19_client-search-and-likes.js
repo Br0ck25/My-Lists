@@ -153,6 +153,43 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
+// escapeAttr is right for a plain attribute and WRONG for a JavaScript string
+// inside one, which is what every onclick="fn(&quot;VALUE&quot;)" handler in
+// this app builds. The HTML parser decodes attribute entities BEFORE the JS
+// parser runs, so escapeHtml's own output re-forms the delimiter it was meant
+// to neutralise -- escaping becomes the delivery mechanism:
+//
+//   value       ");alert(1);//
+//   escapeAttr  &quot;);alert(1);//
+//   markup      onclick="fn(&quot;&quot;);alert(1);//&quot;)"
+//   executed    fn("");alert(1);//")        <- the payload runs
+//
+// Measured, not theorised: a channel id carrying that shape, arriving through
+// a restored backup or a pasted install link, ran script and read the victim's
+// Creator Key out of localStorage.
+//
+// The value has to survive two decodings, so it needs escaping for both, in
+// that order: JS-string first, then HTML. Backslash-escaping the quote makes
+// the HTML decode yield \\\\" rather than ", which the JS parser reads as a
+// literal quote inside the string instead of the end of it.
+//
+// Not a replacement for escapeAttr -- a plain data-* or title attribute still
+// wants escapeAttr, and running this on one would leave visible backslashes.
+// Use this one only where the value lands inside quotes the browser will
+// execute.
+function escapeJsAttr(s) {
+  return escapeHtml(
+    String(s == null ? '' : s)
+      .replace(/\\\\/g, '\\\\\\\\')
+      .replace(/"/g, '\\\\"')
+      .replace(/'/g, "\\\\'")
+      .replace(/\\r/g, '\\\\r')
+      .replace(/\\n/g, '\\\\n')
+      .replace(/\\u2028/g, '\\\\u2028')
+      .replace(/\\u2029/g, '\\\\u2029')
+  );
+}
+
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
 }
@@ -312,6 +349,13 @@ function scoreListSearchMatch(list, rawQuery, intent) {
 
 window._unifiedSearchCache = window._unifiedSearchCache || new Map();
 let currentListSearchSequence = 0;
+// The same counter for the title search. It had none, so on a slow
+// connection the older of two in-flight searches simply won by landing
+// last: typing "batman", then "joker", showed batman's results under the
+// word joker -- and clearing the box mid-request showed results for a query
+// no longer on screen, because renderDefaultCatalogSearch re-checks the
+// input after its await and runCatalogSearch never did.
+let currentTitleSearchSequence = 0;
 
 async function executeUnifiedListSearch(rawQuery, targetBox) {
   const q = (rawQuery || '').trim();
@@ -741,9 +785,22 @@ async function populateSearchResultPosters() {
   Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
+// Every reader treats these as URL strings -- getLikedListsSet().has(url),
+// and a .split('/') in the Discover recommendations. A stored array of OBJECTS
+// therefore throws "u.split is not a function", which the Curated feed catches
+// and renders as its ordinary "like some lists to get recommendations" empty
+// state. Silent, permanent, and indistinguishable from having liked nothing.
+//
+// A restored backup could produce exactly that: applyImportedConfig accepted
+// settings.likedLists on Array.isArray alone, with no element check, while the
+// fullyWatchedShowIds beside it was correctly coerced. Filtering here as well
+// as at the write means an already-poisoned browser heals on next load rather
+// than needing its site data cleared by hand.
 function getLikedListsSet() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'));
+    const raw = JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]');
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((v) => typeof v === 'string' && v));
   } catch (e) {
     return new Set();
   }
@@ -2028,7 +2085,7 @@ async function openItemDetailsModal(id, type, opts) {
         const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
         seasonsHtml += 
           '<div class="season-card">' +
-            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
               '<div class="season-header-main">' +
                 (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
                 '<div class="season-header-info">' +
@@ -2062,7 +2119,7 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeAttr(d.id) + '&quot;)">' +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
                 (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
               '</button>'
               :
@@ -2184,6 +2241,26 @@ function isItemInExternalList(provider, target, listId, id, fallbackList) {
   return false;
 }
 
+// What /api/external-list/item-mutate actually said.
+//
+// All seven call sites used to throw the answer away -- an await inside an
+// empty catch, or Promise.allSettled with the results ignored -- and then show
+// a success message unconditionally. The endpoint answers
+//   400 {"ok":false,"error":"Please connect your Trakt account first."}
+// for a missing or expired provider token, which is the ordinary way this
+// fails, so a removal the provider refused still read as "Removed from TRAKT."
+// while the item stayed in the list and the local membership index recorded it
+// as gone -- which then hid it from the next attempt.
+//
+// Returns null when the write landed, or the message to show when it did not.
+async function externalMutateError(res) {
+  if (!res) return 'Network error.';
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (res.ok && (!data || data.ok !== false)) return null;
+  return (data && data.error) || ('That provider rejected the change (HTTP ' + res.status + ').');
+}
+
 async function removeSingleExternalItemDirect(provider, target, listId, id, type, btn) {
   if (!id) return;
   if (btn) {
@@ -2193,20 +2270,7 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
 
   const key1 = makeExternalKey(provider, target, listId, id);
   const key2 = makeExternalKey(provider, target, listId, String(id).replace(/^tmdb:/, ''));
-  setExternalListMembership(key1, false);
-  setExternalListMembership(key2, false);
-
   const row = btn ? btn.closest('.select-list-row') : null;
-  if (row) {
-    const cb = row.querySelector('.list-select-cb');
-    if (cb) {
-      cb.checked = false;
-      cb.dataset.initiallyChecked = 'false';
-    }
-    const badge = row.querySelector('.in-list-badge');
-    if (badge) badge.remove();
-    btn.style.display = 'none';
-  }
 
   const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
   const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -2219,8 +2283,9 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
   const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
+  let mutateError = null;
   try {
-    await fetch(ORIGIN + '/api/external-list/item-mutate', {
+    const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2244,7 +2309,39 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
         mdblistKey: mdbKey
       })
     });
-  } catch(e) {}
+    mutateError = await externalMutateError(res);
+  } catch (e) {
+    mutateError = 'Network error.';
+  }
+
+  if (mutateError) {
+    // Nothing was changed here, so there is nothing to undo -- the row, the
+    // checkbox and the membership index are all still describing a list the
+    // item really is in.
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Remove';
+    }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Could Not Remove', mutateError, false);
+    } else {
+      showAddedToast('Could not remove: ' + mutateError);
+    }
+    return;
+  }
+
+  setExternalListMembership(key1, false);
+  setExternalListMembership(key2, false);
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    if (btn) btn.style.display = 'none';
+  }
 
   showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
 }
@@ -2269,6 +2366,23 @@ function removeSingleCustomItemDirect(listIdx, id, type, btn) {
   }
   showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
 }
+
+// One way out of the Add/Remove-from-Lists modal.
+//
+// It had four, and they did not agree. The "+ Create New List" button hid the
+// modal without releasing the scroll lock while the link eleven lines below it
+// did, and neither of createListModal's own Cancel and X buttons released it
+// either -- so that route left the lock latched with no modal on screen. It was
+// invisible only because the lock itself did nothing (see lockBackgroundScroll);
+// fixing that without this would have turned it into a page you cannot scroll
+// until you reload.
+function closeSelectListModal() {
+  const modal = document.getElementById('selectListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeSelectListModal = closeSelectListModal;
 
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
@@ -2390,7 +2504,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
             (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -2410,7 +2524,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>Trakt Watchlist</span>' +
           (inTraktWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTraktLists)) {
@@ -2424,7 +2538,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tl.name || 'Trakt List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -2454,7 +2568,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span>' + escapeHtml(st.label) + '</span>' +
             (isPresent ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -2474,7 +2588,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Watchlist</span>' +
           (inTmdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     const tmdbFav = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('favorites')) : null;
@@ -2486,7 +2600,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Favorites</span>' +
           (inTmdbFav ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTmdbLists)) {
@@ -2500,7 +2614,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tml.name || 'TMDB List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tml.id || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tml.id || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -2521,7 +2635,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>MDBList Watchlist</span>' +
           (inMdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myMdblistLists)) {
@@ -2535,7 +2649,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(ml.name || 'MDBList List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -2543,7 +2657,7 @@ function openSelectListModal(id, type, title, poster) {
 
   if (html) {
     html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
-      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="closeSelectListModal(); openCreateListModal();">+ Create New List</button>' +
     '</div>';
   }
 
@@ -2556,8 +2670,7 @@ function openSelectListModal(id, type, title, poster) {
       if (lnk) {
         lnk.onclick = function(e) {
           e.preventDefault();
-          document.getElementById('selectListModal').style.display = 'none';
-          document.body.style.overflow = '';
+          closeSelectListModal();
           if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
@@ -2568,7 +2681,7 @@ function openSelectListModal(id, type, title, poster) {
   
   body.innerHTML = html;
   modal.style.display = 'flex';
-  document.body.style.overflow = 'hidden';
+  lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {
@@ -2594,7 +2707,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -2624,7 +2737,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -2657,7 +2770,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -2687,7 +2800,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -2700,8 +2813,7 @@ function openSelectListModal(id, type, title, poster) {
 
 document.getElementById('selectListModal').addEventListener('click', (e) => {
   if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-    document.getElementById('selectListModal').style.display = 'none';
-    document.body.style.overflow = '';
+    closeSelectListModal();
   }
 });
 
@@ -2771,6 +2883,7 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   });
 
   // Execute external modifications concurrently
+  let externalMutateFailures = [];
   if (changedExternalOperations.length > 0) {
     const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
     const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -2786,8 +2899,11 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
     const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
     const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
-    await Promise.allSettled(changedExternalOperations.map(op => {
-      return fetch(ORIGIN + '/api/external-list/item-mutate', {
+    // allSettled's results used to be discarded, so "Added X to lists." was
+    // shown whether the providers accepted the change or refused every one of
+    // them. Collect the failures and name them below instead.
+    externalMutateFailures = await Promise.all(changedExternalOperations.map(async (op) => {
+      const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2813,17 +2929,31 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
           mdblistAccessToken: mdbToken,
           mdblistKey: mdbKey
         })
-      });
-    }));
+      }).catch(() => null);
+      const err = await externalMutateError(res);
+      return err ? { provider: op.provider, error: err } : null;
+    })).then((r) => r.filter(Boolean));
   }
   
-  document.getElementById('selectListModal').style.display = 'none';
-  document.body.style.overflow = '';
+  closeSelectListModal();
   
   btn.disabled = false;
   btn.textContent = 'Done';
   
-  if (anyAdded) {
+  // A provider that refused the change is named rather than passed over. The
+  // custom-list half of this operation is local and did land, so this is a
+  // partial result, and saying so is the whole point -- the previous message
+  // claimed the lot had worked.
+  if (externalMutateFailures.length) {
+    const detail = externalMutateFailures
+      .map((f) => (f.provider ? f.provider.toUpperCase() + ': ' : '') + f.error)
+      .join('\\n');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Some Lists Were Not Updated', detail, false);
+    } else {
+      showAddedToast('Some lists were not updated.');
+    }
+  } else if (anyAdded) {
     showAddedToast('Added ' + title + ' to lists.');
     if (typeof trackEvent === 'function') trackEvent('list-add', finalImdbId, title, type);
   }
@@ -3162,12 +3292,18 @@ async function renderDefaultCatalogSearch() {
   const inputEl = document.getElementById('catalogSearchInput');
   if (inputEl && inputEl.value.trim()) return;
 
+  // Clearing the box is itself a search -- it supersedes anything already in
+  // flight. Without this, a slow response for the query the person just erased
+  // still landed on top of the default view.
+  const thisSeq = ++currentTitleSearchSequence;
+
   resEl.innerHTML = '<p><small>Loading top ' + (currentCatalogSearchType === 'lists' ? 'public lists' : (currentCatalogSearchType === 'tv' ? 'shows' : 'movies')) + '...</small></p>';
 
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
       const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
+      if (thisSeq !== currentTitleSearchSequence) return;
       if (inputEl && inputEl.value.trim()) return;
       const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
       if (!pubLists.length) {
@@ -3184,6 +3320,7 @@ async function renderDefaultCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
     const data = await res.json();
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
     if (!data.ok || !data.results || !data.results.length) {
       resEl.innerHTML = '<p><small>No titles found.</small></p>';
@@ -3208,6 +3345,7 @@ async function runCatalogSearch() {
     return executeUnifiedListSearch(q, resEl);
   }
 
+  const thisSeq = ++currentTitleSearchSequence;
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -3222,6 +3360,10 @@ async function runCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
     const data = await res.json();
+    // Superseded while this was in flight: a newer search, a type change, or
+    // the box being cleared. Say nothing and touch nothing -- whatever ran
+    // after this one owns the results area now.
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (!data.ok) {
       resEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
       return;
@@ -3235,6 +3377,7 @@ async function runCatalogSearch() {
     window._rawCatalogTitleItems = data.results;
     applySearchFilters();
   } catch (e) {
+    if (thisSeq !== currentTitleSearchSequence) return;
     resEl.innerHTML = '<p class="testresult err">✗ Network error.</p>';
   }
 }

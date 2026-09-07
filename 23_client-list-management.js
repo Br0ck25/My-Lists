@@ -1269,9 +1269,22 @@ function removeListItemFromDetails(btn) {
         mdblistAccessToken: mdbToken,
         mdblistKey: mdbKey
       })
-    }).catch(() => {});
+    }).then((res) => externalMutateError(res)).catch(() => 'Network error.')
+      .then((err) => {
+        // The tile has already gone from the page, and putting it back after
+        // the fact would be worse than saying what happened -- so this reports
+        // rather than reverts. Without it the toast said "Removed from TRAKT."
+        // for a removal Trakt refused, and the item was still there next time
+        // the list loaded.
+        if (!err) return;
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Remove From ' + (provider ? provider.toUpperCase() : 'List'), err, false);
+        } else {
+          showAddedToast('Could not remove: ' + err);
+        }
+      });
 
-    showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
+    showAddedToast('Removing from ' + (provider ? provider.toUpperCase() : 'List') + '\u2026');
   }
 }
 

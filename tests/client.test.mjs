@@ -345,3 +345,461 @@ describe("client: what an anonymous user's first account publishes", () => {
     assert.ok(!names.includes("Continue Watching"), "nor continue watching");
   });
 });
+
+// --- FE-02: data that arrived from someone else must not become code -------
+//
+// 37 handler sites build a JavaScript string inside an HTML attribute and
+// delimit it with &quot;. escapeAttr is escapeHtml, which EMITS &quot; -- and
+// the HTML parser decodes attribute entities before the JS parser runs, so the
+// escaping re-formed the delimiter it was meant to neutralise. A channel id
+// carrying ");… arrived through a restored backup or a pasted install link and
+// executed, with the victim's Creator Key in reach.
+//
+// Two tests, because there are two layers and each has to hold on its own:
+// the escaper (what stops it executing) and the import check (what stops it
+// being stored at all).
+
+// Mirrors what a browser does with an attribute value before running it.
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+describe("client: an imported id cannot break out of an inline handler", () => {
+  const BREAKOUT = '"); window.__pwned = 1; //';
+
+  it("escapes so the handler stays one call with one argument", () => {
+    const client = loadClient();
+    const attr = 'fn(&quot;' + client.call("escapeJsAttr", BREAKOUT) + '&quot;)';
+    const code = decodeEntities(attr);
+
+    // The whole payload has to survive as ONE argument. Before the fix this
+    // parsed as fn("") followed by the payload as live statements.
+    const seen = [];
+    // eslint-disable-next-line no-new-func
+    new Function("fn", code)((...args) => seen.push(args));
+    assert.deepEqual(seen, [[BREAKOUT]],
+      "the id must arrive as a single string argument, not as executed code");
+  });
+
+  it("leaves an ordinary id byte-identical", () => {
+    const client = loadClient();
+    for (const id of ["ch_1700000000_ab12", "tt0944947", "tmdb:1399", "my-list-slug"]) {
+      assert.equal(client.call("escapeJsAttr", id), id, id + " must pass through untouched");
+    }
+  });
+
+  it("survives a name that merely contains quotes, which used to be a syntax error", () => {
+    const client = loadClient();
+    const name = 'O\'Brien & Sons "Best"';
+    const code = decodeEntities('fn(&quot;' + client.call("escapeJsAttr", name) + '&quot;)');
+    const seen = [];
+    // eslint-disable-next-line no-new-func
+    new Function("fn", code)((...args) => seen.push(args));
+    assert.deepEqual(seen, [[name]]);
+  });
+
+  it("drops such an id at import rather than storing it", () => {
+    const client = loadClient();
+    const data = {
+      version: "3.0",
+      entries: [],
+      channels: {
+        ch_good_1: { channelId: "ch_good_1", name: "Keep Me", type: "series", items: [] },
+        [BREAKOUT]: { channelId: BREAKOUT, name: "Drop Me", type: "series", items: [] },
+      },
+      customLists: { "good-list": { slug: "good-list", name: "Good", type: "movie", items: [] } },
+    };
+    const dropped = client.call("dropUnsafeImportedIds", data);
+
+    assert.deepEqual(Object.keys(data.channels), ["ch_good_1"],
+      "the hostile channel must be gone");
+    assert.deepEqual(Object.keys(data.customLists), ["good-list"],
+      "and the rest of the file must be untouched -- dropping one entry, not rejecting the import");
+    assert.equal(dropped.length, 1, "and the caller must be told, so it can be reported");
+  });
+});
+
+// --- FE-03: an impatient click must not create the account twice -----------
+//
+// Two clicks on "Create Account" sent two POST /api/creator/create. Both
+// succeeded and returned different keys: KV keeps the last, D1's INSERT fails
+// on the second and is swallowed so D1 keeps the first, and reads prefer D1.
+// The browser stores the last, so the key it shows and saves is the one that
+// does not authenticate -- 6 out of 6 double-clicks in a real browser produced
+// an account nobody could sign into.
+//
+// KV-only the same double-click was harmless, which is why the guard was never
+// missed until D1 arrived.
+describe("client: a double-clicked credential form submits once", () => {
+  const creates = () => {
+    let n = 0;
+    return {
+      count: () => n,
+      routes: (saves) => ({
+        ...anonRoutes(saves),
+        [CREATE]: () => {
+          n += 1;
+          // Distinct keys, as the server really does return -- so a second
+          // request does not merely duplicate the first, it replaces the key
+          // this browser will keep.
+          return { json: { ok: true, creatorName: "bob", displayName: "Bob", creatorKey: "MYL-KEY-" + n } };
+        },
+      }),
+    };
+  };
+
+  it("sends one create however many times Create is clicked", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    fillCreateForm(client, "newbie");
+
+    // Not awaited between calls -- that is the whole point. Awaiting each one
+    // serialises them, and the server correctly answers "username taken" for
+    // the later ones; the damage only happens while the first is in flight.
+    const all = [client.call("submitCreateProfile"), client.call("submitCreateProfile"), client.call("submitCreateProfile")];
+    await Promise.all(all);
+    await settle();
+
+    assert.equal(c.count(), 1, "three clicks must produce one account, not three");
+    assert.equal(client.get("localStorage").getItem("myListAddon:creatorKey"), "MYL-KEY-1",
+      "and the key kept must be the one the single request returned");
+  });
+
+  it("re-arms after the request finishes, so a later attempt still works", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    fillCreateForm(client, "newbie");
+
+    await client.call("submitCreateProfile");
+    await settle();
+    await client.call("submitCreateProfile");
+    await settle();
+
+    // A guard that latches would be its own bug: the form would silently stop
+    // working after one use.
+    assert.equal(c.count(), 2, "a second, separate attempt must be allowed through");
+  });
+
+  it("does not latch when the form is rejected before any request", async () => {
+    const c = creates();
+    const client = loadClient({ storage: {}, routes: c.routes([]) });
+    const d = client.get("document");
+    d.getElementById("createProfileNameInput").value = "";      // no username
+    await client.call("submitCreateProfile");
+    await settle();
+    assert.equal(c.count(), 0, "nothing should have been sent");
+
+    fillCreateForm(client, "newbie");
+    await client.call("submitCreateProfile");
+    await settle();
+    assert.equal(c.count(), 1, "and the corrected form must go through");
+  });
+});
+
+// --- FE-04: a write the provider refused must not read as success ----------
+//
+// All seven /api/external-list/item-mutate call sites discarded the response --
+// an await inside an empty catch, or Promise.allSettled with the results thrown
+// away -- and then showed a success message unconditionally. The endpoint
+// answers 400 {"ok":false,"error":"Please connect your Trakt account first."}
+// for a missing or expired token, which is the ordinary way this fails. So a
+// removal Trakt refused still said "Removed from TRAKT.", the item stayed in
+// the list, and the local membership index recorded it as gone -- which then
+// hid it from the next attempt.
+const MUTATE = "/api/external-list/item-mutate";
+
+describe("client: a provider write that failed is not reported as done", () => {
+  function harness(routeResult) {
+    const client = loadClient({ routes: { [MUTATE]: () => routeResult } });
+    const toasts = [];
+    const alerts = [];
+    client.set("showAddedToast", (m) => toasts.push(m));
+    client.set("showAppAlert", (title, msg) => alerts.push(title + ": " + msg));
+    return { client, toasts, alerts };
+  }
+  const membership = (client) => {
+    const raw = client.get("localStorage").getItem("myListAddon:externalMembership");
+    return raw ? JSON.parse(raw) : {};
+  };
+
+  it("says so, and leaves the membership index alone, when the provider refuses", async () => {
+    const { client, toasts, alerts } = harness({
+      status: 400, json: { ok: false, error: "Please connect your Trakt account first." },
+    });
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(!toasts.some((t) => /Removed from/.test(t)),
+      "no success toast for a removal the provider refused");
+    assert.ok(alerts.some((a) => /connect your Trakt account/.test(a)),
+      "the server's own message should reach the user, not a generic one");
+    // The important half: the item IS still in the list, so an index saying it
+    // is gone would hide it from the next attempt.
+    assert.deepEqual(membership(client), {},
+      "nothing may be recorded as removed when nothing was removed");
+  });
+
+  it("still reports and records a removal that did land", async () => {
+    const { client, toasts, alerts } = harness({ status: 200, json: { ok: true } });
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(toasts.some((t) => /Removed from TRAKT/.test(t)), "a real removal still confirms");
+    assert.deepEqual(alerts, [], "and raises nothing");
+    const m = membership(client);
+    assert.ok(Object.keys(m).length > 0, "and is recorded");
+    assert.ok(Object.values(m).every((v) => v === false), "as not-in-list");
+  });
+
+  it("treats a network failure the same as a refusal", async () => {
+    const client = loadClient({ routes: { [MUTATE]: () => { throw new Error("offline"); } } });
+    const toasts = [];
+    const alerts = [];
+    client.set("showAddedToast", (m) => toasts.push(m));
+    client.set("showAppAlert", (t, m) => alerts.push(t + ": " + m));
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(!toasts.some((t) => /Removed from/.test(t)));
+    assert.ok(alerts.some((a) => /Network error/.test(a)));
+  });
+});
+
+// --- FE-05: the main list-edit path must cite the version it edited --------
+//
+// The server answers 409 rather than overwriting when a save cites
+// expectedUpdatedAt. Of twelve lists/save call sites exactly two armed it, and
+// both were remove-one-item paths -- so the button that sends the WHOLE items
+// array, which is the one people press, was still last-write-wins. Two devices
+// each adding a different film ended with one addition gone and both saves
+// reporting ok.
+describe("client: saving a list edit cites what it was built on", () => {
+  function editing(client, list) {
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("lastCreatorListsData", [list]);
+    client.set("editingCreatorListSlug", list.slug);
+    client.set("customListDraftItems", [{ id: "tt1" }, { id: "tt2" }]);
+    client.set("customListDraftType", "movie");
+  }
+
+  it("sends expectedUpdatedAt from the version the dashboard reported", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 7000 } }; } },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].expectedUpdatedAt, 4200,
+      "the save must name the version the edit was built on");
+  });
+
+  it("cites nothing for a list the server never gave a version for", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 1 } }; } },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie" });   // legacy record
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    // Inventing a baseline would either reject every save or assert a version
+    // this browser never saw.
+    assert.equal("expectedUpdatedAt" in saves[0], false);
+  });
+
+  it("does not overwrite the other device on a conflict", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: {
+        [SAVE]: (req) => { saves.push(req.body); return { status: 409, json: { ok: false, error: "conflict", conflict: true } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const notices = [];
+    client.set("showAppNoticeModal", (t, m) => notices.push(t + ": " + m));
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves.length, 1, "a 409 must not be followed by a blind retry");
+    assert.ok(notices.some((n) => /Changed Elsewhere/.test(n)),
+      "and the person has to be told, since only they can say which version they want");
+    assert.deepEqual(client.get("customListDraftItems"), [{ id: "tt1" }, { id: "tt2" }],
+      "their draft must survive -- there is nothing else holding it");
+  });
+
+  it("advances its baseline, so a second edit is not stale against its own write", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 9100 } }; } },
+    });
+    const list = { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 };
+    editing(client, list);
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+    client.set("editingCreatorListSlug", "faves");
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves[1].expectedUpdatedAt, 9100,
+      "the second save must cite what the first one produced, not the original");
+  });
+});
+
+// --- FE-09: a sync load belongs to the account that asked for it -----------
+describe("client: a sync load for the previous account is discarded", () => {
+  it("does not apply one account's state to the next one", async () => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-ALICE" },
+      routes: {
+        "/api/creator/sync/load": async () => {
+          await held;   // alice's answer, arriving late
+          return { json: { ok: true, data: { config: [{ name: "alice-ROW", url: "https://x/alice", type: "movie", enabled: true }], likedLists: ["https://x/alice/liked"], updatedAt: 10 } } };
+        },
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 11 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+
+    client.set("activeCreator", { creatorName: "alice" });
+    const pending = client.call("loadCreatorSync");
+
+    // Someone signs in as bob while alice's load is still out.
+    client.set("activeCreator", { creatorName: "bob" });
+    client.get("localStorage").setItem("myListAddon:creatorKey", "KEY-BOB");
+
+    release();
+    await pending;
+    await settle();
+
+    assert.equal(client.get("localStorage").getItem("myListAddon:likedLists"), null,
+      "alice's liked lists must not land in bob's session");
+  });
+});
+
+// --- FE-07: likedLists is a list of URL strings -----------------------------
+describe("client: a poisoned likedLists does not kill the Discover feed", () => {
+  it("ignores non-string entries rather than throwing on them", () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:likedLists": JSON.stringify([
+          { url: "https://mdblist.com/lists/a/b", name: "Sci-Fi" },   // what a restore could write
+          "https://mdblist.com/lists/c/d",
+          null,
+          42,
+        ]),
+      },
+    });
+    const set = client.call("getLikedListsSet");
+    assert.deepEqual([...set], ["https://mdblist.com/lists/c/d"]);
+    // The actual crash: every reader does this to each entry.
+    for (const u of set) assert.doesNotThrow(() => u.split("/"));
+  });
+
+  it("stores only strings when a backup is restored", () => {
+    const client = loadClient();
+    client.call("applyImportedConfig", {
+      version: "3.0",
+      entries: [],
+      settings: { likedLists: [{ url: "https://x/a" }, "https://x/b"] },
+    });
+    assert.deepEqual(
+      JSON.parse(client.get("localStorage").getItem("myListAddon:likedLists")),
+      ["https://x/b"]);
+  });
+});
+
+// --- FE-06: the newer search wins ------------------------------------------
+describe("client: an obsolete title search cannot replace a newer one", () => {
+  const TITLES = "/api/title-search";
+  const result = (name) => ({ ok: true, results: [{ id: "tmdb:1", tmdbId: 1, title: name, name, type: "movie", year: "2000", poster: "", vote_average: 1, genre_ids: [] }] });
+
+  it("discards the slower, older response", async () => {
+    let releaseSlow;
+    const slow = new Promise((r) => { releaseSlow = r; });
+    const client = loadClient({
+      routes: {
+        [TITLES]: async (req) => {
+          if (/q=slow/.test(req.url)) { await slow; return { json: result("SLOW") }; }
+          return { json: result("FAST") };
+        },
+        "/api/track-search": () => ({ json: { ok: true } }),
+      },
+    });
+    const input = client.get("document").getElementById("catalogSearchInput");
+
+    input.value = "slowq";
+    const first = client.call("runCatalogSearch");
+    input.value = "fastq";
+    await client.call("runCatalogSearch");
+    await settle();
+    const afterFast = (client.get("window")._rawCatalogTitleItems || []).map((x) => x.title);
+
+    releaseSlow();
+    await first;
+    await settle();
+    const afterSlow = (client.get("window")._rawCatalogTitleItems || []).map((x) => x.title);
+
+    assert.deepEqual(afterFast, ["FAST"]);
+    assert.deepEqual(afterSlow, ["FAST"],
+      "the older response landing later must not replace the newer results");
+  });
+});
+
+// --- FE-13: the saved dashboard order is a list of slugs ------------------
+//
+// Both readers did JSON.parse inside a try/catch -- which covers malformed
+// JSON -- and then tested `savedOrder && savedOrder.length` before calling
+// .map on it. A STRING passes that ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: container type checked, element type
+// not.
+describe("client: a corrupted dashboard order cannot break the dashboard", () => {
+  // Spread into an array of THIS realm before comparing. The bundle runs in a
+  // vm context, so an array it constructs itself has that realm's
+  // Array.prototype and deepStrictEqual rejects it on identity alone -- while
+  // one that came back through the harness's own JSON.parse does not. That
+  // difference is an artefact of the sandbox, not of the code under test.
+  const order = (stored) => [...loadClient({
+    storage: stored === undefined ? {} : { "myListAddon:dashboardListOrder": stored },
+  }).call("readDashboardListOrder")];
+
+  it("reads a normal order through unchanged", () => {
+    assert.deepEqual(order(JSON.stringify(["b", "a", "c"])), ["b", "a", "c"]);
+  });
+
+  it("returns nothing for a value that is not an array", () => {
+    // The exact shape that threw: length-bearing, not mappable.
+    assert.deepEqual(order(JSON.stringify("nope")), []);
+    assert.deepEqual(order(JSON.stringify({ length: 3 })), []);
+    assert.deepEqual(order("42"), []);
+  });
+
+  it("drops entries that are not slugs, rather than throwing on them", () => {
+    assert.deepEqual(order(JSON.stringify(["a", null, 7, { slug: "b" }, "c"])), ["a", "c"]);
+  });
+
+  it("survives malformed JSON and a missing key", () => {
+    assert.deepEqual(order("{not json,,,"), []);
+    assert.deepEqual(order(undefined), []);
+  });
+});

@@ -2105,6 +2105,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
   const title = item.showTitle || item.title || item.name || '';
 
   const promises = [];
+  // Each of these mirrors a local change out to a connected provider. They
+  // used to be fired and forgotten, so an expired Trakt/Simkl/MDBList token
+  // meant "syncing to your connected accounts" silently stopped working and
+  // nothing ever said so. The local change is the user's own action and is
+  // kept either way -- this only makes the failure visible.
+  const mirrorFailures = [];
+  const noteMirror = (provider) => (res) => externalMutateError(res)
+    .then((err) => { if (err) mirrorFailures.push(provider.toUpperCase() + ': ' + err); })
+    .catch(() => {});
 
   if (traktSync && traktToken) {
     promises.push(
@@ -2125,7 +2134,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('trakt')).catch(() => {})
     );
   }
 
@@ -2148,7 +2157,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('mdblist')).catch(() => {})
     );
   }
 
@@ -2171,12 +2180,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('simkl')).catch(() => {})
     );
   }
 
   if (promises.length) {
-    Promise.allSettled(promises);
+    await Promise.allSettled(promises);
+    if (mirrorFailures.length && typeof showAppAlert === 'function') {
+      showAppAlert('Not Synced To Every Account', mirrorFailures.join('\\n'), false);
+    }
   }
 }
 

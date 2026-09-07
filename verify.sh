@@ -30,6 +30,30 @@ python3 html_checks.py rendered.html local
 rm -f rendered.html inner_local.js
 
 echo
+echo "=== 4b. render + validate the admin dashboard ==="
+# The same treatment for /admin, which used to get none. It is a template
+# literal too, and a single backslash inside one never reaches the browser:
+# '\n\n' inside a confirm() string became a real newline, split the string
+# across two lines, and turned the whole 60KB dashboard script into one
+# SyntaxError. Every admin control -- including the only way to remove an
+# anonymously published list -- was dead for two days, and step 4 above could
+# not see it because it only ever rendered the builder page.
+node render_check.js rendered-admin.html --admin
+python3 html_checks.py rendered-admin.html local-admin
+rm -f rendered-admin.html inner_local-admin.js
+
+echo
+echo "=== 4c. syntax-check the service worker ==="
+# /sw.js is emitted from a template literal too, so `node --check` on the
+# combined Worker sees it as string content -- the same blind spot that let a
+# SyntaxError sit in the admin page for two days. A broken service worker is
+# quieter still: it fails to register and the page carries on looking fine,
+# so nobody notices until offline stops working.
+node render_check.js service-worker.js --sw
+node --check service-worker.js && echo "  OK"
+rm -f service-worker.js
+
+echo
 echo "=== 5. FUNCTION-MAP.md drift ==="
 # gen_map.py is only useful if it is actually re-run. It was not: 26% of the
 # map's 811 line numbers pointed at a line that no longer held that symbol,
