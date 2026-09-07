@@ -4307,6 +4307,91 @@
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/creator-lists  (GET)  ?username=...&limit=...&cursor=...
+    //   -> { ok, username, count, lists: [...], cursor, done, orderCount }
+    //
+    // The half of "Delete a creator's lists" that was missing: nothing in this
+    // dashboard could tell you WHICH lists a creator has, and the delete below
+    // takes exact slugs. That is fine for the case it was written for -- an
+    // admin acting on one list somebody reported -- and useless for the case
+    // it keeps being needed for: an account carrying dozens of duplicates of
+    // the same list, minted by the runaway that /api/creator/lists/save's own
+    // comment records (one account reached 129 records for 22 real lists,
+    // coming-of-age-3 through coming-of-age-53). Their slugs are not
+    // guessable, they are not all in the creator's display order, and typing
+    // the base name deletes exactly one of them -- which is what "it will not
+    // delete them" actually is.
+    //
+    // Enumerates the KV records themselves rather than creatorlistorder:,
+    // deliberately. The order key is one value rewritten read-modify-write by
+    // every save, it is what LOST entries during that runaway, and a list
+    // missing from it is precisely the kind that needs cleaning up. inOrder
+    // reports the difference rather than hiding it.
+    if (path === "/admin/api/creator-lists" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      const v = validateCreatorUsername(url.searchParams.get("username"));
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 1), 200);
+      const cursor = url.searchParams.get("cursor") || "";
+      const prefix = `creatorlist:${v.normalized}:`;
+
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix, limit, ...(cursor ? { cursor } : {}) });
+      } catch (e) {
+        return json({ ok: false, error: "Could not read this creator's lists right now." }, 500, { "Cache-Control": "no-store" });
+      }
+
+      // One read for the whole page, not one per row.
+      let order = [];
+      try {
+        const orderRaw = await env.CONFIGS.get(`creatorlistorder:${v.normalized}`);
+        order = orderRaw ? (JSON.parse(orderRaw).order || []) : [];
+      } catch {
+        order = [];
+      }
+      const inOrder = new Set(Array.isArray(order) ? order : []);
+
+      const lists = await Promise.all((listed.keys || []).map(async (k) => {
+        const slug = k.name.slice(prefix.length);
+        let data = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          data = raw ? JSON.parse(raw) : null;
+        } catch {
+          data = null;
+        }
+        return {
+          slug,
+          // Same reasoning as the anonymous browse: a record that will not
+          // parse is still reportable, and is exactly the kind an admin most
+          // needs to be able to select and delete.
+          name: data ? (data.name || "(untitled)") : "(unreadable record)",
+          type: data ? (data.type || "mixed") : null,
+          itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
+          likes: data ? (data.likes || 0) : 0,
+          visibility: data ? effectiveListVisibility(data.visibility) : null,
+          updatedAt: data && Number.isFinite(Number(data.updatedAt)) ? Number(data.updatedAt) : null,
+          inOrder: inOrder.has(slug),
+          url: `${url.origin}/lists/${v.normalized}/${slug}`,
+        };
+      }));
+
+      return json({
+        ok: true,
+        username: v.normalized,
+        count: lists.length,
+        lists,
+        // How many the creator's own dashboard would show from the order key,
+        // so a page where the two disagree says so out loud.
+        orderCount: inOrder.size,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
     //   -> { ok, deleted: [...], missing: [...], remaining }
     // Admin-only removal of one creator's lists, for cleaning up content the
