@@ -3428,6 +3428,116 @@ async function removeListsFromPublicIndex(env, ids) {
   }
 }
 
+// --- "this account deleted that list" ----------------------------------------
+//
+// A list deleted on one device came back a few minutes later on another, and
+// this key is what stops it.
+//
+// Deleting a list removes its record, its order entry and its directory entry
+// -- so from any OTHER signed-in browser, an account that no longer has the
+// list is indistinguishable from an account that never received it. That
+// browser still holds the list in its own localStorage, and
+// renderCreatorDashboard's reconciliation (uploadMissingLocalListsToAccount,
+// 22_client-creator-profile.js) exists precisely to push a list the account is
+// missing back up. Its own comment describes the recovery it was written for
+// -- a browser whose copy survived when the server's did not -- and a deletion
+// made somewhere else reads exactly the same way. So the phone re-created what
+// the desktop had deleted, and the person's delete undid itself.
+//
+// The deleting browser already writes a LOCAL tombstone for the same reason
+// (recordCreatorListDeletion), which is why the delete sticks on the device it
+// was made on and nowhere else. This is that tombstone, kept on the account
+// where every device can see it.
+//
+// Bounded on both axes: entries older than the TTL are dropped on every read
+// (a list deleted long ago must not be un-restorable forever if a browser's
+// copy is the last one left), and the newest CREATOR_LIST_TOMBSTONE_MAX are
+// kept so a bulk delete cannot grow this key without limit.
+const CREATOR_LIST_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CREATOR_LIST_TOMBSTONE_MAX = 300;
+
+function creatorListTombstoneKey(username) {
+  return `creatorlistdeleted:${username}`;
+}
+
+// { slug: deletedAtMs } with anything expired already dropped. Never throws --
+// an unreadable record means "no deletions known", which is the behaviour this
+// whole mechanism replaces, not a worse one.
+async function readCreatorListDeletions(env, username) {
+  if (!env || !env.CONFIGS || !username) return {};
+  let raw = null;
+  try {
+    raw = await env.CONFIGS.get(creatorListTombstoneKey(username));
+  } catch (e) {
+    return {};
+  }
+  if (!raw) return {};
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  const slugs = parsed && typeof parsed === "object" ? (parsed.slugs || parsed) : null;
+  if (!slugs || typeof slugs !== "object") return {};
+  const now = Date.now();
+  const out = {};
+  for (const [slug, at] of Object.entries(slugs)) {
+    const ts = Number(at) || 0;
+    if (ts && now - ts < CREATOR_LIST_TOMBSTONE_TTL_MS) out[slug] = ts;
+  }
+  return out;
+}
+
+// Best-effort by design, like bumpCreatorListsStamp: the list is already gone
+// by the time this runs, and failing the delete over its bookkeeping would be
+// the worse outcome. A lost write costs one device one spurious re-upload --
+// exactly what happened before this key existed.
+//
+// Deliberately does not bump the lists stamp itself: both callers sit inside
+// an operation that already does (deleteCreatorLists, /api/creator/lists/save),
+// and a bump from here would be a second write for the same change. Anything
+// that ever calls this from somewhere else has to bump.
+async function writeCreatorListDeletions(env, username, slugs) {
+  if (!env || !env.CONFIGS || !username) return;
+  try {
+    const entries = Object.entries(slugs)
+      .sort((a, b) => (Number(b[1]) || 0) - (Number(a[1]) || 0))
+      .slice(0, CREATOR_LIST_TOMBSTONE_MAX);
+    if (!entries.length) {
+      await env.CONFIGS.delete(creatorListTombstoneKey(username));
+      return;
+    }
+    await env.CONFIGS.put(
+      creatorListTombstoneKey(username),
+      JSON.stringify({ slugs: Object.fromEntries(entries) })
+    );
+  } catch (e) {
+    console.error("could not record the list deletion", e);
+  }
+}
+
+async function recordCreatorListDeletions(env, username, slugs) {
+  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return;
+  const known = await readCreatorListDeletions(env, username);
+  const now = Date.now();
+  for (const slug of slugs) {
+    if (slug) known[String(slug)] = now;
+  }
+  await writeCreatorListDeletions(env, username, known);
+}
+
+// The other half: re-creating a list at a slug that was deleted is a
+// deliberate act and has to win, or the tombstone would tell every other
+// device to throw the new list away. Called by /api/creator/lists/save.
+async function clearCreatorListDeletion(env, username, slug) {
+  if (!env || !env.CONFIGS || !username || !slug) return;
+  const known = await readCreatorListDeletions(env, username);
+  if (!Object.prototype.hasOwnProperty.call(known, String(slug))) return;
+  delete known[String(slug)];
+  await writeCreatorListDeletions(env, username, known);
+}
+
 // Deletes one or more of a creator's lists: the KV record, the D1 row, the
 // like ledger, the entry in their display order, and the directory index --
 // with a single index write and a single order write however many slugs are
@@ -3514,6 +3624,14 @@ async function deleteCreatorLists(env, username, slugs) {
   } catch (e) {
     console.error("deleteCreatorLists: could not update list order", e);
   }
+
+  // Every device signed into this account has to be told the list is gone, not
+  // merely find it absent -- see readCreatorListDeletions above for why those
+  // two are not the same thing to a browser holding its own copy. Recorded for
+  // every slug asked for, phantom ones included, for the same reason the order
+  // cleanup above covers them: a record that was already missing is exactly
+  // the case where some other browser is still holding the only copy.
+  await recordCreatorListDeletions(env, username, slugs);
 
   // Deleting a list is a list change like any other, and the one shape of it a
   // derived stamp could not have seen: a MAX(updated_at) over the surviving
@@ -4631,6 +4749,10 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorsyncchannels:${u}`,
     `creatorlistorder:${u}`,
     `creatorliststamp:${u}`,
+    // The account's list-deletion record (readCreatorListDeletions). Nothing
+    // owns it once the account does not, and leaving it behind would tell a
+    // re-registered username's browsers to discard lists it never deleted.
+    creatorListTombstoneKey(u),
     `creatorscrobblequeue:${u}`,
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
@@ -39736,6 +39858,239 @@ function applyCollapsedPanelsState(state) {
   });
 }
 
+// --- Sync baselines that outlive the page -----------------------------------
+//
+// Every push in this file cites the version of the record its edits are built
+// on (expectedUpdatedAt), and the server answers 409 rather than let a stale
+// device overwrite a newer one. That guard is only armed while the browser
+// knows a baseline -- and every one of those baselines lived in a window.
+// variable, which is gone the moment the page is.
+//
+// On a desktop tab left open all day that is invisible. On a phone it is the
+// normal case: an installed PWA is re-launched rather than resumed, so it
+// started every session with no baseline at all, sent expectedUpdatedAt:
+// undefined, and the server -- which reads a missing baseline as "an older
+// client with no opinion" and falls back to last-write-wins -- let it win. A
+// change made on the desktop minutes earlier was overwritten by the phone's
+// own stale copy, and the phone then showed the resurrected state back as if
+// it were current.
+//
+// Persisting them per account is what arms the guard on a cold start: the
+// first push of a session now cites the version this browser last actually
+// saw, so a push built on stale state is refused and pulled instead.
+const SYNC_BASELINE_KEY = 'myListAddon:syncBaselines';
+
+function currentSyncAccountName() {
+  if (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) {
+    return activeCreator.creatorName;
+  }
+  try { return localStorage.getItem('myListAddon:creatorName') || ''; } catch (e) { return ''; }
+}
+
+function loadSyncBaselines() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SYNC_BASELINE_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    // Stamped with the account they describe. Signing out clears every
+    // myListAddon: key anyway (clearLocalAccountData), so this is the
+    // belt-and-braces half: citing one account's version while saving
+    // another's data would 409 forever rather than merely be wrong once.
+    if (!raw.account || raw.account !== currentSyncAccountName()) return null;
+    return raw;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Writes only the fields named, so a save that knows one stamp cannot blank
+// the others.
+function saveSyncBaselines(patch) {
+  const account = currentSyncAccountName();
+  if (!account || !patch) return;
+  try {
+    const current = loadSyncBaselines() || {};
+    const next = { account: account };
+    ['config', 'tracking', 'trackingClient', 'presets', 'channels'].forEach((k) => {
+      // A field the caller has no number for keeps whatever was stored --
+      // "I don't know this one" must not read as "forget it".
+      const offered = Object.prototype.hasOwnProperty.call(patch, k) ? patch[k] : undefined;
+      const v = Number.isFinite(Number(offered)) && offered !== null && offered !== '' ? offered : current[k];
+      if (Number.isFinite(Number(v))) next[k] = Number(v);
+    });
+    localStorage.setItem(SYNC_BASELINE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // Non-critical: without it this browser is exactly as unguarded as it was
+    // before the key existed, never worse.
+  }
+}
+
+// Called once at load, and again from the sign-in paths, so the very first
+// push of a session is guarded. Deliberately does NOT invent a baseline it
+// cannot support: an account with no stored stamps stays undefined, which is
+// the old last-write-wins behaviour rather than a fabricated version the
+// server would compare against.
+function restoreSyncBaselines() {
+  const stored = loadSyncBaselines();
+  if (!stored) return;
+  if (typeof window._serverSyncUpdatedAt === 'undefined' && Number.isFinite(stored.config)) {
+    window._serverSyncUpdatedAt = stored.config;
+  }
+  if (typeof window._serverTrackingUpdatedAt === 'undefined' && Number.isFinite(stored.tracking)) {
+    window._serverTrackingUpdatedAt = stored.tracking;
+  }
+  if (typeof window._serverTrackingClientVersion === 'undefined' && Number.isFinite(stored.trackingClient)) {
+    window._serverTrackingClientVersion = stored.trackingClient;
+  }
+  if (typeof window._serverPresetsUpdatedAt === 'undefined' && Number.isFinite(stored.presets)) {
+    window._serverPresetsUpdatedAt = stored.presets;
+  }
+  if (typeof window._serverChannelsUpdatedAt === 'undefined' && Number.isFinite(stored.channels)) {
+    window._serverChannelsUpdatedAt = stored.channels;
+  }
+}
+restoreSyncBaselines();
+
+// --- Nothing goes up before this browser has asked what is already there ----
+//
+// activeCreator is set the moment /api/creator/restore answers, and the first
+// /api/creator/sync/load is a second round trip behind it -- but the page's
+// own start-up work waits for neither. refreshAiringNext runs 600ms after
+// load and backfillWatchHistoryEpisodeStills at 1400ms, and both end in
+// scheduleTrackingSync (300ms debounce); every autosave path does the same
+// for the config blob. So on a cold start -- which, for an installed PWA, is
+// every time it is opened -- this browser routinely pushed its entire stale
+// Watch History, Continue Watching and config to the account BEFORE the load
+// that would have told it what the account actually holds.
+//
+// save-tracking and sync/save are both full overwrites by design, so an item
+// removed on the desktop an hour earlier came straight back, and the load
+// that followed a moment later handed the resurrected copy back to the person
+// as the current state. That is the bug this gate closes: while a sign-in is
+// known but its first load has not been applied, a push is remembered rather
+// than sent, and flushed once the load lands. Nothing is at risk in the
+// meantime -- everything being pushed is sitting in localStorage throughout --
+// and it then goes up against the right baseline instead of over the top of
+// whatever it was built without seeing.
+let _creatorSyncLoadedFor = null;
+let _pendingSyncPushes = null;
+let _creatorSyncGateTimer = null;
+// If the first load never lands (offline, a Worker error), the gate cannot
+// stay shut forever or this browser would stop syncing entirely for as long
+// as the page is open. It opens anyway after this long -- by which point the
+// persisted baselines above are what stands between a stale push and someone
+// else's data, which is exactly the protection they exist to provide.
+const CREATOR_SYNC_GATE_FAILSAFE_MS = 20000;
+
+function creatorSyncGateOpen() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return true;
+  return _creatorSyncLoadedFor === activeCreator.creatorName;
+}
+
+// Remembers that a push was wanted. Which kind is all that needs keeping --
+// every push reads the current state out of localStorage/the DOM when it
+// runs, so one deferred push covers any number of changes made while the gate
+// was shut.
+function deferSyncPush(kind, opts) {
+  if (!_pendingSyncPushes) _pendingSyncPushes = {};
+  _pendingSyncPushes[kind] = true;
+  // Armed here rather than only on a failed load, so that no push can be held
+  // indefinitely by a sign-in path that never got as far as loading -- the
+  // gate is a safety measure, and one that can strand a person's edits is not.
+  if (!_creatorSyncGateTimer) armCreatorSyncGateFailsafe();
+  // An intentional removal must stay one: it is the flag that tells
+  // save-tracking to trust a SHORTER array (see pushTrackingSync), and
+  // losing it across the gate would let the scrobble rescue undo a delete.
+  if (kind === 'tracking' && opts && opts.intentionalRemoval) {
+    _pendingSyncPushes.trackingIntentional = true;
+  }
+}
+
+function flushDeferredSyncPushes() {
+  const pending = _pendingSyncPushes;
+  _pendingSyncPushes = null;
+  if (!pending) return;
+  if (pending.config && typeof pushCreatorSync === 'function') pushCreatorSync();
+  if (pending.channels && typeof pushChannelsSync === 'function') pushChannelsSync();
+  if (pending.presets) {
+    const fn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+    const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+    if (fn) fn(getMapFn());
+  }
+  if (pending.tracking && typeof pushTrackingSync === 'function') {
+    pushTrackingSync({ intentionalRemoval: !!pending.trackingIntentional });
+  }
+}
+
+// Called by loadCreatorSync once the account's state has been applied -- and
+// by the failsafe above if it never can be.
+function markCreatorSyncLoaded() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (_creatorSyncGateTimer) { clearTimeout(_creatorSyncGateTimer); _creatorSyncGateTimer = null; }
+  _creatorSyncLoadedFor = activeCreator.creatorName;
+  flushDeferredSyncPushes();
+}
+window.markCreatorSyncLoaded = markCreatorSyncLoaded;
+
+function armCreatorSyncGateFailsafe() {
+  if (_creatorSyncGateTimer) clearTimeout(_creatorSyncGateTimer);
+  _creatorSyncGateTimer = setTimeout(() => {
+    _creatorSyncGateTimer = null;
+    markCreatorSyncLoaded();
+  }, CREATOR_SYNC_GATE_FAILSAFE_MS);
+}
+
+// --- What this device has of its own, and what is merely stale --------------
+//
+// loadCreatorSync unions any local-only tracking items back into what the
+// server just sent, so an item added here and not yet pushed is not lost. The
+// same union also re-adds anything this device is merely STALE about -- an
+// item another device removed -- and the wrong read of the two silently undid
+// the other device's change.
+//
+// Telling them apart needs to know whether THIS device has touched the list
+// since it was last level with the account. The server's tracking stamp
+// cannot answer that on its own: the merge stamps localList.updatedAt =
+// Date.now() every time it runs, which lands a moment AFTER the server
+// version it just adopted, so a freshly-synced list always looks newer than
+// the baseline it was built from -- and every cold start read "keep
+// everything" again.
+//
+// So the baseline recorded here is the local list's own updatedAt at the last
+// moment this browser and the account are known to have agreed: after a load
+// that kept nothing local-only, and after a successful push. Unequal means
+// this device has edited the list since; equal means it has not, and the
+// server's copy is simply newer.
+const TRACKING_LOCAL_BASELINE_KEY = 'myListAddon:trackingLocalBaseline';
+
+function loadTrackingLocalBaseline() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TRACKING_LOCAL_BASELINE_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    if (!raw.account || raw.account !== currentSyncAccountName()) return null;
+    return raw;
+  } catch (e) {
+    return null;
+  }
+}
+
+// stamps: { 'watch-history': <the updatedAt that is now agreed>, ... }
+function recordTrackingLocalBaseline(stamps) {
+  const account = currentSyncAccountName();
+  if (!account || !stamps) return;
+  try {
+    const current = loadTrackingLocalBaseline() || {};
+    const next = { account: account };
+    ['watch-history', 'continue-watching', 'watchlist'].forEach((k) => {
+      const offered = Object.prototype.hasOwnProperty.call(stamps, k) ? stamps[k] : undefined;
+      const v = Number.isFinite(Number(offered)) && offered !== null && offered !== '' ? offered : current[k];
+      if (Number.isFinite(Number(v))) next[k] = Number(v);
+    });
+    localStorage.setItem(TRACKING_LOCAL_BASELINE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // Same as the sync baselines: without it this is the old behaviour.
+  }
+}
+
 let creatorSyncSaveTimer = null;
 // Debounced -- reordering a list of rows, toggling several panels, or
 // typing into a preset name can all fire this repeatedly in quick
@@ -39788,6 +40143,9 @@ async function pushChannelsSync() {
   if (typeof activeCreator === 'undefined' || !activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen.
+  if (!creatorSyncGateOpen()) { deferSyncPush('channels'); return; }
   try {
     const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
     const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
@@ -39816,6 +40174,7 @@ async function pushChannelsSync() {
     const data = await res.json().catch(() => null);
     if (data && data.ok && typeof data.updatedAt === 'number') {
       window._serverChannelsUpdatedAt = data.updatedAt;
+      saveSyncBaselines({ channels: data.updatedAt });
     }
   } catch (e) {
     // silently fail, it's a background sync
@@ -39834,6 +40193,8 @@ async function pushChannelsSync() {
 // local copy looked complete.
 let trackingSyncTimer = null;
 let _pendingIntentionalRemoval = false;
+// See pushTrackingSync's 409 handler.
+let _trackingConflictRetryInFlight = false;
 function scheduleTrackingSync(opts) {
   if (!activeCreator) return;
   if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
@@ -39856,6 +40217,10 @@ async function pushCreatorSync() {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen. This is the config blob: the catalog rows, which is
+  // where "my list rows came back after opening the phone" came from.
+  if (!creatorSyncGateOpen()) { deferSyncPush('config'); return; }
   try {
     const res = await fetch(ORIGIN + '/api/creator/sync/save', {
       method: 'POST',
@@ -39900,6 +40265,7 @@ async function pushCreatorSync() {
     const data = await res.json().catch(() => null);
     if (data && data.ok && typeof data.updatedAt === 'number') {
       window._serverSyncUpdatedAt = data.updatedAt;
+      saveSyncBaselines({ config: data.updatedAt });
     }
     window._lastCreatorSyncPushedAt = Date.now();
   } catch (e) {
@@ -40038,6 +40404,12 @@ async function pushTrackingSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Not until this browser has seen what the account holds. This endpoint
+  // replaces Watch History and Continue Watching wholesale, and the timers
+  // that start the page (refreshAiringNext at 600ms,
+  // backfillWatchHistoryEpisodeStills at 1400ms) reach it long before the
+  // first load answers -- see creatorSyncGateOpen for the whole story.
+  if (!creatorSyncGateOpen()) { deferSyncPush('tracking', opts); return; }
   try {
     const localMap = loadLocalCustomLists();
     // An intentional removal must always reach the server -- it is the one
@@ -40052,7 +40424,16 @@ async function pushTrackingSync(opts) {
     const wl = localMap['watchlist'] || {};
     const wlItems = Array.isArray(wl.items) ? wl.items : [];
     const wlUpdatedAt = Number(wl.updatedAt) || Date.now();
-    await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
+    // Read before the request, not after: an edit landing while it is in
+    // flight must leave the list looking dirty on the next load, or that
+    // edit would be judged already-agreed and dropped. See
+    // recordTrackingLocalBaseline.
+    const sentStamps = {
+      'watch-history': Number((localMap['watch-history'] || {}).updatedAt) || 0,
+      'continue-watching': Number((localMap['continue-watching'] || {}).updatedAt) || 0,
+      'watchlist': wlUpdatedAt,
+    };
+    const res = await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -40085,8 +40466,47 @@ async function pushTrackingSync(opts) {
         // so an intentional delete can never be silently undone by that
         // rescue on the very next autosave.
         intentionalRemoval: !!(opts && opts.intentionalRemoval),
+        // The version of the account's tracking record this push is built on
+        // -- the server refuses rather than overwrite a newer one. See
+        // save-tracking's own comment for why this is a dedicated version
+        // rather than updatedAt (a scrobble moves updatedAt and must not
+        // start a conflict).
+        expectedClientVersion: window._serverTrackingClientVersion,
       }),
     });
+    if (res && res.status === 409) {
+      // Another browser saved after the version this push cites. Pull that
+      // state, then send this device's changes once, now against the right
+      // baseline. Bounded to one retry: a second conflict means yet another
+      // writer, and the next scheduled push carries the newer baseline
+      // anyway -- what must not happen is this browser looping, or giving up
+      // silently on an intentional removal.
+      if (!(opts && opts.isConflictRetry) && !_trackingConflictRetryInFlight && typeof loadCreatorSync === 'function') {
+        // One conflict cycle at a time across the whole page, not just down
+        // this call stack: the load below can itself start a push (it does,
+        // when it finds local-only items), and that push can conflict too --
+        // which without this is a load/push loop rather than a retry.
+        _trackingConflictRetryInFlight = true;
+        try {
+          await loadCreatorSync({ background: true });
+          return await pushTrackingSync(Object.assign({}, opts || {}, { isConflictRetry: true }));
+        } finally {
+          _trackingConflictRetryInFlight = false;
+        }
+      }
+      return;
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (data && data.ok) {
+      if (Number.isFinite(Number(data.clientVersion))) {
+        window._serverTrackingClientVersion = Number(data.clientVersion);
+        saveSyncBaselines({ trackingClient: Number(data.clientVersion) });
+      }
+      // This device and the account now agree on what was sent, so a later
+      // load can tell a genuine local edit from a stale copy of something
+      // removed elsewhere.
+      recordTrackingLocalBaseline(sentStamps);
+    }
     window._lastTrackingSyncPushedAt = Date.now();
     window._lastTrackingSig = sig;
   } catch (e) {
@@ -40124,9 +40544,23 @@ async function pushTrackingSync(opts) {
 // keeping. On this device's very first sync ever (no prior baseline to
 // compare against), there is no way to tell -- so it keeps the old,
 // preserve-everything behavior rather than risk dropping real data.
-function shouldKeepLocalOnlyTracking(localList, priorTrackingUpdatedAt) {
-  if (typeof priorTrackingUpdatedAt === 'undefined') return true;
+//
+// The persisted per-list baseline (recordTrackingLocalBaseline, above) is the
+// answer where there is one, and it is what makes this work at all on a phone:
+// the timestamp comparison below can only ever compare against a stamp held in
+// a window. variable, so a re-launched PWA had no baseline, took the
+// first-sync branch, and re-added everything the desktop had removed --
+// every single time it was opened.
+function shouldKeepLocalOnlyTracking(localList, priorTrackingUpdatedAt, listKey) {
   const localUpdatedAt = Number(localList && localList.updatedAt) || 0;
+  const baseline = listKey ? loadTrackingLocalBaseline() : null;
+  if (baseline && Object.prototype.hasOwnProperty.call(baseline, listKey)) {
+    // This device has edited the list since the last time the two sides were
+    // known to agree -- and only then is "missing from the server's answer"
+    // something this device might legitimately be holding.
+    return localUpdatedAt !== Number(baseline[listKey]);
+  }
+  if (typeof priorTrackingUpdatedAt === 'undefined') return true;
   return localUpdatedAt > priorTrackingUpdatedAt;
 }
 
@@ -40164,9 +40598,19 @@ async function loadCreatorSync(opts) {
     if (isStale()) return;
     const data = await res.json();
     if (isStale()) return;
-    if (!data.ok) return;
+    if (!data.ok) {
+      // Answered, but not with state this browser can adopt (a rejected key,
+      // a storage error). Same failsafe as the catch below: the gate must
+      // not hold pushes forever on a load that is never going to arrive.
+      armCreatorSyncGateFailsafe();
+      return;
+    }
     window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
+      // This account has nothing stored, so there is nothing to be stale
+      // against and this browser's state becomes its first save -- open the
+      // gate first, or the pushes below would defer against themselves.
+      markCreatorSyncLoaded();
       pushCreatorSync();
       const localPresets = loadPresetsMap();
       if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
@@ -40192,6 +40636,21 @@ async function loadCreatorSync(opts) {
       presets: Number(synced.presetsUpdatedAt) || 0,
       channels: Number(synced.channelsUpdatedAt) || 0,
     };
+    // The same stamps, kept where the next cold start can find them. Without
+    // this the first push of every new page session cites nothing and the
+    // server's conflict guard cannot fire -- see loadSyncBaselines.
+    saveSyncBaselines({
+      config: Number(synced.updatedAt) || 0,
+      tracking: Number(synced.trackingUpdatedAt) || 0,
+      presets: Number(synced.presetsUpdatedAt) || 0,
+      channels: Number(synced.channelsUpdatedAt) || 0,
+      trackingClient: Number.isFinite(Number(synced.trackingClientVersion))
+        ? Number(synced.trackingClientVersion)
+        : undefined,
+    });
+    if (Number.isFinite(Number(synced.trackingClientVersion))) {
+      window._serverTrackingClientVersion = Number(synced.trackingClientVersion);
+    }
     const timeChanged = typeof window._serverSyncUpdatedAt === 'undefined' || (synced.updatedAt && synced.updatedAt > window._serverSyncUpdatedAt);
     if (synced.updatedAt !== undefined) window._serverSyncUpdatedAt = synced.updatedAt;
     // The baselines the presets and channels pushes build on, adopted from
@@ -40578,7 +41037,7 @@ async function loadCreatorSync(opts) {
         const localWH = loadLocalCustomLists()['watch-history'];
         const localWHItems = (localWH && Array.isArray(localWH.items)) ? localWH.items : [];
         const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
-        const keepLocalOnlyWH = shouldKeepLocalOnlyTracking(localWH, priorServerTrackingUpdatedAt);
+        const keepLocalOnlyWH = shouldKeepLocalOnlyTracking(localWH, priorServerTrackingUpdatedAt, 'watch-history');
         const localOnlyWH = keepLocalOnlyWH
           ? localWHItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
           : [];
@@ -40613,6 +41072,13 @@ async function loadCreatorSync(opts) {
 
         if (localOnlyWH.length > 0 && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
+        } else if (!isRecentRemoval) {
+          // Nothing of this device's own was folded in, so what is on disk is
+          // exactly what the account holds: record that agreement, so the
+          // next load can tell a real local edit from a stale copy. Recorded
+          // only here, never when local items were kept -- those still have
+          // to reach the server before the two sides agree about them.
+          recordTrackingLocalBaseline({ 'watch-history': wh.updatedAt });
         }
         touchedTracking = true;
       }
@@ -40621,7 +41087,7 @@ async function loadCreatorSync(opts) {
         const localCW = loadLocalCustomLists()['continue-watching'];
         const localCWItems = (localCW && Array.isArray(localCW.items)) ? localCW.items : [];
         const serverShowIds = new Set(serverCW.map((it) => String(it && it.showId)).filter(Boolean));
-        const keepLocalOnlyCW = shouldKeepLocalOnlyTracking(localCW, priorServerTrackingUpdatedAt);
+        const keepLocalOnlyCW = shouldKeepLocalOnlyTracking(localCW, priorServerTrackingUpdatedAt, 'continue-watching');
         const localOnlyCW = keepLocalOnlyCW
           ? localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))))
           : [];
@@ -40640,6 +41106,8 @@ async function loadCreatorSync(opts) {
 
         if (localOnlyCW.length > 0 && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
+        } else if (!isRecentRemoval) {
+          recordTrackingLocalBaseline({ 'continue-watching': cw.updatedAt });
         }
         touchedTracking = true;
       }
@@ -40651,7 +41119,7 @@ async function loadCreatorSync(opts) {
         const localItems = (localWL && Array.isArray(localWL.items)) ? localWL.items : [];
 
         const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
-        const keepLocalOnlyWL = shouldKeepLocalOnlyTracking(localWL, priorServerTrackingUpdatedAt);
+        const keepLocalOnlyWL = shouldKeepLocalOnlyTracking(localWL, priorServerTrackingUpdatedAt, 'watchlist');
         const localOnly = keepLocalOnlyWL
           ? localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
           : [];
@@ -40663,6 +41131,8 @@ async function loadCreatorSync(opts) {
 
         if (localOnly.length > 0 && typeof pushTrackingSync === 'function') {
           pushTrackingSync();
+        } else if (!isRecentRemoval) {
+          recordTrackingLocalBaseline({ 'watchlist': map['watchlist'].updatedAt });
         }
         touchedTracking = true;
       }
@@ -40742,9 +41212,20 @@ async function loadCreatorSync(opts) {
     suppressSave = true;
     saveState();
     suppressSave = false;
+
+    // The account's state is applied, so anything this browser wants to send
+    // is now built on it rather than on nothing. Releases whatever was held
+    // back while this load was in flight -- see creatorSyncGateOpen.
+    markCreatorSyncLoaded();
   } catch (e) {
     // Network hiccup -- stay with whatever's already on this browser
     // rather than blocking on a retry.
+    //
+    // The gate cannot stay shut on a failure, or a browser that opened
+    // offline would never sync again for as long as the page stayed open.
+    // It opens on a timer instead, by which point a push is guarded by the
+    // persisted baseline rather than by having seen the load.
+    armCreatorSyncGateFailsafe();
   }
 }
 
@@ -41300,6 +41781,62 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
 }
 window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
 
+// Lists the ACCOUNT says were deleted, from /api/creator/lists.
+//
+// A local tombstone (recordCreatorListDeletion above) is what stops the
+// deleting browser restoring its own delete. It says nothing to any other
+// browser -- and to another browser, an account that no longer has a list is
+// indistinguishable from an account that never received it, which is the case
+// uploadMissingLocalListsToAccount exists to repair. So a list deleted on the
+// desktop was faithfully re-uploaded by the phone the next time it opened,
+// generally within a minute of the person deleting it.
+//
+// The account now records its own deletions (readCreatorListDeletions,
+// 02_http-and-creator-utils.js) and hands them back here. Applying one is the
+// same three steps the deleting browser already takes: tombstone it so the
+// backfill leaves it alone, drop it from this browser's local map, and remove
+// any catalog row still pointing at it.
+//
+// Deliberately not a delete request of its own -- the list is already gone
+// from the account; this is one browser catching up with that.
+function applyServerListDeletions(deletedSlugs) {
+  if (!Array.isArray(deletedSlugs) || !deletedSlugs.length) return 0;
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  let removed = 0;
+  let rowsPruned = false;
+  deletedSlugs.forEach((raw) => {
+    const slug = String(raw || '');
+    // Never the auto-tracked slugs: those are generated from watch state and
+    // are not the account's to delete out from under this browser.
+    if (!slug || BACKFILL_SKIP_SLUGS.has(slug)) return;
+    // Recorded even when this browser has no copy -- a response that arrives
+    // before some other tab writes one still has to win.
+    recordCreatorListDeletion(slug);
+    Object.keys(map).forEach((k) => {
+      const l = map[k];
+      if (k === slug || (l && (l.slug === slug || l.creatorSlug === slug || l.localSlug === slug || l.listSlug === slug))) {
+        delete map[k];
+        removed++;
+      }
+    });
+    if (typeof document !== 'undefined' && typeof parseCustomListPayloadClient === 'function') {
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (!rowPayload) return;
+        if (rowPayload.creatorSlug === slug || rowPayload.localSlug === slug || rowPayload.slug === slug || rowPayload.listSlug === slug) {
+          const entry = urlInput.closest('.entry');
+          if (entry) { entry.remove(); rowsPruned = true; }
+        }
+      });
+    }
+  });
+  if (removed) saveLocalCustomListsMap(map);
+  if (rowsPruned && typeof saveState === 'function') saveState();
+  return removed;
+}
+window.applyServerListDeletions = applyServerListDeletions;
+
 // Uploads local lists the account does not have yet, and -- the part that
 // matters -- writes the slug the server actually used back into the local
 // store.
@@ -41433,6 +41970,12 @@ async function renderCreatorDashboard(options) {
       return;
     }
     lastCreatorListsData = data.lists;
+
+    // Deletions made on another device, applied before anything below reads
+    // the local map -- needUploading is computed from it further down, and
+    // uploading a list this account has just deleted is precisely the bug
+    // this response's deletedSlugs exists to stop.
+    try { applyServerListDeletions(data.deletedSlugs); } catch (e) {}
     
     // Prune any config rows that reference a creatorSlug no longer on the server
     // (these are ghost rows left behind by previously deleted lists)
@@ -41605,6 +42148,9 @@ async function renderCreatorDashboard(options) {
     const serverSlugs = new Set((data.lists || []).map(l => l.slug));
     const localRestoredCustomLists = [];
     const needUploading = [];
+    // Read once for the whole pass rather than per list -- this parses a
+    // localStorage record, and an account can hold hundreds of lists.
+    const listTombstones = loadDeletedCreatorLists();
     Object.keys(localMapForCreator || {}).forEach((k) => {
       if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
       const l = localMapForCreator[k];
@@ -41616,6 +42162,12 @@ async function renderCreatorDashboard(options) {
       // the local key is what made this block think an uploaded list was
       // still missing and upload it all over again.
       if (!serverSlugs.has(l.creatorSlug || l.slug)) {
+        // Not if the account says it was deleted. applyServerListDeletions
+        // above has normally already removed it from the local map; this is
+        // the belt-and-braces half, for the case where that write failed (a
+        // full localStorage) -- a failed tidy-up must not turn into a list
+        // being re-created on the account.
+        if (listTombstones[l.creatorSlug || l.slug] || listTombstones[k]) return;
         localRestoredCustomLists.push(l);
         if (activeCreator && creatorKey) needUploading.push(l);
       }
@@ -47272,6 +47824,14 @@ async function pushPresetsDirectly(presetsMap) {
   if (!activeCreator) return { ok: false, error: null };
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return { ok: false, error: null };
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen (22_client-creator-profile.js). Presets are a full
+  // overwrite like everything else here, so a cold start pushing this
+  // browser's copy before the load lands replaces the account's.
+  if (typeof creatorSyncGateOpen === 'function' && !creatorSyncGateOpen()) {
+    if (typeof deferSyncPush === 'function') deferSyncPush('presets');
+    return { ok: false, error: null, deferred: true };
+  }
   try {
     // Sent as references too. The account's presets record was the other
     // place the duplicated item data piled up, and it travels over the wire
@@ -47302,7 +47862,10 @@ async function pushPresetsDirectly(presetsMap) {
       console.error('pushPresetsDirectly failed:', res.status, data);
       return { ok: false, error: (data && data.error) || null, status: res.status };
     }
-    if (typeof data.updatedAt === 'number') window._serverPresetsUpdatedAt = data.updatedAt;
+    if (typeof data.updatedAt === 'number') {
+      window._serverPresetsUpdatedAt = data.updatedAt;
+      if (typeof saveSyncBaselines === 'function') saveSyncBaselines({ presets: data.updatedAt });
+    }
     return { ok: true, error: null };
   } catch (e) {
     console.error('pushPresetsDirectly failed:', e);
@@ -47363,7 +47926,12 @@ async function saveCurrentAsPreset() {
 
   if (!localOk) {
     const pushResult = activeCreator ? await pushPresetsDirectly(map) : { ok: false, error: null };
-    if (!pushResult.ok) {
+    // A deferred push is not a failure: the account is signed in and the push is
+    // queued behind this page's first sync load (see creatorSyncGateOpen,
+    // 22_client-creator-profile.js), so telling the person it could not be
+    // saved would be wrong -- and would push them to retry a save that is
+    // already on its way.
+    if (!pushResult.ok && !pushResult.deferred) {
       const errMsg = activeCreator
         ? (pushResult.error
             ? "Could not save this preset to your account: " + pushResult.error
@@ -57569,7 +58137,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // KV reads above -- the lists still have to be read to know whether
       // they changed. What it removes is the transfer and the parse, which
       // is where the stall the person actually feels comes from.
-      const listsPayload = { ok: true, displayName: auth.displayName, lists, order };
+      // Slugs this account has deleted, so a browser still holding a local
+      // copy of one drops it instead of helpfully uploading it again. Without
+      // this the dashboard's own reconciliation re-created every list deleted
+      // on another device, a minute or two after it was deleted -- see
+      // readCreatorListDeletions (02_http-and-creator-utils.js) and
+      // applyServerListDeletions (22_client-creator-profile.js) for the two
+      // halves of that.
+      //
+      // Part of the payload the version hash is taken over, so a delete made
+      // elsewhere can never be hidden behind an "unchanged" reply.
+      const deletedSlugs = Object.keys(await readCreatorListDeletions(env, auth.username))
+        .filter((s) => !lists.some((l) => l && l.slug === s));
+      const listsPayload = { ok: true, displayName: auth.displayName, lists, order, deletedSlugs };
       let listsVersion = "";
       try {
         const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
@@ -57857,6 +58437,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
         }
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
+
+      // Saving a list at a slug the account previously deleted retires that
+      // deletion. The tombstone tells every other device to drop its local
+      // copy of the slug (see readCreatorListDeletions,
+      // 02_http-and-creator-utils.js), so leaving it standing would have them
+      // throw away a list that has just been deliberately re-created.
+      await clearCreatorListDeletion(env, auth.username, slug);
 
       // The record is stored; tell the account's other browsers. Placed here
       // rather than beside the response because the directory step below can
@@ -58238,6 +58825,58 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (!auth.ok) return authFailureResponse(auth);
       const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
 
+      // The stored record, read once: the conflict guard immediately below
+      // and the scrobble merge further down both need it, and it used to be
+      // read only inside the merge.
+      let existingBlob = null;
+      try {
+        const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+        if (existingRaw) existingBlob = JSON.parse(existingRaw);
+      } catch {
+        existingBlob = null;
+      }
+
+      // Conflict guard, the same one /api/creator/sync/save has carried for a
+      // while -- this endpoint had none, and it is the endpoint that overwrites
+      // Watch History and Continue Watching wholesale.
+      //
+      // Two devices signed into one account is the ordinary case here: change
+      // something on the desktop, open the phone, and the phone's own stale
+      // snapshot went up as the full current state with nothing to stop it.
+      // The scrobble merge below cannot help -- it only ever RESCUES items the
+      // stored record has and the push does not, which is precisely what makes
+      // it re-add whatever another device just removed.
+      //
+      // Guarded on a dedicated clientVersion rather than on updatedAt, because
+      // updatedAt also moves for writes no browser made: a scrobble ping
+      // (handleSubtitlesTrack, handleMediaServerScrobble) and the Continue
+      // Watching cron both rewrite this record. Rejecting a browser because a
+      // scrobble landed would 409 constantly during ordinary playback, which
+      // the merge already handles correctly. clientVersion moves only when a
+      // browser saves here, so it answers exactly the question the guard is
+      // asking: has another BROWSER replaced this state since the one I built
+      // my copy on? Those other writers read-modify-write the parsed blob, so
+      // the field survives them; a record written before this existed has no
+      // clientVersion at all, which reads as "no opinion" and behaves exactly
+      // as this endpoint did before.
+      const expectedClient = parseExpectedUpdatedAt(body.expectedClientVersion);
+      if (!expectedClient.ok) {
+        return json({ ok: false, error: "expectedClientVersion must be a number." }, 400);
+      }
+      const storedClientVersion = existingBlob && Number.isFinite(Number(existingBlob.clientVersion))
+        ? Number(existingBlob.clientVersion)
+        : null;
+      if (expectedClient.value !== null && storedClientVersion !== null && storedClientVersion > expectedClient.value) {
+        ctx.waitUntil(bumpStat(env, "sync_conflict"));
+        return json({
+          ok: false,
+          error: "conflict",
+          conflict: true,
+          clientVersion: storedClientVersion,
+          updatedAt: Number(existingBlob.updatedAt) || 0,
+        }, 409);
+      }
+
       // Guard against a narrow but real race: handleSubtitlesTrack and
       // handleMediaServerScrobble both read-modify-write this same KV key
       // directly and outside of any request this browser initiated, so a
@@ -58275,10 +58914,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       let rescuedCount = 0;
       if (!body.intentionalRemoval) {
         try {
-          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-          if (existingRaw) {
-            const existingBlob = JSON.parse(existingRaw);
-
+          if (existingBlob) {
             // Watch History: find server items not present in the incoming payload
             const incomingIds = new Set(
               (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
@@ -58483,6 +59119,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
         scrobbleAllowedUsers: typeof body.scrobbleAllowedUsers === "string" ? body.scrobbleAllowedUsers : "",
         scrobbleBlockAnonymous: typeof body.scrobbleBlockAnonymous === "boolean" ? body.scrobbleBlockAnonymous : false,
+        // Bumped only here, and strictly increasing for the same reason
+        // /api/creator/sync/save's version is (see nextSyncVersion): two saves
+        // inside one frozen Workers millisecond must not be able to claim the
+        // same version, or the guard above cannot tell them apart. This is the
+        // baseline a browser cites as expectedClientVersion.
+        clientVersion: nextSyncVersion(storedClientVersion || 0),
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -58550,7 +59192,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true, rescuedFromScrobble: rescuedCount });
+      // clientVersion goes back so the browser can advance its baseline from
+      // the save itself, without a /sync/load round trip in between -- exactly
+      // what sync/save returns updatedAt for.
+      return json({ ok: true, rescuedFromScrobble: rescuedCount, clientVersion: blob.clientVersion });
     }
 
     // /api/creator/sync/save-presets  (POST)  { creatorName, creatorKey,
@@ -58911,6 +59556,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
             ? trackingBlob.curatedRecommendations
             : null;
           data.trackingUpdatedAt = trackingBlob.updatedAt || 0;
+          // The baseline save-tracking's conflict guard compares against --
+          // see its own comment. Absent on a record written before that guard
+          // existed, and deliberately left undefined rather than 0 in that
+          // case: 0 is an opinion, and the wrong one.
+          data.trackingClientVersion = Number.isFinite(Number(trackingBlob.clientVersion))
+            ? Number(trackingBlob.clientVersion)
+            : undefined;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;

@@ -1741,7 +1741,19 @@
       // KV reads above -- the lists still have to be read to know whether
       // they changed. What it removes is the transfer and the parse, which
       // is where the stall the person actually feels comes from.
-      const listsPayload = { ok: true, displayName: auth.displayName, lists, order };
+      // Slugs this account has deleted, so a browser still holding a local
+      // copy of one drops it instead of helpfully uploading it again. Without
+      // this the dashboard's own reconciliation re-created every list deleted
+      // on another device, a minute or two after it was deleted -- see
+      // readCreatorListDeletions (02_http-and-creator-utils.js) and
+      // applyServerListDeletions (22_client-creator-profile.js) for the two
+      // halves of that.
+      //
+      // Part of the payload the version hash is taken over, so a delete made
+      // elsewhere can never be hidden behind an "unchanged" reply.
+      const deletedSlugs = Object.keys(await readCreatorListDeletions(env, auth.username))
+        .filter((s) => !lists.some((l) => l && l.slug === s));
+      const listsPayload = { ok: true, displayName: auth.displayName, lists, order, deletedSlugs };
       let listsVersion = "";
       try {
         const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
@@ -2029,6 +2041,13 @@
         }
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
+
+      // Saving a list at a slug the account previously deleted retires that
+      // deletion. The tombstone tells every other device to drop its local
+      // copy of the slug (see readCreatorListDeletions,
+      // 02_http-and-creator-utils.js), so leaving it standing would have them
+      // throw away a list that has just been deliberately re-created.
+      await clearCreatorListDeletion(env, auth.username, slug);
 
       // The record is stored; tell the account's other browsers. Placed here
       // rather than beside the response because the directory step below can
@@ -2410,6 +2429,58 @@
       if (!auth.ok) return authFailureResponse(auth);
       const watchlistUpdatedAt = Number(body.watchlistUpdatedAt) || Date.now();
 
+      // The stored record, read once: the conflict guard immediately below
+      // and the scrobble merge further down both need it, and it used to be
+      // read only inside the merge.
+      let existingBlob = null;
+      try {
+        const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+        if (existingRaw) existingBlob = JSON.parse(existingRaw);
+      } catch {
+        existingBlob = null;
+      }
+
+      // Conflict guard, the same one /api/creator/sync/save has carried for a
+      // while -- this endpoint had none, and it is the endpoint that overwrites
+      // Watch History and Continue Watching wholesale.
+      //
+      // Two devices signed into one account is the ordinary case here: change
+      // something on the desktop, open the phone, and the phone's own stale
+      // snapshot went up as the full current state with nothing to stop it.
+      // The scrobble merge below cannot help -- it only ever RESCUES items the
+      // stored record has and the push does not, which is precisely what makes
+      // it re-add whatever another device just removed.
+      //
+      // Guarded on a dedicated clientVersion rather than on updatedAt, because
+      // updatedAt also moves for writes no browser made: a scrobble ping
+      // (handleSubtitlesTrack, handleMediaServerScrobble) and the Continue
+      // Watching cron both rewrite this record. Rejecting a browser because a
+      // scrobble landed would 409 constantly during ordinary playback, which
+      // the merge already handles correctly. clientVersion moves only when a
+      // browser saves here, so it answers exactly the question the guard is
+      // asking: has another BROWSER replaced this state since the one I built
+      // my copy on? Those other writers read-modify-write the parsed blob, so
+      // the field survives them; a record written before this existed has no
+      // clientVersion at all, which reads as "no opinion" and behaves exactly
+      // as this endpoint did before.
+      const expectedClient = parseExpectedUpdatedAt(body.expectedClientVersion);
+      if (!expectedClient.ok) {
+        return json({ ok: false, error: "expectedClientVersion must be a number." }, 400);
+      }
+      const storedClientVersion = existingBlob && Number.isFinite(Number(existingBlob.clientVersion))
+        ? Number(existingBlob.clientVersion)
+        : null;
+      if (expectedClient.value !== null && storedClientVersion !== null && storedClientVersion > expectedClient.value) {
+        ctx.waitUntil(bumpStat(env, "sync_conflict"));
+        return json({
+          ok: false,
+          error: "conflict",
+          conflict: true,
+          clientVersion: storedClientVersion,
+          updatedAt: Number(existingBlob.updatedAt) || 0,
+        }, 409);
+      }
+
       // Guard against a narrow but real race: handleSubtitlesTrack and
       // handleMediaServerScrobble both read-modify-write this same KV key
       // directly and outside of any request this browser initiated, so a
@@ -2447,10 +2518,7 @@
       let rescuedCount = 0;
       if (!body.intentionalRemoval) {
         try {
-          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-          if (existingRaw) {
-            const existingBlob = JSON.parse(existingRaw);
-
+          if (existingBlob) {
             // Watch History: find server items not present in the incoming payload
             const incomingIds = new Set(
               (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
@@ -2655,6 +2723,12 @@
         scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
         scrobbleAllowedUsers: typeof body.scrobbleAllowedUsers === "string" ? body.scrobbleAllowedUsers : "",
         scrobbleBlockAnonymous: typeof body.scrobbleBlockAnonymous === "boolean" ? body.scrobbleBlockAnonymous : false,
+        // Bumped only here, and strictly increasing for the same reason
+        // /api/creator/sync/save's version is (see nextSyncVersion): two saves
+        // inside one frozen Workers millisecond must not be able to claim the
+        // same version, or the guard above cannot tell them apart. This is the
+        // baseline a browser cites as expectedClientVersion.
+        clientVersion: nextSyncVersion(storedClientVersion || 0),
         updatedAt: Date.now(),
       };
       const serialized = JSON.stringify(blob);
@@ -2722,7 +2796,10 @@
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
       }
-      return json({ ok: true, rescuedFromScrobble: rescuedCount });
+      // clientVersion goes back so the browser can advance its baseline from
+      // the save itself, without a /sync/load round trip in between -- exactly
+      // what sync/save returns updatedAt for.
+      return json({ ok: true, rescuedFromScrobble: rescuedCount, clientVersion: blob.clientVersion });
     }
 
     // /api/creator/sync/save-presets  (POST)  { creatorName, creatorKey,
@@ -3083,6 +3160,13 @@
             ? trackingBlob.curatedRecommendations
             : null;
           data.trackingUpdatedAt = trackingBlob.updatedAt || 0;
+          // The baseline save-tracking's conflict guard compares against --
+          // see its own comment. Absent on a record written before that guard
+          // existed, and deliberately left undefined rather than 0 in that
+          // case: 0 is an opinion, and the wrong one.
+          data.trackingClientVersion = Number.isFinite(Number(trackingBlob.clientVersion))
+            ? Number(trackingBlob.clientVersion)
+            : undefined;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;

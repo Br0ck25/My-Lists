@@ -1164,6 +1164,14 @@ async function pushPresetsDirectly(presetsMap) {
   if (!activeCreator) return { ok: false, error: null };
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return { ok: false, error: null };
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen (22_client-creator-profile.js). Presets are a full
+  // overwrite like everything else here, so a cold start pushing this
+  // browser's copy before the load lands replaces the account's.
+  if (typeof creatorSyncGateOpen === 'function' && !creatorSyncGateOpen()) {
+    if (typeof deferSyncPush === 'function') deferSyncPush('presets');
+    return { ok: false, error: null, deferred: true };
+  }
   try {
     // Sent as references too. The account's presets record was the other
     // place the duplicated item data piled up, and it travels over the wire
@@ -1194,7 +1202,10 @@ async function pushPresetsDirectly(presetsMap) {
       console.error('pushPresetsDirectly failed:', res.status, data);
       return { ok: false, error: (data && data.error) || null, status: res.status };
     }
-    if (typeof data.updatedAt === 'number') window._serverPresetsUpdatedAt = data.updatedAt;
+    if (typeof data.updatedAt === 'number') {
+      window._serverPresetsUpdatedAt = data.updatedAt;
+      if (typeof saveSyncBaselines === 'function') saveSyncBaselines({ presets: data.updatedAt });
+    }
     return { ok: true, error: null };
   } catch (e) {
     console.error('pushPresetsDirectly failed:', e);
@@ -1255,7 +1266,12 @@ async function saveCurrentAsPreset() {
 
   if (!localOk) {
     const pushResult = activeCreator ? await pushPresetsDirectly(map) : { ok: false, error: null };
-    if (!pushResult.ok) {
+    // A deferred push is not a failure: the account is signed in and the push is
+    // queued behind this page's first sync load (see creatorSyncGateOpen,
+    // 22_client-creator-profile.js), so telling the person it could not be
+    // saved would be wrong -- and would push them to retry a save that is
+    // already on its way.
+    if (!pushResult.ok && !pushResult.deferred) {
       const errMsg = activeCreator
         ? (pushResult.error
             ? "Could not save this preset to your account: " + pushResult.error

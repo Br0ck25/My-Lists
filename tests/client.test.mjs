@@ -939,3 +939,265 @@ describe("client: See All opens with the list's real size, not just the first pa
       "no total to show yet must fall back to the old progressive count, not claim a wrong one");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The report this suite of tests comes from: change something on the desktop,
+// open the installed PWA on the phone a few minutes later, and the change is
+// reverted. The phone was pushing before it had asked.
+//
+// An installed PWA is re-launched rather than resumed, so it begins every
+// session holding whatever it last saw and knowing no server version at all.
+// Two things followed from that. Its start-up timers (refreshAiringNext at
+// 600ms, backfillWatchHistoryEpisodeStills at 1400ms, every autosave path)
+// reached the push endpoints before the first sync load answered -- and those
+// pushes are full overwrites. And with no baseline in hand they cited no
+// version, so the server's conflict guard, which treats a missing baseline as
+// "an older client with no opinion", let them through.
+describe("client: a cold start asks the account before it tells it anything", () => {
+  const LOCAL_LISTS_KEY = "myListAddon:localCustomLists";
+  const LOAD = "/api/creator/sync/load";
+  const SAVE_TRACKING = "/api/creator/sync/save-tracking";
+  const SAVE_SYNC = "/api/creator/sync/save";
+
+  const withHistory = (items, updatedAt) => JSON.stringify({
+    "watch-history": { slug: "watch-history", name: "Watch History", type: "movie", items, updatedAt },
+  });
+
+  it("holds a tracking push until the first load has been applied", async () => {
+    const pushes = [];
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorKey": "KEY-1",
+        "myListAddon:creatorName": "alice",
+        [LOCAL_LISTS_KEY]: withHistory([{ id: "tt1", type: "movie", name: "Stale", watchedAt: 900 }], 1000),
+      },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: { watchHistory: [], trackingUpdatedAt: 6000, trackingClientVersion: 12 } } }),
+        [SAVE_TRACKING]: (req) => { pushes.push(req.body); return { json: { ok: true, clientVersion: 13 } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    await client.call("pushTrackingSync");
+    assert.equal(pushes.length, 0,
+      "a push before the first load is what overwrote the account with this browser's stale copy");
+
+    await client.call("loadCreatorSync");
+    await settle();
+    assert.equal(pushes.length, 1, "and it must not be dropped either -- it goes up once the load lands");
+    assert.equal(pushes[0].expectedClientVersion, 12,
+      "against the version the load just reported, so the server can refuse it if it is already stale");
+  });
+
+  it("keeps an intentional removal intentional across the wait", async () => {
+    // intentionalRemoval is what tells save-tracking to trust a SHORTER
+    // array. Losing it while the push waits would let the scrobble rescue
+    // put back the item the person just deleted.
+    const pushes = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice", [LOCAL_LISTS_KEY]: withHistory([], 1000) },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: { watchHistory: [], trackingUpdatedAt: 6000 } } }),
+        [SAVE_TRACKING]: (req) => { pushes.push(req.body); return { json: { ok: true, clientVersion: 2 } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    await client.call("pushTrackingSync", { intentionalRemoval: true });
+    assert.equal(pushes.length, 0);
+    await client.call("loadCreatorSync");
+    await settle();
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].intentionalRemoval, true);
+  });
+
+  it("cites the version it last saw, on a session that has not loaded yet", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorKey": "KEY-1",
+        "myListAddon:creatorName": "alice",
+        // What the previous session ended knowing. Before this was persisted
+        // it lived in a window. variable and every new session started blind.
+        "myListAddon:syncBaselines": JSON.stringify({ account: "alice", config: 4242 }),
+      },
+      routes: { [SAVE_SYNC]: (req) => { saves.push(req.body); return { json: { ok: true, updatedAt: 4300 } }; } },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("markCreatorSyncLoaded");
+
+    await client.call("pushCreatorSync");
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].expectedUpdatedAt, 4242,
+      "a cold start that cites nothing is a last-write-wins overwrite of whatever the other device did");
+  });
+
+  it("does not adopt a baseline belonging to a different account", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorKey": "KEY-1",
+        "myListAddon:creatorName": "bob",
+        "myListAddon:syncBaselines": JSON.stringify({ account: "alice", config: 4242 }),
+      },
+      routes: { [SAVE_SYNC]: (req) => { saves.push(req.body); return { json: { ok: true, updatedAt: 1 } }; } },
+    });
+    client.set("activeCreator", { creatorName: "bob" });
+    client.call("markCreatorSyncLoaded");
+
+    await client.call("pushCreatorSync");
+    assert.equal(saves[0].expectedUpdatedAt, undefined,
+      "citing another account's version would 409 forever rather than be merely wrong once");
+  });
+
+  it("retries a refused tracking push once, against the version it was refused with", async () => {
+    const pushes = [];
+    let loads = 0;
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice", [LOCAL_LISTS_KEY]: withHistory([{ id: "tt1", watchedAt: 5 }], 1000) },
+      routes: {
+        [LOAD]: () => {
+          loads++;
+          return { json: { ok: true, data: { watchHistory: [{ id: "tt1", watchedAt: 5 }], trackingUpdatedAt: 6000, trackingClientVersion: 99 } } };
+        },
+        [SAVE_TRACKING]: (req) => {
+          pushes.push(req.body);
+          if (pushes.length === 1) return { status: 409, json: { ok: false, conflict: true, clientVersion: 99 } };
+          return { json: { ok: true, clientVersion: 100 } };
+        },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("markCreatorSyncLoaded");
+
+    await client.call("pushTrackingSync");
+    await settle();
+    assert.equal(pushes.length, 2, "a refusal must be answered by pulling and re-sending, not by giving up");
+    assert.ok(loads >= 1, "and the retry must be built on what the account actually holds");
+    assert.equal(pushes[1].expectedClientVersion, 99);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The same report's tracking half, at the merge rather than the push.
+//
+// shouldKeepLocalOnlyTracking's timestamp comparison could only ever read a
+// baseline held in a window. variable, so a re-launched PWA took its
+// first-sync branch ("no baseline, keep everything") on every single launch --
+// and re-added, then re-pushed, whatever the desktop had removed.
+describe("client: a relaunched app does not un-delete what another device removed", () => {
+  const LOCAL_LISTS_KEY = "myListAddon:localCustomLists";
+  const LOAD = "/api/creator/sync/load";
+
+  const seeded = (baseline, localUpdatedAt) => loadClient({
+    storage: Object.assign({
+      "myListAddon:creatorKey": "KEY-1",
+      "myListAddon:creatorName": "alice",
+      [LOCAL_LISTS_KEY]: JSON.stringify({
+        "watch-history": {
+          slug: "watch-history", name: "Watch History", type: "movie",
+          items: [{ id: "tt1", type: "movie", name: "Removed On Desktop", watchedAt: 900 }],
+          updatedAt: localUpdatedAt,
+        },
+      }),
+    }, baseline ? { "myListAddon:trackingLocalBaseline": JSON.stringify(baseline) } : {}),
+    routes: {
+      [LOAD]: () => ({ json: { ok: true, data: { watchHistory: [], trackingUpdatedAt: 6000 } } }),
+      "/api/creator/sync/save-tracking": () => ({ json: { ok: true, clientVersion: 2 } }),
+      [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+    },
+  });
+
+  it("drops the stale item on a fresh page session, with no in-memory baseline at all", async () => {
+    const client = seeded({ account: "alice", "watch-history": 1000 }, 1000);
+    client.set("activeCreator", { creatorName: "alice" });
+    // Deliberately no window._serverTrackingUpdatedAt: this is a launch, not
+    // a resume, which is exactly the case that used to keep everything.
+    await client.call("loadCreatorSync");
+    await settle();
+    assert.deepEqual([...client.get("loadLocalCustomLists()['watch-history'].items")], [],
+      "the removal made on the other device must stick");
+  });
+
+  it("still keeps an edit this device made after that agreement", async () => {
+    const client = seeded({ account: "alice", "watch-history": 1000 }, 5500);
+    client.set("activeCreator", { creatorName: "alice" });
+    await client.call("loadCreatorSync");
+    await settle();
+    assert.deepEqual([...client.get("loadLocalCustomLists()['watch-history'].items")].map((it) => it.id), ["tt1"],
+      "a local edit that never reached the server is not the same thing as a stale copy");
+  });
+
+  it("records the agreement when a load keeps nothing local", async () => {
+    const client = seeded(null, 1000);
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("window._serverTrackingUpdatedAt", 5000);
+    await client.call("loadCreatorSync");
+    await settle();
+    const stored = JSON.parse(client.get("localStorage").getItem("myListAddon:trackingLocalBaseline"));
+    assert.equal(stored.account, "alice");
+    assert.equal(stored["watch-history"], client.get("loadLocalCustomLists()['watch-history'].updatedAt"),
+      "without this the next launch has nothing to judge its own local copy against");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// And the list half: a list deleted on the desktop was back on the account a
+// minute after the phone was opened, because to the phone "the account does
+// not have this list" and "the account never received this list" looked the
+// same -- and the second is what uploadMissingLocalListsToAccount exists to
+// repair.
+describe("client: a list deleted on another device is not uploaded back", () => {
+  const LOCAL_LISTS_KEY = "myListAddon:localCustomLists";
+
+  const withLocalList = () => JSON.stringify({
+    faves: { slug: "faves", creatorSlug: "faves", name: "Faves", type: "movie", items: [{ id: "tt1" }], visibility: "private" },
+  });
+
+  it("drops the local copy and tombstones the slug", () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorKey": "KEY-1",
+        "myListAddon:creatorName": "alice",
+        [LOCAL_LISTS_KEY]: withLocalList(),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const removed = client.call("applyServerListDeletions", ["faves"]);
+    assert.equal(removed, 1);
+    assert.equal(client.get("loadLocalCustomLists()").faves, undefined,
+      "the browser has to catch up with the delete, not hold the only copy of it");
+    const tombstones = JSON.parse(client.get("localStorage").getItem("myListAddon:deletedCreatorLists"));
+    assert.ok(tombstones.faves, "and remember it, so the backfill does not restore it a moment later");
+  });
+
+  it("leaves the auto-tracked slugs alone", () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorKey": "KEY-1",
+        "myListAddon:creatorName": "alice",
+        [LOCAL_LISTS_KEY]: JSON.stringify({ "watch-history": { slug: "watch-history", items: [{ id: "tt1" }] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("applyServerListDeletions", ["watch-history"]);
+    assert.ok(client.get("loadLocalCustomLists()['watch-history']"),
+      "Watch History is generated from watch state -- it is not the account's to delete out from under this browser");
+  });
+
+  it("a tombstoned list is not re-created by the backfill", () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("applyServerListDeletions", ["faves"]);
+    const restored = client.call("backfillCreatorListsIntoLocalMap", [
+      { slug: "faves", name: "Faves", type: "movie", items: [{ id: "tt1" }] },
+    ]);
+    assert.equal(restored, 0);
+  });
+});

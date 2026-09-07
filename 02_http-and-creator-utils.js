@@ -1652,6 +1652,116 @@ async function removeListsFromPublicIndex(env, ids) {
   }
 }
 
+// --- "this account deleted that list" ----------------------------------------
+//
+// A list deleted on one device came back a few minutes later on another, and
+// this key is what stops it.
+//
+// Deleting a list removes its record, its order entry and its directory entry
+// -- so from any OTHER signed-in browser, an account that no longer has the
+// list is indistinguishable from an account that never received it. That
+// browser still holds the list in its own localStorage, and
+// renderCreatorDashboard's reconciliation (uploadMissingLocalListsToAccount,
+// 22_client-creator-profile.js) exists precisely to push a list the account is
+// missing back up. Its own comment describes the recovery it was written for
+// -- a browser whose copy survived when the server's did not -- and a deletion
+// made somewhere else reads exactly the same way. So the phone re-created what
+// the desktop had deleted, and the person's delete undid itself.
+//
+// The deleting browser already writes a LOCAL tombstone for the same reason
+// (recordCreatorListDeletion), which is why the delete sticks on the device it
+// was made on and nowhere else. This is that tombstone, kept on the account
+// where every device can see it.
+//
+// Bounded on both axes: entries older than the TTL are dropped on every read
+// (a list deleted long ago must not be un-restorable forever if a browser's
+// copy is the last one left), and the newest CREATOR_LIST_TOMBSTONE_MAX are
+// kept so a bulk delete cannot grow this key without limit.
+const CREATOR_LIST_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CREATOR_LIST_TOMBSTONE_MAX = 300;
+
+function creatorListTombstoneKey(username) {
+  return `creatorlistdeleted:${username}`;
+}
+
+// { slug: deletedAtMs } with anything expired already dropped. Never throws --
+// an unreadable record means "no deletions known", which is the behaviour this
+// whole mechanism replaces, not a worse one.
+async function readCreatorListDeletions(env, username) {
+  if (!env || !env.CONFIGS || !username) return {};
+  let raw = null;
+  try {
+    raw = await env.CONFIGS.get(creatorListTombstoneKey(username));
+  } catch (e) {
+    return {};
+  }
+  if (!raw) return {};
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  const slugs = parsed && typeof parsed === "object" ? (parsed.slugs || parsed) : null;
+  if (!slugs || typeof slugs !== "object") return {};
+  const now = Date.now();
+  const out = {};
+  for (const [slug, at] of Object.entries(slugs)) {
+    const ts = Number(at) || 0;
+    if (ts && now - ts < CREATOR_LIST_TOMBSTONE_TTL_MS) out[slug] = ts;
+  }
+  return out;
+}
+
+// Best-effort by design, like bumpCreatorListsStamp: the list is already gone
+// by the time this runs, and failing the delete over its bookkeeping would be
+// the worse outcome. A lost write costs one device one spurious re-upload --
+// exactly what happened before this key existed.
+//
+// Deliberately does not bump the lists stamp itself: both callers sit inside
+// an operation that already does (deleteCreatorLists, /api/creator/lists/save),
+// and a bump from here would be a second write for the same change. Anything
+// that ever calls this from somewhere else has to bump.
+async function writeCreatorListDeletions(env, username, slugs) {
+  if (!env || !env.CONFIGS || !username) return;
+  try {
+    const entries = Object.entries(slugs)
+      .sort((a, b) => (Number(b[1]) || 0) - (Number(a[1]) || 0))
+      .slice(0, CREATOR_LIST_TOMBSTONE_MAX);
+    if (!entries.length) {
+      await env.CONFIGS.delete(creatorListTombstoneKey(username));
+      return;
+    }
+    await env.CONFIGS.put(
+      creatorListTombstoneKey(username),
+      JSON.stringify({ slugs: Object.fromEntries(entries) })
+    );
+  } catch (e) {
+    console.error("could not record the list deletion", e);
+  }
+}
+
+async function recordCreatorListDeletions(env, username, slugs) {
+  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return;
+  const known = await readCreatorListDeletions(env, username);
+  const now = Date.now();
+  for (const slug of slugs) {
+    if (slug) known[String(slug)] = now;
+  }
+  await writeCreatorListDeletions(env, username, known);
+}
+
+// The other half: re-creating a list at a slug that was deleted is a
+// deliberate act and has to win, or the tombstone would tell every other
+// device to throw the new list away. Called by /api/creator/lists/save.
+async function clearCreatorListDeletion(env, username, slug) {
+  if (!env || !env.CONFIGS || !username || !slug) return;
+  const known = await readCreatorListDeletions(env, username);
+  if (!Object.prototype.hasOwnProperty.call(known, String(slug))) return;
+  delete known[String(slug)];
+  await writeCreatorListDeletions(env, username, known);
+}
+
 // Deletes one or more of a creator's lists: the KV record, the D1 row, the
 // like ledger, the entry in their display order, and the directory index --
 // with a single index write and a single order write however many slugs are
@@ -1738,6 +1848,14 @@ async function deleteCreatorLists(env, username, slugs) {
   } catch (e) {
     console.error("deleteCreatorLists: could not update list order", e);
   }
+
+  // Every device signed into this account has to be told the list is gone, not
+  // merely find it absent -- see readCreatorListDeletions above for why those
+  // two are not the same thing to a browser holding its own copy. Recorded for
+  // every slug asked for, phantom ones included, for the same reason the order
+  // cleanup above covers them: a record that was already missing is exactly
+  // the case where some other browser is still holding the only copy.
+  await recordCreatorListDeletions(env, username, slugs);
 
   // Deleting a list is a list change like any other, and the one shape of it a
   // derived stamp could not have seen: a MAX(updated_at) over the surviving
@@ -2855,6 +2973,10 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorsyncchannels:${u}`,
     `creatorlistorder:${u}`,
     `creatorliststamp:${u}`,
+    // The account's list-deletion record (readCreatorListDeletions). Nothing
+    // owns it once the account does not, and leaving it behind would tell a
+    // re-registered username's browsers to discard lists it never deleted.
+    creatorListTombstoneKey(u),
     `creatorscrobblequeue:${u}`,
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
