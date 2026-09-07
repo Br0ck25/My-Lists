@@ -161,6 +161,7 @@ const CREATOR_POSTS = [
 ];
 
 const ADMIN_GETS = [
+  "/admin/api/creator-lists",
   "/admin/api/leaderboard",
   "/admin/api/feedback",
   "/admin/api/analytics",
@@ -6378,6 +6379,7 @@ describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
   // entry is a claim someone has to re-justify if this list ever grows.
   const NON_MUTATORS = {
     "02_http-and-creator-utils.js :: getCreatorList": "reads one record",
+    "26_api-creator-and-admin-routes.js :: /admin/api/creator-lists": "enumerates one creator's records for the admin browse; changes nothing",
     "26_api-creator-and-admin-routes.js :: /api/creator/lists": "self-heals the order key on a read; the same response already carries the healed order",
     "26_api-creator-and-admin-routes.js :: /api/creator/sync/load": "reads the order key",
     "26_api-creator-and-admin-routes.js :: /api/search-published-lists": "reads published records",
@@ -6689,5 +6691,92 @@ describe("a list deleted on one device stays deleted on the others", () => {
     });
     assert.equal(gone.body.ok, true, JSON.stringify(gone.body).slice(0, 200));
     assert.equal(env.CONFIGS._store.get("creatorlistdeleted:deldev4"), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// You cannot delete what you cannot name.
+//
+// /admin/api/delete-creator-list takes exact slugs, and nothing in the admin
+// dashboard could tell an admin what a creator's slugs are -- the creator's
+// own dashboard is the only place they appear. That is workable for one
+// reported list and useless for the case it keeps being needed for: an
+// account carrying dozens of copies of the same list under slugs nobody could
+// guess (coming-of-age-3 ... coming-of-age-53, per lists/save's own comment),
+// where typing the base name deletes exactly one of them.
+describe("admin: browsing one creator's stored lists", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey }, cookie: await adminCookie(env) };
+  };
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { ...K, type: "movie", visibility: "private", items: [{ id: "tt1" }], ...extra },
+  });
+  const browse = (env, cookie, username) => call(env, `/admin/api/creator-lists?username=${username}`, { cookie });
+
+  it("reports every stored list, with its slug", async () => {
+    const { env, K, cookie } = await mk("browse1");
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Something Else" });
+
+    const r = await browse(env, cookie, "browse1");
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+    const slugs = r.body.lists.map((l) => l.slug).sort();
+    assert.equal(slugs.length, 3, "all three records must be reported");
+    assert.ok(slugs.filter((s) => s.startsWith("coming-of-age")).length === 2,
+      "including the duplicate, whose slug is the part an admin cannot guess");
+    assert.equal(r.body.username, "browse1");
+  });
+
+  it("reports a record the creator's own dashboard cannot see", async () => {
+    // The runaway that minted these duplicates was caused by lost entries in
+    // creatorlistorder:, and a record missing from it is invisible to the
+    // dashboard while still being served at its URL. Browsing the order key
+    // instead of the records would hide exactly the lists most in need of
+    // deleting.
+    const { env, K, cookie } = await mk("browse2");
+    const saved = await save(env, K, { name: "Orphaned" });
+    env.CONFIGS._store.set("creatorlistorder:browse2", JSON.stringify({ order: [] }));
+
+    const r = await browse(env, cookie, "browse2");
+    const row = r.body.lists.find((l) => l.slug === saved.body.slug);
+    assert.ok(row, "a record with no order entry must still be listed");
+    assert.equal(row.inOrder, false, "and be marked as the orphan it is");
+    assert.equal(r.body.orderCount, 0);
+  });
+
+  it("rejects an invalid username rather than reading a made-up prefix", async () => {
+    const { env, cookie } = await mk("browse3");
+    const r = await call(env, "/admin/api/creator-lists?username=" + encodeURIComponent("../evil"), { cookie });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("browse then delete removes every copy, and records it for the creator's devices", async () => {
+    const { env, K, cookie } = await mk("browse4");
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Keep This" });
+
+    const listed = await browse(env, cookie, "browse4");
+    const doomed = listed.body.lists.filter((l) => l.name === "Coming Of Age").map((l) => l.slug);
+    assert.equal(doomed.length, 2, "precondition: both copies found by name");
+
+    const del = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "browse4", slugs: doomed },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body).slice(0, 200));
+    assert.deepEqual([...del.body.deleted].sort(), [...doomed].sort());
+
+    const after = await browse(env, cookie, "browse4");
+    assert.deepEqual(after.body.lists.map((l) => l.name), ["Keep This"], "the duplicates must be gone");
+
+    // And the creator's other signed-in browsers must be told, or they upload
+    // their own copies straight back -- which is what "it will not delete
+    // them" was.
+    const owner = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual([...owner.body.deletedSlugs].sort(), [...doomed].sort());
   });
 });

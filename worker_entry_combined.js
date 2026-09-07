@@ -7243,10 +7243,22 @@ async function renderAdminDashboard(env) {
     <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Delete a creator&rsquo;s lists</div>
       <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Removes specific lists belonging to one Creator Profile: the list itself, its likes, its place in that creator&rsquo;s order, and its directory entry. Use it for content a creator cannot or will not remove themselves. A slug whose list is already gone is still cleared from the directory, which is how you get rid of an entry that shows an item count but opens empty.</p>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Browse first: this reads the creator&rsquo;s actual stored records, including any the creator&rsquo;s own dashboard cannot see because they are missing from their display order &mdash; which is how an account ends up with dozens of copies of one list under slugs nobody could guess. Filter by name, select them all, then delete. Deleting also records the deletion on the account, so the creator&rsquo;s other signed-in browsers drop their copies instead of uploading them straight back.</p>
       <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list. Prefer &ldquo;Rebuild Public List Index&rdquo; above first &mdash; if the lists are only phantom directory entries, that fixes them without deleting anything.</p>
       <div class="row" style="margin-bottom:8px;">
         <input type="text" id="deleteListUserInput" class="admin-select" placeholder="Creator username" style="margin-right:6px;">
-        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:260px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseCreatorListsBtn" onclick="loadCreatorLists(true)">Browse this creator&rsquo;s lists</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseCreatorListsMoreBtn" onclick="loadCreatorLists(false)" hidden>Load more</button>
+        <span id="creatorListsStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="creatorListsFilterInput" class="admin-select" placeholder="Filter by name or slug (e.g. coming of age)" style="min-width:280px; margin-right:6px;" oninput="renderCreatorListsTable()">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="selectShownListsBtn" onclick="selectShownCreatorLists()">Select all shown</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="clearSelectedListsBtn" onclick="clearSelectedCreatorLists()">Clear selection</button>
+      </div>
+      <div id="creatorListsResults" style="margin-bottom:8px; max-height:340px; overflow:auto;"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:320px;">
       </div>
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
       <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
@@ -7650,6 +7662,172 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
     }
 
+    // Browsing one creator's stored list records.
+    //
+    // The delete below takes exact slugs, and until now nothing here could
+    // tell you what they were: the creator's own dashboard is the only place
+    // that lists them, an admin cannot open it, and the slugs of a duplicate
+    // run (coming-of-age-3 ... coming-of-age-53) are not guessable. Typing the
+    // base name deletes exactly one of fifty-three.
+    //
+    // Kept in memory rather than re-fetched on every keystroke: the filter
+    // below is a view of what has already been loaded, and paging with "Load
+    // more" appends to it.
+    let creatorListsLoaded = [];
+    let creatorListsCursor = null;
+    let creatorListsUser = '';
+
+    function creatorListsFilterText() {
+      return (document.getElementById('creatorListsFilterInput').value || '').trim().toLowerCase();
+    }
+
+    // Matched against name AND slug, and with spaces treated as the hyphens a
+    // slug actually uses -- someone hunting "coming of age" is typing the
+    // list's name, not "coming-of-age".
+    function creatorListMatchesFilter(L, q) {
+      if (!q) return true;
+      const name = String(L.name || '').toLowerCase();
+      const slug = String(L.slug || '').toLowerCase();
+      const dashed = q.replace(/\\s+/g, '-');
+      return name.indexOf(q) !== -1 || slug.indexOf(q) !== -1 || slug.indexOf(dashed) !== -1;
+    }
+
+    function shownCreatorLists() {
+      const q = creatorListsFilterText();
+      return creatorListsLoaded.filter(function (L) { return creatorListMatchesFilter(L, q); });
+    }
+
+    function renderCreatorListsTable() {
+      const results = document.getElementById('creatorListsResults');
+      const status = document.getElementById('creatorListsStatus');
+      if (!creatorListsLoaded.length) {
+        results.innerHTML = '';
+        return;
+      }
+      const shown = shownCreatorLists();
+      if (!shown.length) {
+        results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No list matches that filter.</p>';
+      } else {
+        const rows = shown.map(function (L) {
+          const vis = L.visibility ? escapeHtmlAdmin(L.visibility) : 'unreadable';
+          // A record the creator's own dashboard cannot see, because its
+          // order entry was lost. These are the ones that get re-uploaded and
+          // re-duplicated, so they are worth calling out rather than hiding.
+          const orphan = L.inOrder ? '' :
+            '<span title="not in this creator\\'s display order" style="color:#FF9500;"> orphan</span>';
+          return '<tr>' +
+            '<td style="padding:4px 8px 4px 0;"><button type="button" class="admin-select" data-creator-slug="' +
+              escapeHtmlAdmin(L.slug) + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem;">Select</button></td>' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + escapeHtmlAdmin(L.slug) + '</code>' + orphan + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(L.name) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + vis + '</td>' +
+            '<td style="padding:4px 0;"><a href="' + escapeHtmlAdmin(L.url) + '" target="_blank" rel="noopener">open</a></td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th></th><th style="padding-right:8px;">Slug</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px;">Visibility</th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+      }
+      const q = creatorListsFilterText();
+      status.textContent = creatorListsLoaded.length + ' list' + (creatorListsLoaded.length === 1 ? '' : 's') +
+        ' loaded for "' + creatorListsUser + '"' +
+        (q ? (', ' + shown.length + ' matching') : '') +
+        (creatorListsCursor ? ', more available.' : '.');
+    }
+
+    async function loadCreatorLists(reset) {
+      const btn = document.getElementById('browseCreatorListsBtn');
+      const moreBtn = document.getElementById('browseCreatorListsMoreBtn');
+      const status = document.getElementById('creatorListsStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      if (!username) {
+        status.textContent = 'Enter a creator username first.';
+        return;
+      }
+      // Switching creator without resetting would mix two accounts' slugs
+      // into one selection, and this is a delete tool.
+      if (reset || username !== creatorListsUser) {
+        creatorListsLoaded = [];
+        creatorListsCursor = null;
+        creatorListsUser = username;
+        document.getElementById('creatorListsResults').innerHTML = '';
+        moreBtn.hidden = true;
+      }
+      btn.disabled = true;
+      moreBtn.disabled = true;
+      status.textContent = 'Loading…';
+      try {
+        const qs = '?username=' + encodeURIComponent(username) + '&limit=200' +
+          (creatorListsCursor ? '&cursor=' + encodeURIComponent(creatorListsCursor) : '');
+        const res = await fetch('/admin/api/creator-lists' + qs);
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          return;
+        }
+        creatorListsLoaded = creatorListsLoaded.concat(data.lists || []);
+        creatorListsCursor = data.cursor || null;
+        moreBtn.hidden = !creatorListsCursor;
+        renderCreatorListsTable();
+        if (!creatorListsLoaded.length) {
+          document.getElementById('creatorListsResults').innerHTML =
+            '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">This creator has no stored lists.</p>';
+        }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      } finally {
+        btn.disabled = false;
+        moreBtn.disabled = false;
+      }
+    }
+
+    // Fills the slug box rather than deleting, exactly as the anonymous browse
+    // does: a one-click delete next to a browse list is how the wrong list
+    // gets removed. The delete button still asks, and still names what it is
+    // about to remove.
+    function setSelectedCreatorSlugs(slugs) {
+      const input = document.getElementById('deleteListSlugsInput');
+      input.value = slugs.join(', ');
+      document.getElementById('deleteListStatus').textContent =
+        slugs.length + ' slug' + (slugs.length === 1 ? '' : 's') + ' selected.';
+    }
+
+    function currentSelectedCreatorSlugs() {
+      const input = document.getElementById('deleteListSlugsInput');
+      return (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+    }
+
+    function selectShownCreatorLists() {
+      const shown = shownCreatorLists();
+      if (!shown.length) {
+        document.getElementById('deleteListStatus').textContent = 'Nothing shown to select.';
+        return;
+      }
+      const current = currentSelectedCreatorSlugs();
+      shown.forEach(function (L) {
+        if (current.indexOf(L.slug) === -1) current.push(L.slug);
+      });
+      setSelectedCreatorSlugs(current);
+    }
+
+    function clearSelectedCreatorLists() {
+      setSelectedCreatorSlugs([]);
+      document.getElementById('deleteListStatus').textContent = 'Selection cleared.';
+    }
+
+    document.getElementById('creatorListsResults').addEventListener('click', function (ev) {
+      const btn = ev.target.closest('[data-creator-slug]');
+      if (!btn) return;
+      const slug = btn.getAttribute('data-creator-slug');
+      const current = currentSelectedCreatorSlugs();
+      if (current.indexOf(slug) === -1) current.push(slug);
+      setSelectedCreatorSlugs(current);
+    });
+
     // Irreversible, so it asks first and names exactly what it is about to
     // remove. The endpoint caps each call (ADMIN_LIST_DELETE_MAX), so a bigger
     // cleanup is sent as several batches here rather than rejected.
@@ -7689,7 +7867,18 @@ async function renderAdminDashboard(env) {
           });
           const data = await res.json();
           if (!data.ok) {
-            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            // The endpoint reports what it managed to remove even when the
+            // sweep as a whole failed -- most often the records are gone and
+            // only the directory cleanup did not finish. Saying just "Failed"
+            // hid that difference, so a delete that had actually worked read
+            // as one that had not, and got retried forever.
+            deleted += (data.deleted || []).length;
+            missing += (data.missing || []).length;
+            const detail = (data.remaining === null || data.remaining === undefined)
+              ? ''
+              : (' ' + data.remaining + ' list' + (data.remaining === 1 ? '' : 's') + ' left for this creator.');
+            status.textContent = 'Failed: ' + (data.error || 'unknown error') +
+              ' (removed ' + deleted + ' before stopping.' + detail + ')';
             btn.disabled = false;
             return;
           }
@@ -60703,6 +60892,91 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // evtcount:list-add:, searchquery:), storing which prefix and how far
     // into its key list this run has reached in migratedaycounts:state so
     // repeated calls make forward progress without redoing work.
+    // /admin/api/creator-lists  (GET)  ?username=...&limit=...&cursor=...
+    //   -> { ok, username, count, lists: [...], cursor, done, orderCount }
+    //
+    // The half of "Delete a creator's lists" that was missing: nothing in this
+    // dashboard could tell you WHICH lists a creator has, and the delete below
+    // takes exact slugs. That is fine for the case it was written for -- an
+    // admin acting on one list somebody reported -- and useless for the case
+    // it keeps being needed for: an account carrying dozens of duplicates of
+    // the same list, minted by the runaway that /api/creator/lists/save's own
+    // comment records (one account reached 129 records for 22 real lists,
+    // coming-of-age-3 through coming-of-age-53). Their slugs are not
+    // guessable, they are not all in the creator's display order, and typing
+    // the base name deletes exactly one of them -- which is what "it will not
+    // delete them" actually is.
+    //
+    // Enumerates the KV records themselves rather than creatorlistorder:,
+    // deliberately. The order key is one value rewritten read-modify-write by
+    // every save, it is what LOST entries during that runaway, and a list
+    // missing from it is precisely the kind that needs cleaning up. inOrder
+    // reports the difference rather than hiding it.
+    if (path === "/admin/api/creator-lists" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      const v = validateCreatorUsername(url.searchParams.get("username"));
+      if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 1), 200);
+      const cursor = url.searchParams.get("cursor") || "";
+      const prefix = `creatorlist:${v.normalized}:`;
+
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix, limit, ...(cursor ? { cursor } : {}) });
+      } catch (e) {
+        return json({ ok: false, error: "Could not read this creator's lists right now." }, 500, { "Cache-Control": "no-store" });
+      }
+
+      // One read for the whole page, not one per row.
+      let order = [];
+      try {
+        const orderRaw = await env.CONFIGS.get(`creatorlistorder:${v.normalized}`);
+        order = orderRaw ? (JSON.parse(orderRaw).order || []) : [];
+      } catch {
+        order = [];
+      }
+      const inOrder = new Set(Array.isArray(order) ? order : []);
+
+      const lists = await Promise.all((listed.keys || []).map(async (k) => {
+        const slug = k.name.slice(prefix.length);
+        let data = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          data = raw ? JSON.parse(raw) : null;
+        } catch {
+          data = null;
+        }
+        return {
+          slug,
+          // Same reasoning as the anonymous browse: a record that will not
+          // parse is still reportable, and is exactly the kind an admin most
+          // needs to be able to select and delete.
+          name: data ? (data.name || "(untitled)") : "(unreadable record)",
+          type: data ? (data.type || "mixed") : null,
+          itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
+          likes: data ? (data.likes || 0) : 0,
+          visibility: data ? effectiveListVisibility(data.visibility) : null,
+          updatedAt: data && Number.isFinite(Number(data.updatedAt)) ? Number(data.updatedAt) : null,
+          inOrder: inOrder.has(slug),
+          url: `${url.origin}/lists/${v.normalized}/${slug}`,
+        };
+      }));
+
+      return json({
+        ok: true,
+        username: v.normalized,
+        count: lists.length,
+        lists,
+        // How many the creator's own dashboard would show from the order key,
+        // so a page where the two disagree says so out loud.
+        orderCount: inOrder.size,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/delete-creator-list  (POST)  { username, slugs: [...] }
     //   -> { ok, deleted: [...], missing: [...], remaining }
     // Admin-only removal of one creator's lists, for cleaning up content the
