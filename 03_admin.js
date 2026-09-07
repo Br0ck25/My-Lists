@@ -1987,6 +1987,14 @@ async function renderAdminDashboard(env) {
     </div>
 
     <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Database schema</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Migrations are applied by hand and nothing records that it happened, so this Worker can end up running ahead of its own database. It degrades quietly when that happens rather than refusing to start &mdash; which is why this check exists. Run it after any deploy that shipped a new file under <code>migrations/</code>.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="schemaCheckBtn" onclick="runSchemaCheck()">Check schema</button>
+      <span id="schemaCheckStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <div id="schemaCheckResult" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
       <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
@@ -2580,6 +2588,66 @@ async function renderAdminDashboard(env) {
           ' slug' + (missing === 1 ? '' : 's') + ' had no list to remove.';
         document.getElementById('deleteAnonSlugsInput').value = '';
         if (anonListCount) await loadPublishedLists(true);
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Reports which files under migrations/ this database has not had run,
+    // and what each omission silently costs. The consequence text is the
+    // useful part: "creator_tombstones is missing" is not something an
+    // operator can act on.
+    async function runSchemaCheck() {
+      const btn = document.getElementById('schemaCheckBtn');
+      const status = document.getElementById('schemaCheckStatus');
+      const out = document.getElementById('schemaCheckResult');
+      btn.disabled = true;
+      status.textContent = 'Checking\u2026';
+      out.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/schema-status');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        if (!data.bound) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>';
+          btn.disabled = false;
+          return;
+        }
+        if (!data.checked) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
+            (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
+            ' This is not the same as a missing migration \u2014 try again.</p>';
+          btn.disabled = false;
+          return;
+        }
+        if (data.upToDate) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>';
+          btn.disabled = false;
+          return;
+        }
+        const rows = (data.missing || []).map(function (m) {
+          return '<tr>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.migration) + '</code></td>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.name) + '</code></td>' +
+            '<td style="padding:4px 0; vertical-align:top;">' + escapeHtmlAdmin(m.consequence) + '</td>' +
+            '</tr>';
+        }).join('');
+        status.textContent = '';
+        out.innerHTML = '<p style="color:#FF9500; margin:0 0 8px; font-size:0.82rem;"><strong>This Worker is running ahead of its database.</strong> ' +
+          'Unapplied migration' + ((data.pendingMigrations || []).length === 1 ? '' : 's') + ': ' +
+          escapeHtmlAdmin((data.pendingMigrations || []).join(', ')) +
+          '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
+          '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
+          '<tbody>' + rows + '</tbody></table></div>';
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

@@ -279,3 +279,55 @@ function buildRegionOptionsHtml(selectedRegion) {
 }
 
 
+
+// --- D1 schema manifest ------------------------------------------------------
+//
+// What each file under migrations/ adds, so the Worker can tell an operator
+// when it is running ahead of its own database.
+//
+// This exists because the failure is otherwise silent and measured: deploy the
+// Worker without running migration 0004 and account deletion still answers
+// ok:true, still writes its KV tombstone, and still refuses the deleted
+// account on a normal request -- but the strongly-consistent half of R3 is
+// gone, and a colo with a stale KV cache authenticates a deleted account. The
+// only trace is one line in the Worker's logs, which nobody reads until after
+// something has gone wrong.
+//
+// `consequence` is the point of the whole structure. "creator_tombstones is
+// missing" tells an operator nothing they can act on; "deleted accounts can
+// still authenticate from a colo whose KV cache is stale" tells them whether
+// it matters this afternoon.
+//
+// Kept in step with migrations/ by a test, not by discipline: adding a
+// migration without adding its objects here fails the suite, the same way
+// FUNCTION-MAP.md and the combined Worker are kept honest by a drift check.
+const D1_SCHEMA_MANIFEST = [
+  {
+    migration: "0001a", kind: "column", table: "creator_lists", name: "likes",
+    consequence: "Every list save and the whole D1 mirror fail -- creator_lists has no likes column to write.",
+  },
+  {
+    migration: "0001b", kind: "index", name: "idx_creator_lists_likes",
+    consequence: "Ordering public lists by likes scans the table instead of using an index. Slower, not broken.",
+  },
+  {
+    migration: "0002", kind: "table", name: "stats",
+    consequence: "Counters fall back to the older KV-only path. Admin totals still work; day-by-day history is thinner.",
+  },
+  {
+    migration: "0003", kind: "index", name: "idx_creators_last_active",
+    consequence: "The admin creators list sorts by scanning every row. Slower, not broken.",
+  },
+  {
+    migration: "0003", kind: "index", name: "idx_creator_lists_vis_likes",
+    consequence: "The public directory query sorts the whole table rather than walking an index. Slower, not broken.",
+  },
+  {
+    migration: "0004", kind: "table", name: "creator_tombstones",
+    consequence: "A deleted account can still authenticate from a colo whose KV cache predates the deletion. This is a security property, not a performance one -- apply this one.",
+  },
+  {
+    migration: "0005", kind: "index", name: "idx_stats_day_totals",
+    consequence: "The dashboard's counter panels scan and sort the whole stats table on every load. Slower, not broken.",
+  },
+];

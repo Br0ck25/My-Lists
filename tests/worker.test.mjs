@@ -5981,6 +5981,147 @@ describe("R1: an anonymously published list can be removed", () => {
   });
 });
 
+describe("the Worker can tell an operator it is ahead of its own database", () => {
+  // Migrations are applied by hand and nothing records that it happened, so
+  // the Worker can outrun its schema with no signal. Measured before this
+  // existed: deploy without migration 0004 and delete-account still answers
+  // ok:true, still writes its KV tombstone, and still refuses the deleted
+  // account on a normal request -- while a colo with a stale KV cache
+  // authenticates it. One line in the logs was the only trace.
+
+  // The manifest is only useful if it stays in step with migrations/, and
+  // discipline is not a mechanism. Same shape as the FUNCTION-MAP and
+  // build-drift checks: adding a migration without listing what it creates
+  // fails here.
+  it("its manifest lists exactly what migrations/ creates", async () => {
+    const dir = path.join(REPO_ROOT, "migrations");
+    const found = [];
+    for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+      const migration = (/^(\d+[a-z]?)_/.exec(file) || [])[1];
+      const sql = fs.readFileSync(path.join(dir, file), "utf8")
+        .split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
+      for (const m of sql.matchAll(/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:table:${m[1]}`);
+      }
+      for (const m of sql.matchAll(/CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:index:${m[1]}`);
+      }
+      for (const m of sql.matchAll(/ALTER\s+TABLE\s+([A-Za-z_][\w]*)\s+ADD\s+COLUMN\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:column:${m[2]}`);
+      }
+    }
+    // Read the manifest back out of the running Worker rather than out of the
+    // source. A top-level `const` lives in the script's lexical scope and
+    // never becomes a property of a vm sandbox, so loadSourceFunctions would
+    // hand back undefined and this would compare against nothing and pass.
+    // An empty database is missing every entry by construction, so the
+    // endpoint's report IS the manifest -- and it comes through the same code
+    // path an operator would use.
+    const db = makeD1();
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones"]) {
+      db._db.exec(`DROP TABLE IF EXISTS ${t};`);
+    }
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const r = await call(env, "/admin/api/schema-status", { cookie: await adminCookie(env) });
+    const listed = r.body.missing.map((e) => `${e.migration}:${e.kind}:${e.name}`);
+    assert.deepEqual(listed.slice().sort(), found.slice().sort(),
+      "D1_SCHEMA_MANIFEST and migrations/ have drifted apart");
+  });
+
+  it("reports a clean bill of health on a fully migrated database", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.upToDate, true, `unexpectedly missing: ${JSON.stringify(r.body.missing)}`);
+    assert.deepEqual(r.body.pendingMigrations, []);
+  });
+
+  it("names the unapplied migration, and what skipping it costs", async () => {
+    const db = makeD1();
+    // The state of a database that never had 0004 run against it.
+    db._db.exec("DROP TABLE IF EXISTS creator_tombstones;");
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+
+    assert.equal(r.body.upToDate, false);
+    assert.deepEqual(r.body.pendingMigrations, ["0004"]);
+    const entry = r.body.missing.find((m) => m.name === "creator_tombstones");
+    assert.ok(entry, "the missing table must be named");
+    // The consequence is the whole point: "creator_tombstones is missing" is
+    // not something an operator can act on.
+    assert.match(entry.consequence, /still authenticate/i,
+      "the report must say what silently stops working, not just what is absent");
+  });
+
+  it("detects a missing column, not just a missing table", async () => {
+    const db = makeD1();
+    // Rebuild creator_lists without the column 0001a adds. Dropping and
+    // recreating is the only way SQLite offers, and it is what a database
+    // that predates 0001a genuinely looks like.
+    db._db.exec("DROP TABLE IF EXISTS creator_lists;");
+    db._db.exec(`CREATE TABLE creator_lists (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+      visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.ok(r.body.pendingMigrations.includes("0001a"),
+      `a missing column must be reported too, got ${JSON.stringify(r.body.pendingMigrations)}`);
+  });
+
+  it("is not fooled by a column whose name merely contains the one it wants", async () => {
+    const db = makeD1();
+    // No `likes`, but a `likes_count` that a substring search would accept.
+    // Reporting 0001a as applied here is the worse failure of the two: it
+    // tells an operator the schema is fine while every list save is failing
+    // on a column that is not there.
+    db._db.exec("DROP TABLE IF EXISTS creator_lists;");
+    db._db.exec(`CREATE TABLE creator_lists (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+      visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+      likes_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const r = await call(env, "/admin/api/schema-status", { cookie: await adminCookie(env) });
+    assert.ok(r.body.pendingMigrations.includes("0001a"),
+      "likes_count must not be mistaken for likes");
+  });
+
+  it("says nothing is wrong when there is no D1 to check", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    // A KV-only deployment is a supported configuration, not a database
+    // that needs migrating. Reporting seven unapplied migrations would be
+    // noise an operator learns to ignore.
+    assert.equal(r.body.bound, false);
+    assert.equal(r.body.upToDate, true);
+    assert.deepEqual(r.body.pendingMigrations, []);
+  });
+
+  it("reports a database it cannot read as unchecked, not as unmigrated", async () => {
+    const db = makeD1();
+    db.failWhen((sql) => /sqlite_master/i.test(sql));
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    db.failWhen(null);
+    // "I could not check" and "it is not there" are different things, and
+    // only one of them is an instruction to go run a migration.
+    assert.equal(r.body.checked, false);
+    assert.deepEqual(r.body.pendingMigrations, [],
+      "a database that will not answer must not be reported as missing every table");
+  });
+
+  it("needs an admin session", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    assert.equal((await call(env, "/admin/api/schema-status")).status, 401);
+  });
+});
+
 describe("R2: the client is actually given a baseline to cite", () => {
   // The guard and the field that arms it are two halves of one fix, and the
   // guard shipped alone: /api/creator/lists did not return updatedAt, so the
