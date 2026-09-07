@@ -24816,6 +24816,13 @@ function scoreListSearchMatch(list, rawQuery, intent) {
 
 window._unifiedSearchCache = window._unifiedSearchCache || new Map();
 let currentListSearchSequence = 0;
+// The same counter for the title search. It had none, so on a slow
+// connection the older of two in-flight searches simply won by landing
+// last: typing "batman", then "joker", showed batman's results under the
+// word joker -- and clearing the box mid-request showed results for a query
+// no longer on screen, because renderDefaultCatalogSearch re-checks the
+// input after its await and runCatalogSearch never did.
+let currentTitleSearchSequence = 0;
 
 async function executeUnifiedListSearch(rawQuery, targetBox) {
   const q = (rawQuery || '').trim();
@@ -25245,9 +25252,22 @@ async function populateSearchResultPosters() {
   Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
+// Every reader treats these as URL strings -- getLikedListsSet().has(url),
+// and a .split('/') in the Discover recommendations. A stored array of OBJECTS
+// therefore throws "u.split is not a function", which the Curated feed catches
+// and renders as its ordinary "like some lists to get recommendations" empty
+// state. Silent, permanent, and indistinguishable from having liked nothing.
+//
+// A restored backup could produce exactly that: applyImportedConfig accepted
+// settings.likedLists on Array.isArray alone, with no element check, while the
+// fullyWatchedShowIds beside it was correctly coerced. Filtering here as well
+// as at the write means an already-poisoned browser heals on next load rather
+// than needing its site data cleared by hand.
 function getLikedListsSet() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'));
+    const raw = JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]');
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((v) => typeof v === 'string' && v));
   } catch (e) {
     return new Set();
   }
@@ -27725,12 +27745,18 @@ async function renderDefaultCatalogSearch() {
   const inputEl = document.getElementById('catalogSearchInput');
   if (inputEl && inputEl.value.trim()) return;
 
+  // Clearing the box is itself a search -- it supersedes anything already in
+  // flight. Without this, a slow response for the query the person just erased
+  // still landed on top of the default view.
+  const thisSeq = ++currentTitleSearchSequence;
+
   resEl.innerHTML = '<p><small>Loading top ' + (currentCatalogSearchType === 'lists' ? 'public lists' : (currentCatalogSearchType === 'tv' ? 'shows' : 'movies')) + '...</small></p>';
 
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
       const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
+      if (thisSeq !== currentTitleSearchSequence) return;
       if (inputEl && inputEl.value.trim()) return;
       const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
       if (!pubLists.length) {
@@ -27747,6 +27773,7 @@ async function renderDefaultCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
     const data = await res.json();
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
     if (!data.ok || !data.results || !data.results.length) {
       resEl.innerHTML = '<p><small>No titles found.</small></p>';
@@ -27771,6 +27798,7 @@ async function runCatalogSearch() {
     return executeUnifiedListSearch(q, resEl);
   }
 
+  const thisSeq = ++currentTitleSearchSequence;
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -27785,6 +27813,10 @@ async function runCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
     const data = await res.json();
+    // Superseded while this was in flight: a newer search, a type change, or
+    // the box being cleared. Say nothing and touch nothing -- whatever ran
+    // after this one owns the results area now.
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (!data.ok) {
       resEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
       return;
@@ -27798,6 +27830,7 @@ async function runCatalogSearch() {
     window._rawCatalogTitleItems = data.results;
     applySearchFilters();
   } catch (e) {
+    if (thisSeq !== currentTitleSearchSequence) return;
     resEl.innerHTML = '<p class="testresult err">✗ Network error.</p>';
   }
 }
@@ -35472,20 +35505,57 @@ async function saveCreatorListEdit(name) {
   const endSubmit = beginSubmit('saveCreatorList', '#customListSaveBtn', 'Saving\u2026');
   if (!endSubmit) return;
 
+  // The version this edit was built on, so the server can tell whether another
+  // device saved in between instead of this one silently winning.
+  //
+  // The guard has existed server-side for a while and only two call sites ever
+  // armed it, both of them remove-one-item paths -- so the main "save my edits
+  // to this list" button, the one that sends the WHOLE items array, was still
+  // last-write-wins. Two devices adding a different film each ended with one of
+  // them gone and both saves reporting ok.
+  //
+  // Only cite a baseline the server actually gave us: a legacy record has no
+  // updatedAt, and inventing one would either reject every save or assert a
+  // version this browser never saw.
+  const cached = Array.isArray(lastCreatorListsData)
+    ? lastCreatorListsData.find((l) => l && l.slug === editingCreatorListSlug)
+    : null;
+  const baseline = cached && Number.isFinite(cached.updatedAt) ? cached.updatedAt : null;
+
   try {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: editingCreatorListSlug,
+      name: name,
+      type: customListDraftType,
+      items: customListDraftItems,
+      visibility: visibility,
+    };
+    if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        slug: editingCreatorListSlug,
-        name: name,
-        type: customListDraftType,
-        items: customListDraftItems,
-        visibility: visibility,
-      }),
+      body: JSON.stringify(body),
     });
+    if (res.status === 409) {
+      // Another device saved this list since this browser loaded it. Unlike the
+      // remove-one-item paths, this edit is a whole replacement array built in
+      // the builder, so there is no change to re-apply on top of theirs -- only
+      // the person can say which they want. Pull what is actually stored so the
+      // dashboard stops showing a version that no longer exists, and leave the
+      // draft alone so nothing they typed is lost.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      const msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        'Your edits are still here. Reopen the list to see what the other device saved, then re-apply your changes.';
+      if (typeof showAppNoticeModal === 'function') {
+        showAppNoticeModal('This List Changed Elsewhere', msg, true);
+      } else {
+        alert(msg);
+      }
+      return;
+    }
     const data = await res.json();
     if (!data.ok) {
       if (typeof showAppNoticeModal === 'function') {
@@ -35495,6 +35565,9 @@ async function saveCreatorListEdit(name) {
       }
       return;
     }
+    // Advance the baseline, or a second edit in this session cites a version
+    // this browser has itself already replaced and 409s against its own write.
+    if (cached && Number.isFinite(data.updatedAt)) cached.updatedAt = data.updatedAt;
     if (editingCreatorListSlug === 'watchlist') {
       const map = loadLocalCustomLists();
       if (map['watchlist']) {
@@ -39190,6 +39263,12 @@ async function submitRestoreProfile() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
+    // Released here, not in the finally below: what follows is the sign-in
+    // tail, and loadCreatorSync can take as long as the network takes. Holding
+    // the guard across it would leave the Login button disabled for the whole
+    // of it and stop someone signing into a different account. Calling it twice
+    // is harmless.
+    endSubmit();
     renderCreatorProfileBar();
     renderAccountKeySection();
     renderWatchlistPreferencesSection();
@@ -39255,6 +39334,9 @@ async function submitForgotKey() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     closeModal();
+    // Released before the sign-in tail, same reasoning as
+    // submitRestoreProfile -- see there.
+    endSubmit();
     showKeyRevealModal(data.displayName, data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -39696,13 +39778,28 @@ async function loadCreatorSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Who this load is for. Checked again after the await, because signing in as
+  // someone else calls clearLocalAccountData() and then starts a fresh load --
+  // and this one is still in flight. Measured: signing in as alice and then
+  // immediately as bob left alice's catalog rows and liked lists rendered under
+  // bob's name, because her slower response was simply the last writer and
+  // nothing told it that it had been superseded.
+  //
+  // The account itself was never contaminated -- the next push cited alice's
+  // updatedAt, the server answered 409 and the 409 handler pulled bob's state
+  // back. But that is the server catching it, and what was on screen in the
+  // meantime was another account's data.
+  const loadingFor = activeCreator.creatorName;
+  const isStale = () => !activeCreator || activeCreator.creatorName !== loadingFor;
   try {
     const res = await fetch(ORIGIN + '/api/creator/sync/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
     });
+    if (isStale()) return;
     const data = await res.json();
+    if (isStale()) return;
     if (!data.ok) return;
     window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
@@ -39844,7 +39941,11 @@ async function loadCreatorSync(opts) {
     }
     if (Array.isArray(synced.likedLists)) {
       try {
-        localStorage.setItem('myListAddon:likedLists', JSON.stringify(synced.likedLists));
+        // Strings only -- see getLikedListsSet. sync/save coerces with
+        // .map(String) server-side, so this is belt and braces for a record
+        // written before it did.
+        localStorage.setItem('myListAddon:likedLists',
+          JSON.stringify(synced.likedLists.filter((v) => typeof v === 'string' && v)));
       } catch (e) {
         // non-critical, see rememberLikedList's own comment
       }
@@ -46115,7 +46216,11 @@ function applyImportedConfig(data) {
     try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
   }
   if (Array.isArray(s.likedLists)) {
-    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+    // Strings only -- see getLikedListsSet. Array.isArray alone was the check
+    // here, and an array of objects got through and killed the Curated feed
+    // for good while the restore reported "Restore Complete".
+    const likedUrls = s.likedLists.filter((v) => typeof v === 'string' && v);
+    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(likedUrls)); } catch (e) {}
   }
   if (Array.isArray(s.fullyWatchedShowIds)) {
     window._fullyWatchedShowIds = new Set(s.fullyWatchedShowIds.map(String));

@@ -569,3 +569,198 @@ describe("client: a provider write that failed is not reported as done", () => {
     assert.ok(alerts.some((a) => /Network error/.test(a)));
   });
 });
+
+// --- FE-05: the main list-edit path must cite the version it edited --------
+//
+// The server answers 409 rather than overwriting when a save cites
+// expectedUpdatedAt. Of twelve lists/save call sites exactly two armed it, and
+// both were remove-one-item paths -- so the button that sends the WHOLE items
+// array, which is the one people press, was still last-write-wins. Two devices
+// each adding a different film ended with one addition gone and both saves
+// reporting ok.
+describe("client: saving a list edit cites what it was built on", () => {
+  function editing(client, list) {
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("lastCreatorListsData", [list]);
+    client.set("editingCreatorListSlug", list.slug);
+    client.set("customListDraftItems", [{ id: "tt1" }, { id: "tt2" }]);
+    client.set("customListDraftType", "movie");
+  }
+
+  it("sends expectedUpdatedAt from the version the dashboard reported", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 7000 } }; } },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].expectedUpdatedAt, 4200,
+      "the save must name the version the edit was built on");
+  });
+
+  it("cites nothing for a list the server never gave a version for", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 1 } }; } },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie" });   // legacy record
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    // Inventing a baseline would either reject every save or assert a version
+    // this browser never saw.
+    assert.equal("expectedUpdatedAt" in saves[0], false);
+  });
+
+  it("does not overwrite the other device on a conflict", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: {
+        [SAVE]: (req) => { saves.push(req.body); return { status: 409, json: { ok: false, error: "conflict", conflict: true } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    editing(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const notices = [];
+    client.set("showAppNoticeModal", (t, m) => notices.push(t + ": " + m));
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves.length, 1, "a 409 must not be followed by a blind retry");
+    assert.ok(notices.some((n) => /Changed Elsewhere/.test(n)),
+      "and the person has to be told, since only they can say which version they want");
+    assert.deepEqual(client.get("customListDraftItems"), [{ id: "tt1" }, { id: "tt2" }],
+      "their draft must survive -- there is nothing else holding it");
+  });
+
+  it("advances its baseline, so a second edit is not stale against its own write", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: "faves", updatedAt: 9100 } }; } },
+    });
+    const list = { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 };
+    editing(client, list);
+
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+    client.set("editingCreatorListSlug", "faves");
+    await client.call("saveCreatorListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves[1].expectedUpdatedAt, 9100,
+      "the second save must cite what the first one produced, not the original");
+  });
+});
+
+// --- FE-09: a sync load belongs to the account that asked for it -----------
+describe("client: a sync load for the previous account is discarded", () => {
+  it("does not apply one account's state to the next one", async () => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-ALICE" },
+      routes: {
+        "/api/creator/sync/load": async () => {
+          await held;   // alice's answer, arriving late
+          return { json: { ok: true, data: { config: [{ name: "alice-ROW", url: "https://x/alice", type: "movie", enabled: true }], likedLists: ["https://x/alice/liked"], updatedAt: 10 } } };
+        },
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 11 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+
+    client.set("activeCreator", { creatorName: "alice" });
+    const pending = client.call("loadCreatorSync");
+
+    // Someone signs in as bob while alice's load is still out.
+    client.set("activeCreator", { creatorName: "bob" });
+    client.get("localStorage").setItem("myListAddon:creatorKey", "KEY-BOB");
+
+    release();
+    await pending;
+    await settle();
+
+    assert.equal(client.get("localStorage").getItem("myListAddon:likedLists"), null,
+      "alice's liked lists must not land in bob's session");
+  });
+});
+
+// --- FE-07: likedLists is a list of URL strings -----------------------------
+describe("client: a poisoned likedLists does not kill the Discover feed", () => {
+  it("ignores non-string entries rather than throwing on them", () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:likedLists": JSON.stringify([
+          { url: "https://mdblist.com/lists/a/b", name: "Sci-Fi" },   // what a restore could write
+          "https://mdblist.com/lists/c/d",
+          null,
+          42,
+        ]),
+      },
+    });
+    const set = client.call("getLikedListsSet");
+    assert.deepEqual([...set], ["https://mdblist.com/lists/c/d"]);
+    // The actual crash: every reader does this to each entry.
+    for (const u of set) assert.doesNotThrow(() => u.split("/"));
+  });
+
+  it("stores only strings when a backup is restored", () => {
+    const client = loadClient();
+    client.call("applyImportedConfig", {
+      version: "3.0",
+      entries: [],
+      settings: { likedLists: [{ url: "https://x/a" }, "https://x/b"] },
+    });
+    assert.deepEqual(
+      JSON.parse(client.get("localStorage").getItem("myListAddon:likedLists")),
+      ["https://x/b"]);
+  });
+});
+
+// --- FE-06: the newer search wins ------------------------------------------
+describe("client: an obsolete title search cannot replace a newer one", () => {
+  const TITLES = "/api/title-search";
+  const result = (name) => ({ ok: true, results: [{ id: "tmdb:1", tmdbId: 1, title: name, name, type: "movie", year: "2000", poster: "", vote_average: 1, genre_ids: [] }] });
+
+  it("discards the slower, older response", async () => {
+    let releaseSlow;
+    const slow = new Promise((r) => { releaseSlow = r; });
+    const client = loadClient({
+      routes: {
+        [TITLES]: async (req) => {
+          if (/q=slow/.test(req.url)) { await slow; return { json: result("SLOW") }; }
+          return { json: result("FAST") };
+        },
+        "/api/track-search": () => ({ json: { ok: true } }),
+      },
+    });
+    const input = client.get("document").getElementById("catalogSearchInput");
+
+    input.value = "slowq";
+    const first = client.call("runCatalogSearch");
+    input.value = "fastq";
+    await client.call("runCatalogSearch");
+    await settle();
+    const afterFast = (client.get("window")._rawCatalogTitleItems || []).map((x) => x.title);
+
+    releaseSlow();
+    await first;
+    await settle();
+    const afterSlow = (client.get("window")._rawCatalogTitleItems || []).map((x) => x.title);
+
+    assert.deepEqual(afterFast, ["FAST"]);
+    assert.deepEqual(afterSlow, ["FAST"],
+      "the older response landing later must not replace the newer results");
+  });
+});

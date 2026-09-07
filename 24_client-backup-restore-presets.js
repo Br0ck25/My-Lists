@@ -590,7 +590,11 @@ function applyImportedConfig(data) {
     try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(s.hiddenMyListsSections)); } catch (e) {}
   }
   if (Array.isArray(s.likedLists)) {
-    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(s.likedLists)); } catch (e) {}
+    // Strings only -- see getLikedListsSet. Array.isArray alone was the check
+    // here, and an array of objects got through and killed the Curated feed
+    // for good while the restore reported "Restore Complete".
+    const likedUrls = s.likedLists.filter((v) => typeof v === 'string' && v);
+    try { localStorage.setItem('myListAddon:likedLists', JSON.stringify(likedUrls)); } catch (e) {}
   }
   if (Array.isArray(s.fullyWatchedShowIds)) {
     window._fullyWatchedShowIds = new Set(s.fullyWatchedShowIds.map(String));

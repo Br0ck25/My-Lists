@@ -349,6 +349,13 @@ function scoreListSearchMatch(list, rawQuery, intent) {
 
 window._unifiedSearchCache = window._unifiedSearchCache || new Map();
 let currentListSearchSequence = 0;
+// The same counter for the title search. It had none, so on a slow
+// connection the older of two in-flight searches simply won by landing
+// last: typing "batman", then "joker", showed batman's results under the
+// word joker -- and clearing the box mid-request showed results for a query
+// no longer on screen, because renderDefaultCatalogSearch re-checks the
+// input after its await and runCatalogSearch never did.
+let currentTitleSearchSequence = 0;
 
 async function executeUnifiedListSearch(rawQuery, targetBox) {
   const q = (rawQuery || '').trim();
@@ -778,9 +785,22 @@ async function populateSearchResultPosters() {
   Array.from({ length: Math.min(CONCURRENCY, slots.length) }, () => worker());
 }
 
+// Every reader treats these as URL strings -- getLikedListsSet().has(url),
+// and a .split('/') in the Discover recommendations. A stored array of OBJECTS
+// therefore throws "u.split is not a function", which the Curated feed catches
+// and renders as its ordinary "like some lists to get recommendations" empty
+// state. Silent, permanent, and indistinguishable from having liked nothing.
+//
+// A restored backup could produce exactly that: applyImportedConfig accepted
+// settings.likedLists on Array.isArray alone, with no element check, while the
+// fullyWatchedShowIds beside it was correctly coerced. Filtering here as well
+// as at the write means an already-poisoned browser heals on next load rather
+// than needing its site data cleared by hand.
 function getLikedListsSet() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]'));
+    const raw = JSON.parse(localStorage.getItem('myListAddon:likedLists') || '[]');
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((v) => typeof v === 'string' && v));
   } catch (e) {
     return new Set();
   }
@@ -3258,12 +3278,18 @@ async function renderDefaultCatalogSearch() {
   const inputEl = document.getElementById('catalogSearchInput');
   if (inputEl && inputEl.value.trim()) return;
 
+  // Clearing the box is itself a search -- it supersedes anything already in
+  // flight. Without this, a slow response for the query the person just erased
+  // still landed on top of the default view.
+  const thisSeq = ++currentTitleSearchSequence;
+
   resEl.innerHTML = '<p><small>Loading top ' + (currentCatalogSearchType === 'lists' ? 'public lists' : (currentCatalogSearchType === 'tv' ? 'shows' : 'movies')) + '...</small></p>';
 
   if (currentCatalogSearchType === 'lists') {
     window._rawCatalogTitleItems = [];
     try {
       const pubRes = await fetch(ORIGIN + '/api/search-published-lists?q=', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ ok: false, lists: [] }));
+      if (thisSeq !== currentTitleSearchSequence) return;
       if (inputEl && inputEl.value.trim()) return;
       const pubLists = pubRes && pubRes.ok && Array.isArray(pubRes.lists) ? pubRes.lists : [];
       if (!pubLists.length) {
@@ -3280,6 +3306,7 @@ async function renderDefaultCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
     const data = await res.json();
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
     if (!data.ok || !data.results || !data.results.length) {
       resEl.innerHTML = '<p><small>No titles found.</small></p>';
@@ -3304,6 +3331,7 @@ async function runCatalogSearch() {
     return executeUnifiedListSearch(q, resEl);
   }
 
+  const thisSeq = ++currentTitleSearchSequence;
   resEl.innerHTML = '<p><small>Searching...</small></p>';
 
   try {
@@ -3318,6 +3346,10 @@ async function runCatalogSearch() {
   try {
     const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
     const data = await res.json();
+    // Superseded while this was in flight: a newer search, a type change, or
+    // the box being cleared. Say nothing and touch nothing -- whatever ran
+    // after this one owns the results area now.
+    if (thisSeq !== currentTitleSearchSequence) return;
     if (!data.ok) {
       resEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
       return;
@@ -3331,6 +3363,7 @@ async function runCatalogSearch() {
     window._rawCatalogTitleItems = data.results;
     applySearchFilters();
   } catch (e) {
+    if (thisSeq !== currentTitleSearchSequence) return;
     resEl.innerHTML = '<p class="testresult err">✗ Network error.</p>';
   }
 }

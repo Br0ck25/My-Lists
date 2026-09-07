@@ -554,20 +554,57 @@ async function saveCreatorListEdit(name) {
   const endSubmit = beginSubmit('saveCreatorList', '#customListSaveBtn', 'Saving\u2026');
   if (!endSubmit) return;
 
+  // The version this edit was built on, so the server can tell whether another
+  // device saved in between instead of this one silently winning.
+  //
+  // The guard has existed server-side for a while and only two call sites ever
+  // armed it, both of them remove-one-item paths -- so the main "save my edits
+  // to this list" button, the one that sends the WHOLE items array, was still
+  // last-write-wins. Two devices adding a different film each ended with one of
+  // them gone and both saves reporting ok.
+  //
+  // Only cite a baseline the server actually gave us: a legacy record has no
+  // updatedAt, and inventing one would either reject every save or assert a
+  // version this browser never saw.
+  const cached = Array.isArray(lastCreatorListsData)
+    ? lastCreatorListsData.find((l) => l && l.slug === editingCreatorListSlug)
+    : null;
+  const baseline = cached && Number.isFinite(cached.updatedAt) ? cached.updatedAt : null;
+
   try {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: editingCreatorListSlug,
+      name: name,
+      type: customListDraftType,
+      items: customListDraftItems,
+      visibility: visibility,
+    };
+    if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        slug: editingCreatorListSlug,
-        name: name,
-        type: customListDraftType,
-        items: customListDraftItems,
-        visibility: visibility,
-      }),
+      body: JSON.stringify(body),
     });
+    if (res.status === 409) {
+      // Another device saved this list since this browser loaded it. Unlike the
+      // remove-one-item paths, this edit is a whole replacement array built in
+      // the builder, so there is no change to re-apply on top of theirs -- only
+      // the person can say which they want. Pull what is actually stored so the
+      // dashboard stops showing a version that no longer exists, and leave the
+      // draft alone so nothing they typed is lost.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      const msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        'Your edits are still here. Reopen the list to see what the other device saved, then re-apply your changes.';
+      if (typeof showAppNoticeModal === 'function') {
+        showAppNoticeModal('This List Changed Elsewhere', msg, true);
+      } else {
+        alert(msg);
+      }
+      return;
+    }
     const data = await res.json();
     if (!data.ok) {
       if (typeof showAppNoticeModal === 'function') {
@@ -577,6 +614,9 @@ async function saveCreatorListEdit(name) {
       }
       return;
     }
+    // Advance the baseline, or a second edit in this session cites a version
+    // this browser has itself already replaced and 409s against its own write.
+    if (cached && Number.isFinite(data.updatedAt)) cached.updatedAt = data.updatedAt;
     if (editingCreatorListSlug === 'watchlist') {
       const map = loadLocalCustomLists();
       if (map['watchlist']) {

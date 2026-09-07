@@ -1337,6 +1337,12 @@ async function submitRestoreProfile() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
     closeModal();
+    // Released here, not in the finally below: what follows is the sign-in
+    // tail, and loadCreatorSync can take as long as the network takes. Holding
+    // the guard across it would leave the Login button disabled for the whole
+    // of it and stop someone signing into a different account. Calling it twice
+    // is harmless.
+    endSubmit();
     renderCreatorProfileBar();
     renderAccountKeySection();
     renderWatchlistPreferencesSection();
@@ -1402,6 +1408,9 @@ async function submitForgotKey() {
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
     closeModal();
+    // Released before the sign-in tail, same reasoning as
+    // submitRestoreProfile -- see there.
+    endSubmit();
     showKeyRevealModal(data.displayName, data.creatorKey);
     renderCreatorProfileBar();
     renderAccountKeySection();
@@ -1843,13 +1852,28 @@ async function loadCreatorSync(opts) {
   if (!activeCreator) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   if (!creatorKey) return;
+  // Who this load is for. Checked again after the await, because signing in as
+  // someone else calls clearLocalAccountData() and then starts a fresh load --
+  // and this one is still in flight. Measured: signing in as alice and then
+  // immediately as bob left alice's catalog rows and liked lists rendered under
+  // bob's name, because her slower response was simply the last writer and
+  // nothing told it that it had been superseded.
+  //
+  // The account itself was never contaminated -- the next push cited alice's
+  // updatedAt, the server answered 409 and the 409 handler pulled bob's state
+  // back. But that is the server catching it, and what was on screen in the
+  // meantime was another account's data.
+  const loadingFor = activeCreator.creatorName;
+  const isStale = () => !activeCreator || activeCreator.creatorName !== loadingFor;
   try {
     const res = await fetch(ORIGIN + '/api/creator/sync/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
     });
+    if (isStale()) return;
     const data = await res.json();
+    if (isStale()) return;
     if (!data.ok) return;
     window._lastCreatorSyncLoadedAt = Date.now();
     if (!data.data) {
@@ -1991,7 +2015,11 @@ async function loadCreatorSync(opts) {
     }
     if (Array.isArray(synced.likedLists)) {
       try {
-        localStorage.setItem('myListAddon:likedLists', JSON.stringify(synced.likedLists));
+        // Strings only -- see getLikedListsSet. sync/save coerces with
+        // .map(String) server-side, so this is belt and braces for a record
+        // written before it did.
+        localStorage.setItem('myListAddon:likedLists',
+          JSON.stringify(synced.likedLists.filter((v) => typeof v === 'string' && v)));
       } catch (e) {
         // non-critical, see rememberLikedList's own comment
       }
