@@ -290,11 +290,12 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey, env = null, ctx 
             : "";
         throw new Error(`Trakt chart request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     },
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Runs async `fn` over `items` with at most `limit` running at once, rather

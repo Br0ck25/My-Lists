@@ -6780,3 +6780,111 @@ describe("admin: browsing one creator's stored lists", () => {
     assert.deepEqual([...owner.body.deletedSlugs].sort(), [...doomed].sort());
   });
 });
+
+// ---------------------------------------------------------------------------
+// "100 items" for a list that has 303.
+//
+// /api/preview reports totalItems so a See All header can say how big a list
+// really is before anything has been scrolled. Trakt's fetchers never
+// supplied one: fetchFn returned res.json() and the Response -- headers and
+// all -- went out of scope, so the only number available was the length of
+// the page in hand, which this endpoint caps at 100.
+describe("a Trakt list reports its real size, not its first page's length", () => {
+  const CHART_PAGE = Array.from({ length: 100 }, (_, i) => ({
+    movie: { title: "Film " + i, year: 2020, ids: { imdb: "tt" + String(1000000 + i) } },
+  }));
+
+  // A fresh module instance per test: the chart memo (PER_USER_CACHE_MAP)
+  // lives in the isolate, is keyed by chart + kind + page, and other tests in
+  // this file stub the same charts -- so the shared worker answers these from
+  // whatever they left behind rather than from the stub below.
+  async function previewOn(isolate, env, json) {
+    const pending = [];
+    const ctx = { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) };
+    const res = await isolate.fetch(new Request("https://example.test/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": nextIp() },
+      body: JSON.stringify(json),
+    }), env, ctx);
+    await Promise.all(pending);
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
+  function stubTrakt({ total, withHeader = true }) {
+    const seen = [];
+    globalThis.fetch = async (input) => {
+      const href = typeof input === "string" ? input : input && input.url;
+      seen.push(href);
+      if (href && href.includes("api.trakt.tv")) {
+        const headers = new Headers({ "content-type": "application/json" });
+        if (withHeader) headers.set("X-Pagination-Item-Count", String(total));
+        return new Response(JSON.stringify(CHART_PAGE), { status: 200, headers });
+      }
+      // Trailer/details enrichment -- nothing this test cares about.
+      return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return seen;
+  }
+
+  it("carries Trakt's item count through to /api/preview", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubTrakt({ total: 303 });
+      const env = makeEnv({ CONFIGS: makeKv() });
+      const body = await previewOn(await freshIsolate(), env,
+        { url: "trakt:chart:trending", type: "movie", skip: 0, sample: 100, traktKey: "trakt-client-id" });
+      assert.equal(body.ok, true, JSON.stringify(body).slice(0, 200));
+      assert.equal(body.count, 100, "precondition: one page is 100 items");
+      assert.equal(body.totalItems, 303,
+        "the See All header has nothing else to show the real size from -- 100 is the page, not the list");
+      assert.equal(body.maybeMore, true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("reports no total when the endpoint does not paginate", async () => {
+    // movies/boxoffice returns its ten and sends no pagination headers. A
+    // fabricated total would be worse than none.
+    const realFetch = globalThis.fetch;
+    try {
+      stubTrakt({ total: 0, withHeader: false });
+      const env = makeEnv({ CONFIGS: makeKv() });
+      const body = await previewOn(await freshIsolate(), env,
+        { url: "trakt:chart:box_office", type: "movie", skip: 0, sample: 100, traktKey: "trakt-client-id" });
+      assert.equal(body.ok, true, JSON.stringify(body).slice(0, 200));
+      assert.equal(body.totalItems, null);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("still reads a payload cached before the total was carried with it", async () => {
+    // The cached value is now { items, totalItems }; every entry written
+    // before this shipped is a bare array, and those stay valid for a day.
+    const sandbox = loadSourceFunctions("06_source-fetchers-mdblist-trakt.js");
+    const legacy = [{ movie: { title: "Old", ids: { imdb: "tt1" } } }];
+    assert.deepEqual(sandbox.traktPayloadItems(legacy), legacy, "a bare array is still the items");
+    assert.equal(sandbox.traktPayloadTotal(legacy), null, "and carries no total, as before");
+
+    const wrapped = sandbox.traktPayloadWithTotal(legacy, {
+      headers: new Headers({ "X-Pagination-Item-Count": "42" }),
+    });
+    assert.deepEqual(sandbox.traktPayloadItems(wrapped), legacy);
+    assert.equal(sandbox.traktPayloadTotal(wrapped), 42);
+  });
+
+  it("an empty wrapped reply still counts as empty, so it cannot erase a good copy", async () => {
+    // refuseEmptyOverwrite protects the shared chart caches, and it decides
+    // by asking isEmptyPayload. Wrapping the payload to carry its total put
+    // an object with two keys where an array used to be -- which would have
+    // read as "not empty" and let a blank upstream reply overwrite the last
+    // good chart.
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    assert.equal(sandbox.isEmptyPayload({ items: [], totalItems: 0 }), true);
+    assert.equal(sandbox.isEmptyPayload({ items: [1], totalItems: 1 }), false);
+    assert.equal(sandbox.isEmptyPayload([]), true);
+    assert.equal(sandbox.isEmptyPayload([1]), false);
+  });
+});

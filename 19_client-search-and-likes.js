@@ -709,10 +709,17 @@ async function populateSearchResultPosters() {
       if (movieSample[i]) merged.push(movieSample[i]);
       if (seriesSample[i]) merged.push(seriesSample[i]);
     }
+    // totalItems only when BOTH halves reported one -- adding a known count
+    // to an unknown one produces a number that looks authoritative and is
+    // simply wrong. maybeMore if either half has more to give.
+    const movieTotal = movieOk && typeof movieResult.totalItems === 'number' ? movieResult.totalItems : null;
+    const seriesTotal = seriesOk && typeof seriesResult.totalItems === 'number' ? seriesResult.totalItems : null;
     return {
       ok: true,
       sample: merged,
       count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
+      totalItems: (movieTotal != null && seriesTotal != null) ? (movieTotal + seriesTotal) : null,
+      maybeMore: !!((movieOk && movieResult.maybeMore) || (seriesOk && seriesResult.maybeMore)),
     };
   }
 
@@ -733,7 +740,27 @@ async function populateSearchResultPosters() {
         if (data.ok && data.sample && data.sample.length) {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
-            const totalCount = cardItems || data.count || (validPosters.length * 10);
+            // What this card can honestly claim about the list's size.
+            //
+            // This used to be data.count -- the number of items on the FIRST
+            // PAGE, which /api/preview caps at 100. So every list longer than
+            // that advertised "100", and the badge carried that 100 into the
+            // See All page as an exact item count (see the searchViewListBtn
+            // handler and openListDetailsPage's knownTotalItems), where it
+            // then overrode the real count as more pages loaded. A 303-item
+            // chart said 100 items, and went on saying it after the whole
+            // list had been scrolled through.
+            //
+            // So: a real total when the source reports one (totalItems), the
+            // stored count when the directory knows it (cardItems), and
+            // otherwise "100+" -- which is all that is actually known when a
+            // full page came back and more remains. exactCount is what the
+            // details page may adopt as a total; the "+" estimate is
+            // deliberately not passed on, so that page counts what it loads
+            // rather than believing a floor.
+            const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
+            const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
+            const totalCount = exactCount || ((data.count || validPosters.length) + '+');
             const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
             const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
 
@@ -744,10 +771,10 @@ async function populateSearchResultPosters() {
 
               let overlays = '';
               if (isMobileEnd) {
-                overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+                overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
               if (isDesktopEnd) {
-                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
 
               let removeBtn = '';
@@ -763,7 +790,7 @@ async function populateSearchResultPosters() {
                 removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
               }
 
-              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
                 '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
                   removeBtn +

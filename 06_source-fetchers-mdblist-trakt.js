@@ -122,6 +122,69 @@ function mapMdblistItems(data, type) {
     });
 }
 
+// --- how big is this list, really? ------------------------------------------
+//
+// Trakt answers that in a header on every paginated endpoint
+// (X-Pagination-Item-Count), and every fetcher below threw it away: fetchFn
+// returned res.json() and the Response, headers and all, went out of scope. A
+// chart of 303 titles therefore looked like exactly the 100 its first page
+// carried, and every count built from that said 100 -- the Discover card's
+// badge, the See All header -- until enough scrolling had paged the rest in,
+// if it corrected at all.
+//
+// The count has to travel WITH the data rather than beside it. These replies
+// are cached across three tiers (isolate memory, KV, the edge cache) and the
+// two durable ones store JSON.stringify(payload), which silently drops a
+// property hung on an array -- so the total would survive a memory hit and
+// vanish on a KV hit, which is worse than not having it. The cached value is
+// therefore { items, totalItems }, and every reader goes through the two
+// accessors below, which still understand a bare array: that is what every
+// entry cached before this shipped still holds.
+const TRAKT_TOTAL_HEADER = "x-pagination-item-count";
+
+function traktPayloadWithTotal(json, res) {
+  let totalItems = null;
+  try {
+    const raw = res && res.headers ? res.headers.get(TRAKT_TOTAL_HEADER) : null;
+    const n = raw == null ? NaN : Number(raw);
+    if (Number.isFinite(n) && n >= 0) totalItems = n;
+  } catch {
+    // An endpoint that does not paginate (movies/boxoffice) sends no such
+    // header, and neither does a cached copy written before this existed.
+    // No total is the state this code was always in; it is not an error.
+    totalItems = null;
+  }
+  return { items: json, totalItems };
+}
+
+// Both accessors take the payload as it comes back from the cache, which may
+// be the wrapper above or the bare JSON an older entry holds.
+function traktPayloadItems(payload) {
+  if (payload && !Array.isArray(payload) && typeof payload === "object" &&
+      "items" in payload && "totalItems" in payload) {
+    return payload.items;
+  }
+  return payload;
+}
+
+function traktPayloadTotal(payload) {
+  if (payload && !Array.isArray(payload) && typeof payload === "object") {
+    const n = Number(payload.totalItems);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+// Hangs the collection's real size on a page of metas, the same way
+// fetchMdblist and the TMDB fetchers already do -- /api/preview reads
+// metas.totalItems and hands it to the browser as the list's size (see
+// 25_api-catalog-routes.js). In-process only, so unlike the cached payload
+// above there is no serialization to lose it.
+function withTraktTotal(metas, totalItems) {
+  if (totalItems != null && Array.isArray(metas)) metas.totalItems = totalItems;
+  return metas;
+}
+
 async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = null) {
   const src = mdblistJsonUrl(entry.url, mdblistKey);
   if (!src) {
@@ -418,11 +481,12 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
             : "";
         throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Pulls the connected account's Trakt watchlist
@@ -473,11 +537,12 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
             : "";
         throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // History's shape is different from a plain list/watchlist -- each row is
@@ -621,11 +686,12 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
             : "";
         throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktHistoryItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktHistoryItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Pulls the connected account's Trakt Airing Next shows

@@ -1201,3 +1201,87 @@ describe("client: a list deleted on another device is not uploaded back", () => 
     assert.equal(restored, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// See All said "100 items" for a list that has 303.
+//
+// /api/preview caps a page at 100, so the only number a freshly-opened See
+// All had was its first page's length -- and it printed that as the list's
+// size. It corrected itself as scrolling paged the rest in, unless something
+// had handed it that 100 as an exact count (the Discover card's badge does),
+// in which case it went on saying 100 with 303 items on screen.
+describe("client: See All reports the list's size, not the page it is holding", () => {
+  const PREVIEW = "/api/preview";
+  const subtitleOf = (client) => client.__byId.get("detailSubtitle").textContent;
+  const page = (n, start) => Array.from({ length: n }, (_, i) => ({
+    id: "tt" + (start + i), type: "movie", name: "Film " + (start + i),
+  }));
+
+  // A 303-item source paged 100 at a time. totalItems is what the source
+  // reports about the whole collection; null means it does not report one.
+  function pagingClient(totalItems) {
+    let calls = 0;
+    return loadClient({
+      routes: {
+        [PREVIEW]: () => {
+          const sizes = [100, 100, 100, 3];
+          const n = sizes[calls] === undefined ? 0 : sizes[calls];
+          const items = page(n, calls * 100);
+          calls++;
+          return { json: { ok: true, count: n, totalItems, maybeMore: n >= 100, sample: items } };
+        },
+      },
+    });
+  }
+  const scrollToEnd = async (client) => {
+    for (let i = 0; i < 4; i++) await client.call("window._listDetailsLoadNextPage");
+  };
+
+  it("shows the real total before anything is scrolled, when the source reports one", async () => {
+    const client = pagingClient(303);
+    await client.call("openListDetailsPage", "Trending", "movie", "trakt:chart:trending", null, {});
+    assert.match(subtitleOf(client), /303 items/,
+      "the size is known from the first response -- there is no reason to make someone scroll for it");
+  });
+
+  it("says 100+ rather than 100 while there are pages it has not loaded", async () => {
+    const client = pagingClient(null);
+    await client.call("openListDetailsPage", "Trending", "movie", "trakt:chart:trending", null, {});
+    assert.match(subtitleOf(client), /100\+ items/,
+      "without a total from the source, a bare 100 reads as the whole list");
+    await scrollToEnd(client);
+    assert.match(subtitleOf(client), /303 items/, "and the exact count once the last page lands");
+    assert.doesNotMatch(subtitleOf(client), /\+/, "with no + left on it");
+  });
+
+  it("stops believing a handed-in count the loaded items have overtaken", async () => {
+    // This is the reported bug: the Discover card's badge passes its own
+    // number through as an exact item count, and that number was the first
+    // page's length. It then outranked the real count forever.
+    const client = pagingClient(null);
+    await client.call("openListDetailsPage", "Trending", "movie", "trakt:chart:trending", null, { itemCount: "100" });
+    await scrollToEnd(client);
+    assert.match(subtitleOf(client), /303 items/,
+      "303 items are on screen; a header still claiming 100 is simply wrong");
+  });
+
+  it("keeps a stored list's own count, which is a real total", async () => {
+    // The guard above must not throw away a count that IS the truth: a
+    // creator list's itemCount comes from the stored record, not a page.
+    const client = pagingClient(null);
+    await client.call("openListDetailsPage", "Faves", "movie", "https://mdblist.com/lists/a/b", null, { itemCount: 250 });
+    assert.match(subtitleOf(client), /250 items/);
+    await client.call("window._listDetailsLoadNextPage");
+    assert.match(subtitleOf(client), /250 items/, "one page of 100 does not contradict a stored total of 250");
+  });
+
+  it("brings the total down when an item is removed", async () => {
+    const client = pagingClient(303);
+    await client.call("openListDetailsPage", "Trending", "movie", "trakt:chart:trending", null, {});
+    assert.match(subtitleOf(client), /303 items/);
+    // What removeListItemFromDetails does after dropping one.
+    await client.call("window._updateListDetailsItemCount", 99);
+    assert.match(subtitleOf(client), /302 items/,
+      "a list one item shorter must not keep advertising the size it had before");
+  });
+});
