@@ -2829,6 +2829,14 @@ async function fetchWithPerUserCacheAndCircuitBreaker(options) {
 // treated as empty -- those are real answers.
 function isEmptyPayload(value) {
   if (Array.isArray(value)) return value.length === 0;
+  // A wrapper carrying its rows under `items` is as empty as the array inside
+  // it -- see traktPayloadWithTotal (06_source-fetchers-mdblist-trakt.js),
+  // which wraps a Trakt reply so its real item count can survive being
+  // cached. Without this, wrapping a response to carry its total would
+  // quietly switch this guard off for that cache: { items: [], totalItems: 0 }
+  // is an object with two keys, so an empty upstream reply would have counted
+  // as a successful refresh and overwritten the last good copy.
+  if (value && typeof value === "object" && Array.isArray(value.items)) return value.items.length === 0;
   if (value && typeof value === "object") return Object.keys(value).length === 0;
   return false;
 }
@@ -10665,6 +10673,69 @@ function mapMdblistItems(data, type) {
     });
 }
 
+// --- how big is this list, really? ------------------------------------------
+//
+// Trakt answers that in a header on every paginated endpoint
+// (X-Pagination-Item-Count), and every fetcher below threw it away: fetchFn
+// returned res.json() and the Response, headers and all, went out of scope. A
+// chart of 303 titles therefore looked like exactly the 100 its first page
+// carried, and every count built from that said 100 -- the Discover card's
+// badge, the See All header -- until enough scrolling had paged the rest in,
+// if it corrected at all.
+//
+// The count has to travel WITH the data rather than beside it. These replies
+// are cached across three tiers (isolate memory, KV, the edge cache) and the
+// two durable ones store JSON.stringify(payload), which silently drops a
+// property hung on an array -- so the total would survive a memory hit and
+// vanish on a KV hit, which is worse than not having it. The cached value is
+// therefore { items, totalItems }, and every reader goes through the two
+// accessors below, which still understand a bare array: that is what every
+// entry cached before this shipped still holds.
+const TRAKT_TOTAL_HEADER = "x-pagination-item-count";
+
+function traktPayloadWithTotal(json, res) {
+  let totalItems = null;
+  try {
+    const raw = res && res.headers ? res.headers.get(TRAKT_TOTAL_HEADER) : null;
+    const n = raw == null ? NaN : Number(raw);
+    if (Number.isFinite(n) && n >= 0) totalItems = n;
+  } catch {
+    // An endpoint that does not paginate (movies/boxoffice) sends no such
+    // header, and neither does a cached copy written before this existed.
+    // No total is the state this code was always in; it is not an error.
+    totalItems = null;
+  }
+  return { items: json, totalItems };
+}
+
+// Both accessors take the payload as it comes back from the cache, which may
+// be the wrapper above or the bare JSON an older entry holds.
+function traktPayloadItems(payload) {
+  if (payload && !Array.isArray(payload) && typeof payload === "object" &&
+      "items" in payload && "totalItems" in payload) {
+    return payload.items;
+  }
+  return payload;
+}
+
+function traktPayloadTotal(payload) {
+  if (payload && !Array.isArray(payload) && typeof payload === "object") {
+    const n = Number(payload.totalItems);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+// Hangs the collection's real size on a page of metas, the same way
+// fetchMdblist and the TMDB fetchers already do -- /api/preview reads
+// metas.totalItems and hands it to the browser as the list's size (see
+// 25_api-catalog-routes.js). In-process only, so unlike the cached payload
+// above there is no serialization to lose it.
+function withTraktTotal(metas, totalItems) {
+  if (totalItems != null && Array.isArray(metas)) metas.totalItems = totalItems;
+  return metas;
+}
+
 async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = null) {
   const src = mdblistJsonUrl(entry.url, mdblistKey);
   if (!src) {
@@ -10961,11 +11032,12 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
             : "";
         throw new Error(`Trakt request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Pulls the connected account's Trakt watchlist
@@ -11016,11 +11088,12 @@ async function fetchTraktWatchlist(entry, skip = 0, traktKey = "", accessToken =
             : "";
         throw new Error(`Trakt watchlist request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // History's shape is different from a plain list/watchlist -- each row is
@@ -11164,11 +11237,12 @@ async function fetchTraktHistory(entry, skip = 0, traktKey = "", accessToken = "
             : "";
         throw new Error(`Trakt history request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     }
   });
 
-  return enrichTrailers(mapTraktHistoryItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktHistoryItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Pulls the connected account's Trakt Airing Next shows
@@ -11707,11 +11781,12 @@ async function fetchTraktChart(entry, skip, traktKey, chartKey, env = null, ctx 
             : "";
         throw new Error(`Trakt chart request failed (HTTP ${res.status}).${hint}`);
       }
-      return await res.json();
+      return traktPayloadWithTotal(await res.json(), res);
     },
   });
 
-  return enrichTrailers(mapTraktItems(data, entry.type), entry.type, TMDB_API_KEY);
+  const metas = await enrichTrailers(mapTraktItems(traktPayloadItems(data), entry.type), entry.type, TMDB_API_KEY);
+  return withTraktTotal(metas, traktPayloadTotal(data));
 }
 
 // Runs async `fn` over `items` with at most `limit` running at once, rather
@@ -25814,10 +25889,17 @@ async function populateSearchResultPosters() {
       if (movieSample[i]) merged.push(movieSample[i]);
       if (seriesSample[i]) merged.push(seriesSample[i]);
     }
+    // totalItems only when BOTH halves reported one -- adding a known count
+    // to an unknown one produces a number that looks authoritative and is
+    // simply wrong. maybeMore if either half has more to give.
+    const movieTotal = movieOk && typeof movieResult.totalItems === 'number' ? movieResult.totalItems : null;
+    const seriesTotal = seriesOk && typeof seriesResult.totalItems === 'number' ? seriesResult.totalItems : null;
     return {
       ok: true,
       sample: merged,
       count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
+      totalItems: (movieTotal != null && seriesTotal != null) ? (movieTotal + seriesTotal) : null,
+      maybeMore: !!((movieOk && movieResult.maybeMore) || (seriesOk && seriesResult.maybeMore)),
     };
   }
 
@@ -25838,7 +25920,27 @@ async function populateSearchResultPosters() {
         if (data.ok && data.sample && data.sample.length) {
           const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
           if (validPosters.length) {
-            const totalCount = cardItems || data.count || (validPosters.length * 10);
+            // What this card can honestly claim about the list's size.
+            //
+            // This used to be data.count -- the number of items on the FIRST
+            // PAGE, which /api/preview caps at 100. So every list longer than
+            // that advertised "100", and the badge carried that 100 into the
+            // See All page as an exact item count (see the searchViewListBtn
+            // handler and openListDetailsPage's knownTotalItems), where it
+            // then overrode the real count as more pages loaded. A 303-item
+            // chart said 100 items, and went on saying it after the whole
+            // list had been scrolled through.
+            //
+            // So: a real total when the source reports one (totalItems), the
+            // stored count when the directory knows it (cardItems), and
+            // otherwise "100+" -- which is all that is actually known when a
+            // full page came back and more remains. exactCount is what the
+            // details page may adopt as a total; the "+" estimate is
+            // deliberately not passed on, so that page counts what it loads
+            // rather than believing a floor.
+            const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
+            const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
+            const totalCount = exactCount || ((data.count || validPosters.length) + '+');
             const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
             const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
 
@@ -25849,10 +25951,10 @@ async function populateSearchResultPosters() {
 
               let overlays = '';
               if (isMobileEnd) {
-                overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+                overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
               if (isDesktopEnd) {
-                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
               }
 
               let removeBtn = '';
@@ -25868,7 +25970,7 @@ async function populateSearchResultPosters() {
                 removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
               }
 
-              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(totalCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
                 '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
                   '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
                   removeBtn +
@@ -46265,7 +46367,20 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     }
   }
 
-  let knownTotalItems = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) || (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  // The list's real size when something upstream actually knows it: a
+  // stored list's item count, or a source that reports a total (see
+  // /api/preview's totalItems). Coerced, because it arrives from a dataset
+  // attribute -- a string -- as often as it arrives as a number, and it is
+  // compared against the loaded count below.
+  const rawKnownTotal = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) ||
+    (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  let knownTotalItems = Number.isFinite(Number(rawKnownTotal)) && Number(rawKnownTotal) > 0
+    ? Number(rawKnownTotal)
+    : null;
+  // Whether the source still has pages this view has not loaded. Held here
+  // rather than passed around, so every re-render of the subtitle -- a page
+  // arriving, a like landing, an item being removed -- agrees about it.
+  let moreToLoad = false;
   let likesCount = (opts && opts.likes !== undefined && opts.likes !== null && opts.likes !== '') ? opts.likes : ((preloaded && preloaded.likes !== undefined && preloaded.likes !== null) ? preloaded.likes : null);
 
   const isNoLikesList =
@@ -46285,14 +46400,24 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     likesCount = null;
   }
 
-  function formatSubtitle(count, maybeMore, itemsThisPage) {
+  function formatSubtitle(count) {
     const parts = [];
     if (creatorName) parts.push('by ' + creatorName);
     parts.push(type === 'series' ? 'Shows' : 'Movies');
-    if (knownTotalItems != null && knownTotalItems > 0) {
+    const loaded = (count === undefined || count === null) ? null : Number(count);
+    // A known total is only believable while it is at least what is already
+    // on screen. One that the loaded items have overtaken was never the
+    // list's size -- it was a first page's length, capped at 100 by
+    // /api/preview, handed over by whatever card was clicked. Believing it
+    // is how a 303-item chart went on saying "100 items" after the whole
+    // thing had been scrolled through.
+    if (knownTotalItems != null && (loaded == null || knownTotalItems >= loaded)) {
       parts.push(knownTotalItems.toLocaleString() + ' item' + (knownTotalItems === 1 ? '' : 's'));
-    } else if (count !== undefined && count !== null) {
-      parts.push(count.toLocaleString() + ' item' + (count === 1 ? '' : 's'));
+    } else if (loaded != null) {
+      // No total from the source, so the honest claim is "at least this
+      // many" until the last page lands -- a bare "100" on a list still
+      // paging in reads as the whole list.
+      parts.push(loaded.toLocaleString() + (moreToLoad ? '+' : '') + ' item' + (loaded === 1 ? '' : 's'));
     } else {
       parts.push('Loading\u2026');
     }
@@ -46304,16 +46429,23 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 
   window._currentListDetailsUpdateLikes = function(newLikes) {
     likesCount = newLikes;
-    subEl.textContent = formatSubtitle(loadedCount, false, 0);
+    subEl.textContent = formatSubtitle(loadedCount);
   };
 
   window._updateListDetailsItemCount = function(newCount) {
+    // A removal makes the list itself shorter, so a total this page was
+    // handed has to come down with it -- otherwise the header keeps
+    // advertising the size the list had before the item was removed.
+    if (knownTotalItems != null && typeof newCount === 'number' && newCount < loadedCount) {
+      knownTotalItems = Math.max(0, knownTotalItems - (loadedCount - newCount));
+      if (knownTotalItems === 0) knownTotalItems = null;
+    }
     loadedCount = newCount;
-    if (subEl) subEl.textContent = formatSubtitle(newCount, false, 0);
+    if (subEl) subEl.textContent = formatSubtitle(newCount);
   };
 
   titleEl.textContent = name || 'List';
-  subEl.textContent = formatSubtitle(null, false, 0);
+  subEl.textContent = formatSubtitle(null);
   gridEl.innerHTML = '';
   gridEl.classList.toggle('is-watch-history-shelf', !!(name && name.toLowerCase().includes('watch history')));
   statusEl.innerHTML = '<small>Loading\u2026</small>';
@@ -46739,13 +46871,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
-    subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
       statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
     } else {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
+    // Set before the subtitle is written, not after: the subtitle says "100+"
+    // rather than "100" precisely when this is true.
+    moreToLoad = !done;
+    subEl.textContent = formatSubtitle(loadedCount);
   }
 
   async function loadNextPage() {

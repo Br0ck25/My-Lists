@@ -2068,7 +2068,20 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     }
   }
 
-  let knownTotalItems = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) || (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  // The list's real size when something upstream actually knows it: a
+  // stored list's item count, or a source that reports a total (see
+  // /api/preview's totalItems). Coerced, because it arrives from a dataset
+  // attribute -- a string -- as often as it arrives as a number, and it is
+  // compared against the loaded count below.
+  const rawKnownTotal = (opts && opts.itemCount) || (preloaded && preloaded.itemCount) ||
+    (preloaded && Array.isArray(preloaded.items) ? preloaded.items.length : null);
+  let knownTotalItems = Number.isFinite(Number(rawKnownTotal)) && Number(rawKnownTotal) > 0
+    ? Number(rawKnownTotal)
+    : null;
+  // Whether the source still has pages this view has not loaded. Held here
+  // rather than passed around, so every re-render of the subtitle -- a page
+  // arriving, a like landing, an item being removed -- agrees about it.
+  let moreToLoad = false;
   let likesCount = (opts && opts.likes !== undefined && opts.likes !== null && opts.likes !== '') ? opts.likes : ((preloaded && preloaded.likes !== undefined && preloaded.likes !== null) ? preloaded.likes : null);
 
   const isNoLikesList =
@@ -2088,14 +2101,24 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     likesCount = null;
   }
 
-  function formatSubtitle(count, maybeMore, itemsThisPage) {
+  function formatSubtitle(count) {
     const parts = [];
     if (creatorName) parts.push('by ' + creatorName);
     parts.push(type === 'series' ? 'Shows' : 'Movies');
-    if (knownTotalItems != null && knownTotalItems > 0) {
+    const loaded = (count === undefined || count === null) ? null : Number(count);
+    // A known total is only believable while it is at least what is already
+    // on screen. One that the loaded items have overtaken was never the
+    // list's size -- it was a first page's length, capped at 100 by
+    // /api/preview, handed over by whatever card was clicked. Believing it
+    // is how a 303-item chart went on saying "100 items" after the whole
+    // thing had been scrolled through.
+    if (knownTotalItems != null && (loaded == null || knownTotalItems >= loaded)) {
       parts.push(knownTotalItems.toLocaleString() + ' item' + (knownTotalItems === 1 ? '' : 's'));
-    } else if (count !== undefined && count !== null) {
-      parts.push(count.toLocaleString() + ' item' + (count === 1 ? '' : 's'));
+    } else if (loaded != null) {
+      // No total from the source, so the honest claim is "at least this
+      // many" until the last page lands -- a bare "100" on a list still
+      // paging in reads as the whole list.
+      parts.push(loaded.toLocaleString() + (moreToLoad ? '+' : '') + ' item' + (loaded === 1 ? '' : 's'));
     } else {
       parts.push('Loading\u2026');
     }
@@ -2107,16 +2130,23 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 
   window._currentListDetailsUpdateLikes = function(newLikes) {
     likesCount = newLikes;
-    subEl.textContent = formatSubtitle(loadedCount, false, 0);
+    subEl.textContent = formatSubtitle(loadedCount);
   };
 
   window._updateListDetailsItemCount = function(newCount) {
+    // A removal makes the list itself shorter, so a total this page was
+    // handed has to come down with it -- otherwise the header keeps
+    // advertising the size the list had before the item was removed.
+    if (knownTotalItems != null && typeof newCount === 'number' && newCount < loadedCount) {
+      knownTotalItems = Math.max(0, knownTotalItems - (loadedCount - newCount));
+      if (knownTotalItems === 0) knownTotalItems = null;
+    }
     loadedCount = newCount;
-    if (subEl) subEl.textContent = formatSubtitle(newCount, false, 0);
+    if (subEl) subEl.textContent = formatSubtitle(newCount);
   };
 
   titleEl.textContent = name || 'List';
-  subEl.textContent = formatSubtitle(null, false, 0);
+  subEl.textContent = formatSubtitle(null);
   gridEl.innerHTML = '';
   gridEl.classList.toggle('is-watch-history-shelf', !!(name && name.toLowerCase().includes('watch history')));
   statusEl.innerHTML = '<small>Loading\u2026</small>';
@@ -2542,13 +2572,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
-    subEl.textContent = formatSubtitle(loadedCount, maybeMore, itemsThisPage);
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
       statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
     } else {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
+    // Set before the subtitle is written, not after: the subtitle says "100+"
+    // rather than "100" precisely when this is true.
+    moreToLoad = !done;
+    subEl.textContent = formatSubtitle(loadedCount);
   }
 
   async function loadNextPage() {

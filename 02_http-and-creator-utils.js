@@ -1053,6 +1053,14 @@ async function fetchWithPerUserCacheAndCircuitBreaker(options) {
 // treated as empty -- those are real answers.
 function isEmptyPayload(value) {
   if (Array.isArray(value)) return value.length === 0;
+  // A wrapper carrying its rows under `items` is as empty as the array inside
+  // it -- see traktPayloadWithTotal (06_source-fetchers-mdblist-trakt.js),
+  // which wraps a Trakt reply so its real item count can survive being
+  // cached. Without this, wrapping a response to carry its total would
+  // quietly switch this guard off for that cache: { items: [], totalItems: 0 }
+  // is an object with two keys, so an empty upstream reply would have counted
+  // as a successful refresh and overwritten the last good copy.
+  if (value && typeof value === "object" && Array.isArray(value.items)) return value.items.length === 0;
   if (value && typeof value === "object") return Object.keys(value).length === 0;
   return false;
 }
