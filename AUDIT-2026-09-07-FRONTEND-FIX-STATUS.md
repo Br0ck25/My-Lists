@@ -214,6 +214,27 @@ labels its checkboxes, so it reported 67 controls that a real DOM says are fine.
 A check that is wrong 67 times is worse than no check; the browser probe answers
 it correctly via `element.labels` and is committed alongside.
 
+### Why the admin-page check in particular earns its place
+
+The swallowed-backslash class is not a one-off. `git log` has it three times
+before this audit:
+
+```
+7dea440  Fix See All overflow root cause + a backslash-escaping regression
+c1e0829  ... the admin page's \n\n and /[\s,]+/          (FE-01, first half)
+4ba6e0a  ... the second confirm() block                     (FE-01, second half)
+```
+
+It caught two more during this work: writing `.join('\n')` into
+`19_client-search-and-likes.js` and a regex literal into
+`24_client-backup-restore-presets.js`, both of which would have shipped broken
+and both of which the checks failed on immediately.
+
+That is the argument for the check rather than for care. Every one of these was
+written by someone who knew the rule; the file is 35,000 lines of code living
+inside a template literal, and the only reliable defence is a machine that reads
+what the browser will actually receive.
+
 ---
 
 ## One correction to the audit itself
