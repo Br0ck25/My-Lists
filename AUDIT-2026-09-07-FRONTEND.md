@@ -672,14 +672,21 @@ opener on close. Wire the four static modals in `09_page-shell.js` to the same h
 
 Measured: `[role=tablist]` × 2, `[role=tab]` × **0**, `[role=tabpanel]` × 0, no
 `aria-selected`, no `aria-controls`. An ARIA `tablist` may only contain `tab`
-children, so assistive technology sees an empty tab list. Both bars are in the DOM
-at all times (only CSS hides one), so the six navigation items are announced
-twice.
+children, so assistive technology sees an empty tab list.
 
-**Fix.** `role="tab"` + `aria-selected` + `aria-controls` on the buttons,
-`role="tabpanel"` + `aria-labelledby` on `[data-tab-panel]`, and `aria-hidden="true"`
-(or `display:none`, which it already has) plus removal from the a11y tree on
-whichever bar is not shown.
+> **Correction (added while fixing this).** This finding originally also claimed
+> the six navigation items are announced twice because both bars are in the DOM
+> at once. That is wrong: each bar is `display: none` at the other's breakpoint,
+> which removes it from the accessibility tree. Measured after the fact —
+> `[role=tablist]` with a computed display other than `none`: `bottom-nav` at
+> 390px, `tab-bar` at 1280px, one at a time. The empty-tablist half of the
+> finding stands; the duplicate-announcement half does not.
+
+**Fix.** `role="tab"` + `aria-selected` + `aria-controls` on the buttons, and
+`role="tabpanel"` + `aria-labelledby` on `[data-tab-panel]`. A tablist is also
+one stop in the page's tab order with the arrows moving inside it, so a roving
+`tabindex` and arrow/Home/End handling belong with the roles rather than after
+them.
 
 ### Smaller a11y findings
 
