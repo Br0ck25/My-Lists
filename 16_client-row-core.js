@@ -1157,7 +1157,7 @@ function renderUserFeedbackThreadsUI() {
       const catLabel = t.category ? (t.category.charAt(0).toUpperCase() + t.category.slice(1)) : 'Support';
       const hasAdminReply = Array.isArray(t.messages) && t.messages.some((m) => m.sender === 'admin');
       const badge = hasAdminReply ? ' \uD83D\uDCAC' : '';
-      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeAttr(t.id) + '&quot;)">' +
+      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeJsAttr(t.id) + '&quot;)">' +
         escapeHtml(catLabel) + badge +
       '</button>';
     }).join('');

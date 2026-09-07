@@ -7448,15 +7448,15 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Enter a username and at least one slug.';
         return;
       }
-      const slugs = rawSlugs.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = rawSlugs.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
-        ' belonging to "' + username + '"?\n\n' + slugs.slice(0, 12).join(', ') +
+        ' belonging to "' + username + '"?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;
@@ -7572,7 +7572,7 @@ async function renderAdminDashboard(env) {
       if (!btn) return;
       const input = document.getElementById('deleteAnonSlugsInput');
       const slug = btn.getAttribute('data-anon-slug');
-      const current = (input.value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const current = (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (current.indexOf(slug) === -1) current.push(slug);
       input.value = current.join(', ');
       document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
@@ -7584,15 +7584,15 @@ async function renderAdminDashboard(env) {
       const btn = document.getElementById('deleteAnonBtn');
       const status = document.getElementById('deleteAnonStatus');
       const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
-      const slugs = raw.split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      const slugs = raw.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!slugs.length) {
         status.textContent = 'Enter at least one slug.';
         return;
       }
       const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
-        (slugs.length === 1 ? '' : 's') + '?\n\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length === 1 ? '' : 's') + '?\\n\\n' + slugs.slice(0, 12).join(', ') +
         (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
-        '\n\nThis cannot be undone.');
+        '\\n\\nThis cannot be undone.');
       if (!ok) return;
 
       btn.disabled = true;
@@ -19238,7 +19238,7 @@ function renderUserFeedbackThreadsUI() {
       const catLabel = t.category ? (t.category.charAt(0).toUpperCase() + t.category.slice(1)) : 'Support';
       const hasAdminReply = Array.isArray(t.messages) && t.messages.some((m) => m.sender === 'admin');
       const badge = hasAdminReply ? ' \uD83D\uDCAC' : '';
-      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeAttr(t.id) + '&quot;)">' +
+      return '<button type="button" class="support-thread-pill ' + (isActive ? 'active' : '') + '" onclick="selectFeedbackThread(&quot;' + escapeJsAttr(t.id) + '&quot;)">' +
         escapeHtml(catLabel) + badge +
       '</button>';
     }).join('');
@@ -24608,6 +24608,43 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
+// escapeAttr is right for a plain attribute and WRONG for a JavaScript string
+// inside one, which is what every onclick="fn(&quot;VALUE&quot;)" handler in
+// this app builds. The HTML parser decodes attribute entities BEFORE the JS
+// parser runs, so escapeHtml's own output re-forms the delimiter it was meant
+// to neutralise -- escaping becomes the delivery mechanism:
+//
+//   value       ");alert(1);//
+//   escapeAttr  &quot;);alert(1);//
+//   markup      onclick="fn(&quot;&quot;);alert(1);//&quot;)"
+//   executed    fn("");alert(1);//")        <- the payload runs
+//
+// Measured, not theorised: a channel id carrying that shape, arriving through
+// a restored backup or a pasted install link, ran script and read the victim's
+// Creator Key out of localStorage.
+//
+// The value has to survive two decodings, so it needs escaping for both, in
+// that order: JS-string first, then HTML. Backslash-escaping the quote makes
+// the HTML decode yield \\\\" rather than ", which the JS parser reads as a
+// literal quote inside the string instead of the end of it.
+//
+// Not a replacement for escapeAttr -- a plain data-* or title attribute still
+// wants escapeAttr, and running this on one would leave visible backslashes.
+// Use this one only where the value lands inside quotes the browser will
+// execute.
+function escapeJsAttr(s) {
+  return escapeHtml(
+    String(s == null ? '' : s)
+      .replace(/\\\\/g, '\\\\\\\\')
+      .replace(/"/g, '\\\\"')
+      .replace(/'/g, "\\\\'")
+      .replace(/\\r/g, '\\\\r')
+      .replace(/\\n/g, '\\\\n')
+      .replace(/\\u2028/g, '\\\\u2028')
+      .replace(/\\u2029/g, '\\\\u2029')
+  );
+}
+
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
 }
@@ -26483,7 +26520,7 @@ async function openItemDetailsModal(id, type, opts) {
         const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
         seasonsHtml += 
           '<div class="season-card">' +
-            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeAttr(d.id) + '&quot;)">' +
+            '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
               '<div class="season-header-main">' +
                 (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
                 '<div class="season-header-info">' +
@@ -26517,7 +26554,7 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeAttr(d.id) + '&quot;)">' +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
                 (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
               '</button>'
               :
@@ -26845,7 +26882,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
             (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -26865,7 +26902,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>Trakt Watchlist</span>' +
           (inTraktWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTraktWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTraktLists)) {
@@ -26879,7 +26916,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tl.name || 'Trakt List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tl.id || tl.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -26909,7 +26946,7 @@ function openSelectListModal(id, type, title, poster) {
             '<span>' + escapeHtml(st.label) + '</span>' +
             (isPresent ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
-          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+          (isPresent ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st.key + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
         '</div>';
     });
   }
@@ -26929,7 +26966,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Watchlist</span>' +
           (inTmdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     const tmdbFav = Array.isArray(window._myTmdbLists) ? window._myTmdbLists.find(l => l.url && l.url.includes('favorites')) : null;
@@ -26941,7 +26978,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>TMDB Favorites</span>' +
           (inTmdbFav ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inTmdbFav ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;favorite&quot;, &quot;favorite&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myTmdbLists)) {
@@ -26955,7 +26992,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(tml.name || 'TMDB List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeAttr(tml.id || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(tml.id || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -26976,7 +27013,7 @@ function openSelectListModal(id, type, title, poster) {
           '<span>MDBList Watchlist</span>' +
           (inMdbWatchlist ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
         '</label>' +
-        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+        (inMdbWatchlist ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;watchlist&quot;, &quot;watchlist&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
       '</div>';
 
     if (Array.isArray(window._myMdblistLists)) {
@@ -26990,7 +27027,7 @@ function openSelectListModal(id, type, title, poster) {
               '<span>' + escapeHtml(ml.name || 'MDBList List') + '</span>' +
               (inList ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
             '</label>' +
-            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>' : '') +
+            (inList ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;custom&quot;, &quot;' + escapeJsAttr(ml.id || ml.slug || '') + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
           '</div>';
       });
     }
@@ -27049,7 +27086,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;simkl&quot;, &quot;status&quot;, &quot;' + st + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27079,7 +27116,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;trakt&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27112,7 +27149,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;tmdb&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -27142,7 +27179,7 @@ function openSelectListModal(id, type, title, poster) {
                 const label = row.querySelector('label');
                 if (label) label.insertAdjacentHTML('beforeend', '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>');
                 if (!row.querySelector('button')) {
-                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeAttr(listId) + '&quot;, &quot;' + escapeAttr(id) + '&quot;, &quot;' + escapeAttr(type) + '&quot;, this)">Remove</button>');
+                  row.insertAdjacentHTML('beforeend', '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleExternalItemDirect(&quot;mdblist&quot;, &quot;' + target + '&quot;, &quot;' + escapeJsAttr(listId) + '&quot;, &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>');
                 }
               }
             }
@@ -32772,7 +32809,7 @@ function renderChannelCrossoverSuggestions() {
       '<p class="channel-crossover-desc">' + escapeHtml(event.description) + '</p>' +
       '<div class="channel-crossover-parts">' + chipsHtml + '</div>' +
       '<div class="channel-crossover-actions">' +
-        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
+        '<button type="button" class="primary lc-btn" onclick="spliceCrossoverEvent(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" style="padding:6px 14px; font-size:0.82rem;">' + escapeHtml(btnLabel) + '</button>' +
       '</div>' +
     '</div>';
   }).join('');
@@ -33350,14 +33387,14 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
       const isDesktopEnd = (i === previewPosters.length - 1 && totalCount >= 4);
       let overlays = '';
       if (isMobileEnd) {
-        overlays += '<div class="list-card-count-overlay mobile-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay mobile-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
       if (isDesktopEnd) {
-        overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
 
       return '<div class="list-card-mini-poster-tile">' +
-        '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)">' +
+        '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
           '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
           overlays +
         '</div>' +
@@ -33369,7 +33406,7 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
     return '<div class="list-card" data-universe-id="' + escapeAttr(event.id) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" onclick="openStorylineDetails(&quot;' + escapeAttr(event.id) + '&quot;)" style="cursor:pointer;">' + escapeHtml(event.name) + '</div>' +
+          '<div class="list-card-title" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + escapeHtml(event.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + escapeHtml(event.franchise) + '</span>' +
             '<span class="list-card-meta-sep">&middot;</span>' +
@@ -33379,8 +33416,8 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn ' + (isAdded ? 'secondary is-added' : 'primary') + '" onclick="createInstantStorylineChannel(&quot;' + escapeAttr(event.id) + '&quot;, this)" ' + (isAdded ? 'style="color:var(--danger);"' : '') + '>' + (isAdded ? 'Remove' : '+ Add') + '</button>' +
-          '<button type="button" class="lc-btn secondary" onclick="loadStorylineToDraft(&quot;' + escapeAttr(event.id) + '&quot;, this)" title="Customize in Channel Builder">Customize</button>' +
+          '<button type="button" class="lc-btn ' + (isAdded ? 'secondary is-added' : 'primary') + '" onclick="createInstantStorylineChannel(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" ' + (isAdded ? 'style="color:var(--danger);"' : '') + '>' + (isAdded ? 'Remove' : '+ Add') + '</button>' +
+          '<button type="button" class="lc-btn secondary" onclick="loadStorylineToDraft(&quot;' + escapeJsAttr(event.id) + '&quot;, this)" title="Customize in Channel Builder">Customize</button>' +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters">' +
@@ -34045,10 +34082,10 @@ function renderMyCreatedChannelsList() {
       const isDesktopEnd = (i === allPosters.length - 1 && allItems.length >= 4);
       let overlays = '';
       if (isMobileEnd) {
-        overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
       }
       if (isDesktopEnd) {
-        overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
+        overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' + totalEpisodes + ' &rsaquo;</div>';
       }
 
       const p = it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '';
@@ -34114,7 +34151,7 @@ function renderMyCreatedChannelsList() {
       const itemId = it.imdbId || it.id || '';
       const itemType = (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series';
       const posterClickAttr = itemId
-        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
+        ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
         : '';
       
       return '<div class="list-card-mini-poster-tile">' +
@@ -34127,7 +34164,7 @@ function renderMyCreatedChannelsList() {
       '</div>';
     }).join('');
     
-    const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleChannelInCatalog(&quot;' + escapeAttr(ch.channelId) + '&quot;)">' +
+    const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleChannelInCatalog(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">' +
       (isAdded ? 'Remove' : '+ Add') +
     '</button>';
 
@@ -34140,8 +34177,8 @@ function renderMyCreatedChannelsList() {
           '</div>' +
         '</div>' +
         '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeAttr(ch.channelId) + '&quot;)">Edit</button>' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeAttr(ch.channelId) + '&quot;, &quot;' + escapeAttr(ch.name) + '&quot;)">Delete</button>' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
       '</div>' +
@@ -34733,7 +34770,7 @@ function renderChannelMergeList() {
           if (ch && Array.isArray(ch.items)) totalEpisodes += ch.items.length;
           return '<span class="badge" style="display:inline-flex; align-items:center; gap:5px; padding:3px 8px; font-size:0.8rem; background:var(--panel-strong); border:1px solid var(--border); border-radius:6px; margin:2px 4px 2px 0;">' +
             escapeHtml(chName) +
-            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, &quot;' + escapeAttr(chId) + '&quot;)">&times;</button>' +
+            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, &quot;' + escapeJsAttr(chId) + '&quot;)">&times;</button>' +
           '</span>';
         }).join('');
         
@@ -34742,7 +34779,7 @@ function renderChannelMergeList() {
         if (remainingChannels.length) {
           remainingChannels.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           const options = remainingChannels.map((c) => '<option value="' + escapeAttr(c.channelId) + '">' + escapeHtml(c.name) + ' (' + (c.items ? c.items.length : 0) + ' ep)</option>').join('');
-          addSelectHtml = '<select class="merge-add-channel-select" onchange="addChannelToMerge(&quot;' + escapeAttr(merged.mergedId) + '&quot;, this.value); this.value=&quot;&quot;;">' +
+          addSelectHtml = '<select class="merge-add-channel-select" onchange="addChannelToMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, this.value); this.value=&quot;&quot;;">' +
             '<option value="">+ Add channel...</option>' +
             options +
           '</select>';
@@ -34755,7 +34792,7 @@ function renderChannelMergeList() {
         
         const countText = (merged.channelIds ? merged.channelIds.length : 0) + ' channels &middot; ' + totalEpisodes + ' episodes';
         
-        const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleMergedChannelInCatalog(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">' +
+        const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary' : 'primary') + '" style="padding:6px 12px; font-size:0.8rem;' + (isAdded ? ' color:var(--danger);' : '') + '" onclick="toggleMergedChannelInCatalog(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;)">' +
           (isAdded ? 'Remove' : '+ Add') +
         '</button>';
 
@@ -34771,7 +34808,7 @@ function renderChannelMergeList() {
               '</div>' +
             '</div>' +
             '<div class="list-card-actions">' +
-              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalMergedChannel(&quot;' + escapeAttr(merged.mergedId) + '&quot;)">Delete</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalMergedChannel(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;)">Delete</button>' +
               addBtnHtml +
             '</div>' +
           '</div>' +
@@ -40856,7 +40893,7 @@ async function renderCreatorDashboard(options) {
           overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
         }
         const removeBtn = isWatchlist
-          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
           : '';
         const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
         const itemPoster = resolveItemPoster(it);
@@ -41061,11 +41098,11 @@ function buildLocalListCardHtml(l) {
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
     if (l.slug === 'continue-watching' && it.showId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
     } else if (isWatchlist) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
     }
     const itemPoster = resolveItemPoster(it);
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
@@ -45563,6 +45600,53 @@ function looksLikeTmdbKey(v) {
   return /^[0-9a-f]{32}$/i.test(String(v || '').trim());
 }
 
+// Ids and slugs that arrived from somewhere else.
+//
+// escapeJsAttr (19_client-search-and-likes.js) is what actually stops an
+// imported id executing; this is the second layer, and it is here because an
+// id is not free text. Every id this app produces is a slug, a "ch_<time>_<rand>",
+// a "tt…" or a "tmdb:…" -- none of which can contain a quote, an angle bracket,
+// a backslash or a control character. A value that does was not produced by
+// this app, and the honest thing to do with it is drop it and say so rather
+// than store it and hope the renderer holds.
+//
+// Dropped rather than rewritten on purpose: a row can reference a channel or
+// list BY KEY, so renaming the key would leave the row pointing at nothing --
+// a silently empty shelf, which is the failure this file exists to prevent.
+// Character codes rather than a regex literal on purpose. This whole file is
+// emitted from a template literal, which eats single backslashes -- that is
+// exactly how /[\\s,]+/ became /[s,]+/ in the admin page. A test written with
+// charCodeAt cannot be broken that way, and reads no worse.
+function hasUnsafeIdChar(v) {
+  const str = String(v == null ? '' : v);
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    //  control chars      "          '          <          >          backslash
+    if (c < 32 || c === 34 || c === 39 || c === 60 || c === 62 || c === 92) return true;
+  }
+  return false;
+}
+
+function dropUnsafeImportedIds(data) {
+  const dropped = [];
+  if (!data || typeof data !== 'object') return dropped;
+  ['customLists', 'channels', 'mergedChannels', 'presets'].forEach((field) => {
+    const map = data[field];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+    Object.keys(map).forEach((key) => {
+      const entry = map[key];
+      const inner = entry && typeof entry === 'object'
+        ? String(entry.channelId || entry.slug || '')
+        : '';
+      if (hasUnsafeIdChar(key) || (inner && hasUnsafeIdChar(inner))) {
+        delete map[key];
+        dropped.push(field + '/' + key.slice(0, 40));
+      }
+    });
+  });
+  return dropped;
+}
+
 function validateAndRepairBackup(data) {
   const notes = [];
   const warnings = [];
@@ -45649,6 +45733,14 @@ function validateAndRepairBackup(data) {
   });
   if (emptyRows.length) {
     warnings.push(emptyRows.length + ' row(s) have no items and nothing to load them from: ' + emptyRows.slice(0, 5).join(', ') + (emptyRows.length > 5 ? '...' : ''));
+  }
+
+  // 6. Ids that cannot have come from this app -- see dropUnsafeImportedIds.
+  const unsafeIds = dropUnsafeImportedIds(data);
+  if (unsafeIds.length) {
+    warnings.push('Removed ' + unsafeIds.length + ' list/channel(s) whose id contained characters this app never produces (' +
+      unsafeIds.slice(0, 3).join(', ') + (unsafeIds.length > 3 ? ', and others' : '') +
+      '). A backup from this app cannot contain those, so the file was edited or came from somewhere else.');
   }
 
   return { data: data, format: format, notes: notes, warnings: warnings };
@@ -46029,6 +46121,10 @@ async function importFromLink() {
     renderChannelMergeList();
 
     // Rebuild & restore custom lists and channels from the imported link
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -46112,6 +46208,9 @@ async function importFromLink() {
       msg += '\\n\\nRestored ' + parts.join(' and ') + ' to your My Lists tab.';
       if (restoredListNames.length) msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
     }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
+    }
     if (typeof showAppAlert === 'function') showAppAlert('Import Complete', msg, true);
     else alert(msg);
   } catch (e) {
@@ -46135,6 +46234,10 @@ async function restoreListsFromLink() {
       return;
     }
 
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -46219,6 +46322,9 @@ async function restoreListsFromLink() {
     msg += ' from that link into your My Lists tab.';
     if (restoredListNames.length) {
       msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
     }
     if (typeof showAppAlert === 'function') showAppAlert('Custom Lists Rebuilt', msg, true);
     else alert(msg);

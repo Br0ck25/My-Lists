@@ -228,6 +228,53 @@ function looksLikeTmdbKey(v) {
   return /^[0-9a-f]{32}$/i.test(String(v || '').trim());
 }
 
+// Ids and slugs that arrived from somewhere else.
+//
+// escapeJsAttr (19_client-search-and-likes.js) is what actually stops an
+// imported id executing; this is the second layer, and it is here because an
+// id is not free text. Every id this app produces is a slug, a "ch_<time>_<rand>",
+// a "tt…" or a "tmdb:…" -- none of which can contain a quote, an angle bracket,
+// a backslash or a control character. A value that does was not produced by
+// this app, and the honest thing to do with it is drop it and say so rather
+// than store it and hope the renderer holds.
+//
+// Dropped rather than rewritten on purpose: a row can reference a channel or
+// list BY KEY, so renaming the key would leave the row pointing at nothing --
+// a silently empty shelf, which is the failure this file exists to prevent.
+// Character codes rather than a regex literal on purpose. This whole file is
+// emitted from a template literal, which eats single backslashes -- that is
+// exactly how /[\\s,]+/ became /[s,]+/ in the admin page. A test written with
+// charCodeAt cannot be broken that way, and reads no worse.
+function hasUnsafeIdChar(v) {
+  const str = String(v == null ? '' : v);
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    //  control chars      "          '          <          >          backslash
+    if (c < 32 || c === 34 || c === 39 || c === 60 || c === 62 || c === 92) return true;
+  }
+  return false;
+}
+
+function dropUnsafeImportedIds(data) {
+  const dropped = [];
+  if (!data || typeof data !== 'object') return dropped;
+  ['customLists', 'channels', 'mergedChannels', 'presets'].forEach((field) => {
+    const map = data[field];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+    Object.keys(map).forEach((key) => {
+      const entry = map[key];
+      const inner = entry && typeof entry === 'object'
+        ? String(entry.channelId || entry.slug || '')
+        : '';
+      if (hasUnsafeIdChar(key) || (inner && hasUnsafeIdChar(inner))) {
+        delete map[key];
+        dropped.push(field + '/' + key.slice(0, 40));
+      }
+    });
+  });
+  return dropped;
+}
+
 function validateAndRepairBackup(data) {
   const notes = [];
   const warnings = [];
@@ -314,6 +361,14 @@ function validateAndRepairBackup(data) {
   });
   if (emptyRows.length) {
     warnings.push(emptyRows.length + ' row(s) have no items and nothing to load them from: ' + emptyRows.slice(0, 5).join(', ') + (emptyRows.length > 5 ? '...' : ''));
+  }
+
+  // 6. Ids that cannot have come from this app -- see dropUnsafeImportedIds.
+  const unsafeIds = dropUnsafeImportedIds(data);
+  if (unsafeIds.length) {
+    warnings.push('Removed ' + unsafeIds.length + ' list/channel(s) whose id contained characters this app never produces (' +
+      unsafeIds.slice(0, 3).join(', ') + (unsafeIds.length > 3 ? ', and others' : '') +
+      '). A backup from this app cannot contain those, so the file was edited or came from somewhere else.');
   }
 
   return { data: data, format: format, notes: notes, warnings: warnings };
@@ -694,6 +749,10 @@ async function importFromLink() {
     renderChannelMergeList();
 
     // Rebuild & restore custom lists and channels from the imported link
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -777,6 +836,9 @@ async function importFromLink() {
       msg += '\\n\\nRestored ' + parts.join(' and ') + ' to your My Lists tab.';
       if (restoredListNames.length) msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
     }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
+    }
     if (typeof showAppAlert === 'function') showAppAlert('Import Complete', msg, true);
     else alert(msg);
   } catch (e) {
@@ -800,6 +862,10 @@ async function restoreListsFromLink() {
       return;
     }
 
+    // The link path never went through validateAndRepairBackup, so the same
+    // id check has to happen here. resolveInstallLinkData will fetch from ANY
+    // origin the pasted link names, so this payload is a stranger's JSON.
+    const unsafeFromLink = dropUnsafeImportedIds(data);
     const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(data);
     const listSlugs = Object.keys(extractedLists);
     const channelIds = Object.keys(extractedChannels);
@@ -884,6 +950,9 @@ async function restoreListsFromLink() {
     msg += ' from that link into your My Lists tab.';
     if (restoredListNames.length) {
       msg += '\\n\\n• ' + restoredListNames.join('\\n• ');
+    }
+    if (unsafeFromLink.length) {
+      msg += '\\n\\nSkipped ' + unsafeFromLink.length + ' item(s) whose id contained characters this app never produces. A link from this app cannot contain those.';
     }
     if (typeof showAppAlert === 'function') showAppAlert('Custom Lists Rebuilt', msg, true);
     else alert(msg);

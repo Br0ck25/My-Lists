@@ -345,3 +345,81 @@ describe("client: what an anonymous user's first account publishes", () => {
     assert.ok(!names.includes("Continue Watching"), "nor continue watching");
   });
 });
+
+// --- FE-02: data that arrived from someone else must not become code -------
+//
+// 37 handler sites build a JavaScript string inside an HTML attribute and
+// delimit it with &quot;. escapeAttr is escapeHtml, which EMITS &quot; -- and
+// the HTML parser decodes attribute entities before the JS parser runs, so the
+// escaping re-formed the delimiter it was meant to neutralise. A channel id
+// carrying ");… arrived through a restored backup or a pasted install link and
+// executed, with the victim's Creator Key in reach.
+//
+// Two tests, because there are two layers and each has to hold on its own:
+// the escaper (what stops it executing) and the import check (what stops it
+// being stored at all).
+
+// Mirrors what a browser does with an attribute value before running it.
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+describe("client: an imported id cannot break out of an inline handler", () => {
+  const BREAKOUT = '"); window.__pwned = 1; //';
+
+  it("escapes so the handler stays one call with one argument", () => {
+    const client = loadClient();
+    const attr = 'fn(&quot;' + client.call("escapeJsAttr", BREAKOUT) + '&quot;)';
+    const code = decodeEntities(attr);
+
+    // The whole payload has to survive as ONE argument. Before the fix this
+    // parsed as fn("") followed by the payload as live statements.
+    const seen = [];
+    // eslint-disable-next-line no-new-func
+    new Function("fn", code)((...args) => seen.push(args));
+    assert.deepEqual(seen, [[BREAKOUT]],
+      "the id must arrive as a single string argument, not as executed code");
+  });
+
+  it("leaves an ordinary id byte-identical", () => {
+    const client = loadClient();
+    for (const id of ["ch_1700000000_ab12", "tt0944947", "tmdb:1399", "my-list-slug"]) {
+      assert.equal(client.call("escapeJsAttr", id), id, id + " must pass through untouched");
+    }
+  });
+
+  it("survives a name that merely contains quotes, which used to be a syntax error", () => {
+    const client = loadClient();
+    const name = 'O\'Brien & Sons "Best"';
+    const code = decodeEntities('fn(&quot;' + client.call("escapeJsAttr", name) + '&quot;)');
+    const seen = [];
+    // eslint-disable-next-line no-new-func
+    new Function("fn", code)((...args) => seen.push(args));
+    assert.deepEqual(seen, [[name]]);
+  });
+
+  it("drops such an id at import rather than storing it", () => {
+    const client = loadClient();
+    const data = {
+      version: "3.0",
+      entries: [],
+      channels: {
+        ch_good_1: { channelId: "ch_good_1", name: "Keep Me", type: "series", items: [] },
+        [BREAKOUT]: { channelId: BREAKOUT, name: "Drop Me", type: "series", items: [] },
+      },
+      customLists: { "good-list": { slug: "good-list", name: "Good", type: "movie", items: [] } },
+    };
+    const dropped = client.call("dropUnsafeImportedIds", data);
+
+    assert.deepEqual(Object.keys(data.channels), ["ch_good_1"],
+      "the hostile channel must be gone");
+    assert.deepEqual(Object.keys(data.customLists), ["good-list"],
+      "and the rest of the file must be untouched -- dropping one entry, not rejecting the import");
+    assert.equal(dropped.length, 1, "and the caller must be told, so it can be reported");
+  });
+});
