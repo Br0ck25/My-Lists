@@ -753,6 +753,67 @@ the splash flashes light for dark-mode users.
 
 ---
 
+### FE-17 — MEDIUM — A resumed PWA never refetches custom lists changed on another device
+
+*Found after the original pass, from the question "phone backgrounded 30 min, desktop
+makes changes, phone reopened 20 min later — does it see them, or overwrite them?"
+Probes: `t46_background_resume.mjs`, `t47_stale_list_overwrite.mjs`,
+`t48_resume_variants.mjs`.*
+
+`handleForegroundResumeSync` (`22_client-creator-profile.js:5032`) skips the full
+load unless one of four stamps has moved, and `/api/creator/sync/meta`
+(`26_api-creator-and-admin-routes.js:2851`) returns exactly four: `config`,
+`tracking`, `presets`, `channels`. Custom lists are stored in
+`creatorlist:<user>:<slug>` and `creatorlistorder:<user>`
+(`26_api-creator-and-admin-routes.js:1980`, `:2024`) — no stamp covers them, and
+`loadCreatorSync` is the only thing that refetches lists on resume.
+
+So a desktop edit that touches *only* a list is invisible to a resumed phone:
+
+```
+server after desktop:  ["Fight Club","The Dark Knight"]
+resume requests     :  ["/api/creator/sync/meta"]          <- and nothing else
+phone after resume  :  ["Fight Club"]                       <- stale
+  switchTab(customLists) -> []   still ["Fight Club"]
+  switchTab(myLists)     -> []   still ["Fight Club"]
+  switchTab(settings)    -> []   still ["Fight Club"]
+70s hidden          :  []                                   <- no background polling
+70s visible         :  ["/api/creator/sync/meta"]           <- same gate, still stale
+```
+
+It is a display bug, not a data-loss bug. **No overwrite occurs**: the stale save
+is refused and the desktop's work survives, because `saveCreatorListEdit` cites
+`expectedUpdatedAt` (FE-05):
+
+```
+phone sent          : ["Fight Club","Inception"]  baseline 1788780797002 (stale)
+server before/after : ["Fight Club","The Dark Knight"]      <- unchanged
+409s: 1   warned: YES ("This List Changed Elsewhere")
+phone converged after the refused save: YES
+```
+
+A **cold start** also converges — `/api/creator/sync/load` + `/api/creator/lists`
+run on a fresh load — so this only bites while the PWA is still resident. The
+service worker is not involved: its fetch handler returns early on
+`req.method !== 'GET'` and every sync call is a POST.
+
+The endpoint's own comment says it reads "the same keys sync/load reads" and so
+"cannot drift". That is true and still leaves this hole: lists do not come from
+`sync/load`, they come from `/api/creator/lists`. The gate covers a strictly
+smaller set than the load it gates.
+
+**Fix.** Either (a) call `/api/creator/lists` on every resume — it already supports
+`knownVersion` and answers `{unchanged:true}`, but the version is a hash of the
+response body, so the server still reads and serialises every list and only the
+download is saved; or (b) add a `lists` stamp to `sync/meta`, bumped by
+`lists/save`, `lists/delete` and `lists/reorder` through one shared helper.
+
+(b) keeps resume genuinely cheap, at the cost of the dedicated-key drift risk the
+`sync/meta` comment deliberately avoided — bounded to one helper rather than three
+call sites.
+
+---
+
 ## Performance / Memory
 
 No leaks found. Chrome DevTools `Performance.getMetrics` before and after

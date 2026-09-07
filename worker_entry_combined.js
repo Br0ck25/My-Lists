@@ -3515,6 +3515,12 @@ async function deleteCreatorLists(env, username, slugs) {
     console.error("deleteCreatorLists: could not update list order", e);
   }
 
+  // Deleting a list is a list change like any other, and the one shape of it a
+  // derived stamp could not have seen: a MAX(updated_at) over the surviving
+  // records goes DOWN when the newest list is the one removed. See
+  // bumpCreatorListsStamp.
+  await bumpCreatorListsStamp(env, username);
+
   return out;
 }
 
@@ -4322,6 +4328,55 @@ function nextSyncVersion(currentUpdatedAt) {
   return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
 }
 
+// --- "the custom lists changed" stamp ----------------------------------------
+//
+// /api/creator/sync/meta answers the browser's "has anything moved?" poll from
+// four stored blobs, and reading those real records is what makes its answer
+// impossible to drift from the truth. Custom lists have no such blob -- they
+// are one record per list (creatorlist:{user}:{slug}) plus an order key -- so
+// there was nothing for meta to read, and it reported "nothing changed" for an
+// account whose lists had just been rewritten from another device. A resumed
+// browser therefore kept showing a list that had moved on, and went on showing
+// it through the 60s poll and through every tab switch, until something else
+// happened to change one of the four (FE-17).
+//
+// This is the missing fifth stamp. It IS the dedicated key meta's own comment
+// argues against -- "a single missed write there would silently stop a device
+// from ever syncing again" -- so the mitigation is structural rather than
+// hopeful: every list mutation in the codebase goes through one of five call
+// sites, all of which call this, and tests/client.test.mjs fails the build if a
+// sixth writer of a creatorlist:/creatorlistorder: key appears without one.
+//
+// Best-effort by design. A failed bump costs one browser a delayed refresh;
+// throwing would fail a save whose data is already safely stored.
+//
+// `notBefore` is a floor the new stamp must clear. It exists for the one caller
+// that destroys the key before bumping it: purgeCreatorData sweeps
+// creatorliststamp: along with everything else, so the read below finds nothing,
+// prev falls to 0, and the new stamp is a bare Date.now() -- which ties with the
+// previous stamp whenever the whole reset lands inside one millisecond. A tie
+// reads as "nothing changed" to a polling browser, which is precisely the state
+// this stamp exists to prevent. CI caught that as a flake; it is a real hole,
+// not a flaky test.
+async function bumpCreatorListsStamp(env, username, notBefore) {
+  try {
+    const raw = await env.CONFIGS.get(`creatorliststamp:${username}`);
+    let prev = Number(notBefore) || 0;
+    if (raw) {
+      try { prev = Math.max(prev, Number(JSON.parse(raw).updatedAt) || 0); } catch {}
+    }
+    // Strictly increasing, for the same reason the sync blob's own version is:
+    // the client compares with >, so two saves inside one millisecond must not
+    // land on the same number.
+    await env.CONFIGS.put(
+      `creatorliststamp:${username}`,
+      JSON.stringify({ updatedAt: nextSyncVersion(prev) })
+    );
+  } catch (e) {
+    console.error("bumpCreatorListsStamp: could not record a list change", e);
+  }
+}
+
 // --- Deleted-username tombstones ---------------------------------------------
 //
 // A purge is a sweep, and a sweep is a moment in time. Every authenticated
@@ -4412,6 +4467,15 @@ async function isCreatorTombstoned(env, username) {
 async function purgeCreatorData(env, username, options = {}) {
   const deleteIdentity = options.deleteIdentity === true;
   const u = username;
+  // Read before the sweep below deletes it, so the bump at the end can still
+  // guarantee the stamp moves forward -- see bumpCreatorListsStamp's notBefore.
+  let priorListsStamp = 0;
+  try {
+    const stampRaw = await env.CONFIGS.get(`creatorliststamp:${u}`);
+    if (stampRaw) priorListsStamp = Number(JSON.parse(stampRaw).updatedAt) || 0;
+  } catch (e) {
+    // An unreadable stamp is no worse than the absent one this used to assume.
+  }
   let listsCleared = 0;
   const purgedListIds = [];
   let keysCleared = 0;
@@ -4566,6 +4630,7 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorsyncpresets:${u}`,
     `creatorsyncchannels:${u}`,
     `creatorlistorder:${u}`,
+    `creatorliststamp:${u}`,
     `creatorscrobblequeue:${u}`,
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
@@ -4704,6 +4769,20 @@ async function purgeCreatorData(env, username, options = {}) {
         console.error("purgeCreatorData: could not clear the D1 tombstone after a failed delete:", dbErr);
       }
     }
+  }
+
+  // An account/reset empties the lists but leaves the person signed in on
+  // every device, so the stamp has to move or those browsers keep rendering
+  // lists that no longer exist. Deliberately after the sweep above, which
+  // deletes creatorliststamp: along with the rest -- and skipped entirely for
+  // a full account delete, where there is no account left to poll.
+  //
+  // Gated on having actually removed something, because /api/creator/create
+  // runs this as a pre-create purge over a name that is usually clean: an
+  // unconditional bump there would hand every brand-new account a non-zero
+  // stamp describing a list change that never happened.
+  if (!deleteIdentity && listsCleared > 0) {
+    await bumpCreatorListsStamp(env, u, priorListsStamp);
   }
 
   // `ok` is the whole point: it is false when this call left something
@@ -40050,10 +40129,13 @@ async function loadCreatorSync(opts) {
       return;
     }
     const synced = data.data;
-    // Snapshot of the four stamps this browser is now level with. The
+    // Snapshot of the four blob stamps this browser is now level with. The
     // background poll compares /api/creator/sync/meta against exactly
     // these and skips the full load when none of them has moved -- see
-    // handleForegroundResumeSync below.
+    // handleForegroundResumeSync below. meta returns a fifth, "lists", which
+    // this load cannot fill in (it describes the creatorlist: records, not
+    // the sync blob); handleForegroundResumeSync adopts that one itself once
+    // it has refreshed the dashboard.
     window._syncMetaStamps = {
       config: Number(synced.updatedAt) || 0,
       tracking: Number(synced.trackingUpdatedAt) || 0,
@@ -43180,6 +43262,14 @@ async function handleForegroundResumeSync() {
       // a timer. See the endpoint's own comment,
       // 26_api-creator-and-admin-routes.js.
       let needsFullLoad = true;
+      // Custom lists are not part of the sync blob -- they are their own
+      // records, behind /api/creator/lists -- so they need their own answer
+      // from the same poll. Before the "lists" stamp existed, a list edited
+      // on another device moved none of the four stamps below, this function
+      // concluded "nothing changed", and the browser went on rendering the
+      // old copy indefinitely (FE-17).
+      let listsChanged = false;
+      let metaLists = null;
       const known = window._syncMetaStamps;
       if (known) {
         try {
@@ -43195,6 +43285,23 @@ async function handleForegroundResumeSync() {
               (Number(meta.tracking) || 0) > (known.tracking || 0) ||
               (Number(meta.presets) || 0) > (known.presets || 0) ||
               (Number(meta.channels) || 0) > (known.channels || 0);
+            const rawLists = Number(meta.lists);
+            if (Number.isFinite(rawLists)) {
+              metaLists = rawLists;
+              // known.lists is undefined on the first poll after a full
+              // load, which snapshots the four blob stamps and knows nothing
+              // of this one. Treating that as 0 spends one conditional
+              // /api/creator/lists -- which answers "unchanged" and costs
+              // almost nothing -- rather than adopting the server's number
+              // untested and risking a miss for a change that landed while
+              // that load was in flight.
+              listsChanged = metaLists > (Number(known.lists) || 0);
+            } else {
+              // An older worker, or a response without the field: refresh
+              // rather than assume, for the same reason the four above fall
+              // back to a full load.
+              listsChanged = true;
+            }
           }
           // Anything other than a clean ok:true response leaves
           // needsFullLoad true, so a failed or unrecognised meta check
@@ -43205,7 +43312,20 @@ async function handleForegroundResumeSync() {
         }
       }
       if (needsFullLoad && typeof loadCreatorSync === 'function') {
+        // Refetches the dashboard itself, so it covers the lists too.
         await loadCreatorSync({ background: true });
+      } else if (listsChanged && typeof renderCreatorDashboard === 'function') {
+        // Only the lists moved: refresh those alone rather than pulling the
+        // whole sync blob for them. fetchCreatorListsOnce sends the version it
+        // holds, so this is one small request when nothing has really changed.
+        await renderCreatorDashboard({ silent: true });
+      }
+      // Adopt the stamp only after the refresh it triggered has finished --
+      // recording it earlier would mark this browser level with a version it
+      // had not actually loaded. Set after a full load too, since
+      // loadCreatorSync's own snapshot cannot include this stamp.
+      if (metaLists !== null && window._syncMetaStamps) {
+        window._syncMetaStamps.lists = metaLists;
       }
     } catch (e) {
       // Silent background sync
@@ -56115,6 +56235,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (l.items.length !== initLen) {
               l.updatedAt = Date.now();
               await env.CONFIGS.put(key, JSON.stringify(l));
+              // Auto-Track Playback silently takes what you just watched off
+              // the Watchlist. That is a list change made by one device that
+              // every other device is showing, which is exactly what the
+              // stamp is for -- and the least obvious of the six mutation
+              // sites, since nothing here looks like a list edit.
+              await bumpCreatorListsStamp(env, auth.username);
             }
           };
 
@@ -57634,6 +57760,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
 
+      // The record is stored; tell the account's other browsers. Placed here
+      // rather than beside the response because the directory step below can
+      // return 500 on a save whose data DID land, and a browser that never
+      // hears about a stored change is exactly the failure this stamp exists
+      // to prevent. See bumpCreatorListsStamp (02_http-and-creator-utils.js).
+      await bumpCreatorListsStamp(env, auth.username);
+
       // Keep the directory index in step with this save. A list turned
       // private is removed rather than updated, otherwise unpublishing would
       // leave it listed publicly.
@@ -57733,6 +57866,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
             .slice(0, CREATOR_LIST_ORDER_MAX)
         : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
+      // Order is what the dashboard renders in, so a reorder on one device is
+      // a visible change on every other one -- and it touches only the order
+      // key, which is why the stamp cannot be derived from the list records.
+      await bumpCreatorListsStamp(env, auth.username);
       return json({ ok: true, order: newOrder });
     }
 
@@ -58308,6 +58445,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
             order.unshift("watchlist");
             await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
           }
+          // The Watchlist is a creatorlist: record like any other and shows on
+          // the same dashboard, so adding to it here counts as a list change.
+          await bumpCreatorListsStamp(env, auth.username);
         }
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
@@ -58433,9 +58573,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
-    //   -> { ok, config, tracking, presets, channels }
+    //   -> { ok, config, tracking, presets, channels, lists }
     // A deliberately tiny sibling of /api/creator/sync/load below, holding
-    // nothing but the four updatedAt stamps that tell a browser whether
+    // nothing but the five updatedAt stamps that tell a browser whether
     // anything it cares about has actually changed.
     //
     // It exists because the dashboard polls for multi-device changes on a
@@ -58447,7 +58587,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // megabytes of response, several times a minute, almost always to
     // conclude that nothing had changed at all.
     //
-    // Two things keep this cheap. The four reads run concurrently rather
+    // Two things keep this cheap. The five reads run concurrently rather
     // than one after another, and each updatedAt is pulled straight out of
     // the raw stored string (see readUpdatedAtFromRaw) instead of parsing
     // the blob -- so a 4MB tracking record costs a substring scan here,
@@ -58483,13 +58623,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return Number.isFinite(num) ? num : 0;
       }
 
-      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null;
+      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null, listsRaw = null;
       try {
-        [configRaw, trackingRaw, presetsRaw, channelsRaw] = await Promise.all([
+        [configRaw, trackingRaw, presetsRaw, channelsRaw, listsRaw] = await Promise.all([
           env.CONFIGS.get(`creatorsync:${auth.username}`),
           env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
           env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
           env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+          env.CONFIGS.get(`creatorliststamp:${auth.username}`),
         ]);
       } catch {
         // A read failure must not look like "nothing changed" -- returning
@@ -58504,6 +58645,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
         tracking: readUpdatedAtFromRaw(trackingRaw),
         presets: readUpdatedAtFromRaw(presetsRaw),
         channels: readUpdatedAtFromRaw(channelsRaw),
+        // The fifth stamp. Unlike the four above it is not read out of the
+        // blob it describes -- custom lists have no single blob -- but out of
+        // a tiny record every list mutation bumps. See bumpCreatorListsStamp
+        // (02_http-and-creator-utils.js) for why that key exists and what
+        // keeps it honest. A never-touched account has no such key, which
+        // reads as 0 and matches the 0 a fresh browser starts from, so this
+        // costs an existing account no spurious reload.
+        lists: readUpdatedAtFromRaw(listsRaw),
       });
     }
 

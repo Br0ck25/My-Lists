@@ -6319,3 +6319,183 @@ describe("R5: concurrent list creation does not lose the user's ordering", () =>
   // later reader does not mistake this test for a proof of correctness under
   // arbitrary interleaving.
 });
+
+// ---------------------------------------------------------------------------
+// FE-17 -- the "custom lists changed" stamp.
+//
+// /api/creator/sync/meta answers the browser's resume poll. It used to report
+// four stamps read straight out of the four sync blobs, which its own comment
+// (rightly) called drift-proof: reading the real record cannot lie. Custom
+// lists have no such blob, so they were simply absent from the answer, and a
+// list edited on another device stayed invisible to a resumed browser.
+//
+// The fifth stamp is a dedicated key, which reintroduces exactly the failure
+// that comment warned about: one mutation that forgets to bump it stops other
+// devices seeing that kind of change, silently and forever. These tests are
+// the mitigation. The first is a canary over the source itself -- it already
+// caught handleSubtitlesTrack, which quietly removes a watched film from the
+// Watchlist and looks nothing like a list edit.
+describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
+  const SRC = {
+    "02_http-and-creator-utils.js": fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8"),
+    "26_api-creator-and-admin-routes.js": fs.readFileSync(path.join(REPO_ROOT, "26_api-creator-and-admin-routes.js"), "utf8"),
+  };
+
+  // Every place in the two storage-owning files that names a custom-list key,
+  // grouped by the route or function it sits in.
+  function listKeyBlocks() {
+    const key = /`(creatorlist(?:order)?:[^`]*)`/g;
+    const anchor = /(?:path === "(\/[^"]+)")|(?:^[ \t]*(?:async )?function (\w+))/gm;
+    const out = new Map();
+    for (const [file, src] of Object.entries(SRC)) {
+      const anchors = [];
+      let m;
+      anchor.lastIndex = 0;
+      while ((m = anchor.exec(src))) anchors.push([m.index, m[1] || m[2]]);
+      key.lastIndex = 0;
+      while ((m = key.exec(src))) {
+        let name = "?", start = 0, end = src.length;
+        for (let i = 0; i < anchors.length; i++) {
+          if (anchors[i][0] < m.index) { name = anchors[i][1]; start = anchors[i][0]; end = i + 1 < anchors.length ? anchors[i + 1][0] : src.length; }
+          else break;
+        }
+        out.set(`${file} :: ${name}`, src.slice(start, end));
+      }
+    }
+    return out;
+  }
+
+  // Touches a custom-list key AND changes it, so it must bump the stamp.
+  const MUTATORS = [
+    "02_http-and-creator-utils.js :: deleteCreatorLists",
+    "02_http-and-creator-utils.js :: purgeCreatorData",
+    "26_api-creator-and-admin-routes.js :: handleSubtitlesTrack",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists/save",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists/reorder",
+    "26_api-creator-and-admin-routes.js :: /api/creator/sync/save-tracking",
+  ];
+  // Touches one without changing anything a browser needs told about. Each
+  // entry is a claim someone has to re-justify if this list ever grows.
+  const NON_MUTATORS = {
+    "02_http-and-creator-utils.js :: getCreatorList": "reads one record",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists": "self-heals the order key on a read; the same response already carries the healed order",
+    "26_api-creator-and-admin-routes.js :: /api/creator/sync/load": "reads the order key",
+    "26_api-creator-and-admin-routes.js :: /api/search-published-lists": "reads published records",
+    "26_api-creator-and-admin-routes.js :: /admin/api/backfill-trending": "reads to build the trending set",
+    "26_api-creator-and-admin-routes.js :: /admin/api/delete-creator-list": "delegates to deleteCreatorLists, which bumps",
+  };
+
+  it("every place that mutates a custom-list key bumps the stamp", () => {
+    const blocks = listKeyBlocks();
+    for (const name of MUTATORS) {
+      const body = blocks.get(name);
+      assert.ok(body, `${name} no longer touches custom-list storage -- if it moved, move its entry too`);
+      assert.match(body, /bumpCreatorListsStamp\(/,
+        `${name} writes a custom-list key without bumping the stamp, so a change made there ` +
+        `is invisible to every other device the account is signed in on (FE-17)`);
+    }
+  });
+
+  it("no new place touches custom-list storage without being classified", () => {
+    const found = [...listKeyBlocks().keys()].sort();
+    const known = [...MUTATORS, ...Object.keys(NON_MUTATORS)].sort();
+    assert.deepEqual(found, known,
+      "somewhere new reads or writes a creatorlist:/creatorlistorder: key. If it CHANGES one, " +
+      "call bumpCreatorListsStamp(env, username) there and add it to MUTATORS; if it only reads, " +
+      "add it to NON_MUTATORS with the reason. Leaving it out is how the stamp goes stale.");
+  });
+
+  it("sync/meta reports a lists stamp, and a fresh account's is 0", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17fresh");
+    const K = { creatorName: "fe17fresh", creatorKey: u.creatorKey };
+    const r = await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.lists, 0, "an account that has never saved a list must not look changed");
+  });
+
+  it("saving, reordering and deleting a list each move the stamp", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17moves");
+    const K = { creatorName: "fe17moves", creatorKey: u.creatorKey };
+    const meta = async () => (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body;
+
+    const before = await meta();
+    const saved = await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "public", items: [{ id: "tt1", type: "movie", title: "A" }] } });
+    assert.equal(saved.body.ok, true);
+    const afterSave = await meta();
+    assert.ok(afterSave.lists > before.lists, "saving a list must move the stamp");
+    // The whole point: a list change moves ONLY this stamp, which is why the
+    // four blob stamps could never have carried it.
+    assert.equal(afterSave.config, before.config, "and must not move the config stamp");
+    assert.equal(afterSave.tracking, before.tracking);
+    assert.equal(afterSave.presets, before.presets);
+    assert.equal(afterSave.channels, before.channels);
+
+    await call(env, "/api/creator/lists/reorder", { method: "POST", ip: nextIp(), json: { ...K, order: [saved.body.slug] } });
+    const afterReorder = await meta();
+    assert.ok(afterReorder.lists > afterSave.lists,
+      "reordering must move the stamp -- it writes only the order key, which is why the stamp " +
+      "cannot be derived from the list records themselves");
+
+    await call(env, "/api/creator/lists/delete", { method: "POST", ip: nextIp(), json: { ...K, slug: saved.body.slug } });
+    const afterDelete = await meta();
+    assert.ok(afterDelete.lists > afterReorder.lists,
+      "deleting must move the stamp -- and this is the case a MAX(updated_at) over the surviving " +
+      "records would get wrong, since removing the newest list lowers that maximum");
+  });
+
+  it("the stamp only ever goes up, so a same-millisecond pair cannot be missed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17mono");
+    const K = { creatorName: "fe17mono", creatorKey: u.creatorKey };
+    const seen = [];
+    for (let i = 0; i < 5; i++) {
+      await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+        json: { ...K, name: `L${i}`, type: "movie", visibility: "private", items: [] } });
+      seen.push((await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists);
+    }
+    for (let i = 1; i < seen.length; i++) {
+      assert.ok(seen[i] > seen[i - 1], `stamp must strictly increase (${seen[i - 1]} -> ${seen[i]})`);
+    }
+  });
+
+  it("a deleted account does not leave its stamp behind for the next owner of the name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17gone");
+    const K = { creatorName: "fe17gone", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "private", items: [] } });
+    assert.ok(env.CONFIGS._store.has("creatorliststamp:fe17gone"), "precondition: the stamp exists");
+    await call(env, "/api/creator/delete-account", { method: "POST", ip: nextIp(), json: { ...K, confirm: "DELETE" } });
+    assert.ok(!env.CONFIGS._store.has("creatorliststamp:fe17gone"),
+      "a stamp outliving its account is inherited by whoever registers the name next -- the same " +
+      "class of bug purgeCreatorData's own comment exists to prevent");
+  });
+
+  it("emptying an account moves the stamp rather than resetting it to 0", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17reset");
+    const K = { creatorName: "fe17reset", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "private", items: [] } });
+    // Forced forward rather than left to the clock. A reset sweeps
+    // creatorliststamp: away before re-bumping it, so the bump has nothing to
+    // count up from -- and the natural version of this test only fails when the
+    // whole reset happens to land inside one millisecond of the save, which is
+    // how it reached CI green locally and red there. Pinning the stored stamp
+    // ahead of the wall clock makes the hole deterministic: whatever the timing,
+    // the new stamp has to clear the old one.
+    const pinned = Date.now() + 60000;
+    env.CONFIGS._store.set("creatorliststamp:fe17reset", JSON.stringify({ updatedAt: pinned }));
+    const before = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
+    assert.equal(before, pinned, "precondition: the pinned stamp is what meta reports");
+    const reset = await call(env, "/api/creator/account/reset", { method: "POST", ip: nextIp(), json: { ...K, confirm: "RESET" } });
+    assert.equal(reset.body.ok, true, "precondition: the reset succeeded");
+    const after = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
+    assert.ok(after > before,
+      "a reset empties the lists but leaves every device signed in; a stamp that did not clear the " +
+      "old one reads as 'nothing changed' and leaves them rendering lists that no longer exist");
+  });
+});

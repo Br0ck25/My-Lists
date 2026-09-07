@@ -5,12 +5,13 @@ which describes the frontend as it stood at `be20b1b`. That document is left as
 the audit record and is not rewritten to match the fixes — except for one
 correction, noted below, where the audit itself was wrong.
 
-**Every finding in the report is now fixed** — the ten ranked fixes first, then
-the four below the line. Each was verified the same way twice: the probe that
-demonstrated the defect now reports it gone, and the defect reintroduced by
-mutation makes the suite fail.
+**Every finding in the original report is now fixed** — the ten ranked fixes
+first, then the four below the line. Each was verified the same way twice: the
+probe that demonstrated the defect now reports it gone, and the defect
+reintroduced by mutation makes the suite fail. One finding found later, FE-17,
+is fixed here too.
 
-Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
+Suite: **315 tests, 314 passing, 1 skipped** (network-gated), up from 286/285.
 `verify.sh` passes, including the byte-exact rebuild and three new steps.
 
 ---
@@ -35,8 +36,11 @@ Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
 | **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ✅ | `0ab30b8` |
 | **FE-14** | "Settings" label clipped at 320px | LOW | ✅ | `0ab30b8` |
 | **FE-16** | Dead `renderCustomListSearchResults` | LOW | ✅ | `0ab30b8` |
+| **FE-17** | Resumed PWA never refetches lists changed elsewhere | MEDIUM | ✅ | this commit |
 
-Nothing from the report is left open.
+Nothing from the report is left open. FE-17 was found after the original pass,
+from a multi-device question about a backgrounded PWA, and is fixed here with
+option (b) of the two the finding sets out.
 
 ---
 
@@ -335,6 +339,96 @@ only other mention was the generated `FUNCTION-MAP.md`, which regenerates.
 ---
 
 ---
+
+## FE-17 — the fifth stamp
+
+`/api/creator/sync/meta` is the cheap poll a resumed browser makes before
+deciding whether to reload anything. It returned four `updatedAt` stamps, read
+straight out of the four sync blobs — and its own comment explains why they are
+read from the real records rather than from a dedicated "last changed" key:
+
+> a dedicated key would have to be updated by every write path that touches any
+> of these blobs, and a single missed write there would silently stop a device
+> from ever syncing again. Reading the real thing cannot drift.
+
+That reasoning is sound and the hole was next to it: custom lists are not one of
+those blobs. They are one record per list plus an order key, so there was
+nothing for meta to read, and it answered "nothing changed" for an account whose
+lists had just been rewritten elsewhere.
+
+**Two options, and why this one.** Calling `/api/creator/lists` on every resume
+would be smaller and drift-proof, but its version is a hash of the response
+body, so the server reads and serialises every list to compute it — the saving
+is the download, not the work. A fifth stamp keeps the poll genuinely cheap, at
+the cost of being exactly the dedicated key that comment warned about. So the
+warning is answered structurally rather than with care:
+
+- `bumpCreatorListsStamp` (`02_http-and-creator-utils.js`) is the only writer.
+- Six call sites bump it: `lists/save`, `lists/reorder`, `deleteCreatorLists`
+  (shared by the user route and the admin one), the Watchlist write inside
+  `sync/save-tracking`, `handleSubtitlesTrack`, and `purgeCreatorData` on a
+  reset.
+- A test walks the source, groups every mention of a `creatorlist:` /
+  `creatorlistorder:` key by the route or function containing it, and fails if a
+  block that mutates one lacks a bump — or if a block appears that is in neither
+  the mutating nor the read-only list. Adding a seventh writer therefore breaks
+  the build until someone classifies it.
+
+That test earned itself immediately: it found `handleSubtitlesTrack`, which
+takes a film off your Watchlist when you finish watching it. Nothing about it
+reads like a list edit, and I had not counted it among the sites to bump.
+
+**Details that only showed up in testing.**
+
+- Account creation runs `purgeCreatorData` as a pre-create sweep, so an
+  unconditional bump there handed every brand-new account a stamp describing a
+  change that never happened. Gated on `listsCleared > 0`.
+- A reset had to bump *after* the sweep, since `creatorliststamp:` is itself in
+  the swept key set — and a stamp that went back to `0` would read as "nothing
+  changed" to browsers still showing the lists it had just deleted.
+- `creatorliststamp:` is in `purgeCreatorData`'s key list, so a deleted account
+  cannot leave one behind for whoever registers that username next. That is the
+  precise failure the key list's own comment exists to prevent.
+- The stamp uses `nextSyncVersion`, so it strictly increases; the client
+  compares with `>`, and two saves inside one millisecond must not tie.
+- A reset sweeps `creatorliststamp:` away *before* re-bumping it, so the bump had
+  nothing to count up from and produced a bare `Date.now()` — which ties with the
+  previous stamp whenever the whole reset lands inside one millisecond, and a tie
+  reads as "nothing changed". CI surfaced that as one red run against one green
+  one; it was a real hole, not a flaky test. `bumpCreatorListsStamp` now takes a
+  `notBefore` floor, and `purgeCreatorData` reads the stamp before the sweep so
+  it can pass it. The test no longer depends on the clock either: it pins the
+  stored stamp ahead of the wall clock, so the new one has to clear it whatever
+  the timing.
+- Deleting a list is why the stamp is written rather than derived: a
+  `MAX(updated_at)` over the surviving `creator_lists` rows goes *down* when the
+  newest list is the one removed. Reordering is the second reason — it touches
+  only the order key, which has no D1 row at all.
+
+**Client.** `handleForegroundResumeSync` compares the new stamp and, when only
+the lists moved, refreshes just the dashboard instead of pulling the whole sync
+blob. The stamp is adopted only after that refresh finishes, so a browser never
+records itself level with a version it has not loaded. On the first poll after a
+full load the stamp is unknown, which costs one conditional
+`/api/creator/lists` — measured at **61 bytes** against a 2,636-byte full
+payload for a 40-item list, answered `unchanged`.
+
+**Measured, on the probes that found it** (`t46`/`t47`/`t48`, same rig):
+
+```
+                                      before          after
+resume requests            /sync/meta only     /sync/meta + /lists
+phone shows desktop's list           NO              YES
+foreground 60s poll                  NO              YES
+after 4 tab switches                 NO              (n/a, already current)
+phone's own edit             409 + "This List      merges cleanly,
+                              Changed Elsewhere"     no warning
+desktop's films destroyed          none             none
+```
+
+The 409 path is not gone, only no longer routine — it is still what protects a
+genuine simultaneous edit, and FE-05's guard is untouched.
+
 
 ## Regression tests added
 

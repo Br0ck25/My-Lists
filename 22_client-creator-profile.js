@@ -1889,10 +1889,13 @@ async function loadCreatorSync(opts) {
       return;
     }
     const synced = data.data;
-    // Snapshot of the four stamps this browser is now level with. The
+    // Snapshot of the four blob stamps this browser is now level with. The
     // background poll compares /api/creator/sync/meta against exactly
     // these and skips the full load when none of them has moved -- see
-    // handleForegroundResumeSync below.
+    // handleForegroundResumeSync below. meta returns a fifth, "lists", which
+    // this load cannot fill in (it describes the creatorlist: records, not
+    // the sync blob); handleForegroundResumeSync adopts that one itself once
+    // it has refreshed the dashboard.
     window._syncMetaStamps = {
       config: Number(synced.updatedAt) || 0,
       tracking: Number(synced.trackingUpdatedAt) || 0,
@@ -5019,6 +5022,14 @@ async function handleForegroundResumeSync() {
       // a timer. See the endpoint's own comment,
       // 26_api-creator-and-admin-routes.js.
       let needsFullLoad = true;
+      // Custom lists are not part of the sync blob -- they are their own
+      // records, behind /api/creator/lists -- so they need their own answer
+      // from the same poll. Before the "lists" stamp existed, a list edited
+      // on another device moved none of the four stamps below, this function
+      // concluded "nothing changed", and the browser went on rendering the
+      // old copy indefinitely (FE-17).
+      let listsChanged = false;
+      let metaLists = null;
       const known = window._syncMetaStamps;
       if (known) {
         try {
@@ -5034,6 +5045,23 @@ async function handleForegroundResumeSync() {
               (Number(meta.tracking) || 0) > (known.tracking || 0) ||
               (Number(meta.presets) || 0) > (known.presets || 0) ||
               (Number(meta.channels) || 0) > (known.channels || 0);
+            const rawLists = Number(meta.lists);
+            if (Number.isFinite(rawLists)) {
+              metaLists = rawLists;
+              // known.lists is undefined on the first poll after a full
+              // load, which snapshots the four blob stamps and knows nothing
+              // of this one. Treating that as 0 spends one conditional
+              // /api/creator/lists -- which answers "unchanged" and costs
+              // almost nothing -- rather than adopting the server's number
+              // untested and risking a miss for a change that landed while
+              // that load was in flight.
+              listsChanged = metaLists > (Number(known.lists) || 0);
+            } else {
+              // An older worker, or a response without the field: refresh
+              // rather than assume, for the same reason the four above fall
+              // back to a full load.
+              listsChanged = true;
+            }
           }
           // Anything other than a clean ok:true response leaves
           // needsFullLoad true, so a failed or unrecognised meta check
@@ -5044,7 +5072,20 @@ async function handleForegroundResumeSync() {
         }
       }
       if (needsFullLoad && typeof loadCreatorSync === 'function') {
+        // Refetches the dashboard itself, so it covers the lists too.
         await loadCreatorSync({ background: true });
+      } else if (listsChanged && typeof renderCreatorDashboard === 'function') {
+        // Only the lists moved: refresh those alone rather than pulling the
+        // whole sync blob for them. fetchCreatorListsOnce sends the version it
+        // holds, so this is one small request when nothing has really changed.
+        await renderCreatorDashboard({ silent: true });
+      }
+      // Adopt the stamp only after the refresh it triggered has finished --
+      // recording it earlier would mark this browser level with a version it
+      // had not actually loaded. Set after a full load too, since
+      // loadCreatorSync's own snapshot cannot include this stamp.
+      if (metaLists !== null && window._syncMetaStamps) {
+        window._syncMetaStamps.lists = metaLists;
       }
     } catch (e) {
       // Silent background sync
