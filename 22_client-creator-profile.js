@@ -1840,6 +1840,42 @@ async function pushTrackingSync(opts) {
   }
 }
 
+// Decides whether loadCreatorSync's watch-history/continue-watching/
+// watchlist merges should union this device's local-only items back into
+// what the server just sent, or drop them and trust the server outright.
+//
+// The merge exists for a real case: an item added on this device that
+// hasn't reached the server yet (offline, or a push still in flight)
+// should not vanish just because this load's response doesn't have it.
+// But the same union also re-adds anything this device's local copy is
+// merely STALE about -- most sharply, an item another device removed
+// (unwatched an episode, dismissed a finished show from Continue
+// Watching) after this device's last sync. That removal reaches the
+// server as a shorter array with nothing marking what's now missing, so
+// "not in the server response" reads exactly like "added here and not
+// pushed yet" -- and the wrong read wins the merge, silently undoes the
+// other device's change, then a push a few lines down carries the
+// undone-removal straight back to the server. That is the bug: change
+// something on desktop, open the phone, and the change is gone.
+//
+// The two cases are told apart by timing instead: localList.updatedAt is
+// stamped on every genuine local mutation (toggleWatchStatus,
+// updateContinueWatching, etc. -- never by this merge itself, since the
+// caller reads it before overwriting the field). priorTrackingUpdatedAt
+// is the tracking stamp this device was already level with BEFORE this
+// load. If the local list has not changed since then, this device has
+// nothing of its own to protect -- the server is strictly newer, and any
+// item missing from it was removed there, not added here. Only a local
+// edit that lands AFTER that baseline is genuinely unpushed and worth
+// keeping. On this device's very first sync ever (no prior baseline to
+// compare against), there is no way to tell -- so it keeps the old,
+// preserve-everything behavior rather than risk dropping real data.
+function shouldKeepLocalOnlyTracking(localList, priorTrackingUpdatedAt) {
+  if (typeof priorTrackingUpdatedAt === 'undefined') return true;
+  const localUpdatedAt = Number(localList && localList.updatedAt) || 0;
+  return localUpdatedAt > priorTrackingUpdatedAt;
+}
+
 // Called right after sign-in (fresh restore, auto-restore, or a brand new
 // profile). A null 'data' means this account has never synced from any
 // device before, so rather than wiping out whatever's already on this
@@ -1917,6 +1953,13 @@ async function loadCreatorSync(opts) {
     const configChanged = timeChanged && configDataChanged;
 
     const trackingChanged = typeof window._serverTrackingUpdatedAt === 'undefined' || (synced.trackingUpdatedAt && synced.trackingUpdatedAt > window._serverTrackingUpdatedAt);
+    // The baseline this device was level with BEFORE this load -- captured
+    // ahead of the reassignment below so the merge blocks further down can
+    // tell "an edit this device made since it last talked to the server"
+    // (keep it) apart from "a stale local copy of something removed
+    // elsewhere since" (drop it). See shouldKeepLocalOnlyTracking's own
+    // comment for why that distinction matters.
+    const priorServerTrackingUpdatedAt = window._serverTrackingUpdatedAt;
     if (synced.trackingUpdatedAt !== undefined) window._serverTrackingUpdatedAt = synced.trackingUpdatedAt;
 
     // Only rebuild lists table DOM if the list config actually changed or it's a full initial load
@@ -2281,8 +2324,11 @@ async function loadCreatorSync(opts) {
         const localWH = loadLocalCustomLists()['watch-history'];
         const localWHItems = (localWH && Array.isArray(localWH.items)) ? localWH.items : [];
         const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
-        const localOnlyWH = localWHItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)));
-        
+        const keepLocalOnlyWH = shouldKeepLocalOnlyTracking(localWH, priorServerTrackingUpdatedAt);
+        const localOnlyWH = keepLocalOnlyWH
+          ? localWHItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
+          : [];
+
         let mergedWH = [...serverItems, ...localOnlyWH];
         if (isRecentRemoval) {
           mergedWH = localWHItems;
@@ -2321,8 +2367,10 @@ async function loadCreatorSync(opts) {
         const localCW = loadLocalCustomLists()['continue-watching'];
         const localCWItems = (localCW && Array.isArray(localCW.items)) ? localCW.items : [];
         const serverShowIds = new Set(serverCW.map((it) => String(it && it.showId)).filter(Boolean));
-        
-        const localOnlyCW = localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))));
+        const keepLocalOnlyCW = shouldKeepLocalOnlyTracking(localCW, priorServerTrackingUpdatedAt);
+        const localOnlyCW = keepLocalOnlyCW
+          ? localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))))
+          : [];
         let mergedCW = dedupeContinueWatchingItems([...serverCW, ...localOnlyCW]);
         if (isRecentRemoval) {
           mergedCW = localCWItems;
@@ -2347,9 +2395,12 @@ async function loadCreatorSync(opts) {
         const localWL = map['watchlist'] || { items: [], updatedAt: 0 };
         const serverItems = synced.watchlist;
         const localItems = (localWL && Array.isArray(localWL.items)) ? localWL.items : [];
-        
+
         const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
-        const localOnly = localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)));
+        const keepLocalOnlyWL = shouldKeepLocalOnlyTracking(localWL, priorServerTrackingUpdatedAt);
+        const localOnly = keepLocalOnlyWL
+          ? localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
+          : [];
         const mergedWL = [...serverItems, ...localOnly];
 
         map['watchlist'].items = mergedWL;
