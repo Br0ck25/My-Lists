@@ -72,8 +72,8 @@ PORT=8788 node /tmp/server_nod1.mjs &
 | `t25_storage.mjs` | — | Malformed JSON, wrong types, quota exhaustion |
 | `t21_url.mjs` | — | 14 malformed and hostile deep links |
 | `t46_background_resume.mjs` | **FE-17** | Backgrounded PWA resumed: which desktop changes reach it |
-| `t47_stale_list_overwrite.mjs` | **FE-17** | The stale copy is never pushed over the desktop's — 409, warning, converge |
-| `t48_resume_variants.mjs` | **FE-17** | Foreground poll vs. cold start vs. recovery after the refused save |
+| `t47_stale_list_overwrite.mjs` | **FE-17** | The desktop's work is never overwritten; the phone converges on resume |
+| `t48_resume_variants.mjs` | **FE-17** | Foreground poll vs. cold start vs. an edit straight after resuming |
 
 ## Multi-device resume (t46 / t47 / t48)
 
@@ -111,6 +111,20 @@ poll interval and records that it makes zero requests the whole time. A 30-minut
 background and a 70-second one run the same code.
 
 `t46` and `t48` take ~90s each — most of it deliberate waiting.
+
+These now run **after** the fix, so they read as regression probes: `t46`'s
+phase B and `t48`'s cases 1 and 2 all converge, and `t47` ends in an explicit
+`RESULT: PASS`. To watch them fail the way they originally did, drop the
+`lists:` field from the `/api/creator/sync/meta` response in
+`26_api-creator-and-admin-routes.js` and rebuild — the client falls back to
+refreshing whenever the field is missing, so also make it return a constant
+(`lists: 0`) to reproduce the original blindness.
+
+Note what `t46` phase E does *not* do. An earlier cut had the phone rename an
+existing config row and then checked that the desktop's name for that row had
+survived — which it had not, because renaming it was the instruction. It now
+adds a row instead, so the question is the real one: does the phone's save carry
+the desktop's other work with it.
 
 ## Seeding
 

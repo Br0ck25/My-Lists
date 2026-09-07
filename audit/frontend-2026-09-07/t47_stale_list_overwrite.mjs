@@ -66,7 +66,9 @@ let n = logs.requests.length;
 await show();
 await page.waitForTimeout(7000);
 console.log("resume requests   :", JSON.stringify(since(n)));
-console.log("phone after resume:", JSON.stringify(await memList(page)), "  <-- stale if 1 item");
+const resumed = await memList(page);
+console.log("phone after resume:", JSON.stringify(resumed),
+  resumed.items.includes("The Dark Knight") ? "  <-- converged" : "  <-- STALE (FE-17 regressed)");
 
 // (1) does ordinary navigation make it converge?
 for (const tab of ["customLists", "myLists", "settings", "customLists"]) {
@@ -76,8 +78,8 @@ for (const tab of ["customLists", "myLists", "settings", "customLists"]) {
   console.log(`  switchTab(${tab}) -> ${JSON.stringify(since(n))}  mem: ${JSON.stringify(await memList(page))}`);
 }
 
-// (2) the person edits that list on the phone, from the stale copy
-console.log("\n--- phone edits the list it is showing (adds Inception to its 1-item copy) ---");
+// (2) the person edits that list on the phone, on top of whatever it is showing
+console.log("\n--- phone adds Inception to the copy it is showing ---");
 const before = await serverList();
 const res = await page.evaluate(async () => {
   const stale = (lastCreatorListsData || []).find((l) => l.slug === "shared-list");
@@ -85,10 +87,12 @@ const res = await page.evaluate(async () => {
   editingCreatorListSlug = "shared-list";
   customListDraftType = "movie";
   customListDraftItems = [...(stale.items || []), { id: "tt1375666", type: "movie", title: "Inception", year: 2010 }];
+  // Read before the save: a successful one clears the draft.
+  const sent = customListDraftItems.map((i) => i.title);
   await saveCreatorListEdit(stale.name);
   await new Promise((r) => setTimeout(r, 500));
   return { citedBaseline: stale.updatedAt,
-    sentItems: customListDraftItems.map((i) => i.title),
+    sentItems: sent,
     noticeShown: /Changed Elsewhere/i.test(document.body.innerText),
     noticeText: (document.body.innerText.match(/Another device saved[^]{0,120}/) || [""])[0] };
 });
@@ -101,5 +105,16 @@ const lost = (before.items || []).filter((t) => !(after.items || []).includes(t)
 console.log(`>>> desktop films destroyed by the phone's save: ${lost.length ? JSON.stringify(lost) : "NONE"}`);
 console.log(`>>> phone warned the person: ${res.noticeShown ? "YES" : "NO"}`);
 console.log(">>> 409s:", logs.responses.filter((r) => r.status === 409).length);
+// Post-fix expectation. Before the lists stamp existed, the resume left the
+// phone on a one-item copy, the save was refused with a 409 and the person got
+// "This List Changed Elsewhere" -- correct, but a detour caused by showing them
+// something out of date. With the stamp, the resume converges first and the
+// edit simply merges. `resumed` is the state captured right after the resume,
+// before any edit, which is the thing actually under test.
+const converged = resumed.items.includes("The Dark Knight");
+console.log(`\n>>> RESULT: ${converged && lost.length === 0
+  ? "PASS -- the phone converged on resume and its edit merged with the desktop's"
+  : "FAIL -- " + (converged ? "the desktop's work was lost" : "the phone is still showing a stale list (FE-17)")}`);
+
 report(logs, "stale list overwrite");
 await browser.close();

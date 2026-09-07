@@ -140,9 +140,20 @@ console.log(`  >>> desktop items the phone's save destroyed: ${lost.length ? JSO
 
 console.log("\n### PHASE E — phone triggers a config autosave from its stale baseline");
 const beforeE = await serverState();
+// Deliberately ADDS a row rather than renaming one. An earlier cut of this
+// renamed the first row and then asserted the desktop's name for it had
+// survived -- which it had not, because renaming it is precisely what the
+// phone was told to do. The question is whether the phone's save carries the
+// desktop's OTHER work along with its own, so the edit has to be one that
+// leaves the desktop's rows alone.
 await page.evaluate(() => {
-  const row = document.querySelector("#lists .entry .name");
-  if (row) { row.value = "PHONE-EDITED-ROW"; row.dispatchEvent(new Event("input", { bubbles: true })); }
+  const first = document.querySelector("#lists .entry");
+  if (first) {
+    const copy = first.cloneNode(true);
+    const nameInput = copy.querySelector(".name");
+    if (nameInput) nameInput.value = "PHONE-ADDED-ROW";
+    first.parentNode.appendChild(copy);
+  }
   if (typeof scheduleCreatorSyncSave === "function") scheduleCreatorSyncSave();
 });
 await page.waitForTimeout(7000);
@@ -151,6 +162,7 @@ console.log("  server before:", JSON.stringify(beforeE));
 console.log("  server after :", JSON.stringify(afterE));
 const lostCfg = beforeE.configRows.filter((c) => !afterE.configRows.includes(c));
 console.log(`  >>> desktop config rows the phone's autosave destroyed: ${lostCfg.length ? JSON.stringify(lostCfg) : "none"}`);
+console.log(`  >>> and the phone's own new row landed: ${afterE.configRows.includes("PHONE-ADDED-ROW") ? "YES" : "NO"}`);
 console.log("  phone after the 409 recovery:", JSON.stringify(await phoneState(page)));
 console.log("  409s the phone received:", logs.responses.filter((r) => r.status === 409).length);
 

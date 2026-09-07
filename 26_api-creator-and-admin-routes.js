@@ -505,6 +505,12 @@
             if (l.items.length !== initLen) {
               l.updatedAt = Date.now();
               await env.CONFIGS.put(key, JSON.stringify(l));
+              // Auto-Track Playback silently takes what you just watched off
+              // the Watchlist. That is a list change made by one device that
+              // every other device is showing, which is exactly what the
+              // stamp is for -- and the least obvious of the six mutation
+              // sites, since nothing here looks like a list edit.
+              await bumpCreatorListsStamp(env, auth.username);
             }
           };
 
@@ -2024,6 +2030,13 @@
         await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
       }
 
+      // The record is stored; tell the account's other browsers. Placed here
+      // rather than beside the response because the directory step below can
+      // return 500 on a save whose data DID land, and a browser that never
+      // hears about a stored change is exactly the failure this stamp exists
+      // to prevent. See bumpCreatorListsStamp (02_http-and-creator-utils.js).
+      await bumpCreatorListsStamp(env, auth.username);
+
       // Keep the directory index in step with this save. A list turned
       // private is removed rather than updated, otherwise unpublishing would
       // leave it listed publicly.
@@ -2123,6 +2136,10 @@
             .slice(0, CREATOR_LIST_ORDER_MAX)
         : [];
       await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order: newOrder }));
+      // Order is what the dashboard renders in, so a reorder on one device is
+      // a visible change on every other one -- and it touches only the order
+      // key, which is why the stamp cannot be derived from the list records.
+      await bumpCreatorListsStamp(env, auth.username);
       return json({ ok: true, order: newOrder });
     }
 
@@ -2698,6 +2715,9 @@
             order.unshift("watchlist");
             await env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order }));
           }
+          // The Watchlist is a creatorlist: record like any other and shows on
+          // the same dashboard, so adding to it here counts as a list change.
+          await bumpCreatorListsStamp(env, auth.username);
         }
       } catch (e) {
         return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
@@ -2823,9 +2843,9 @@
     }
 
     // /api/creator/sync/meta  (POST)  { creatorName, creatorKey }
-    //   -> { ok, config, tracking, presets, channels }
+    //   -> { ok, config, tracking, presets, channels, lists }
     // A deliberately tiny sibling of /api/creator/sync/load below, holding
-    // nothing but the four updatedAt stamps that tell a browser whether
+    // nothing but the five updatedAt stamps that tell a browser whether
     // anything it cares about has actually changed.
     //
     // It exists because the dashboard polls for multi-device changes on a
@@ -2837,7 +2857,7 @@
     // megabytes of response, several times a minute, almost always to
     // conclude that nothing had changed at all.
     //
-    // Two things keep this cheap. The four reads run concurrently rather
+    // Two things keep this cheap. The five reads run concurrently rather
     // than one after another, and each updatedAt is pulled straight out of
     // the raw stored string (see readUpdatedAtFromRaw) instead of parsing
     // the blob -- so a 4MB tracking record costs a substring scan here,
@@ -2873,13 +2893,14 @@
         return Number.isFinite(num) ? num : 0;
       }
 
-      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null;
+      let configRaw = null, trackingRaw = null, presetsRaw = null, channelsRaw = null, listsRaw = null;
       try {
-        [configRaw, trackingRaw, presetsRaw, channelsRaw] = await Promise.all([
+        [configRaw, trackingRaw, presetsRaw, channelsRaw, listsRaw] = await Promise.all([
           env.CONFIGS.get(`creatorsync:${auth.username}`),
           env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
           env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
           env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
+          env.CONFIGS.get(`creatorliststamp:${auth.username}`),
         ]);
       } catch {
         // A read failure must not look like "nothing changed" -- returning
@@ -2894,6 +2915,14 @@
         tracking: readUpdatedAtFromRaw(trackingRaw),
         presets: readUpdatedAtFromRaw(presetsRaw),
         channels: readUpdatedAtFromRaw(channelsRaw),
+        // The fifth stamp. Unlike the four above it is not read out of the
+        // blob it describes -- custom lists have no single blob -- but out of
+        // a tiny record every list mutation bumps. See bumpCreatorListsStamp
+        // (02_http-and-creator-utils.js) for why that key exists and what
+        // keeps it honest. A never-touched account has no such key, which
+        // reads as 0 and matches the 0 a fresh browser starts from, so this
+        // costs an existing account no spurious reload.
+        lists: readUpdatedAtFromRaw(listsRaw),
       });
     }
 

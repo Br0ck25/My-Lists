@@ -1739,6 +1739,12 @@ async function deleteCreatorLists(env, username, slugs) {
     console.error("deleteCreatorLists: could not update list order", e);
   }
 
+  // Deleting a list is a list change like any other, and the one shape of it a
+  // derived stamp could not have seen: a MAX(updated_at) over the surviving
+  // records goes DOWN when the newest list is the one removed. See
+  // bumpCreatorListsStamp.
+  await bumpCreatorListsStamp(env, username);
+
   return out;
 }
 
@@ -2546,6 +2552,46 @@ function nextSyncVersion(currentUpdatedAt) {
   return Number.isFinite(prev) && prev >= now ? prev + 1 : now;
 }
 
+// --- "the custom lists changed" stamp ----------------------------------------
+//
+// /api/creator/sync/meta answers the browser's "has anything moved?" poll from
+// four stored blobs, and reading those real records is what makes its answer
+// impossible to drift from the truth. Custom lists have no such blob -- they
+// are one record per list (creatorlist:{user}:{slug}) plus an order key -- so
+// there was nothing for meta to read, and it reported "nothing changed" for an
+// account whose lists had just been rewritten from another device. A resumed
+// browser therefore kept showing a list that had moved on, and went on showing
+// it through the 60s poll and through every tab switch, until something else
+// happened to change one of the four (FE-17).
+//
+// This is the missing fifth stamp. It IS the dedicated key meta's own comment
+// argues against -- "a single missed write there would silently stop a device
+// from ever syncing again" -- so the mitigation is structural rather than
+// hopeful: every list mutation in the codebase goes through one of five call
+// sites, all of which call this, and tests/client.test.mjs fails the build if a
+// sixth writer of a creatorlist:/creatorlistorder: key appears without one.
+//
+// Best-effort by design. A failed bump costs one browser a delayed refresh;
+// throwing would fail a save whose data is already safely stored.
+async function bumpCreatorListsStamp(env, username) {
+  try {
+    const raw = await env.CONFIGS.get(`creatorliststamp:${username}`);
+    let prev = 0;
+    if (raw) {
+      try { prev = Number(JSON.parse(raw).updatedAt) || 0; } catch {}
+    }
+    // Strictly increasing, for the same reason the sync blob's own version is:
+    // the client compares with >, so two saves inside one millisecond must not
+    // land on the same number.
+    await env.CONFIGS.put(
+      `creatorliststamp:${username}`,
+      JSON.stringify({ updatedAt: nextSyncVersion(prev) })
+    );
+  } catch (e) {
+    console.error("bumpCreatorListsStamp: could not record a list change", e);
+  }
+}
+
 // --- Deleted-username tombstones ---------------------------------------------
 //
 // A purge is a sweep, and a sweep is a moment in time. Every authenticated
@@ -2790,6 +2836,7 @@ async function purgeCreatorData(env, username, options = {}) {
     `creatorsyncpresets:${u}`,
     `creatorsyncchannels:${u}`,
     `creatorlistorder:${u}`,
+    `creatorliststamp:${u}`,
     `creatorscrobblequeue:${u}`,
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
@@ -2928,6 +2975,20 @@ async function purgeCreatorData(env, username, options = {}) {
         console.error("purgeCreatorData: could not clear the D1 tombstone after a failed delete:", dbErr);
       }
     }
+  }
+
+  // An account/reset empties the lists but leaves the person signed in on
+  // every device, so the stamp has to move or those browsers keep rendering
+  // lists that no longer exist. Deliberately after the sweep above, which
+  // deletes creatorliststamp: along with the rest -- and skipped entirely for
+  // a full account delete, where there is no account left to poll.
+  //
+  // Gated on having actually removed something, because /api/creator/create
+  // runs this as a pre-create purge over a name that is usually clean: an
+  // unconditional bump there would hand every brand-new account a non-zero
+  // stamp describing a list change that never happened.
+  if (!deleteIdentity && listsCleared > 0) {
+    await bumpCreatorListsStamp(env, u);
   }
 
   // `ok` is the whole point: it is false when this call left something

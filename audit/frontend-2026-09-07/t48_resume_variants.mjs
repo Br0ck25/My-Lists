@@ -4,7 +4,7 @@
 //
 //   1. The phone stays in the FOREGROUND across a full 60s poll -- same gate?
 //   2. COLD START: the OS evicted the PWA, so reopening is a fresh page load.
-//   3. After the 409 warning, does the phone converge, or stay stale?
+//   3. An edit made right after the resume: does it merge, or collide?
 import { open, report } from "./drive.mjs";
 
 const B = "http://127.0.0.1:8787";
@@ -56,7 +56,7 @@ const fgStale = !(await memList(page)).items.includes("The Dark Knight");
 console.log(`  >>> foreground phone converged? ${fgStale ? "NO — still stale" : "YES"}`);
 
 // ---- 3. does the failed save converge it? ----------------------------------
-console.log("\n### 3. person edits the list from the stale copy, gets the warning, then what?");
+console.log("\n### 3. person edits the list straight after the resume");
 const r3 = await page.evaluate(async () => {
   const stale = (lastCreatorListsData || []).find((l) => l.slug === "shared-list");
   editingCreatorListSlug = "shared-list";
@@ -68,7 +68,12 @@ const r3 = await page.evaluate(async () => {
 await page.waitForTimeout(4000);
 const afterWarn = await memList(page);
 console.log("  warned:", r3.warned, " phone now:", JSON.stringify(afterWarn));
-console.log(`  >>> phone converged after the refused save? ${afterWarn.items.includes("The Dark Knight") ? "YES" : "NO"}`);
+// Before the lists stamp, this edit was built on a stale one-item copy, so it
+// was refused with a 409 and "This List Changed Elsewhere" -- the failed save
+// was what converged the phone. With the stamp the resume has already
+// converged it, so the edit merges and no warning is needed.
+console.log(`  >>> desktop's film still present after the phone's edit? ${afterWarn.items.includes("The Dark Knight") ? "YES" : "NO"}`);
+console.log(`  >>> needed a 409 detour to get there? ${r3.warned ? "YES" : "NO"}`);
 console.log("  server:", JSON.stringify(await serverList()));
 
 // ---- 2. cold start ---------------------------------------------------------
