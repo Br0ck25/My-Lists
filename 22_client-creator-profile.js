@@ -280,6 +280,26 @@ async function migrateLocalCustomListsToAccount() {
   // that already runs right after this function returns (see
   // submitCreateProfile), so nothing here needs to push them itself.
   const AUTO_TRACKED_SLUGS = ['watch-history', 'continue-watching'];
+  // The Watchlist migrates, but privately.
+  //
+  // It is not hand-built to share either -- it is a personal queue, filled by
+  // an add button the same way Watch History is -- and it was going up as
+  // visibility: 'public' with the rest. Measured: an anonymous user with two
+  // films in their Watchlist created an account, and both were published
+  // under their new username without being asked.
+  //
+  // Excluding it from the migration entirely would be wrong: the Watchlist IS
+  // expected to be a server list (removeWatchlistItemDirect looks it up in
+  // lastCreatorListsData), unlike the two auto-tracked slugs above, which
+  // travel in the sync blob instead. So it migrates -- just not published.
+  //
+  // Every other write of this list already defaults it to private
+  // (uploadMissingLocalListsToAccount, removeWatchlistItemDirect,
+  // 21_client-custom-list-builder.js). This was the one place that did not,
+  // which is why it reads as an oversight rather than a decision.
+  const isWatchlistSlug = (slug, list) => slug === 'watchlist'
+    || (list && (list.isWatchlist === true
+      || (typeof list.name === 'string' && list.name.toLowerCase() === 'watchlist')));
   const slugs = Object.keys(localMap).filter((slug) => !AUTO_TRACKED_SLUGS.includes(slug));
   if (!slugs.length) return;
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
@@ -297,7 +317,7 @@ async function migrateLocalCustomListsToAccount() {
           name: list.name,
           type: list.type,
           items: list.items,
-          visibility: 'public',
+          visibility: isWatchlistSlug(slug, list) ? 'private' : 'public',
         }),
       });
       const data = await res.json();
@@ -2466,6 +2486,27 @@ async function submitCreateProfile() {
         escapeHtml(data.error === 'no-kv' ? 'This Worker has no CONFIGS KV namespace bound.' : (data.error || 'Could not create profile.')) + '</p>';
       return;
     }
+    // Sign the previous account out first if there was one, exactly as
+    // submitRestoreProfile does.
+    //
+    // migrateLocalCustomListsToAccount below exists for the anonymous case --
+    // someone builds lists without an account, then makes one, and their work
+    // comes with them. Reached while ALREADY signed in, the same call uploads
+    // the previous account's lists into the new one, and the first thing it
+    // does with them is publish them (visibility: 'public'). Measured: signed
+    // in as alice, creating "bob" put "Alice's Private Picks" into bob's
+    // account as a public list.
+    //
+    // Every button that opens this modal sits inside an "if (!activeCreator)"
+    // branch, so a correctly-rendered page does not offer it -- but that is
+    // protection by rendering, and any path that sets activeCreator without
+    // re-rendering the profile bar leaves those buttons on screen and live.
+    // The consequence is one person's private list published under another
+    // person's name, which is too sharp to leave resting on a render.
+    //
+    // Clearing here rather than at the top of the function so a failed
+    // creation does not sign anyone out; nothing has been uploaded yet.
+    if (activeCreator) clearLocalAccountData();
     activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);

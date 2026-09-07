@@ -10,7 +10,7 @@ A fix whose mutation leaves the suite green is called out below rather than
 counted as done — see "What the mutation run actually said", which is also
 where the one case of a *correctly* surviving mutation is explained.
 
-Suite: **281 tests, 280 passing, 1 skipped** (network-gated), up from 234/233.
+Suite: **286 tests, 285 passing, 1 skipped** (network-gated), up from 234/233.
 `verify.sh` passes, including the byte-exact rebuild.
 
 ### What the mutation run actually said
@@ -315,6 +315,50 @@ keeps returning to, so the test now builds a `creator_lists` with a
 `likes_count` and no `likes` -- the case where a substring match reports the
 schema healthy while every list save fails on a column that is not there.
 
+## Two account-boundary defects the client harness found next
+
+Pointed at the browser's own version of N4 -- one machine, two accounts, one
+localStorage -- rather than at the server's.
+
+**C1. Creating a second account uploaded the first account's lists into it,
+published.** `migrateLocalCustomListsToAccount` exists for the anonymous case:
+someone builds lists without an account, then makes one, and their work comes
+with them. Reached while already signed in, the same call took the previous
+account's local map and wrote it into the new account as `visibility: 'public'`.
+Measured: signed in as alice, creating "bob" put "Alice's Private Picks" into
+bob's account as a public list.
+
+Every button that opens that modal sits inside an `if (!activeCreator)` branch,
+so a correctly-rendered page does not offer it -- which is protection by
+rendering, not by design, and it lapses the moment any path sets
+`activeCreator` without re-rendering the profile bar. One person's private list
+published under another person's name is too sharp to leave resting on that, so
+`submitCreateProfile` now signs the previous account out first, exactly as
+`submitRestoreProfile` already did. Clearing after the create succeeds, so a
+failed creation does not sign anyone out.
+
+**C2. Signing up published your Watchlist.** With C1 fixed, the same test showed
+an anonymous user's Watchlist going up as `public` on account creation --
+`AUTO_TRACKED_SLUGS` excludes Watch History and Continue Watching but not the
+Watchlist. It is not hand-built to share either: it is a personal queue, filled
+by an add button the same way Watch History is. Measured: two films published
+under a brand-new username without the person being asked.
+
+Excluding it entirely would be wrong -- unlike the two auto-tracked slugs, the
+Watchlist *is* expected to be a server list (`removeWatchlistItemDirect` looks
+it up in `lastCreatorListsData`). So it migrates, privately. What makes this
+read as an oversight rather than a decision is that every other write of this
+list already defaults it to private: `uploadMissingLocalListsToAccount`,
+`removeWatchlistItemDirect`, and `21_client-custom-list-builder.js`. This was
+the one place that did not.
+
+Five mutations, all caught -- including both directions on C2, since narrowing
+the watchlist must not quietly turn the whole migration private. Sign-out
+itself was already clean and stays that way under mutation: it wipes
+localStorage *and* sessionStorage, the latter added by an earlier fix whose
+comment explains that `loadLocalCustomLists` reads sessionStorage first, so
+clearing only localStorage left the copy that actually gets read.
+
 ## Deliberately not done
 
 **Behavioural coverage of the client, beyond the contract below.** 35,225 of
@@ -335,7 +379,7 @@ expired rows safely.
 ## Verification
 
 ```bash
-node --test tests/*.test.mjs        # 281 tests, 280 pass, 1 skipped
+node --test tests/*.test.mjs        # 286 tests, 285 pass, 1 skipped
 bash verify.sh                      # build drift, syntax, page render, map, tests
 python3 check_sync.py               # byte-exact rebuild check on its own
 
