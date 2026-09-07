@@ -500,3 +500,72 @@ describe("client: a double-clicked credential form submits once", () => {
     assert.equal(c.count(), 1, "and the corrected form must go through");
   });
 });
+
+// --- FE-04: a write the provider refused must not read as success ----------
+//
+// All seven /api/external-list/item-mutate call sites discarded the response --
+// an await inside an empty catch, or Promise.allSettled with the results thrown
+// away -- and then showed a success message unconditionally. The endpoint
+// answers 400 {"ok":false,"error":"Please connect your Trakt account first."}
+// for a missing or expired token, which is the ordinary way this fails. So a
+// removal Trakt refused still said "Removed from TRAKT.", the item stayed in
+// the list, and the local membership index recorded it as gone -- which then
+// hid it from the next attempt.
+const MUTATE = "/api/external-list/item-mutate";
+
+describe("client: a provider write that failed is not reported as done", () => {
+  function harness(routeResult) {
+    const client = loadClient({ routes: { [MUTATE]: () => routeResult } });
+    const toasts = [];
+    const alerts = [];
+    client.set("showAddedToast", (m) => toasts.push(m));
+    client.set("showAppAlert", (title, msg) => alerts.push(title + ": " + msg));
+    return { client, toasts, alerts };
+  }
+  const membership = (client) => {
+    const raw = client.get("localStorage").getItem("myListAddon:externalMembership");
+    return raw ? JSON.parse(raw) : {};
+  };
+
+  it("says so, and leaves the membership index alone, when the provider refuses", async () => {
+    const { client, toasts, alerts } = harness({
+      status: 400, json: { ok: false, error: "Please connect your Trakt account first." },
+    });
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(!toasts.some((t) => /Removed from/.test(t)),
+      "no success toast for a removal the provider refused");
+    assert.ok(alerts.some((a) => /connect your Trakt account/.test(a)),
+      "the server's own message should reach the user, not a generic one");
+    // The important half: the item IS still in the list, so an index saying it
+    // is gone would hide it from the next attempt.
+    assert.deepEqual(membership(client), {},
+      "nothing may be recorded as removed when nothing was removed");
+  });
+
+  it("still reports and records a removal that did land", async () => {
+    const { client, toasts, alerts } = harness({ status: 200, json: { ok: true } });
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(toasts.some((t) => /Removed from TRAKT/.test(t)), "a real removal still confirms");
+    assert.deepEqual(alerts, [], "and raises nothing");
+    const m = membership(client);
+    assert.ok(Object.keys(m).length > 0, "and is recorded");
+    assert.ok(Object.values(m).every((v) => v === false), "as not-in-list");
+  });
+
+  it("treats a network failure the same as a refusal", async () => {
+    const client = loadClient({ routes: { [MUTATE]: () => { throw new Error("offline"); } } });
+    const toasts = [];
+    const alerts = [];
+    client.set("showAddedToast", (m) => toasts.push(m));
+    client.set("showAppAlert", (t, m) => alerts.push(t + ": " + m));
+
+    await client.call("removeSingleExternalItemDirect", "trakt", "watchlist", "watchlist", "tt0137523", "movie", null);
+
+    assert.ok(!toasts.some((t) => /Removed from/.test(t)));
+    assert.ok(alerts.some((a) => /Network error/.test(a)));
+  });
+});

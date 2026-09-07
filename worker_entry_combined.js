@@ -22417,6 +22417,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
   const title = item.showTitle || item.title || item.name || '';
 
   const promises = [];
+  // Each of these mirrors a local change out to a connected provider. They
+  // used to be fired and forgotten, so an expired Trakt/Simkl/MDBList token
+  // meant "syncing to your connected accounts" silently stopped working and
+  // nothing ever said so. The local change is the user's own action and is
+  // kept either way -- this only makes the failure visible.
+  const mirrorFailures = [];
+  const noteMirror = (provider) => (res) => externalMutateError(res)
+    .then((err) => { if (err) mirrorFailures.push(provider.toUpperCase() + ': ' + err); })
+    .catch(() => {});
 
   if (traktSync && traktToken) {
     promises.push(
@@ -22437,7 +22446,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('trakt')).catch(() => {})
     );
   }
 
@@ -22460,7 +22469,7 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('mdblist')).catch(() => {})
     );
   }
 
@@ -22483,12 +22492,15 @@ async function syncSingleItemToConnectedProviders(item, action) {
           episode: episodeNum,
           title: title,
         }),
-      }).catch(() => {})
+      }).then(noteMirror('simkl')).catch(() => {})
     );
   }
 
   if (promises.length) {
-    Promise.allSettled(promises);
+    await Promise.allSettled(promises);
+    if (mirrorFailures.length && typeof showAppAlert === 'function') {
+      showAppAlert('Not Synced To Every Account', mirrorFailures.join('\\n'), false);
+    }
   }
 }
 
@@ -26676,6 +26688,26 @@ function isItemInExternalList(provider, target, listId, id, fallbackList) {
   return false;
 }
 
+// What /api/external-list/item-mutate actually said.
+//
+// All seven call sites used to throw the answer away -- an await inside an
+// empty catch, or Promise.allSettled with the results ignored -- and then show
+// a success message unconditionally. The endpoint answers
+//   400 {"ok":false,"error":"Please connect your Trakt account first."}
+// for a missing or expired provider token, which is the ordinary way this
+// fails, so a removal the provider refused still read as "Removed from TRAKT."
+// while the item stayed in the list and the local membership index recorded it
+// as gone -- which then hid it from the next attempt.
+//
+// Returns null when the write landed, or the message to show when it did not.
+async function externalMutateError(res) {
+  if (!res) return 'Network error.';
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (res.ok && (!data || data.ok !== false)) return null;
+  return (data && data.error) || ('That provider rejected the change (HTTP ' + res.status + ').');
+}
+
 async function removeSingleExternalItemDirect(provider, target, listId, id, type, btn) {
   if (!id) return;
   if (btn) {
@@ -26685,20 +26717,7 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
 
   const key1 = makeExternalKey(provider, target, listId, id);
   const key2 = makeExternalKey(provider, target, listId, String(id).replace(/^tmdb:/, ''));
-  setExternalListMembership(key1, false);
-  setExternalListMembership(key2, false);
-
   const row = btn ? btn.closest('.select-list-row') : null;
-  if (row) {
-    const cb = row.querySelector('.list-select-cb');
-    if (cb) {
-      cb.checked = false;
-      cb.dataset.initiallyChecked = 'false';
-    }
-    const badge = row.querySelector('.in-list-badge');
-    if (badge) badge.remove();
-    btn.style.display = 'none';
-  }
 
   const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
   const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -26711,8 +26730,9 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
   const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
+  let mutateError = null;
   try {
-    await fetch(ORIGIN + '/api/external-list/item-mutate', {
+    const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -26736,7 +26756,39 @@ async function removeSingleExternalItemDirect(provider, target, listId, id, type
         mdblistKey: mdbKey
       })
     });
-  } catch(e) {}
+    mutateError = await externalMutateError(res);
+  } catch (e) {
+    mutateError = 'Network error.';
+  }
+
+  if (mutateError) {
+    // Nothing was changed here, so there is nothing to undo -- the row, the
+    // checkbox and the membership index are all still describing a list the
+    // item really is in.
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Remove';
+    }
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Could Not Remove', mutateError, false);
+    } else {
+      showAddedToast('Could not remove: ' + mutateError);
+    }
+    return;
+  }
+
+  setExternalListMembership(key1, false);
+  setExternalListMembership(key2, false);
+  if (row) {
+    const cb = row.querySelector('.list-select-cb');
+    if (cb) {
+      cb.checked = false;
+      cb.dataset.initiallyChecked = 'false';
+    }
+    const badge = row.querySelector('.in-list-badge');
+    if (badge) badge.remove();
+    if (btn) btn.style.display = 'none';
+  }
 
   showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
 }
@@ -27263,6 +27315,7 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   });
 
   // Execute external modifications concurrently
+  let externalMutateFailures = [];
   if (changedExternalOperations.length > 0) {
     const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
     const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
@@ -27278,8 +27331,11 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
     const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
     const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
 
-    await Promise.allSettled(changedExternalOperations.map(op => {
-      return fetch(ORIGIN + '/api/external-list/item-mutate', {
+    // allSettled's results used to be discarded, so "Added X to lists." was
+    // shown whether the providers accepted the change or refused every one of
+    // them. Collect the failures and name them below instead.
+    externalMutateFailures = await Promise.all(changedExternalOperations.map(async (op) => {
+      const res = await fetch(ORIGIN + '/api/external-list/item-mutate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -27305,8 +27361,10 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
           mdblistAccessToken: mdbToken,
           mdblistKey: mdbKey
         })
-      });
-    }));
+      }).catch(() => null);
+      const err = await externalMutateError(res);
+      return err ? { provider: op.provider, error: err } : null;
+    })).then((r) => r.filter(Boolean));
   }
   
   document.getElementById('selectListModal').style.display = 'none';
@@ -27315,7 +27373,20 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
   btn.disabled = false;
   btn.textContent = 'Done';
   
-  if (anyAdded) {
+  // A provider that refused the change is named rather than passed over. The
+  // custom-list half of this operation is local and did land, so this is a
+  // partial result, and saying so is the whole point -- the previous message
+  // claimed the lot had worked.
+  if (externalMutateFailures.length) {
+    const detail = externalMutateFailures
+      .map((f) => (f.provider ? f.provider.toUpperCase() + ': ' : '') + f.error)
+      .join('\\n');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Some Lists Were Not Updated', detail, false);
+    } else {
+      showAddedToast('Some lists were not updated.');
+    }
+  } else if (anyAdded) {
     showAddedToast('Added ' + title + ' to lists.');
     if (typeof trackEvent === 'function') trackEvent('list-add', finalImdbId, title, type);
   }
@@ -44076,9 +44147,22 @@ function removeListItemFromDetails(btn) {
         mdblistAccessToken: mdbToken,
         mdblistKey: mdbKey
       })
-    }).catch(() => {});
+    }).then((res) => externalMutateError(res)).catch(() => 'Network error.')
+      .then((err) => {
+        // The tile has already gone from the page, and putting it back after
+        // the fact would be worse than saying what happened -- so this reports
+        // rather than reverts. Without it the toast said "Removed from TRAKT."
+        // for a removal Trakt refused, and the item was still there next time
+        // the list loaded.
+        if (!err) return;
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Could Not Remove From ' + (provider ? provider.toUpperCase() : 'List'), err, false);
+        } else {
+          showAddedToast('Could not remove: ' + err);
+        }
+      });
 
-    showAddedToast('Removed from ' + (provider ? provider.toUpperCase() : 'List') + '.');
+    showAddedToast('Removing from ' + (provider ? provider.toUpperCase() : 'List') + '\u2026');
   }
 }
 
