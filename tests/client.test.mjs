@@ -899,3 +899,43 @@ describe("client: a resumed device does not re-add what another device removed",
     });
   });
 });
+
+// --- Live Preview's See All opens with the list's real size, not the first
+// page's ------------------------------------------------------------------
+//
+// /api/preview reports totalItems whenever the source can supply one (see
+// its own comment, 25_api-catalog-routes.js), but renderLivePreview's shelf
+// cache and openLivePreviewSeeAll's handoff to openListDetailsPage both
+// dropped it on the floor -- so a See All page for a >100-item list opened
+// showing "100 items" (the first preview page's length) and only corrected
+// itself once infinite scroll had paged the rest in.
+describe("client: See All opens with the list's real size, not just the first page", () => {
+  it("threads totalItems from the shelf cache into openListDetailsPage's itemCount", () => {
+    const client = loadClient({});
+    const openCalls = [];
+    client.set("openListDetailsPage", (name, type, listUrl, preloaded) => { openCalls.push({ name, type, listUrl, preloaded }); });
+    client.set("livePreviewShelfData", [
+      { name: "Huge List", type: "movie", url: "mdblist:huge", sample: new Array(100).fill({ id: "tt1" }), maybeMore: true, totalItems: 4231 },
+    ]);
+
+    client.call("openLivePreviewSeeAll", 0);
+
+    assert.equal(openCalls.length, 1);
+    assert.equal(openCalls[0].preloaded.itemCount, 4231,
+      "the shelf's known total must reach openListDetailsPage, not just the 100-item sample");
+  });
+
+  it("leaves itemCount unset when the source could not report a total", () => {
+    const client = loadClient({});
+    const openCalls = [];
+    client.set("openListDetailsPage", (name, type, listUrl, preloaded) => { openCalls.push({ preloaded }); });
+    client.set("livePreviewShelfData", [
+      { name: "Unknown-Size List", type: "movie", url: "trakt:x", sample: new Array(100).fill({ id: "tt1" }), maybeMore: true, totalItems: null },
+    ]);
+
+    client.call("openLivePreviewSeeAll", 0);
+
+    assert.equal(openCalls[0].preloaded.itemCount, null,
+      "no total to show yet must fall back to the old progressive count, not claim a wrong one");
+  });
+});
