@@ -391,6 +391,15 @@ reads like a list edit, and I had not counted it among the sites to bump.
   precise failure the key list's own comment exists to prevent.
 - The stamp uses `nextSyncVersion`, so it strictly increases; the client
   compares with `>`, and two saves inside one millisecond must not tie.
+- A reset sweeps `creatorliststamp:` away *before* re-bumping it, so the bump had
+  nothing to count up from and produced a bare `Date.now()` — which ties with the
+  previous stamp whenever the whole reset lands inside one millisecond, and a tie
+  reads as "nothing changed". CI surfaced that as one red run against one green
+  one; it was a real hole, not a flaky test. `bumpCreatorListsStamp` now takes a
+  `notBefore` floor, and `purgeCreatorData` reads the stamp before the sweep so
+  it can pass it. The test no longer depends on the clock either: it pins the
+  stored stamp ahead of the wall clock, so the new one has to clear it whatever
+  the timing.
 - Deleting a list is why the stamp is written rather than derived: a
   `MAX(updated_at)` over the surviving `creator_lists` rows goes *down* when the
   newest list is the one removed. Reordering is the second reason — it touches

@@ -4349,12 +4349,21 @@ function nextSyncVersion(currentUpdatedAt) {
 //
 // Best-effort by design. A failed bump costs one browser a delayed refresh;
 // throwing would fail a save whose data is already safely stored.
-async function bumpCreatorListsStamp(env, username) {
+//
+// `notBefore` is a floor the new stamp must clear. It exists for the one caller
+// that destroys the key before bumping it: purgeCreatorData sweeps
+// creatorliststamp: along with everything else, so the read below finds nothing,
+// prev falls to 0, and the new stamp is a bare Date.now() -- which ties with the
+// previous stamp whenever the whole reset lands inside one millisecond. A tie
+// reads as "nothing changed" to a polling browser, which is precisely the state
+// this stamp exists to prevent. CI caught that as a flake; it is a real hole,
+// not a flaky test.
+async function bumpCreatorListsStamp(env, username, notBefore) {
   try {
     const raw = await env.CONFIGS.get(`creatorliststamp:${username}`);
-    let prev = 0;
+    let prev = Number(notBefore) || 0;
     if (raw) {
-      try { prev = Number(JSON.parse(raw).updatedAt) || 0; } catch {}
+      try { prev = Math.max(prev, Number(JSON.parse(raw).updatedAt) || 0); } catch {}
     }
     // Strictly increasing, for the same reason the sync blob's own version is:
     // the client compares with >, so two saves inside one millisecond must not
@@ -4458,6 +4467,15 @@ async function isCreatorTombstoned(env, username) {
 async function purgeCreatorData(env, username, options = {}) {
   const deleteIdentity = options.deleteIdentity === true;
   const u = username;
+  // Read before the sweep below deletes it, so the bump at the end can still
+  // guarantee the stamp moves forward -- see bumpCreatorListsStamp's notBefore.
+  let priorListsStamp = 0;
+  try {
+    const stampRaw = await env.CONFIGS.get(`creatorliststamp:${u}`);
+    if (stampRaw) priorListsStamp = Number(JSON.parse(stampRaw).updatedAt) || 0;
+  } catch (e) {
+    // An unreadable stamp is no worse than the absent one this used to assume.
+  }
   let listsCleared = 0;
   const purgedListIds = [];
   let keysCleared = 0;
@@ -4764,7 +4782,7 @@ async function purgeCreatorData(env, username, options = {}) {
   // unconditional bump there would hand every brand-new account a non-zero
   // stamp describing a list change that never happened.
   if (!deleteIdentity && listsCleared > 0) {
-    await bumpCreatorListsStamp(env, u);
+    await bumpCreatorListsStamp(env, u, priorListsStamp);
   }
 
   // `ok` is the whole point: it is false when this call left something

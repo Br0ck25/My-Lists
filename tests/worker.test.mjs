@@ -6480,12 +6480,22 @@ describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
     const K = { creatorName: "fe17reset", creatorKey: u.creatorKey };
     await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
       json: { ...K, name: "Shared List", type: "movie", visibility: "private", items: [] } });
+    // Forced forward rather than left to the clock. A reset sweeps
+    // creatorliststamp: away before re-bumping it, so the bump has nothing to
+    // count up from -- and the natural version of this test only fails when the
+    // whole reset happens to land inside one millisecond of the save, which is
+    // how it reached CI green locally and red there. Pinning the stored stamp
+    // ahead of the wall clock makes the hole deterministic: whatever the timing,
+    // the new stamp has to clear the old one.
+    const pinned = Date.now() + 60000;
+    env.CONFIGS._store.set("creatorliststamp:fe17reset", JSON.stringify({ updatedAt: pinned }));
     const before = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
+    assert.equal(before, pinned, "precondition: the pinned stamp is what meta reports");
     const reset = await call(env, "/api/creator/account/reset", { method: "POST", ip: nextIp(), json: { ...K, confirm: "RESET" } });
     assert.equal(reset.body.ok, true, "precondition: the reset succeeded");
     const after = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
     assert.ok(after > before,
-      "a reset empties the lists but leaves every device signed in; a stamp that went back to 0 " +
-      "would read as 'nothing changed' and leave them rendering lists that no longer exist");
+      "a reset empties the lists but leaves every device signed in; a stamp that did not clear the " +
+      "old one reads as 'nothing changed' and leaves them rendering lists that no longer exist");
   });
 });
