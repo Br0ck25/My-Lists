@@ -203,3 +203,145 @@ describe("client: the watchlist removal path uses the same guard", () => {
       "the retry keeps the other device's item and still removes tt1");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Account boundaries. The client-side half of N4: whatever the server does
+// about one person's data reaching another, the browser is the other place it
+// can happen -- one machine, two accounts, one localStorage.
+// ---------------------------------------------------------------------------
+const CREATE = "/api/creator/create";
+const SECRET = "tt-ALICE-SECRET";
+
+const anonRoutes = (saves) => ({
+  [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, slug: req.body.slug || "s", updatedAt: 1 } }; },
+  [CREATE]: () => ({ json: { ok: true, creatorName: "bob", displayName: "Bob", creatorKey: "MYL-BBBB" } }),
+  [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+  "/api/creator/sync/load": () => ({ json: { ok: true, data: {} } }),
+  "/api/creator/sync/save": () => ({ json: { ok: true } }),
+  "/api/creator/sync/meta": () => ({ json: { ok: true } }),
+  "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+});
+
+function fillCreateForm(client, name) {
+  const d = client.get("document");
+  d.getElementById("createProfileNameInput").value = name;
+  d.getElementById("createProfileDisplayInput").value = name;
+  d.getElementById("createProfileRecoveryInput").value = "correcthorsebattery";
+}
+
+const settle = async (n = 20) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+
+describe("client: one browser, two accounts", () => {
+  it("signing out leaves nothing of the previous account behind", async () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorName": "alice",
+        "myListAddon:creatorDisplayName": "Alice",
+        "myListAddon:creatorKey": "MYL-AAAA",
+        "myListAddon:localCustomLists": JSON.stringify({
+          "alices-picks": { name: "Alice's Picks", type: "movie", slug: "alices-picks", items: [{ id: SECRET }] },
+        }),
+        "myListAddon:state": JSON.stringify({ entries: [{ name: "Alice's row", url: "https://x/" + SECRET }] }),
+      },
+      routes: anonRoutes([]),
+    });
+    client.set("activeCreator", { creatorName: "alice", displayName: "Alice" });
+
+    client.call("switchCreatorProfile");
+
+    const remaining = [...client.localStorage._store.entries()]
+      .filter(([k, v]) => String(v).includes(SECRET) || /alice/i.test(String(v)) || /alice/i.test(k))
+      .map(([k]) => k);
+    assert.deepEqual(remaining, [], "the next person on this browser must not find the last one's data");
+    assert.equal(client.get("activeCreator"), null);
+  });
+
+  it("creating a second account does not carry the first one's lists into it", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: {
+        "myListAddon:creatorName": "alice",
+        "myListAddon:creatorKey": "MYL-AAAA",
+        "myListAddon:localCustomLists": JSON.stringify({
+          "alices-private-picks": {
+            name: "Alice's Private Picks", type: "movie", slug: "alices-private-picks",
+            items: [{ id: SECRET }],
+          },
+        }),
+      },
+      routes: anonRoutes(saves),
+    });
+    client.set("activeCreator", { creatorName: "alice", displayName: "Alice" });
+
+    fillCreateForm(client, "bob");
+    await client.call("submitCreateProfile");
+    await settle();
+
+    // Before: migrateLocalCustomListsToAccount ran against alice's local map
+    // and put "Alice's Private Picks" into bob's account -- as a PUBLIC list.
+    // Every button that opens this modal is inside an `if (!activeCreator)`
+    // branch, so a correctly-rendered page does not offer it; that is
+    // protection by rendering, and this is the same thing in code.
+    const leaked = saves.filter((s) => JSON.stringify(s.items || []).includes(SECRET));
+    assert.deepEqual(leaked, [],
+      "one account's list must not be uploaded into another account");
+  });
+});
+
+describe("client: what an anonymous user's first account publishes", () => {
+  const anonStorage = () => ({
+    "myListAddon:localCustomLists": JSON.stringify({
+      "watchlist": { name: "Watchlist", type: "mixed", slug: "watchlist",
+        items: [{ id: "tt-PERSONAL-1" }, { id: "tt-PERSONAL-2" }] },
+      "watch-history": { name: "Watch History", type: "mixed", slug: "watch-history",
+        items: [{ id: "tt-PRIVATE-HISTORY" }] },
+      "continue-watching": { name: "Continue Watching", type: "mixed", slug: "continue-watching", items: [] },
+      "my-favourites": { name: "My Favourites", type: "movie", slug: "my-favourites",
+        items: [{ id: "tt-SHAREABLE" }] },
+    }),
+  });
+
+  it("migrates the watchlist privately, not publicly", async () => {
+    const saves = [];
+    const client = loadClient({ storage: anonStorage(), routes: anonRoutes(saves) });
+    fillCreateForm(client, "newbie");
+    await client.call("submitCreateProfile");
+    await settle();
+
+    const watchlist = saves.find((s) => s.name === "Watchlist");
+    assert.ok(watchlist, "the watchlist should still migrate to the account");
+    // Before: it went up as visibility 'public'. A watchlist is a personal
+    // queue, filled by an add button the same way Watch History is -- and
+    // every other write of this list in the codebase already defaults it to
+    // private. Measured: two films published under a brand-new username
+    // without the person being asked.
+    assert.equal(watchlist.visibility, "private",
+      "a personal watchlist must not be published publicly by signing up");
+  });
+
+  it("still publishes a list the person actually built", async () => {
+    const saves = [];
+    const client = loadClient({ storage: anonStorage(), routes: anonRoutes(saves) });
+    fillCreateForm(client, "newbie");
+    await client.call("submitCreateProfile");
+    await settle();
+
+    // The other half of the fix: this is a sharing feature, and narrowing the
+    // watchlist must not quietly turn the migration private for everything.
+    const built = saves.find((s) => s.name === "My Favourites");
+    assert.ok(built, "a hand-built list should still migrate");
+    assert.equal(built.visibility, "public");
+  });
+
+  it("never sends the auto-tracked lists through the publish endpoint at all", async () => {
+    const saves = [];
+    const client = loadClient({ storage: anonStorage(), routes: anonRoutes(saves) });
+    fillCreateForm(client, "newbie");
+    await client.call("submitCreateProfile");
+    await settle();
+
+    const names = saves.map((s) => s.name);
+    assert.ok(!names.includes("Watch History"), "watch history must not become a server list here");
+    assert.ok(!names.includes("Continue Watching"), "nor continue watching");
+  });
+});
