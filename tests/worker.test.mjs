@@ -6499,3 +6499,195 @@ describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
       "old one reads as 'nothing changed' and leaves them rendering lists that no longer exist");
   });
 });
+
+// ---------------------------------------------------------------------------
+// A change made on one device, reverted a few minutes later by another.
+//
+// Both halves of this are the same shape: a second signed-in browser sends
+// its own full snapshot of state it has not re-read since, and the server
+// takes it. On a desktop tab left open that is rare. On a phone it is the
+// normal case -- an installed PWA is re-launched rather than resumed, so it
+// begins every session holding whatever it last saw, however old that is.
+describe("a second device cannot silently replace what the first one changed", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+  const tracking = (env, user) => JSON.parse(env.CONFIGS._store.get(`creatorsynctracking:${user}`));
+
+  it("save-tracking refuses a push built on a version another browser has replaced", async () => {
+    const { env, K } = await mk("twodev1");
+    // The desktop saves two watched films, and learns the version it made.
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }] },
+    });
+    assert.equal(first.body.ok, true);
+    const desktopVersion = first.body.clientVersion;
+    assert.ok(Number.isFinite(desktopVersion), "a save must report the version it produced");
+
+    // The desktop removes one of them.
+    const removal = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }], intentionalRemoval: true,
+              expectedClientVersion: desktopVersion },
+    });
+    assert.equal(removal.body.ok, true);
+    assert.equal(tracking(env, "twodev1").watchHistory.length, 1, "precondition: the removal landed");
+
+    // The phone opens, holding the state from before that removal, and pushes.
+    const stale = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }],
+              expectedClientVersion: desktopVersion },
+    });
+    assert.equal(stale.status, 409, "a push built on a replaced version must be refused");
+    assert.equal(stale.body.conflict, true);
+    assert.equal(tracking(env, "twodev1").watchHistory.length, 1,
+      "and must leave the removal standing -- this is the whole bug: the item came back");
+    assert.ok(stale.body.clientVersion > desktopVersion,
+      "the answer carries the current version, so the browser can retry against it");
+  });
+
+  it("the same push succeeds once it cites the version it was refused with", async () => {
+    const { env, K } = await mk("twodev2");
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const stale = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt9", watchedAt: 90 }], expectedClientVersion: 1 },
+    });
+    assert.equal(stale.status, 409, "precondition: refused");
+    const retry = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt9", watchedAt: 90 }], expectedClientVersion: stale.body.clientVersion },
+    });
+    assert.equal(retry.body.ok, true, "a browser that has caught up must be able to save");
+    assert.ok(retry.body.clientVersion > first.body.clientVersion);
+  });
+
+  it("a scrobble landing in between does not start a conflict", async () => {
+    // updatedAt moves for writes no browser made -- handleSubtitlesTrack and
+    // the Continue Watching cron both rewrite this record. Guarding on it
+    // would 409 through ordinary playback, which the scrobble merge already
+    // handles correctly, so the guard reads a version only a browser bumps.
+    const { env, K } = await mk("twodev3");
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const blob = tracking(env, "twodev3");
+    blob.watchHistory.unshift({ id: "tt-scrobbled", watchedAt: Date.now() });
+    blob.updatedAt = Date.now() + 5000;
+    env.CONFIGS._store.set("creatorsynctracking:twodev3", JSON.stringify(blob));
+
+    const next = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }],
+              expectedClientVersion: first.body.clientVersion },
+    });
+    assert.equal(next.body.ok, true, "a scrobble is not another browser; this must not be refused");
+    const ids = tracking(env, "twodev3").watchHistory.map((it) => it.id);
+    assert.ok(ids.includes("tt-scrobbled"), "and the scrobble must still be rescued into the result");
+    assert.ok(ids.includes("tt2"));
+  });
+
+  it("a client that sends no version at all still saves, as it always did", async () => {
+    const { env, K } = await mk("twodev4");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const second = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }] },
+    });
+    assert.equal(second.body.ok, true, "the guard is additive -- an older client must not be locked out");
+  });
+
+  it("rejects a malformed version rather than dropping the guard", async () => {
+    const { env, K } = await mk("twodev5");
+    const bad = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], expectedClientVersion: "soon" },
+    });
+    assert.equal(bad.status, 400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The other half of the same report: a list deleted on the desktop was back
+// on the account a minute after the phone was opened.
+//
+// Deleting a list leaves the account with no trace of it, and to any OTHER
+// browser "the account does not have this list" is indistinguishable from
+// "the account never received this list" -- which is the case
+// uploadMissingLocalListsToAccount exists to repair. So the phone dutifully
+// re-uploaded it. The account has to say the list was DELETED, not merely be
+// missing it.
+describe("a list deleted on one device stays deleted on the others", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { ...K, type: "movie", visibility: "private", items: [{ id: "tt1" }], ...extra },
+  });
+
+  it("reports the deleted slug to every other device", async () => {
+    const { env, K } = await mk("deldev1");
+    const saved = await save(env, K, { name: "Faves" });
+    const slug = saved.body.slug;
+
+    const before = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(before.body.deletedSlugs, [], "nothing deleted yet");
+
+    const del = await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+    assert.equal(del.body.ok, true);
+
+    const after = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(after.body.lists.map((l) => l.slug), [], "precondition: the list is gone");
+    assert.deepEqual(after.body.deletedSlugs, [slug],
+      "another device has to be told it was deleted, or it uploads its own copy back");
+  });
+
+  it("re-creating the list at the same slug retires the deletion", async () => {
+    const { env, K } = await mk("deldev2");
+    const saved = await save(env, K, { name: "Faves" });
+    const slug = saved.body.slug;
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+
+    const again = await save(env, K, { name: "Faves", slug });
+    assert.equal(again.body.ok, true);
+    const after = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(after.body.deletedSlugs, [],
+      "a deliberate re-create must win, or every other device would throw the new list away");
+    assert.deepEqual(after.body.lists.map((l) => l.slug), [slug]);
+  });
+
+  it("a deletion changes the lists version, so it cannot hide behind an unchanged reply", async () => {
+    const { env, K } = await mk("deldev3");
+    const saved = await save(env, K, { name: "Faves" });
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug: saved.body.slug } });
+    const after = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, knownVersion: first.body.version },
+    });
+    assert.notEqual(after.body.unchanged, true, "a delete must not answer 'nothing changed'");
+    assert.deepEqual(after.body.deletedSlugs, [saved.body.slug]);
+  });
+
+  it("deleting the account takes its deletion record with it", async () => {
+    // The username is freed for re-registration, and a tombstone that
+    // outlived the account would tell the next owner's browsers to discard
+    // lists they never deleted.
+    const { env, K } = await mk("deldev4");
+    const saved = await save(env, K, { name: "Faves" });
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug: saved.body.slug } });
+    assert.ok(env.CONFIGS._store.get("creatorlistdeleted:deldev4"), "precondition: recorded");
+
+    const gone = await call(env, "/api/creator/delete-account", {
+      method: "POST", ip: nextIp(), json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(gone.body.ok, true, JSON.stringify(gone.body).slice(0, 200));
+    assert.equal(env.CONFIGS._store.get("creatorlistdeleted:deldev4"), undefined);
+  });
+});
