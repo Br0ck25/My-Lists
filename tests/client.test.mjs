@@ -803,3 +803,99 @@ describe("client: a corrupted dashboard order cannot break the dashboard", () =>
     assert.deepEqual(order(undefined), []);
   });
 });
+
+// --- a resumed device does not un-delete a tracking-list removal made
+// elsewhere -----------------------------------------------------------------
+//
+// loadCreatorSync merges the server's watch-history/continue-watching/
+// watchlist arrays with whatever this device still has locally, so an item
+// added offline and not yet pushed is not lost. Before this fix, "not in the
+// server's answer" was read as "added here, not pushed yet" unconditionally
+// -- which is also exactly what a removal made on ANOTHER device looks like
+// from a stale local copy's point of view. A phone that has not synced since
+// before a desktop unwatched something reintroduced it on load, then pushed
+// that reintroduction straight back to the account.
+describe("client: a resumed device does not re-add what another device removed", () => {
+  const LOCAL_LISTS_KEY = "myListAddon:localCustomLists";
+
+  function seeded(routes, storageExtra) {
+    return loadClient({
+      storage: Object.assign({
+        "myListAddon:creatorKey": "KEY-1",
+        [LOCAL_LISTS_KEY]: JSON.stringify({
+          "watch-history": {
+            slug: "watch-history", name: "Watch History", type: "movie",
+            items: [{ id: "tt1", type: "movie", name: "Stale Movie", watchedAt: 900 }],
+            updatedAt: 1000,
+          },
+        }),
+      }, storageExtra),
+      routes: Object.assign({
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+      }, routes),
+    });
+  }
+
+  it("drops a stale local item the server no longer has, once this device has a baseline", () => {
+    const pushes = [];
+    const client = seeded({
+      "/api/creator/sync/load": () => ({ json: { ok: true, data: {
+        watchHistory: [], trackingUpdatedAt: 6000,
+      } } }),
+      "/api/creator/sync/save-tracking": (req) => { pushes.push(req.body); return { json: { ok: true } }; },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    // This device already synced up to tracking version 5000 before -- the
+    // baseline the local watch-history's updatedAt: 1000 falls well behind.
+    client.set("window._serverTrackingUpdatedAt", 5000);
+
+    return client.call("loadCreatorSync").then(async () => {
+      await new Promise((r) => setImmediate(r));
+      const items = client.get("loadLocalCustomLists()['watch-history'].items");
+      assert.deepEqual([...items], [], "the removal made elsewhere must stick");
+      assert.equal(pushes.length, 0, "nothing to push back -- the stale item must not resurrect on the server either");
+    });
+  });
+
+  it("still keeps a local item added since this device's last sync", () => {
+    const client = seeded({
+      "/api/creator/sync/load": () => ({ json: { ok: true, data: {
+        watchHistory: [], trackingUpdatedAt: 6000,
+      } } }),
+    }, {
+      [LOCAL_LISTS_KEY]: JSON.stringify({
+        "watch-history": {
+          slug: "watch-history", name: "Watch History", type: "movie",
+          items: [{ id: "tt1", type: "movie", name: "Just Watched", watchedAt: 5500 }],
+          // Newer than the 5000 baseline below -- a genuine unpushed local edit.
+          updatedAt: 5500,
+        },
+      }),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("window._serverTrackingUpdatedAt", 5000);
+
+    return client.call("loadCreatorSync").then(async () => {
+      await new Promise((r) => setImmediate(r));
+      const items = client.get("loadLocalCustomLists()['watch-history'].items");
+      assert.deepEqual([...items].map((it) => it.id), ["tt1"], "an edit newer than the last sync must survive");
+    });
+  });
+
+  it("keeps everything on this device's very first sync, with no baseline to compare against", () => {
+    const client = seeded({
+      "/api/creator/sync/load": () => ({ json: { ok: true, data: {
+        watchHistory: [], trackingUpdatedAt: 6000,
+      } } }),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    // No prior _serverTrackingUpdatedAt at all -- this device has never synced.
+
+    return client.call("loadCreatorSync").then(async () => {
+      await new Promise((r) => setImmediate(r));
+      const items = client.get("loadLocalCustomLists()['watch-history'].items");
+      assert.deepEqual([...items].map((it) => it.id), ["tt1"], "first sync ever must not discard local data it cannot yet judge");
+    });
+  });
+});
