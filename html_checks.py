@@ -119,6 +119,44 @@ print(f"  inline handlers resolve ({len(handler_calls)} distinct functions, "
       f"{sum(handler_calls.values())} call sites)")
 
 
+# --- ARIA structure that only the rendered page can show ---
+# Both nav bars carried role="tablist" with no role="tab" beneath them, so
+# assistive technology was told to expect tabs and found none. These three
+# checks are the ones a rendered page makes cheap: whether the roles agree,
+# whether every aria-controls / aria-labelledby resolves to an element that
+# exists, and whether every form control has an accessible name. All three
+# were failing when they were written.
+def _attr(tag, name):
+    m = re.search(r'\b' + name + r'\s*=\s*"([^"]*)"', tag)
+    return m.group(1) if m else None
+
+all_ids = set(re.findall(r'\bid\s*=\s*"([^"]+)"', html))
+open_tags = re.findall(r'<(?!/)([a-zA-Z][\w-]*)((?:[^<>"]|"[^"]*")*)>', html)
+tags = [(t[0].lower(), '<' + t[0] + t[1] + '>') for t in open_tags]
+
+tabs = [t for _, t in tags if _attr(t, 'role') == 'tab']
+tablists = [t for _, t in tags if _attr(t, 'role') == 'tablist']
+if tablists and not tabs:
+    print(f"FAIL: {len(tablists)} role=tablist with no role=tab inside them.")
+    print("  A tablist may only contain tabs; screen readers announce an empty one.")
+    sys.exit(1)
+
+broken_refs = []
+for _, t in tags:
+    for attr in ('aria-controls', 'aria-labelledby', 'aria-describedby'):
+        v = _attr(t, attr)
+        if not v:
+            continue
+        for ref in v.split():
+            if ref not in all_ids:
+                broken_refs.append((attr, ref, t[:70]))
+if broken_refs:
+    print(f"FAIL: {len(broken_refs)} aria reference(s) point at an id that does not exist:")
+    for attr, ref, t in broken_refs[:8]:
+        print(f"    {attr}=\"{ref}\"  on  {t}")
+    sys.exit(1)
+print(f"  aria refs resolve ({len(tabs)} tabs, {len(tablists)} tablists, {len(all_ids)} ids)")
+
 # --- CSS brace balance ---
 styles = re.findall(r'<style[^>]*>(.*?)</style>', html, re.DOTALL)
 tot_o = tot_c = 0

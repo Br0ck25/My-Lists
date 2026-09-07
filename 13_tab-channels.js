@@ -1,4 +1,4 @@
-<div class="tab-panel" data-tab-panel="channels" hidden>
+<div class="tab-panel" data-tab-panel="channels" id="content-channels" role="tabpanel" aria-labelledby="tab-desktop-channels" hidden>
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
@@ -188,7 +188,7 @@
   </div>
 </div>
 
-<div class="tab-panel" data-tab-panel="search" hidden>
+<div class="tab-panel" data-tab-panel="search" id="content-search" role="tabpanel" aria-labelledby="tab-desktop-search" hidden>
   <div class="panel">
     <div class="shelf-header" style="margin-bottom:10px;">
       <h2 class="shelf-title">Search Movies, TV Shows &amp; Lists</h2>
@@ -208,7 +208,7 @@
 
     <!-- Quick Filter Dropdowns for Movies & Shows -->
     <div id="catalogSearchFiltersRow" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center;">
-      <select id="catalogSearchGenreSelect" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchGenreSelect" aria-label="Filter by genre" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Genres</option>
         <option value="28,10759">Action &amp; Adventure</option>
         <option value="16">Animation</option>
@@ -228,7 +228,7 @@
         <option value="37">Western</option>
       </select>
 
-      <select id="catalogSearchYearSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchYearSelect" aria-label="Filter by year" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Years</option>
         <option value="2026">2026</option>
         <option value="2025">2025</option>
@@ -241,7 +241,7 @@
         <option value="<1990">1980s &amp; Older</option>
       </select>
 
-      <select id="catalogSearchRatingSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchRatingSelect" aria-label="Filter by minimum rating" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Ratings</option>
         <option value="8.0">8.0+ ⭐</option>
         <option value="7.0">7.0+ ⭐</option>

@@ -1724,10 +1724,15 @@ async function renderAdminDashboard(env) {
   <h1>Admin Dashboard</h1>
   <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
-  <div class="admin-main-tab-bar" role="tablist">
-    <button type="button" class="admin-main-tab-btn active" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
+  <!-- Not a tablist: these three buttons do not reveal panels, they choose
+       which row of sub-tabs is shown, and it is the sub-tab that selects
+       content. role="tablist" with nothing inside it carrying role="tab"
+       told assistive technology to expect tabs and hand it none, so this
+       is a labelled group of toggle buttons, which is what it is. -->
+  <div class="admin-main-tab-bar" role="group" aria-label="Dashboard sections">
+    <button type="button" class="admin-main-tab-btn active" aria-pressed="true" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
   </div>
 
   <div class="admin-subnav-bar" id="adminSubnavOverview">
@@ -2053,7 +2058,11 @@ async function renderAdminDashboard(env) {
     };
 
     function switchAdminMainTab(catId) {
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === catId));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === catId;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + catId.charAt(0).toUpperCase() + catId.slice(1)) ? 'flex' : 'none';
       });
@@ -2075,7 +2084,11 @@ async function renderAdminDashboard(env) {
       if (updateUrl && history.replaceState) {
         history.replaceState(null, '', '#' + tabId);
       }
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === cat));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === cat;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + cat.charAt(0).toUpperCase() + cat.slice(1)) ? 'flex' : 'none';
       });

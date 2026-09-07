@@ -604,6 +604,35 @@ async function decompressBase64ToJson(b64) {
 }
 
 // --- Tab & Submenu Navigation ---------------------------------------------
+// Arrow-key movement inside the two tab bars.
+//
+// role="tablist" was on both bars from the start, with no role="tab" beneath
+// it -- so assistive technology was told to expect tabs and found none. Adding
+// the roles without the keyboard behaviour they imply would be its own half
+// measure: a tablist is one tab stop, and the arrows move between the tabs.
+function handleTabBarKeydown(e) {
+  const btn = e.target && e.target.closest ? e.target.closest('.tab-btn, .bottom-nav-item') : null;
+  if (!btn) return;
+  const bar = btn.closest('[role="tablist"]');
+  if (!bar) return;
+  const tabs = [...bar.querySelectorAll('[role="tab"]')];
+  const i = tabs.indexOf(btn);
+  if (i === -1) return;
+  let next = -1;
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (i + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (i - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') next = 0;
+  else if (e.key === 'End') next = tabs.length - 1;
+  if (next === -1) return;
+  e.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleTabBarKeydown);
+}
+
 function switchTab(name) {
   if (name === 'backup') {
     switchTab('settings');
@@ -645,15 +674,25 @@ function switchTab(name) {
     const p = panels[i];
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
   }
+  // aria-selected alongside the class, and a roving tabindex, because both bars
+  // declare role="tablist" and their buttons now carry role="tab". A tab widget
+  // is one stop in the page's tab order; the arrow keys move within it (see
+  // handleTabBarKeydown).
   const tabBtns = document.querySelectorAll('.tab-btn');
   for (let i = 0; i < tabBtns.length; i++) {
     const b = tabBtns[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
   const navItems = document.querySelectorAll('.bottom-nav-item');
   for (let i = 0; i < navItems.length; i++) {
     const b = navItems[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
 
   if (name !== 'list-details' && name !== 'item-details') {
@@ -788,6 +827,10 @@ function showAddedToast(msg) {
     toast = document.createElement('div');
     toast.id = 'actionToast';
     toast.className = 'action-toast';
+    // Matches the static #actionToast in 09_page-shell.js, which is the copy
+    // that normally exists; this branch only runs if that one is missing.
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
     document.body.appendChild(toast);
   }
   toast.textContent = msg || 'Added to My Catalogs \u2713';
@@ -836,21 +879,192 @@ function resolveMissingPostersInDom(rootEl) {
   });
 }
 
+// Locking the page behind a modal.
+//
+// Every caller used to set document.body.style.overflow = 'hidden', and it has
+// never done anything. html { overflow-x: hidden } (09_page-shell.js) gives the
+// root element an explicit overflow-y of auto -- a non-visible value on one axis
+// computes the other from visible to auto -- and once <html> has its own
+// overflow, the body's stops propagating to the viewport. Measured: with a modal
+// open and body.style.overflow === 'hidden', a wheel event over the backdrop
+// still scrolled the page 900px.
+//
+// So the lock goes on the element that actually scrolls. The scrollbar it
+// removes would shift the layout, hence the compensating padding; the scroll
+// position is restored because setting overflow on <html> does not preserve it
+// the way body's did on browsers where body's had an effect.
+//
+// Counted, not boolean: two overlays can be open at once (a confirm raised from
+// a dialog), and the inner one closing must not unlock the page under the outer.
+let _scrollLockDepth = 0;
+let _scrollLockY = 0;
+
+function lockBackgroundScroll(on) {
+  const root = document.documentElement;
+  if (!root || !root.style) return;
+  if (on) {
+    _scrollLockDepth++;
+    if (_scrollLockDepth > 1) return;
+    _scrollLockY = window.pageYOffset || root.scrollTop || 0;
+    const barWidth = window.innerWidth - root.clientWidth;
+    root.style.overflow = 'hidden';
+    if (barWidth > 0) root.style.paddingRight = barWidth + 'px';
+    return;
+  }
+  if (_scrollLockDepth === 0) return;
+  _scrollLockDepth--;
+  if (_scrollLockDepth > 0) return;
+  root.style.overflow = '';
+  root.style.paddingRight = '';
+  window.scrollTo(0, _scrollLockY);
+}
+
+// Where the keyboard was, so it can be put back. A modal that steals focus and
+// never returns it leaves a keyboard or screen-reader user at the top of the
+// document with no idea what happened.
+let _modalReturnFocus = null;
+
+function focusableInModal(overlay) {
+  return [...overlay.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+// Escape, Tab and focus for every dynamic modal at once. There was none of
+// this: measured, Escape closed nothing, focus never entered the dialog, and
+// Tab from inside walked straight out into the page behind it.
+function handleModalKeydown(e) {
+  const overlay = document.getElementById('activeModalOverlay');
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeModal();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) {
+    // Nothing to move to, so keep the keyboard inside rather than letting it
+    // wander into the page the dialog is covering.
+    e.preventDefault();
+    return;
+  }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// Escape and focus for the four modals that predate showModal.
+//
+// createListModal, addShelfModal, selectListModal and traktDeviceModal are
+// static markup toggled with style.display, so none of showModal's handling
+// reached them: measured, Escape closed nothing and focus never entered any of
+// them. Rather than convert four dialogs to showModal -- which would mean
+// rebuilding markup that works -- this gives them the same three behaviours
+// from the outside.
+const STATIC_MODALS = [
+  { id: 'createListModal', close: 'closeCreateListModal' },
+  { id: 'selectListModal', close: 'closeSelectListModal' },
+  { id: 'addShelfModal', close: null },
+  { id: 'traktDeviceModal', close: 'closeTraktDeviceModal' },
+];
+
+function visibleStaticModal() {
+  for (let i = STATIC_MODALS.length - 1; i >= 0; i--) {
+    const el = document.getElementById(STATIC_MODALS[i].id);
+    if (el && el.style.display && el.style.display !== 'none') return STATIC_MODALS[i];
+  }
+  return null;
+}
+
+function closeStaticModal(entry) {
+  if (!entry) return;
+  if (entry.close && typeof window[entry.close] === 'function') {
+    window[entry.close]();
+    return;
+  }
+  const el = document.getElementById(entry.id);
+  if (el) el.style.display = 'none';
+  lockBackgroundScroll(false);
+}
+
+function handleStaticModalKeydown(e) {
+  // The dynamic overlay sits on top when both are open, and has its own
+  // handler -- leave it to that one.
+  if (document.getElementById('activeModalOverlay')) return;
+  const entry = visibleStaticModal();
+  if (!entry) return;
+  const overlay = document.getElementById(entry.id);
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeStaticModal(entry);
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) { e.preventDefault(); return; }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleStaticModalKeydown, true);
+}
+
 function showModal(innerHtml, extraClass) {
   closeModal();
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.id = 'activeModalOverlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) closeModal();
   });
+  _modalReturnFocus = (document.activeElement && document.activeElement !== document.body)
+    ? document.activeElement
+    : null;
   document.body.appendChild(overlay);
+  document.addEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(true);
+  // The heading first when there is one, so a screen reader announces what
+  // this dialog is before naming its buttons; otherwise the first control.
+  const items = focusableInModal(overlay);
+  const heading = overlay.querySelector('h2, h3');
+  if (heading) {
+    heading.setAttribute('tabindex', '-1');
+    heading.focus();
+  } else if (items.length) {
+    items[0].focus();
+  }
 }
 
 function closeModal() {
   const existing = document.getElementById('activeModalOverlay');
   if (existing) existing.remove();
+  document.removeEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(false);
+  if (_modalReturnFocus && typeof _modalReturnFocus.focus === 'function') {
+    try { _modalReturnFocus.focus(); } catch (e) {}
+  }
+  _modalReturnFocus = null;
 }
 
 function showAppAlert(title, message, isSuccess = false) {
@@ -2028,7 +2242,7 @@ function addRow(name, url, type, enabled, group, channelId) {
             '<input type="text" placeholder="Name (e.g. Trending Movies)" class="name" value="' + escapeAttr(name || '') + '">' +
           '</div>' +
           '<div class="entry-type-row" style="width: auto;">' +
-            '<select class="type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
+            '<select class="type" aria-label="Catalog type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
               '<option value="movie" ' + ((type === 'movie' || (isCustomList && type === 'movie')) ? 'selected' : '') + '>Movies</option>' +
               '<option value="series" ' + ((type === 'series' || isChannel || (isCustomList && type === 'series')) ? 'selected' : '') + '>Shows</option>' +
             '</select>' +

@@ -4252,6 +4252,17 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
+// The createListModal counterpart of closeSelectListModal. Its X and Cancel
+// buttons hid the modal and released nothing, which was the other half of the
+// latched scroll lock.
+function closeCreateListModal() {
+  const modal = document.getElementById('createListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeCreateListModal = closeCreateListModal;
+
 function openCreateListModal(presetDestination) {
   const destEl = document.getElementById('createListModalDestination');
   if (destEl) {
@@ -4295,6 +4306,7 @@ function openCreateListModal(presetDestination) {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 
@@ -4518,7 +4530,7 @@ async function submitCreateListModal() {
     }
 
     saveState();
-    document.getElementById('createListModal').style.display = 'none';
+    closeCreateListModal();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
     if (currentPendingItem && currentPendingItem.title) {

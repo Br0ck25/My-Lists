@@ -3033,13 +3033,13 @@ ${seoHeadHtml}
   </header>
 
   <!-- Top Tab Bar (Desktop View) -->
-  <div class="tab-bar" role="tablist">
-    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
-    <button type="button" class="tab-btn" data-tab="channels" onclick="switchTab('channels')">Channels</button>
-    <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
-    <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
-    <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  <div class="tab-bar" role="tablist" aria-label="Main navigation">
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')">Channels</button>
+    <button type="button" class="tab-btn active" role="tab" id="tab-desktop-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')">Discover</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')">Search</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')">Settings</button>
   </div>
 
   <!-- Unsaved Changes Floating Banner -->
@@ -3050,13 +3050,13 @@ ${seoHeadHtml}
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->
   <nav class="bottom-nav" role="tablist" aria-label="Main navigation">
-    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')" title="Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
@@ -3064,27 +3064,27 @@ ${seoHeadHtml}
       </svg>
       Lists
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="channels" onclick="switchTab('channels')" title="Channels">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')" title="Channels">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>
         <polyline points="17 2 12 7 7 2"></polyline>
       </svg>
       Channels
     </button>
-    <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
+    <button type="button" class="bottom-nav-item active" role="tab" id="tab-mobile-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect>
         <rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect>
       </svg>
       Discover
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="search" onclick="switchTab('search')" title="Search">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')" title="Search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
       Search
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="settings" onclick="switchTab('settings')" title="Settings">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')" title="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"></circle>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -3130,7 +3130,7 @@ ${seoHeadHtml}
   </script>
 
   <!-- Action Notification Toast -->
-  <div id="actionToast" class="action-toast"></div>
+  <div id="actionToast" class="action-toast" role="status" aria-live="polite"></div>
 
   <!-- List Details page ("See All" full list view) -->
   <div class="tab-panel list-details-page" data-tab-panel="list-details" id="content-list-details" hidden>
@@ -3195,16 +3195,16 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="createListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
-        <button type="button" class="modal-close-x" onclick="document.getElementById('createListModal').style.display = 'none';">&#x2715;</button>
+        <button type="button" class="modal-close-x" onclick="closeCreateListModal()">&#x2715;</button>
       </div>
 
       <div style="margin-bottom: 12px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Destination</label>
-        <select id="createListModalDestination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
+        <select id="createListModalDestination" aria-label="Destination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
           <option value="custom">Custom List</option>
           <option value="trakt">Trakt List</option>
           <option value="tmdb">TMDB List</option>
@@ -3225,7 +3225,7 @@ ${seoHeadHtml}
       
       <div style="margin-bottom: 14px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Content Type</label>
-        <select id="createListModalType" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
+        <select id="createListModalType" aria-label="Content type" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
           <option value="mixed">Mixed (Movies &amp; Shows)</option>
@@ -3241,14 +3241,14 @@ ${seoHeadHtml}
       </div>
       
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
+        <button type="button" class="lc-btn secondary" onclick="closeCreateListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="createListModalBtn" style="opacity: 0.5; min-width: 80px;" disabled onclick="submitCreateListModal()">Create</button>
       </div>
     </div>
   </div>
 
   <!-- Add Catalog Modal -->
-  <div id="addShelfModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
@@ -3263,7 +3263,7 @@ ${seoHeadHtml}
         
         <button type="button" class="lc-btn secondary" style="width: 100%; margin-bottom: 12px; font-size: 0.9rem;" onclick="addShelfModalAddLink()">+ Add another link (Combined List)</button>
         
-        <select id="addShelfModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
+        <select id="addShelfModalType" aria-label="Catalog type" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
         </select>
@@ -3276,7 +3276,7 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
       <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
         <div>
@@ -3289,14 +3289,14 @@ ${seoHeadHtml}
         <!-- Filled dynamically -->
       </div>
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="document.getElementById('selectListModal').style.display = 'none'; document.body.style.overflow = '';">Cancel</button>
+        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="closeSelectListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="addSelectedListsBtn" style="min-width: 90px;">Done</button>
       </div>
     </div>
   </div>
 
   <!-- Trakt Device Activation Modal -->
-  <div id="traktDeviceModal" class="modal-overlay" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
     <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>

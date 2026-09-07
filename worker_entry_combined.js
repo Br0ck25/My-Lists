@@ -6757,10 +6757,15 @@ async function renderAdminDashboard(env) {
   <h1>Admin Dashboard</h1>
   <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
 
-  <div class="admin-main-tab-bar" role="tablist">
-    <button type="button" class="admin-main-tab-btn active" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
-    <button type="button" class="admin-main-tab-btn" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
+  <!-- Not a tablist: these three buttons do not reveal panels, they choose
+       which row of sub-tabs is shown, and it is the sub-tab that selects
+       content. role="tablist" with nothing inside it carrying role="tab"
+       told assistive technology to expect tabs and hand it none, so this
+       is a labelled group of toggle buttons, which is what it is. -->
+  <div class="admin-main-tab-bar" role="group" aria-label="Dashboard sections">
+    <button type="button" class="admin-main-tab-btn active" aria-pressed="true" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
   </div>
 
   <div class="admin-subnav-bar" id="adminSubnavOverview">
@@ -7086,7 +7091,11 @@ async function renderAdminDashboard(env) {
     };
 
     function switchAdminMainTab(catId) {
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === catId));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === catId;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + catId.charAt(0).toUpperCase() + catId.slice(1)) ? 'flex' : 'none';
       });
@@ -7108,7 +7117,11 @@ async function renderAdminDashboard(env) {
       if (updateUrl && history.replaceState) {
         history.replaceState(null, '', '#' + tabId);
       }
-      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.mainTab === cat));
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === cat;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
       document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
         bar.style.display = bar.id === ('adminSubnav' + cat.charAt(0).toUpperCase() + cat.slice(1)) ? 'flex' : 'none';
       });
@@ -16636,13 +16649,13 @@ ${seoHeadHtml}
   </header>
 
   <!-- Top Tab Bar (Desktop View) -->
-  <div class="tab-bar" role="tablist">
-    <button type="button" class="tab-btn" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
-    <button type="button" class="tab-btn" data-tab="lists" onclick="switchTab('lists')">Lists</button>
-    <button type="button" class="tab-btn" data-tab="channels" onclick="switchTab('channels')">Channels</button>
-    <button type="button" class="tab-btn active" data-tab="discover" onclick="switchTab('discover')">Discover</button>
-    <button type="button" class="tab-btn" data-tab="search" onclick="switchTab('search')">Search</button>
-    <button type="button" class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  <div class="tab-bar" role="tablist" aria-label="Main navigation">
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')">Catalogs</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')">Lists</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')">Channels</button>
+    <button type="button" class="tab-btn active" role="tab" id="tab-desktop-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')">Discover</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')">Search</button>
+    <button type="button" class="tab-btn" role="tab" id="tab-desktop-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')">Settings</button>
   </div>
 
   <!-- Unsaved Changes Floating Banner -->
@@ -16653,13 +16666,13 @@ ${seoHeadHtml}
 
   <!-- Bottom Nav Bar (Mobile View - Persistent Glassmorphism) -->
   <nav class="bottom-nav" role="tablist" aria-label="Main navigation">
-    <button type="button" class="bottom-nav-item" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-catalogs" aria-controls="content-catalogs" aria-selected="false" tabindex="-1" data-tab="catalogs" onclick="switchTab('catalogs')" title="Catalogs">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
       </svg>
       Catalogs
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="lists" onclick="switchTab('lists')" title="Lists">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-lists" aria-controls="content-lists" aria-selected="false" tabindex="-1" data-tab="lists" onclick="switchTab('lists')" title="Lists">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line>
         <line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line>
@@ -16667,27 +16680,27 @@ ${seoHeadHtml}
       </svg>
       Lists
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="channels" onclick="switchTab('channels')" title="Channels">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-channels" aria-controls="content-channels" aria-selected="false" tabindex="-1" data-tab="channels" onclick="switchTab('channels')" title="Channels">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="7" width="20" height="15" rx="2" ry="2"></rect>
         <polyline points="17 2 12 7 7 2"></polyline>
       </svg>
       Channels
     </button>
-    <button type="button" class="bottom-nav-item active" data-tab="discover" onclick="switchTab('discover')" title="Discover">
+    <button type="button" class="bottom-nav-item active" role="tab" id="tab-mobile-discover" aria-controls="content-discover" aria-selected="true" tabindex="0" data-tab="discover" onclick="switchTab('discover')" title="Discover">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect>
         <rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect>
       </svg>
       Discover
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="search" onclick="switchTab('search')" title="Search">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-search" aria-controls="content-search" aria-selected="false" tabindex="-1" data-tab="search" onclick="switchTab('search')" title="Search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
       Search
     </button>
-    <button type="button" class="bottom-nav-item" data-tab="settings" onclick="switchTab('settings')" title="Settings">
+    <button type="button" class="bottom-nav-item" role="tab" id="tab-mobile-settings" aria-controls="content-settings" aria-selected="false" tabindex="-1" data-tab="settings" onclick="switchTab('settings')" title="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"></circle>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -16733,7 +16746,7 @@ ${seoHeadHtml}
   </script>
 
   <!-- Action Notification Toast -->
-  <div id="actionToast" class="action-toast"></div>
+  <div id="actionToast" class="action-toast" role="status" aria-live="polite"></div>
 
   <!-- List Details page ("See All" full list view) -->
   <div class="tab-panel list-details-page" data-tab-panel="list-details" id="content-list-details" hidden>
@@ -16798,16 +16811,16 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="createListModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
-        <button type="button" class="modal-close-x" onclick="document.getElementById('createListModal').style.display = 'none';">&#x2715;</button>
+        <button type="button" class="modal-close-x" onclick="closeCreateListModal()">&#x2715;</button>
       </div>
 
       <div style="margin-bottom: 12px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Destination</label>
-        <select id="createListModalDestination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
+        <select id="createListModalDestination" aria-label="Destination" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;" onchange="onChangeCreateListDestination()">
           <option value="custom">Custom List</option>
           <option value="trakt">Trakt List</option>
           <option value="tmdb">TMDB List</option>
@@ -16828,7 +16841,7 @@ ${seoHeadHtml}
       
       <div style="margin-bottom: 14px;">
         <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase;">Content Type</label>
-        <select id="createListModalType" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
+        <select id="createListModalType" aria-label="Content type" style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:0.95rem;">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
           <option value="mixed">Mixed (Movies &amp; Shows)</option>
@@ -16844,14 +16857,14 @@ ${seoHeadHtml}
       </div>
       
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" onclick="document.getElementById('createListModal').style.display = 'none'">Cancel</button>
+        <button type="button" class="lc-btn secondary" onclick="closeCreateListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="createListModalBtn" style="opacity: 0.5; min-width: 80px;" disabled onclick="submitCreateListModal()">Create</button>
       </div>
     </div>
   </div>
 
   <!-- Add Catalog Modal -->
-  <div id="addShelfModal" class="modal-overlay" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
@@ -16866,7 +16879,7 @@ ${seoHeadHtml}
         
         <button type="button" class="lc-btn secondary" style="width: 100%; margin-bottom: 12px; font-size: 0.9rem;" onclick="addShelfModalAddLink()">+ Add another link (Combined List)</button>
         
-        <select id="addShelfModalType" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
+        <select id="addShelfModalType" aria-label="Catalog type" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem; margin-bottom:12px;" onchange="validateAddShelfModal()">
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
         </select>
@@ -16879,7 +16892,7 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
       <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
         <div>
@@ -16892,14 +16905,14 @@ ${seoHeadHtml}
         <!-- Filled dynamically -->
       </div>
       <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px;">
-        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="document.getElementById('selectListModal').style.display = 'none'; document.body.style.overflow = '';">Cancel</button>
+        <button type="button" class="lc-btn secondary" id="selectListModalCancelBtn" onclick="closeSelectListModal()">Cancel</button>
         <button type="button" class="lc-btn primary" id="addSelectedListsBtn" style="min-width: 90px;">Done</button>
       </div>
     </div>
   </div>
 
   <!-- Trakt Device Activation Modal -->
-  <div id="traktDeviceModal" class="modal-overlay" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
     <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
@@ -16945,7 +16958,7 @@ if ('serviceWorker' in navigator) {
 }
 </script>
 
-<div class="tab-panel" data-tab-panel="catalogs" hidden>
+<div class="tab-panel" data-tab-panel="catalogs" id="content-catalogs" role="tabpanel" aria-labelledby="tab-desktop-catalogs" hidden>
   <!-- Top Submenu Pills for Catalogs -->
   <div class="subnav-pills-bar" id="catalogsFilterBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="switchCatalogsSubmenu('all', this)"><span class="check-icon">&#x2713;</span> My Catalogs</button>
@@ -16967,7 +16980,7 @@ if ('serviceWorker' in navigator) {
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
       <input type="text" id="listFilterInput" placeholder="Filter catalogs by name..." oninput="filterLists()">
-      <select id="listGroupFilterSelect" onchange="filterLists()" style="flex:none; width:auto;">
+      <select id="listGroupFilterSelect" aria-label="Filter catalogs by group" onchange="filterLists()" style="flex:none; width:auto;">
         <option value="">All groups</option>
       </select>
     </div>
@@ -17116,7 +17129,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<div class="tab-panel" data-tab-panel="discover">
+<div class="tab-panel" data-tab-panel="discover" id="content-discover" role="tabpanel" aria-labelledby="tab-desktop-discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
@@ -17188,7 +17201,7 @@ if ('serviceWorker' in navigator) {
     <div id="curatedListsFeed"></div>
   </div>
 </div>
-<div class="tab-panel" data-tab-panel="lists" hidden>
+<div class="tab-panel" data-tab-panel="lists" id="content-lists" role="tabpanel" aria-labelledby="tab-desktop-lists" hidden>
   <!-- Top Submenu Pills for Lists -->
   <div class="subnav-pills-bar" id="listsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="my-lists" onclick="switchListsSubmenu('my-lists', this)"><span class="check-icon">&#x2713;</span> My Lists</button>
@@ -17343,7 +17356,7 @@ if ('serviceWorker' in navigator) {
 
 
 </div>
-<div class="tab-panel" data-tab-panel="channels" hidden>
+<div class="tab-panel" data-tab-panel="channels" id="content-channels" role="tabpanel" aria-labelledby="tab-desktop-channels" hidden>
   <!-- Top Submenu Pills for Channels -->
   <div class="subnav-pills-bar" id="channelsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
@@ -17533,7 +17546,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<div class="tab-panel" data-tab-panel="search" hidden>
+<div class="tab-panel" data-tab-panel="search" id="content-search" role="tabpanel" aria-labelledby="tab-desktop-search" hidden>
   <div class="panel">
     <div class="shelf-header" style="margin-bottom:10px;">
       <h2 class="shelf-title">Search Movies, TV Shows &amp; Lists</h2>
@@ -17553,7 +17566,7 @@ if ('serviceWorker' in navigator) {
 
     <!-- Quick Filter Dropdowns for Movies & Shows -->
     <div id="catalogSearchFiltersRow" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center;">
-      <select id="catalogSearchGenreSelect" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchGenreSelect" aria-label="Filter by genre" onchange="applySearchFilters()" style="flex:1; min-width:130px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Genres</option>
         <option value="28,10759">Action &amp; Adventure</option>
         <option value="16">Animation</option>
@@ -17573,7 +17586,7 @@ if ('serviceWorker' in navigator) {
         <option value="37">Western</option>
       </select>
 
-      <select id="catalogSearchYearSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchYearSelect" aria-label="Filter by year" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Years</option>
         <option value="2026">2026</option>
         <option value="2025">2025</option>
@@ -17586,7 +17599,7 @@ if ('serviceWorker' in navigator) {
         <option value="<1990">1980s &amp; Older</option>
       </select>
 
-      <select id="catalogSearchRatingSelect" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <select id="catalogSearchRatingSelect" aria-label="Filter by minimum rating" onchange="applySearchFilters()" style="flex:1; min-width:115px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
         <option value="">All Ratings</option>
         <option value="8.0">8.0+ ⭐</option>
         <option value="7.0">7.0+ ⭐</option>
@@ -17600,7 +17613,7 @@ if ('serviceWorker' in navigator) {
     <div id="catalogSearchResult" style="margin-top:14px;"></div>
   </div>
 </div>
-<div class="tab-panel" data-tab-panel="settings" hidden>
+<div class="tab-panel" data-tab-panel="settings" id="content-settings" role="tabpanel" aria-labelledby="tab-desktop-settings" hidden>
   <!-- Settings Top Submenu Pills -->
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="account" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
@@ -17622,7 +17635,7 @@ if ('serviceWorker' in navigator) {
       </div>
       <div class="actions" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('presetFileInput').click()">Upload preset file</button>
-        <input type="file" id="presetFileInput" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
+        <input type="file" id="presetFileInput" aria-label="Choose a preset file to upload" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
       </div>
       <div id="presetsList" style="margin-top:10px;"></div>
     </div>
@@ -17636,7 +17649,7 @@ if ('serviceWorker' in navigator) {
         <button type="button" class="secondary lc-btn" onclick="importConfigJson()">Import JSON</button>
         <button type="button" class="secondary lc-btn" onclick="downloadConfigJson()">Download file</button>
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('configFileInput').click()">Upload file</button>
-        <input type="file" id="configFileInput" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
+        <input type="file" id="configFileInput" aria-label="Choose a backup file to restore" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
       </div>
 
       <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
@@ -17702,7 +17715,7 @@ if ('serviceWorker' in navigator) {
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Region</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
-      <select id="regionSelect" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+      <select id="regionSelect" aria-label="Streaming region" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
         ${buildRegionOptionsHtml(initialRegion)}
       </select>
     </div>
@@ -17984,7 +17997,7 @@ if ('serviceWorker' in navigator) {
         <label style="display:block; font-weight:600; font-size:0.88rem; margin-bottom:6px; color:var(--text);">Select file(s)</label>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <button type="button" class="secondary lc-btn" onclick="document.getElementById('unifiedImportFileInput').click()" style="padding:8px 16px;">Select files&hellip;</button>
-          <input type="file" id="unifiedImportFileInput" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
+          <input type="file" id="unifiedImportFileInput" aria-label="Choose a file to import" multiple accept=".csv,.json,.zip,.txt" style="display:none;" onchange="onUnifiedImportFilesSelected(this)">
           <span id="unifiedImportSelectedCount" style="font-size:0.85rem; color:var(--muted);">No files selected</span>
         </div>
       </div>
@@ -18035,7 +18048,7 @@ if ('serviceWorker' in navigator) {
       <div id="newFeedbackFormWrap">
         <div class="row">
           <label style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:2px;">Category</label>
-          <select id="feedbackCategorySelect">
+          <select id="feedbackCategorySelect" aria-label="Feedback category">
             <option value="bug">Bug Report</option>
             <option value="improvement">Improvement / Feature Request</option>
             <option value="idea">Idea / Suggestion</option>
@@ -18685,6 +18698,35 @@ async function decompressBase64ToJson(b64) {
 }
 
 // --- Tab & Submenu Navigation ---------------------------------------------
+// Arrow-key movement inside the two tab bars.
+//
+// role="tablist" was on both bars from the start, with no role="tab" beneath
+// it -- so assistive technology was told to expect tabs and found none. Adding
+// the roles without the keyboard behaviour they imply would be its own half
+// measure: a tablist is one tab stop, and the arrows move between the tabs.
+function handleTabBarKeydown(e) {
+  const btn = e.target && e.target.closest ? e.target.closest('.tab-btn, .bottom-nav-item') : null;
+  if (!btn) return;
+  const bar = btn.closest('[role="tablist"]');
+  if (!bar) return;
+  const tabs = [...bar.querySelectorAll('[role="tab"]')];
+  const i = tabs.indexOf(btn);
+  if (i === -1) return;
+  let next = -1;
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (i + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (i - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') next = 0;
+  else if (e.key === 'End') next = tabs.length - 1;
+  if (next === -1) return;
+  e.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleTabBarKeydown);
+}
+
 function switchTab(name) {
   if (name === 'backup') {
     switchTab('settings');
@@ -18726,15 +18768,25 @@ function switchTab(name) {
     const p = panels[i];
     p.hidden = (p.getAttribute('data-tab-panel') !== name);
   }
+  // aria-selected alongside the class, and a roving tabindex, because both bars
+  // declare role="tablist" and their buttons now carry role="tab". A tab widget
+  // is one stop in the page's tab order; the arrow keys move within it (see
+  // handleTabBarKeydown).
   const tabBtns = document.querySelectorAll('.tab-btn');
   for (let i = 0; i < tabBtns.length; i++) {
     const b = tabBtns[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
   const navItems = document.querySelectorAll('.bottom-nav-item');
   for (let i = 0; i < navItems.length; i++) {
     const b = navItems[i];
-    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+    const on = b.getAttribute('data-tab') === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.setAttribute('tabindex', on ? '0' : '-1');
   }
 
   if (name !== 'list-details' && name !== 'item-details') {
@@ -18869,6 +18921,10 @@ function showAddedToast(msg) {
     toast = document.createElement('div');
     toast.id = 'actionToast';
     toast.className = 'action-toast';
+    // Matches the static #actionToast in 09_page-shell.js, which is the copy
+    // that normally exists; this branch only runs if that one is missing.
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
     document.body.appendChild(toast);
   }
   toast.textContent = msg || 'Added to My Catalogs \u2713';
@@ -18917,21 +18973,192 @@ function resolveMissingPostersInDom(rootEl) {
   });
 }
 
+// Locking the page behind a modal.
+//
+// Every caller used to set document.body.style.overflow = 'hidden', and it has
+// never done anything. html { overflow-x: hidden } (09_page-shell.js) gives the
+// root element an explicit overflow-y of auto -- a non-visible value on one axis
+// computes the other from visible to auto -- and once <html> has its own
+// overflow, the body's stops propagating to the viewport. Measured: with a modal
+// open and body.style.overflow === 'hidden', a wheel event over the backdrop
+// still scrolled the page 900px.
+//
+// So the lock goes on the element that actually scrolls. The scrollbar it
+// removes would shift the layout, hence the compensating padding; the scroll
+// position is restored because setting overflow on <html> does not preserve it
+// the way body's did on browsers where body's had an effect.
+//
+// Counted, not boolean: two overlays can be open at once (a confirm raised from
+// a dialog), and the inner one closing must not unlock the page under the outer.
+let _scrollLockDepth = 0;
+let _scrollLockY = 0;
+
+function lockBackgroundScroll(on) {
+  const root = document.documentElement;
+  if (!root || !root.style) return;
+  if (on) {
+    _scrollLockDepth++;
+    if (_scrollLockDepth > 1) return;
+    _scrollLockY = window.pageYOffset || root.scrollTop || 0;
+    const barWidth = window.innerWidth - root.clientWidth;
+    root.style.overflow = 'hidden';
+    if (barWidth > 0) root.style.paddingRight = barWidth + 'px';
+    return;
+  }
+  if (_scrollLockDepth === 0) return;
+  _scrollLockDepth--;
+  if (_scrollLockDepth > 0) return;
+  root.style.overflow = '';
+  root.style.paddingRight = '';
+  window.scrollTo(0, _scrollLockY);
+}
+
+// Where the keyboard was, so it can be put back. A modal that steals focus and
+// never returns it leaves a keyboard or screen-reader user at the top of the
+// document with no idea what happened.
+let _modalReturnFocus = null;
+
+function focusableInModal(overlay) {
+  return [...overlay.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+// Escape, Tab and focus for every dynamic modal at once. There was none of
+// this: measured, Escape closed nothing, focus never entered the dialog, and
+// Tab from inside walked straight out into the page behind it.
+function handleModalKeydown(e) {
+  const overlay = document.getElementById('activeModalOverlay');
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeModal();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) {
+    // Nothing to move to, so keep the keyboard inside rather than letting it
+    // wander into the page the dialog is covering.
+    e.preventDefault();
+    return;
+  }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// Escape and focus for the four modals that predate showModal.
+//
+// createListModal, addShelfModal, selectListModal and traktDeviceModal are
+// static markup toggled with style.display, so none of showModal's handling
+// reached them: measured, Escape closed nothing and focus never entered any of
+// them. Rather than convert four dialogs to showModal -- which would mean
+// rebuilding markup that works -- this gives them the same three behaviours
+// from the outside.
+const STATIC_MODALS = [
+  { id: 'createListModal', close: 'closeCreateListModal' },
+  { id: 'selectListModal', close: 'closeSelectListModal' },
+  { id: 'addShelfModal', close: null },
+  { id: 'traktDeviceModal', close: 'closeTraktDeviceModal' },
+];
+
+function visibleStaticModal() {
+  for (let i = STATIC_MODALS.length - 1; i >= 0; i--) {
+    const el = document.getElementById(STATIC_MODALS[i].id);
+    if (el && el.style.display && el.style.display !== 'none') return STATIC_MODALS[i];
+  }
+  return null;
+}
+
+function closeStaticModal(entry) {
+  if (!entry) return;
+  if (entry.close && typeof window[entry.close] === 'function') {
+    window[entry.close]();
+    return;
+  }
+  const el = document.getElementById(entry.id);
+  if (el) el.style.display = 'none';
+  lockBackgroundScroll(false);
+}
+
+function handleStaticModalKeydown(e) {
+  // The dynamic overlay sits on top when both are open, and has its own
+  // handler -- leave it to that one.
+  if (document.getElementById('activeModalOverlay')) return;
+  const entry = visibleStaticModal();
+  if (!entry) return;
+  const overlay = document.getElementById(entry.id);
+  if (!overlay) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeStaticModal(entry);
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const items = focusableInModal(overlay);
+  if (!items.length) { e.preventDefault(); return; }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || !overlay.contains(active))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !overlay.contains(active))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', handleStaticModalKeydown, true);
+}
+
 function showModal(innerHtml, extraClass) {
   closeModal();
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.id = 'activeModalOverlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.innerHTML = '<div class="modal-card' + (extraClass ? ' ' + extraClass : '') + '">' + innerHtml + '</div>';
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) closeModal();
   });
+  _modalReturnFocus = (document.activeElement && document.activeElement !== document.body)
+    ? document.activeElement
+    : null;
   document.body.appendChild(overlay);
+  document.addEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(true);
+  // The heading first when there is one, so a screen reader announces what
+  // this dialog is before naming its buttons; otherwise the first control.
+  const items = focusableInModal(overlay);
+  const heading = overlay.querySelector('h2, h3');
+  if (heading) {
+    heading.setAttribute('tabindex', '-1');
+    heading.focus();
+  } else if (items.length) {
+    items[0].focus();
+  }
 }
 
 function closeModal() {
   const existing = document.getElementById('activeModalOverlay');
   if (existing) existing.remove();
+  document.removeEventListener('keydown', handleModalKeydown, true);
+  lockBackgroundScroll(false);
+  if (_modalReturnFocus && typeof _modalReturnFocus.focus === 'function') {
+    try { _modalReturnFocus.focus(); } catch (e) {}
+  }
+  _modalReturnFocus = null;
 }
 
 function showAppAlert(title, message, isSuccess = false) {
@@ -20109,7 +20336,7 @@ function addRow(name, url, type, enabled, group, channelId) {
             '<input type="text" placeholder="Name (e.g. Trending Movies)" class="name" value="' + escapeAttr(name || '') + '">' +
           '</div>' +
           '<div class="entry-type-row" style="width: auto;">' +
-            '<select class="type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
+            '<select class="type" aria-label="Catalog type" ' + ((isChannel || isCustomList) ? 'disabled title="Type is fixed for this list kind"' : '') + '>' +
               '<option value="movie" ' + ((type === 'movie' || (isCustomList && type === 'movie')) ? 'selected' : '') + '>Movies</option>' +
               '<option value="series" ' + ((type === 'series' || isChannel || (isCustomList && type === 'series')) ? 'selected' : '') + '>Shows</option>' +
             '</select>' +
@@ -26834,6 +27061,23 @@ function removeSingleCustomItemDirect(listIdx, id, type, btn) {
   showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
 }
 
+// One way out of the Add/Remove-from-Lists modal.
+//
+// It had four, and they did not agree. The "+ Create New List" button hid the
+// modal without releasing the scroll lock while the link eleven lines below it
+// did, and neither of createListModal's own Cancel and X buttons released it
+// either -- so that route left the lock latched with no modal on screen. It was
+// invisible only because the lock itself did nothing (see lockBackgroundScroll);
+// fixing that without this would have turned it into a page you cannot scroll
+// until you reload.
+function closeSelectListModal() {
+  const modal = document.getElementById('selectListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeSelectListModal = closeSelectListModal;
+
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
@@ -27107,7 +27351,7 @@ function openSelectListModal(id, type, title, poster) {
 
   if (html) {
     html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
-      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="closeSelectListModal(); openCreateListModal();">+ Create New List</button>' +
     '</div>';
   }
 
@@ -27120,8 +27364,7 @@ function openSelectListModal(id, type, title, poster) {
       if (lnk) {
         lnk.onclick = function(e) {
           e.preventDefault();
-          document.getElementById('selectListModal').style.display = 'none';
-          document.body.style.overflow = '';
+          closeSelectListModal();
           if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
@@ -27132,7 +27375,7 @@ function openSelectListModal(id, type, title, poster) {
   
   body.innerHTML = html;
   modal.style.display = 'flex';
-  document.body.style.overflow = 'hidden';
+  lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {
@@ -27264,8 +27507,7 @@ function openSelectListModal(id, type, title, poster) {
 
 document.getElementById('selectListModal').addEventListener('click', (e) => {
   if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-    document.getElementById('selectListModal').style.display = 'none';
-    document.body.style.overflow = '';
+    closeSelectListModal();
   }
 });
 
@@ -27387,8 +27629,7 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
     })).then((r) => r.filter(Boolean));
   }
   
-  document.getElementById('selectListModal').style.display = 'none';
-  document.body.style.overflow = '';
+  closeSelectListModal();
   
   btn.disabled = false;
   btn.textContent = 'Done';
@@ -42178,6 +42419,17 @@ document.addEventListener('dragover', (e) => {
 document.getElementById('lists').addEventListener('input', saveState);
 document.getElementById('lists').addEventListener('change', saveState);
 
+// The createListModal counterpart of closeSelectListModal. Its X and Cancel
+// buttons hid the modal and released nothing, which was the other half of the
+// latched scroll lock.
+function closeCreateListModal() {
+  const modal = document.getElementById('createListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeCreateListModal = closeCreateListModal;
+
 function openCreateListModal(presetDestination) {
   const destEl = document.getElementById('createListModalDestination');
   if (destEl) {
@@ -42221,6 +42473,7 @@ function openCreateListModal(presetDestination) {
   }
   const modal = document.getElementById('createListModal');
   if (modal) modal.style.display = 'flex';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 
@@ -42444,7 +42697,7 @@ async function submitCreateListModal() {
     }
 
     saveState();
-    document.getElementById('createListModal').style.display = 'none';
+    closeCreateListModal();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
     if (currentPendingItem && currentPendingItem.title) {

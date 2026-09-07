@@ -2367,6 +2367,23 @@ function removeSingleCustomItemDirect(listIdx, id, type, btn) {
   showAddedToast('Removed from ' + (list.name || 'Custom List') + '.');
 }
 
+// One way out of the Add/Remove-from-Lists modal.
+//
+// It had four, and they did not agree. The "+ Create New List" button hid the
+// modal without releasing the scroll lock while the link eleven lines below it
+// did, and neither of createListModal's own Cancel and X buttons released it
+// either -- so that route left the lock latched with no modal on screen. It was
+// invisible only because the lock itself did nothing (see lockBackgroundScroll);
+// fixing that without this would have turned it into a page you cannot scroll
+// until you reload.
+function closeSelectListModal() {
+  const modal = document.getElementById('selectListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeSelectListModal = closeSelectListModal;
+
 function openSelectListModal(id, type, title, poster) {
   const modal = document.getElementById('selectListModal');
   const body = document.getElementById('selectListModalBody');
@@ -2640,7 +2657,7 @@ function openSelectListModal(id, type, title, poster) {
 
   if (html) {
     html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); text-align: center;">' +
-      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="document.getElementById(&quot;selectListModal&quot;).style.display=&quot;none&quot;; openCreateListModal();">+ Create New List</button>' +
+      '<button type="button" class="lc-btn secondary" style="width:100%; font-size:0.9rem;" onclick="closeSelectListModal(); openCreateListModal();">+ Create New List</button>' +
     '</div>';
   }
 
@@ -2653,8 +2670,7 @@ function openSelectListModal(id, type, title, poster) {
       if (lnk) {
         lnk.onclick = function(e) {
           e.preventDefault();
-          document.getElementById('selectListModal').style.display = 'none';
-          document.body.style.overflow = '';
+          closeSelectListModal();
           if (typeof openCreateListModal === 'function') openCreateListModal();
         };
       }
@@ -2665,7 +2681,7 @@ function openSelectListModal(id, type, title, poster) {
   
   body.innerHTML = html;
   modal.style.display = 'flex';
-  document.body.style.overflow = 'hidden';
+  lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {
@@ -2797,8 +2813,7 @@ function openSelectListModal(id, type, title, poster) {
 
 document.getElementById('selectListModal').addEventListener('click', (e) => {
   if (e.target.id === 'selectListModal' || e.target.id === 'selectListModalCloseBtn') {
-    document.getElementById('selectListModal').style.display = 'none';
-    document.body.style.overflow = '';
+    closeSelectListModal();
   }
 });
 
@@ -2920,8 +2935,7 @@ document.getElementById('addSelectedListsBtn').addEventListener('click', async (
     })).then((r) => r.filter(Boolean));
   }
   
-  document.getElementById('selectListModal').style.display = 'none';
-  document.body.style.overflow = '';
+  closeSelectListModal();
   
   btn.disabled = false;
   btn.textContent = 'Done';

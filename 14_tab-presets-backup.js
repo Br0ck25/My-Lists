@@ -1,4 +1,4 @@
-<div class="tab-panel" data-tab-panel="settings" hidden>
+<div class="tab-panel" data-tab-panel="settings" id="content-settings" role="tabpanel" aria-labelledby="tab-desktop-settings" hidden>
   <!-- Settings Top Submenu Pills -->
   <div class="subnav-pills-bar" id="settingsSubnavBar">
     <button type="button" class="subnav-pill active" data-sub="account" onclick="switchSettingsSubmenu('account', this)"><span class="check-icon">&#x2713;</span> Account &amp; Sync</button>
@@ -20,7 +20,7 @@
       </div>
       <div class="actions" style="margin-top:8px;">
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('presetFileInput').click()">Upload preset file</button>
-        <input type="file" id="presetFileInput" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
+        <input type="file" id="presetFileInput" aria-label="Choose a preset file to upload" accept="application/json,.json" style="display:none;" onchange="uploadPresetFile(this)">
       </div>
       <div id="presetsList" style="margin-top:10px;"></div>
     </div>
@@ -34,7 +34,7 @@
         <button type="button" class="secondary lc-btn" onclick="importConfigJson()">Import JSON</button>
         <button type="button" class="secondary lc-btn" onclick="downloadConfigJson()">Download file</button>
         <button type="button" class="secondary lc-btn" onclick="document.getElementById('configFileInput').click()">Upload file</button>
-        <input type="file" id="configFileInput" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
+        <input type="file" id="configFileInput" aria-label="Choose a backup file to restore" accept="application/json,.json" style="display:none;" onchange="uploadConfigFile(this)">
       </div>
 
       <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
