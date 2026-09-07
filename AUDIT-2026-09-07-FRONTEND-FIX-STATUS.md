@@ -31,10 +31,10 @@ Suite: **308 tests, 307 passing, 1 skipped** (network-gated), up from 286/285.
 | **FE-11** | `role="tablist"` containing no tabs | MEDIUM | ✅ | `53ac761` |
 | **FE-08** | Modal scroll lock has never worked | MEDIUM | ✅ | `53ac761` |
 | **FE-12** | One modal exit leaks the scroll lock | LOW | ✅ | `53ac761` |
-| **FE-15** | No offline capability despite the README | MEDIUM | ✅ | `HEAD` |
-| **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ✅ | `HEAD` |
-| **FE-14** | "Settings" label clipped at 320px | LOW | ✅ | `HEAD` |
-| **FE-16** | Dead `renderCustomListSearchResults` | LOW | ✅ | `HEAD` |
+| **FE-15** | No offline capability despite the README | MEDIUM | ✅ | `0ab30b8` |
+| **FE-13** | Non-array `dashboardListOrder` crashes the dashboard | LOW | ✅ | `0ab30b8` |
+| **FE-14** | "Settings" label clipped at 320px | LOW | ✅ | `0ab30b8` |
+| **FE-16** | Dead `renderCustomListSearchResults` | LOW | ✅ | `0ab30b8` |
 
 Nothing from the report is left open.
 
