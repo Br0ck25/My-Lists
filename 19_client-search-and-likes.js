@@ -3197,6 +3197,77 @@ let currentCatalogSearchType = 'movie';
 let catalogSearchDebounceTimer = null;
 window._rawCatalogTitleItems = [];
 
+// --- Keeping what the Search tab already rendered ---------------------------
+//
+// The default (empty-box) view costs a round trip, and for Lists one
+// /api/preview per card on top of that to fill its poster strip. It was
+// rebuilt from scratch every single time the tab was shown: coming back from
+// a poster, coming back from See All, coming back from any other tab, and
+// every press of the Movies / Shows / Lists chips in either direction. That
+// is the flicker -- the results visibly tore down and reloaded when nothing
+// about them had changed.
+//
+// Nothing in that view depends on when it was rendered, only on what the
+// render reads: which chip is active, what is in the search box, and the
+// three filter dropdowns. So that tuple is the key; a request to render a
+// key that is already on screen is a no-op, and the markup of the view being
+// replaced is kept so switching back is instant.
+//
+// Bounded at one entry per chip -- this is a display cache, not a history.
+window._catalogSearchViewCache = window._catalogSearchViewCache || {};
+window._catalogSearchRenderedKey = null;
+
+function catalogSearchViewKey(type) {
+  const val = (id) => (document.getElementById(id) || {}).value || '';
+  return [
+    type || currentCatalogSearchType,
+    val('catalogSearchInput').trim().toLowerCase(),
+    val('catalogSearchGenreSelect'),
+    val('catalogSearchYearSelect'),
+    val('catalogSearchRatingSelect'),
+  ].join('|');
+}
+
+function markCatalogSearchRendered() {
+  window._catalogSearchRenderedKey = catalogSearchViewKey();
+}
+
+function stashCatalogSearchView() {
+  const key = window._catalogSearchRenderedKey;
+  const resEl = document.getElementById('catalogSearchResult');
+  if (!key || !resEl) return;
+  // A poster strip that has not come back yet still carries
+  // .poster-preview-slot (populateSearchResultPosters drops the class as it
+  // fills each one). Snapshotting mid-flight would freeze those cards empty
+  // forever, because that filler runs document-wide and cannot be re-aimed at
+  // one restored view -- so a half-loaded render simply is not kept, and the
+  // next visit renders it fresh exactly as it does today.
+  if (resEl.querySelector('.poster-preview-slot')) return;
+  window._catalogSearchViewCache[key.split('|')[0]] = {
+    key: key,
+    html: resEl.innerHTML,
+    raw: Array.isArray(window._rawCatalogTitleItems) ? window._rawCatalogTitleItems : [],
+  };
+}
+
+function restoreCatalogSearchView(key) {
+  const entry = window._catalogSearchViewCache[key.split('|')[0]];
+  const resEl = document.getElementById('catalogSearchResult');
+  if (!entry || !resEl || entry.key !== key) return false;
+  resEl.innerHTML = entry.html;
+  window._rawCatalogTitleItems = entry.raw;
+  window._catalogSearchRenderedKey = key;
+  return true;
+}
+
+// True when the view the current controls describe is already on screen, so
+// re-rendering it would only make it flicker.
+function catalogSearchViewIsCurrent() {
+  const resEl = document.getElementById('catalogSearchResult');
+  return !!(resEl && resEl.childElementCount &&
+    window._catalogSearchRenderedKey === catalogSearchViewKey());
+}
+
 function handleCatalogSearchInput(input) {
   const q = (input ? input.value : '').trim();
   if (!q) {
@@ -3211,6 +3282,9 @@ function handleCatalogSearchInput(input) {
 }
 
 function setCatalogSearchFilter(filter, btn) {
+  // Keep the outgoing chip's rendered view before it is replaced, so coming
+  // back to it does not cost another round trip.
+  if (filter !== currentCatalogSearchType) stashCatalogSearchView();
   if (btn) {
     document.querySelectorAll('#catalogSearchTypeChips .subnav-pill').forEach(function(p) {
       p.classList.remove('active');
@@ -3293,6 +3367,7 @@ function applySearchFilters() {
   });
 
   renderTitlePosterCards(filtered, rawItems.length, resEl);
+  markCatalogSearchRendered();
 }
 
 function renderTitlePosterCards(items, totalCount, resEl) {
@@ -3342,11 +3417,19 @@ function renderTitlePosterCards(items, totalCount, resEl) {
   }
 }
 
-async function renderDefaultCatalogSearch() {
+async function renderDefaultCatalogSearch(force) {
   const resEl = document.getElementById('catalogSearchResult');
   if (!resEl) return;
   const inputEl = document.getElementById('catalogSearchInput');
   if (inputEl && inputEl.value.trim()) return;
+
+  // Already showing exactly this, or able to put it straight back -- see the
+  // view cache above. Only an explicit force (nothing calls for one today)
+  // goes back to the network.
+  if (!force) {
+    if (catalogSearchViewIsCurrent()) return;
+    if (restoreCatalogSearchView(catalogSearchViewKey())) return;
+  }
 
   // Clearing the box is itself a search -- it supersedes anything already in
   // flight. Without this, a slow response for the query the person just erased
@@ -3367,6 +3450,7 @@ async function renderDefaultCatalogSearch() {
         return;
       }
       renderListSearchResults([], [], null, pubLists, [], resEl);
+      markCatalogSearchRendered();
     } catch (e) {
       resEl.innerHTML = '<p class="testresult err">✗ Could not load public lists.</p>';
     }

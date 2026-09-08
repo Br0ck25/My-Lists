@@ -2694,7 +2694,7 @@ function renderGuidePage(origin) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <title>${title}</title>
 <meta name="description" content="${description}">
@@ -2756,6 +2756,11 @@ function renderGuidePage(origin) {
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700;800&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
+    /* Same reason as the app shell's (09_page-shell.js): an installed PWA
+       paints the status bar and the home-indicator strip from the UA's own
+       surface color, and that surface stays white until the document says
+       it is dark. This page defaults to dark, so the default says dark. */
+    color-scheme: dark;
     --bg: #000000;
     --bg-surface: #1C1C1E;
     --bg-card: #2C2C2E;
@@ -2778,6 +2783,7 @@ function renderGuidePage(origin) {
   }
 
   :root.light-theme, .light-theme {
+    color-scheme: light;
     --bg: #F2F2F7;
     --bg-surface: #FFFFFF;
     --bg-card: #E5E5EA;
@@ -2794,10 +2800,11 @@ function renderGuidePage(origin) {
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-behavior: smooth; }
+  html { scroll-behavior: smooth; background: var(--bg); }
   body {
     background: var(--bg);
     color: var(--text);
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     font-size: 16px;
     line-height: 1.65;

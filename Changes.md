@@ -1,5 +1,37 @@
 # Changes Log
 
+## 2026-09-08 - UI reports from real use: page shift, PWA bars, See All counts, Search reloads
+
+### Files Changed
+`02_http-and-creator-utils.js`, `07_source-fetchers-tmdb-simkl.js`, `09_page-shell.js`, `15_tab-settings-html.js`, `16_client-row-core.js`, `19_client-search-and-likes.js`, `24_client-backup-restore-presets.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`
+
+### Root Cause
+
+Six unrelated reports, four of which turn out to be one cause each rather than one per tab.
+
+- **Four tabs "shift the whole page to the right."** Discover > Hidden Gems, Catalogs > Bulk Add, Lists > Liked and Import, Channels > Quick Add and Import. Nothing about those four panels is special except that each is short: they fit the viewport without scrolling, the classic scrollbar disappears with them, the content box gets ~15px wider, and a `max-width` block centred with `margin: 0 auto` moves right by half of that. One cause, four symptoms.
+- **The PWA's status bar and home-indicator strip stay white in dark mode.** `<meta name="theme-color">` was already being flipped, and the page background was already black, and neither is what an installed PWA paints those strips from. It paints them from the UA's own surface, which stays light until the document declares `color-scheme: dark` — and the document had never declared a colour scheme at all. Compounding it, `viewport-fit=cover` was never set, so every `env(safe-area-inset-*)` this app writes (there are nine) evaluated to `0` and the document never reached into those strips to paint them itself.
+- **TMDB and MDBList See All says 100 until you scroll.** The fix for this shipped for Trakt and did not generalise, for two separate reasons. `fetchTmdb` (user lists, watchlist, favourites) and `fetchTmdbCollection` never reported a total in the first place. Everything that did — MDBList lists, every TMDB chart, collections — reported it by hanging `totalItems` on the returned array, and the cache serialises with `JSON.stringify`, which drops properties hung on an array. So the count survived a hit in isolate memory and vanished on a KV or edge hit, which is exactly the shape that makes a bug look intermittent rather than absent.
+- **The Search tab reloads itself.** `switchTab('search')` called `renderDefaultCatalogSearch()` unconditionally, so returning from a poster, from See All, or from any other tab tore the results down and refetched them. `setCatalogSearchFilter` did the same on every press of the Movies / Shows / Lists chips, in both directions. On the Lists chip that is a round trip plus one `/api/preview` per card.
+- **Four Settings buttons are accent blue.** Open the Guide, Buy me a coffee, Try TorBox Debrid, Import. The two `<a>`s are the interesting half: `button, .actions a` (0,1,1) outranks a bare `.lc-btn` (0,1,0), so an anchor inside `.actions` came out blue whatever modifier class it carried — which is why the TorBox link carried a hard-coded `color:#ffffff` to stay legible.
+
+### What Changed
+
+**`html { scrollbar-gutter: stable }` (`09`).** Reserved for the document, so the layout stops depending on whether the tab currently showing happens to overflow. `stable` rather than `overflow-y: scroll` so a short page does not grow a dead track; engines without it use overlay scrollbars and never had the shift. `lockBackgroundScroll` (`16`) computed its modal compensation from `window.innerWidth - root.clientWidth` *before* setting `overflow: hidden` — with a reserved gutter that is a width that may still be reserved afterwards, so it would have padded the page in the other direction. It now measures `clientWidth` across the change and pads by the difference, which is zero when the gutter stays.
+
+**`color-scheme`, a painted root canvas, and `viewport-fit=cover` (`09`, `24`).** `color-scheme: light` on `:root` and `dark` on `:root.dark-theme` is what tells the OS which surface to paint; it also brings the scrollbars, form controls and `<select>` popups along. `html` paints `var(--bg)` itself rather than relying on `body`'s background propagating, because the safe areas are outside `body`'s box. `viewport-fit=cover` makes the insets real, so `body` pays them back in padding — `calc(16px + env(safe-area-inset-top))` and `max(12px, env(safe-area-inset-left))` and their mirrors — or the header would sit under the clock and content under the notch in landscape. `apple-mobile-web-app-capable` is added alongside, because without it iOS ignores the `apple-mobile-web-app-status-bar-style` that was already there. The guide page gets the same treatment: it opens inside the installed PWA.
+
+**The item count travels beside the rows, not on them (`02`).** `fetchWithPerUserCacheUncoalesced` stores `{ data, totalItems, freshUntil }` and hangs the total back on the array on the way out, for the two durable tiers as well as the memo. Entries written before this simply have no `totalItems` key, which reads as "no total" — the state every one of them was already in. That is one fix for MDBList lists, all of the TMDB charts and TMDB collections at once, and for anything that reports a total later.
+
+**TMDB lists and collections report one (`07`).** A collection arrives whole, so `parts.length` is exact. A user list is walked page by page, and the honest answer differs by case: exact when the walk runs out of pages, exact from TMDB's `total_results` for the account watchlist/favourites endpoints (which are per-kind), and *deliberately absent* for a v4 list that has actually shown both movies and shows without being fully walked — `total_results` counts both kinds there and there is no way to split it without walking every page. That last case keeps saying "100+" and counting up, which is what it did before and is at least true.
+
+**The Search tab keeps what it rendered (`19`, `16`).** The view is keyed on everything the render reads — which chip is active, what is in the box, and the three filter dropdowns. A request to render a key already on screen is a no-op; the markup of a view about to be replaced by a chip press is kept, one entry per chip, so switching back is instant. A half-loaded Lists view is not kept: a poster strip still in flight carries `.poster-preview-slot` until `populateSearchResultPosters` fills it, and that filler runs document-wide and cannot be re-aimed at one restored view, so snapshotting mid-flight would freeze those cards empty. Such a view renders fresh, exactly as it does today.
+
+**`.lc-btn.secondary` (`09`, `15`).** A two-class rule (0,2,0) that outranks `button, .actions a`, carrying the same surface `button.secondary` already gives every Connect / Disconnect / Copy button. The four buttons move to it and the TorBox link drops its hard-coded white text and blue border.
+
+### Verification
+`bash verify.sh` — build drift, `node --check`, both scope checks, all four render passes, `FUNCTION-MAP.md` drift, and 430 tests.
+
 ## 2026-09-08 - v1.5.3: the last open items from Adversarial Audit III
 
 ### Files Changed

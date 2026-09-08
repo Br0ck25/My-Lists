@@ -1148,6 +1148,41 @@ async function fetchWithPerUserCacheAndCircuitBreaker(options) {
   }
 }
 
+// Keeping a page's real list size across the durable cache tiers.
+//
+// Several fetchers hang the source's own item count on the array of metas
+// they return -- fetchMdblist, fetchTmdbChart, fetchTmdbCollection and the
+// rest of the TMDB window fetchers all end with `res.totalItems = <n>`, and
+// /api/preview reads exactly that to tell the browser how big a list is
+// (25_api-catalog-routes.js).
+//
+// A property hung on an array does not survive JSON.stringify: `[1,2,3]`
+// serializes as `[1,2,3]`, total dropped. Two of the three cache tiers below
+// are durable and store JSON, so the count survived a hit in isolate memory
+// and vanished on a KV or edge hit -- which is worse than never having it,
+// because it made the bug look intermittent. That is what left a "See All"
+// header saying 100 items (the first page's length) for a 303-item TMDB
+// chart or MDBList list until enough scrolling had paged the rest in.
+//
+// So the total travels beside the data in the stored envelope and is hung
+// back on the array on the way out. Entries written before this shipped
+// simply have no `totalItems` key, which reads as "no total" -- the state
+// every one of them was already in.
+function cacheEnvelopeFor(data, freshUntil) {
+  const envelope = { data, freshUntil };
+  if (Array.isArray(data) && typeof data.totalItems === "number") {
+    envelope.totalItems = data.totalItems;
+  }
+  return envelope;
+}
+
+function rehydrateCachedTotal(envelope) {
+  if (envelope && typeof envelope.totalItems === "number" && Array.isArray(envelope.data)) {
+    envelope.data.totalItems = envelope.totalItems;
+  }
+  return envelope;
+}
+
 // "Empty" for the purposes of refuseEmptyOverwrite below: an array with no
 // items, or a plain object with no keys. A string, number or boolean is never
 // treated as empty -- those are real answers.
@@ -1185,7 +1220,7 @@ async function fetchWithPerUserCacheUncoalesced({
   let kvData = null;
   if (!cached && env && env.CONFIGS && kvKey) {
     try {
-      const raw = await env.CONFIGS.get(`cache:${kvKey}`, "json");
+      const raw = rehydrateCachedTotal(await env.CONFIGS.get(`cache:${kvKey}`, "json"));
       if (raw && raw.data !== undefined) {
         kvData = raw;
         setPerUserCache(cacheKey, raw.data, freshTtlSec, staleTtlSec);
@@ -1203,7 +1238,7 @@ async function fetchWithPerUserCacheUncoalesced({
     try {
       const edgeRes = await caches.default.match(edgeCacheReq);
       if (edgeRes) {
-        const raw = await edgeRes.json();
+        const raw = rehydrateCachedTotal(await edgeRes.json());
         if (raw && raw.data !== undefined) {
           edgeCacheData = raw;
           setPerUserCache(cacheKey, raw.data, freshTtlSec, staleTtlSec);
@@ -1261,10 +1296,9 @@ async function fetchWithPerUserCacheUncoalesced({
       }
       setPerUserCache(cacheKey, freshData, freshTtlSec, staleTtlSec);
       
-      const cachePayload = JSON.stringify({
-        data: freshData,
-        freshUntil: Date.now() + freshTtlSec * 1000,
-      });
+      const cachePayload = JSON.stringify(
+        cacheEnvelopeFor(freshData, Date.now() + freshTtlSec * 1000)
+      );
 
       if (env && env.CONFIGS && kvKey) {
         const p = env.CONFIGS.put(`cache:${kvKey}`, cachePayload, { expirationTtl: kvTtlSec }).catch(() => {});
