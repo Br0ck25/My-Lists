@@ -428,11 +428,39 @@ function hexToBuffer(hex) {
 }
 // Constant-time-ish comparison -- guards against a timing attack revealing
 // how many leading hex characters matched, which a plain === wouldn't.
+//
+// The early length return is deliberate and safe HERE: every caller compares
+// two values of a length fixed by construction (a PBKDF2 digest, an OAuth
+// state minted by generateShortId, an admin session signature), so the length
+// is not a secret and never varies with the input. A caller comparing a
+// secret of UNKNOWN length must use timingSafeEqualSecret below instead --
+// this one would answer from the length alone.
 function timingSafeEqualHex(a, b) {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+// The same comparison for a secret whose length is itself secret.
+//
+// ADMIN_KEY is chosen by whoever deploys this Worker, so its length is not
+// fixed by anything -- and `if (a.length !== b.length) return false` above
+// answers before the constant-time loop, which makes the length observable
+// by timing from an unauthenticated endpoint. Guessing a length is not
+// guessing a key, but it narrows the search for free and the fix costs one
+// hash.
+//
+// Both sides are digested first, so the comparison always runs over 64 hex
+// characters whatever came in, and the loop below sees no difference between
+// a one-character guess and a hundred-character one.
+async function timingSafeEqualSecret(a, b) {
+  const enc = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(a == null ? "" : a))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(b == null ? "" : b))),
+  ]);
+  return timingSafeEqualHex(bufferToHex(new Uint8Array(da)), bufferToHex(new Uint8Array(db)));
 }
 const PBKDF2_ITERATIONS = 100000;
 

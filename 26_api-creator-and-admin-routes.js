@@ -5144,7 +5144,10 @@
       } catch {
         // falls through with an empty key, which will fail the compare below
       }
-      if (!timingSafeEqualHex(submittedKey, env.ADMIN_KEY)) {
+      // Digests both sides first: ADMIN_KEY is whatever the deployer chose,
+      // so its LENGTH is a secret too, and timingSafeEqualHex answers from
+      // the length alone before its constant-time loop ever runs.
+      if (!(await timingSafeEqualSecret(submittedKey, env.ADMIN_KEY))) {
         // Failures only -- a correct key must never spend the budget that
         // protects it, or an admin who logs in often would lock themselves
         // out.

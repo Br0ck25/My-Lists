@@ -4973,6 +4973,21 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // Loads active support chat threads for a user/device
     if (path === "/api/feedback/threads" && (request.method === "POST" || request.method === "GET")) {
       if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
+      // The last piece of the thread-id finding (AUDIT-2026-09-05 §3): the id
+      // is a capability, it is now 72 bits of CSPRNG rather than 31 bits of
+      // Math.random, and this endpoint is deliberately unauthenticated for the
+      // threadIds path -- anonymous users with no account rely on it to follow
+      // up on what they filed. What it had no answer for was VOLUME: 20 ids
+      // per request, no limit, so guessing cost nothing to attempt.
+      //
+      // Generous against real use (the support panel calls this when it opens
+      // and on a manual refresh, not on a timer) and ruinous against
+      // enumeration, which needs orders of magnitude more than this to be
+      // worth starting.
+      const threadsIp = clientIpKey(request);
+      if (await consumeRateLimit(env, ctx, "feedbackthreads", threadsIp, 60)) {
+        return json({ ok: false, error: "Too many requests. Please wait a moment." }, 429, { "Cache-Control": "no-store" });
+      }
       let threadIds = [];
       let creatorName = null;
       let creatorKey = null;
@@ -5620,6 +5635,17 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // install config) that nothing ever expires or deletes. Generous
       // bucket -- regenerating an install link a few times while adjusting
       // rows is normal -- but not unlimited.
+      //
+      // No TTL on the key itself, deliberately (AUDIT-2026-09-05 top-10 §9
+      // left this open; this is the answer). The id IS somebody's install
+      // URL -- it is pasted into Stremio or wako and read on every catalog
+      // request, for as long as they keep the add-on. An expiry would break
+      // those installs silently, months later, with nothing to point at:
+      // the failure would arrive as "my lists stopped loading" from someone
+      // who had done nothing at all. So the growth is bounded at the door
+      // instead -- this per-IP limit, plus SAVED_CONFIG_ENTRIES_MAX and
+      // SAVED_CONFIG_BYTES_MAX below -- rather than by throwing away data
+      // somebody is still using.
       const saveIp = clientIpKey(request);
       if (!saveIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const saveRateKey = `ratelimit:save:${saveIp}`;
@@ -5687,10 +5713,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
     if (path === "/api/publish-list" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      // Unauthenticated, and every call mints a permanent KV key that no
-      // route in this Worker can ever delete again. Same per-IP bucket as
-      // /api/creator/create, just a little more permissive because
-      // publishing several lists in one sitting is normal.
+      // Unauthenticated, and every call mints a permanent KV key. Same
+      // per-IP bucket as /api/creator/create, just a little more permissive
+      // because publishing several lists in one sitting is normal.
+      //
+      // "that no route in this Worker can ever delete again" is what this
+      // comment used to say, and it was true until /admin/api/published-lists
+      // and /admin/api/delete-published-list (26_) gave an operator a way to
+      // browse and remove these. What is still deliberate is the absence of a
+      // TTL: the slug is a shared list URL somebody has handed to other
+      // people, and expiring it would break their link rather than free
+      // anything worth freeing. Bounded at the door instead, by this limit
+      // and PUBLISHED_LIST_ITEMS_MAX/PUBLISHED_LIST_BYTES_MAX.
       const plIp = clientIpKey(request);
       if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const plRateKey = `ratelimit:publishlist:${plIp}`;

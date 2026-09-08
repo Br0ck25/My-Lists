@@ -1,6 +1,7 @@
 # Adversarial audit harness — 2026-09-06
 
-Reproduction scripts for `AUDIT-2026-09-06-ADVERSARIAL.md` (repo root). Every
+Reproduction scripts for [`AUDIT-2026-09-06-ADVERSARIAL.md`](../../docs/history/AUDIT-2026-09-06-ADVERSARIAL.md)
+(moved to `docs/history/` once every finding in it was closed). Every
 finding in that report has a script here that demonstrates it. Nothing in this
 directory is imported by the Worker, the build, `verify.sh` or CI — `build.py`
 globs `[0-9][0-9]_*.js` at the repo root and CI runs `tests/*.test.mjs`, neither

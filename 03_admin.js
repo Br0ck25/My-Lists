@@ -80,6 +80,17 @@ async function bumpStat(env, kind) {
       await d1BumpStat(env, kind, ["total", statsToday()], 1);
       return;
     }
+    // KV path: get-then-put, so concurrent bumps lose increments
+    // (AUDIT-2026-09-05 §14). Deliberately left as it is, and recorded here
+    // rather than silently: KV has no atomic increment and no
+    // compare-and-swap, so the only correct fix is a different storage
+    // primitive -- which is exactly what the D1 branch above is
+    // (d1BumpStat's upsert is atomic, and it is the path any deployment
+    // that cares about exact counters should be on). What is lost is a
+    // display statistic under simultaneous load; nothing reads these
+    // numbers to make a decision, and no user-visible behaviour depends on
+    // one. Spending a durable object per counter on that would be the
+    // wrong trade.
     const totalKey = `stats:${kind}:total`;
     const dayKey = `stats:${kind}:${statsToday()}`;
     const [totalRaw, dayRaw] = await Promise.all([env.CONFIGS.get(totalKey), env.CONFIGS.get(dayKey)]);

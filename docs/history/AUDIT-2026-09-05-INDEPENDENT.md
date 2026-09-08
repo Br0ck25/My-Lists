@@ -312,6 +312,13 @@ CSPRNG output. Old ids keep working — only newly minted ones change — and th
 stays, because `/admin/api/feedback` relies on these keys sorting chronologically. A per-IP limit on
 `/api/feedback/threads` is still outstanding.
 
+**Resolution (2026-09-07).** Closed. `/api/feedback/threads` now spends the shared
+per-IP bucket (`consumeRateLimit`, bucket `feedbackthreads`, 60/minute) before it
+parses anything. Generous against real use — the support panel calls it when it opens
+and on a manual refresh, not on a timer — and ruinous against enumeration, which needs
+orders of magnitude more attempts than that to be worth starting against a 72-bit id.
+Regression test: the bucket is spent and answers 429, and a second IP is unaffected.
+
 ---
 
 ### 4. Any anonymous caller can write into any support thread and spoof the sender
@@ -633,12 +640,21 @@ onclick/onchange handler resolution check"*. No such step exists in `html_checks
 from inline handlers in the rendered page, **all 103 resolve** — so the check would pass today and is
 worth adding to `html_checks.py` to keep it that way, rather than deleting the comment.
 
-### 12. `timingSafeEqualHex` leaks the compared value's length
+### 12. `timingSafeEqualHex` leaks the compared value's length — ✅ FIXED
 
 **🔵 Low · `02_http-and-creator-utils.js:346`**
 
 `if (a.length !== b.length) return false;` returns before the constant-time loop, revealing
 `ADMIN_KEY`'s length via timing. Compare fixed-length digests of both inputs instead.
+
+**Resolution (2026-09-07).** Done exactly as described, as a second function rather than a
+change to this one. `timingSafeEqualSecret(a, b)` SHA-256s both sides and compares the two
+64-character digests, so the comparison runs over the same length whatever came in;
+`/admin/login` uses it. `timingSafeEqualHex` keeps the early return and now carries a comment
+saying why that is safe *there*: its three remaining callers all compare values whose length is
+fixed by construction (a PBKDF2 digest, an OAuth state from `generateShortId`, an admin session
+signature), so the length is not a secret and does not vary with input. Tests cover both the
+comparison itself and that the admin route cannot quietly go back to the length-shortcutting one.
 
 ### 13. Latent: cron never populates the module-level API-key globals — ✅ FIXED
 
@@ -657,13 +673,21 @@ Demonstrated on a real fresh isolate (the built Worker in its own `vm` context, 
 event): before, all four globals were `""` after a tick; now they carry the configured values. A
 regression test does exactly that, and fails against the pre-fix build.
 
-### 14. Counter updates lost under concurrency on the KV path
+### 14. Counter updates lost under concurrency on the KV path — ⏸️ ACCEPTED
 
 **🔵 Low · `03_admin.js:66` (`bumpStat`), `26_…:1144` (`stats:creator_count`)**
 
 Classic get-then-put; concurrent bumps lose increments. Only affects display statistics, and the D1
 path is already atomic. Worth noting because the D1 binding is optional and commented out by default,
 so the lossy path is the default one.
+
+**Resolution (2026-09-07).** Accepted, and now recorded in the code rather than only here. KV has
+no atomic increment and no compare-and-swap, so the only correct fix is a different storage
+primitive — which is precisely what the D1 branch already is, and what any deployment that needs
+exact counters should bind. What is lost is a display statistic under simultaneous load: nothing
+reads these numbers to make a decision and no user-visible behaviour depends on one. `bumpStat`
+carries that reasoning, and a test asserts the comment stays, because a decision nobody can find
+gets re-litigated by whoever tidies up next.
 
 ---
 
@@ -1170,7 +1194,13 @@ Tested during this audit and found to have **no defect** — recorded so the sam
 6. ~~**Always rate-limit `/api/recommendations` and `/api/details/batch`.**~~ — **DONE.** (5)
 7. ~~**Add SRI to the fflate `<script>`.**~~ — **DONE.** (6)
 8. ~~**Move the reset-key and admin-login limiters onto D1's atomic upsert.**~~ — **DONE.** (7)
-9. ~~**Cap and cache `/api/channel-logo`**~~ — **DONE.** TTL/sweep for `/api/save` + `/api/publish-list` keys still open.
+9. ~~**Cap and cache `/api/channel-logo`**~~ — **DONE.** TTL/sweep for `/api/save` +
+   `/api/publish-list` keys: **decided against, 2026-09-07** — both ids are URLs somebody is still
+   using (an install link pasted into Stremio/wako; a shared list link handed to other people), so an
+   expiry breaks a stranger's install months later with nothing to point at. Bounded at the door
+   instead — per-IP limits plus the entry/byte caps — and `publishedlist:user:*` now has an admin
+   browse-and-delete path for the moderation case that actually motivated it. Reasoning recorded at
+   both call sites, with a test that keeps it there.
 10. ~~**Add the four regression tests** for findings 1, 2, 4 and 5, plus the handler-resolution check.~~ — **DONE** (and considerably more besides).
 
 ---
