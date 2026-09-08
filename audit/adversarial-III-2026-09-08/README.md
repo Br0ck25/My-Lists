@@ -45,6 +45,8 @@ directory with Node 22:
 | `p04c.mjs` | control: the same run with a `listName` binding sends exactly one |
 | `p19_anonurl.mjs` | the cold-index directory advertises `/lists/Anonymous/<slug>`, which 404s |
 | `p33_falsesuccess.mjs` | `saveLocalCustomListEdit` shows "saved" on 401, 409 and 500 |
+| `p42_falsesuccess_fixed.mjs` | after the fix: each of those three now shows the failure and names it, the local copy is still written, and a genuine 200 still shows the success modal |
+| `p43_guards_armed.mjs` | after the fix: all three slug-bearing `lists/save` call sites cite a baseline, and the two that carry a delta re-apply it to the other device's copy on a 409 |
 
 ## Data integrity and scale
 
@@ -68,7 +70,7 @@ that the KV-only configuration is the self-hosting path.
 
 | Probe | Proves |
 |---|---|
-| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever |
+| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever. Re-run after the fix, the same probe now reports `413`, nothing in KV, nothing in D1, and no `migrate-d1` error |
 | `p37_d1_profile.mjs` | KV ops and D1 queries per invocation at 400 accounts, cold index |
 | `p38_warm_index.mjs` | the same in steady state with the index warm — the honest production numbers |
 

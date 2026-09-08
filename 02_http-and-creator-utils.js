@@ -777,6 +777,25 @@ function jsonForScript(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
+// The size of a string as it will actually be stored, in BYTES.
+//
+// Every *_BYTES_MAX ceiling in 00_constants.js is a byte budget -- KV value
+// size, and D1's 2,000,000-byte maximum string/row size, which is why
+// CREATOR_LIST_BYTES_MAX exists at all. All four guards measured with
+// String.prototype.length, which counts UTF-16 code units, not bytes. For
+// ASCII the two agree, which is why this went unnoticed; for anything else
+// they do not. A CJK character is 1 unit and 3 bytes, an emoji or any astral
+// character is 2 units and 4 bytes -- so a 1.8M-unit list of Japanese titles
+// measured 4.7 MB on the wire, passed the guard, and was written to KV. The
+// D1 mirror then failed, in the catch that logs and carries on, so the list
+// was saved and served while the admin panel could not see it and every
+// migrate-d1 run reported the same unclearable error.
+//
+// The check now measures what the comment always said it measured.
+function utf8ByteLength(s) {
+  return new TextEncoder().encode(String(s == null ? "" : s)).length;
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather
@@ -2196,7 +2215,8 @@ function normalizeExternalListUrl(rawUrl) {
 //
 // Paginating that properly is worse, not better: it means reading EVERY list
 // on every directory load (10k lists = 10k KV reads per page view, well past
-// the 1,000 subrequest/invocation cap). So the directory reads a single
+// the 1,000-storage-operations/invocation cap -- the KV/D1 one, 1,000 on both
+// plans, not the outbound-fetch cap). So the directory reads a single
 // maintained index blob instead, updated on publish/unpublish. Directory cost
 // is now ONE KV read regardless of how many lists exist.
 //

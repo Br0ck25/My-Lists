@@ -1877,9 +1877,10 @@
       // Item count alone is not a size bound -- items carry titles,
       // overviews and poster URLs -- so this is checked on the exact bytes
       // about to be stored, before a slug is allocated or anything is
-      // written.
+      // written. BYTES, via utf8ByteLength: .length counts UTF-16 code
+      // units, and the ceiling exists because of D1's byte limit.
       const itemsJson = JSON.stringify(items || []);
-      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+      if (utf8ByteLength(itemsJson) > CREATOR_LIST_BYTES_MAX) {
         return json({
           ok: false,
           error: "That list is too large to save. Try splitting it into more than one list.",
@@ -2759,8 +2760,9 @@
           wlObj.updatedAt = watchlistUpdatedAt;
           // Same D1 row-size reasoning as /api/creator/lists/save: a
           // watchlist over the ceiling cannot be mirrored, and a mirror that
-          // silently stops is how a missing D1 row comes about.
-          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+          // silently stops is how a missing D1 row comes about. Measured in
+          // bytes for the same reason it is there.
+          if (utf8ByteLength(JSON.stringify(wlObj.items || [])) > CREATOR_LIST_BYTES_MAX) {
             return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
           }
           
@@ -4012,7 +4014,8 @@
     // source_groups and the stats counters from KV to D1.
     //
     // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
-    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // write per key both count against Cloudflare's 1,000-storage-operations
+    // per-invocation limit (the KV/D1 cap, 1,000 on Free and Paid alike),
     // and the previous single-pass version simply aborted partway through on
     // any site large enough to actually need migrating -- backfilling a
     // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
@@ -4295,7 +4298,8 @@
     // it happens.
     //
     // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
-    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // Cloudflare's 1,000-storage-operations per-invocation limit and a
+    // large deployment needs
     // several passes. Keep calling until `done` is true -- exactly like
     // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
     // does that loop for you. A chunk here gets a bigger op budget than the

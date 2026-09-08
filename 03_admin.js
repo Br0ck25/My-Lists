@@ -274,7 +274,7 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // throttle. That column existed for a long time but nothing ever wrote to
 // it, which forced the dashboard to do one KV `get` per account just to
 // render the "Last Active" column -- linear in the account count, and
-// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// over Cloudflare's 1,000-storage-operations/invocation cap past roughly a
 // thousand creators (the admin dashboard then stopped loading entirely in
 // production; Miniflare doesn't enforce that limit, so it rendered fine
 // locally). Writing it here lets the dashboard read last-active straight
@@ -469,7 +469,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     // Cap the candidate pool. This branch reads the running-total key AND
     // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
     // reads each, which is ~2,000 reads at 1,000 titles and crosses
-    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // Cloudflare's 1,000-storage-operations/invocation cap around 500 titles,
     // killing the whole Trending tab. We surface only 100, so a fixed
     // candidate ceiling bounds the cost regardless of corpus size; the
     // day-index windows below are capped the same way.

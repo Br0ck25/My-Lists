@@ -5186,8 +5186,21 @@ function deleteExternalListDirect(provider, listId, listName, btn) {
 // Retried once. A second conflict means a third device is writing to the same
 // list in the same instant; the edit is dropped rather than looping, and the
 // dashboard reload below shows what actually landed.
+//
+// Pass removeItem = null when the edit CANNOT be re-applied -- a whole-list
+// replacement built in the builder is not a delta, and re-running it against
+// the other device's copy would erase exactly what the guard exists to
+// protect. Those callers get the conflict back and tell the person, since
+// only they can say which version they want.
+//
+// Returns the outcome rather than swallowing it: { ok, status, conflict, url,
+// updatedAt, error, networkError }. The two background remove-one-item callers
+// ignore it, as they did before; the callers that show the person a "saved"
+// modal must not (a false success is its own finding).
 async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
-  if (!list || typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (!list || typeof activeCreator === 'undefined' || !activeCreator) {
+    return { ok: false, skipped: true };
+  }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const send = async (target) => {
     const body = {
@@ -5213,34 +5226,51 @@ async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
   try {
     let res = await send(list);
     if (res.status === 409) {
+      // Whatever this browser holds is now stale either way, so the cached
+      // dashboard copy has to go before anything reads it again.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      // No re-appliable edit -- a whole-list replacement. Re-running it
+      // against the other device's copy is exactly the overwrite the guard
+      // just prevented, so hand the conflict back and let the caller tell
+      // the person.
+      if (typeof removeItem !== 'function') return { ok: false, status: 409, conflict: true };
       // Someone else saved in between. Pull what they saved, re-apply this
       // removal on top of it, and try once more.
       let fresh = null;
       try {
-        if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
         const data = await fetchCreatorListsOnce(creatorKey);
         fresh = ((data && data.lists) || []).find((l) => l && l.slug === list.slug) || null;
       } catch (e) {
         fresh = null;
       }
-      if (!fresh) return;
+      if (!fresh) return { ok: false, status: 409, conflict: true };
       fresh.items = removeItem(Array.isArray(fresh.items) ? fresh.items : []);
       // Keep the in-memory copy in step with what is about to be saved, so
       // the dashboard does not re-render the pre-merge list.
       list.items = fresh.items;
       list.updatedAt = fresh.updatedAt;
       res = await send(fresh);
-      if (res.status === 409) return;
+      if (res.status === 409) return { ok: false, status: 409, conflict: true };
     }
     const data = await res.json().catch(() => null);
     // Advance the baseline, or the next edit in this session cites a version
     // that is now stale and 409s against a write this browser made itself.
     if (data && data.ok && Number.isFinite(data.updatedAt)) list.updatedAt = data.updatedAt;
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-    if (toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    if (data && data.ok && toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    return {
+      ok: !!(data && data.ok),
+      status: res.status,
+      conflict: !!(data && data.conflict),
+      url: (data && data.url) || null,
+      updatedAt: (data && Number.isFinite(data.updatedAt)) ? data.updatedAt : null,
+      error: (data && data.error) || (data && data.ok ? null : 'The server rejected the save.'),
+    };
   } catch (e) {
     // Background save, same as before -- the edit is still in the DOM and in
-    // the local map, and the next load reconciles.
+    // the local map, and the next load reconciles. Callers that told the
+    // person something read networkError and correct themselves.
+    return { ok: false, networkError: true, error: 'A network error occurred while saving.' };
   }
 }
 

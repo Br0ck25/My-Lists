@@ -143,6 +143,11 @@ export function loadClient(opts = {}) {
     getElementById(id) { if (!byId.has(id)) byId.set(id, makeElement()); return byId.get(id); },
     querySelector: () => makeElement(), querySelectorAll: () => [],
     getElementsByClassName: () => [], getElementsByTagName: () => [],
+    // Radio groups (updateCustomListTypeRadio, reached from
+    // cancelEditCustomList) look their inputs up by name. Missing, this threw
+    // a TypeError -- which the older save paths swallowed in their own catch,
+    // so the tests passed while reporting a network error that never happened.
+    getElementsByName: () => [],
     addEventListener() {}, removeEventListener() {}, cookie: "",
   };
 

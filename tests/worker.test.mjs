@@ -4974,6 +4974,44 @@ describe("A11: the authenticated list write needs the bounds its anonymous sibli
     });
     assert.equal(r.body.ok, true, "the largest genuine list observed was ~1,200 items");
   });
+
+  // AIII addendum: the ceiling exists because of D1's 2,000,000-BYTE maximum
+  // string size, and it was measured with String.prototype.length, which
+  // counts UTF-16 code units. ASCII makes the two agree, which is why five
+  // audits went past it. A CJK character is 1 unit and 3 bytes, so a list of
+  // Japanese titles passed the guard at 1.78M units while being 4.7 MB on the
+  // wire: KV stored it, the public page served it, the D1 mirror failed inside
+  // a catch that logs and carries on, and every migrate-d1 run afterwards
+  // reported the same error that could never be cleared.
+  it("measures the size ceiling in bytes, not UTF-16 code units", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11e");
+    const K = { creatorName: "big11e", creatorKey: u.creatorKey };
+
+    // Deliberately under the cap by .length and well over it by bytes: each
+    // character is 1 UTF-16 unit and 3 UTF-8 bytes.
+    const cjk = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "\u65e5".repeat(1000) }));
+    const json = JSON.stringify(cjk);
+    assert.ok(json.length < 1_800_000, "the fixture must pass the OLD units-based check");
+    assert.ok(new TextEncoder().encode(json).length > 1_800_000, "and fail the byte-based one");
+
+    const r = await save(env, K, { name: "Nihongo", items: cjk });
+    assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 160));
+    assert.equal(env.CONFIGS._store.get("creatorlist:big11e:nihongo"), undefined,
+      "a record KV accepts and D1 silently refuses is the divergence this guard exists to stop");
+  });
+
+  it("leaves an ASCII list of the same character count alone", async () => {
+    // The regression risk of measuring bytes is refusing lists that used to
+    // save. It only bites where bytes and units differ: same 700k characters,
+    // ASCII, comfortably accepted.
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11f");
+    const K = { creatorName: "big11f", creatorKey: u.creatorKey };
+    const ascii = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "a".repeat(1000) }));
+    const r = await save(env, K, { name: "Ascii", items: ascii });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+  });
 });
 
 describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {

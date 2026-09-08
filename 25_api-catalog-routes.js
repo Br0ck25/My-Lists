@@ -5756,8 +5756,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a
-      // name and a group. Checked on the exact bytes about to be stored.
-      if (savePayload.length > SAVED_CONFIG_BYTES_MAX) {
+      // name and a group. Checked on the exact bytes about to be stored --
+      // bytes, not UTF-16 code units, which the constant's name has always
+      // said and the check did not do.
+      if (utf8ByteLength(savePayload) > SAVED_CONFIG_BYTES_MAX) {
         return json({ ok: false, error: "That configuration is too large to save." }, 413);
       }
 
@@ -5832,8 +5834,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Item COUNT alone is not a size bound -- individual items carry
       // titles, overviews and poster URLs, so a few thousand of them can
       // still be many megabytes. This is the bound that actually protects
-      // storage, checked on the exact bytes about to be written.
-      if (plPayload.length > PUBLISHED_LIST_BYTES_MAX) {
+      // storage, checked on the exact bytes about to be written -- bytes,
+      // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
+      // mirrored to D1 on this path, so unlike the creator guard this one is
+      // only a storage bound; the two were deliberately kept in step.
+      if (utf8ByteLength(plPayload) > PUBLISHED_LIST_BYTES_MAX) {
         return json({ ok: false, error: "That list is too large to publish." }, 413);
       }
       await env.CONFIGS.put(plKey, plPayload);

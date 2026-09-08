@@ -111,21 +111,37 @@ const CREATOR_LIST_BYTES_MAX = 1_800_000;
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
-// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
-// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
-// the request. Shared with the client so the chunk size it sends and the
-// size the server accepts cannot drift apart.
+// Worker owner's shared key. 200 items is ~400 outbound fetches, measured.
+//
+// Cloudflare has TWO per-invocation caps and they are not the same number:
+//
+//   outbound fetch()  ("subrequests")  Free: 50        Paid: 10,000 (configurable)
+//   KV / D1 / R2 operations                  1,000           1,000
+//
+// 400 sits comfortably inside the Paid outbound cap with room for the rest of
+// the request, and is eight times over the Free one -- so on a free Worker a
+// Letterboxd import dies above roughly 25 titles. That is a real limitation of
+// the free plan, documented in README.md ("Which Cloudflare plan do I need?"),
+// not something this constant can fix: lowering it to fit 50 would make every
+// paid deployment issue 8x the requests for the same import. The fix is to
+// chunk the endpoint itself (tracked in the audit's fix order), which changes
+// the client contract and is not a constant edit.
+//
+// Shared with the client so the chunk size it sends and the size the server
+// accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
 // publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
-// a D1 write on each key it keeps -- both of which count against
-// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
-// whole sweep in one request with no cap, so on a site big enough to need
-// migrating it aborted partway through with "Too many subrequests" and
-// backfilled only whatever it had reached.
+// a D1 write on each key it keeps -- both of which count against Cloudflare's
+// 1,000-storage-operations-per-invocation limit. That is the KV/D1/R2 cap,
+// 1,000 on both the Free and the Paid plan; the separate outbound-fetch cap
+// (50 free, 10,000 paid) does not apply here, since this sweep makes no
+// outbound requests. It used to do the whole sweep in one request with no
+// cap, so on a site big enough to need migrating it aborted partway through
+// with "Too many subrequests" and backfilled only whatever it had reached.
 //
 // That failure is worse than it looks: per wrangler.toml, an account present
 // in KV but missing from D1 is exactly the case /api/creator/reset-key and
@@ -141,9 +157,9 @@ const BULK_RESOLVE_ITEMS_MAX = 200;
 const MIGRATE_D1_STATE_KEY = "migrated1:state";
 const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
 // This endpoint has its invocation to itself (it is admin-triggered, not
-// ridden along on the cron), so it can claim more of the 1,000 than the
-// index rebuild does -- but still well short of it, since a chunk that
-// throws saves no progress.
+// ridden along on the cron), so it can claim more of the 1,000 storage
+// operations than the index rebuild does -- but still well short of it,
+// since a chunk that throws saves no progress.
 const MIGRATE_D1_OPS_PER_RUN = 700;
 const MIGRATE_D1_PAGE = 200;
 // Errors accumulate across every chunk of a run and are handed back to the
@@ -238,8 +254,9 @@ function applyEnvApiKeys(env) {
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
 // How many of one creator's lists /admin/api/delete-creator-list will remove
 // in a single call. Each slug costs a KV read, a KV delete, a ledger delete
-// and (with D1 bound) a statement, so this keeps one call well inside
-// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// and (with D1 bound) a statement -- storage operations, so the cap that
+// applies is the 1,000-per-invocation one, the same on Free and Paid. This
+// keeps one call well inside it. The admin panel loops, so a
 // larger cleanup still completes -- it just arrives as several bounded calls,
 // the same shape the other maintenance tools use.
 const ADMIN_LIST_DELETE_MAX = 50;
@@ -2572,6 +2589,25 @@ function jsonForScript(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
+// The size of a string as it will actually be stored, in BYTES.
+//
+// Every *_BYTES_MAX ceiling in 00_constants.js is a byte budget -- KV value
+// size, and D1's 2,000,000-byte maximum string/row size, which is why
+// CREATOR_LIST_BYTES_MAX exists at all. All four guards measured with
+// String.prototype.length, which counts UTF-16 code units, not bytes. For
+// ASCII the two agree, which is why this went unnoticed; for anything else
+// they do not. A CJK character is 1 unit and 3 bytes, an emoji or any astral
+// character is 2 units and 4 bytes -- so a 1.8M-unit list of Japanese titles
+// measured 4.7 MB on the wire, passed the guard, and was written to KV. The
+// D1 mirror then failed, in the catch that logs and carries on, so the list
+// was saved and served while the admin panel could not see it and every
+// migrate-d1 run reported the same unclearable error.
+//
+// The check now measures what the comment always said it measured.
+function utf8ByteLength(s) {
+  return new TextEncoder().encode(String(s == null ? "" : s)).length;
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather
@@ -3991,7 +4027,8 @@ function normalizeExternalListUrl(rawUrl) {
 //
 // Paginating that properly is worse, not better: it means reading EVERY list
 // on every directory load (10k lists = 10k KV reads per page view, well past
-// the 1,000 subrequest/invocation cap). So the directory reads a single
+// the 1,000-storage-operations/invocation cap -- the KV/D1 one, 1,000 on both
+// plans, not the outbound-fetch cap). So the directory reads a single
 // maintained index blob instead, updated on publish/unpublish. Directory cost
 // is now ONE KV read regardless of how many lists exist.
 //
@@ -5768,7 +5805,7 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // throttle. That column existed for a long time but nothing ever wrote to
 // it, which forced the dashboard to do one KV `get` per account just to
 // render the "Last Active" column -- linear in the account count, and
-// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// over Cloudflare's 1,000-storage-operations/invocation cap past roughly a
 // thousand creators (the admin dashboard then stopped loading entirely in
 // production; Miniflare doesn't enforce that limit, so it rendered fine
 // locally). Writing it here lets the dashboard read last-active straight
@@ -5963,7 +6000,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     // Cap the candidate pool. This branch reads the running-total key AND
     // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
     // reads each, which is ~2,000 reads at 1,000 titles and crosses
-    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // Cloudflare's 1,000-storage-operations/invocation cap around 500 titles,
     // killing the whole Trending tab. We surface only 100, so a fixed
     // candidate ceiling bounds the cost regardless of corpus size; the
     // day-index windows below are capped the same way.
@@ -14452,7 +14489,7 @@ function renderBuilder(
         applicationCategory: "MultimediaApplication",
         operatingSystem: "Any",
         description:
-          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own free Cloudflare Worker.",
+          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own Cloudflare Worker.",
         offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
         url: origin + "/",
       })}</script>`;
@@ -28522,9 +28559,22 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
     const exists = idx !== -1;
     
+    // The same match, and the same add or remove, expressed as a function of
+    // whatever items it is handed. The array below is one possible result of
+    // it; the function is what lets the edit be re-applied to another device's
+    // copy instead of overwriting it -- see saveCreatorListWithBaseline.
+    const matchesTarget = (it) => !!it && (
+      (it.imdbId === imdbId) || (it.id === originalId) ||
+      (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId)
+    );
+    const addedItem = { imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined };
+    const applyEdit = shouldBeInList
+      ? (items) => ((items || []).some(matchesTarget) ? (items || []).slice() : (items || []).concat([addedItem]))
+      : (items) => (items || []).filter((it) => !matchesTarget(it));
+
     let changed = false;
     if (shouldBeInList && !exists) {
-      payload.items.push({ imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined });
+      payload.items.push(addedItem);
       changed = true;
     } else if (!shouldBeInList && exists) {
       payload.items.splice(idx, 1);
@@ -28544,7 +28594,7 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
       
       const nameInput = list.row ? list.row.querySelector('.name') : null;
       const rowName = (nameInput ? nameInput.value : '') || list.name || '';
-      syncCustomListPayload(payload, rowName);
+      syncCustomListPayload(payload, rowName, applyEdit);
     }
     return changed;
     
@@ -28554,7 +28604,12 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
   }
 }
 
-async function syncCustomListPayload(payload, name) {
+// applyEdit(items) is the single add-or-remove this sync is carrying, as a
+// function -- optional, and only used when the list lives on the account. It
+// is what the conflict guard needs: on a 409 the edit is re-run against the
+// copy the other device saved, rather than the stale array being re-sent over
+// the top of it.
+async function syncCustomListPayload(payload, name, applyEdit) {
   const isWatchlist = payload.localSlug === 'watchlist' || payload.creatorSlug === 'watchlist' || (name && name.toLowerCase() === 'watchlist');
   if (isWatchlist) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
@@ -28596,27 +28651,32 @@ async function syncCustomListPayload(payload, name) {
           const otherItems = creatorListMeta.items.filter(it => !currentIds.has(it.imdbId || it.id));
           combinedItems = (payload.items || []).concat(otherItems);
         }
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: creatorName,
-            creatorKey: creatorKey,
-            slug: payload.creatorSlug,
-            name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
-            type: finalType,
-            items: combinedItems,
-            visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private')
-          })
-        });
-        const data = await res.json();
-        if (data.ok) {
+        // A whole-list replacement of an existing account list, sent with no
+        // baseline: one of the three slug-bearing call sites that left the
+        // server's expectedUpdatedAt guard unarmed, so a second device's
+        // additions between this browser's last load and this write were
+        // silently overwritten. Routed through the one helper that cites the
+        // baseline and, on a 409, re-applies this single add/remove to what
+        // the other device actually saved.
+        const target = {
+          slug: payload.creatorSlug,
+          name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+          type: finalType,
+          items: combinedItems,
+          visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private'),
+        };
+        if (creatorListMeta && Number.isFinite(creatorListMeta.updatedAt)) {
+          target.updatedAt = creatorListMeta.updatedAt;
+        }
+        const result = await saveCreatorListWithBaseline(target, applyEdit || null, null);
+        if (result && result.ok) {
+          // target.items is what actually landed -- on a merged retry the
+          // helper replaces it with the other device's copy plus this edit.
+          combinedItems = target.items;
           if (creatorListMeta) {
             creatorListMeta.items = combinedItems;
-            creatorListMeta.itemCount = combinedItems.length;
-          }
-          if (typeof renderCreatorDashboard === 'function') {
-            renderCreatorDashboard({ silent: true });
+            creatorListMeta.itemCount = (combinedItems || []).length;
+            if (Number.isFinite(target.updatedAt)) creatorListMeta.updatedAt = target.updatedAt;
           }
         }
         payload.items = combinedItems;
@@ -36683,29 +36743,81 @@ async function saveLocalCustomListEdit(name) {
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (slug || 'watchlist'))
     : (location.origin + '/lists/' + (slug === 'watchlist' ? 'watchlist' : ('custom/' + slug))));
 
+  // The account mirror. Its outcome used to be discarded entirely -- there was
+  // no else and no error path, so a 401, a 409 and a 500 all ended at the same
+  // "saved" modal while nothing reached the account. On the next sign-in the
+  // server's older copy wins and the edit is gone, having been reported saved.
+  // The LOCAL save above stays unconditional -- it is this function's job and
+  // it works -- but what the person is told about the account has to match
+  // what happened.
+  let mirror = null;
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     if (creatorKey) {
-      try {
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: slug,
-            name: name,
-            type: customListDraftType,
-            items: customListDraftItems,
-            visibility: visibility,
-          }),
-        });
-        const data = await res.json();
-        if (data.ok && data.url) {
-          finalUrl = data.url;
+      // A whole-list replacement of a list that already exists on the server:
+      // exactly what the server's expectedUpdatedAt guard is for, and one of
+      // the three slug-bearing call sites that never armed it. Routed through
+      // the one helper that speaks that protocol rather than a fourth copy of
+      // it. No re-apply function is passed: a replacement is not a delta, so
+      // re-running it against the other device's copy would erase precisely
+      // what the guard exists to protect. The conflict comes back here.
+      const cached = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData))
+        ? lastCreatorListsData.find((l) => l && l.slug === slug)
+        : null;
+      const target = {
+        slug: slug,
+        name: name,
+        type: customListDraftType,
+        items: customListDraftItems,
+        visibility: visibility,
+      };
+      if (cached && Number.isFinite(cached.updatedAt)) target.updatedAt = cached.updatedAt;
+      mirror = await saveCreatorListWithBaseline(target, null, null);
+      if (mirror && mirror.ok) {
+        if (mirror.url) finalUrl = mirror.url;
+        // Keep the dashboard's copy in step with what was just stored, or the
+        // next edit in this session cites a version this browser has itself
+        // already replaced and 409s against its own write.
+        if (cached) {
+          cached.name = name;
+          cached.type = customListDraftType;
+          cached.items = customListDraftItems.slice();
+          cached.itemCount = cached.items.length;
+          cached.visibility = visibility;
+          if (Number.isFinite(target.updatedAt)) cached.updatedAt = target.updatedAt;
         }
-      } catch (e) {}
+      }
     }
+  }
+
+  if (mirror && !mirror.ok && !mirror.skipped) {
+    const savedHere = 'Your changes are saved on this device, but they did not reach your account.';
+    let title = 'Saved Here, Not To Your Account';
+    let msg;
+    if (mirror.conflict || mirror.status === 409) {
+      // The helper has already dropped the cached dashboard copy, so the
+      // re-render below shows what is actually stored rather than a version
+      // that no longer exists. The server sends conflict: true and the stored
+      // updatedAt precisely so the client can go and look.
+      title = 'This List Changed Elsewhere';
+      msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        savedHere + ' Reopen the list to see what the other device saved, then re-apply your changes.';
+    } else if (mirror.networkError) {
+      msg = 'A network error occurred while saving to your account. ' + savedHere + ' Please try again.';
+    } else if (mirror.status === 401 || mirror.status === 403) {
+      msg = 'Your account key was rejected, so the change could not be saved to your account. ' +
+        savedHere + ' Sign in again and re-save.';
+    } else {
+      msg = (mirror.error || 'The server rejected the save.') + ' ' + savedHere;
+    }
+    if (typeof showAppNoticeModal === 'function') {
+      showAppNoticeModal(title, msg, true);
+    } else {
+      alert(msg);
+    }
+    cancelEditCustomList();
+    renderCreatorDashboard();
+    return;
   }
 
   if (typeof showSavedCustomListModal === 'function') {
@@ -37318,7 +37430,13 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
     );
     if (creatorWatchlist && Array.isArray(creatorWatchlist.items) && creatorWatchlist.items.length) {
       const initialLen = creatorWatchlist.items.length;
-      const updatedItems = creatorWatchlist.items.filter((it) => {
+      // The removal as a FUNCTION, not as its result. This used to send the
+      // array computed from a possibly-stale local copy, fire-and-forget, with
+      // no expectedUpdatedAt -- so a second device's Watchlist additions could
+      // be erased between this browser's last load and this write, with
+      // nothing reported anywhere. Expressed this way the same removal can be
+      // re-run against whatever the other device actually saved.
+      const dropWatched = (items) => (items || []).filter((it) => {
         if (!it) return false;
         const itId = String(it.id || '');
         const itImdbId = String(it.imdbId || '');
@@ -37341,22 +37459,14 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
         if (itTmdbId && (targetIds.has(itTmdbId) || targetIds.has('tmdb:' + itTmdbId))) return false;
         return true;
       });
+      const updatedItems = dropWatched(creatorWatchlist.items);
       if (updatedItems.length !== initialLen) {
         creatorWatchlist.items = updatedItems;
-        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-        fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            name: creatorWatchlist.name,
-            type: creatorWatchlist.type || 'mixed',
-            items: updatedItems,
-            visibility: creatorWatchlist.visibility || 'private',
-            slug: creatorWatchlist.slug,
-          }),
-        }).catch(() => {});
+        // Still a background save -- nothing here is waiting on it, and the
+        // helper reports nothing on failure by design (the removal is already
+        // applied locally and the next load reconciles). What it adds is the
+        // baseline and the merge-and-retry.
+        saveCreatorListWithBaseline(creatorWatchlist, dropWatched, null);
       }
     }
   }
@@ -44163,8 +44273,21 @@ function deleteExternalListDirect(provider, listId, listName, btn) {
 // Retried once. A second conflict means a third device is writing to the same
 // list in the same instant; the edit is dropped rather than looping, and the
 // dashboard reload below shows what actually landed.
+//
+// Pass removeItem = null when the edit CANNOT be re-applied -- a whole-list
+// replacement built in the builder is not a delta, and re-running it against
+// the other device's copy would erase exactly what the guard exists to
+// protect. Those callers get the conflict back and tell the person, since
+// only they can say which version they want.
+//
+// Returns the outcome rather than swallowing it: { ok, status, conflict, url,
+// updatedAt, error, networkError }. The two background remove-one-item callers
+// ignore it, as they did before; the callers that show the person a "saved"
+// modal must not (a false success is its own finding).
 async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
-  if (!list || typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (!list || typeof activeCreator === 'undefined' || !activeCreator) {
+    return { ok: false, skipped: true };
+  }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const send = async (target) => {
     const body = {
@@ -44190,34 +44313,51 @@ async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
   try {
     let res = await send(list);
     if (res.status === 409) {
+      // Whatever this browser holds is now stale either way, so the cached
+      // dashboard copy has to go before anything reads it again.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      // No re-appliable edit -- a whole-list replacement. Re-running it
+      // against the other device's copy is exactly the overwrite the guard
+      // just prevented, so hand the conflict back and let the caller tell
+      // the person.
+      if (typeof removeItem !== 'function') return { ok: false, status: 409, conflict: true };
       // Someone else saved in between. Pull what they saved, re-apply this
       // removal on top of it, and try once more.
       let fresh = null;
       try {
-        if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
         const data = await fetchCreatorListsOnce(creatorKey);
         fresh = ((data && data.lists) || []).find((l) => l && l.slug === list.slug) || null;
       } catch (e) {
         fresh = null;
       }
-      if (!fresh) return;
+      if (!fresh) return { ok: false, status: 409, conflict: true };
       fresh.items = removeItem(Array.isArray(fresh.items) ? fresh.items : []);
       // Keep the in-memory copy in step with what is about to be saved, so
       // the dashboard does not re-render the pre-merge list.
       list.items = fresh.items;
       list.updatedAt = fresh.updatedAt;
       res = await send(fresh);
-      if (res.status === 409) return;
+      if (res.status === 409) return { ok: false, status: 409, conflict: true };
     }
     const data = await res.json().catch(() => null);
     // Advance the baseline, or the next edit in this session cites a version
     // that is now stale and 409s against a write this browser made itself.
     if (data && data.ok && Number.isFinite(data.updatedAt)) list.updatedAt = data.updatedAt;
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-    if (toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    if (data && data.ok && toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    return {
+      ok: !!(data && data.ok),
+      status: res.status,
+      conflict: !!(data && data.conflict),
+      url: (data && data.url) || null,
+      updatedAt: (data && Number.isFinite(data.updatedAt)) ? data.updatedAt : null,
+      error: (data && data.error) || (data && data.ok ? null : 'The server rejected the save.'),
+    };
   } catch (e) {
     // Background save, same as before -- the edit is still in the DOM and in
-    // the local map, and the next load reconciles.
+    // the local map, and the next load reconciles. Callers that told the
+    // person something read networkError and correct themselves.
+    return { ok: false, networkError: true, error: 'A network error occurred while saving.' };
   }
 }
 
@@ -56730,8 +56870,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a
-      // name and a group. Checked on the exact bytes about to be stored.
-      if (savePayload.length > SAVED_CONFIG_BYTES_MAX) {
+      // name and a group. Checked on the exact bytes about to be stored --
+      // bytes, not UTF-16 code units, which the constant's name has always
+      // said and the check did not do.
+      if (utf8ByteLength(savePayload) > SAVED_CONFIG_BYTES_MAX) {
         return json({ ok: false, error: "That configuration is too large to save." }, 413);
       }
 
@@ -56806,8 +56948,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Item COUNT alone is not a size bound -- individual items carry
       // titles, overviews and poster URLs, so a few thousand of them can
       // still be many megabytes. This is the bound that actually protects
-      // storage, checked on the exact bytes about to be written.
-      if (plPayload.length > PUBLISHED_LIST_BYTES_MAX) {
+      // storage, checked on the exact bytes about to be written -- bytes,
+      // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
+      // mirrored to D1 on this path, so unlike the creator guard this one is
+      // only a storage bound; the two were deliberately kept in step.
+      if (utf8ByteLength(plPayload) > PUBLISHED_LIST_BYTES_MAX) {
         return json({ ok: false, error: "That list is too large to publish." }, 413);
       }
       await env.CONFIGS.put(plKey, plPayload);
@@ -59001,9 +59146,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Item count alone is not a size bound -- items carry titles,
       // overviews and poster URLs -- so this is checked on the exact bytes
       // about to be stored, before a slug is allocated or anything is
-      // written.
+      // written. BYTES, via utf8ByteLength: .length counts UTF-16 code
+      // units, and the ceiling exists because of D1's byte limit.
       const itemsJson = JSON.stringify(items || []);
-      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+      if (utf8ByteLength(itemsJson) > CREATOR_LIST_BYTES_MAX) {
         return json({
           ok: false,
           error: "That list is too large to save. Try splitting it into more than one list.",
@@ -59883,8 +60029,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
           wlObj.updatedAt = watchlistUpdatedAt;
           // Same D1 row-size reasoning as /api/creator/lists/save: a
           // watchlist over the ceiling cannot be mirrored, and a mirror that
-          // silently stops is how a missing D1 row comes about.
-          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+          // silently stops is how a missing D1 row comes about. Measured in
+          // bytes for the same reason it is there.
+          if (utf8ByteLength(JSON.stringify(wlObj.items || [])) > CREATOR_LIST_BYTES_MAX) {
             return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
           }
           
@@ -61136,7 +61283,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // source_groups and the stats counters from KV to D1.
     //
     // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
-    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // write per key both count against Cloudflare's 1,000-storage-operations
+    // per-invocation limit (the KV/D1 cap, 1,000 on Free and Paid alike),
     // and the previous single-pass version simply aborted partway through on
     // any site large enough to actually need migrating -- backfilling a
     // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
@@ -61419,7 +61567,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // it happens.
     //
     // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
-    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // Cloudflare's 1,000-storage-operations per-invocation limit and a
+    // large deployment needs
     // several passes. Keep calling until `done` is true -- exactly like
     // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
     // does that loop for you. A chunk here gets a bigger op budget than the

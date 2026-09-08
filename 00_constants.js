@@ -61,21 +61,37 @@ const CREATOR_LIST_BYTES_MAX = 1_800_000;
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
-// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
-// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
-// the request. Shared with the client so the chunk size it sends and the
-// size the server accepts cannot drift apart.
+// Worker owner's shared key. 200 items is ~400 outbound fetches, measured.
+//
+// Cloudflare has TWO per-invocation caps and they are not the same number:
+//
+//   outbound fetch()  ("subrequests")  Free: 50        Paid: 10,000 (configurable)
+//   KV / D1 / R2 operations                  1,000           1,000
+//
+// 400 sits comfortably inside the Paid outbound cap with room for the rest of
+// the request, and is eight times over the Free one -- so on a free Worker a
+// Letterboxd import dies above roughly 25 titles. That is a real limitation of
+// the free plan, documented in README.md ("Which Cloudflare plan do I need?"),
+// not something this constant can fix: lowering it to fit 50 would make every
+// paid deployment issue 8x the requests for the same import. The fix is to
+// chunk the endpoint itself (tracked in the audit's fix order), which changes
+// the client contract and is not a constant edit.
+//
+// Shared with the client so the chunk size it sends and the size the server
+// accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
 // publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
-// a D1 write on each key it keeps -- both of which count against
-// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
-// whole sweep in one request with no cap, so on a site big enough to need
-// migrating it aborted partway through with "Too many subrequests" and
-// backfilled only whatever it had reached.
+// a D1 write on each key it keeps -- both of which count against Cloudflare's
+// 1,000-storage-operations-per-invocation limit. That is the KV/D1/R2 cap,
+// 1,000 on both the Free and the Paid plan; the separate outbound-fetch cap
+// (50 free, 10,000 paid) does not apply here, since this sweep makes no
+// outbound requests. It used to do the whole sweep in one request with no
+// cap, so on a site big enough to need migrating it aborted partway through
+// with "Too many subrequests" and backfilled only whatever it had reached.
 //
 // That failure is worse than it looks: per wrangler.toml, an account present
 // in KV but missing from D1 is exactly the case /api/creator/reset-key and
@@ -91,9 +107,9 @@ const BULK_RESOLVE_ITEMS_MAX = 200;
 const MIGRATE_D1_STATE_KEY = "migrated1:state";
 const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
 // This endpoint has its invocation to itself (it is admin-triggered, not
-// ridden along on the cron), so it can claim more of the 1,000 than the
-// index rebuild does -- but still well short of it, since a chunk that
-// throws saves no progress.
+// ridden along on the cron), so it can claim more of the 1,000 storage
+// operations than the index rebuild does -- but still well short of it,
+// since a chunk that throws saves no progress.
 const MIGRATE_D1_OPS_PER_RUN = 700;
 const MIGRATE_D1_PAGE = 200;
 // Errors accumulate across every chunk of a run and are handed back to the
@@ -188,8 +204,9 @@ function applyEnvApiKeys(env) {
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
 // How many of one creator's lists /admin/api/delete-creator-list will remove
 // in a single call. Each slug costs a KV read, a KV delete, a ledger delete
-// and (with D1 bound) a statement, so this keeps one call well inside
-// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// and (with D1 bound) a statement -- storage operations, so the cap that
+// applies is the 1,000-per-invocation one, the same on Free and Paid. This
+// keeps one call well inside it. The admin panel loops, so a
 // larger cleanup still completes -- it just arrives as several bounded calls,
 // the same shape the other maintenance tools use.
 const ADMIN_LIST_DELETE_MAX = 50;

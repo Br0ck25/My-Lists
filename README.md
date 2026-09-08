@@ -3,7 +3,7 @@
 > **Official Website & Live Web App**: [**mylistsaddon.com**](https://mylistsaddon.com)
 > **Source Code**: [**github.com/Br0ck25/My-Lists**](https://github.com/Br0ck25/My-Lists)
 
-A powerful, full-featured add-on for [Stremio](https://stremio.com), [Wako](https://wako.app), [Nuvio](https://nuvio.to), and any other app built on the Stremio addon protocol, that transforms your **MDBList**, **Trakt**, **TMDB**, and **Simkl** lists into dynamic catalog rows on your home screen — featuring a full **Custom List Builder**, **Letterboxd CSV Import**, **Virtual TV Channels**, **Airing Next Calendars**, **Continue Watching & Watch History Sync**, **Creator Profiles**, and an **Admin Analytics Dashboard**, all running on a single free [Cloudflare Workers](https://workers.cloudflare.com) deployment or directly at [**mylistsaddon.com**](https://mylistsaddon.com).
+A powerful, full-featured add-on for [Stremio](https://stremio.com), [Wako](https://wako.app), [Nuvio](https://nuvio.to), and any other app built on the Stremio addon protocol, that transforms your **MDBList**, **Trakt**, **TMDB**, and **Simkl** lists into dynamic catalog rows on your home screen — featuring a full **Custom List Builder**, **Letterboxd CSV Import**, **Virtual TV Channels**, **Airing Next Calendars**, **Continue Watching & Watch History Sync**, **Creator Profiles**, and an **Admin Analytics Dashboard**, all running on a single [Cloudflare Workers](https://workers.cloudflare.com) deployment (free plan included, with [some limits](#which-cloudflare-plan-do-i-need)) or directly at [**mylistsaddon.com**](https://mylistsaddon.com).
 
 There are no servers to manage, no external databases required, and no subscription fees. Your configuration is encoded directly into your install link or securely synchronized via your own private Cloudflare KV storage.
 
@@ -14,7 +14,9 @@ There are no servers to manage, no external databases required, and no subscript
 You can use the official hosted instance right now without deploying anything:
 **[mylistsaddon.com](https://mylistsaddon.com)**
 
-Or follow the instructions below to self-host on your own free Cloudflare Worker.
+Or follow the instructions below to self-host on your own Cloudflare Worker. A **free** Workers plan runs the
+add-on for yourself and a few friends; several features need the **Paid** plan or are effectively off without
+it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need) says exactly which, and why.
 
 ---
 
@@ -65,9 +67,57 @@ Or follow the instructions below to self-host on your own free Cloudflare Worker
 
 ## Requirements
 
-- A free [Cloudflare](https://dash.cloudflare.com/sign-up) account.
+- A free [Cloudflare](https://dash.cloudflare.com/sign-up) account. See
+  [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need) before deciding whether to stay on the
+  free Workers plan — some features do not fit inside its limits.
 - **Optional**: Free API keys/OAuth apps from TMDB, Trakt, Simkl, or MDBList to unlock specific list providers.
 - **Zero build dependencies**: The entire add-on runs from `worker_entry_combined.js`.
+
+---
+
+## Which Cloudflare plan do I need?
+
+Short answer: **free is fine for a personal install** — your own catalogs, your own custom lists, the channel
+builder, the directory, sharing links. Three things do not fit in the free plan's limits, and one of them is
+silent, so it is worth knowing which before you build a habit around them.
+
+The limits that matter (Cloudflare's, not this add-on's):
+
+| | Workers **Free** | Workers **Paid** |
+|---|---|---|
+| Outbound `fetch()` per request ("subrequests") | **50** | 10,000 (configurable) |
+| CPU time per request | **10 ms** | up to 5 min |
+| Requests per day | 100,000 | metered |
+| KV writes to *different* keys per day | **1,000** | metered |
+| KV reads per day | 100,000 | metered |
+| KV operations per invocation | 1,000 | 1,000 |
+| KV writes to *the same* key | 1 per second | 1 per second |
+
+Measured against those, on the free plan:
+
+- **Letterboxd CSV import stops at about 25 titles.** `/api/bulk-resolve` spends up to two TMDB calls per
+  title, so its documented 200-item maximum is ~400 subrequests against a cap of 50. `/api/details/batch`
+  (~180 subrequests at its 60-id cap) is over it too.
+- **The 6-minute cron does not run at all.** One tick over 30 accounts is ~186 subrequests. That is the job
+  that fills Continue Watching and pre-warms the shared provider charts, so both are simply absent — and it
+  fails quietly, at the edge, where you will not see it.
+- **CPU is tight on sign-in.** Creator Key verification is PBKDF2 at 100,000 iterations, ~15–18 ms measured,
+  against a 10 ms cap. A key check that is not already memoized in the isolate can be cut off.
+- **About 500 page views per day exhausts the KV write budget — unless D1 is bound.** Every page view bumps
+  two KV counters; with D1 bound the same page view costs **zero** KV writes, because the counters move into
+  D1 entirely. After the 1,000-write budget is gone, *every* KV write in the app fails for the rest of the
+  day: rate limiters, list saves, sync, feedback.
+
+So: **D1 is optional for correctness and close to required for anything shared.** Step 4 below is written as
+optional because the app genuinely works without it — every accessor tries D1 and falls back to KV — but if
+more than a handful of people will open your deployment, bind it. It is the single change that keeps a free
+Worker inside its own write budget.
+
+If you want the import and the cron, you want the Paid plan. Nothing else here needs it.
+
+> The plan limits above were read from Cloudflare's docs on 2026-09-08 and the per-request counts were measured
+> against this code with provider responses stubbed. The *consequences* on a free plan follow from those two
+> numbers; they have not been observed on a live free deployment.
 
 ---
 
@@ -114,7 +164,9 @@ The Worker boots and serves the catalog/manifest pages without this, but every s
 
 ### Step 4 - (Optional) Enable Cloudflare D1 Storage
 
-D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped -- most self-hosters can skip this entire section. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale.
+D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped -- a single-user install can skip this entire section. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale.
+
+**On a free Workers plan, bind it as soon as anyone but you uses the deployment.** Page-view counters are the app's most frequent KV write, and binding D1 moves them off KV entirely -- measured, two KV writes per page view become zero. Without it, roughly 500 page views spend the free plan's whole 1,000-writes-per-day budget, and after that every KV write in the app fails until the day rolls over. See [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need).
 
 Every step below is doable entirely from the Cloudflare Dashboard -- nothing here needs `wrangler`, `npx`, or a terminal of any kind, even though D1's own docs (and this file, in an earlier version) usually show the CLI first. A **Wrangler CLI alternative** is noted at the end for anyone who prefers it.
 
