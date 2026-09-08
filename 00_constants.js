@@ -215,6 +215,25 @@ const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 // invocation budget.
 const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 
+// --- Bound on /api/resolve's cross-deployment fallback -----------------------
+//
+// /api/resolve takes a `url` and, when the local config resolves to nothing,
+// refetches /api/resolve from THAT url's origin -- so one deployment can read
+// an install link minted by a sibling. Legitimate, and the client only reaches
+// it when the pasted link carried an explicit origin (resolveInstallLinkData,
+// 24_client-backup-restore-presets.js), which is at most a few times while
+// somebody imports.
+//
+// Unbounded, it was an unauthenticated outbound-request generator aimed at any
+// host on the internet, with the response echoed back to the caller. The host
+// check (isRemoteResolveOrigin, 02_http-and-creator-utils.js) is what stops it
+// reaching anything private; this is what stops it being a free reflector.
+//
+// Charged ONLY on the request that actually makes the outbound call, so an
+// ordinary import -- no `url`, or one that resolves locally -- never touches
+// the bucket.
+const RESOLVE_PROXY_PER_MINUTE = 20;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with

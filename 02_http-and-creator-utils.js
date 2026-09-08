@@ -47,6 +47,19 @@ function isPublicCorsPath(path) {
 // defaulted, so a route cannot accidentally opt out either.
 function isPrivateApiPath(path) {
   const p = String(path || "");
+  // /api/resolve is neither of those prefixes and is the one per-account GET
+  // in this Worker. It hands back the config owner's MDBList key and their
+  // Trakt/MDBList OAuth tokens to anyone holding the install id -- and being a
+  // GET, it inherited json()'s cacheable max-age default, with no Vary, so a
+  // browser (or any shared cache in front of this Worker) could store one
+  // person's OAuth tokens for an hour. The sibling page that renders the same
+  // secrets, /:config/configure, sets no-store deliberately; the two disagreed.
+  //
+  // The comment below already predicted this exact shape -- "it stops being
+  // true the day one of them gains a GET form". Named here rather than only
+  // fixed at the route, because this is the choke point that is supposed to
+  // mean a route added later cannot forget.
+  if (p === "/api/resolve") return true;
   return p.startsWith("/api/creator/") || p === "/admin" || p.startsWith("/admin/");
 }
 
@@ -2087,6 +2100,61 @@ const LIKEABLE_SENTINEL_PREFIXES = [
 ];
 const LIKEABLE_SENTINEL_EXACT = new Set(["tmdb:hidden-gems"]);
 
+// The origin /api/resolve is allowed to refetch from, or null.
+//
+// That route's `url` parameter named any http(s) origin and the Worker fetched
+// it and echoed the body back -- unauthenticated, with no allowlist and no rate
+// limit. Off Cloudflare (which the README documents as a supported way to run
+// this) loopback and RFC1918 are reachable, so that was an internal-network
+// SSRF; on Cloudflare they are not routable from the edge, but it was still an
+// unbounded outbound-request generator pointed at the public internet, burning
+// this deployment's subrequest budget and putting its egress behind somebody
+// else's traffic.
+//
+// /api/preview grew a provider allowlist for exactly this shape and this
+// sibling was missed. It cannot reuse that list, though: the legitimate target
+// here is not a provider, it is ANOTHER DEPLOYMENT OF THIS ADD-ON, which lives
+// on whatever workers.dev subdomain or custom domain its owner chose. So the
+// rule is "a real, public, DNS-named https origin" rather than a fixed set.
+//
+// The TLD test is what does most of the work. Every hostname that is really an
+// IP address in disguise fails it, in every encoding a URL parser accepts:
+//
+//   http://127.0.0.1/        last label "1"          -> rejected
+//   http://2130706433/       no dot at all           -> rejected
+//   http://0x7f.0.0.0xff/    last label "0xff"       -> rejected
+//   http://[::1]/            hostname has colons     -> rejected
+//   http://192.168.1.7:8080/ last label "7", + port  -> rejected
+//   https://my.workers.dev/  last label "dev"        -> allowed
+//
+// Names that resolve inside a private network by suffix are named explicitly,
+// since those do have alphabetic TLDs. The port is pinned because a sibling
+// deployment is always on 443, and a port is the other half of a scan.
+const PRIVATE_HOST_SUFFIXES = ["localhost", "local", "internal", "intranet", "lan", "home.arpa"];
+
+function isRemoteResolveOrigin(rawUrl) {
+  let u;
+  try {
+    u = new URL(String(rawUrl || ""));
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:") return null;
+  if (u.port && u.port !== "443") return null;
+  const host = u.hostname.toLowerCase();
+  // An IPv6 literal keeps its brackets in hostname; either way it has colons.
+  if (!host || host.includes(":")) return null;
+  const labels = host.split(".");
+  if (labels.length < 2) return null;
+  if (!labels.every((l) => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l))) return null;
+  // Alphabetic TLD: no IPv4 literal has one, in any encoding.
+  if (!/^[a-z]{2,}$/.test(labels[labels.length - 1])) return null;
+  for (const suffix of PRIVATE_HOST_SUFFIXES) {
+    if (host === suffix || host.endsWith("." + suffix)) return null;
+  }
+  return u.origin;
+}
+
 function normalizeExternalListUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   if (!s || s.length > 300) return null;
@@ -2236,6 +2304,24 @@ async function writePublicListIndex(env, entries) {
 async function updatePublicListIndex(env, id, entry) {
   if (!env || !env.CONFIGS) return false;
   if (!entry) await noteRemovedFromPublicIndex(env, [id]);
+  // An ADD for an account that is being deleted must not land.
+  //
+  // This runs at the very end of a save, and a save that authenticated a
+  // millisecond before its owner deleted the account keeps going: the purge's
+  // second pass removes the record and drops the id from the directory, and
+  // then THIS call puts the entry straight back. The record is gone, so the
+  // row 404s the moment anyone opens it -- the same stranded-entry problem
+  // removeListsFromPublicIndex was written to prevent, one pass later.
+  //
+  // The tombstone is the right thing to ask, and it is the FIRST thing
+  // purgeCreatorData writes, before it deletes anything -- so any index update
+  // that runs after the deletion began sees it. One KV read, on the save path
+  // only (never on a page view), and only for creator-owned ids: `a:` entries
+  // are anonymous published lists with no account behind them.
+  if (entry && typeof id === "string" && id.startsWith("c:")) {
+    const owner = id.slice(2).split(":")[0];
+    if (owner && (await isCreatorTombstoned(env, owner))) return true;
+  }
   try {
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
@@ -2422,12 +2508,28 @@ async function rebuildPublicListIndex(env, options = {}) {
     // of them should pay for the lookup.
     if (inFlightNames.has(username)) return inFlightNames.get(username);
     const p = (async () => {
-      let name = username;
+      // null means "this account does not exist", which buildEntry turns into
+      // a skip. Without the distinction an orphaned creatorlist: record -- one
+      // left behind by a save that raced its owner's account deletion -- was
+      // re-advertised in the directory on every rebuild, under the raw
+      // username, forever. The public list route refuses to serve it, so the
+      // entry was a dead row; this stops it being created at all.
+      let name = null;
       try {
         const profileRaw = await getCreator(countedEnv, username);
-        if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+        if (profileRaw) {
+          try {
+            name = JSON.parse(profileRaw).displayName || username;
+          } catch {
+            // Account exists, record unparseable -- index it under the slug.
+            name = username;
+          }
+        }
       } catch {
-        // fall back to the raw username slug
+        // A read that FAILED is not an account that is absent. Treat it as
+        // present under the raw username: dropping a live list from the
+        // directory over a transient KV error would be the worse mistake.
+        name = username;
       }
       state.names[username] = name;
       return name;
@@ -2460,11 +2562,18 @@ async function rebuildPublicListIndex(env, options = {}) {
       const data = JSON.parse(raw);
       await stampListVisibilityIfNeeded(countedEnv, keyName, data);
       if (!isPublicListVisibility(data.visibility)) return null;
+      let creatorName = null;
+      if (phase === 0) {
+        creatorName = await resolveDisplayName(username);
+        // See resolveDisplayName: null is "no such account", so this record is
+        // an orphan and must not go back into the directory.
+        if (creatorName === null) return null;
+      }
       return {
         id,
         isCreator: phase === 0,
         username,
-        ...(phase === 0 ? { creatorName: await resolveDisplayName(username) } : {}),
+        ...(phase === 0 ? { creatorName } : {}),
         slug,
         name: data.name || "List",
         type: data.type || "mixed",
@@ -3146,13 +3255,23 @@ async function purgeCreatorData(env, username, options = {}) {
   // and cannot be inherited either, because the tombstone holds the username
   // for longer than any request can run.
   if (deleteIdentity && identityRemoved) {
+    // Whatever this pass finds also has to come OUT OF THE DIRECTORY. The
+    // first pass collects its ids into purgedListIds and hands them to
+    // removeListsFromPublicIndex above; this one only deleted the KV keys, so
+    // a list that landed between the two passes had its record removed and its
+    // index entry left behind -- a directory row advertising an item count
+    // that 404s the moment anyone opens it. Same failure the batch removal
+    // exists to prevent, one pass later.
+    const lateListIds = [];
     try {
       let cursor;
       for (let page = 0; page < 5; page++) {
         const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
         for (const k of res.keys) {
           await env.CONFIGS.delete(k.name);
-          try { await env.CONFIGS.delete(`listlikevoters:${k.name.slice("creatorlist:".length)}`); } catch (e) {}
+          const listPath = k.name.slice("creatorlist:".length);
+          lateListIds.push("c:" + listPath);
+          try { await env.CONFIGS.delete(`listlikevoters:${listPath}`); } catch (e) {}
           listsCleared++;
         }
         if (res.list_complete || !res.cursor) break;
@@ -3172,6 +3291,17 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.delete(`creatorlastseen:${u}`);
     } catch (e) {
       console.error("purgeCreatorData: the post-deletion sweep did not finish", e);
+    }
+    if (lateListIds.length) {
+      try {
+        await removeListsFromPublicIndex(env, lateListIds);
+      } catch (e) {
+        // Best-effort, same as the sweep above: the records are gone either
+        // way, and the read path now refuses a list whose owner no longer
+        // exists (see the creator check in /lists/:user/:slug), so a stranded
+        // index entry is a dead row rather than an exposure.
+        console.error("purgeCreatorData: could not drop late lists from the directory", e);
+      }
     }
   }
 
@@ -3293,6 +3423,41 @@ async function getCreator(env, username) {
 // The cost is one indexed primary-key lookup, and only for deployments that
 // have bound D1. The caller issues it alongside the KV read rather than after
 // it, so it costs a subrequest rather than a round trip.
+// "Does this account still exist", memoized for one request.
+//
+// A creator list whose creator is gone is an orphan -- left behind by a save
+// that raced its owner's account deletion, which the two purge sweeps cannot
+// fully prevent because nothing bounds how late a KV write may land. The
+// public list route refuses to serve one; these are the two places that
+// ADVERTISE lists by reading records directly (the cold-index fallbacks in
+// /lists/public.json and /api/search-published-lists), and without this they
+// kept offering a row that 404s the moment anyone opens it.
+//
+// The promise, not the result, goes in the map: both callers fan out over a
+// page of keys with Promise.all, so a hundred lists by one creator would
+// otherwise each start their own lookup.
+//
+// A read that FAILED counts as present. getCreator already falls back to D1
+// and only returns null when neither store has the account, so this only fires
+// on a genuine absence -- and hiding live lists over a transient KV error
+// would be the worse mistake.
+function makeCreatorExistsMemo(env) {
+  const cache = new Map();
+  return function creatorExists(username) {
+    if (!username) return Promise.resolve(false);
+    if (cache.has(username)) return cache.get(username);
+    const pending = (async () => {
+      try {
+        return !!(await getCreator(env, username));
+      } catch {
+        return true;
+      }
+    })();
+    cache.set(username, pending);
+    return pending;
+  };
+}
+
 async function authoritativeKeyHash(env, username, kvKeyHash) {
   if (!env || !env.DB) return kvKeyHash;
   try {

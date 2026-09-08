@@ -438,6 +438,7 @@ async function handleFetch(request, env, ctx) {
         if (rest.includes(":")) listKeys.push({ key: k.name, isCreator: true });
       });
 
+      const creatorExists = makeCreatorExistsMemo(env);
       const listPromises = listKeys.slice(0, 100).map(async ({ key, isCreator }) => {
         const raw = await env.CONFIGS.get(key);
         if (!raw) return null;
@@ -454,6 +455,11 @@ async function handleFetch(request, env, ctx) {
           } else {
             slug = key.slice("publishedlist:user:".length);
           }
+          // Never advertise a list whose creator no longer exists -- see
+          // makeCreatorExistsMemo. The index path cannot produce one (the
+          // rebuild skips orphans); this scan reads records directly, so it
+          // has to ask.
+          if (isCreator && !(await creatorExists(username))) return null;
           const cleanSlug = slug || slugifyServer(l.name) || "list";
           return {
             name: l.name,
@@ -5588,22 +5594,54 @@ Sitemap: ${url.origin}/sitemap.xml`;
         let resData = await resolveConfig(config, env);
         let { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, watchHistory, continueWatching, watchlist, airingNext } = resData;
         if (!entries || !entries.length) {
-          if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+          // Refetch from the origin the pasted link came from, so one
+          // deployment can read an install link minted by a sibling.
+          //
+          // The test used to be `/^https?:\/\//`, which is not a check: the
+          // host, port and scheme came straight from the query string, so this
+          // was an unauthenticated fetch of any origin on the internet with the
+          // response echoed back to the caller -- an internal-network SSRF off
+          // Cloudflare, and a free outbound-request reflector on it. Its
+          // sibling /api/preview grew an allowlist for the same shape and this
+          // one was missed. See isRemoteResolveOrigin (02_http-and-creator-
+          // utils.js) for what "a real, public, DNS-named https origin"
+          // excludes and why the TLD test is what does most of the work.
+          const remoteOrigin = rawUrl ? isRemoteResolveOrigin(rawUrl) : null;
+          if (remoteOrigin) {
+            // Charged only here, on the request that actually makes the
+            // outbound call -- an ordinary import (no `url`, or one that
+            // resolved locally) never touches the bucket. No client IP means
+            // this Worker is running outside Cloudflare, where consumeRateLimit
+            // lets the request through: the host check above is the control
+            // that matters, and failing closed here would break the import
+            // button for every self-hoster rather than bound an abuse path.
+            if (await consumeRateLimit(env, ctx, "resolveproxy", clientIpKey(request), RESOLVE_PROXY_PER_MINUTE)) {
+              return json({ ok: false, error: "Too many link lookups just now. Please wait a minute and try again." }, 429);
+            }
             try {
-              const u = new URL(rawUrl);
-              const remoteResolveUrl = `${u.origin}/api/resolve?config=${encodeURIComponent(config)}`;
-              const remoteRes = await fetch(remoteResolveUrl);
+              const remoteResolveUrl = `${remoteOrigin}/api/resolve?config=${encodeURIComponent(config)}`;
+              const remoteRes = await fetchWithTimeout(remoteResolveUrl);
               if (remoteRes.ok) {
                 const remoteData = await remoteRes.json();
                 if (remoteData && remoteData.ok && Array.isArray(remoteData.entries) && remoteData.entries.length) {
-                  return json(remoteData);
+                  // jsonPrivate, not json: this body carries the OTHER
+                  // deployment's copy of the same provider keys and OAuth
+                  // tokens the local branch below returns.
+                  return jsonPrivate(remoteData);
                 }
               }
             } catch {}
           }
         }
         if (!entries || !entries.length) return json({ ok: false, error: "That link has no lists in it." });
-        return json({
+        // jsonPrivate: this body is one account's -- it carries their MDBList
+        // key and their Trakt/MDBList OAuth tokens. json()'s successful-2xx
+        // default is max-age=3600 with no Vary, and this is a GET, so a
+        // browser or any shared cache in front of this Worker could store
+        // somebody's tokens for an hour. isPrivateApiPath now names this route
+        // too, so the header is set at the boundary as well; this says so at
+        // the call site.
+        return jsonPrivate({
           ok: true,
           entries,
           watchHistory: watchHistory || [],

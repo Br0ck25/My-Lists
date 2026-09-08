@@ -1453,11 +1453,81 @@ describe("key rotation", () => {
   });
 });
 
+describe("a list whose creator is gone is not servable", () => {
+  // A save that authenticated a millisecond before its owner deleted the
+  // account keeps running, and its KV put lands after both of
+  // purgeCreatorData's sweeps. Measured before the fix: 6 of 10 plain
+  // concurrent delete+save runs left a public record behind, and because the
+  // record is genuinely `public` it stayed readable, stayed in the directory,
+  // and could never be removed -- every authenticated route answers 401 for
+  // that username. A sweep can only narrow that window, so the read side is
+  // what closes it.
+
+  it("404s a creator list with no creator record, and keeps it out of the directory", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    // Exactly the state the race produces: the list record, no account.
+    await kv.put("creatorlist:ghost:orphaned", JSON.stringify({
+      name: "Orphaned", slug: "orphaned", type: "movie", visibility: "public",
+      items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+
+    const page = await call(env, "/lists/ghost/orphaned.json");
+    assert.equal(page.status, 404, "an ownerless list must not be served");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.deepEqual(dir.body.lists, [], "an ownerless list must not be advertised");
+
+    const search = await call(env, "/api/search-published-lists?q=orphaned");
+    assert.deepEqual(search.body.lists, [], "an ownerless list must not be searchable");
+  });
+
+  it("still serves an identical list whose creator does exist", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    await kv.put("creator:realowner", JSON.stringify({
+      displayName: "Real Owner", keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+    }));
+    await kv.put("creatorlist:realowner:orphaned", JSON.stringify({
+      name: "Orphaned", slug: "orphaned", type: "movie", visibility: "public",
+      items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+
+    const page = await call(env, "/lists/realowner/orphaned.json");
+    assert.equal(page.status, 200, "a list with a live owner must still serve");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.length, 1);
+    assert.equal(dir.body.lists[0].creator, "realowner");
+  });
+
+  // The remaining half of this fix -- updatePublicListIndex refusing an ADD
+  // for an account whose deletion tombstone is already written -- cannot be
+  // reached from a route, because authenticateCreator rejects a tombstoned
+  // account before any handler runs. It only happens to a request that
+  // authenticated BEFORE the tombstone existed, which is a real race rather
+  // than a state a test can construct through the public surface. It is
+  // covered end to end by audit/adversarial-III-2026-09-08/p26_ghostpublic.mjs
+  // and p27_ghostnatural.mjs, which hold a save open across a real deletion.
+});
+
 describe("directory pagination", () => {
   it("public.json reports every seeded list after the index rebuilds", async () => {
     const kv = makeKv();
     const env = makeEnv({ CONFIGS: kv });
     const n = 180;
+    // A creator list is only reachable through authenticateCreator, so a
+    // creatorlist: record cannot exist in production without its creator:
+    // record -- and the directory now refuses to advertise one that does,
+    // because that combination means the account was deleted while a save was
+    // in flight (see makeCreatorExistsMemo). Seeding the accounts keeps these
+    // fixtures honest about that; without them these tests were exercising a
+    // state the app cannot produce.
+    for (let u = 0; u < 20; u++) {
+      await kv.put(`creator:user${String(u).padStart(2, "0")}`, JSON.stringify({
+        displayName: `user${String(u).padStart(2, "0")}`, keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+      }));
+    }
     for (let i = 0; i < n; i++) {
       const slug = `list-${String(i).padStart(4, "0")}`;
       const username = `user${String(i % 20).padStart(2, "0")}`;
@@ -1487,6 +1557,7 @@ describe("directory pagination", () => {
     // incremental index update never ran) to simulate a genuinely cold
     // index -- a fresh deploy, or the index key lost some other way.
     const n = 12;
+    await kv.put("creator:idxuser", JSON.stringify({ displayName: "idxuser", keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
     for (let i = 0; i < n; i++) {
       await kv.put(`creatorlist:idxuser:list-${i}`, JSON.stringify({
         name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
@@ -1511,6 +1582,7 @@ describe("directory pagination", () => {
     const env = makeEnv({ CONFIGS: kv });
     const n = 7;
     for (let i = 0; i < n; i++) {
+      await kv.put("creator:cronuser", JSON.stringify({ displayName: "cronuser", keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
       await kv.put(`creatorlist:cronuser:list-${i}`, JSON.stringify({
         name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
         items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,

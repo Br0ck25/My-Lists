@@ -22,6 +22,7 @@ directory with Node 22:
 | `p39_attr_browser.mjs` | **real Chromium**: the attribute half — a payload in an install link's `tmdbKey` ending `value="…"` |
 | `p40_roundtrip.mjs` | **real Chromium**: that the fix is lossless — `<`, `>`, `&`, quotes, em-dash, emoji and CJK all round-trip exactly, ld+json still parses |
 | `p20_ssrf.mjs` | `/api/resolve?url=` fetches an attacker-named origin, echoes its body, no rate limit |
+| `p41_resolve_fixed.mjs` | after the fix: the sibling-deployment path still works and is `no-store`, 11 SSRF variants make **zero** outbound requests, the outbound branch throttles at 20/min, and an ordinary import never touches the bucket |
 | `p31_installlink.mjs` | what an install link hands to anyone who has it |
 | `p34_cache.mjs` | `/api/resolve` is the only per-account GET with `max-age=3600` |
 | `p05_authmatrix.mjs` | 19 creator routes × {no auth, wrong key, **another creator's key**} — all 401 |
