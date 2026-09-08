@@ -275,11 +275,19 @@ for — the byte cost the finding is actually about is removed either way.
 
 ### Two behaviour changes worth knowing about
 
-**The three subrequest budgets default to the free-plan numbers.** That matches
-`BULK_RESOLVE_SUBREQUEST_BUDGET`'s existing precedent and it protects the deployment README documents — a
-Worker pasted into the Cloudflare dashboard, which has no `wrangler.toml` to read a variable from. Anything
-deployed with this repository's `wrangler.toml` gets the Paid values and behaves exactly as before. A free
-deployment gets working Continue Watching for the first time, at 12 shows a tick, and no chart pre-warming.
+**Two of the three subrequest budgets default to the free-plan number; the cron one does not.** The line is
+what each budget does when it binds. `BULK_RESOLVE_` and `DETAILS_BATCH_` only *pace* — the client re-posts
+what the server did not reach, so the work still completes and a low default costs invocations and nothing
+else. `CRON_SUBREQUEST_BUDGET` *disables*: below one chart's worth there is no pre-warming at all and the
+sweep drops to 12 shows a tick from 150. A default that silently switches off a working feature is the wrong
+default, so it ships at 10,000 and a free Worker sets it down to 48 — one plain-text variable under the
+Worker's Settings → Variables and Secrets.
+
+The first draft made all three free-safe on the reasoning that a dashboard paste cannot read `wrangler.toml`,
+so the constant is a paste-in deployment's only protection. True, and backwards in application: the deployment
+this add-on is published from *is* a dashboard paste, so a default only wrangler users benefit from protects
+nobody, and the free-safe cron number would have taken pre-warming off the live deployment. Corrected before
+release; a test now pins all three defaults and the README line that tells a free deployment which one to set.
 
 **The daily index rebuild starts running on busy deployments.** Staleness was read from the index blob's own
 `updatedAt`, which every incremental write bumped — so a directory busy enough to matter looked freshly built

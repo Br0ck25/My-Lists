@@ -5479,11 +5479,12 @@ describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
     return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
   }
 
-  it("skips chart pre-warming when the budget cannot fit even one chart", async () => {
+  it("skips chart pre-warming when a free Worker sets the budget down", async () => {
     // One chart is ~105 outbound fetches (5 paged reads plus a detail call per
     // item), so no free-plan budget can warm one. Issuing them anyway is what
-    // took the whole tick down -- and the episode sweep with it.
-    const env = chartEnv();
+    // took the whole tick down -- and the episode sweep with it. A free Worker
+    // sets CRON_SUBREQUEST_BUDGET=48 and gets a tick that completes instead.
+    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "48" });
     const net = stubEverything();
     const warnings = [];
     const realWarn = console.warn;
@@ -5492,6 +5493,8 @@ describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
       await runScheduledTick(env);
       assert.ok(warnings.some((w) => w.includes("chart pre-warming skipped")),
         "a skipped pre-warm must say so rather than being silent");
+      assert.ok(warnings.some((w) => w.includes("CRON_SUBREQUEST_BUDGET")),
+        "and must name the variable that turns it back on");
       assert.ok(net.count() <= 50, `one tick spent ${net.count()} outbound fetches on the free budget`);
     } finally {
       console.warn = realWarn;
@@ -5499,21 +5502,43 @@ describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
     }
   });
 
-  it("warms the charts on a paid budget, exactly as it always did", async () => {
+  it("warms the charts on the DEFAULT budget, with nothing configured", async () => {
+    // The regression this pins. The default was briefly the free-plan number,
+    // which silently switched pre-warming off and dropped the sweep to 8% of
+    // its throughput on every deployment that had not set a variable -- and
+    // the deployment this add-on is published from is a paste into the
+    // Cloudflare dashboard, which never reads wrangler.toml. A default that
+    // only wrangler users benefit from protects nobody.
+    //
     // A fresh isolate: chart results are memoised in module scope, so warming
     // them here would leave a later test's tick with nothing to write.
     const w = await freshIsolate();
-    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "10000" });
+    const env = chartEnv();
     const net = stubEverything();
     try {
       await runScheduledTick(env, {}, w);
       assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("cache:trakt:chart:")),
-        "a paid budget must still warm the whole chart list");
+        "an unconfigured deployment must still warm the whole chart list");
       // The whole list fits, so nothing is left for a next tick to resume.
       assert.equal(env.CONFIGS._store.get("cron:prewarm:cursor"), undefined);
     } finally {
       net.restore();
     }
+  });
+
+  it("keeps the two pacing budgets free-safe and only this one plan-sized", async () => {
+    // The line the three defaults are drawn on: pacing an import or a shelf
+    // refresh costs invocations and nothing else, so those stay free-safe.
+    // Pacing the cron below one chart switches a feature off, so that one is
+    // sized for the deployment and a free Worker steps it down.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8");
+    assert.match(src, /const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;/);
+    assert.match(src, /const DETAILS_BATCH_SUBREQUEST_BUDGET = 48;/);
+    assert.match(src, /const CRON_SUBREQUEST_BUDGET = 10000;/);
+    // README has to tell a free deployment which one to set, and where.
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    assert.match(readme, /Variables and Secrets/);
+    assert.match(readme, /`CRON_SUBREQUEST_BUDGET`/);
   });
 
   it("rotates through the charts when only some of them fit", async () => {

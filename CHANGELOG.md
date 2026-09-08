@@ -100,13 +100,20 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 Closes the last open items from `AUDIT-2026-09-08-ADVERSARIAL-III.md`. Every finding in that report is now
 either fixed or a recorded decision; nothing is deferred.
 
-### ⚠️ Action required if you deploy with `wrangler`
+### ⚠️ Action required only if you are on the Workers **Free** plan
 
-`wrangler.toml` now sets three plan-tuning variables (`BULK_RESOLVE_SUBREQUEST_BUDGET`,
-`DETAILS_BATCH_SUBREQUEST_BUDGET`, `CRON_SUBREQUEST_BUDGET`) to their **Workers Paid** values, which keeps the
-behaviour you have today. The constants in the code default to the **Free** values instead, because a Worker
-pasted into the Cloudflare dashboard has no `wrangler.toml` to read. If you deploy this file to a *free*
-Worker, comment that `[vars]` block out. See README's "Which Cloudflare plan do I need?".
+Three paths that used to exceed Cloudflare's 50-subrequest cap now work to a budget, and each budget is an
+environment variable. Two default to the free-safe number and need nothing from anyone. The third,
+`CRON_SUBREQUEST_BUDGET`, defaults to **10000** — the Paid number — because pacing it below one chart's worth
+switches chart pre-warming *off* and drops the Continue Watching sweep to 8% of its throughput, which is a
+feature going dark rather than a slower path to the same place.
+
+**On a free Worker, set `CRON_SUBREQUEST_BUDGET` to `48`.** Dashboard deploys: your Worker → Settings →
+Variables and Secrets → Add variable (type *Text*). You then get a tick that **completes** — Continue Watching
+sweeping 12 shows every 6 minutes, which has never worked on a free Worker before — and no chart pre-warming,
+because no free-plan budget can fit even one chart. Leave it unset on a free Worker and the tick is terminated
+outright, exactly as it is today. **On a paid Worker, do nothing.** See README's "Which Cloudflare plan do I
+need?".
 
 ### 🗑️ Removed
 
