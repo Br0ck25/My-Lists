@@ -21,7 +21,7 @@
   element.
 -->
 <script>
-const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
+const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${jsonForScript(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
 // Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
 // exact page load resolved a known chart slug -- e.g. loading
@@ -31,15 +31,15 @@ const IS_CONFIGURE = ${isConfigureMode};
 // handleInitialDeepLink in 24_client-backup-restore-presets.js, which
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
-const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+const SERVER_DEEP_LINK_LIST = ${jsonForScript(deepLinkList)};
 // The signed-in person's OAuth tokens. These are the reason the preamble
 // exists at all: they are specific to one page load and must never end up
 // in the shared bundle below, which is cached publicly under a URL that is
 // identical for every visitor.
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+let traktAccessToken = ${jsonForScript(initialTraktAccessToken)};
+let mdblistAccessToken = ${jsonForScript(initialMdblistAccessToken)};
+let simklAccessToken = ${jsonForScript(initialSimklAccessToken)};
+let simklUsername = ${jsonForScript(initialSimklUsername)};
 // Resolved from an install/configure link by the route that rendered this
 // page. Previously declared far down in 24_client-backup-restore-presets.js;
 // hoisted here because they differ per config. Moving a const declaration
@@ -56,7 +56,7 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
-const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
 
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one

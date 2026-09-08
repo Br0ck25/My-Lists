@@ -724,6 +724,46 @@ function escapeHtmlServer(s) {
   );
 }
 
+// JSON destined for the inside of a <script> element.
+//
+// JSON.stringify escapes " and \ , which is everything the JavaScript parser
+// needs -- and nothing the HTML parser does. An HTML tokenizer ends a script
+// element at the first "</script" sequence it sees, with no notion of being
+// inside a JS string, so a value carrying one closes the block early and every
+// byte after it is parsed as markup. That is a stored XSS on the two pages
+// that render caller-supplied data into the preamble: a published list's name
+// or item titles (/lists/:user/:slug) and the provider keys and OAuth tokens
+// baked into an install link (/:config/configure).
+//
+// escapeHtmlServer above is the wrong tool here -- it would turn the payload
+// into &lt;/script&gt;, which is correct in a text node and wrong inside a
+// script element, where the browser does not decode entities at all and the
+// literal &lt; would land in the value.
+//
+// \u003c is a valid escape in BOTH grammars this output has to satisfy: JSON
+// (the ld+json blocks) and JavaScript source (everything else). So the parsed
+// value is byte-for-byte what it was before -- only the wire bytes change,
+// and nothing downstream needs to know this ran.
+//
+// U+2028 and U+2029 are escaped for a separate, older reason: they are legal
+// inside a JSON string but were line terminators in JavaScript source before
+// ES2019, so an unescaped one used to be a SyntaxError that took the whole
+// bundle with it.
+//
+// Applied at EVERY stringify that lands in a script element, not only the ones
+// reachable by a caller today. Deciding per site is how this was missed twice:
+// two prior audits checked the client-side render, where escapeHtml is applied
+// correctly, and never the server-rendered preamble. html_checks.py now proves
+// the rule holds against a deliberately hostile render -- see its
+// MYLXSSPROBE check.
+function jsonForScript(value) {
+  return JSON.stringify(value === undefined ? null : value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather

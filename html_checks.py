@@ -119,6 +119,60 @@ print(f"  inline handlers resolve ({len(handler_calls)} distinct functions, "
       f"{sum(handler_calls.values())} call sites)")
 
 
+# --- XSS: no caller-supplied value may terminate the inline <script> ---
+#
+# JSON.stringify escapes " and \ -- everything the JavaScript parser needs and
+# nothing the HTML parser does. An HTML tokenizer ends a script element at the
+# first "</script" it sees, with no notion of being inside a JS string, so a
+# list name or an OAuth token carrying one closed the block early and turned
+# the rest of the payload into markup. That was a stored XSS reachable with no
+# account (POST /api/publish-list, payload in the list NAME) and a reflected
+# one through any install link. Two prior audits called this area clean because
+# both tested the CLIENT-side render, where escapeHtml is applied correctly,
+# and neither tested the server-rendered preamble.
+#
+# So this does not read the source. It renders the page with every
+# caller-supplied field set to a payload and asserts the payload came out inert
+# -- see render_check.js --hostile, which produces the input.
+#
+# Two markers, two contexts: the script preamble (jsonForScript) and the
+# settings value="..." attributes (escapeHtmlServer). Keep them identical to
+# the ones in render_check.js.
+XSS_SCRIPT_MARK = 'MYLXSSPROBE'
+XSS_ATTR_MARK = 'MYLXSSATTR'
+
+if 'hostile' in tag:
+    problems = []
+    # Positive control FIRST. Without it a render that silently stopped
+    # including these values would pass every assertion below by rendering
+    # nothing -- which is exactly the shape of check this repo has been bitten
+    # by before (see the note on check_sync.py).
+    if XSS_SCRIPT_MARK not in html:
+        problems.append(f"{XSS_SCRIPT_MARK} is absent -- the hostile render did not reach the script preamble, "
+                        "so the breakout assertion below proves nothing")
+    if XSS_ATTR_MARK not in html:
+        problems.append(f"{XSS_ATTR_MARK} is absent -- the hostile render did not reach the settings attributes, "
+                        "so the breakout assertion below proves nothing")
+    # The breakouts themselves.
+    if XSS_SCRIPT_MARK + '</script' in html:
+        problems.append(f"{XSS_SCRIPT_MARK}</script survived: a caller-supplied value ENDS the inline <script> "
+                        "element. Everything after it is parsed as HTML -> stored XSS. "
+                        "Interpolate through jsonForScript() (02_http-and-creator-utils.js), not JSON.stringify()")
+    if XSS_ATTR_MARK + '"' in html:
+        problems.append(f'{XSS_ATTR_MARK}" survived: a caller-supplied value ENDS its HTML attribute -> XSS via '
+                        'an injected event handler. Wrap the interpolation in escapeHtmlServer()')
+    if problems:
+        print("FAIL: hostile render broke out of its context:")
+        for pr in problems:
+            print("    " + pr)
+        sys.exit(1)
+    print(f"  hostile render is inert (both markers present, neither breaks out)")
+elif XSS_SCRIPT_MARK in html or XSS_ATTR_MARK in html:
+    print(f"FAIL: XSS probe markers found in a non-hostile render ({tag}) -- "
+          "render_check.js is injecting them where it should not")
+    sys.exit(1)
+
+
 # --- ARIA structure that only the rendered page can show ---
 # Both nav bars carried role="tablist" with no role="tab" beneath them, so
 # assistive technology was told to expect tabs and found none. These three

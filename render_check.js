@@ -7,6 +7,9 @@
 //   node render_check.js rendered.html          -> the builder page
 //   node render_check.js admin.html --admin     -> the admin dashboard
 //   node render_check.js sw.js --sw             -> the service worker
+//   node render_check.js hostile.html --hostile -> the builder page with every
+//                                                  caller-supplied field set to
+//                                                  an XSS payload
 //
 // The admin page needs its own pass. It is a template literal like the builder
 // page, and a single backslash inside one is eaten before the browser sees it
@@ -20,6 +23,7 @@ const vm = require('vm');
 const outPath = process.argv[2] || 'rendered.html';
 const wantAdmin = process.argv.includes('--admin');
 const wantSw = process.argv.includes('--sw');
+const wantHostile = process.argv.includes('--hostile');
 let src = fs.readFileSync('worker_entry_combined.js', 'utf8');
 
 const idx = src.lastIndexOf('export default');
@@ -73,6 +77,39 @@ if (wantSw) {
   process.exit(0);
 }
 
+// Every field a caller can put into the rendered page, set to a payload that
+// would end the inline <script> (or the enclosing attribute) if it reached the
+// browser unescaped. html_checks.py asserts, against this exact render, that
+// neither marker survives in a form that could break out -- and that both
+// markers are present at all, so the check cannot pass by rendering nothing.
+//
+// Keep the two marker strings identical to the ones in html_checks.py.
+const XSS_SCRIPT = 'MYLXSSPROBE</script><svg onload=1>';
+const XSS_ATTR = 'MYLXSSATTR" onfocus="1';
+const hostileOpts = {
+  isConfigureMode: true,
+  deepLinkList: {
+    name: XSS_SCRIPT,
+    type: 'movie',
+    url: 'https://example.com/lists/someone/a-list',
+    creatorName: XSS_SCRIPT,
+    likes: 0,
+    sample: [{ id: 'tt0111161', name: XSS_SCRIPT, poster: XSS_SCRIPT, year: XSS_SCRIPT, type: 'movie' }],
+    maybeMore: false,
+  },
+  initialEntries: [
+    { id: 'e1', name: XSS_SCRIPT, url: 'tmdb:chart:popular', type: 'movie', enabled: true, group: XSS_SCRIPT },
+  ],
+  initialKeys: {
+    // Rendered into value="..." attributes (15_tab-settings-html.js).
+    tmdbKey: XSS_ATTR, mdblistKey: XSS_ATTR, traktKey: XSS_ATTR,
+    traktUsername: XSS_ATTR, simklKey: XSS_ATTR,
+    // Rendered into the inline <script> preamble (16_client-row-core.js).
+    traktAccessToken: XSS_SCRIPT, mdblistAccessToken: XSS_SCRIPT,
+    simklAccessToken: XSS_SCRIPT, simklUsername: XSS_SCRIPT,
+  },
+};
+
 const fnName = wantAdmin ? 'renderAdminDashboard' : 'renderBuilder';
 if (typeof sandbox[fnName] !== 'function') {
   console.error('FAIL: ' + fnName + ' is not defined after evaluation');
@@ -95,7 +132,7 @@ async function main() {
   try {
     html = wantAdmin
       ? await sandbox.renderAdminDashboard({ CONFIGS: emptyKv })
-      : sandbox.renderBuilder('https://example.com', {});
+      : sandbox.renderBuilder('https://example.com', wantHostile ? hostileOpts : {});
   } catch (e) {
     console.error('FAIL: ' + fnName + '() threw:', e.message);
     process.exit(1);
@@ -106,7 +143,7 @@ async function main() {
     process.exit(1);
   }
   fs.writeFileSync(outPath, html);
-  console.log(fnName + ' OK  ->', outPath, html.length, 'chars');
+  console.log(fnName + (wantHostile ? ' (hostile input)' : '') + ' OK  ->', outPath, html.length, 'chars');
 }
 
 main();

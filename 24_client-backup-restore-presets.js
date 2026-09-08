@@ -2709,7 +2709,7 @@ function renderGuidePage(origin) {
 <meta name="twitter:title" content="${title}">
 <meta name="twitter:description" content="${description}">
 <link rel="icon" type="image/png" href="${origin}/icon.png">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
     "@context": "https://schema.org",
     "@type": "FAQPage",
     mainEntity: [

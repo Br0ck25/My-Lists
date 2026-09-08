@@ -19,6 +19,8 @@ directory with Node 22:
 | `p17_entries.mjs` | `serverEntries` breakout via both the base64 config and the short `/api/save` id |
 | `p13_browser_xss.mjs` | **real Chromium**: anonymous `/api/publish-list` → shared page → attacker script reads the victim's Creator Key |
 | `p14_browser_xss2.mjs` | **real Chromium**: the install-link (`/<config>/configure` and `/<config>/manifest.json`) variant |
+| `p39_attr_browser.mjs` | **real Chromium**: the attribute half — a payload in an install link's `tmdbKey` ending `value="…"` |
+| `p40_roundtrip.mjs` | **real Chromium**: that the fix is lossless — `<`, `>`, `&`, quotes, em-dash, emoji and CJK all round-trip exactly, ld+json still parses |
 | `p20_ssrf.mjs` | `/api/resolve?url=` fetches an attacker-named origin, echoes its body, no rate limit |
 | `p31_installlink.mjs` | what an install link hands to anyone who has it |
 | `p34_cache.mjs` | `/api/resolve` is the only per-account GET with `max-age=3600` |

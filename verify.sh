@@ -54,6 +54,18 @@ node --check service-worker.js && echo "  OK"
 rm -f service-worker.js
 
 echo
+echo "=== 4d. render the builder page with hostile input ==="
+# Steps 4 and 4b prove the page PARSES. They cannot see the bug that mattered
+# most: JSON.stringify escapes " and \ but not "</script", so a published
+# list's name -- or an OAuth token in an install link -- ended the inline
+# <script> and everything after it was parsed as HTML. Stored XSS, reachable
+# with no account at all. This renders the same page with every
+# caller-supplied field set to a payload and asserts it came out inert.
+node render_check.js rendered-hostile.html --hostile
+python3 html_checks.py rendered-hostile.html local-hostile
+rm -f rendered-hostile.html inner_local-hostile.js
+
+echo
 echo "=== 5. FUNCTION-MAP.md drift ==="
 # gen_map.py is only useful if it is actually re-run. It was not: 26% of the
 # map's 811 line numbers pointed at a line that no longer held that symbol,

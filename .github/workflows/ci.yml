@@ -61,6 +61,25 @@ jobs:
           node render_check.js rendered-admin.html --admin
           python3 html_checks.py rendered-admin.html ci-admin
 
+      # The two steps above prove the page PARSES. Neither can see the bug that
+      # mattered most: JSON.stringify escapes " and \ but not "</script", so a
+      # published list's name -- or an OAuth token baked into an install link --
+      # ended the inline <script> element and every byte after it was parsed as
+      # HTML. That was a stored XSS reachable with no account (POST
+      # /api/publish-list, payload in the list NAME) and a reflected one through
+      # any /<config>/configure link. Two audits called this area clean because
+      # both tested the client-side render, where escapeHtml is applied
+      # correctly, and neither tested the server-rendered preamble.
+      #
+      # This renders the same page with every caller-supplied field set to a
+      # payload and asserts it came out inert -- and asserts the markers are
+      # PRESENT first, so a render that quietly stopped including them cannot
+      # pass by proving nothing.
+      - name: Render the builder page with hostile input
+        run: |
+          node render_check.js rendered-hostile.html --hostile
+          python3 html_checks.py rendered-hostile.html ci-hostile
+
       # /sw.js is a template literal as well, so `node --check` above sees it
       # as string content. A broken service worker is quieter than a broken
       # page: it just fails to register, and nothing looks wrong until offline

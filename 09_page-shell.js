@@ -58,7 +58,7 @@ function renderBuilder(
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
 <meta name="twitter:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account.">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         name: ADDON_NAME,
@@ -76,7 +76,7 @@ function renderBuilder(
   // apart (see the "pre-fill" block's own comment on why that distinction
   // matters for when to trust localStorage over what the server sent).
   const usingDefaultEntries = !hasInitial;
-  const initialEntriesJson = JSON.stringify(
+  const initialEntriesJson = jsonForScript(
     hasInitial
       ? initialEntries
       : [
@@ -3347,17 +3347,17 @@ ${seoHeadHtml}
 
 <script>
 /* Chart data tables -- injected at render time for renderDiscoverChartsList */
-window._CHARTS_TMDB = ${JSON.stringify(TMDB_CHART_LISTS)};
-window._CHARTS_TRAKT = ${JSON.stringify(TRAKT_CHART_LISTS)};
-window._CHARTS_TRAKT_BO = ${JSON.stringify(TRAKT_BOXOFFICE_LIST)};
-window._CHARTS_MDBLIST = ${JSON.stringify(MDBLIST_OFFICIAL_CHARTS)};
-window._CHARTS_SIMKL = ${JSON.stringify(SIMKL_CHART_LISTS)};
-window._CHARTS_SIMKL_ANIME = ${JSON.stringify(SIMKL_ANIME_LIST)};
-window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
-window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
-window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
-window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
-window._CHARTS_GENRES = ${JSON.stringify(GENRE_LISTS)};
+window._CHARTS_TMDB = ${jsonForScript(TMDB_CHART_LISTS)};
+window._CHARTS_TRAKT = ${jsonForScript(TRAKT_CHART_LISTS)};
+window._CHARTS_TRAKT_BO = ${jsonForScript(TRAKT_BOXOFFICE_LIST)};
+window._CHARTS_MDBLIST = ${jsonForScript(MDBLIST_OFFICIAL_CHARTS)};
+window._CHARTS_SIMKL = ${jsonForScript(SIMKL_CHART_LISTS)};
+window._CHARTS_SIMKL_ANIME = ${jsonForScript(SIMKL_ANIME_LIST)};
+window._CHARTS_STREAMING_TOP10 = ${jsonForScript(STREAMING_TOP10)};
+window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
+window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
+window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
+window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }

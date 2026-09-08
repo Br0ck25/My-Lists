@@ -2500,6 +2500,46 @@ function escapeHtmlServer(s) {
   );
 }
 
+// JSON destined for the inside of a <script> element.
+//
+// JSON.stringify escapes " and \ , which is everything the JavaScript parser
+// needs -- and nothing the HTML parser does. An HTML tokenizer ends a script
+// element at the first "</script" sequence it sees, with no notion of being
+// inside a JS string, so a value carrying one closes the block early and every
+// byte after it is parsed as markup. That is a stored XSS on the two pages
+// that render caller-supplied data into the preamble: a published list's name
+// or item titles (/lists/:user/:slug) and the provider keys and OAuth tokens
+// baked into an install link (/:config/configure).
+//
+// escapeHtmlServer above is the wrong tool here -- it would turn the payload
+// into &lt;/script&gt;, which is correct in a text node and wrong inside a
+// script element, where the browser does not decode entities at all and the
+// literal &lt; would land in the value.
+//
+// \u003c is a valid escape in BOTH grammars this output has to satisfy: JSON
+// (the ld+json blocks) and JavaScript source (everything else). So the parsed
+// value is byte-for-byte what it was before -- only the wire bytes change,
+// and nothing downstream needs to know this ran.
+//
+// U+2028 and U+2029 are escaped for a separate, older reason: they are legal
+// inside a JSON string but were line terminators in JavaScript source before
+// ES2019, so an unescaped one used to be a SyntaxError that took the whole
+// bundle with it.
+//
+// Applied at EVERY stringify that lands in a script element, not only the ones
+// reachable by a caller today. Deciding per site is how this was missed twice:
+// two prior audits checked the client-side render, where escapeHtml is applied
+// correctly, and never the server-rendered preamble. html_checks.py now proves
+// the rule holds against a deliberately hostile render -- see its
+// MYLXSSPROBE check.
+function jsonForScript(value) {
+  return JSON.stringify(value === undefined ? null : value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather
@@ -14178,7 +14218,7 @@ function renderBuilder(
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
 <meta name="twitter:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account.">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         name: ADDON_NAME,
@@ -14196,7 +14236,7 @@ function renderBuilder(
   // apart (see the "pre-fill" block's own comment on why that distinction
   // matters for when to trust localStorage over what the server sent).
   const usingDefaultEntries = !hasInitial;
-  const initialEntriesJson = JSON.stringify(
+  const initialEntriesJson = jsonForScript(
     hasInitial
       ? initialEntries
       : [
@@ -17467,17 +17507,17 @@ ${seoHeadHtml}
 
 <script>
 /* Chart data tables -- injected at render time for renderDiscoverChartsList */
-window._CHARTS_TMDB = ${JSON.stringify(TMDB_CHART_LISTS)};
-window._CHARTS_TRAKT = ${JSON.stringify(TRAKT_CHART_LISTS)};
-window._CHARTS_TRAKT_BO = ${JSON.stringify(TRAKT_BOXOFFICE_LIST)};
-window._CHARTS_MDBLIST = ${JSON.stringify(MDBLIST_OFFICIAL_CHARTS)};
-window._CHARTS_SIMKL = ${JSON.stringify(SIMKL_CHART_LISTS)};
-window._CHARTS_SIMKL_ANIME = ${JSON.stringify(SIMKL_ANIME_LIST)};
-window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
-window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
-window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
-window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
-window._CHARTS_GENRES = ${JSON.stringify(GENRE_LISTS)};
+window._CHARTS_TMDB = ${jsonForScript(TMDB_CHART_LISTS)};
+window._CHARTS_TRAKT = ${jsonForScript(TRAKT_CHART_LISTS)};
+window._CHARTS_TRAKT_BO = ${jsonForScript(TRAKT_BOXOFFICE_LIST)};
+window._CHARTS_MDBLIST = ${jsonForScript(MDBLIST_OFFICIAL_CHARTS)};
+window._CHARTS_SIMKL = ${jsonForScript(SIMKL_CHART_LISTS)};
+window._CHARTS_SIMKL_ANIME = ${jsonForScript(SIMKL_ANIME_LIST)};
+window._CHARTS_STREAMING_TOP10 = ${jsonForScript(STREAMING_TOP10)};
+window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
+window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
+window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
+window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }
@@ -18390,7 +18430,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom TMDB API Key / Token</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${escapeHtmlServer(initialTmdbKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free TMDB API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent-2);">themoviedb.org/settings/api</a>.</small></p>
           </div>
         </details>
@@ -18420,10 +18460,10 @@ if ('serviceWorker' in navigator) {
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
             <div class="row">
-              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${escapeHtmlServer(initialTraktKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <div class="row" style="margin-top:8px;">
-              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${escapeHtmlServer(initialTraktUsername)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <p style="margin-top:4px;"><small>Create a free Trakt Client ID at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--accent-2);">trakt.tv/oauth/applications</a>.</small></p>
           </div>
@@ -18452,7 +18492,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${escapeHtmlServer(initialMdblistKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
           </div>
         </details>
@@ -18480,7 +18520,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${escapeHtmlServer(initialSimklKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
@@ -18640,7 +18680,7 @@ if ('serviceWorker' in navigator) {
   element.
 -->
 <script>
-const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
+const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${jsonForScript(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
 // Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
 // exact page load resolved a known chart slug -- e.g. loading
@@ -18650,15 +18690,15 @@ const IS_CONFIGURE = ${isConfigureMode};
 // handleInitialDeepLink in 24_client-backup-restore-presets.js, which
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
-const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+const SERVER_DEEP_LINK_LIST = ${jsonForScript(deepLinkList)};
 // The signed-in person's OAuth tokens. These are the reason the preamble
 // exists at all: they are specific to one page load and must never end up
 // in the shared bundle below, which is cached publicly under a URL that is
 // identical for every visitor.
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+let traktAccessToken = ${jsonForScript(initialTraktAccessToken)};
+let mdblistAccessToken = ${jsonForScript(initialMdblistAccessToken)};
+let simklAccessToken = ${jsonForScript(initialSimklAccessToken)};
+let simklUsername = ${jsonForScript(initialSimklUsername)};
 // Resolved from an install/configure link by the route that rendered this
 // page. Previously declared far down in 24_client-backup-restore-presets.js;
 // hoisted here because they differ per config. Moving a const declaration
@@ -18675,7 +18715,7 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
-const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
 
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
@@ -49732,7 +49772,7 @@ function renderGuidePage(origin) {
 <meta name="twitter:title" content="${title}">
 <meta name="twitter:description" content="${description}">
 <link rel="icon" type="image/png" href="${origin}/icon.png">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
     "@context": "https://schema.org",
     "@type": "FAQPage",
     mainEntity: [
