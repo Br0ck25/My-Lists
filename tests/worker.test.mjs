@@ -3198,6 +3198,26 @@ describe("audit fix 8: handlePosterImgError works for every call site's markup",
   });
 });
 
+// /api/bulk-resolve issues up to two TMDB calls per title. Left unstubbed the
+// tests below make those calls for real: 5,000 of them for the rate-limit test
+// alone, against api.themoviedb.org with a bogus key. Locally that is 30
+// seconds of pure network wait (3 seconds of CPU); on a CI runner with real
+// internet it is slow enough to look like a hung job, which is exactly what it
+// did. Stubbed, the same tests run in milliseconds and assert the same things.
+function stubTmdbSearch() {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (u) => {
+    calls++;
+    const href = typeof u === "string" ? u : (u && u.url) || "";
+    const body = href.includes("/external_ids")
+      ? { imdb_id: "tt0000001" }
+      : { results: [{ id: 1, title: "A Film", release_date: "2001-01-01" }] };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+}
+
 describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
   it("rejects a bulk-resolve request larger than the server's fan-out cap", async () => {
     const env = makeEnv();
@@ -3220,28 +3240,31 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     // free-safe budget the same 30 requests would only be charged for the 24
     // titles each one actually gets through, which is the point: the bucket
     // follows the TMDB quota spent, not the number of HTTP calls made.
-    const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
-    const ip = nextIp();
-    const batch = Array.from({ length: 200 }, (_, i) => ({ title: "X" + i, year: 2000 }));
-    let limited = 0;
-    for (let i = 0; i < 25; i++) {
-      const r = await call(env, "/api/bulk-resolve", { method: "POST", ip, json: { items: batch } });
-      if (r.status === 429) limited++;
-    }
-    assert.ok(limited > 0, "5,000 titles from one IP in a minute must not all be served");
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const ip = nextIp();
+      const batch = Array.from({ length: 200 }, (_, i) => ({ title: "X" + i, year: 2000 }));
+      let limited = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env, "/api/bulk-resolve", { method: "POST", ip, json: { items: batch } });
+        if (r.status === 429) limited++;
+      }
+      assert.ok(limited > 0, "5,000 titles from one IP in a minute must not all be served");
 
-    // ...and a handful of small lookups is nowhere near the ceiling, where
-    // per-request counting would have thrown them away after 20.
-    const env2 = makeEnv();
-    const ip2 = nextIp();
-    let ok = 0;
-    for (let i = 0; i < 25; i++) {
-      const r = await call(env2, "/api/bulk-resolve", {
-        method: "POST", ip: ip2, json: { items: [{ title: "X", year: 2000 }] },
-      });
-      if (r.status !== 429) ok++;
-    }
-    assert.equal(ok, 25, "25 single-title lookups is 25 titles, not 25 units of the old budget");
+      // ...and a handful of small lookups is nowhere near the ceiling, where
+      // per-request counting would have thrown them away after 20.
+      const env2 = makeEnv();
+      const ip2 = nextIp();
+      let ok = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env2, "/api/bulk-resolve", {
+          method: "POST", ip: ip2, json: { items: [{ title: "X", year: 2000 }] },
+        });
+        if (r.status !== 429) ok++;
+      }
+      assert.equal(ok, 25, "25 single-title lookups is 25 titles, not 25 units of the old budget");
+    } finally { tmdb.restore(); }
   });
 
   // This test used to assert that a caller supplying their own tmdbKey "must
@@ -5152,27 +5175,37 @@ describe("AIII fix: /api/creator/lists pages instead of reading every list", () 
 describe("AIII fix: /api/bulk-resolve fits an invocation budget and says where it stopped", () => {
   const titles = (n) => Array.from({ length: n }, (_, i) => ({ title: "Film " + i, year: 2000 }));
 
-  it("processes only what fits the budget and reports how far it got", async () => {
-    const env = makeEnv();
-    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
-    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
-    // 48 outbound fetches, two per title worst case, is 24 titles.
-    assert.equal(r.body.nextIndex, 24, "the free plan's cap is 50 outbound fetches per invocation");
-    assert.equal(r.body.done, false, "and the caller has to be told there is more");
+  it("stays inside the free plan's 50 outbound fetches and reports how far it got", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+      // The number that matters: this used to be ~400 against a cap of 50.
+      assert.ok(tmdb.count() <= 50, `spent ${tmdb.count()} outbound fetches, the free plan allows 50`);
+      assert.equal(r.body.nextIndex, 24, "48 fetches, two per title worst case, is 24 titles");
+      assert.equal(r.body.done, false, "and the caller has to be told there is more");
+    } finally { tmdb.restore(); }
   });
 
   it("says done when the whole request fitted", async () => {
-    const env = makeEnv();
-    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(5) } });
-    assert.equal(r.body.nextIndex, 5);
-    assert.equal(r.body.done, true);
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(5) } });
+      assert.equal(r.body.nextIndex, 5);
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
   });
 
   it("honours a paid plan's larger budget", async () => {
-    const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
-    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
-    assert.equal(r.body.nextIndex, 200, "400 outbound fetches covers a whole 200-title request");
-    assert.equal(r.body.done, true);
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.nextIndex, 200, "400 outbound fetches covers a whole 200-title request");
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
   });
 
   it("keeps rejecting a request over the item cap", async () => {
