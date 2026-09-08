@@ -1490,12 +1490,19 @@ function clientIpKey(request) {
 // ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
 // request it is protecting. Callers check for a missing client IP
 // themselves, since what to return in that case is route-specific.
-async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+// `cost` is how much of the bucket this call spends -- 1 for an ordinary
+// request, and for /api/bulk-resolve the number of titles it is about to
+// look up. That endpoint's real cost is someone else's TMDB quota, not the
+// request itself, so counting requests would move the ceiling by a factor of
+// eight the moment a request was split into several smaller invocations.
+// Every other caller omits it and behaves exactly as before.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60, cost = 1) {
   if (!env || !env.CONFIGS || !ip) return false;
   const key = `ratelimit:${bucket}:${ip}`;
   const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
   if (used >= maxPerWindow) return true;
-  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  const spend = Number.isFinite(cost) && cost > 0 ? Math.floor(cost) : 1;
+  const write = env.CONFIGS.put(key, String(used + spend), { expirationTtl: windowSec });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
   else await write;
   return false;
@@ -2294,6 +2301,45 @@ function sortPublicIndexEntries(entries) {
   return entries.sort(
     (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
   );
+}
+
+// Like/unlike is the frequent directory write, and it is the one that makes
+// index:publiclists a hot key.
+//
+// Every vote that changed a count did a read-modify-write of the single key
+// holding the WHOLE directory: 4.45 MB parsed, sorted and re-serialised at the
+// 20,000-entry cap, measured, for a one-number change. Cloudflare allows one
+// write per second to a given key on both plans, so past roughly one like per
+// second across the entire deployment the index was being written faster than
+// KV accepts it -- and the failure mode there is not "one entry is late", it
+// is "the directory is hours stale for everyone".
+//
+// So a like-driven index update now claims a short global cooldown first. Below
+// one like every LIKE_INDEX_COOLDOWN_SEC the cooldown is always free and every
+// vote updates the directory exactly as before -- which is every deployment
+// this code has ever run on. Above it, the writes coalesce and the skipped
+// votes are picked up by the list's next save or the daily rebuild, the same
+// backstops that already cover a lost concurrent publish.
+//
+// Deliberately NOT the whole of the audit's recommendation: sharding the index
+// across 32 keys is the other half and is not done here, because a half-sharded
+// index serves a fraction of the directory and that is worse than the current
+// behaviour. It wants one change, with a version marker in the build state,
+// and it is not urgent below a few thousand public lists.
+const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
+const LIKE_INDEX_COOLDOWN_SEC = 10;
+
+async function claimLikeIndexWrite(env) {
+  if (!env || !env.CONFIGS) return false;
+  try {
+    if (await env.CONFIGS.get(LIKE_INDEX_COOLDOWN_KEY)) return false;
+    await env.CONFIGS.put(LIKE_INDEX_COOLDOWN_KEY, "1", { expirationTtl: LIKE_INDEX_COOLDOWN_SEC });
+    return true;
+  } catch {
+    // The cooldown is an optimisation, not a correctness control. If KV is
+    // unhappy, fall back to the old behaviour rather than dropping the update.
+    return true;
+  }
 }
 
 async function writePublicListIndex(env, entries) {

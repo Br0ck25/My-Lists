@@ -707,6 +707,17 @@ async function markSimklListAllWatched(btn) {
 // chunk size comes from the same constant the server validates against so
 // the two cannot drift apart.
 //
+// The server may also process only PART of a chunk and say so: its outbound
+// budget is 50 fetches per invocation on a free Cloudflare Worker and two per
+// title, so 200 titles do not fit there. It answers with nextIndex -- how
+// many of the titles just sent it got through -- and the loop resumes from
+// exactly there. A deployment that predates that sends no nextIndex, which is
+// read as "the whole chunk", so this keeps working against an older Worker.
+//
+// Advancing by anything other than what the server actually consumed is how
+// an import silently drops titles, which is worse than failing, so a reply
+// claiming no progress is treated as an error rather than retried forever.
+//
 // Throws on the first failed chunk, matching the previous single-request
 // behaviour: each caller already has its own catch that reports the
 // category as failed rather than silently importing half of it.
@@ -714,15 +725,20 @@ async function bulkResolveInChunks(items) {
   const list = Array.isArray(items) ? items : [];
   const CHUNK = ${BULK_RESOLVE_ITEMS_MAX};
   const out = [];
-  for (let i = 0; i < list.length; i += CHUNK) {
+  let i = 0;
+  while (i < list.length) {
+    const sent = Math.min(CHUNK, list.length - i);
     const res = await fetch(ORIGIN + '/api/bulk-resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items: list.slice(i, i + CHUNK) }),
+      body: JSON.stringify({ items: list.slice(i, i + sent) }),
     });
     const data = await res.json();
     if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
     if (Array.isArray(data.resolved)) out.push.apply(out, data.resolved);
+    const consumed = Number.isFinite(data.nextIndex) ? Math.min(data.nextIndex, sent) : sent;
+    if (consumed < 1) throw new Error('the server made no progress on this batch');
+    i += consumed;
   }
   return out;
 }

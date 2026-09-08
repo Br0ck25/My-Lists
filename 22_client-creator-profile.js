@@ -3235,57 +3235,102 @@ let _creatorListsInFlight = null;
 // only reads it (find/forEach) -- so handing back the same object is safe
 // rather than a shared-mutable-state trap.
 let _lastCreatorListsResponse = null;
-let _creatorListsVersion = '';
+// One entry per page: { version, page }. The endpoint pages now (an account
+// past ~990 lists spent more KV operations than Cloudflare allows in one
+// invocation, and the dashboard 500'd forever), so the conditional-response
+// version is per page too. Almost every account is one page, where this
+// behaves exactly as the single-version cache did.
+let _creatorListsPages = [];
 
 // Cleared whenever the cached lists are dropped, so the browser can never
 // claim to hold a version it no longer has.
 function resetCreatorListsCache() {
   _lastCreatorListsResponse = null;
-  _creatorListsVersion = '';
+  _creatorListsPages = [];
 }
 
 async function fetchCreatorListsOnce(creatorKey) {
   if (_creatorListsInFlight) return await _creatorListsInFlight;
   const p = (async () => {
-    // Only claim a version if the data that version describes is still
-    // here; otherwise an "unchanged" reply would leave nothing to render.
-    const canReuse = !!(_creatorListsVersion && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
-    const res = await fetch(ORIGIN + '/api/creator/lists', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        knownVersion: canReuse ? _creatorListsVersion : '',
-      }),
-    });
-    const data = await res.json();
-    if (data && data.ok && data.unchanged) {
-      // Nothing changed server-side -- reuse the copy already in memory.
-      if (canReuse) return _lastCreatorListsResponse;
-      // Should be unreachable (the version was only sent when reusable),
-      // but if it ever happens, ask again without a version rather than
-      // returning a response with no lists in it.
-      resetCreatorListsCache();
-      const retry = await fetch(ORIGIN + '/api/creator/lists', {
+    const askFor = async (offset, knownVersion) => {
+      const res = await fetch(ORIGIN + '/api/creator/lists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          offset: offset,
+          limit: ${CREATOR_LISTS_PAGE_DEFAULT},
+          knownVersion: knownVersion || '',
+        }),
       });
-      const retryData = await retry.json();
-      if (retryData && retryData.ok) {
-        _lastCreatorListsResponse = retryData;
-        _creatorListsVersion = retryData.version || '';
+      return await res.json();
+    };
+
+    // Only claim a version if the data that version describes is still
+    // here; otherwise an "unchanged" reply would leave nothing to render.
+    const canReuse = !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+    const pages = [];
+    let combined = null;
+    for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
+      const cached = canReuse ? _creatorListsPages[i] : null;
+      let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '');
+      if (data && data.ok && data.unchanged) {
+        if (cached && cached.page) {
+          // Nothing changed on this page -- reuse the copy already in memory.
+          pages.push({ version: data.version || cached.version, page: cached.page });
+          if (!data.hasMore) break;
+          continue;
+        }
+        // Should be unreachable (a version is only sent when reusable), but
+        // if it ever happens, ask again without one rather than assembling a
+        // response with a page missing from it.
+        data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '');
       }
-      return retryData;
+      if (!data || !data.ok) {
+        resetCreatorListsCache();
+        return data;
+      }
+      pages.push({ version: data.version || '', page: data });
+      if (!combined) combined = data;
+      if (!data.hasMore) break;
     }
-    if (data && data.ok) {
-      _lastCreatorListsResponse = data;
-      _creatorListsVersion = data.version || '';
-    } else {
+    if (!pages.length) {
       resetCreatorListsCache();
+      return combined;
     }
-    return data;
+
+    // One page is the overwhelmingly common case and is handed back as-is,
+    // so nothing downstream sees a synthesised object where it used to see
+    // the server's own response.
+    let out;
+    if (pages.length === 1) {
+      out = pages[0].page;
+    } else {
+      const first = pages[0].page;
+      const lists = [];
+      const deleted = [];
+      const seenDeleted = new Set();
+      for (const p2 of pages) {
+        const pg = p2.page || {};
+        if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
+        for (const s of (pg.deletedSlugs || [])) {
+          if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+        }
+      }
+      out = {
+        ok: true,
+        displayName: first.displayName,
+        lists: lists,
+        order: first.order || [],
+        deletedSlugs: deleted,
+        total: first.total,
+        version: pages.map((x) => x.version).join('.'),
+      };
+    }
+    _lastCreatorListsResponse = out;
+    _creatorListsPages = pages;
+    return out;
   })();
   _creatorListsInFlight = p;
   try {

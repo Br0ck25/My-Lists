@@ -5786,12 +5786,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // TTL: the slug is a shared list URL somebody has handed to other
       // people, and expiring it would break their link rather than free
       // anything worth freeing. Bounded at the door instead, by this limit
-      // and PUBLISHED_LIST_ITEMS_MAX/PUBLISHED_LIST_BYTES_MAX.
+      // and the ANON_PUBLISH_* ceilings (00_constants.js).
+      //
+      // Those ceilings used to be the ones the AUTHENTICATED save uses, and
+      // the two are not the same risk: a creator list belongs to an account
+      // that can be found and deleted, an anonymous one has no owner at all
+      // and only an operator, by hand, can remove it. At the old 10 publishes
+      // a minute and 2 MB apiece this was 20 MB a minute of permanent unowned
+      // storage from one IP -- from an endpoint the shipped UI never calls.
       const plIp = clientIpKey(request);
       if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const plRateKey = `ratelimit:publishlist:${plIp}`;
       const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
-      if (plAttempts >= 10) {
+      if (plAttempts >= ANON_PUBLISH_PER_MINUTE) {
         return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
       }
       await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
@@ -5814,8 +5821,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
         return json({ ok: false, error: "That list name is too long." }, 400);
       }
-      if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
-        return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      if (plItems.length > ANON_PUBLISH_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to publish (limit ${ANON_PUBLISH_ITEMS_MAX} items).` }, 413);
+      }
+      // An item is a catalog entry, not an arbitrary JSON document. Without
+      // this the endpoint accepted any shape at all -- nested objects, whole
+      // strings, nulls -- none of which can render, so the only thing they
+      // could ever do is occupy the namespace permanently. Rejected rather
+      // than filtered, for the same reason the size bounds reject: quietly
+      // storing something other than what was sent is the worse bug.
+      for (const it of plItems) {
+        if (!it || typeof it !== "object" || Array.isArray(it)) {
+          return json({ ok: false, error: "That list contains an entry that is not a list item." }, 400);
+        }
+        const itId = it.id != null ? it.id : it.imdbId;
+        if (typeof itId !== "string" || !itId || itId.length > ANON_PUBLISH_ITEM_ID_MAX) {
+          return json({ ok: false, error: "That list contains an entry with no usable id." }, 400);
+        }
       }
       // Never falls through onto a slug that is taken -- see pickFreeSlug.
       const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
@@ -5838,7 +5860,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
       // mirrored to D1 on this path, so unlike the creator guard this one is
       // only a storage bound; the two were deliberately kept in step.
-      if (utf8ByteLength(plPayload) > PUBLISHED_LIST_BYTES_MAX) {
+      if (utf8ByteLength(plPayload) > ANON_PUBLISH_BYTES_MAX) {
         return json({ ok: false, error: "That list is too large to publish." }, 413);
       }
       await env.CONFIGS.put(plKey, plPayload);
@@ -5959,16 +5981,27 @@ Sitemap: ${url.origin}/sitemap.xml`;
           // name/type/itemCount match what is actually stored.
           const likeIsCreator = likeKey === likeCreatorKey;
           if (isPublicListVisibility(updated.visibility)) {
-            ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
-              isCreator: likeIsCreator,
-              username: likeIsCreator ? likeUser : "user",
-              slug: likeSlug,
-              name: updated.name || "List",
-              type: updated.type || "mixed",
-              itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
-              likes: count,
-              updatedAt: updated.updatedAt || updated.createdAt || null,
-            }));
+            // Behind a short global cooldown. This is a read-modify-write of
+            // the single key holding the whole directory -- 4.45 MB at the
+            // entry cap -- and likes are the frequent write, so at any real
+            // like rate it was being issued faster than KV's one-write-per-
+            // second-per-key allows. Below that rate the cooldown is always
+            // free and this behaves exactly as it did; above it the writes
+            // coalesce and the skipped votes ride along on the list's next
+            // save or the daily rebuild. See claimLikeIndexWrite.
+            ctx.waitUntil((async () => {
+              if (!(await claimLikeIndexWrite(env))) return;
+              await updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+                isCreator: likeIsCreator,
+                username: likeIsCreator ? likeUser : "user",
+                slug: likeSlug,
+                name: updated.name || "List",
+                type: updated.type || "mixed",
+                itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
+                likes: count,
+                updatedAt: updated.updatedAt || updated.createdAt || null,
+              });
+            })().catch(() => {}));
           }
         }
       }

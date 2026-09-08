@@ -56,11 +56,12 @@ directory with Node 22:
 | `p26_ghostpublic.mjs` | a write held across `delete-account` leaves a permanently-public, unremovable list |
 | `p27_ghostnatural.mjs` | the same with **no** artificial stalling: 6/10 plain concurrent runs |
 | `p28_rebuild_privacy.mjs` | making a list private *through the API* mid-rebuild is **not** republished (clean) |
-| `p29_dashscale.mjs` | `/api/creator/lists` KV ops and response size at 10 / 100 / 500 / 1,200 lists |
-| `p30_breakpoint.mjs` | the exact breakpoint: 990 lists → 1,001 KV ops, over Cloudflare's cap |
+| `p29_dashscale.mjs` | `/api/creator/lists` KV ops and response size at 10 / 100 / 500 / 1,200 lists. Re-run after the paging fix: KV ops flatten at **209** and the response at **2.52 MB**, whatever the list count |
+| `p30_breakpoint.mjs` | the exact breakpoint: 990 lists → 1,001 KV ops, over Cloudflare's cap. Re-run after the fix: **210 at every size**, so the breakpoint is gone |
 | `p21_scale_index.mjs` | cost of one public save at index sizes 100 → 20,000 (4.45 MB RMW) |
 | `p22_kvops.mjs` | KV get/put/delete/list counts per request, with and without D1 |
-| `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50 |
+| `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50. Re-run after the budget fix: `/api/bulk-resolve` at its 200-title maximum is **48**, was 400. `/api/details/batch` (180) and the cron tick (186) are untouched and still over |
+| `p44_hotkey_and_publish.mjs` | after the fix: 25 likes in a burst cost **1** whole-directory rewrite (was 25) with every vote still counted, and one IP's anonymous publishing is down to 5 records and 2.1 MB a minute with five kinds of non-item entry refused |
 | `p24_cpu.mjs` | PBKDF2 and per-request CPU vs. the free plan's 10 ms |
 
 ## Deployment profile (Addendum A)

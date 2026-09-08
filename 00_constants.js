@@ -28,9 +28,37 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
-const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+
+// --- ...and the tighter ones for /api/publish-list specifically -------------
+//
+// PUBLISHED_LIST_ITEMS_MAX and the 2 MB byte ceiling that used to sit beside
+// it were shared with the AUTHENTICATED list save, and the two are not the
+// same risk. A creator list belongs to an account that can be found, warned
+// and deleted; an anonymous published list has no owner at all, gets no TTL
+// (the slug is a URL somebody has shared -- expiring it would break their
+// link), and can only be removed by an operator, by hand, from the admin
+// panel.
+//
+// At 10 publishes a minute and 2 MB apiece that was 20 MB a minute of
+// permanent unowned storage from one IP -- a free plan's entire 1 GB
+// namespace in under an hour, and its whole 1,000-writes-per-day budget in
+// under two minutes -- from an endpoint the shipped UI never calls. (It is
+// also the easiest route to a stored payload, which is what made it vector A
+// of this audit's XSS finding.)
+//
+// So this path gets its own, much tighter ceilings. Still far above anything
+// genuine: the largest list ever observed in a real account export was ~1,200
+// items, which serialises to roughly 130 KB. What changes is the worst case,
+// from 20 MB/minute to 2.5.
+const ANON_PUBLISH_ITEMS_MAX = 5000;
+const ANON_PUBLISH_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+const ANON_PUBLISH_PER_MINUTE = 5;
+// An item is a catalog entry, not an arbitrary JSON document. Anything this
+// rejects could not have rendered anyway -- it could only have occupied the
+// namespace.
+const ANON_PUBLISH_ITEM_ID_MAX = 128;
 
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //
@@ -58,6 +86,30 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // export was ~1,200 items.
 const CREATOR_LIST_BYTES_MAX = 1_800_000;
 
+// --- Bound on what /api/creator/lists reads in one invocation ---------------
+//
+// That route is the creator dashboard's only data source. It read the account's
+// whole list order and then issued ONE KV get per list, with no cap: 990 lists
+// is 1,001 KV operations, past Cloudflare's 1,000-operations-per-invocation
+// limit (that is the KV/D1 cap -- 1,000 on Free and Paid alike -- not the
+// outbound-fetch one). At that point the invocation is terminated and the
+// dashboard never loads again. Because deleting a list is done FROM the
+// dashboard, an account that crossed the line had no in-app way back.
+//
+// Not hypothetical: one real account reached 129 list records for 22 real
+// lists through the duplicate-slug bug, and a repeat of anything like that
+// walks straight into this wall.
+//
+// So the route pages. The default is well clear of any real account (the
+// measured average is ~6 lists) so the common case is still exactly one
+// request, and the client pages through the rest rather than losing it.
+const CREATOR_LISTS_PAGE_DEFAULT = 200;
+const CREATOR_LISTS_PAGE_MAX = 500;
+// A stop on the client's paging loop, so a server that never sets hasMore=false
+// cannot spin forever. 100 pages x 200 = 20,000 lists, far past anything the
+// rest of these bounds allow.
+const CREATOR_LISTS_MAX_PAGES = 100;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
@@ -80,6 +132,26 @@ const CREATOR_LIST_BYTES_MAX = 1_800_000;
 // Shared with the client so the chunk size it sends and the size the server
 // accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
+// ...and how much of one INVOCATION's outbound-fetch budget the route may
+// spend before it stops and hands back a continuation.
+//
+// This is what makes the endpoint work on a free Worker without making a paid
+// one send eight times as many titles per request: the REQUEST size stays 200,
+// and the server processes as much of it as fits, reporting how far it got.
+// The client re-posts the remainder. So the import completes on both plans;
+// on Free it simply arrives as more invocations.
+//
+// 48 is two per item for 24 items, under the free plan's 50. A paid deployment
+// can raise it with a BULK_RESOLVE_SUBREQUEST_BUDGET var in wrangler.toml and
+// get the old one-invocation behaviour back.
+const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;
+// The per-IP ceiling, counted in TITLES rather than requests. It used to be 20
+// requests a minute, which was 4,000 titles while a request carried 200 of
+// them -- and would have become 480 the moment the budget above split a
+// request into several. Counting the thing the endpoint actually spends
+// (someone else's TMDB quota) keeps the ceiling where it was, however the
+// work is divided up.
+const BULK_RESOLVE_ITEMS_PER_MINUTE = 4000;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //

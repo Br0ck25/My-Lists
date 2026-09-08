@@ -2826,9 +2826,26 @@ async function renderAdminDashboard(env) {
           btn.disabled = false;
           return;
         }
+        // The public directory index truncates silently at its entry cap --
+        // it keeps the most-liked and drops the tail, which is the right
+        // choice, but nothing said it had happened. Reported here in every
+        // branch below, because it has nothing to do with D1: a KV-only
+        // deployment can hit it too.
+        var idx = data.publicIndex;
+        var indexNote = '';
+        if (idx) {
+          var pct = idx.max ? Math.round((idx.entries / idx.max) * 100) : 0;
+          indexNote = idx.truncated
+            ? '<p style="color:#FF9500; margin:10px 0 0; font-size:0.82rem;"><strong>The public list directory is full.</strong> ' +
+              'It holds ' + idx.entries.toLocaleString() + ' of a maximum ' + idx.max.toLocaleString() +
+              ' entries, so the least-liked lists past that point are no longer being advertised. ' +
+              'They are still reachable by their own URL.</p>'
+            : '<p style="color:#8E8E93; margin:10px 0 0; font-size:0.82rem;">Public list directory: ' +
+              idx.entries.toLocaleString() + ' of ' + idx.max.toLocaleString() + ' entries (' + pct + '%).</p>';
+        }
         if (!data.bound) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>';
+          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -2836,13 +2853,13 @@ async function renderAdminDashboard(env) {
           status.textContent = '';
           out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
             (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
-            ' This is not the same as a missing migration \u2014 try again.</p>';
+            ' This is not the same as a missing migration \u2014 try again.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
         if (data.upToDate) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -2860,7 +2877,7 @@ async function renderAdminDashboard(env) {
           '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
           '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
           '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table></div>';
+          '<tbody>' + rows + '</tbody></table></div>' + indexNote;
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

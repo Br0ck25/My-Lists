@@ -1540,3 +1540,170 @@ describe("client: toggling one item into an account list cites the version", () 
       "both additions survive; the stale array would have dropped tt-theirs");
   });
 });
+
+// --- AIII-15/18: the two client loops that make the server's paging work ----
+//
+// Both endpoints now hand back part of an answer plus a continuation, and in
+// both cases a client that ignores it loses data silently: the dashboard would
+// show only the first page of lists (and then helpfully re-upload the ones it
+// could not see), and a Letterboxd import would drop every title past the
+// first batch. So the loops get their own tests.
+describe("client: the dashboard pages through every list the account owns", () => {
+  function pagedRoutes(total, pageSize, seen) {
+    return {
+      [LISTS]: (req) => {
+        const offset = req.body.offset || 0;
+        if (seen) seen.push({ offset, limit: req.body.limit, knownVersion: req.body.knownVersion });
+        const lists = [];
+        for (let i = offset; i < Math.min(offset + pageSize, total); i++) {
+          lists.push({ slug: "l" + i, name: "List " + i, type: "movie", items: [], updatedAt: 1000 + i });
+        }
+        return { json: {
+          ok: true, displayName: "alice", lists, order: [], deletedSlugs: [],
+          total, offset, limit: pageSize, hasMore: offset + lists.length < total,
+          version: "v" + offset,
+        } };
+      },
+    };
+  }
+
+  it("keeps asking until the server says there is no more", async () => {
+    const seen = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: pagedRoutes(450, 200, seen),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(data.lists.length, 450, "a dashboard showing only the first page re-uploads the rest");
+    assert.equal(seen.map((s) => s.offset).join(","), "0,200,400");
+    assert.equal(new Set(data.lists.map((l) => l.slug)).size, 450, "and nothing arrives twice");
+    assert.equal(data.lists[449].slug, "l449");
+  });
+
+  it("hands a single-page account the server's own response, untouched", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: pagedRoutes(6, 200),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(data.lists.length, 6);
+    assert.equal(data.version, "v0", "nothing downstream should see a synthesised object here");
+  });
+
+  it("stops at one page against a Worker that does not page at all", async () => {
+    // An older deployment sends no hasMore. Reading that as "there is more"
+    // would loop 100 times against the same offset.
+    let calls = 0;
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: { [LISTS]: () => { calls++; return { json: { ok: true, displayName: "alice", lists: [{ slug: "a", items: [] }], order: [], deletedSlugs: [], version: "v" } }; } },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(calls, 1);
+    assert.equal(data.lists.length, 1);
+  });
+
+  it("reuses a cached page the server says is unchanged, and still learns there is more", async () => {
+    // The conditional-response version is per page now. The trap this guards
+    // is an "unchanged" page 0 that carries no paging fields: the client would
+    // have no way to know page 1 exists and would silently show 200 of 300.
+    const seen = [];
+    const bodies = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LISTS]: (req) => {
+          const offset = req.body.offset || 0;
+          seen.push({ offset, knownVersion: req.body.knownVersion });
+          const version = "v" + offset;
+          const paging = { total: 300, offset, limit: 200, hasMore: offset + 200 < 300, version };
+          if (req.body.knownVersion === version) {
+            bodies.push("unchanged@" + offset);
+            return { json: { ok: true, unchanged: true, ...paging } };
+          }
+          const lists = [];
+          for (let i = offset; i < Math.min(offset + 200, 300); i++) {
+            lists.push({ slug: "l" + i, name: "List " + i, type: "movie", items: [] });
+          }
+          return { json: { ok: true, displayName: "alice", lists, order: [], deletedSlugs: [], ...paging } };
+        },
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const first = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(first.lists.length, 300);
+    client.set("lastCreatorListsData", first.lists);
+
+    const again = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(again.lists.length, 300, "an unchanged page must not truncate the assembled result");
+    assert.ok(bodies.includes("unchanged@0") && bodies.includes("unchanged@200"),
+      "the second pass must cite the version it holds for each page");
+    assert.equal(seen.filter((s) => s.offset === 200).length, 2,
+      "and must still ask for page 1 after an unchanged page 0");
+  });
+});
+
+describe("client: a Letterboxd import follows the server's continuation", () => {
+  const RESOLVE = "/api/bulk-resolve";
+
+  it("resumes from exactly what the server processed, not from the chunk size", async () => {
+    const posted = [];
+    const client = loadClient({
+      routes: {
+        [RESOLVE]: (req) => {
+          const items = req.body.items || [];
+          posted.push(items.length);
+          // A free-plan Worker: 24 titles per invocation, whatever it was sent.
+          const took = Math.min(24, items.length);
+          return { json: {
+            ok: true,
+            resolved: items.slice(0, took).map((it) => ({ title: it.title, imdbId: "tt" + it.title })),
+            nextIndex: took,
+            done: took >= items.length,
+          } };
+        },
+      },
+    });
+
+    const titles = Array.from({ length: 100 }, (_, i) => ({ title: String(i), year: 2000 }));
+    const out = await client.call("bulkResolveInChunks", titles);
+
+    assert.equal(out.length, 100, "advancing by the chunk size would silently drop 76 of these");
+    // Joined, not deepEqual'd: the bundle evaluates in a vm sandbox, so an
+    // array it built has that realm's Array.prototype and deepStrictEqual
+    // rejects it on the prototype before it ever looks at the contents.
+    assert.equal(out.map((r) => r.title).join(","), titles.map((t) => t.title).join(","), "and in order");
+    assert.equal(posted.length, Math.ceil(100 / 24));
+  });
+
+  it("still works against a Worker that sends no continuation", async () => {
+    const client = loadClient({
+      routes: {
+        [RESOLVE]: (req) => ({ json: {
+          ok: true,
+          resolved: (req.body.items || []).map((it) => ({ title: it.title, imdbId: "tt" + it.title })),
+        } }),
+      },
+    });
+    const out = await client.call("bulkResolveInChunks", Array.from({ length: 500 }, (_, i) => ({ title: String(i) })));
+    assert.equal(out.length, 500, "a missing nextIndex means the whole chunk was processed");
+  });
+
+  it("refuses to spin when the server reports no progress", async () => {
+    const client = loadClient({
+      routes: { [RESOLVE]: () => ({ json: { ok: true, resolved: [], nextIndex: 0, done: false } }) },
+    });
+    await assert.rejects(
+      () => client.call("bulkResolveInChunks", [{ title: "A" }, { title: "B" }]),
+      /no progress/,
+      "an infinite retry loop is worse than a reported failure",
+    );
+  });
+});
