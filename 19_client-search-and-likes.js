@@ -1804,6 +1804,18 @@ window.openSelectListModalFromItemModal = function() {
   openSelectListModal(d.id, isSeries ? 'series' : 'movie', d.title || '', d.poster || '');
 };
 
+// Which show's episode list is cached for a season number. The cache was
+// keyed on the season number alone, and it is never cleared, so opening one
+// show's season 3 and then another's compared the second show's watched
+// count against the FIRST show's episode list -- a 10-episode season made a
+// 22-episode one look complete. Both writer (toggleSeasonEpisodes) and
+// reader (isSeasonFullyWatched) are handed the same show id, so keying on it
+// costs nothing.
+function seasonEpisodesKey(showId, seasonNum) {
+  return String(showId) + '|' + Number(seasonNum);
+}
+window.seasonEpisodesKey = seasonEpisodesKey;
+
 function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   if (!showId || seasonNum == null) return false;
   const sNum = Number(seasonNum);
@@ -1818,12 +1830,24 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
   ].filter(Boolean));
 
-  if (window._fullyWatchedShowIds) {
-    for (const sid of showIdsToCheck) {
-      if (window._fullyWatchedShowIds.has(sid)) return true;
-    }
-  }
-
+  // _fullyWatchedShowIds deliberately NOT consulted here, though it used to
+  // short-circuit this function with an unconditional true.
+  //
+  // That set does not mean "every episode of this show was watched". It means
+  // "Continue Watching has nothing left to offer for this show", and three
+  // things put a show in it: Mark Whole Show Watched, dismissing the show from
+  // Continue Watching (dismissContinueWatchingShow calls
+  // setShowFullyWatched(showId, true) on purpose -- dismissed is "caught up"
+  // as far as the badge is concerned), and updateContinueWatching deciding
+  // there is no season after the last watched one. Only the first is evidence
+  // about a season, and it needs none: it writes every episode into Watch
+  // History, so the per-season count below already sees them.
+  //
+  // The other two are how a season the user had never touched came up saying
+  // "Mark Season Unwatched" -- one dismissal flipped the button on all 24
+  // seasons of a show with nothing watched in any of them. A season is
+  // watched when this browser has the episodes to prove it, and not
+  // otherwise.
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
@@ -1838,8 +1862,9 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
 
     const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
 
-    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
-      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
+    const loadedEpisodes = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonEpisodesKey(showId, sNum)];
+    if (loadedEpisodes) {
+      const aired = loadedEpisodes.filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
       if (aired.length > 0) return distinctEps.size >= aired.length;
     }
 
@@ -1893,6 +1918,15 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     if (!data.ok || !data.season || !Array.isArray(data.season.episodes)) {
       throw new Error(data.error || 'Failed to fetch season episodes');
     }
+
+    // Remember what this season actually contains, so isSeasonFullyWatched
+    // can compare against the AIRED episodes rather than TMDB's
+    // episode_count. The two differ only for a season still going out, and
+    // that is precisely the season this marks all of: it skips unaired
+    // episodes below, so counting against episode_count would leave the
+    // button saying "Mark Season Watched" immediately after marking it.
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonEpisodesKey(d.id, seasonNum)] = data.season.episodes;
 
     const episodes = [];
     data.season.episodes.forEach(ep => {
@@ -2196,7 +2230,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     if (!data.ok || !data.season || !data.season.episodes) throw new Error(data.error || 'Failed to load season');
     
     if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
-    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+    window._seasonEpisodesMap[seasonEpisodesKey(imdbId, seasonNum)] = data.season.episodes;
     
     // Fall back to the season's own poster, then the show's poster, when
     // an episode has no still (TMDB frequently lacks stills for reality/

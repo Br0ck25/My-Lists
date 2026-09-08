@@ -1,5 +1,50 @@
 # Changes Log
 
+## 2026-09-08 - A season claiming to be watched when none of it was
+
+### Files Changed
+`07_source-fetchers-tmdb-simkl.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Reported with a screenshot: NCIS season 10, "24 episodes", button reading "✓ Mark Season Unwatched", and not one episode in the season marked watched.
+
+`isSeasonFullyWatched` (`19`) opened with this:
+
+```js
+if (window._fullyWatchedShowIds) {
+  for (const sid of showIdsToCheck) {
+    if (window._fullyWatchedShowIds.has(sid)) return true;
+  }
+}
+```
+
+That set does not mean "every episode of this show has been watched". It means "Continue Watching has nothing left to offer for this show", and three things put a show in it:
+
+- **Mark Whole Show Watched.** Real evidence — and it needs no shortcut, because it writes every aired episode into Watch History, which the per-season count below the early return already reads.
+- **Dismissing the show from Continue Watching.** `dismissContinueWatchingShow` calls `setShowFullyWatched(showId, true)` on purpose, with a comment saying so: dismissed is "caught up" as far as the blue checkmark is concerned. One press on one card, and every season of a show with nothing watched in any of them claimed to be watched.
+- **`updateContinueWatching` failing to find season N+1.** Which is the second bug. It asks `/api/season` for the season after the last watched one to learn whether the show has ended, and that route answers `404 { ok: false }` for a season TMDB is sure is not there *and* for a rate limit, a 5xx, or an unreachable TMDB — `fetchTmdbSeasonDetailsUncached` collapsed both into `null` at `if (!res.ok) return null`. The client read every one of them as "no further season, so the show is complete". The function's own declaration comment promises the opposite ("stays null if a fetch below fails, so a network hiccup can't flip the badge one way or the other"), and the *first* of its two fetches honours it by throwing on `!data.ok`. Only the second one did not.
+
+A third defect sits in the same function's evidence: `window._seasonEpisodesMap` is keyed on the season number alone and never cleared, so opening one show's season 3 and then another's compared the second show's watched count against the first show's episode list.
+
+### What Changed
+
+**The early return is gone (`19`).** A season is watched when this browser holds the episodes to prove it. The one legitimate writer of that set already leaves those episodes behind, so nothing that was correct before stops being correct; the two heuristic writers stop being able to speak for a season they know nothing about.
+
+**`_seasonEpisodesMap` is keyed per show (`19`).** A `seasonEpisodesKey(showId, seasonNum)` helper, used by the writer (`toggleSeasonEpisodes`) and the reader (`isSeasonFullyWatched`), both of which are already handed the same show id.
+
+**Marking a season or a show now caches what it marked (`19`, `21`).** Both skip unaired episodes, and the fallback yardstick is TMDB's `episode_count`, which counts them. For a season still going out those differ, so without the early return masking it, a season would have read as unwatched the instant it was marked. Both paths already fetch the episode list they are marking from — they now keep it, so the comparison is against aired episodes, which is what was actually marked.
+
+**`/api/season` says which failure it hit (`07`, `25`).** TMDB answers 404 only for a season it is sure is not there, so that case returns `{ seasonMissing: true }` and the route reports `seasonExists: false`; anything else stays `null` and the route reports `seasonExists: null`. The sentinel carries no `episodes` key, so the four other callers — all of which test for one — see it exactly as they saw `null`.
+
+**`updateContinueWatching` believes only the first (`21`).** `seasonExists === false` concludes the show has ended; anything else leaves `showFullyWatched` at null, the "don't know" the rest of the function already uses.
+
+### Verification
+`bash verify.sh` — 437 tests. Seven are new, and each was mutation-checked against the code it covers:
+
+- five in `tests/client.test.mjs` — a caught-up flag does not make an unwatched season read as watched; a genuinely fully-watched season still does; a partly-watched one does not; another show's cached season list is not the yardstick; and a still-airing season counts aired episodes once its list is loaded. Restoring the early return or the season-number-only key fails two of them.
+- two in `tests/worker.test.mjs` — `/api/season` reports `seasonExists: false` for a TMDB 404 and `null` for a 429. Removing the sentinel fails the first. They use different season numbers because the lookup is memoised per isolate on `tmdb:season:<id>:<n>`, and one number would have served the first case's answer to the second.
+
 ## 2026-09-08 - UI reports from real use: page shift, PWA bars, See All counts, Search reloads
 
 ### Files Changed

@@ -7946,3 +7946,54 @@ describe("the last open items from the 2026-09-05 audit", () => {
       "the removed route leaves a note saying what still reads its records");
   });
 });
+
+// --- /api/season: "no such season" vs "the lookup failed" -------------------
+//
+// Continue Watching asks for season N+1 to find out whether a show has ended.
+// This route answered 404 { ok: false } for both a season TMDB is sure is not
+// there and a rate limit or a 5xx, so the client read every failure as "the
+// show is over, every episode is watched" and filed it under fullyWatchedShowIds
+// -- which then made every season of it claim to be watched.
+describe("/api/season says whether the season is really absent", () => {
+  // A distinct season number per case: the season lookup is memoised per
+  // isolate on tmdb:season:<id>:<n>, so reusing one number would serve the
+  // first case's answer to the second and the assertion could not fail.
+  async function season(tmdbStatus, seasonNum) {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      const url = String(typeof u === "string" ? u : u.url);
+      if (url.includes("/3/find/")) {
+        return new Response(JSON.stringify({ tv_results: [{ id: 4614 }] }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("/season/")) {
+        return new Response(tmdbStatus === 200 ? JSON.stringify({ episodes: [] }) : "", {
+          status: tmdbStatus, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const env = { ...makeEnv(), TMDB_API_KEY: "test-tmdb-key" };
+      const r = await call(env, "/api/season?imdbId=tt0364845&seasonNum=" + seasonNum + "&tmdbKey=test-tmdb-key");
+      return r.body;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("reports seasonExists:false when TMDB is sure the season is not there", async () => {
+    const body = await season(404, 90);
+    assert.equal(body.ok, false);
+    assert.equal(body.seasonExists, false,
+      "the client needs this to conclude a show has ended");
+  });
+
+  it("reports seasonExists:null when the lookup itself failed", async () => {
+    const body = await season(429, 91);
+    assert.equal(body.ok, false);
+    assert.equal(body.seasonExists, null,
+      "a rate limit is not evidence that the show has ended");
+  });
+});

@@ -1211,7 +1211,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (!imdbId || !seasonNum) return json({ ok: false, error: "Missing imdbId or seasonNum" }, 400);
         
         const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId, env, ctx);
-        if (!seasonData) return json({ ok: false, error: "Not found or TMDB error" }, 404);
+        if (!seasonData || seasonData.seasonMissing) {
+          // seasonExists distinguishes the two failures this single 404 has
+          // always covered: false means TMDB is sure the season is not there,
+          // null means the lookup itself did not come back. Continue Watching
+          // asks for season N+1 to learn whether a show has ended and needs
+          // the difference -- see updateContinueWatching.
+          return json({
+            ok: false,
+            error: "Not found or TMDB error",
+            seasonExists: seasonData ? false : null,
+          }, 404);
+        }
         
         // A short max-age (not json()'s 3600s default) -- this response's
         // shape has changed before (the tmdbId passthrough above is a

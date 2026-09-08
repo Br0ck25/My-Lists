@@ -13894,6 +13894,14 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
+  // "There is no such season" and "the lookup failed" both used to come back
+  // as null, and one caller has to tell them apart: Continue Watching asks
+  // for season N+1 to find out whether the show has ended, and read a rate
+  // limit or a 5xx as "it has" -- which marked a show fully watched off a
+  // network hiccup. TMDB answers 404 only for a season it is sure is not
+  // there. No `episodes` key, so every other caller (all of which test for
+  // one) still sees this as no data, exactly as it saw null.
+  if (res.status === 404) return { seasonMissing: true };
   if (!res.ok) return null;
   const data = await res.json();
   
@@ -28049,6 +28057,18 @@ window.openSelectListModalFromItemModal = function() {
   openSelectListModal(d.id, isSeries ? 'series' : 'movie', d.title || '', d.poster || '');
 };
 
+// Which show's episode list is cached for a season number. The cache was
+// keyed on the season number alone, and it is never cleared, so opening one
+// show's season 3 and then another's compared the second show's watched
+// count against the FIRST show's episode list -- a 10-episode season made a
+// 22-episode one look complete. Both writer (toggleSeasonEpisodes) and
+// reader (isSeasonFullyWatched) are handed the same show id, so keying on it
+// costs nothing.
+function seasonEpisodesKey(showId, seasonNum) {
+  return String(showId) + '|' + Number(seasonNum);
+}
+window.seasonEpisodesKey = seasonEpisodesKey;
+
 function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   if (!showId || seasonNum == null) return false;
   const sNum = Number(seasonNum);
@@ -28063,12 +28083,24 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
   ].filter(Boolean));
 
-  if (window._fullyWatchedShowIds) {
-    for (const sid of showIdsToCheck) {
-      if (window._fullyWatchedShowIds.has(sid)) return true;
-    }
-  }
-
+  // _fullyWatchedShowIds deliberately NOT consulted here, though it used to
+  // short-circuit this function with an unconditional true.
+  //
+  // That set does not mean "every episode of this show was watched". It means
+  // "Continue Watching has nothing left to offer for this show", and three
+  // things put a show in it: Mark Whole Show Watched, dismissing the show from
+  // Continue Watching (dismissContinueWatchingShow calls
+  // setShowFullyWatched(showId, true) on purpose -- dismissed is "caught up"
+  // as far as the badge is concerned), and updateContinueWatching deciding
+  // there is no season after the last watched one. Only the first is evidence
+  // about a season, and it needs none: it writes every episode into Watch
+  // History, so the per-season count below already sees them.
+  //
+  // The other two are how a season the user had never touched came up saying
+  // "Mark Season Unwatched" -- one dismissal flipped the button on all 24
+  // seasons of a show with nothing watched in any of them. A season is
+  // watched when this browser has the episodes to prove it, and not
+  // otherwise.
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
@@ -28083,8 +28115,9 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
 
     const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
 
-    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
-      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
+    const loadedEpisodes = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonEpisodesKey(showId, sNum)];
+    if (loadedEpisodes) {
+      const aired = loadedEpisodes.filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
       if (aired.length > 0) return distinctEps.size >= aired.length;
     }
 
@@ -28138,6 +28171,15 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     if (!data.ok || !data.season || !Array.isArray(data.season.episodes)) {
       throw new Error(data.error || 'Failed to fetch season episodes');
     }
+
+    // Remember what this season actually contains, so isSeasonFullyWatched
+    // can compare against the AIRED episodes rather than TMDB's
+    // episode_count. The two differ only for a season still going out, and
+    // that is precisely the season this marks all of: it skips unaired
+    // episodes below, so counting against episode_count would leave the
+    // button saying "Mark Season Watched" immediately after marking it.
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonEpisodesKey(d.id, seasonNum)] = data.season.episodes;
 
     const episodes = [];
     data.season.episodes.forEach(ep => {
@@ -28441,7 +28483,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
     if (!data.ok || !data.season || !data.season.episodes) throw new Error(data.error || 'Failed to load season');
     
     if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
-    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+    window._seasonEpisodesMap[seasonEpisodesKey(imdbId, seasonNum)] = data.season.episodes;
     
     // Fall back to the season's own poster, then the show's poster, when
     // an episode has no still (TMDB frequently lacks stills for reality/
@@ -38699,6 +38741,13 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Same reason as markSeasonWatched's copy of this: unaired
+            // episodes are skipped below, so isSeasonFullyWatched has to
+            // measure against the aired ones rather than TMDB's
+            // episode_count or a still-airing season reads as unwatched the
+            // moment it has been marked.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[seasonEpisodesKey(imdbId, season.season_number)] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -39050,11 +39099,18 @@ async function updateContinueWatching(showId) {
         } else {
           showFullyWatched = true;
         }
-      } else {
-        // No further season at all -- this was the last one, and it's
-        // fully watched.
+      } else if (data2 && data2.seasonExists === false) {
+        // TMDB is sure there is no season after this one -- the show has
+        // ended and every aired episode of it has been watched.
         showFullyWatched = true;
       }
+      // Anything else means the next-season lookup did not come back (rate
+      // limit, upstream error, the 404 this route also answers when TMDB
+      // itself could not be reached). showFullyWatched stays null, which is
+      // this function's own "don't know" -- the same thing a thrown fetch
+      // leaves behind, and what the comment on its declaration promises.
+      // Reading a failed lookup as "no further season" is how a show nobody
+      // had finished ended up in _fullyWatchedShowIds.
     }
   } catch (e) {
     // Silent failure -- showFullyWatched stays null, see comment above.
@@ -53304,7 +53360,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (!imdbId || !seasonNum) return json({ ok: false, error: "Missing imdbId or seasonNum" }, 400);
         
         const seasonData = await fetchTmdbSeasonDetails(imdbId, seasonNum, tmdbKey, knownTmdbId, env, ctx);
-        if (!seasonData) return json({ ok: false, error: "Not found or TMDB error" }, 404);
+        if (!seasonData || seasonData.seasonMissing) {
+          // seasonExists distinguishes the two failures this single 404 has
+          // always covered: false means TMDB is sure the season is not there,
+          // null means the lookup itself did not come back. Continue Watching
+          // asks for season N+1 to learn whether a show has ended and needs
+          // the difference -- see updateContinueWatching.
+          return json({
+            ok: false,
+            error: "Not found or TMDB error",
+            seasonExists: seasonData ? false : null,
+          }, 404);
+        }
         
         // A short max-age (not json()'s 3600s default) -- this response's
         // shape has changed before (the tmdbId passthrough above is a

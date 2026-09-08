@@ -1816,6 +1816,13 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Same reason as markSeasonWatched's copy of this: unaired
+            // episodes are skipped below, so isSeasonFullyWatched has to
+            // measure against the aired ones rather than TMDB's
+            // episode_count or a still-airing season reads as unwatched the
+            // moment it has been marked.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[seasonEpisodesKey(imdbId, season.season_number)] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -2167,11 +2174,18 @@ async function updateContinueWatching(showId) {
         } else {
           showFullyWatched = true;
         }
-      } else {
-        // No further season at all -- this was the last one, and it's
-        // fully watched.
+      } else if (data2 && data2.seasonExists === false) {
+        // TMDB is sure there is no season after this one -- the show has
+        // ended and every aired episode of it has been watched.
         showFullyWatched = true;
       }
+      // Anything else means the next-season lookup did not come back (rate
+      // limit, upstream error, the 404 this route also answers when TMDB
+      // itself could not be reached). showFullyWatched stays null, which is
+      // this function's own "don't know" -- the same thing a thrown fetch
+      // leaves behind, and what the comment on its declaration promises.
+      // Reading a failed lookup as "no further season" is how a show nobody
+      // had finished ended up in _fullyWatchedShowIds.
     }
   } catch (e) {
     // Silent failure -- showFullyWatched stays null, see comment above.

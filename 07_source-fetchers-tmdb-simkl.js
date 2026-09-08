@@ -1604,6 +1604,14 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
+  // "There is no such season" and "the lookup failed" both used to come back
+  // as null, and one caller has to tell them apart: Continue Watching asks
+  // for season N+1 to find out whether the show has ended, and read a rate
+  // limit or a 5xx as "it has" -- which marked a show fully watched off a
+  // network hiccup. TMDB answers 404 only for a season it is sure is not
+  // there. No `episodes` key, so every other caller (all of which test for
+  // one) still sees this as no data, exactly as it saw null.
+  if (res.status === 404) return { seasonMissing: true };
   if (!res.ok) return null;
   const data = await res.json();
   

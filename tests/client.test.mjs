@@ -1854,3 +1854,95 @@ describe("client: a Letterboxd import follows the server's continuation", () => 
     );
   });
 });
+
+// --- Season watched state ---------------------------------------------------
+//
+// Reported from a phone: every season button on NCIS read "✓ Mark Season
+// Unwatched" while nothing in any of those seasons was watched.
+//
+// isSeasonFullyWatched used to start by consulting _fullyWatchedShowIds and
+// returning true if the show was in it. That set does not mean "every episode
+// was watched" -- dismissing a show from Continue Watching puts it there on
+// purpose (dismissed is "caught up" as far as the badge is concerned), and so
+// did a failed next-season lookup. Either one made all 24 seasons claim to be
+// watched.
+function showWithSeasons(client, { seasons, watchedEpisodes = [], fullyWatched = [] }) {
+  client.set("window._currentItemDetails", {
+    id: "tt0364845", title: "NCIS", tmdbId: "4614",
+    seasonsData: seasons.map((s) => ({ season_number: s.n, episode_count: s.count, name: "Season " + s.n })),
+  });
+  client.window._fullyWatchedShowIds = new Set(fullyWatched);
+  client.window._seasonEpisodesMap = {};
+  // Through the memo loadLocalCustomLists checks first, not localStorage:
+  // the bundle populates that memo while it loads, so a later write to
+  // storage is never read back.
+  client.set("_memoryCustomListsObj", {
+    "watch-history": {
+      slug: "watch-history", name: "Watch History",
+      items: watchedEpisodes.map((e) => ({
+        id: "ep" + e.s + "x" + e.e, type: "episode", showId: "tt0364845",
+        showTitle: "NCIS", seasonNum: e.s, episodeNum: e.e,
+      })),
+    },
+  });
+  return client;
+}
+
+describe("client: a season is watched only when its episodes are", () => {
+  it("does not call a season watched because the show is flagged caught-up", () => {
+    const client = showWithSeasons(loadClient(), {
+      seasons: [{ n: 10, count: 24 }],
+      watchedEpisodes: [],
+      // What dismissContinueWatchingShow leaves behind, and what a failed
+      // next-season lookup used to leave behind.
+      fullyWatched: ["tt0364845"],
+    });
+    assert.equal(
+      client.call("isSeasonFullyWatched", "tt0364845", 10, 24), false,
+      "nothing in season 10 is watched, so the button must offer to mark it",
+    );
+  });
+
+  it("still reports a season whose episodes really were all watched", () => {
+    const watchedEpisodes = Array.from({ length: 24 }, (_, i) => ({ s: 10, e: i + 1 }));
+    const client = showWithSeasons(loadClient(), { seasons: [{ n: 10, count: 24 }], watchedEpisodes });
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 10, 24), true);
+  });
+
+  it("does not report a partly-watched season", () => {
+    const client = showWithSeasons(loadClient(), {
+      seasons: [{ n: 10, count: 24 }],
+      watchedEpisodes: [{ s: 10, e: 1 }, { s: 10, e: 2 }],
+    });
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 10, 24), false);
+  });
+
+  it("measures against the show's own episode list, not another show's", () => {
+    const client = showWithSeasons(loadClient(), {
+      seasons: [{ n: 10, count: 24 }],
+      watchedEpisodes: [{ s: 10, e: 1 }, { s: 10, e: 2 }],
+    });
+    // A different show's season 10, loaded earlier in the same session. The
+    // cache was keyed on the season number alone, so these 2 aired episodes
+    // were the yardstick for NCIS's 24-episode season 10.
+    client.window._seasonEpisodesMap[client.call("seasonEpisodesKey", "tt1234567", 10)] =
+      [{ episode_number: 1, air_date: "2000-01-01" }, { episode_number: 2, air_date: "2000-01-08" }];
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 10, 24), false);
+  });
+
+  it("counts only aired episodes once this show's season has been loaded", () => {
+    const client = showWithSeasons(loadClient(), {
+      seasons: [{ n: 11, count: 24 }],
+      watchedEpisodes: [{ s: 11, e: 1 }, { s: 11, e: 2 }],
+    });
+    // A season still going out: TMDB's episode_count is 24, two have aired,
+    // and both are watched. Marking a season skips unaired episodes, so this
+    // is the state right after "Mark Season Watched" on a current season.
+    client.window._seasonEpisodesMap[client.call("seasonEpisodesKey", "tt0364845", 11)] = [
+      { episode_number: 1, air_date: "2000-01-01" },
+      { episode_number: 2, air_date: "2000-01-08" },
+      { episode_number: 3, air_date: "2999-01-01" },
+    ];
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 11, 24), true);
+  });
+});
