@@ -215,12 +215,32 @@ const DETAILS_BATCH_MAX_ROUNDS = 8;
 // user-visible half of the tick has already been written to KV before the
 // expensive optional half starts.
 //
-// The default is the free-plan number, for the same reason
-// BULK_RESOLVE_SUBREQUEST_BUDGET's is: a Worker pasted into the Cloudflare
-// dashboard has no wrangler.toml and no way to set a var, and that is exactly
-// the deployment the README documents. Anyone deploying with this repo's
-// wrangler.toml gets CRON_SUBREQUEST_BUDGET = "10000" and the full tick.
-const CRON_SUBREQUEST_BUDGET = 48;
+// The default is the PAID number, and it is the only one of the three that is.
+// The difference is what the budget does when it binds:
+//
+//   BULK_RESOLVE_ and DETAILS_BATCH_ only PACE. Everything still completes --
+//   the client re-posts what the server did not reach -- so a low default
+//   costs invocations and nothing else. Free-safe is the right default there,
+//   and it is what those two ship with.
+//
+//   This one DISABLES. Below one chart's worth of budget there is no
+//   pre-warming at all, and the sweep drops to 12 shows a tick, which is 8% of
+//   its throughput. That is a feature going dark, not a slower path to the
+//   same place.
+//
+// A default that silently switches off a working feature is the wrong default,
+// so this one is sized for the deployment this code actually runs on. It is
+// NOT sized by wrangler.toml: the deployment README documents -- and the one
+// this add-on is published from -- is a paste into the Cloudflare dashboard,
+// which never reads that file. A default only wrangler users benefit from
+// would protect nobody.
+//
+// A free Worker sets this down to 48, which is one plain-text variable in the
+// dashboard (your Worker -> Settings -> Variables and Secrets). That is the
+// same amount of work the other direction would have cost the paid deployment,
+// spent by the deployment that gains a feature rather than the one that loses
+// one. See README's "Which Cloudflare plan do I need?".
+const CRON_SUBREQUEST_BUDGET = 10000;
 // Two season lookups per show, worst case -- see findNextAiredEpisodeForShow.
 const CRON_EPISODE_CHECK_FETCHES = 2;
 // 5 paged chart fetches + up to PAGE_SIZE detail resolutions. A ceiling, not
@@ -231,9 +251,9 @@ const CRON_CHART_WARM_FETCHES = 105;
 // sweep has always used, so a paid deployment behaves exactly as before.
 const CRON_EPISODE_CHECK_MAX = 150;
 // How much of the budget the episode sweep may claim before the pre-warm gets
-// what is left. At the free default that is 24 fetches -> 12 shows a tick,
-// which is 2,880 checks a day; at 10,000 it is 5,000 -> the 150 ceiling above,
-// leaving 9,700 for the charts, which covers all 47 of them.
+// what is left. At the 10,000 default that is 5,000 -> the 150 ceiling above,
+// leaving 9,700 for the charts, which covers all 47 of them; at a free
+// Worker's 48 it is 24 fetches -> 12 shows a tick, which is 2,880 checks a day.
 const CRON_EPISODE_CHECK_SHARE = 0.5;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------

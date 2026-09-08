@@ -69,19 +69,37 @@ id = "YOUR_KV_NAMESPACE_ID"
 # CRON_SUBREQUEST_BUDGET -- how many outbound fetches ONE cron tick may spend.
 # Half of it goes to the Continue Watching sweep (two fetches per show), the
 # rest to chart pre-warming. One chart is about 105 fetches, so under that the
-# pre-warm is skipped with a log line and only the episode sweep runs -- which
-# is the free plan's reality and is why the code's default is 48.
+# pre-warm is skipped with a log line and only the episode sweep runs.
 #
-# The three defaults are all the FREE-plan numbers, because a Worker pasted
-# into the Cloudflare dashboard has no wrangler.toml to read a var from and
-# that is the deployment README.md documents. Anything deployed with THIS file
-# is assumed to be on Workers Paid: the values below restore the full
-# behaviour -- a 200-title import in one invocation, a whole cold Airing Next
-# refresh in one, and a 6-minute tick that sweeps 150 shows and warms all 47
-# charts. Comment the block out if you deploy this file to a free Worker.
+# This one defaults to the PAID number (10,000) while the two above default to
+# the free-safe 48, and the difference is what each does when it binds. Pacing
+# bulk-resolve or details-batch costs invocations and nothing else -- the client
+# re-posts what the server did not reach, and the work still completes. Pacing
+# the cron below one chart's worth switches pre-warming OFF and drops the sweep
+# to 8% of its throughput: a feature going dark rather than a slower path to the
+# same place. A default that silently does that to a working deployment is the
+# wrong default.
+#
+# ON A FREE WORKER, set it down:
+#
+#   CRON_SUBREQUEST_BUDGET = "48"
+#
+# which gives you a tick that completes -- Continue Watching sweeping 12 shows
+# every 6 minutes, 2,880 a day -- and no chart pre-warming, because no free-plan
+# budget can fit even one chart. That is a strictly better free plan than the
+# tick Cloudflare used to terminate outright.
+#
+# Deploying by pasting into the Cloudflare dashboard instead of with wrangler?
+# None of this file is read. Set these as plain-text variables under your
+# Worker -> Settings -> Variables and Secrets, or leave them unset and take the
+# defaults. See README.md's "Which Cloudflare plan do I need?".
 [vars]
+# Both raise a free-safe default to its Paid equivalent: a whole 200-title
+# import in one invocation, and a whole cold Airing Next refresh in one.
 BULK_RESOLVE_SUBREQUEST_BUDGET = "400"
 DETAILS_BATCH_SUBREQUEST_BUDGET = "600"
+# Already the code's default; stated here so all three knobs are visible in one
+# place. Change it to "48" if you deploy this file to a free Worker.
 CRON_SUBREQUEST_BUDGET = "10000"
 
 # --- Cron trigger (REQUIRED for Continue Watching) ---------------------------

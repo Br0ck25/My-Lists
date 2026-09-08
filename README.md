@@ -101,10 +101,12 @@ Measured against those, on the free plan:
   two KV counters; with D1 bound the same page view costs **zero** KV writes, because the counters move into
   D1 entirely. After the 1,000-write budget is gone, *every* KV write in the app fails for the rest of the
   day: rate limiters, list saves, sync, feedback.
-- **Chart pre-warming does not run.** One chart warm is ~105 subrequests on its own — five paged TMDB reads
-  and a detail call per item — so no free-plan budget can fit even one. The tick skips it and logs one line
-  saying so. Catalogs still load; they are simply colder, and the deployment leans harder on the provider
-  rate limits.
+- **Chart pre-warming does not run, and the cron needs one variable set.** One chart warm is ~105 subrequests
+  on its own — five paged TMDB reads and a detail call per item — so no free-plan budget can fit even one.
+  Set `CRON_SUBREQUEST_BUDGET` to `48` (see [below](#the-three-subrequest-budgets)) and the tick skips the
+  pre-warm, logs one line saying why, and **completes** — which is what gets Continue Watching working. Leave
+  it unset and Cloudflare terminates the tick outright, so neither half runs. Catalogs still load either way;
+  without pre-warming they are simply colder and lean harder on the provider rate limits.
 
 So: **D1 is optional for correctness and close to required for anything shared.** Step 4 below is written as
 optional because the app genuinely works without it — every accessor tries D1 and falls back to KV — but if
@@ -114,21 +116,28 @@ Worker inside its own write budget.
 ### The three subrequest budgets
 
 Three paths used to exceed the 50-subrequest cap outright, which meant Cloudflare terminated the invocation
-and the feature was simply absent on a free Worker. As of 1.5.3 each of them works to a budget instead, and
-each budget is a variable you can raise:
+and the feature was simply absent on a free Worker. Each of them works to a budget instead, and each budget is
+an environment variable:
 
-| Variable | Default | What it bounds | What the default costs you on Free |
+| Variable | Default | What it bounds | Set it on a free Worker? |
 |---|---|---|---|
-| `BULK_RESOLVE_SUBREQUEST_BUDGET` | 48 | `/api/bulk-resolve` — the Letterboxd CSV import | 24 titles per invocation; the client re-posts the rest, so the import finishes either way |
-| `DETAILS_BATCH_SUBREQUEST_BUDGET` | 48 | `/api/details/batch` — rebuilding the Airing Next shelf | only *cold* ids are charged; a warm refresh is one invocation on either plan |
-| `CRON_SUBREQUEST_BUDGET` | 48 | one 6-minute cron tick | Continue Watching sweeps 12 shows a tick (2,880 a day) and chart pre-warming is skipped |
+| `BULK_RESOLVE_SUBREQUEST_BUDGET` | `48` | `/api/bulk-resolve` — the Letterboxd CSV import | **No.** Already free-safe: 24 titles per invocation, and the client re-posts the rest until the import finishes |
+| `DETAILS_BATCH_SUBREQUEST_BUDGET` | `48` | `/api/details/batch` — rebuilding the Airing Next shelf | **No.** Already free-safe. Only *cold* ids are charged, so a warm refresh is one invocation on either plan |
+| `CRON_SUBREQUEST_BUDGET` | `10000` | one 6-minute cron tick | **Yes — set it to `48`.** Otherwise the tick is terminated and Continue Watching never runs |
 
-The defaults are the free-plan numbers because a Worker pasted into the Cloudflare dashboard has no
-`wrangler.toml` to read a variable from, and that is the deployment [Step 2](#step-2--deploy-the-add-on-code)
-documents. **If you deploy with this repository's `wrangler.toml` you get the Paid values already set** — a
-whole 200-title import in one invocation, a whole cold Airing Next refresh in one, and a tick that sweeps 150
-shows and warms all 47 charts. Comment that `[vars]` block out if you are deploying this file to a free
-Worker.
+Two of the three default to the free-safe number and one does not, and the difference is what each budget does
+when it binds. Pacing an import or a shelf refresh costs invocations and nothing else — the work still
+completes. Pacing the cron below one chart's worth of budget switches chart pre-warming **off** and drops the
+Continue Watching sweep to 8% of its throughput. That is a feature going dark rather than a slower path to the
+same place, so it is sized for a paid Worker by default and a free one steps it down.
+
+**Setting a variable when you deploy by pasting into the dashboard:** your Worker → **Settings** → **Variables
+and Secrets** → **Add variable**, type *Text*, name `CRON_SUBREQUEST_BUDGET`, value `48`. Deploy. Nothing in
+`wrangler.toml` is read on that path, so this is the only place these can be set.
+
+With `CRON_SUBREQUEST_BUDGET = 48` a free Worker gets a tick that **completes** — Continue Watching sweeping 12
+shows every 6 minutes, 2,880 a day — and no chart pre-warming, because no free-plan budget can fit even one
+chart. Catalogs still load; they are simply colder.
 
 Nothing is dropped at any budget. Each endpoint reports what it did not reach and the client asks again; the
 cron resumes from a stored cursor, so a smaller slice costs ticks, not coverage — and there are 240 ticks a
