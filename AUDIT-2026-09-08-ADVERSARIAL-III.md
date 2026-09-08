@@ -51,7 +51,16 @@ is out of scope, so `trackEvent('list-copy', …)` — the **only** producer of 
 in the app — throws into a bare `catch` every time. The `stats:list_copy:` namespace a previous
 audit carefully rewired to be *readable* has never received a single write.
 
-## Scalability posture — the documented deployment target cannot run this app
+## Scalability posture — split by deployment, see the addendum
+
+> **Deployment correction (added 2026-09-08, after the first pass).** The maintainer
+> confirmed the production site runs **with D1 bound**, at ~400 creator accounts, and that the
+> **KV-only path is the self-hosting-for-friends configuration**, not production. Everything in
+> this section was measured on the KV-only, free-plan profile and is therefore about
+> **self-hosters**, not about `mylistsaddon.com`. See
+> [Addendum A](#addendum-a--re-scoring-against-the-real-production-profile) for the re-measured
+> production numbers and one finding that only exists because D1 is bound. Every **security**
+> finding in this report is unaffected by either choice.
 
 README.md:17 says *"self-host on your own free Cloudflare Worker."* Against the limits I
 fetched from Cloudflare's docs today (Free: **10 ms CPU**, **50 subrequests/invocation**,
@@ -1640,6 +1649,153 @@ PHASE 5 — Hardening and cleanup
 
 ---
 
+# Addendum A — Re-scoring against the real production profile
+
+**Added 2026-09-08, after the maintainer confirmed the deployment.** Production runs with **D1
+bound** at ~**400 creator accounts**; the KV-only configuration is for self-hosters running the
+addon for themselves and a few friends. Every number below was re-measured under that profile
+(`p37_d1_profile.mjs`, `p38_warm_index.mjs`).
+
+## Nothing in the security half changes
+
+The critical XSS, both `/api/resolve` findings, the ghost-list deletion race, all three unbound
+identifiers, the false-success save, the conflict-guard gap and `/api/publish-list` are
+independent of KV-vs-D1 and of the plan. The ghost-list race in particular was already measured
+**with D1 bound** — D1's foreign key rejects the orphan row, KV accepts it, and
+`/lists/:user/:slug` reads KV, so the ghost is served either way.
+
+## Measured: production steady state, D1 bound, warm index
+
+400 accounts x 6 lists = 1,200 lists, of which 600 public. `index:publiclists` is **243 KB**.
+KV operations and D1 queries both count as subrequests.
+
+| Route | KV ops | D1 queries | Subrequests | Workers Paid (10,000) | Workers Free (50) |
+|---|---:|---:|---:|---|---|
+| `GET /` page view | 0 | 1 | **1** | ok | ok |
+| `GET /lists/public.json` | 2 | 0 | **2** | ok | ok |
+| `GET /api/search-published-lists` | 2 | 0 | **2** | ok | ok |
+| `POST /api/lists/like` | 4 | 1 | **5** | ok | ok |
+| `POST /api/creator/lists` (6 lists) | 11 | 4 | **15** | ok | ok |
+| `POST /api/creator/sync/load` | 14 | 3 | **17** | ok | ok |
+| `POST /api/creator/lists/save` (public) | 16 | 4 | **20** | ok | ok |
+| `GET /admin` | 12 | 12 | **24** | ok | over |
+| `POST /admin/api/migrate-d1` (one chunk) | 355 | 350 | **705** | ok | over |
+| `POST /admin/api/rebuild-public-index` (one chunk) | 804 | 1 | **805** | ok | over |
+
+Every hot path is comfortably inside the paid budgets. The round-4 directory index and the
+round-5 admin work both hold up exactly as their trackers claim: the directory and search each
+cost **2 subrequests** at 1,200 lists, and `/admin` costs 24.
+
+## Findings that change
+
+| Finding | Was | Now | Why |
+|---|---|---|---|
+| **Free-plan budget mismatch** | MEDIUM, production | MEDIUM, **self-host documentation only** | Not production's problem. Sharper for its real audience: on Free, a full PBKDF2 verification (17.6 ms) cannot complete inside the 10 ms CPU cap, so **sign-in itself fails**; bulk-resolve (400), the cron (186) and details/batch (180) all exceed the 50-subrequest cap; and 2 KV writes per page view exhausts the 1,000/day budget at ~500 views. New, measured here: **on Free, D1 is capped at 50 queries per invocation** (vs 1,000 paid), so a free self-hoster who binds D1 still cannot run `migrate-d1` (350 D1 queries per chunk). |
+| **`stats:pageviews:total` hot key** | MEDIUM | **INFORMATIONAL** for production | Measured: a page view with D1 bound is **0 KV writes, 1 D1 query** — `bumpStat` returns early into D1's atomic upsert. The 1-write-per-second-per-key ceiling only exists on the KV-only path. |
+| **`index:publiclists` single hot key** | MEDIUM | **LOW** at current scale | At 1,200 public lists the blob is **243 KB**, not the 4.45 MB it reaches at the 20,000 cap, and a like costs 5 subrequests end to end. The write-rate ceiling needs a sustained >1 public write/second site-wide, which 400 accounts will not produce. Revisit at ~5,000 public lists, or if likes ever become a burst feature. |
+| **`/api/creator/lists` 990-list wall** | HIGH | **HIGH, but latent** | Unchanged by D1: `getCreatorList` reads KV first, so it is still one KV get per list even with D1 bound, and the 1,000-operations-per-invocation cap is identical on both plans. At 6 lists per account you are two orders of magnitude away from it. Still worth fixing — it has no graceful degradation and no in-app recovery — but it belongs after the security work, not before it. |
+
+## New finding — visible only because D1 is bound
+
+## [LOW] The list-size guard is stated in bytes and measured in UTF-16 code units
+
+**Category:** Data Integrity / KV-D1 consistency
+**Confidence:** Confirmed (executed)
+**File:** `00_constants.js:59` (`CREATOR_LIST_BYTES_MAX`), `26_api-creator-and-admin-routes.js:1882`
+
+### Description
+
+```js
+const itemsJson = JSON.stringify(items || []);
+if (itemsJson.length > CREATOR_LIST_BYTES_MAX) { ... 413 ... }
+```
+
+`String.prototype.length` counts **UTF-16 code units**. The constant's own comment says why the
+number is 1.8 MB:
+
+> *"D1's maximum string/row size is 2,000,000 **bytes**. A creator list is mirrored into
+> `creator_lists.items_json`, and a record over that limit cannot be written — the failure lands
+> in a catch that logs and carries on, so the list simply stops being mirrored, silently."*
+
+The reasoning is byte-based; the check is not. CJK text is 1 UTF-16 unit and 3 UTF-8 bytes per
+character; astral characters and emoji are 2 units and 4 bytes. So a list can pass the guard at
+1.8 M units and still be several megabytes on the wire.
+
+### Why it matters *now*
+
+While D1 was optional this was a silent no-op. With D1 bound it is a live KV/D1 divergence: the
+save succeeds, KV stores the list, the public page serves it — and the row D1 never received is
+one the admin panel reads from.
+
+### Proof
+
+`p36_d1_bytes.mjs` — a 2,000-item list of Japanese titles with overviews:
+
+```
+JSON.stringify().length (UTF-16 units, what the guard checks): 1,775,971  cap 1,800,000  -> ACCEPTED
+UTF-8 bytes (what D1 actually limits):                         4,711,971  cap 2,000,000  -> OVER by 136%
+ratio bytes/unit: 2.65
+
+POST /api/creator/lists/save -> 200 {"ok":true,"slug":"anime-collection", ...}
+KV record written:        true
+D1 row written:           false
+public page still works:  200
+admin dashboard lists it: false
+migrate-d1 repairs it:    ["List bigjp:anime-collection: D1_ERROR: ..."]     <- every run, forever
+```
+
+### Scope
+
+It takes a genuinely large list to reach — 1.8 M UTF-16 units is roughly ten thousand items — so
+this is an edge case, not something the current 400 accounts are likely hitting. It is reported
+because the guard does not do what its own comment says it does, and because the failure is
+silent in both directions: the user is told the list saved, and the operator sees a
+`migrate-d1` error they cannot clear.
+
+### Recommended fix
+
+One line, at both size guards:
+
+```js
+const itemsBytes = new TextEncoder().encode(itemsJson).length;
+if (itemsBytes > CREATOR_LIST_BYTES_MAX) { ... }
+```
+
+`/api/publish-list`'s `PUBLISHED_LIST_BYTES_MAX` check has the same shape. Anonymous published
+lists get no `creator_lists` row, so nothing is diverging there today — but the constant is
+named in bytes there too, and the two guards were deliberately kept in step.
+
+### Regression risk
+
+Lists that currently save may start being refused at 413 — which is the intended behaviour, but
+it is a behaviour change for any account holding a large non-ASCII list. Worth running once
+against production data to see whether any existing list would newly fail, before shipping.
+
+## Revised fix order for production
+
+Phase 4 (scalability) largely leaves the production critical path. The order becomes:
+
+```text
+1. The XSS, all six sinks + the CI check that keeps them fixed
+2. /api/resolve  ->  jsonPrivate() + isPrivateApiPath(), then the host allowlist and rate limit
+3. purgeCreatorData re-sweep + fail closed on an ownerless list        (ghost lists)
+4. isShow / clientId / listName, and the no-undef pass that finds them
+5. saveLocalCustomListEdit's false success, and the three unarmed conflict guards
+6. README: what a free Worker cannot run, and that D1 is required past a handful of users
+7. TextEncoder byte check on both list-size guards
+8. /api/creator/lists paging  (latent at 6 lists/account -- schedule it, do not rush it)
+9. Cleanup: publish-list, external-list/create, reset-key status, dead code
+```
+
+## Still unverified
+
+Whether production is on **Workers Paid**. D1 being bound does not imply it, and the two
+plans differ on every budget above. At 400 accounts a free Worker would also be against the
+100,000-requests-per-day ceiling. If production is on Free, the entire free-plan finding applies
+to production too and moves back to the top of the list. **NOT VERIFIED — no access to the
+Cloudflare account from this session.**
+
+
 # Reproducing This Audit
 
 ```bash
@@ -1654,6 +1810,8 @@ node p27_ghostnatural.mjs                        # HIGH, ghost public lists (6/1
 node p30_breakpoint.mjs                          # HIGH, 990-list KV cap
 node p23_subrequests.mjs && node p24_cpu.mjs     # MEDIUM, free-plan limits
 node p05_authmatrix.mjs && node p06_adminmatrix.mjs   # clean results
+node p36_d1_bytes.mjs                            # LOW, UTF-16 vs bytes against D1
+node p37_d1_profile.mjs && node p38_warm_index.mjs    # Addendum A, production profile
 ```
 
 `p13`/`p14` need Playwright (`npm i playwright`) and the Chromium at

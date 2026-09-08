@@ -58,6 +58,17 @@ directory with Node 22:
 | `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50 |
 | `p24_cpu.mjs` | PBKDF2 and per-request CPU vs. the free plan's 10 ms |
 
+## Deployment profile (Addendum A)
+
+Added after the maintainer confirmed production runs with **D1 bound at ~400 accounts**, and
+that the KV-only configuration is the self-hosting path.
+
+| Probe | Proves |
+|---|---|
+| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever |
+| `p37_d1_profile.mjs` | KV ops and D1 queries per invocation at 400 accounts, cold index |
+| `p38_warm_index.mjs` | the same in steady state with the index warm — the honest production numbers |
+
 `p13_browser_xss.mjs` and `p14_browser_xss2.mjs` need `npm i playwright` and a Chromium at
 `/opt/pw-browsers/chromium-*/chrome-linux/chrome`; adjust `executablePath` for your machine.
 Everything else needs only Node 22 and this repository.
