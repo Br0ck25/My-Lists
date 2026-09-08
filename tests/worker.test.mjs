@@ -6888,3 +6888,74 @@ describe("a Trakt list reports its real size, not its first page's length", () =
     assert.equal(sandbox.isEmptyPayload([1]), false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The three items AUDIT-2026-09-05 left open behind an otherwise-fixed
+// finding. Each was recorded in that report as still outstanding and none had
+// a test, which is how an open item becomes a forgotten one.
+describe("the last open items from the 2026-09-05 audit", () => {
+  // §3's tail. The thread id is a capability, now 72 bits of CSPRNG rather
+  // than 31 bits of Math.random -- but the endpoint that spends it took 20
+  // ids per request with no limit at all, so attempts were free.
+  it("bounds /api/feedback/threads per IP", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ip = nextIp();
+    const body = { threadIds: ["1757000000000:abcdefghijkl"] };
+    let sawLimit = false;
+    for (let i = 0; i < 65; i++) {
+      const r = await call(env, "/api/feedback/threads", { method: "POST", ip, json: body });
+      if (r.status === 429) { sawLimit = true; break; }
+    }
+    assert.ok(sawLimit, "an unauthenticated capability lookup must not be free to attempt forever");
+
+    // The limit is per IP, and generous enough that the support panel opening
+    // is nowhere near it.
+    const fresh = await call(env, "/api/feedback/threads", { method: "POST", ip: nextIp(), json: body });
+    assert.equal(fresh.status, 200, "another visitor must not inherit someone else's exhausted bucket");
+  });
+
+  // §12. ADMIN_KEY is chosen by the deployer, so its length is a secret --
+  // and timingSafeEqualHex answers from the length before its constant-time
+  // loop runs.
+  it("compares the admin key without answering from its length", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    sandbox.crypto = globalThis.crypto;
+    sandbox.TextEncoder = TextEncoder;
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "hunter2"), true);
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "hunter3"), false);
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "h"), false,
+      "a shorter guess is still wrong -- it must be wrong for the right reason");
+    assert.equal(await sandbox.timingSafeEqualSecret("", ""), true);
+    assert.equal(await sandbox.timingSafeEqualSecret(undefined, ""), true);
+
+    const src = fs.readFileSync(path.join(REPO_ROOT, "26_api-creator-and-admin-routes.js"), "utf8");
+    assert.match(src, /timingSafeEqualSecret\(submittedKey, env\.ADMIN_KEY\)/,
+      "the admin login must use the length-blind comparison");
+    assert.doesNotMatch(src, /timingSafeEqualHex\([^)]*ADMIN_KEY/,
+      "and must not go back to the one that returns early on a length mismatch");
+  });
+
+  it("still lets the right admin key in, and keeps every other one out", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ok = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: env.ADMIN_KEY } });
+    assert.equal(ok.status, 302, "the correct key must still work");
+    for (const wrong of ["", "t", "test-admin-secre", "test-admin-secret-", "TEST-ADMIN-SECRET"]) {
+      const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: wrong } });
+      assert.equal(r.status, 401, `"${wrong}" must not authenticate`);
+    }
+  });
+
+  // §14 and top-10 §9: both are decisions rather than defects now, and both
+  // are the kind that gets silently undone by someone tidying up. The comment
+  // IS the decision -- if it goes, the reasoning goes with it.
+  it("keeps the reasoning for the two accepted limitations where the code is", () => {
+    const admin = fs.readFileSync(path.join(REPO_ROOT, "03_admin.js"), "utf8");
+    assert.match(admin, /KV has no atomic increment/,
+      "bumpStat's KV path is lossy on purpose; the D1 branch is the answer for anyone who needs exact counters");
+    const routes = fs.readFileSync(path.join(REPO_ROOT, "25_api-catalog-routes.js"), "utf8");
+    assert.match(routes, /The id IS somebody's install\s*\n\s*\/\/ URL/,
+      "no TTL on /api/save: expiring it breaks a live install months later");
+    assert.match(routes, /expiring it would break their link/,
+      "no TTL on /api/publish-list: the slug is a URL somebody has shared");
+  });
+});

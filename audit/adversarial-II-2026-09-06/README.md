@@ -1,6 +1,7 @@
 # Adversarial audit II — executable probes
 
-Every probe backing `AUDIT-2026-09-06-ADVERSARIAL-II.md`. They import
+Every probe backing [`AUDIT-2026-09-06-ADVERSARIAL-II.md`](../../docs/history/AUDIT-2026-09-06-ADVERSARIAL-II.md)
+(in `docs/history/`, closed). They import
 `tests/harness.mjs` and run against the **committed
 `worker_entry_combined.js`**, not against the numbered sources — so what they
 exercise is what deploys.
@@ -87,5 +88,5 @@ either the way you would any other:
 node --test --test-name-pattern "^R[1-5]:" tests/worker.test.mjs
 ```
 
-`AUDIT-2026-09-06-ADVERSARIAL-II-FIX-STATUS.md` records what each one changed
+[`AUDIT-2026-09-06-ADVERSARIAL-II-FIX-STATUS.md`](../../docs/history/AUDIT-2026-09-06-ADVERSARIAL-II-FIX-STATUS.md) records what each one changed
 and — for R5 — what it deliberately did not.

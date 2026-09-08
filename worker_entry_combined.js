@@ -2204,11 +2204,39 @@ function hexToBuffer(hex) {
 }
 // Constant-time-ish comparison -- guards against a timing attack revealing
 // how many leading hex characters matched, which a plain === wouldn't.
+//
+// The early length return is deliberate and safe HERE: every caller compares
+// two values of a length fixed by construction (a PBKDF2 digest, an OAuth
+// state minted by generateShortId, an admin session signature), so the length
+// is not a secret and never varies with the input. A caller comparing a
+// secret of UNKNOWN length must use timingSafeEqualSecret below instead --
+// this one would answer from the length alone.
 function timingSafeEqualHex(a, b) {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+// The same comparison for a secret whose length is itself secret.
+//
+// ADMIN_KEY is chosen by whoever deploys this Worker, so its length is not
+// fixed by anything -- and `if (a.length !== b.length) return false` above
+// answers before the constant-time loop, which makes the length observable
+// by timing from an unauthenticated endpoint. Guessing a length is not
+// guessing a key, but it narrows the search for free and the fix costs one
+// hash.
+//
+// Both sides are digested first, so the comparison always runs over 64 hex
+// characters whatever came in, and the loop below sees no difference between
+// a one-character guess and a hundred-character one.
+async function timingSafeEqualSecret(a, b) {
+  const enc = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(a == null ? "" : a))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(b == null ? "" : b))),
+  ]);
+  return timingSafeEqualHex(bufferToHex(new Uint8Array(da)), bufferToHex(new Uint8Array(db)));
 }
 const PBKDF2_ITERATIONS = 100000;
 
@@ -5322,6 +5350,17 @@ async function bumpStat(env, kind) {
       await d1BumpStat(env, kind, ["total", statsToday()], 1);
       return;
     }
+    // KV path: get-then-put, so concurrent bumps lose increments
+    // (AUDIT-2026-09-05 §14). Deliberately left as it is, and recorded here
+    // rather than silently: KV has no atomic increment and no
+    // compare-and-swap, so the only correct fix is a different storage
+    // primitive -- which is exactly what the D1 branch above is
+    // (d1BumpStat's upsert is atomic, and it is the path any deployment
+    // that cares about exact counters should be on). What is lost is a
+    // display statistic under simultaneous load; nothing reads these
+    // numbers to make a decision, and no user-visible behaviour depends on
+    // one. Spending a durable object per counter on that would be the
+    // wrong trade.
     const totalKey = `stats:${kind}:total`;
     const dayKey = `stats:${kind}:${statsToday()}`;
     const [totalRaw, dayRaw] = await Promise.all([env.CONFIGS.get(totalKey), env.CONFIGS.get(dayKey)]);
@@ -55637,6 +55676,21 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // Loads active support chat threads for a user/device
     if (path === "/api/feedback/threads" && (request.method === "POST" || request.method === "GET")) {
       if (!env || !env.CONFIGS) return json({ ok: true, threads: [] }, 200, { "Cache-Control": "no-store" });
+      // The last piece of the thread-id finding (AUDIT-2026-09-05 §3): the id
+      // is a capability, it is now 72 bits of CSPRNG rather than 31 bits of
+      // Math.random, and this endpoint is deliberately unauthenticated for the
+      // threadIds path -- anonymous users with no account rely on it to follow
+      // up on what they filed. What it had no answer for was VOLUME: 20 ids
+      // per request, no limit, so guessing cost nothing to attempt.
+      //
+      // Generous against real use (the support panel calls this when it opens
+      // and on a manual refresh, not on a timer) and ruinous against
+      // enumeration, which needs orders of magnitude more than this to be
+      // worth starting.
+      const threadsIp = clientIpKey(request);
+      if (await consumeRateLimit(env, ctx, "feedbackthreads", threadsIp, 60)) {
+        return json({ ok: false, error: "Too many requests. Please wait a moment." }, 429, { "Cache-Control": "no-store" });
+      }
       let threadIds = [];
       let creatorName = null;
       let creatorKey = null;
@@ -56284,6 +56338,17 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // install config) that nothing ever expires or deletes. Generous
       // bucket -- regenerating an install link a few times while adjusting
       // rows is normal -- but not unlimited.
+      //
+      // No TTL on the key itself, deliberately (AUDIT-2026-09-05 top-10 §9
+      // left this open; this is the answer). The id IS somebody's install
+      // URL -- it is pasted into Stremio or wako and read on every catalog
+      // request, for as long as they keep the add-on. An expiry would break
+      // those installs silently, months later, with nothing to point at:
+      // the failure would arrive as "my lists stopped loading" from someone
+      // who had done nothing at all. So the growth is bounded at the door
+      // instead -- this per-IP limit, plus SAVED_CONFIG_ENTRIES_MAX and
+      // SAVED_CONFIG_BYTES_MAX below -- rather than by throwing away data
+      // somebody is still using.
       const saveIp = clientIpKey(request);
       if (!saveIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const saveRateKey = `ratelimit:save:${saveIp}`;
@@ -56351,10 +56416,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
     if (path === "/api/publish-list" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      // Unauthenticated, and every call mints a permanent KV key that no
-      // route in this Worker can ever delete again. Same per-IP bucket as
-      // /api/creator/create, just a little more permissive because
-      // publishing several lists in one sitting is normal.
+      // Unauthenticated, and every call mints a permanent KV key. Same
+      // per-IP bucket as /api/creator/create, just a little more permissive
+      // because publishing several lists in one sitting is normal.
+      //
+      // "that no route in this Worker can ever delete again" is what this
+      // comment used to say, and it was true until /admin/api/published-lists
+      // and /admin/api/delete-published-list (26_) gave an operator a way to
+      // browse and remove these. What is still deliberate is the absence of a
+      // TTL: the slug is a shared list URL somebody has handed to other
+      // people, and expiring it would break their link rather than free
+      // anything worth freeing. Bounded at the door instead, by this limit
+      // and PUBLISHED_LIST_ITEMS_MAX/PUBLISHED_LIST_BYTES_MAX.
       const plIp = clientIpKey(request);
       if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const plRateKey = `ratelimit:publishlist:${plIp}`;
@@ -61864,7 +61937,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       } catch {
         // falls through with an empty key, which will fail the compare below
       }
-      if (!timingSafeEqualHex(submittedKey, env.ADMIN_KEY)) {
+      // Digests both sides first: ADMIN_KEY is whatever the deployer chose,
+      // so its LENGTH is a secret too, and timingSafeEqualHex answers from
+      // the length alone before its constant-time loop ever runs.
+      if (!(await timingSafeEqualSecret(submittedKey, env.ADMIN_KEY))) {
         // Failures only -- a correct key must never spend the budget that
         // protects it, or an admin who logs in often would lock themselves
         // out.

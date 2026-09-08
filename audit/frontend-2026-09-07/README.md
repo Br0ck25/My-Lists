@@ -1,7 +1,8 @@
 # Frontend audit probes — 2026-09-07
 
 Executable reproductions for every confirmed finding in
-[`AUDIT-2026-09-07-FRONTEND.md`](../../AUDIT-2026-09-07-FRONTEND.md).
+[`AUDIT-2026-09-07-FRONTEND.md`](../../docs/history/AUDIT-2026-09-07-FRONTEND.md)
+(in `docs/history/`, closed).
 
 Unlike the two earlier `audit/` directories, these drive a **real browser**
 against a **real Worker**, because every finding here lives in what the client

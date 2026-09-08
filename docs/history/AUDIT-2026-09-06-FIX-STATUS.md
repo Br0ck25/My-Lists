@@ -142,7 +142,11 @@ Re-run from `audit/adversarial-2026-09-06/` against the fixed tree:
 | `t21`/`t22` failed deletes | `ok:true`, data inherited by a stranger | `ok:false`, nothing removed, name not reclaimable |
 
 `m6` (KV pagination cursor), `m7` (index-rebuild prefix), `m10` (slug fallback) and
-`m11` (cap off-by-one) are still open; they belong to the P2 batch.
+`m11` (cap off-by-one) were still open when this line was first written; they belonged
+to the P2 batch, which has since landed. All four are killed — see the mutation table
+above, and the four tests that kill them: `listAllKeys follows the cursor past the first
+page`, the rebuild-prefix assertion, `pickFreeSlug returns empty rather than a taken slug
+when it runs out`, and the item-cap boundary test.
 
 ## Gate for every commit
 

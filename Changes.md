@@ -1,5 +1,185 @@
 # Changes Log
 
+## 2026-09-07f - Audit sweep: the last three open findings closed, and every audit retired
+
+### Files Changed
+`02_http-and-creator-utils.js`, `03_admin.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `worker_entry_combined.js`, `tests/worker.test.mjs`, `docs/history/*` (seven audit documents moved), `docs/history/README.md`, `audit/*/README.md`, `CHANGELOG.md`, `Changes.md`
+
+### Root Cause
+Four audit passes had accumulated at the repository root — the independent 2026-09-05 review, two adversarial rounds, and the frontend round — with three remediation trackers between them. Three of the four were fully closed and said so. The fourth, `AUDIT-2026-09-05-INDEPENDENT.md`, read as closed at a glance and was not: three items were recorded *inside* otherwise-fixed findings, in prose, where nothing pointed at them.
+
+- **§3's tail.** The finding is "thread ids are capability tokens minted with `Math.random()`", and the fix (72 bits of CSPRNG) is described in full — then one sentence at the end says "a per-IP limit on `/api/feedback/threads` is still outstanding." It was: the endpoint took 20 ids per request, unauthenticated, with no bucket of any kind, so attempts against the id space were free.
+- **§12.** `timingSafeEqualHex` returns on `a.length !== b.length` before its constant-time loop. Three of its four callers compare values whose length is fixed by construction; the fourth is `env.ADMIN_KEY`, whose length is whatever the deployer chose — so an unauthenticated endpoint leaked it by timing.
+- **§14 and top-10 §9.** Lossy KV counters, and no TTL/sweep on the two key spaces that unauthenticated endpoints mint permanently. Both are real, and both are decisions rather than defects — but the reasoning existed only in an audit report, which is where reasoning goes to be re-litigated by the next person to read the code.
+
+A fourth thing was simply stale: `AUDIT-2026-09-06-FIX-STATUS.md` still carried a line saying four mutations were "still open", contradicted by its own table twenty lines above, which lists all four as killed. Confirmed against the suite — all four have tests.
+
+### What Changed
+- **`25`**: `/api/feedback/threads` spends the shared per-IP bucket (`consumeRateLimit`, 60/minute) before it parses anything. Generous against real use — the support panel calls it when it opens and on a manual refresh, not on a timer — and ruinous against enumeration.
+- **`02`**: `timingSafeEqualSecret(a, b)` digests both sides with SHA-256 and compares the two 64-character hex strings, so the comparison runs over the same length whatever came in. `26` uses it for the admin key. `timingSafeEqualHex` keeps its early return and now says in a comment why that is safe *there*, and when it is not.
+- **`03`**: `bumpStat`'s KV branch records why it stays a get-then-put — KV has no atomic increment and no compare-and-swap, so the only correct fix is a different storage primitive, which is exactly what the D1 branch beside it already is. What is lost is a display statistic under simultaneous load.
+- **`25`**: both `/api/save` and `/api/publish-list` record why neither key gets a TTL — the id *is* somebody's install URL, or a list link they have handed to other people, so an expiry breaks a stranger's install months later with nothing to point at. Growth is bounded at the door instead. The `/api/publish-list` comment also stopped claiming no route can delete these; one can, since the admin path landed.
+- **Docs**: all seven audit documents moved to `docs/history/`, its README rewritten to list them and to say plainly that there is no open audit — an audit lives at the root while it has work in it. The probe READMEs under `audit/` were repointed; those directories stay where they are, because the probes still run.
+
+### Verification
+`bash verify.sh` — byte-exact rebuild, `node --check`, builder page, admin page, service worker, `FUNCTION-MAP.md` drift, full suite. Four new tests: the threads bucket is spent and answers 429 while a second IP is unaffected; `timingSafeEqualSecret` is correct for equal, unequal and different-length inputs, and the admin route cannot go back to the length-shortcutting comparison; the right admin key still works and five near-misses (including a prefix and a suffix of the real one) do not; and the two accepted limitations keep their reasoning where the code is, because a decision nobody can find gets undone by whoever tidies up next.
+
+## 2026-09-07e - "See All" reported the page it was holding, not the size of the list
+
+### Files Changed
+`02_http-and-creator-utils.js`, `06_source-fetchers-mdblist-trakt.js`, `07_source-fetchers-tmdb-simkl.js`, `19_client-search-and-likes.js`, `23_client-list-management.js`, `worker_entry_combined.js`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### Root Cause
+A 303-item chart said "100 items". In Live Preview's See All the number climbed as scrolling paged the rest in; opened from a Discover card it stayed at 100 with 303 items on screen. Two causes, one on each side of the wire.
+
+**Trakt never reported a total.** Every Trakt fetcher's `fetchFn` returned `res.json()` and let the Response — headers and all — go out of scope, so `X-Pagination-Item-Count`, which is Trakt stating exactly how big the collection is, was discarded on every call. `/api/preview` then fell back to the length of the page in hand, which it caps at `PAGE_SIZE` (100). MDBList and the TMDB fetchers have always reported `totalItems`; Trakt was the gap, and Trakt is what the Discover charts are built from.
+
+**The browser printed a page length as a total.** `populateSearchResultPosters` showed `data.count` — the first page — on the card badge, and carried that number into the See All page as an *exact* item count via `data-items`. `formatSubtitle` then preferred it over the loaded count with no check that the two were still consistent, so 100 outranked the real number permanently.
+
+### What Changed
+- **`06`**: `traktPayloadWithTotal` / `traktPayloadItems` / `traktPayloadTotal` capture the header and thread the count through `fetchTrakt`, `fetchTraktWatchlist` and `fetchTraktHistory`; **`07`** does the same for `fetchTraktChart`. The count travels *with* the data, because these replies are cached across three tiers and the two durable ones store `JSON.stringify(payload)` — which drops a property hung on an array, so a total would survive a memory hit and vanish on a KV hit. The cached value is `{ items, totalItems }`, read back through accessors that still understand the bare array every pre-existing cache entry holds.
+- **`02`**: `isEmptyPayload` learns that shape, so wrapping a payload to carry its total cannot quietly disarm `refuseEmptyOverwrite` for the shared chart caches.
+- **`19`**: the card badge shows a real total when one is known and `100+` when all that is known is that a full page came back and more remains; the estimate is deliberately not passed on as an exact count.
+- **`23`**: the See All header drops a "total" the loaded items have overtaken, says `100+` rather than `100` while pages remain, and brings a known total down when an item is removed.
+
+### Verification
+Nine tests. Server: Trakt's header reaches `/api/preview`; an endpoint that does not paginate reports no total rather than a fabricated one; a payload cached before the wrapper still reads; an empty wrapped reply still counts as empty. Client: the header reads 303 before anything is scrolled when the source reports a total; `100+` then an exact 303 when it does not; a handed-in 100 loses to the 303 actually loaded; a stored list's real count is still trusted against a single page; a removal decrements it. The two end-to-end preview tests run on a fresh isolate — the chart memo is per-isolate and keyed by chart/kind/page, so on the shared worker they were being answered by another test's stub.
+
+### Note
+Trakt replies are cached for up to a day, so a chart already in cache keeps reporting no total until its entry expires.
+
+## 2026-09-07d - An admin could not see a creator's lists, so a duplicate run could not be deleted
+
+### Files Changed
+`03_admin.js`, `26_api-creator-and-admin-routes.js`, `worker_entry_combined.js`, `tests/worker.test.mjs`
+
+### Root Cause
+`/admin/api/delete-creator-list` takes exact slugs, and nothing in the admin dashboard could tell you what a creator's slugs are — the creator's own dashboard is the only place they appear, and an admin cannot open it. Workable for one reported list; useless for the case the tool keeps being needed for: an account carrying dozens of copies of one list under slugs nobody could guess (`coming-of-age-3` … `coming-of-age-53`, from the runaway that `/api/creator/lists/save`'s own comment records). Typing the base name deletes exactly one of them.
+
+Worse, the records most in need of deleting are the hardest to find: the runaway was caused by lost entries in `creatorlistorder:`, and a record missing from that key is invisible on the creator's own dashboard while still being served at its URL.
+
+### What Changed
+- **`26`**: `GET /admin/api/creator-lists?username=&limit=&cursor=` enumerates the stored records — slug, name, type, item count, likes, visibility, `updatedAt`, and `inOrder` — paged with a cursor like the anonymous-list browse beside it. It reads the `creatorlist:` records themselves rather than the order key, deliberately, and reports the difference instead of hiding it.
+- **`03`**: the delete panel grows Browse / filter / "Select all shown". The filter matches name *and* slug and treats spaces as the hyphens a slug uses, so typing the list's name finds `coming-of-age-37`. Selecting fills the slug box rather than deleting outright — the same way the anonymous browse does — so the existing confirmation still names everything that is about to go.
+- **`03`**: a failed delete now reports what it removed before stopping. The endpoint returns `deleted` even when the sweep fails — most often the records are gone and only the directory cleanup did not finish — and showing just "Failed" made a delete that had worked read as one that had not.
+
+### Verification
+Four tests plus the authorization matrix: every stored list is reported including duplicates; a record whose order entry was lost is still listed and marked `inOrder: false`; an invalid username is rejected rather than reading a made-up key prefix; and browse → delete removes every copy and reports the deletion back to the creator's own `/api/creator/lists`. The FE-17 canary caught the new endpoint's read of a `creatorlist:` key and it is classified as a non-mutator with its reason.
+
+## 2026-09-07c - The installed PWA pushed its stale state before it had read the account
+
+### Files Changed
+`02_http-and-creator-utils.js`, `22_client-creator-profile.js`, `24_client-backup-restore-presets.js`, `26_api-creator-and-admin-routes.js`, `worker_entry_combined.js`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### Root Cause
+Reported as: change Continue Watching, Watch History, or delete a list on the desktop, open the installed PWA on the phone minutes later, and the change is reverted. An installed PWA is re-launched rather than resumed, so it begins every session holding whatever it last saw and knowing no server version at all. Three consequences, all producing that one symptom.
+
+**Ordering.** `activeCreator` is set the moment `/api/creator/restore` answers; the first `/api/creator/sync/load` is a second round trip behind it, and the page's own start-up work waits for neither — `refreshAiringNext` at 600ms and `backfillWatchHistoryEpisodeStills` at 1400ms both end in `scheduleTrackingSync`, and every autosave path does the same for the config blob. `save-tracking` and `sync/save` are full overwrites by design, so the phone replaced the account's state with its stale copy *before* the load that would have told it what the account held — then rendered the resurrected copy back as current.
+
+**The conflict guards were disarmed.** `sync/save`, `save-presets` and `save-channels` refuse a push that cites a version the record has moved past, but every baseline lived in a `window.` variable, gone with the page. A new session cited nothing, which the server reads as "an older client with no opinion", i.e. last-write-wins. `save-tracking` had no guard at all. The same gap disarmed `shouldKeepLocalOnlyTracking`: it could only consult an in-memory stamp, so a relaunched app took its "first sync ever, keep everything" branch every single time.
+
+**A deleted list left no trace for the other device.** Deleting a list removes its record, its order entry and its directory entry — so from any other browser, an account that no longer has the list is indistinguishable from one that never received it, which is the case `uploadMissingLocalListsToAccount` exists to repair. The phone uploaded it back.
+
+### What Changed
+- **`22`**: a gate — while a sign-in is known but its first load has not been applied, a push is remembered rather than sent and flushed once the load lands, with the intentional-removal flag preserved across the wait and a failsafe so a browser that starts offline still syncs.
+- **`22`/`24`**: the config, tracking, presets and channels baselines are persisted per account, so the first push of a session cites the version this browser last actually saw.
+- **`22`**: `shouldKeepLocalOnlyTracking` reads a persisted per-list baseline — the local list's own `updatedAt` at the last moment browser and account are known to have agreed. The plain server stamp cannot work, because the merge itself stamps `updatedAt = Date.now()`, which always lands after the version it just adopted.
+- **`26`**: `save-tracking` takes `expectedClientVersion` and answers 409 rather than applying a push built on a version another browser replaced. Guarded on a dedicated `clientVersion` rather than `updatedAt`, because scrobble pings and the Continue Watching cron rewrite this record too and the existing rescue merge already handles those — a browser must not be refused because someone pressed play.
+- **`02`/`26`**: `deleteCreatorLists` records the deletion on the account (`creatorlistdeleted:`, TTL- and size-bounded); `/api/creator/lists` reports it as `deletedSlugs`; `lists/save` retires it when the slug is deliberately re-created; the account purge takes it along, so a reclaimed username inherits nothing.
+
+### Verification
+Twenty tests covering both directions of each fix: the stale push is refused and the removal stands; the caught-up retry succeeds; a scrobble does not start a conflict; a versionless client still saves; a malformed version is rejected rather than dropping the guard; the delete reaches the other device and a re-create wins; the tracking push waits for the load and is not lost; a baseline belonging to another account is ignored.
+
+### Note
+The per-list tracking baseline only exists once a device has synced at least once on this build, so the first launch after deploying may still show one stale merge; from then on it is correct. The gate, the version guards and the deletion record take effect immediately.
+
+## 2026-09-07b - Frontend audit: seventeen findings, and the first pass to drive a real browser
+
+### Files Changed
+`03_admin.js`, `09_page-shell.js`, `16_client-row-core.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`, `22_client-creator-profile.js`, `23_client-list-management.js`, `24_client-backup-restore-presets.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `render_check.js`, `html_checks.py`, `verify.sh`, `.github/workflows/ci.yml`, `tests/client-harness.mjs` (new), `tests/client.test.mjs` (new), `audit/frontend-2026-09-07/*`
+
+### Root Cause
+35,225 of 59,240 source lines are the builder UI, and every previous audit was a server-side audit: route execution against an instrumented Worker harness never renders a page or clicks anything. This pass drove a real browser against a real Worker. The full report and its 33 probes are in `docs/history/AUDIT-2026-09-07-FRONTEND.md` and `audit/frontend-2026-09-07/`.
+
+The two criticals are worth restating. **FE-02**: ids from an imported list or channel reached markup unescaped — opening a shared list could execute script and read the victim's Creator Key from `localStorage`. **FE-01**: a single backslash inside the admin page's template literal became a real newline before the browser ever saw it, splitting a string across two lines and turning the whole 60 KB inline script into one `SyntaxError`; every admin control was dead for two days, and CI could not see it because nothing rendered that page.
+
+### What Changed
+All seventeen findings fixed — the ten ranked, the four below the line, and FE-17 found afterwards. Beyond the individual fixes:
+
+- **`tests/client-harness.mjs`**: evaluates the real builder bundle against a DOM stub small enough to read, so the client's logic — payload shapes, response handling, state transitions — can be tested at all. It is not a browser and cannot test rendering; what it covers is the client/server contract, which is where a server change silently breaks the client.
+- **CI**: renders and validates the admin page and the service worker as well as the builder page, because both are template literals that `node --check` sees as string content. That blind spot is what let FE-01 ship.
+- **FE-17**: `/api/creator/sync/meta` gained a fifth stamp for custom lists. The four blob stamps could not carry a list change by construction, so a resumed browser kept rendering a list that had moved on. A canary test now fails the build if a new place mutates custom-list storage without bumping that stamp.
+
+### Verification
+315 tests, up from 286. Every fix verified twice: the probe that demonstrated the defect reports it gone, and the defect reintroduced by mutation makes the suite fail. Three tests were found to be decorative in the process and were replaced with ones that fail against the pre-fix code.
+
+## 2026-09-06b - Adversarial audit II: cross-account disclosure, the cron, and KV/D1 consistency
+
+### Files Changed
+`02_http-and-creator-utils.js`, `03_admin.js`, `05_catalog-core.js`, `07_source-fetchers-tmdb-simkl.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `schema.sql`, `migrations/0001a`, `0001b`, `0003`, `0004`, `0005`, `gen_map.py`, `check_sync.py`, `tests/*`, `audit/adversarial-II-2026-09-06/*`
+
+### Root Cause
+A second adversarial pass over the code the first one had just fixed. Full report in `docs/history/AUDIT-2026-09-06-ADVERSARIAL-II.md`; what it found clustered in four places.
+
+**Deleted data coming back.** A delete could report success while leaving the record live, and an account deleted and re-registered could inherit its predecessor's stray keys. **The cron.** Its sweep advanced past accounts it had not processed, one poisoned account could stop every account behind it, and `scheduled()` had none of the exception boundary `fetch()` had. **KV/D1 consistency.** Authentication read KV first, so a colo holding a cached pre-rotation record kept accepting the old key. **An empty provider reply erasing a good chart** — the write gate was "not null and not undefined", so a soft-failed upstream answering `200` with nothing counted as a refresh and overwrote all three cache tiers at exactly the moment the circuit breaker existed for.
+
+### What Changed
+Every finding fixed, plus five items the report left open (R1–R5): a delete path for anonymously published lists, which had none in any route; the conflict guard extended to the list write; a strongly-consistent D1 tombstone for deleted accounts; an index that removed a full table scan from the admin counters; and a read-and-union immediately before the list-order write, which took 12 concurrent creations from 9 surviving order entries to 12.
+
+Three tests were found to be decorative and replaced — one of them because the whole suite runs in one Node process and a per-isolate memo made "the cache was not damaged" and "nothing happened" indistinguishable. `tests/harness.mjs` gained `freshIsolate()` so a test can ask what a cold colo actually sees.
+
+### Verification
+286 tests, up from 234. Seventeen mutations, one per fix: fifteen caught, and the two survivors explained rather than papered over — one decorative test replaced, one genuinely redundant line kept as belt-and-braces with the property tested instead of the mechanism. All 26 probes re-run against the fixed code.
+
+## 2026-09-06a - Adversarial audit I: silent data destruction and false success
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `03_admin.js`, `05_catalog-core.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `schema.sql`, `migrations/0003_add_missing_indexes.sql`, `tests/harness.mjs`, `tests/worker.test.mjs`, `audit/adversarial-2026-09-06/*`
+
+### Root Cause
+Twenty findings, and the first of them needed no credentials: `purgeCreatorData` built its D1 delete as `WHERE id LIKE '{username}:%'`, and `_` is LIKE's single-character wildcard. A creator named `a_c-films` deleting their own account also deleted every D1 row belonging to `abc-films`, `axc-films`, `a1c-films`. Usernames may be three all-underscore characters, so the scaled version needed one registration per length and `creator_lists` is empty for the whole deployment. KV still had the records, so nothing visibly broke — while the D1 like counts were gone and the next ordinary edit wrote those zeroes back into KV.
+
+Four more were `ok: true` while doing nothing: a key rotation that reported success while rotating nothing, an account deletion that left the account authenticating, a failed purge that freed the username while the data survived, and an unpublish that answered success while the list stayed in the directory.
+
+The structural cause behind several of them: D1 was preferred on read over KV, which is the store that is actually authoritative.
+
+The test suite could not see any of it. `makeD1()` matched SQL with regexes, hardcoded `SELECT * FROM creator_lists WHERE id = ?` to return no rows — so `getCreatorList`'s D1 branch was never executed by any test — could never throw, and could not enforce a constraint. Seven of twelve controlled bugs survived the suite.
+
+### What Changed
+The harness first, because five of the fixes could not otherwise be proved: `tests/harness.mjs` now runs **real SQLite** loaded from the committed `schema.sql`, with foreign keys on and a fault injector. Then the twenty findings, in order of how bad the lie was.
+
+Also landed: a size bound on the authenticated list write (an account had parked 21.8 MB across eight saves, returned in full on every dashboard render), `parseExpectedUpdatedAt` + `nextSyncVersion` so a frozen clock cannot defeat the conflict guard, no-store on every error response, a global exception boundary, and a schema-drift test that diffs both provisioning paths.
+
+One item was deliberately not done and recorded with its reasoning: a `CHECK (visibility IN …)` constraint would have had to go into `schema.sql` alone, making a fresh database a different shape from a migrated one — exactly the drift that same pass had just closed.
+
+### Verification
+All twelve controlled bugs are killed, plus two new mutations aimed at the fixes themselves. The audit's own reproductions re-run: 120 random operations with D1 failing 15% and 40% went from 5 of 6 seeds diverging to all 6 consistent.
+
+## 2026-09-05a - Independent production audit, and five bugs found by using the product
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `03_admin.js`, `05_catalog-core.js`, `06_source-fetchers-mdblist-trakt.js`, `09_page-shell.js`, `16_client-row-core.js`, `20_client-channel-builder.js`, `22_client-creator-profile.js`, `23_client-list-management.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `html_checks.py`, `tests/*`, `docs/history/*`
+
+### Root Cause
+A full-repository pass that deliberately did not read the previous audits, so every finding was rediscovered from the source and by executing the Worker. Full report in `docs/history/AUDIT-2026-09-05-INDEPENDENT.md`. Two findings were release-blocking and both were silent:
+
+**The public list directory permanently breaks itself at scale.** Past roughly 500 public lists the index rebuild exceeded Cloudflare's 1,000-subrequest limit, threw inside a `waitUntil`, never wrote the index, and the directory fell back forever to a truncated scan — with no error anywhere. An unauthenticated attacker could force it in about 90 minutes on a deployment with 20 real lists, because *private* junk lists still cost the rebuild one KV read each before the visibility filter ran.
+
+**Creator accounts could be taken over by brute-forcing the recovery answer.** The only throttle was per-IP; rotating IPs defeated it entirely, and the endpoint hands back a working Creator Key.
+
+Then five defects reported from real use, every one of them client-side — which is precisely where this audit's method does not look, and what prompted the frontend pass two days later. The worst had already left a live account with 129 public-directory entries for 22 real lists.
+
+### What Changed
+Both blockers fixed (resumable chunked rebuild; per-account daily failure budget plus minimum answer entropy), and the rest of the twenty findings besides: capability-grade thread ids with authorized appends, always-on rate limiting for the TMDB fan-out, SRI on the jsDelivr script, a scoped revocable token for media-server webhooks, slug allocation that can no longer overwrite an existing list, bounded and cacheable channel images, `applyLikeVote` retrying only on evidence that another writer landed, and `applyEnvApiKeys` called from both entry points so the cron cannot run with empty API-key globals.
+
+The five field-reported bugs: channel "See All" collapsing every episode into one tile, Discover's Trakt lists 404ing, the runaway duplicate lists, a Watch History removal rebuilding the whole grid, and a grouped show tile removing from the wrong list.
+
+`html_checks.py` gained the inline-handler resolution check the CSP comment had been citing for months without it existing, and the finished audit documents moved into `docs/history/`.
+
+### Verification
+The suite grew with a regression test per finding, each confirmed to fail against the pre-fix code. Three of the twenty findings are now recorded as accepted decisions rather than fixes — see `2026-09-07f` above, which closed the last of them.
+
+
 ## 2026-09-03d - Airing Next: legacy entries mislabelled type "movie" were filtered out of the series row
 
 ### Files Changed
