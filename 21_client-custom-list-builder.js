@@ -656,29 +656,81 @@ async function saveLocalCustomListEdit(name) {
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (slug || 'watchlist'))
     : (location.origin + '/lists/' + (slug === 'watchlist' ? 'watchlist' : ('custom/' + slug))));
 
+  // The account mirror. Its outcome used to be discarded entirely -- there was
+  // no else and no error path, so a 401, a 409 and a 500 all ended at the same
+  // "saved" modal while nothing reached the account. On the next sign-in the
+  // server's older copy wins and the edit is gone, having been reported saved.
+  // The LOCAL save above stays unconditional -- it is this function's job and
+  // it works -- but what the person is told about the account has to match
+  // what happened.
+  let mirror = null;
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     if (creatorKey) {
-      try {
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: slug,
-            name: name,
-            type: customListDraftType,
-            items: customListDraftItems,
-            visibility: visibility,
-          }),
-        });
-        const data = await res.json();
-        if (data.ok && data.url) {
-          finalUrl = data.url;
+      // A whole-list replacement of a list that already exists on the server:
+      // exactly what the server's expectedUpdatedAt guard is for, and one of
+      // the three slug-bearing call sites that never armed it. Routed through
+      // the one helper that speaks that protocol rather than a fourth copy of
+      // it. No re-apply function is passed: a replacement is not a delta, so
+      // re-running it against the other device's copy would erase precisely
+      // what the guard exists to protect. The conflict comes back here.
+      const cached = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData))
+        ? lastCreatorListsData.find((l) => l && l.slug === slug)
+        : null;
+      const target = {
+        slug: slug,
+        name: name,
+        type: customListDraftType,
+        items: customListDraftItems,
+        visibility: visibility,
+      };
+      if (cached && Number.isFinite(cached.updatedAt)) target.updatedAt = cached.updatedAt;
+      mirror = await saveCreatorListWithBaseline(target, null, null);
+      if (mirror && mirror.ok) {
+        if (mirror.url) finalUrl = mirror.url;
+        // Keep the dashboard's copy in step with what was just stored, or the
+        // next edit in this session cites a version this browser has itself
+        // already replaced and 409s against its own write.
+        if (cached) {
+          cached.name = name;
+          cached.type = customListDraftType;
+          cached.items = customListDraftItems.slice();
+          cached.itemCount = cached.items.length;
+          cached.visibility = visibility;
+          if (Number.isFinite(target.updatedAt)) cached.updatedAt = target.updatedAt;
         }
-      } catch (e) {}
+      }
     }
+  }
+
+  if (mirror && !mirror.ok && !mirror.skipped) {
+    const savedHere = 'Your changes are saved on this device, but they did not reach your account.';
+    let title = 'Saved Here, Not To Your Account';
+    let msg;
+    if (mirror.conflict || mirror.status === 409) {
+      // The helper has already dropped the cached dashboard copy, so the
+      // re-render below shows what is actually stored rather than a version
+      // that no longer exists. The server sends conflict: true and the stored
+      // updatedAt precisely so the client can go and look.
+      title = 'This List Changed Elsewhere';
+      msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        savedHere + ' Reopen the list to see what the other device saved, then re-apply your changes.';
+    } else if (mirror.networkError) {
+      msg = 'A network error occurred while saving to your account. ' + savedHere + ' Please try again.';
+    } else if (mirror.status === 401 || mirror.status === 403) {
+      msg = 'Your account key was rejected, so the change could not be saved to your account. ' +
+        savedHere + ' Sign in again and re-save.';
+    } else {
+      msg = (mirror.error || 'The server rejected the save.') + ' ' + savedHere;
+    }
+    if (typeof showAppNoticeModal === 'function') {
+      showAppNoticeModal(title, msg, true);
+    } else {
+      alert(msg);
+    }
+    cancelEditCustomList();
+    renderCreatorDashboard();
+    return;
   }
 
   if (typeof showSavedCustomListModal === 'function') {
@@ -1291,7 +1343,13 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
     );
     if (creatorWatchlist && Array.isArray(creatorWatchlist.items) && creatorWatchlist.items.length) {
       const initialLen = creatorWatchlist.items.length;
-      const updatedItems = creatorWatchlist.items.filter((it) => {
+      // The removal as a FUNCTION, not as its result. This used to send the
+      // array computed from a possibly-stale local copy, fire-and-forget, with
+      // no expectedUpdatedAt -- so a second device's Watchlist additions could
+      // be erased between this browser's last load and this write, with
+      // nothing reported anywhere. Expressed this way the same removal can be
+      // re-run against whatever the other device actually saved.
+      const dropWatched = (items) => (items || []).filter((it) => {
         if (!it) return false;
         const itId = String(it.id || '');
         const itImdbId = String(it.imdbId || '');
@@ -1314,22 +1372,14 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
         if (itTmdbId && (targetIds.has(itTmdbId) || targetIds.has('tmdb:' + itTmdbId))) return false;
         return true;
       });
+      const updatedItems = dropWatched(creatorWatchlist.items);
       if (updatedItems.length !== initialLen) {
         creatorWatchlist.items = updatedItems;
-        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-        fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            name: creatorWatchlist.name,
-            type: creatorWatchlist.type || 'mixed',
-            items: updatedItems,
-            visibility: creatorWatchlist.visibility || 'private',
-            slug: creatorWatchlist.slug,
-          }),
-        }).catch(() => {});
+        // Still a background save -- nothing here is waiting on it, and the
+        // helper reports nothing on failure by design (the removal is already
+        // applied locally and the next load reconciles). What it adds is the
+        // baseline and the merge-and-retry.
+        saveCreatorListWithBaseline(creatorWatchlist, dropWatched, null);
       }
     }
   }

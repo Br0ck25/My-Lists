@@ -45,6 +45,8 @@ directory with Node 22:
 | `p04c.mjs` | control: the same run with a `listName` binding sends exactly one |
 | `p19_anonurl.mjs` | the cold-index directory advertises `/lists/Anonymous/<slug>`, which 404s |
 | `p33_falsesuccess.mjs` | `saveLocalCustomListEdit` shows "saved" on 401, 409 and 500 |
+| `p42_falsesuccess_fixed.mjs` | after the fix: each of those three now shows the failure and names it, the local copy is still written, and a genuine 200 still shows the success modal |
+| `p43_guards_armed.mjs` | after the fix: all three slug-bearing `lists/save` call sites cite a baseline, and the two that carry a delta re-apply it to the other device's copy on a 409 |
 
 ## Data integrity and scale
 
@@ -54,11 +56,12 @@ directory with Node 22:
 | `p26_ghostpublic.mjs` | a write held across `delete-account` leaves a permanently-public, unremovable list |
 | `p27_ghostnatural.mjs` | the same with **no** artificial stalling: 6/10 plain concurrent runs |
 | `p28_rebuild_privacy.mjs` | making a list private *through the API* mid-rebuild is **not** republished (clean) |
-| `p29_dashscale.mjs` | `/api/creator/lists` KV ops and response size at 10 / 100 / 500 / 1,200 lists |
-| `p30_breakpoint.mjs` | the exact breakpoint: 990 lists → 1,001 KV ops, over Cloudflare's cap |
+| `p29_dashscale.mjs` | `/api/creator/lists` KV ops and response size at 10 / 100 / 500 / 1,200 lists. Re-run after the paging fix: KV ops flatten at **209** and the response at **2.52 MB**, whatever the list count |
+| `p30_breakpoint.mjs` | the exact breakpoint: 990 lists → 1,001 KV ops, over Cloudflare's cap. Re-run after the fix: **210 at every size**, so the breakpoint is gone |
 | `p21_scale_index.mjs` | cost of one public save at index sizes 100 → 20,000 (4.45 MB RMW) |
 | `p22_kvops.mjs` | KV get/put/delete/list counts per request, with and without D1 |
-| `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50 |
+| `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50. Re-run after the budget fix: `/api/bulk-resolve` at its 200-title maximum is **48**, was 400. `/api/details/batch` (180) and the cron tick (186) are untouched and still over |
+| `p44_hotkey_and_publish.mjs` | after the fix: 25 likes in a burst cost **1** whole-directory rewrite (was 25) with every vote still counted, and one IP's anonymous publishing is down to 5 records and 2.1 MB a minute with five kinds of non-item entry refused |
 | `p24_cpu.mjs` | PBKDF2 and per-request CPU vs. the free plan's 10 ms |
 
 ## Deployment profile (Addendum A)
@@ -68,7 +71,7 @@ that the KV-only configuration is the self-hosting path.
 
 | Probe | Proves |
 |---|---|
-| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever |
+| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever. Re-run after the fix, the same probe now reports `413`, nothing in KV, nothing in D1, and no `migrate-d1` error |
 | `p37_d1_profile.mjs` | KV ops and D1 queries per invocation at 400 accounts, cold index |
 | `p38_warm_index.mjs` | the same in steady state with the index warm — the honest production numbers |
 

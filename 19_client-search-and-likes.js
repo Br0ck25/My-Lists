@@ -3032,9 +3032,22 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
     const exists = idx !== -1;
     
+    // The same match, and the same add or remove, expressed as a function of
+    // whatever items it is handed. The array below is one possible result of
+    // it; the function is what lets the edit be re-applied to another device's
+    // copy instead of overwriting it -- see saveCreatorListWithBaseline.
+    const matchesTarget = (it) => !!it && (
+      (it.imdbId === imdbId) || (it.id === originalId) ||
+      (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId)
+    );
+    const addedItem = { imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined };
+    const applyEdit = shouldBeInList
+      ? (items) => ((items || []).some(matchesTarget) ? (items || []).slice() : (items || []).concat([addedItem]))
+      : (items) => (items || []).filter((it) => !matchesTarget(it));
+
     let changed = false;
     if (shouldBeInList && !exists) {
-      payload.items.push({ imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined });
+      payload.items.push(addedItem);
       changed = true;
     } else if (!shouldBeInList && exists) {
       payload.items.splice(idx, 1);
@@ -3054,7 +3067,7 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
       
       const nameInput = list.row ? list.row.querySelector('.name') : null;
       const rowName = (nameInput ? nameInput.value : '') || list.name || '';
-      syncCustomListPayload(payload, rowName);
+      syncCustomListPayload(payload, rowName, applyEdit);
     }
     return changed;
     
@@ -3064,7 +3077,12 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
   }
 }
 
-async function syncCustomListPayload(payload, name) {
+// applyEdit(items) is the single add-or-remove this sync is carrying, as a
+// function -- optional, and only used when the list lives on the account. It
+// is what the conflict guard needs: on a 409 the edit is re-run against the
+// copy the other device saved, rather than the stale array being re-sent over
+// the top of it.
+async function syncCustomListPayload(payload, name, applyEdit) {
   const isWatchlist = payload.localSlug === 'watchlist' || payload.creatorSlug === 'watchlist' || (name && name.toLowerCase() === 'watchlist');
   if (isWatchlist) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
@@ -3106,27 +3124,32 @@ async function syncCustomListPayload(payload, name) {
           const otherItems = creatorListMeta.items.filter(it => !currentIds.has(it.imdbId || it.id));
           combinedItems = (payload.items || []).concat(otherItems);
         }
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: creatorName,
-            creatorKey: creatorKey,
-            slug: payload.creatorSlug,
-            name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
-            type: finalType,
-            items: combinedItems,
-            visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private')
-          })
-        });
-        const data = await res.json();
-        if (data.ok) {
+        // A whole-list replacement of an existing account list, sent with no
+        // baseline: one of the three slug-bearing call sites that left the
+        // server's expectedUpdatedAt guard unarmed, so a second device's
+        // additions between this browser's last load and this write were
+        // silently overwritten. Routed through the one helper that cites the
+        // baseline and, on a 409, re-applies this single add/remove to what
+        // the other device actually saved.
+        const target = {
+          slug: payload.creatorSlug,
+          name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+          type: finalType,
+          items: combinedItems,
+          visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private'),
+        };
+        if (creatorListMeta && Number.isFinite(creatorListMeta.updatedAt)) {
+          target.updatedAt = creatorListMeta.updatedAt;
+        }
+        const result = await saveCreatorListWithBaseline(target, applyEdit || null, null);
+        if (result && result.ok) {
+          // target.items is what actually landed -- on a merged retry the
+          // helper replaces it with the other device's copy plus this edit.
+          combinedItems = target.items;
           if (creatorListMeta) {
             creatorListMeta.items = combinedItems;
-            creatorListMeta.itemCount = combinedItems.length;
-          }
-          if (typeof renderCreatorDashboard === 'function') {
-            renderCreatorDashboard({ silent: true });
+            creatorListMeta.itemCount = (combinedItems || []).length;
+            if (Number.isFinite(target.updatedAt)) creatorListMeta.updatedAt = target.updatedAt;
           }
         }
         payload.items = combinedItems;

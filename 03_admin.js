@@ -274,7 +274,7 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // throttle. That column existed for a long time but nothing ever wrote to
 // it, which forced the dashboard to do one KV `get` per account just to
 // render the "Last Active" column -- linear in the account count, and
-// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// over Cloudflare's 1,000-storage-operations/invocation cap past roughly a
 // thousand creators (the admin dashboard then stopped loading entirely in
 // production; Miniflare doesn't enforce that limit, so it rendered fine
 // locally). Writing it here lets the dashboard read last-active straight
@@ -469,7 +469,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     // Cap the candidate pool. This branch reads the running-total key AND
     // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
     // reads each, which is ~2,000 reads at 1,000 titles and crosses
-    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // Cloudflare's 1,000-storage-operations/invocation cap around 500 titles,
     // killing the whole Trending tab. We surface only 100, so a fixed
     // candidate ceiling bounds the cost regardless of corpus size; the
     // day-index windows below are capped the same way.
@@ -2826,9 +2826,26 @@ async function renderAdminDashboard(env) {
           btn.disabled = false;
           return;
         }
+        // The public directory index truncates silently at its entry cap --
+        // it keeps the most-liked and drops the tail, which is the right
+        // choice, but nothing said it had happened. Reported here in every
+        // branch below, because it has nothing to do with D1: a KV-only
+        // deployment can hit it too.
+        var idx = data.publicIndex;
+        var indexNote = '';
+        if (idx) {
+          var pct = idx.max ? Math.round((idx.entries / idx.max) * 100) : 0;
+          indexNote = idx.truncated
+            ? '<p style="color:#FF9500; margin:10px 0 0; font-size:0.82rem;"><strong>The public list directory is full.</strong> ' +
+              'It holds ' + idx.entries.toLocaleString() + ' of a maximum ' + idx.max.toLocaleString() +
+              ' entries, so the least-liked lists past that point are no longer being advertised. ' +
+              'They are still reachable by their own URL.</p>'
+            : '<p style="color:#8E8E93; margin:10px 0 0; font-size:0.82rem;">Public list directory: ' +
+              idx.entries.toLocaleString() + ' of ' + idx.max.toLocaleString() + ' entries (' + pct + '%).</p>';
+        }
         if (!data.bound) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>';
+          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -2836,13 +2853,13 @@ async function renderAdminDashboard(env) {
           status.textContent = '';
           out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
             (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
-            ' This is not the same as a missing migration \u2014 try again.</p>';
+            ' This is not the same as a missing migration \u2014 try again.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
         if (data.upToDate) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -2860,7 +2877,7 @@ async function renderAdminDashboard(env) {
           '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
           '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
           '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table></div>';
+          '<tbody>' + rows + '</tbody></table></div>' + indexNote;
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

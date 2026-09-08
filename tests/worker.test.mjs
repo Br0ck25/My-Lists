@@ -3198,6 +3198,26 @@ describe("audit fix 8: handlePosterImgError works for every call site's markup",
   });
 });
 
+// /api/bulk-resolve issues up to two TMDB calls per title. Left unstubbed the
+// tests below make those calls for real: 5,000 of them for the rate-limit test
+// alone, against api.themoviedb.org with a bogus key. Locally that is 30
+// seconds of pure network wait (3 seconds of CPU); on a CI runner with real
+// internet it is slow enough to look like a hung job, which is exactly what it
+// did. Stubbed, the same tests run in milliseconds and assert the same things.
+function stubTmdbSearch() {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (u) => {
+    calls++;
+    const href = typeof u === "string" ? u : (u && u.url) || "";
+    const body = href.includes("/external_ids")
+      ? { imdb_id: "tt0000001" }
+      : { results: [{ id: 1, title: "A Film", release_date: "2001-01-01" }] };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+}
+
 describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
   it("rejects a bulk-resolve request larger than the server's fan-out cap", async () => {
     const env = makeEnv();
@@ -3208,17 +3228,43 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
     assert.equal(r.status, 413);
   });
 
-  it("rate-limits repeated bulk-resolve calls from one IP", async () => {
-    const env = makeEnv();
-    const ip = nextIp();
-    let limited = 0;
-    for (let i = 0; i < 25; i++) {
-      const r = await call(env, "/api/bulk-resolve", {
-        method: "POST", ip, json: { items: [{ title: "X", year: 2000 }] },
-      });
-      if (r.status === 429) limited++;
-    }
-    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 25 rapid calls");
+  it("rate-limits bulk-resolve by titles, not by requests, from one IP", async () => {
+    // The bucket is charged in TITLES. It used to be charged per request,
+    // which was 4,000 titles a minute while a request carried 200 of them --
+    // and would have silently become 480 once the subrequest budget started
+    // splitting one request across several invocations. Counting the thing
+    // the endpoint actually spends (the owner's TMDB quota) keeps the ceiling
+    // where it was however the work is divided up.
+    // A paid-plan budget, so one request really does process its whole
+    // 200-title batch -- which also pins the env override. On the default
+    // free-safe budget the same 30 requests would only be charged for the 24
+    // titles each one actually gets through, which is the point: the bucket
+    // follows the TMDB quota spent, not the number of HTTP calls made.
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const ip = nextIp();
+      const batch = Array.from({ length: 200 }, (_, i) => ({ title: "X" + i, year: 2000 }));
+      let limited = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env, "/api/bulk-resolve", { method: "POST", ip, json: { items: batch } });
+        if (r.status === 429) limited++;
+      }
+      assert.ok(limited > 0, "5,000 titles from one IP in a minute must not all be served");
+
+      // ...and a handful of small lookups is nowhere near the ceiling, where
+      // per-request counting would have thrown them away after 20.
+      const env2 = makeEnv();
+      const ip2 = nextIp();
+      let ok = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env2, "/api/bulk-resolve", {
+          method: "POST", ip: ip2, json: { items: [{ title: "X", year: 2000 }] },
+        });
+        if (r.status !== 429) ok++;
+      }
+      assert.equal(ok, 25, "25 single-title lookups is 25 titles, not 25 units of the old budget");
+    } finally { tmdb.restore(); }
   });
 
   // This test used to assert that a caller supplying their own tmdbKey "must
@@ -4974,6 +5020,304 @@ describe("A11: the authenticated list write needs the bounds its anonymous sibli
     });
     assert.equal(r.body.ok, true, "the largest genuine list observed was ~1,200 items");
   });
+
+  // AIII addendum: the ceiling exists because of D1's 2,000,000-BYTE maximum
+  // string size, and it was measured with String.prototype.length, which
+  // counts UTF-16 code units. ASCII makes the two agree, which is why five
+  // audits went past it. A CJK character is 1 unit and 3 bytes, so a list of
+  // Japanese titles passed the guard at 1.78M units while being 4.7 MB on the
+  // wire: KV stored it, the public page served it, the D1 mirror failed inside
+  // a catch that logs and carries on, and every migrate-d1 run afterwards
+  // reported the same error that could never be cleared.
+  it("measures the size ceiling in bytes, not UTF-16 code units", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11e");
+    const K = { creatorName: "big11e", creatorKey: u.creatorKey };
+
+    // Deliberately under the cap by .length and well over it by bytes: each
+    // character is 1 UTF-16 unit and 3 UTF-8 bytes.
+    const cjk = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "\u65e5".repeat(1000) }));
+    const json = JSON.stringify(cjk);
+    assert.ok(json.length < 1_800_000, "the fixture must pass the OLD units-based check");
+    assert.ok(new TextEncoder().encode(json).length > 1_800_000, "and fail the byte-based one");
+
+    const r = await save(env, K, { name: "Nihongo", items: cjk });
+    assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 160));
+    assert.equal(env.CONFIGS._store.get("creatorlist:big11e:nihongo"), undefined,
+      "a record KV accepts and D1 silently refuses is the divergence this guard exists to stop");
+  });
+
+  it("leaves an ASCII list of the same character count alone", async () => {
+    // The regression risk of measuring bytes is refusing lists that used to
+    // save. It only bites where bytes and units differ: same 700k characters,
+    // ASCII, comfortably accepted.
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11f");
+    const K = { creatorName: "big11f", creatorKey: u.creatorKey };
+    const ascii = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "a".repeat(1000) }));
+    const r = await save(env, K, { name: "Ascii", items: ascii });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+  });
+});
+
+// --- AIII-15: the dashboard's only data source had a hard wall at ~990 lists
+//
+// /api/creator/lists issued one KV get per list with no cap, so 990 lists was
+// 1,001 KV operations -- past Cloudflare's 1,000-per-invocation limit, on both
+// plans. The invocation is terminated at that point, so the dashboard 500s
+// forever; and because deleting a list is done FROM the dashboard, the account
+// had no in-app way back. Not hypothetical: one real account reached 129 list
+// records for 22 real lists through the duplicate-slug bug.
+describe("AIII fix: /api/creator/lists pages instead of reading every list", () => {
+  async function accountWith(n, extra = {}) {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, ...extra });
+    const u = await createUser(env, "pager");
+    const order = [];
+    for (let i = 0; i < n; i++) {
+      const s = "l" + String(i).padStart(4, "0");
+      order.push(s);
+      kv._store.set(`creatorlist:pager:${s}`, JSON.stringify({
+        name: s, slug: s, type: "movie", visibility: "private", items: [{ id: "tt1" }], updatedAt: 1000 + i,
+      }));
+    }
+    kv._store.set("creatorlistorder:pager", JSON.stringify({ order }));
+    return { env, kv, K: { creatorName: u.creatorName, creatorKey: u.creatorKey } };
+  }
+
+  function countOps(kv) {
+    const n = { ops: 0 };
+    for (const m of ["get", "put", "list", "delete"]) {
+      const real = kv[m].bind(kv);
+      kv[m] = async (...a) => { n.ops++; return real(...a); };
+    }
+    return n;
+  }
+
+  it("spends a bounded number of KV operations however many lists there are", async () => {
+    for (const n of [10, 990, 1500]) {
+      const { env, kv, K } = await accountWith(n);
+      const counter = countOps(kv);
+      const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+      assert.ok(counter.ops < 1000,
+        `${n} lists spent ${counter.ops} KV operations, past Cloudflare's per-invocation cap`);
+      assert.equal(r.body.total, n, "the count of what exists must not depend on the page size");
+    }
+  });
+
+  it("hands back every list across pages, once each, in order", async () => {
+    const { env, K } = await accountWith(450);
+    const seen = [];
+    let offset = 0;
+    let guard = 0;
+    let page;
+    do {
+      assert.ok(++guard <= 10, "paging must terminate");
+      page = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset, limit: 200 } });
+      assert.equal(page.body.ok, true);
+      assert.ok(page.body.lists.length <= 200, "a page must respect the limit");
+      for (const l of page.body.lists) seen.push(l.slug);
+      offset += page.body.lists.length;
+    } while (page.body.hasMore);
+
+    assert.equal(seen.length, 450, "every list must be reachable by paging");
+    assert.equal(new Set(seen).size, 450, "and none returned twice");
+    assert.equal(seen[0], "l0000");
+    assert.equal(seen[449], "l0449", "display order must survive paging");
+  });
+
+  it("caps an over-large limit rather than honouring it", async () => {
+    const { env, K } = await accountWith(900);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, limit: 5000 } });
+    assert.equal(r.body.lists.length, 500, "the request-supplied limit is clamped to the maximum");
+    assert.equal(r.body.hasMore, true);
+  });
+
+  it("reports a deleted slug only when it is deleted, not when it is on another page", async () => {
+    // deletedSlugs used to be filtered against the lists in the RESPONSE. Once
+    // that became one page, a live list sitting on page 2 would be reported to
+    // the client as deleted -- and the client deletes its local copy of
+    // anything named there.
+    const { env, kv, K } = await accountWith(300);
+    kv._store.set("creatorlistdeleted:pager", JSON.stringify({ "l0250": Date.now(), "gone-for-real": Date.now() }));
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset: 0, limit: 200 } });
+    assert.ok(!first.body.lists.some((l) => l.slug === "l0250"), "l0250 is on the second page");
+    assert.deepEqual(first.body.deletedSlugs, ["gone-for-real"],
+      "a list that still exists must never be advertised as deleted");
+  });
+
+  it("keeps the conditional-response version working per page", async () => {
+    const { env, K } = await accountWith(300);
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset: 0, limit: 200 } });
+    assert.ok(first.body.version, "a page must carry a version");
+    const again = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, offset: 0, limit: 200, knownVersion: first.body.version },
+    });
+    assert.equal(again.body.unchanged, true, "an unchanged page must not be re-sent");
+    // ...and the paging fields ride along, or a client that cached page 0
+    // could not know to ask for page 1 and would stop at what it had.
+    assert.equal(again.body.hasMore, true);
+    assert.equal(again.body.total, 300);
+  });
+
+  it("still returns a small account in one page, exactly as before", async () => {
+    const { env, K } = await accountWith(6);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.equal(r.body.lists.length, 6);
+    assert.equal(r.body.hasMore, false);
+    assert.equal(r.body.total, 6);
+    assert.ok(Array.isArray(r.body.lists[0].items), "items are still returned -- dropping them needs a client change");
+  });
+});
+
+// --- AIII-18: bulk-resolve did not fit a free Worker's outbound budget ------
+describe("AIII fix: /api/bulk-resolve fits an invocation budget and says where it stopped", () => {
+  const titles = (n) => Array.from({ length: n }, (_, i) => ({ title: "Film " + i, year: 2000 }));
+
+  it("stays inside the free plan's 50 outbound fetches and reports how far it got", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+      // The number that matters: this used to be ~400 against a cap of 50.
+      assert.ok(tmdb.count() <= 50, `spent ${tmdb.count()} outbound fetches, the free plan allows 50`);
+      assert.equal(r.body.nextIndex, 24, "48 fetches, two per title worst case, is 24 titles");
+      assert.equal(r.body.done, false, "and the caller has to be told there is more");
+    } finally { tmdb.restore(); }
+  });
+
+  it("says done when the whole request fitted", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(5) } });
+      assert.equal(r.body.nextIndex, 5);
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
+  });
+
+  it("honours a paid plan's larger budget", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.nextIndex, 200, "400 outbound fetches covers a whole 200-title request");
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
+  });
+
+  it("keeps rejecting a request over the item cap", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(201) } });
+    assert.equal(r.status, 413, "the request-size bound is separate from the budget and still rejects");
+  });
+});
+
+// --- AIII-19: index:publiclists is one global key, written on every like ----
+describe("AIII fix: likes no longer rewrite the whole directory on every vote", () => {
+  it("coalesces like-driven index writes behind a cooldown", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "hotkey");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: u.creatorName, creatorKey: u.creatorKey, name: "Faves", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    await call(env, "/lists/public.json");   // force the index into existence
+
+    let indexWrites = 0;
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => { if (k === "index:publiclists") indexWrites++; return realPut(k, ...rest); };
+
+    // Ten distinct voters in the same instant. Each one used to read, sort and
+    // re-serialise the whole directory blob -- 4.45 MB of it at the entry cap
+    // -- against KV's one-write-per-second-per-key limit.
+    for (let i = 0; i < 10; i++) {
+      await call(env, "/api/lists/like", {
+        method: "POST", ip: nextIp(), json: { username: "hotkey", slug: "faves" },
+      });
+    }
+    assert.ok(indexWrites <= 1, `expected the burst to coalesce, got ${indexWrites} whole-directory writes`);
+
+    // The vote itself is never dropped -- only the directory's copy of the
+    // count waits for the next save or the daily rebuild.
+    const rec = JSON.parse(kv._store.get("creatorlist:hotkey:faves"));
+    assert.equal(rec.likes, 10, "every vote must still be counted on the record itself");
+  });
+
+  it("surfaces directory truncation to an operator", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    kv._store.set("index:publiclists", JSON.stringify({
+      updatedAt: Date.now(),
+      entries: Array.from({ length: 20000 }, (_, i) => ({ slug: "s" + i, name: "n", likes: 0 })),
+    }));
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.ok, true);
+    // It truncates by likes, which is the right entries to drop -- but nothing
+    // anywhere said it had happened.
+    assert.equal(r.body.publicIndex.truncated, true);
+    assert.equal(r.body.publicIndex.entries, 20000);
+  });
+});
+
+// --- AIII-22: /api/publish-list is unauthenticated and writes permanently ---
+describe("AIII fix: the anonymous publish route is bounded for what it actually is", () => {
+  const pub = (env, extra) => call(env, "/api/publish-list", {
+    method: "POST", ip: nextIp(),
+    json: { name: "A List", type: "movie", visibility: "public", ...extra },
+  });
+
+  it("still publishes a realistically large list", async () => {
+    const env = makeEnv();
+    const r = await pub(env, { items: Array.from({ length: 2000 }, (_, i) => ({ id: "tt" + i })) });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+  });
+
+  it("refuses the multi-megabyte payloads the old 2 MB ceiling allowed", async () => {
+    // An anonymous list has no owner to warn or delete, gets no TTL, and can
+    // only be removed by an operator by hand. 10 a minute at 2 MB each was
+    // 20 MB a minute of permanent unowned storage from one address.
+    const env = makeEnv();
+    const r = await pub(env, {
+      items: Array.from({ length: 3000 }, (_, i) => ({ id: "tt" + i, title: "X".repeat(400) })),
+    });
+    assert.equal(r.status, 413);
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0);
+  });
+
+  it("refuses entries that are not list items at all", async () => {
+    const env = makeEnv();
+    for (const items of [["just a string"], [null], [[1, 2]], [{ title: "no id" }], [{ id: "x".repeat(200) }]]) {
+      const r = await pub(env, { items });
+      assert.equal(r.status, 400, `expected ${JSON.stringify(items).slice(0, 40)} to be refused`);
+    }
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0,
+      "nothing that cannot render should be able to occupy the namespace");
+  });
+
+  it("accepts an item identified by imdbId as well as id", async () => {
+    const env = makeEnv();
+    const r = await pub(env, { items: [{ imdbId: "tt0111161", title: "The Shawshank Redemption" }] });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+  });
+
+  it("holds one address to a tighter publish rate", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let accepted = 0;
+    for (let i = 0; i < 12; i++) {
+      const r = await call(env, "/api/publish-list", {
+        method: "POST", ip,
+        json: { name: "List " + i, type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+      });
+      if (r.body.ok) accepted++;
+    }
+    assert.equal(accepted, 5, "5 permanent unowned records a minute, not 10");
+  });
 });
 
 describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {
@@ -6061,8 +6405,11 @@ describe("N4: a new account starts clean however data got under its username", (
 // The audit's remaining open items, closed after the report.
 // ---------------------------------------------------------------------------
 describe("R1: an anonymously published list can be removed", () => {
+  // A fresh IP per publish. The anonymous bucket is 5/minute (it mints
+  // permanent, unowned records), and these tests are about the admin paging
+  // and delete contract, not about the bucket -- which has its own test.
   const publish = (env, name) => call(env, "/api/publish-list", {
-    method: "POST", ip: "203.0.113.1",
+    method: "POST", ip: nextIp(),
     json: { name, type: "movie", items: [{ id: "tt1" }], visibility: "public" },
   });
 

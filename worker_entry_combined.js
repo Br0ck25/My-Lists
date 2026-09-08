@@ -78,9 +78,37 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
-const PUBLISHED_LIST_BYTES_MAX = 2 * 1024 * 1024;   // 2 MB of serialized JSON
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+
+// --- ...and the tighter ones for /api/publish-list specifically -------------
+//
+// PUBLISHED_LIST_ITEMS_MAX and the 2 MB byte ceiling that used to sit beside
+// it were shared with the AUTHENTICATED list save, and the two are not the
+// same risk. A creator list belongs to an account that can be found, warned
+// and deleted; an anonymous published list has no owner at all, gets no TTL
+// (the slug is a URL somebody has shared -- expiring it would break their
+// link), and can only be removed by an operator, by hand, from the admin
+// panel.
+//
+// At 10 publishes a minute and 2 MB apiece that was 20 MB a minute of
+// permanent unowned storage from one IP -- a free plan's entire 1 GB
+// namespace in under an hour, and its whole 1,000-writes-per-day budget in
+// under two minutes -- from an endpoint the shipped UI never calls. (It is
+// also the easiest route to a stored payload, which is what made it vector A
+// of this audit's XSS finding.)
+//
+// So this path gets its own, much tighter ceilings. Still far above anything
+// genuine: the largest list ever observed in a real account export was ~1,200
+// items, which serialises to roughly 130 KB. What changes is the worst case,
+// from 20 MB/minute to 2.5.
+const ANON_PUBLISH_ITEMS_MAX = 5000;
+const ANON_PUBLISH_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+const ANON_PUBLISH_PER_MINUTE = 5;
+// An item is a catalog entry, not an arbitrary JSON document. Anything this
+// rejects could not have rendered anyway -- it could only have occupied the
+// namespace.
+const ANON_PUBLISH_ITEM_ID_MAX = 128;
 
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //
@@ -108,24 +136,84 @@ const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 // export was ~1,200 items.
 const CREATOR_LIST_BYTES_MAX = 1_800_000;
 
+// --- Bound on what /api/creator/lists reads in one invocation ---------------
+//
+// That route is the creator dashboard's only data source. It read the account's
+// whole list order and then issued ONE KV get per list, with no cap: 990 lists
+// is 1,001 KV operations, past Cloudflare's 1,000-operations-per-invocation
+// limit (that is the KV/D1 cap -- 1,000 on Free and Paid alike -- not the
+// outbound-fetch one). At that point the invocation is terminated and the
+// dashboard never loads again. Because deleting a list is done FROM the
+// dashboard, an account that crossed the line had no in-app way back.
+//
+// Not hypothetical: one real account reached 129 list records for 22 real
+// lists through the duplicate-slug bug, and a repeat of anything like that
+// walks straight into this wall.
+//
+// So the route pages. The default is well clear of any real account (the
+// measured average is ~6 lists) so the common case is still exactly one
+// request, and the client pages through the rest rather than losing it.
+const CREATOR_LISTS_PAGE_DEFAULT = 200;
+const CREATOR_LISTS_PAGE_MAX = 500;
+// A stop on the client's paging loop, so a server that never sets hasMore=false
+// cannot spin forever. 100 pages x 200 = 20,000 lists, far past anything the
+// rest of these bounds allow.
+const CREATOR_LISTS_MAX_PAGES = 100;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
-// Worker owner's shared key. 200 items is ~400 subrequests, comfortably
-// inside Cloudflare's 1,000-per-invocation limit with room for the rest of
-// the request. Shared with the client so the chunk size it sends and the
-// size the server accepts cannot drift apart.
+// Worker owner's shared key. 200 items is ~400 outbound fetches, measured.
+//
+// Cloudflare has TWO per-invocation caps and they are not the same number:
+//
+//   outbound fetch()  ("subrequests")  Free: 50        Paid: 10,000 (configurable)
+//   KV / D1 / R2 operations                  1,000           1,000
+//
+// 400 sits comfortably inside the Paid outbound cap with room for the rest of
+// the request, and is eight times over the Free one -- so on a free Worker a
+// Letterboxd import dies above roughly 25 titles. That is a real limitation of
+// the free plan, documented in README.md ("Which Cloudflare plan do I need?"),
+// not something this constant can fix: lowering it to fit 50 would make every
+// paid deployment issue 8x the requests for the same import. The fix is to
+// chunk the endpoint itself (tracked in the audit's fix order), which changes
+// the client contract and is not a constant edit.
+//
+// Shared with the client so the chunk size it sends and the size the server
+// accepts cannot drift apart.
 const BULK_RESOLVE_ITEMS_MAX = 200;
+// ...and how much of one INVOCATION's outbound-fetch budget the route may
+// spend before it stops and hands back a continuation.
+//
+// This is what makes the endpoint work on a free Worker without making a paid
+// one send eight times as many titles per request: the REQUEST size stays 200,
+// and the server processes as much of it as fits, reporting how far it got.
+// The client re-posts the remainder. So the import completes on both plans;
+// on Free it simply arrives as more invocations.
+//
+// 48 is two per item for 24 items, under the free plan's 50. A paid deployment
+// can raise it with a BULK_RESOLVE_SUBREQUEST_BUDGET var in wrangler.toml and
+// get the old one-invocation behaviour back.
+const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;
+// The per-IP ceiling, counted in TITLES rather than requests. It used to be 20
+// requests a minute, which was 4,000 titles while a request carried 200 of
+// them -- and would have become 480 the moment the budget above split a
+// request into several. Counting the thing the endpoint actually spends
+// (someone else's TMDB quota) keeps the ceiling where it was, however the
+// work is divided up.
+const BULK_RESOLVE_ITEMS_PER_MINUTE = 4000;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
 // publishedlist:user:, stats:sourcegroup:, stats:) and spends a KV read plus
-// a D1 write on each key it keeps -- both of which count against
-// Cloudflare's 1,000-subrequest-per-invocation limit. It used to do the
-// whole sweep in one request with no cap, so on a site big enough to need
-// migrating it aborted partway through with "Too many subrequests" and
-// backfilled only whatever it had reached.
+// a D1 write on each key it keeps -- both of which count against Cloudflare's
+// 1,000-storage-operations-per-invocation limit. That is the KV/D1/R2 cap,
+// 1,000 on both the Free and the Paid plan; the separate outbound-fetch cap
+// (50 free, 10,000 paid) does not apply here, since this sweep makes no
+// outbound requests. It used to do the whole sweep in one request with no
+// cap, so on a site big enough to need migrating it aborted partway through
+// with "Too many subrequests" and backfilled only whatever it had reached.
 //
 // That failure is worse than it looks: per wrangler.toml, an account present
 // in KV but missing from D1 is exactly the case /api/creator/reset-key and
@@ -141,9 +229,9 @@ const BULK_RESOLVE_ITEMS_MAX = 200;
 const MIGRATE_D1_STATE_KEY = "migrated1:state";
 const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
 // This endpoint has its invocation to itself (it is admin-triggered, not
-// ridden along on the cron), so it can claim more of the 1,000 than the
-// index rebuild does -- but still well short of it, since a chunk that
-// throws saves no progress.
+// ridden along on the cron), so it can claim more of the 1,000 storage
+// operations than the index rebuild does -- but still well short of it,
+// since a chunk that throws saves no progress.
 const MIGRATE_D1_OPS_PER_RUN = 700;
 const MIGRATE_D1_PAGE = 200;
 // Errors accumulate across every chunk of a run and are handed back to the
@@ -238,8 +326,9 @@ function applyEnvApiKeys(env) {
 // bearing control that RESET_KEY_ACCOUNT_MAX_FAILURES is for the weak one.
 // How many of one creator's lists /admin/api/delete-creator-list will remove
 // in a single call. Each slug costs a KV read, a KV delete, a ledger delete
-// and (with D1 bound) a statement, so this keeps one call well inside
-// Cloudflare's per-invocation subrequest limit. The admin panel loops, so a
+// and (with D1 bound) a statement -- storage operations, so the cap that
+// applies is the 1,000-per-invocation one, the same on Free and Paid. This
+// keeps one call well inside it. The admin panel loops, so a
 // larger cleanup still completes -- it just arrives as several bounded calls,
 // the same shape the other maintenance tools use.
 const ADMIN_LIST_DELETE_MAX = 50;
@@ -2572,6 +2661,25 @@ function jsonForScript(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
+// The size of a string as it will actually be stored, in BYTES.
+//
+// Every *_BYTES_MAX ceiling in 00_constants.js is a byte budget -- KV value
+// size, and D1's 2,000,000-byte maximum string/row size, which is why
+// CREATOR_LIST_BYTES_MAX exists at all. All four guards measured with
+// String.prototype.length, which counts UTF-16 code units, not bytes. For
+// ASCII the two agree, which is why this went unnoticed; for anything else
+// they do not. A CJK character is 1 unit and 3 bytes, an emoji or any astral
+// character is 2 units and 4 bytes -- so a 1.8M-unit list of Japanese titles
+// measured 4.7 MB on the wire, passed the guard, and was written to KV. The
+// D1 mirror then failed, in the catch that logs and carries on, so the list
+// was saved and served while the admin panel could not see it and every
+// migrate-d1 run reported the same unclearable error.
+//
+// The check now measures what the comment always said it measured.
+function utf8ByteLength(s) {
+  return new TextEncoder().encode(String(s == null ? "" : s)).length;
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather
@@ -3266,12 +3374,19 @@ function clientIpKey(request) {
 // ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
 // request it is protecting. Callers check for a missing client IP
 // themselves, since what to return in that case is route-specific.
-async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+// `cost` is how much of the bucket this call spends -- 1 for an ordinary
+// request, and for /api/bulk-resolve the number of titles it is about to
+// look up. That endpoint's real cost is someone else's TMDB quota, not the
+// request itself, so counting requests would move the ceiling by a factor of
+// eight the moment a request was split into several smaller invocations.
+// Every other caller omits it and behaves exactly as before.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60, cost = 1) {
   if (!env || !env.CONFIGS || !ip) return false;
   const key = `ratelimit:${bucket}:${ip}`;
   const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
   if (used >= maxPerWindow) return true;
-  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  const spend = Number.isFinite(cost) && cost > 0 ? Math.floor(cost) : 1;
+  const write = env.CONFIGS.put(key, String(used + spend), { expirationTtl: windowSec });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
   else await write;
   return false;
@@ -3991,7 +4106,8 @@ function normalizeExternalListUrl(rawUrl) {
 //
 // Paginating that properly is worse, not better: it means reading EVERY list
 // on every directory load (10k lists = 10k KV reads per page view, well past
-// the 1,000 subrequest/invocation cap). So the directory reads a single
+// the 1,000-storage-operations/invocation cap -- the KV/D1 one, 1,000 on both
+// plans, not the outbound-fetch cap). So the directory reads a single
 // maintained index blob instead, updated on publish/unpublish. Directory cost
 // is now ONE KV read regardless of how many lists exist.
 //
@@ -4069,6 +4185,45 @@ function sortPublicIndexEntries(entries) {
   return entries.sort(
     (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
   );
+}
+
+// Like/unlike is the frequent directory write, and it is the one that makes
+// index:publiclists a hot key.
+//
+// Every vote that changed a count did a read-modify-write of the single key
+// holding the WHOLE directory: 4.45 MB parsed, sorted and re-serialised at the
+// 20,000-entry cap, measured, for a one-number change. Cloudflare allows one
+// write per second to a given key on both plans, so past roughly one like per
+// second across the entire deployment the index was being written faster than
+// KV accepts it -- and the failure mode there is not "one entry is late", it
+// is "the directory is hours stale for everyone".
+//
+// So a like-driven index update now claims a short global cooldown first. Below
+// one like every LIKE_INDEX_COOLDOWN_SEC the cooldown is always free and every
+// vote updates the directory exactly as before -- which is every deployment
+// this code has ever run on. Above it, the writes coalesce and the skipped
+// votes are picked up by the list's next save or the daily rebuild, the same
+// backstops that already cover a lost concurrent publish.
+//
+// Deliberately NOT the whole of the audit's recommendation: sharding the index
+// across 32 keys is the other half and is not done here, because a half-sharded
+// index serves a fraction of the directory and that is worse than the current
+// behaviour. It wants one change, with a version marker in the build state,
+// and it is not urgent below a few thousand public lists.
+const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
+const LIKE_INDEX_COOLDOWN_SEC = 10;
+
+async function claimLikeIndexWrite(env) {
+  if (!env || !env.CONFIGS) return false;
+  try {
+    if (await env.CONFIGS.get(LIKE_INDEX_COOLDOWN_KEY)) return false;
+    await env.CONFIGS.put(LIKE_INDEX_COOLDOWN_KEY, "1", { expirationTtl: LIKE_INDEX_COOLDOWN_SEC });
+    return true;
+  } catch {
+    // The cooldown is an optimisation, not a correctness control. If KV is
+    // unhappy, fall back to the old behaviour rather than dropping the update.
+    return true;
+  }
 }
 
 async function writePublicListIndex(env, entries) {
@@ -5768,7 +5923,7 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // throttle. That column existed for a long time but nothing ever wrote to
 // it, which forced the dashboard to do one KV `get` per account just to
 // render the "Last Active" column -- linear in the account count, and
-// over Cloudflare's 1,000-subrequest/invocation cap past roughly a
+// over Cloudflare's 1,000-storage-operations/invocation cap past roughly a
 // thousand creators (the admin dashboard then stopped loading entirely in
 // production; Miniflare doesn't enforce that limit, so it rendered fine
 // locally). Writing it here lets the dashboard read last-active straight
@@ -5963,7 +6118,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     // Cap the candidate pool. This branch reads the running-total key AND
     // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
     // reads each, which is ~2,000 reads at 1,000 titles and crosses
-    // Cloudflare's 1,000-subrequest/invocation cap around 500 titles,
+    // Cloudflare's 1,000-storage-operations/invocation cap around 500 titles,
     // killing the whole Trending tab. We surface only 100, so a fixed
     // candidate ceiling bounds the cost regardless of corpus size; the
     // day-index windows below are capped the same way.
@@ -8320,9 +8475,26 @@ async function renderAdminDashboard(env) {
           btn.disabled = false;
           return;
         }
+        // The public directory index truncates silently at its entry cap --
+        // it keeps the most-liked and drops the tail, which is the right
+        // choice, but nothing said it had happened. Reported here in every
+        // branch below, because it has nothing to do with D1: a KV-only
+        // deployment can hit it too.
+        var idx = data.publicIndex;
+        var indexNote = '';
+        if (idx) {
+          var pct = idx.max ? Math.round((idx.entries / idx.max) * 100) : 0;
+          indexNote = idx.truncated
+            ? '<p style="color:#FF9500; margin:10px 0 0; font-size:0.82rem;"><strong>The public list directory is full.</strong> ' +
+              'It holds ' + idx.entries.toLocaleString() + ' of a maximum ' + idx.max.toLocaleString() +
+              ' entries, so the least-liked lists past that point are no longer being advertised. ' +
+              'They are still reachable by their own URL.</p>'
+            : '<p style="color:#8E8E93; margin:10px 0 0; font-size:0.82rem;">Public list directory: ' +
+              idx.entries.toLocaleString() + ' of ' + idx.max.toLocaleString() + ' entries (' + pct + '%).</p>';
+        }
         if (!data.bound) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>';
+          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -8330,13 +8502,13 @@ async function renderAdminDashboard(env) {
           status.textContent = '';
           out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
             (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
-            ' This is not the same as a missing migration \u2014 try again.</p>';
+            ' This is not the same as a missing migration \u2014 try again.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
         if (data.upToDate) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + indexNote;
           btn.disabled = false;
           return;
         }
@@ -8354,7 +8526,7 @@ async function renderAdminDashboard(env) {
           '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
           '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
           '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table></div>';
+          '<tbody>' + rows + '</tbody></table></div>' + indexNote;
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -14452,7 +14624,7 @@ function renderBuilder(
         applicationCategory: "MultimediaApplication",
         operatingSystem: "Any",
         description:
-          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own free Cloudflare Worker.",
+          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own Cloudflare Worker.",
         offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
         url: origin + "/",
       })}</script>`;
@@ -24230,6 +24402,17 @@ async function markSimklListAllWatched(btn) {
 // chunk size comes from the same constant the server validates against so
 // the two cannot drift apart.
 //
+// The server may also process only PART of a chunk and say so: its outbound
+// budget is 50 fetches per invocation on a free Cloudflare Worker and two per
+// title, so 200 titles do not fit there. It answers with nextIndex -- how
+// many of the titles just sent it got through -- and the loop resumes from
+// exactly there. A deployment that predates that sends no nextIndex, which is
+// read as "the whole chunk", so this keeps working against an older Worker.
+//
+// Advancing by anything other than what the server actually consumed is how
+// an import silently drops titles, which is worse than failing, so a reply
+// claiming no progress is treated as an error rather than retried forever.
+//
 // Throws on the first failed chunk, matching the previous single-request
 // behaviour: each caller already has its own catch that reports the
 // category as failed rather than silently importing half of it.
@@ -24237,15 +24420,20 @@ async function bulkResolveInChunks(items) {
   const list = Array.isArray(items) ? items : [];
   const CHUNK = ${BULK_RESOLVE_ITEMS_MAX};
   const out = [];
-  for (let i = 0; i < list.length; i += CHUNK) {
+  let i = 0;
+  while (i < list.length) {
+    const sent = Math.min(CHUNK, list.length - i);
     const res = await fetch(ORIGIN + '/api/bulk-resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items: list.slice(i, i + CHUNK) }),
+      body: JSON.stringify({ items: list.slice(i, i + sent) }),
     });
     const data = await res.json();
     if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
     if (Array.isArray(data.resolved)) out.push.apply(out, data.resolved);
+    const consumed = Number.isFinite(data.nextIndex) ? Math.min(data.nextIndex, sent) : sent;
+    if (consumed < 1) throw new Error('the server made no progress on this batch');
+    i += consumed;
   }
   return out;
 }
@@ -28522,9 +28710,22 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
     const idx = payload.items.findIndex(it => (it.imdbId === imdbId) || (it.id === originalId) || (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId));
     const exists = idx !== -1;
     
+    // The same match, and the same add or remove, expressed as a function of
+    // whatever items it is handed. The array below is one possible result of
+    // it; the function is what lets the edit be re-applied to another device's
+    // copy instead of overwriting it -- see saveCreatorListWithBaseline.
+    const matchesTarget = (it) => !!it && (
+      (it.imdbId === imdbId) || (it.id === originalId) ||
+      (it.imdbId === 'tmdb:' + originalId) || (it.id === imdbId)
+    );
+    const addedItem = { imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined };
+    const applyEdit = shouldBeInList
+      ? (items) => ((items || []).some(matchesTarget) ? (items || []).slice() : (items || []).concat([addedItem]))
+      : (items) => (items || []).filter((it) => !matchesTarget(it));
+
     let changed = false;
     if (shouldBeInList && !exists) {
-      payload.items.push({ imdbId: imdbId || originalId, id: originalId || imdbId, type: type || 'movie', title: title || '', poster: poster || undefined });
+      payload.items.push(addedItem);
       changed = true;
     } else if (!shouldBeInList && exists) {
       payload.items.splice(idx, 1);
@@ -28544,7 +28745,7 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
       
       const nameInput = list.row ? list.row.querySelector('.name') : null;
       const rowName = (nameInput ? nameInput.value : '') || list.name || '';
-      syncCustomListPayload(payload, rowName);
+      syncCustomListPayload(payload, rowName, applyEdit);
     }
     return changed;
     
@@ -28554,7 +28755,12 @@ function toggleItemInCustomListUrl(originalId, imdbId, type, listIdx, shouldBeIn
   }
 }
 
-async function syncCustomListPayload(payload, name) {
+// applyEdit(items) is the single add-or-remove this sync is carrying, as a
+// function -- optional, and only used when the list lives on the account. It
+// is what the conflict guard needs: on a 409 the edit is re-run against the
+// copy the other device saved, rather than the stale array being re-sent over
+// the top of it.
+async function syncCustomListPayload(payload, name, applyEdit) {
   const isWatchlist = payload.localSlug === 'watchlist' || payload.creatorSlug === 'watchlist' || (name && name.toLowerCase() === 'watchlist');
   if (isWatchlist) {
     if (typeof loadLocalCustomLists === 'function' && typeof saveLocalCustomListsMap === 'function') {
@@ -28596,27 +28802,32 @@ async function syncCustomListPayload(payload, name) {
           const otherItems = creatorListMeta.items.filter(it => !currentIds.has(it.imdbId || it.id));
           combinedItems = (payload.items || []).concat(otherItems);
         }
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: creatorName,
-            creatorKey: creatorKey,
-            slug: payload.creatorSlug,
-            name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
-            type: finalType,
-            items: combinedItems,
-            visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private')
-          })
-        });
-        const data = await res.json();
-        if (data.ok) {
+        // A whole-list replacement of an existing account list, sent with no
+        // baseline: one of the three slug-bearing call sites that left the
+        // server's expectedUpdatedAt guard unarmed, so a second device's
+        // additions between this browser's last load and this write were
+        // silently overwritten. Routed through the one helper that cites the
+        // baseline and, on a 409, re-applies this single add/remove to what
+        // the other device actually saved.
+        const target = {
+          slug: payload.creatorSlug,
+          name: name.replace(/\s*\((?:Movies|Shows)\)$/i, ''),
+          type: finalType,
+          items: combinedItems,
+          visibility: payload.visibility || (creatorListMeta ? creatorListMeta.visibility : 'private'),
+        };
+        if (creatorListMeta && Number.isFinite(creatorListMeta.updatedAt)) {
+          target.updatedAt = creatorListMeta.updatedAt;
+        }
+        const result = await saveCreatorListWithBaseline(target, applyEdit || null, null);
+        if (result && result.ok) {
+          // target.items is what actually landed -- on a merged retry the
+          // helper replaces it with the other device's copy plus this edit.
+          combinedItems = target.items;
           if (creatorListMeta) {
             creatorListMeta.items = combinedItems;
-            creatorListMeta.itemCount = combinedItems.length;
-          }
-          if (typeof renderCreatorDashboard === 'function') {
-            renderCreatorDashboard({ silent: true });
+            creatorListMeta.itemCount = (combinedItems || []).length;
+            if (Number.isFinite(target.updatedAt)) creatorListMeta.updatedAt = target.updatedAt;
           }
         }
         payload.items = combinedItems;
@@ -36683,29 +36894,81 @@ async function saveLocalCustomListEdit(name) {
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (slug || 'watchlist'))
     : (location.origin + '/lists/' + (slug === 'watchlist' ? 'watchlist' : ('custom/' + slug))));
 
+  // The account mirror. Its outcome used to be discarded entirely -- there was
+  // no else and no error path, so a 401, a 409 and a 500 all ended at the same
+  // "saved" modal while nothing reached the account. On the next sign-in the
+  // server's older copy wins and the edit is gone, having been reported saved.
+  // The LOCAL save above stays unconditional -- it is this function's job and
+  // it works -- but what the person is told about the account has to match
+  // what happened.
+  let mirror = null;
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     if (creatorKey) {
-      try {
-        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: slug,
-            name: name,
-            type: customListDraftType,
-            items: customListDraftItems,
-            visibility: visibility,
-          }),
-        });
-        const data = await res.json();
-        if (data.ok && data.url) {
-          finalUrl = data.url;
+      // A whole-list replacement of a list that already exists on the server:
+      // exactly what the server's expectedUpdatedAt guard is for, and one of
+      // the three slug-bearing call sites that never armed it. Routed through
+      // the one helper that speaks that protocol rather than a fourth copy of
+      // it. No re-apply function is passed: a replacement is not a delta, so
+      // re-running it against the other device's copy would erase precisely
+      // what the guard exists to protect. The conflict comes back here.
+      const cached = (typeof lastCreatorListsData !== 'undefined' && Array.isArray(lastCreatorListsData))
+        ? lastCreatorListsData.find((l) => l && l.slug === slug)
+        : null;
+      const target = {
+        slug: slug,
+        name: name,
+        type: customListDraftType,
+        items: customListDraftItems,
+        visibility: visibility,
+      };
+      if (cached && Number.isFinite(cached.updatedAt)) target.updatedAt = cached.updatedAt;
+      mirror = await saveCreatorListWithBaseline(target, null, null);
+      if (mirror && mirror.ok) {
+        if (mirror.url) finalUrl = mirror.url;
+        // Keep the dashboard's copy in step with what was just stored, or the
+        // next edit in this session cites a version this browser has itself
+        // already replaced and 409s against its own write.
+        if (cached) {
+          cached.name = name;
+          cached.type = customListDraftType;
+          cached.items = customListDraftItems.slice();
+          cached.itemCount = cached.items.length;
+          cached.visibility = visibility;
+          if (Number.isFinite(target.updatedAt)) cached.updatedAt = target.updatedAt;
         }
-      } catch (e) {}
+      }
     }
+  }
+
+  if (mirror && !mirror.ok && !mirror.skipped) {
+    const savedHere = 'Your changes are saved on this device, but they did not reach your account.';
+    let title = 'Saved Here, Not To Your Account';
+    let msg;
+    if (mirror.conflict || mirror.status === 409) {
+      // The helper has already dropped the cached dashboard copy, so the
+      // re-render below shows what is actually stored rather than a version
+      // that no longer exists. The server sends conflict: true and the stored
+      // updatedAt precisely so the client can go and look.
+      title = 'This List Changed Elsewhere';
+      msg = 'Another device saved changes to this list after you opened it, so saving now would undo them. ' +
+        savedHere + ' Reopen the list to see what the other device saved, then re-apply your changes.';
+    } else if (mirror.networkError) {
+      msg = 'A network error occurred while saving to your account. ' + savedHere + ' Please try again.';
+    } else if (mirror.status === 401 || mirror.status === 403) {
+      msg = 'Your account key was rejected, so the change could not be saved to your account. ' +
+        savedHere + ' Sign in again and re-save.';
+    } else {
+      msg = (mirror.error || 'The server rejected the save.') + ' ' + savedHere;
+    }
+    if (typeof showAppNoticeModal === 'function') {
+      showAppNoticeModal(title, msg, true);
+    } else {
+      alert(msg);
+    }
+    cancelEditCustomList();
+    renderCreatorDashboard();
+    return;
   }
 
   if (typeof showSavedCustomListModal === 'function') {
@@ -37318,7 +37581,13 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
     );
     if (creatorWatchlist && Array.isArray(creatorWatchlist.items) && creatorWatchlist.items.length) {
       const initialLen = creatorWatchlist.items.length;
-      const updatedItems = creatorWatchlist.items.filter((it) => {
+      // The removal as a FUNCTION, not as its result. This used to send the
+      // array computed from a possibly-stale local copy, fire-and-forget, with
+      // no expectedUpdatedAt -- so a second device's Watchlist additions could
+      // be erased between this browser's last load and this write, with
+      // nothing reported anywhere. Expressed this way the same removal can be
+      // re-run against whatever the other device actually saved.
+      const dropWatched = (items) => (items || []).filter((it) => {
         if (!it) return false;
         const itId = String(it.id || '');
         const itImdbId = String(it.imdbId || '');
@@ -37341,22 +37610,14 @@ function removeWatchedItemFromWatchlist(id, showId, extraIds) {
         if (itTmdbId && (targetIds.has(itTmdbId) || targetIds.has('tmdb:' + itTmdbId))) return false;
         return true;
       });
+      const updatedItems = dropWatched(creatorWatchlist.items);
       if (updatedItems.length !== initialLen) {
         creatorWatchlist.items = updatedItems;
-        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-        fetch(ORIGIN + '/api/creator/lists/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            name: creatorWatchlist.name,
-            type: creatorWatchlist.type || 'mixed',
-            items: updatedItems,
-            visibility: creatorWatchlist.visibility || 'private',
-            slug: creatorWatchlist.slug,
-          }),
-        }).catch(() => {});
+        // Still a background save -- nothing here is waiting on it, and the
+        // helper reports nothing on failure by design (the removal is already
+        // applied locally and the next load reconciles). What it adds is the
+        // baseline and the merge-and-retry.
+        saveCreatorListWithBaseline(creatorWatchlist, dropWatched, null);
       }
     }
   }
@@ -42212,57 +42473,102 @@ let _creatorListsInFlight = null;
 // only reads it (find/forEach) -- so handing back the same object is safe
 // rather than a shared-mutable-state trap.
 let _lastCreatorListsResponse = null;
-let _creatorListsVersion = '';
+// One entry per page: { version, page }. The endpoint pages now (an account
+// past ~990 lists spent more KV operations than Cloudflare allows in one
+// invocation, and the dashboard 500'd forever), so the conditional-response
+// version is per page too. Almost every account is one page, where this
+// behaves exactly as the single-version cache did.
+let _creatorListsPages = [];
 
 // Cleared whenever the cached lists are dropped, so the browser can never
 // claim to hold a version it no longer has.
 function resetCreatorListsCache() {
   _lastCreatorListsResponse = null;
-  _creatorListsVersion = '';
+  _creatorListsPages = [];
 }
 
 async function fetchCreatorListsOnce(creatorKey) {
   if (_creatorListsInFlight) return await _creatorListsInFlight;
   const p = (async () => {
-    // Only claim a version if the data that version describes is still
-    // here; otherwise an "unchanged" reply would leave nothing to render.
-    const canReuse = !!(_creatorListsVersion && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
-    const res = await fetch(ORIGIN + '/api/creator/lists', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        creatorName: activeCreator.creatorName,
-        creatorKey: creatorKey,
-        knownVersion: canReuse ? _creatorListsVersion : '',
-      }),
-    });
-    const data = await res.json();
-    if (data && data.ok && data.unchanged) {
-      // Nothing changed server-side -- reuse the copy already in memory.
-      if (canReuse) return _lastCreatorListsResponse;
-      // Should be unreachable (the version was only sent when reusable),
-      // but if it ever happens, ask again without a version rather than
-      // returning a response with no lists in it.
-      resetCreatorListsCache();
-      const retry = await fetch(ORIGIN + '/api/creator/lists', {
+    const askFor = async (offset, knownVersion) => {
+      const res = await fetch(ORIGIN + '/api/creator/lists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          offset: offset,
+          limit: ${CREATOR_LISTS_PAGE_DEFAULT},
+          knownVersion: knownVersion || '',
+        }),
       });
-      const retryData = await retry.json();
-      if (retryData && retryData.ok) {
-        _lastCreatorListsResponse = retryData;
-        _creatorListsVersion = retryData.version || '';
+      return await res.json();
+    };
+
+    // Only claim a version if the data that version describes is still
+    // here; otherwise an "unchanged" reply would leave nothing to render.
+    const canReuse = !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+    const pages = [];
+    let combined = null;
+    for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
+      const cached = canReuse ? _creatorListsPages[i] : null;
+      let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '');
+      if (data && data.ok && data.unchanged) {
+        if (cached && cached.page) {
+          // Nothing changed on this page -- reuse the copy already in memory.
+          pages.push({ version: data.version || cached.version, page: cached.page });
+          if (!data.hasMore) break;
+          continue;
+        }
+        // Should be unreachable (a version is only sent when reusable), but
+        // if it ever happens, ask again without one rather than assembling a
+        // response with a page missing from it.
+        data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '');
       }
-      return retryData;
+      if (!data || !data.ok) {
+        resetCreatorListsCache();
+        return data;
+      }
+      pages.push({ version: data.version || '', page: data });
+      if (!combined) combined = data;
+      if (!data.hasMore) break;
     }
-    if (data && data.ok) {
-      _lastCreatorListsResponse = data;
-      _creatorListsVersion = data.version || '';
-    } else {
+    if (!pages.length) {
       resetCreatorListsCache();
+      return combined;
     }
-    return data;
+
+    // One page is the overwhelmingly common case and is handed back as-is,
+    // so nothing downstream sees a synthesised object where it used to see
+    // the server's own response.
+    let out;
+    if (pages.length === 1) {
+      out = pages[0].page;
+    } else {
+      const first = pages[0].page;
+      const lists = [];
+      const deleted = [];
+      const seenDeleted = new Set();
+      for (const p2 of pages) {
+        const pg = p2.page || {};
+        if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
+        for (const s of (pg.deletedSlugs || [])) {
+          if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+        }
+      }
+      out = {
+        ok: true,
+        displayName: first.displayName,
+        lists: lists,
+        order: first.order || [],
+        deletedSlugs: deleted,
+        total: first.total,
+        version: pages.map((x) => x.version).join('.'),
+      };
+    }
+    _lastCreatorListsResponse = out;
+    _creatorListsPages = pages;
+    return out;
   })();
   _creatorListsInFlight = p;
   try {
@@ -44163,8 +44469,21 @@ function deleteExternalListDirect(provider, listId, listName, btn) {
 // Retried once. A second conflict means a third device is writing to the same
 // list in the same instant; the edit is dropped rather than looping, and the
 // dashboard reload below shows what actually landed.
+//
+// Pass removeItem = null when the edit CANNOT be re-applied -- a whole-list
+// replacement built in the builder is not a delta, and re-running it against
+// the other device's copy would erase exactly what the guard exists to
+// protect. Those callers get the conflict back and tell the person, since
+// only they can say which version they want.
+//
+// Returns the outcome rather than swallowing it: { ok, status, conflict, url,
+// updatedAt, error, networkError }. The two background remove-one-item callers
+// ignore it, as they did before; the callers that show the person a "saved"
+// modal must not (a false success is its own finding).
 async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
-  if (!list || typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (!list || typeof activeCreator === 'undefined' || !activeCreator) {
+    return { ok: false, skipped: true };
+  }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   const send = async (target) => {
     const body = {
@@ -44190,34 +44509,51 @@ async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
   try {
     let res = await send(list);
     if (res.status === 409) {
+      // Whatever this browser holds is now stale either way, so the cached
+      // dashboard copy has to go before anything reads it again.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      // No re-appliable edit -- a whole-list replacement. Re-running it
+      // against the other device's copy is exactly the overwrite the guard
+      // just prevented, so hand the conflict back and let the caller tell
+      // the person.
+      if (typeof removeItem !== 'function') return { ok: false, status: 409, conflict: true };
       // Someone else saved in between. Pull what they saved, re-apply this
       // removal on top of it, and try once more.
       let fresh = null;
       try {
-        if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
         const data = await fetchCreatorListsOnce(creatorKey);
         fresh = ((data && data.lists) || []).find((l) => l && l.slug === list.slug) || null;
       } catch (e) {
         fresh = null;
       }
-      if (!fresh) return;
+      if (!fresh) return { ok: false, status: 409, conflict: true };
       fresh.items = removeItem(Array.isArray(fresh.items) ? fresh.items : []);
       // Keep the in-memory copy in step with what is about to be saved, so
       // the dashboard does not re-render the pre-merge list.
       list.items = fresh.items;
       list.updatedAt = fresh.updatedAt;
       res = await send(fresh);
-      if (res.status === 409) return;
+      if (res.status === 409) return { ok: false, status: 409, conflict: true };
     }
     const data = await res.json().catch(() => null);
     // Advance the baseline, or the next edit in this session cites a version
     // that is now stale and 409s against a write this browser made itself.
     if (data && data.ok && Number.isFinite(data.updatedAt)) list.updatedAt = data.updatedAt;
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-    if (toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    if (data && data.ok && toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    return {
+      ok: !!(data && data.ok),
+      status: res.status,
+      conflict: !!(data && data.conflict),
+      url: (data && data.url) || null,
+      updatedAt: (data && Number.isFinite(data.updatedAt)) ? data.updatedAt : null,
+      error: (data && data.error) || (data && data.ok ? null : 'The server rejected the save.'),
+    };
   } catch (e) {
     // Background save, same as before -- the edit is still in the DOM and in
-    // the local map, and the next load reconciles.
+    // the local map, and the next load reconciles. Callers that told the
+    // person something read networkError and correct themselves.
+    return { ok: false, networkError: true, error: 'A network error occurred while saving.' };
   }
 }
 
@@ -56730,8 +57066,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a
-      // name and a group. Checked on the exact bytes about to be stored.
-      if (savePayload.length > SAVED_CONFIG_BYTES_MAX) {
+      // name and a group. Checked on the exact bytes about to be stored --
+      // bytes, not UTF-16 code units, which the constant's name has always
+      // said and the check did not do.
+      if (utf8ByteLength(savePayload) > SAVED_CONFIG_BYTES_MAX) {
         return json({ ok: false, error: "That configuration is too large to save." }, 413);
       }
 
@@ -56758,12 +57096,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // TTL: the slug is a shared list URL somebody has handed to other
       // people, and expiring it would break their link rather than free
       // anything worth freeing. Bounded at the door instead, by this limit
-      // and PUBLISHED_LIST_ITEMS_MAX/PUBLISHED_LIST_BYTES_MAX.
+      // and the ANON_PUBLISH_* ceilings (00_constants.js).
+      //
+      // Those ceilings used to be the ones the AUTHENTICATED save uses, and
+      // the two are not the same risk: a creator list belongs to an account
+      // that can be found and deleted, an anonymous one has no owner at all
+      // and only an operator, by hand, can remove it. At the old 10 publishes
+      // a minute and 2 MB apiece this was 20 MB a minute of permanent unowned
+      // storage from one IP -- from an endpoint the shipped UI never calls.
       const plIp = clientIpKey(request);
       if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
       const plRateKey = `ratelimit:publishlist:${plIp}`;
       const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
-      if (plAttempts >= 10) {
+      if (plAttempts >= ANON_PUBLISH_PER_MINUTE) {
         return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
       }
       await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
@@ -56786,8 +57131,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
         return json({ ok: false, error: "That list name is too long." }, 400);
       }
-      if (plItems.length > PUBLISHED_LIST_ITEMS_MAX) {
-        return json({ ok: false, error: `That list is too large to publish (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      if (plItems.length > ANON_PUBLISH_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to publish (limit ${ANON_PUBLISH_ITEMS_MAX} items).` }, 413);
+      }
+      // An item is a catalog entry, not an arbitrary JSON document. Without
+      // this the endpoint accepted any shape at all -- nested objects, whole
+      // strings, nulls -- none of which can render, so the only thing they
+      // could ever do is occupy the namespace permanently. Rejected rather
+      // than filtered, for the same reason the size bounds reject: quietly
+      // storing something other than what was sent is the worse bug.
+      for (const it of plItems) {
+        if (!it || typeof it !== "object" || Array.isArray(it)) {
+          return json({ ok: false, error: "That list contains an entry that is not a list item." }, 400);
+        }
+        const itId = it.id != null ? it.id : it.imdbId;
+        if (typeof itId !== "string" || !itId || itId.length > ANON_PUBLISH_ITEM_ID_MAX) {
+          return json({ ok: false, error: "That list contains an entry with no usable id." }, 400);
+        }
       }
       // Never falls through onto a slug that is taken -- see pickFreeSlug.
       const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
@@ -56806,8 +57166,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Item COUNT alone is not a size bound -- individual items carry
       // titles, overviews and poster URLs, so a few thousand of them can
       // still be many megabytes. This is the bound that actually protects
-      // storage, checked on the exact bytes about to be written.
-      if (plPayload.length > PUBLISHED_LIST_BYTES_MAX) {
+      // storage, checked on the exact bytes about to be written -- bytes,
+      // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
+      // mirrored to D1 on this path, so unlike the creator guard this one is
+      // only a storage bound; the two were deliberately kept in step.
+      if (utf8ByteLength(plPayload) > ANON_PUBLISH_BYTES_MAX) {
         return json({ ok: false, error: "That list is too large to publish." }, 413);
       }
       await env.CONFIGS.put(plKey, plPayload);
@@ -56928,16 +57291,27 @@ Sitemap: ${url.origin}/sitemap.xml`;
           // name/type/itemCount match what is actually stored.
           const likeIsCreator = likeKey === likeCreatorKey;
           if (isPublicListVisibility(updated.visibility)) {
-            ctx.waitUntil(updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
-              isCreator: likeIsCreator,
-              username: likeIsCreator ? likeUser : "user",
-              slug: likeSlug,
-              name: updated.name || "List",
-              type: updated.type || "mixed",
-              itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
-              likes: count,
-              updatedAt: updated.updatedAt || updated.createdAt || null,
-            }));
+            // Behind a short global cooldown. This is a read-modify-write of
+            // the single key holding the whole directory -- 4.45 MB at the
+            // entry cap -- and likes are the frequent write, so at any real
+            // like rate it was being issued faster than KV's one-write-per-
+            // second-per-key allows. Below that rate the cooldown is always
+            // free and this behaves exactly as it did; above it the writes
+            // coalesce and the skipped votes ride along on the list's next
+            // save or the daily rebuild. See claimLikeIndexWrite.
+            ctx.waitUntil((async () => {
+              if (!(await claimLikeIndexWrite(env))) return;
+              await updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
+                isCreator: likeIsCreator,
+                username: likeIsCreator ? likeUser : "user",
+                slug: likeSlug,
+                name: updated.name || "List",
+                type: updated.type || "mixed",
+                itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
+                likes: count,
+                updatedAt: updated.updatedAt || updated.createdAt || null,
+              });
+            })().catch(() => {}));
           }
         }
       }
@@ -58694,6 +59068,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return authFailureResponse(auth);
+      // Paging. The route used to issue one KV get per list with no cap, so
+      // an account at 990 lists spent 1,001 KV operations and Cloudflare
+      // terminated the invocation -- the dashboard 500s forever, and since
+      // deleting a list is done FROM the dashboard there was no way back.
+      // See CREATOR_LISTS_PAGE_DEFAULT (00_constants.js).
+      //
+      // The slug ORDER is resolved in full first (one KV get plus the orphan
+      // sweep's list() pages -- both independent of list count), and only the
+      // requested window is read. So the per-invocation cost is bounded by
+      // `limit`, not by how many lists the account owns.
+      const rawLimit = parseInt(body.limit, 10);
+      const listLimit = Number.isFinite(rawLimit) && rawLimit > 0
+        ? Math.min(rawLimit, CREATOR_LISTS_PAGE_MAX)
+        : CREATOR_LISTS_PAGE_DEFAULT;
+      const rawOffset = parseInt(body.offset, 10);
+      const listOffset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -58701,9 +59092,111 @@ Sitemap: ${url.origin}/sitemap.xml`;
       } catch {
         order = [];
       }
+      order = order.filter((s) => typeof s === "string" && s);
+
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      //
+      // The sweep runs on EVERY page, not just the first: it is what decides
+      // how many lists there are, and a `total` that changed between pages
+      // would let the client stop early and lose the tail.
+      const orderedSlugs = new Set(order);
+      const recovered = [];
+      let sweepOk = true;
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) { orderedSlugs.add(s); recovered.push(s); }
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        sweepOk = false;
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        order = order.concat(recovered);
+        ctx.waitUntil(
+          env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+        );
+      }
+
+      // The Watchlist, when no creatorlist: record for it turned up above.
+      //
+      // Resolved before paging so it counts toward `total` and cannot be
+      // lost off the end of a page. The sweep sees every creatorlist: key, so
+      // when it succeeded a missing `watchlist` slug means the record really
+      // is absent and only the tracking blob can supply one; when it failed,
+      // the one key is probed directly rather than assuming.
+      let watchlistFallback = null;
+      if (!orderedSlugs.has("watchlist")) {
+        let wlRaw = null;
+        if (!sweepOk) wlRaw = await getCreatorList(env, auth.username, "watchlist");
+        if (wlRaw) {
+          try {
+            const data = JSON.parse(wlRaw);
+            watchlistFallback = {
+              slug: "watchlist",
+              name: data.name || "Watchlist",
+              type: data.type || "mixed",
+              items: data.items || [],
+              itemCount: (data.items || []).length,
+              likes: data.likes || 0,
+              visibility: effectiveListVisibility(data.visibility),
+              url: `${url.origin}/lists/${auth.username}/watchlist`,
+            };
+          } catch {}
+        } else {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (trackingRaw) {
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
+                watchlistFallback = {
+                  slug: "watchlist",
+                  name: "Watchlist",
+                  type: "mixed",
+                  items: tb.watchlist,
+                  itemCount: tb.watchlist.length,
+                  likes: 0,
+                  visibility: "private",
+                  url: `${url.origin}/lists/${auth.username}/watchlist`,
+                };
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // The fallback Watchlist is displayed first, so it occupies index 0 of
+      // the virtual sequence the offsets address.
+      const allSlugs = watchlistFallback ? ["\u0000watchlist"].concat(order) : order.slice();
+      const total = allSlugs.length;
+      const pageSlugs = allSlugs.slice(listOffset, listOffset + listLimit);
+      const hasMore = listOffset + pageSlugs.length < total;
+
       const lists = (
         await Promise.all(
-          order.map(async (slug) => {
+          pageSlugs.map(async (slug) => {
+            if (slug === "\u0000watchlist") return watchlistFallback;
             const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
@@ -58735,112 +59228,6 @@ Sitemap: ${url.origin}/sitemap.xml`;
           })
         )
       ).filter(Boolean);
-
-      // Anything the account owns that creatorlistorder: has lost.
-      //
-      // order is one KV key rewritten read-modify-write by every save, with
-      // no compare-and-swap, so concurrent saves drop each other's entries.
-      // Building the dashboard from order alone meant a list whose entry was
-      // lost became invisible even though its record was sitting right there
-      // in KV -- and the client, seeing it missing, uploaded it again. That
-      // feedback loop is what produced 129 list records for 22 real lists on
-      // one account.
-      //
-      // So order now decides DISPLAY ORDER, not existence: a record with no
-      // order entry is appended rather than dropped, and order is repaired in
-      // the same breath so it converges instead of drifting further. Costs
-      // one KV list() on a healthy account, where the recovered set is empty.
-      const orderedSlugs = new Set(lists.map((l) => l.slug));
-      const recovered = [];
-      try {
-        let listCursor;
-        for (let page = 0; page < 5; page++) {
-          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
-          for (const k of res.keys) {
-            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
-            if (s && !orderedSlugs.has(s)) recovered.push(s);
-          }
-          if (res.list_complete || !res.cursor) break;
-          listCursor = res.cursor;
-        }
-      } catch (e) {
-        // Best-effort: without it the dashboard is exactly as complete as it
-        // was before, never less.
-        console.error("creator lists: orphan sweep failed", e);
-      }
-      if (recovered.length) {
-        const restored = (
-          await Promise.all(
-            recovered.map(async (slug) => {
-              const raw = await getCreatorList(env, auth.username, slug);
-              if (!raw) return null;
-              try {
-                const data = JSON.parse(raw);
-                return {
-                  slug,
-                  name: data.name,
-                  type: data.type,
-                  items: data.items || [],
-                  itemCount: (data.items || []).length,
-                  likes: data.likes || 0,
-                  visibility: effectiveListVisibility(data.visibility),
-                  url: `${url.origin}/lists/${auth.username}/${slug}`,
-                };
-              } catch {
-                return null;
-              }
-            })
-          )
-        ).filter(Boolean);
-        for (const l of restored) {
-          lists.push(l);
-          order.push(l.slug);
-        }
-        if (restored.length) {
-          ctx.waitUntil(
-            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
-          );
-        }
-      }
-
-      const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
-      if (!hasWatchlistInLists) {
-        const wlRaw = await getCreatorList(env, auth.username, "watchlist");
-        if (wlRaw) {
-          try {
-            const data = JSON.parse(wlRaw);
-            lists.unshift({
-              slug: "watchlist",
-              name: data.name || "Watchlist",
-              type: data.type || "mixed",
-              items: data.items || [],
-              itemCount: (data.items || []).length,
-              likes: data.likes || 0,
-              visibility: effectiveListVisibility(data.visibility),
-              url: `${url.origin}/lists/${auth.username}/watchlist`,
-            });
-          } catch {}
-        } else {
-          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-          if (trackingRaw) {
-            try {
-              const tb = JSON.parse(trackingRaw);
-              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
-                lists.unshift({
-                  slug: "watchlist",
-                  name: "Watchlist",
-                  type: "mixed",
-                  items: tb.watchlist,
-                  itemCount: tb.watchlist.length,
-                  likes: 0,
-                  visibility: "private",
-                  url: `${url.origin}/lists/${auth.username}/watchlist`,
-                });
-              }
-            } catch {}
-          }
-        }
-      }
 
       // Content version + conditional response.
       //
@@ -58875,9 +59262,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
       //
       // Part of the payload the version hash is taken over, so a delete made
       // elsewhere can never be hidden behind an "unchanged" reply.
+      // Filtered against every slug the account owns, not against this PAGE
+      // of them: a slug that is alive but sits on another page would
+      // otherwise be reported to the client as deleted, and the client
+      // deletes its local copy of anything named here.
       const deletedSlugs = Object.keys(await readCreatorListDeletions(env, auth.username))
-        .filter((s) => !lists.some((l) => l && l.slug === s));
-      const listsPayload = { ok: true, displayName: auth.displayName, lists, order, deletedSlugs };
+        .filter((s) => !orderedSlugs.has(s) && !(watchlistFallback && s === "watchlist"));
+      const listsPayload = {
+        ok: true, displayName: auth.displayName, lists, order, deletedSlugs,
+        total, offset: listOffset, limit: listLimit, hasMore,
+      };
       let listsVersion = "";
       try {
         const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
@@ -58889,7 +59283,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // browser that stops seeing its own list changes.
       }
       if (listsVersion && body.knownVersion && body.knownVersion === listsVersion) {
-        return jsonPrivate({ ok: true, unchanged: true, version: listsVersion });
+        // The paging fields ride along on the unchanged reply too. Without
+        // them a client that cached page 0 could not know whether to ask for
+        // page 1, and would stop at whatever it already had.
+        return jsonPrivate({
+          ok: true, unchanged: true, version: listsVersion,
+          total, offset: listOffset, limit: listLimit, hasMore,
+        });
       }
       return jsonPrivate({ ...listsPayload, version: listsVersion });
     }
@@ -59001,9 +59401,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Item count alone is not a size bound -- items carry titles,
       // overviews and poster URLs -- so this is checked on the exact bytes
       // about to be stored, before a slug is allocated or anything is
-      // written.
+      // written. BYTES, via utf8ByteLength: .length counts UTF-16 code
+      // units, and the ceiling exists because of D1's byte limit.
       const itemsJson = JSON.stringify(items || []);
-      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+      if (utf8ByteLength(itemsJson) > CREATOR_LIST_BYTES_MAX) {
         return json({
           ok: false,
           error: "That list is too large to save. Try splitting it into more than one list.",
@@ -59883,8 +60284,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
           wlObj.updatedAt = watchlistUpdatedAt;
           // Same D1 row-size reasoning as /api/creator/lists/save: a
           // watchlist over the ceiling cannot be mirrored, and a mirror that
-          // silently stops is how a missing D1 row comes about.
-          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+          // silently stops is how a missing D1 row comes about. Measured in
+          // bytes for the same reason it is there.
+          if (utf8ByteLength(JSON.stringify(wlObj.items || [])) > CREATOR_LIST_BYTES_MAX) {
             return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
           }
           
@@ -61136,7 +61538,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // source_groups and the stats counters from KV to D1.
     //
     // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
-    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // write per key both count against Cloudflare's 1,000-storage-operations
+    // per-invocation limit (the KV/D1 cap, 1,000 on Free and Paid alike),
     // and the previous single-pass version simply aborted partway through on
     // any site large enough to actually need migrating -- backfilling a
     // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
@@ -61419,7 +61822,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // it happens.
     //
     // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
-    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // Cloudflare's 1,000-storage-operations per-invocation limit and a
+    // large deployment needs
     // several passes. Keep calling until `done` is true -- exactly like
     // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
     // does that loop for you. A chunk here gets a bigger op budget than the
@@ -61639,6 +62043,28 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       const status = await checkD1Schema(env);
+      // The directory index also silently truncates.
+      //
+      // writePublicListIndex keeps the PUBLIC_INDEX_MAX highest-liked entries
+      // and drops the tail -- the right entries to drop, but nothing anywhere
+      // said it had happened, so a deployment past the cap would simply stop
+      // advertising its least popular lists with no signal at all. This panel
+      // already exists to answer "is something quietly not working", so the
+      // count goes here.
+      let publicIndex = null;
+      try {
+        const idx = await readPublicListIndex(env);
+        if (idx) {
+          publicIndex = {
+            entries: idx.entries.length,
+            max: PUBLIC_INDEX_MAX,
+            truncated: idx.entries.length >= PUBLIC_INDEX_MAX,
+            updatedAt: idx.updatedAt || null,
+          };
+        }
+      } catch (e) {
+        console.error("schema-status: could not read the public list index", e);
+      }
       return json({
         ok: true,
         bound: status.bound,
@@ -61649,6 +62075,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           migration: m.migration, kind: m.kind, name: m.name, consequence: m.consequence,
         })),
         pendingMigrations: status.pendingMigrations,
+        publicIndex,
       }, 200, { "Cache-Control": "no-store" });
     }
 
@@ -62384,12 +62811,34 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
         return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
       }
-      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+      // How much of this invocation's OUTBOUND-fetch budget the loop below may
+      // spend. Cloudflare's cap is 50 on the free plan and 10,000 on paid --
+      // two different numbers, and the comment this endpoint was sized against
+      // quoted neither of them (1,000 is the KV/D1 storage-operations cap). At
+      // two TMDB calls per title, 200 titles is ~400 fetches: fine on paid,
+      // eight times over on free, where a Letterboxd import simply died above
+      // about 25 titles.
+      //
+      // So the request size stays 200 and the SERVER decides how much of it
+      // fits, reporting how far it got. See BULK_RESOLVE_SUBREQUEST_BUDGET.
+      const envBudget = parseInt(env && env.BULK_RESOLVE_SUBREQUEST_BUDGET, 10);
+      const bulkBudget = Number.isFinite(envBudget) && envBudget >= 2 ? envBudget : BULK_RESOLVE_SUBREQUEST_BUDGET;
+      // Worst case is two fetches per title (a search that matches, then its
+      // external ids), so this is the count that cannot exceed the budget
+      // whatever the responses turn out to be.
+      const bulkMaxItems = Math.max(1, Math.floor(bulkBudget / 2));
+      const bulkTake = Math.min(bulkBody.items.length, bulkMaxItems);
+      // Charged in TITLES, not requests -- the endpoint always spends the
+      // Worker owner's shared TMDB key, and that is what the ceiling is
+      // protecting. Counting requests would have cut the effective ceiling
+      // from 4,000 titles a minute to 480 the moment the budget above started
+      // splitting a request into several.
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, BULK_RESOLVE_ITEMS_PER_MINUTE, 60, bulkTake)) {
         return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       try {
         const body = bulkBody;
-        const items = body.items || [];
+        const items = (body.items || []).slice(0, bulkMaxItems);
         const resolved = [];
         // Always the shared TMDB_API_KEY -- no per-user override on this
         // endpoint. Counted precisely (not just items.length) since a
@@ -62442,7 +62891,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
           }
         }
         if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
-        return json({ ok: true, resolved });
+        // `nextIndex` is how many of the SUBMITTED items this invocation got
+        // through, so the caller knows where to resume. `done` says there is
+        // nothing left of what it sent. Both are additive: a caller that
+        // ignores them sees the same { ok, resolved } it always did -- which
+        // is why the client also treats a missing nextIndex as "the whole
+        // chunk was processed", the behaviour of any older deployment.
+        const nextIndex = items.length;
+        return json({ ok: true, resolved, nextIndex, done: nextIndex >= bulkBody.items.length });
       } catch (e) {
         // Logged, not returned -- the message can carry upstream URLs and
         // internal detail that the caller has no business seeing.

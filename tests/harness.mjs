@@ -215,8 +215,13 @@ export function nextIp() {
   return `198.51.${(n >> 8) & 255}.${n & 255}`;
 }
 
+// Anything else passed in rides along as an env var, so a test can set the
+// same wrangler.toml [vars] a deployment would (BULK_RESOLVE_SUBREQUEST_BUDGET,
+// for one). Without the spread those keys were silently dropped and a test
+// asserting on one passed for the wrong reason.
 export function makeEnv(opts = {}) {
   return {
+    ...opts,
     CONFIGS: opts.CONFIGS || makeKv(),
     ADMIN_KEY: opts.ADMIN_KEY === undefined ? "test-admin-secret" : opts.ADMIN_KEY,
     DB: opts.DB,

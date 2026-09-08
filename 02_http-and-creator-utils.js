@@ -777,6 +777,25 @@ function jsonForScript(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
+// The size of a string as it will actually be stored, in BYTES.
+//
+// Every *_BYTES_MAX ceiling in 00_constants.js is a byte budget -- KV value
+// size, and D1's 2,000,000-byte maximum string/row size, which is why
+// CREATOR_LIST_BYTES_MAX exists at all. All four guards measured with
+// String.prototype.length, which counts UTF-16 code units, not bytes. For
+// ASCII the two agree, which is why this went unnoticed; for anything else
+// they do not. A CJK character is 1 unit and 3 bytes, an emoji or any astral
+// character is 2 units and 4 bytes -- so a 1.8M-unit list of Japanese titles
+// measured 4.7 MB on the wire, passed the guard, and was written to KV. The
+// D1 mirror then failed, in the catch that logs and carries on, so the list
+// was saved and served while the admin panel could not see it and every
+// migrate-d1 run reported the same unclearable error.
+//
+// The check now measures what the comment always said it measured.
+function utf8ByteLength(s) {
+  return new TextEncoder().encode(String(s == null ? "" : s)).length;
+}
+
 // Turns an arbitrary string (an external list's URL, for
 // /api/lists/like-external) into a short, stable, filesystem/KV-key-safe
 // hex string -- external URLs can contain characters KV keys would rather
@@ -1471,12 +1490,19 @@ function clientIpKey(request) {
 // ctx.waitUntil so a rate-limit bookkeeping write never adds latency to the
 // request it is protecting. Callers check for a missing client IP
 // themselves, since what to return in that case is route-specific.
-async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60) {
+// `cost` is how much of the bucket this call spends -- 1 for an ordinary
+// request, and for /api/bulk-resolve the number of titles it is about to
+// look up. That endpoint's real cost is someone else's TMDB quota, not the
+// request itself, so counting requests would move the ceiling by a factor of
+// eight the moment a request was split into several smaller invocations.
+// Every other caller omits it and behaves exactly as before.
+async function consumeRateLimit(env, ctx, bucket, ip, maxPerWindow, windowSec = 60, cost = 1) {
   if (!env || !env.CONFIGS || !ip) return false;
   const key = `ratelimit:${bucket}:${ip}`;
   const used = parseInt((await env.CONFIGS.get(key)) || "0", 10) || 0;
   if (used >= maxPerWindow) return true;
-  const write = env.CONFIGS.put(key, String(used + 1), { expirationTtl: windowSec });
+  const spend = Number.isFinite(cost) && cost > 0 ? Math.floor(cost) : 1;
+  const write = env.CONFIGS.put(key, String(used + spend), { expirationTtl: windowSec });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
   else await write;
   return false;
@@ -2196,7 +2222,8 @@ function normalizeExternalListUrl(rawUrl) {
 //
 // Paginating that properly is worse, not better: it means reading EVERY list
 // on every directory load (10k lists = 10k KV reads per page view, well past
-// the 1,000 subrequest/invocation cap). So the directory reads a single
+// the 1,000-storage-operations/invocation cap -- the KV/D1 one, 1,000 on both
+// plans, not the outbound-fetch cap). So the directory reads a single
 // maintained index blob instead, updated on publish/unpublish. Directory cost
 // is now ONE KV read regardless of how many lists exist.
 //
@@ -2274,6 +2301,45 @@ function sortPublicIndexEntries(entries) {
   return entries.sort(
     (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
   );
+}
+
+// Like/unlike is the frequent directory write, and it is the one that makes
+// index:publiclists a hot key.
+//
+// Every vote that changed a count did a read-modify-write of the single key
+// holding the WHOLE directory: 4.45 MB parsed, sorted and re-serialised at the
+// 20,000-entry cap, measured, for a one-number change. Cloudflare allows one
+// write per second to a given key on both plans, so past roughly one like per
+// second across the entire deployment the index was being written faster than
+// KV accepts it -- and the failure mode there is not "one entry is late", it
+// is "the directory is hours stale for everyone".
+//
+// So a like-driven index update now claims a short global cooldown first. Below
+// one like every LIKE_INDEX_COOLDOWN_SEC the cooldown is always free and every
+// vote updates the directory exactly as before -- which is every deployment
+// this code has ever run on. Above it, the writes coalesce and the skipped
+// votes are picked up by the list's next save or the daily rebuild, the same
+// backstops that already cover a lost concurrent publish.
+//
+// Deliberately NOT the whole of the audit's recommendation: sharding the index
+// across 32 keys is the other half and is not done here, because a half-sharded
+// index serves a fraction of the directory and that is worse than the current
+// behaviour. It wants one change, with a version marker in the build state,
+// and it is not urgent below a few thousand public lists.
+const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
+const LIKE_INDEX_COOLDOWN_SEC = 10;
+
+async function claimLikeIndexWrite(env) {
+  if (!env || !env.CONFIGS) return false;
+  try {
+    if (await env.CONFIGS.get(LIKE_INDEX_COOLDOWN_KEY)) return false;
+    await env.CONFIGS.put(LIKE_INDEX_COOLDOWN_KEY, "1", { expirationTtl: LIKE_INDEX_COOLDOWN_SEC });
+    return true;
+  } catch {
+    // The cooldown is an optimisation, not a correctness control. If KV is
+    // unhappy, fall back to the old behaviour rather than dropping the update.
+    return true;
+  }
 }
 
 async function writePublicListIndex(env, entries) {

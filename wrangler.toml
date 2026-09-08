@@ -48,6 +48,21 @@ id = "YOUR_KV_NAMESPACE_ID"
 # database_name = "my-lists-db"
 # database_id = "YOUR_DATABASE_ID"
 
+# --- Plan tuning (optional) --------------------------------------------------
+# BULK_RESOLVE_SUBREQUEST_BUDGET -- how many outbound fetches /api/bulk-resolve
+# (the Letterboxd CSV import) may spend in ONE invocation.
+#
+# Cloudflare allows 50 outbound fetches per invocation on the Workers FREE
+# plan and 10,000 on Paid. The import costs two TMDB calls per title, so the
+# default of 48 gets through 24 titles per invocation and works on either
+# plan -- the client just re-posts the remainder until the import is done.
+#
+# On a Paid plan you can raise this and finish an import in far fewer
+# invocations. 400 covers a full 200-title request in one go.
+#
+# [vars]
+# BULK_RESOLVE_SUBREQUEST_BUDGET = "400"
+
 # --- Cron trigger (REQUIRED for Continue Watching) ---------------------------
 # Drives the scheduled() export at the bottom of
 # 26_api-creator-and-admin-routes.js: checkForNewEpisodes() sweeps creator

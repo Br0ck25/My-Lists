@@ -1570,6 +1570,23 @@
       }
       const auth = await authenticateCreator(body.creatorName, body.creatorKey);
       if (!auth.ok) return authFailureResponse(auth);
+      // Paging. The route used to issue one KV get per list with no cap, so
+      // an account at 990 lists spent 1,001 KV operations and Cloudflare
+      // terminated the invocation -- the dashboard 500s forever, and since
+      // deleting a list is done FROM the dashboard there was no way back.
+      // See CREATOR_LISTS_PAGE_DEFAULT (00_constants.js).
+      //
+      // The slug ORDER is resolved in full first (one KV get plus the orphan
+      // sweep's list() pages -- both independent of list count), and only the
+      // requested window is read. So the per-invocation cost is bounded by
+      // `limit`, not by how many lists the account owns.
+      const rawLimit = parseInt(body.limit, 10);
+      const listLimit = Number.isFinite(rawLimit) && rawLimit > 0
+        ? Math.min(rawLimit, CREATOR_LISTS_PAGE_MAX)
+        : CREATOR_LISTS_PAGE_DEFAULT;
+      const rawOffset = parseInt(body.offset, 10);
+      const listOffset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -1577,9 +1594,111 @@
       } catch {
         order = [];
       }
+      order = order.filter((s) => typeof s === "string" && s);
+
+      // Anything the account owns that creatorlistorder: has lost.
+      //
+      // order is one KV key rewritten read-modify-write by every save, with
+      // no compare-and-swap, so concurrent saves drop each other's entries.
+      // Building the dashboard from order alone meant a list whose entry was
+      // lost became invisible even though its record was sitting right there
+      // in KV -- and the client, seeing it missing, uploaded it again. That
+      // feedback loop is what produced 129 list records for 22 real lists on
+      // one account.
+      //
+      // So order decides DISPLAY ORDER, not existence: a record with no
+      // order entry is appended rather than dropped, and order is repaired in
+      // the same breath so it converges instead of drifting further. Costs
+      // one KV list() on a healthy account, where the recovered set is empty.
+      //
+      // The sweep runs on EVERY page, not just the first: it is what decides
+      // how many lists there are, and a `total` that changed between pages
+      // would let the client stop early and lose the tail.
+      const orderedSlugs = new Set(order);
+      const recovered = [];
+      let sweepOk = true;
+      try {
+        let listCursor;
+        for (let page = 0; page < 5; page++) {
+          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
+          for (const k of res.keys) {
+            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
+            if (s && !orderedSlugs.has(s)) { orderedSlugs.add(s); recovered.push(s); }
+          }
+          if (res.list_complete || !res.cursor) break;
+          listCursor = res.cursor;
+        }
+      } catch (e) {
+        // Best-effort: without it the dashboard is exactly as complete as it
+        // was before, never less.
+        sweepOk = false;
+        console.error("creator lists: orphan sweep failed", e);
+      }
+      if (recovered.length) {
+        order = order.concat(recovered);
+        ctx.waitUntil(
+          env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
+        );
+      }
+
+      // The Watchlist, when no creatorlist: record for it turned up above.
+      //
+      // Resolved before paging so it counts toward `total` and cannot be
+      // lost off the end of a page. The sweep sees every creatorlist: key, so
+      // when it succeeded a missing `watchlist` slug means the record really
+      // is absent and only the tracking blob can supply one; when it failed,
+      // the one key is probed directly rather than assuming.
+      let watchlistFallback = null;
+      if (!orderedSlugs.has("watchlist")) {
+        let wlRaw = null;
+        if (!sweepOk) wlRaw = await getCreatorList(env, auth.username, "watchlist");
+        if (wlRaw) {
+          try {
+            const data = JSON.parse(wlRaw);
+            watchlistFallback = {
+              slug: "watchlist",
+              name: data.name || "Watchlist",
+              type: data.type || "mixed",
+              items: data.items || [],
+              itemCount: (data.items || []).length,
+              likes: data.likes || 0,
+              visibility: effectiveListVisibility(data.visibility),
+              url: `${url.origin}/lists/${auth.username}/watchlist`,
+            };
+          } catch {}
+        } else {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (trackingRaw) {
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
+                watchlistFallback = {
+                  slug: "watchlist",
+                  name: "Watchlist",
+                  type: "mixed",
+                  items: tb.watchlist,
+                  itemCount: tb.watchlist.length,
+                  likes: 0,
+                  visibility: "private",
+                  url: `${url.origin}/lists/${auth.username}/watchlist`,
+                };
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // The fallback Watchlist is displayed first, so it occupies index 0 of
+      // the virtual sequence the offsets address.
+      const allSlugs = watchlistFallback ? ["\u0000watchlist"].concat(order) : order.slice();
+      const total = allSlugs.length;
+      const pageSlugs = allSlugs.slice(listOffset, listOffset + listLimit);
+      const hasMore = listOffset + pageSlugs.length < total;
+
       const lists = (
         await Promise.all(
-          order.map(async (slug) => {
+          pageSlugs.map(async (slug) => {
+            if (slug === "\u0000watchlist") return watchlistFallback;
             const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
@@ -1611,112 +1730,6 @@
           })
         )
       ).filter(Boolean);
-
-      // Anything the account owns that creatorlistorder: has lost.
-      //
-      // order is one KV key rewritten read-modify-write by every save, with
-      // no compare-and-swap, so concurrent saves drop each other's entries.
-      // Building the dashboard from order alone meant a list whose entry was
-      // lost became invisible even though its record was sitting right there
-      // in KV -- and the client, seeing it missing, uploaded it again. That
-      // feedback loop is what produced 129 list records for 22 real lists on
-      // one account.
-      //
-      // So order now decides DISPLAY ORDER, not existence: a record with no
-      // order entry is appended rather than dropped, and order is repaired in
-      // the same breath so it converges instead of drifting further. Costs
-      // one KV list() on a healthy account, where the recovered set is empty.
-      const orderedSlugs = new Set(lists.map((l) => l.slug));
-      const recovered = [];
-      try {
-        let listCursor;
-        for (let page = 0; page < 5; page++) {
-          const res = await env.CONFIGS.list({ prefix: `creatorlist:${auth.username}:`, cursor: listCursor });
-          for (const k of res.keys) {
-            const s = k.name.slice(`creatorlist:${auth.username}:`.length);
-            if (s && !orderedSlugs.has(s)) recovered.push(s);
-          }
-          if (res.list_complete || !res.cursor) break;
-          listCursor = res.cursor;
-        }
-      } catch (e) {
-        // Best-effort: without it the dashboard is exactly as complete as it
-        // was before, never less.
-        console.error("creator lists: orphan sweep failed", e);
-      }
-      if (recovered.length) {
-        const restored = (
-          await Promise.all(
-            recovered.map(async (slug) => {
-              const raw = await getCreatorList(env, auth.username, slug);
-              if (!raw) return null;
-              try {
-                const data = JSON.parse(raw);
-                return {
-                  slug,
-                  name: data.name,
-                  type: data.type,
-                  items: data.items || [],
-                  itemCount: (data.items || []).length,
-                  likes: data.likes || 0,
-                  visibility: effectiveListVisibility(data.visibility),
-                  url: `${url.origin}/lists/${auth.username}/${slug}`,
-                };
-              } catch {
-                return null;
-              }
-            })
-          )
-        ).filter(Boolean);
-        for (const l of restored) {
-          lists.push(l);
-          order.push(l.slug);
-        }
-        if (restored.length) {
-          ctx.waitUntil(
-            env.CONFIGS.put(`creatorlistorder:${auth.username}`, JSON.stringify({ order })).catch(() => {})
-          );
-        }
-      }
-
-      const hasWatchlistInLists = lists.some(l => l && l.slug === "watchlist");
-      if (!hasWatchlistInLists) {
-        const wlRaw = await getCreatorList(env, auth.username, "watchlist");
-        if (wlRaw) {
-          try {
-            const data = JSON.parse(wlRaw);
-            lists.unshift({
-              slug: "watchlist",
-              name: data.name || "Watchlist",
-              type: data.type || "mixed",
-              items: data.items || [],
-              itemCount: (data.items || []).length,
-              likes: data.likes || 0,
-              visibility: effectiveListVisibility(data.visibility),
-              url: `${url.origin}/lists/${auth.username}/watchlist`,
-            });
-          } catch {}
-        } else {
-          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-          if (trackingRaw) {
-            try {
-              const tb = JSON.parse(trackingRaw);
-              if (Array.isArray(tb.watchlist) && tb.watchlist.length > 0) {
-                lists.unshift({
-                  slug: "watchlist",
-                  name: "Watchlist",
-                  type: "mixed",
-                  items: tb.watchlist,
-                  itemCount: tb.watchlist.length,
-                  likes: 0,
-                  visibility: "private",
-                  url: `${url.origin}/lists/${auth.username}/watchlist`,
-                });
-              }
-            } catch {}
-          }
-        }
-      }
 
       // Content version + conditional response.
       //
@@ -1751,9 +1764,16 @@
       //
       // Part of the payload the version hash is taken over, so a delete made
       // elsewhere can never be hidden behind an "unchanged" reply.
+      // Filtered against every slug the account owns, not against this PAGE
+      // of them: a slug that is alive but sits on another page would
+      // otherwise be reported to the client as deleted, and the client
+      // deletes its local copy of anything named here.
       const deletedSlugs = Object.keys(await readCreatorListDeletions(env, auth.username))
-        .filter((s) => !lists.some((l) => l && l.slug === s));
-      const listsPayload = { ok: true, displayName: auth.displayName, lists, order, deletedSlugs };
+        .filter((s) => !orderedSlugs.has(s) && !(watchlistFallback && s === "watchlist"));
+      const listsPayload = {
+        ok: true, displayName: auth.displayName, lists, order, deletedSlugs,
+        total, offset: listOffset, limit: listLimit, hasMore,
+      };
       let listsVersion = "";
       try {
         const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(listsPayload)));
@@ -1765,7 +1785,13 @@
         // browser that stops seeing its own list changes.
       }
       if (listsVersion && body.knownVersion && body.knownVersion === listsVersion) {
-        return jsonPrivate({ ok: true, unchanged: true, version: listsVersion });
+        // The paging fields ride along on the unchanged reply too. Without
+        // them a client that cached page 0 could not know whether to ask for
+        // page 1, and would stop at whatever it already had.
+        return jsonPrivate({
+          ok: true, unchanged: true, version: listsVersion,
+          total, offset: listOffset, limit: listLimit, hasMore,
+        });
       }
       return jsonPrivate({ ...listsPayload, version: listsVersion });
     }
@@ -1877,9 +1903,10 @@
       // Item count alone is not a size bound -- items carry titles,
       // overviews and poster URLs -- so this is checked on the exact bytes
       // about to be stored, before a slug is allocated or anything is
-      // written.
+      // written. BYTES, via utf8ByteLength: .length counts UTF-16 code
+      // units, and the ceiling exists because of D1's byte limit.
       const itemsJson = JSON.stringify(items || []);
-      if (itemsJson.length > CREATOR_LIST_BYTES_MAX) {
+      if (utf8ByteLength(itemsJson) > CREATOR_LIST_BYTES_MAX) {
         return json({
           ok: false,
           error: "That list is too large to save. Try splitting it into more than one list.",
@@ -2759,8 +2786,9 @@
           wlObj.updatedAt = watchlistUpdatedAt;
           // Same D1 row-size reasoning as /api/creator/lists/save: a
           // watchlist over the ceiling cannot be mirrored, and a mirror that
-          // silently stops is how a missing D1 row comes about.
-          if (JSON.stringify(wlObj.items || []).length > CREATOR_LIST_BYTES_MAX) {
+          // silently stops is how a missing D1 row comes about. Measured in
+          // bytes for the same reason it is there.
+          if (utf8ByteLength(JSON.stringify(wlObj.items || [])) > CREATOR_LIST_BYTES_MAX) {
             return json({ ok: false, error: "Your Watchlist is too large to store. Try removing some items." }, 413);
           }
           
@@ -4012,7 +4040,8 @@
     // source_groups and the stats counters from KV to D1.
     //
     // ONE BOUNDED CHUNK PER CALL, not the whole sweep: a KV read plus a D1
-    // write per key both count against Cloudflare's 1,000-subrequest limit,
+    // write per key both count against Cloudflare's 1,000-storage-operations
+    // per-invocation limit (the KV/D1 cap, 1,000 on Free and Paid alike),
     // and the previous single-pass version simply aborted partway through on
     // any site large enough to actually need migrating -- backfilling a
     // prefix of the data and reporting ok. See MIGRATE_D1_* (00_constants.js)
@@ -4295,7 +4324,8 @@
     // it happens.
     //
     // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
-    // Cloudflare's 1,000-subrequest limit and a large deployment needs
+    // Cloudflare's 1,000-storage-operations per-invocation limit and a
+    // large deployment needs
     // several passes. Keep calling until `done` is true -- exactly like
     // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
     // does that loop for you. A chunk here gets a bigger op budget than the
@@ -4515,6 +4545,28 @@
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
       const status = await checkD1Schema(env);
+      // The directory index also silently truncates.
+      //
+      // writePublicListIndex keeps the PUBLIC_INDEX_MAX highest-liked entries
+      // and drops the tail -- the right entries to drop, but nothing anywhere
+      // said it had happened, so a deployment past the cap would simply stop
+      // advertising its least popular lists with no signal at all. This panel
+      // already exists to answer "is something quietly not working", so the
+      // count goes here.
+      let publicIndex = null;
+      try {
+        const idx = await readPublicListIndex(env);
+        if (idx) {
+          publicIndex = {
+            entries: idx.entries.length,
+            max: PUBLIC_INDEX_MAX,
+            truncated: idx.entries.length >= PUBLIC_INDEX_MAX,
+            updatedAt: idx.updatedAt || null,
+          };
+        }
+      } catch (e) {
+        console.error("schema-status: could not read the public list index", e);
+      }
       return json({
         ok: true,
         bound: status.bound,
@@ -4525,6 +4577,7 @@
           migration: m.migration, kind: m.kind, name: m.name, consequence: m.consequence,
         })),
         pendingMigrations: status.pendingMigrations,
+        publicIndex,
       }, 200, { "Cache-Control": "no-store" });
     }
 
@@ -5260,12 +5313,34 @@
       if (bulkBody.items.length > BULK_RESOLVE_ITEMS_MAX) {
         return json({ ok: false, error: `Too many titles in one request (limit ${BULK_RESOLVE_ITEMS_MAX}).` }, 413);
       }
-      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, 20)) {
+      // How much of this invocation's OUTBOUND-fetch budget the loop below may
+      // spend. Cloudflare's cap is 50 on the free plan and 10,000 on paid --
+      // two different numbers, and the comment this endpoint was sized against
+      // quoted neither of them (1,000 is the KV/D1 storage-operations cap). At
+      // two TMDB calls per title, 200 titles is ~400 fetches: fine on paid,
+      // eight times over on free, where a Letterboxd import simply died above
+      // about 25 titles.
+      //
+      // So the request size stays 200 and the SERVER decides how much of it
+      // fits, reporting how far it got. See BULK_RESOLVE_SUBREQUEST_BUDGET.
+      const envBudget = parseInt(env && env.BULK_RESOLVE_SUBREQUEST_BUDGET, 10);
+      const bulkBudget = Number.isFinite(envBudget) && envBudget >= 2 ? envBudget : BULK_RESOLVE_SUBREQUEST_BUDGET;
+      // Worst case is two fetches per title (a search that matches, then its
+      // external ids), so this is the count that cannot exceed the budget
+      // whatever the responses turn out to be.
+      const bulkMaxItems = Math.max(1, Math.floor(bulkBudget / 2));
+      const bulkTake = Math.min(bulkBody.items.length, bulkMaxItems);
+      // Charged in TITLES, not requests -- the endpoint always spends the
+      // Worker owner's shared TMDB key, and that is what the ceiling is
+      // protecting. Counting requests would have cut the effective ceiling
+      // from 4,000 titles a minute to 480 the moment the budget above started
+      // splitting a request into several.
+      if (await consumeRateLimit(env, ctx, "bulkresolve", bulkIp, BULK_RESOLVE_ITEMS_PER_MINUTE, 60, bulkTake)) {
         return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       try {
         const body = bulkBody;
-        const items = body.items || [];
+        const items = (body.items || []).slice(0, bulkMaxItems);
         const resolved = [];
         // Always the shared TMDB_API_KEY -- no per-user override on this
         // endpoint. Counted precisely (not just items.length) since a
@@ -5318,7 +5393,14 @@
           }
         }
         if (tmdbCallCount) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", tmdbCallCount));
-        return json({ ok: true, resolved });
+        // `nextIndex` is how many of the SUBMITTED items this invocation got
+        // through, so the caller knows where to resume. `done` says there is
+        // nothing left of what it sent. Both are additive: a caller that
+        // ignores them sees the same { ok, resolved } it always did -- which
+        // is why the client also treats a missing nextIndex as "the whole
+        // chunk was processed", the behaviour of any older deployment.
+        const nextIndex = items.length;
+        return json({ ok: true, resolved, nextIndex, done: nextIndex >= bulkBody.items.length });
       } catch (e) {
         // Logged, not returned -- the message can carry upstream URLs and
         // internal detail that the caller has no business seeing.

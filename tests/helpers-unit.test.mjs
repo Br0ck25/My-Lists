@@ -14,6 +14,7 @@ function loadHelpers() {
     "clientIpKey",
     "expandIpv6Hextets",
     "normalizeExternalListUrl",
+    "utf8ByteLength",
   ];
   const chunks = [];
   for (const name of names) {
@@ -94,5 +95,32 @@ describe("URL allowlists", () => {
     assert.equal(H.normalizeExternalListUrl("simkl:user:alice"), null);
     // Not a real chart id at all, just an unmatched sentinel-shaped string.
     assert.equal(H.normalizeExternalListUrl("tmdb:notachart"), null);
+  });
+});
+
+// Every *_BYTES_MAX ceiling in 00_constants.js is a byte budget -- KV value
+// size, and D1's 2,000,000-byte maximum string size. All four guards measured
+// with String.prototype.length, which counts UTF-16 code units. This is the
+// one-line difference.
+describe("utf8ByteLength", () => {
+  it("agrees with .length on ASCII, which is why the bug was invisible", () => {
+    assert.equal(H.utf8ByteLength("hello"), 5);
+    assert.equal(H.utf8ByteLength("hello"), "hello".length);
+  });
+
+  it("counts 3 bytes for a CJK character that .length counts as 1", () => {
+    assert.equal("\u65e5\u672c\u8a9e".length, 3);
+    assert.equal(H.utf8ByteLength("\u65e5\u672c\u8a9e"), 9);
+  });
+
+  it("counts 4 bytes for an astral character that .length counts as 2", () => {
+    assert.equal("\u{1f600}".length, 2);
+    assert.equal(H.utf8ByteLength("\u{1f600}"), 4);
+  });
+
+  it("treats null and undefined as empty rather than as their spelling", () => {
+    assert.equal(H.utf8ByteLength(null), 0);
+    assert.equal(H.utf8ByteLength(undefined), 0);
+    assert.equal(H.utf8ByteLength(""), 0);
   });
 });

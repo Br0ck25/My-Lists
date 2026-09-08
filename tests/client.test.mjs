@@ -1285,3 +1285,425 @@ describe("client: See All reports the list's size, not the page it is holding", 
       "a list one item shorter must not keep advertising the size it had before");
   });
 });
+
+// --- AIII-8/9: a mirror that failed must not be reported as saved, and the
+// --- three slug-bearing lists/save call sites must arm the conflict guard.
+//
+// saveLocalCustomListEdit() had no else and no error path around its account
+// mirror: `if (data.ok && data.url) finalUrl = data.url;` inside a bare catch,
+// then an unconditional "saved" modal. A 401, a 409 and a 500 all ended at the
+// same success screen while nothing reached the account -- so on the next
+// sign-in the server's older copy won and the edit was gone, having been
+// reported saved.
+//
+// The same function was also one of three call sites that sent an explicit
+// slug (a whole-list replacement of an existing list -- exactly what the
+// server's expectedUpdatedAt guard exists for) with no baseline at all. The
+// two findings are fixed together on purpose: arming the guard turns silent
+// overwrites into 409s, which is only an improvement if the 409 is surfaced.
+describe("client: a local list edit reports what actually happened to the account copy", () => {
+  const LOCAL_LIST = JSON.stringify({
+    faves: { slug: "faves", name: "Faves", type: "movie", items: [{ id: "tt0" }], createdAt: 1, updatedAt: 1 },
+  });
+
+  function editingLocal(client, cachedList) {
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("lastCreatorListsData", cachedList ? [cachedList] : []);
+    client.set("editingLocalCustomListSlug", "faves");
+    client.set("customListDraftItems", [{ id: "tt1" }, { id: "tt2" }]);
+    client.set("customListDraftType", "movie");
+  }
+
+  function spyModals(client) {
+    const saved = [];
+    const notices = [];
+    client.set("showSavedCustomListModal", (n, v, url) => saved.push({ n, v, url }));
+    client.set("showAppNoticeModal", (t, m) => notices.push({ t, m }));
+    client.set("renderCreatorDashboard", () => {});
+    return { saved, notices };
+  }
+
+  // The account already holds this list. An empty /api/creator/lists would
+  // make the load-time "upload lists this account is missing" pass fire and
+  // put a second save on the wire, which has nothing to do with what is
+  // under test.
+  const ACCOUNT_LISTS = { ok: true, lists: [{
+    slug: "faves", name: "Faves", type: "movie", visibility: "private", updatedAt: 4200, items: [{ id: "tt0" }],
+  }] };
+
+  const clientFor = (saveHandler, saves) => loadClient({
+    storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice", "myListAddon:localCustomLists": LOCAL_LIST },
+    routes: {
+      [SAVE]: (req) => { if (saves) saves.push(req.body); return saveHandler(req); },
+      [LISTS]: () => ({ json: ACCOUNT_LISTS }),
+    },
+  });
+
+  it("cites the version the dashboard reported", async () => {
+    const saves = [];
+    const client = clientFor(() => ({ json: { ok: true, url: "https://x/lists/alice/faves", updatedAt: 7000 } }), saves);
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const { saved } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].expectedUpdatedAt, 4200,
+      "a whole-list replacement of an existing list is exactly what the guard is for");
+    assert.equal(saves[0].slug, "faves");
+    assert.equal(saved.length, 1, "the save worked, so the success modal is correct here");
+    assert.equal(saved[0].url, "https://x/lists/alice/faves");
+  });
+
+  it("does not show 'saved' when the server answered 500", async () => {
+    const client = clientFor(() => ({ status: 500, json: { ok: false, error: "Internal error." } }));
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const { saved, notices } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saved.length, 0, "nothing reached the account -- saying 'saved' is the bug");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].m, /did not reach your account/);
+  });
+
+  it("names the conflict when the server answered 409", async () => {
+    const client = clientFor(() => ({ status: 409, json: { ok: false, conflict: true, updatedAt: 9000 } }));
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const { saved, notices } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saved.length, 0);
+    assert.match(notices[0].t, /Changed Elsewhere/);
+    // A replacement cannot be merged onto the other device's copy, so the
+    // person is told rather than one side being silently picked for them.
+    assert.match(notices[0].m, /Another device saved changes/);
+  });
+
+  it("says the key was rejected on a 401", async () => {
+    const client = clientFor(() => ({ status: 401, json: { ok: false, error: "Invalid key." } }));
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const { saved, notices } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saved.length, 0);
+    assert.match(notices[0].m, /account key was rejected/);
+  });
+
+  it("surfaces a network failure instead of swallowing it", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice", "myListAddon:localCustomLists": LOCAL_LIST },
+      routes: { [SAVE]: () => { throw new Error("offline"); }, [LISTS]: () => ({ json: ACCOUNT_LISTS }) },
+    });
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    const { saved, notices } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saved.length, 0);
+    assert.match(notices[0].m, /network error/i);
+  });
+
+  it("still saves locally when the account copy fails", async () => {
+    const client = clientFor(() => ({ status: 500, json: { ok: false, error: "Internal error." } }));
+    editingLocal(client, { slug: "faves", name: "Faves", type: "movie", updatedAt: 4200 });
+    spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    // The local save is this function's job and it works. Only the reported
+    // outcome was wrong, so the fix must not make the local write conditional.
+    const stored = JSON.parse(client.localStorage.getItem("myListAddon:localCustomLists"));
+    assert.deepEqual(stored.faves.items.map((i) => i.id), ["tt1", "tt2"]);
+  });
+
+  it("shows 'saved' as before when there is no account at all", async () => {
+    const client = loadClient({ storage: { "myListAddon:localCustomLists": LOCAL_LIST }, routes: {} });
+    client.set("activeCreator", null);
+    client.set("editingLocalCustomListSlug", "faves");
+    client.set("customListDraftItems", [{ id: "tt1" }]);
+    client.set("customListDraftType", "movie");
+    const { saved, notices } = spyModals(client);
+
+    await client.call("saveLocalCustomListEdit", "Faves");
+    await settle();
+
+    assert.equal(saved.length, 1, "a purely local list has no account copy to fail");
+    assert.equal(notices.length, 0);
+    assert.equal(client.requests.length, 0);
+  });
+});
+
+describe("client: the watched-item sweep no longer overwrites the other device", () => {
+  it("cites a baseline and re-applies the removal on a conflict", async () => {
+    const saves = [];
+    let conflicts = 1;
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: {
+        [SAVE]: (req) => {
+          saves.push(req.body);
+          if (conflicts-- > 0) return { status: 409, json: { ok: false, conflict: true } };
+          return { json: { ok: true, updatedAt: 9500 } };
+        },
+        // What the other device saved: the watched film is still there, and
+        // they added one of their own.
+        [LISTS]: () => ({ json: { ok: true, lists: [{
+          slug: "watchlist", name: "Watchlist", type: "mixed", visibility: "private", updatedAt: 9000,
+          items: [{ id: "tt-watched", type: "movie" }, { id: "tt-theirs", type: "movie" }],
+        }] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("lastCreatorListsData", [{
+      slug: "watchlist", name: "Watchlist", type: "mixed", visibility: "private", updatedAt: 4200,
+      items: [{ id: "tt-watched", type: "movie" }, { id: "tt-mine", type: "movie" }],
+    }]);
+    client.set("renderCreatorDashboard", () => {});
+
+    await client.call("removeWatchedItemFromWatchlist", "tt-watched", null, null);
+    await settle();
+
+    assert.equal(saves.length, 2, "one attempt, one merged retry");
+    assert.equal(saves[0].expectedUpdatedAt, 4200,
+      "this used to be fire-and-forget with no baseline at all");
+    assert.equal(saves[1].expectedUpdatedAt, 9000, "the retry cites the fresh version");
+    const ids = saves[1].items.map((i) => i.id);
+    assert.deepEqual(ids, ["tt-theirs"],
+      "the watched film is gone AND the other device's addition survived -- re-sending the " +
+      "array computed from the stale copy would have erased tt-theirs");
+  });
+});
+
+describe("client: toggling one item into an account list cites the version", () => {
+  function toggling(client, meta) {
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("lastCreatorListsData", [meta]);
+    client.set("renderCreatorDashboard", () => {});
+    client.window._selectListModalTempLists = [{
+      name: "Faves",
+      url: "customlist:v1:" + JSON.stringify({ creatorSlug: "faves", type: "movie", items: [{ id: "tt-old", imdbId: "tt-old" }] }),
+    }];
+  }
+
+  it("sends expectedUpdatedAt", async () => {
+    const saves = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: {
+        [SAVE]: (req) => { saves.push(req.body); return { json: { ok: true, updatedAt: 8000 } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    toggling(client, { slug: "faves", name: "Faves", type: "movie", visibility: "private", updatedAt: 4200, items: [{ id: "tt-old", imdbId: "tt-old" }] });
+
+    client.call("toggleItemInCustomListUrl", "tt-new", "tt-new", "movie", 0, true, "New", "");
+    await settle();
+
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].expectedUpdatedAt, 4200);
+    assert.deepEqual(saves[0].items.map((i) => i.imdbId), ["tt-old", "tt-new"]);
+  });
+
+  it("re-applies the single add to what the other device saved", async () => {
+    const saves = [];
+    let conflicts = 1;
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: {
+        [SAVE]: (req) => {
+          saves.push(req.body);
+          if (conflicts-- > 0) return { status: 409, json: { ok: false, conflict: true } };
+          return { json: { ok: true, updatedAt: 9500 } };
+        },
+        [LISTS]: () => ({ json: { ok: true, lists: [{
+          slug: "faves", name: "Faves", type: "movie", visibility: "private", updatedAt: 9000,
+          items: [{ id: "tt-old", imdbId: "tt-old" }, { id: "tt-theirs", imdbId: "tt-theirs" }],
+        }] } }),
+      },
+    });
+    toggling(client, { slug: "faves", name: "Faves", type: "movie", visibility: "private", updatedAt: 4200, items: [{ id: "tt-old", imdbId: "tt-old" }] });
+
+    client.call("toggleItemInCustomListUrl", "tt-new", "tt-new", "movie", 0, true, "New", "");
+    await settle();
+
+    assert.equal(saves.length, 2);
+    assert.deepEqual(saves[1].items.map((i) => i.imdbId), ["tt-old", "tt-theirs", "tt-new"],
+      "both additions survive; the stale array would have dropped tt-theirs");
+  });
+});
+
+// --- AIII-15/18: the two client loops that make the server's paging work ----
+//
+// Both endpoints now hand back part of an answer plus a continuation, and in
+// both cases a client that ignores it loses data silently: the dashboard would
+// show only the first page of lists (and then helpfully re-upload the ones it
+// could not see), and a Letterboxd import would drop every title past the
+// first batch. So the loops get their own tests.
+describe("client: the dashboard pages through every list the account owns", () => {
+  function pagedRoutes(total, pageSize, seen) {
+    return {
+      [LISTS]: (req) => {
+        const offset = req.body.offset || 0;
+        if (seen) seen.push({ offset, limit: req.body.limit, knownVersion: req.body.knownVersion });
+        const lists = [];
+        for (let i = offset; i < Math.min(offset + pageSize, total); i++) {
+          lists.push({ slug: "l" + i, name: "List " + i, type: "movie", items: [], updatedAt: 1000 + i });
+        }
+        return { json: {
+          ok: true, displayName: "alice", lists, order: [], deletedSlugs: [],
+          total, offset, limit: pageSize, hasMore: offset + lists.length < total,
+          version: "v" + offset,
+        } };
+      },
+    };
+  }
+
+  it("keeps asking until the server says there is no more", async () => {
+    const seen = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: pagedRoutes(450, 200, seen),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(data.lists.length, 450, "a dashboard showing only the first page re-uploads the rest");
+    assert.equal(seen.map((s) => s.offset).join(","), "0,200,400");
+    assert.equal(new Set(data.lists.map((l) => l.slug)).size, 450, "and nothing arrives twice");
+    assert.equal(data.lists[449].slug, "l449");
+  });
+
+  it("hands a single-page account the server's own response, untouched", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: pagedRoutes(6, 200),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(data.lists.length, 6);
+    assert.equal(data.version, "v0", "nothing downstream should see a synthesised object here");
+  });
+
+  it("stops at one page against a Worker that does not page at all", async () => {
+    // An older deployment sends no hasMore. Reading that as "there is more"
+    // would loop 100 times against the same offset.
+    let calls = 0;
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: { [LISTS]: () => { calls++; return { json: { ok: true, displayName: "alice", lists: [{ slug: "a", items: [] }], order: [], deletedSlugs: [], version: "v" } }; } },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(calls, 1);
+    assert.equal(data.lists.length, 1);
+  });
+
+  it("reuses a cached page the server says is unchanged, and still learns there is more", async () => {
+    // The conditional-response version is per page now. The trap this guards
+    // is an "unchanged" page 0 that carries no paging fields: the client would
+    // have no way to know page 1 exists and would silently show 200 of 300.
+    const seen = [];
+    const bodies = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LISTS]: (req) => {
+          const offset = req.body.offset || 0;
+          seen.push({ offset, knownVersion: req.body.knownVersion });
+          const version = "v" + offset;
+          const paging = { total: 300, offset, limit: 200, hasMore: offset + 200 < 300, version };
+          if (req.body.knownVersion === version) {
+            bodies.push("unchanged@" + offset);
+            return { json: { ok: true, unchanged: true, ...paging } };
+          }
+          const lists = [];
+          for (let i = offset; i < Math.min(offset + 200, 300); i++) {
+            lists.push({ slug: "l" + i, name: "List " + i, type: "movie", items: [] });
+          }
+          return { json: { ok: true, displayName: "alice", lists, order: [], deletedSlugs: [], ...paging } };
+        },
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const first = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(first.lists.length, 300);
+    client.set("lastCreatorListsData", first.lists);
+
+    const again = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(again.lists.length, 300, "an unchanged page must not truncate the assembled result");
+    assert.ok(bodies.includes("unchanged@0") && bodies.includes("unchanged@200"),
+      "the second pass must cite the version it holds for each page");
+    assert.equal(seen.filter((s) => s.offset === 200).length, 2,
+      "and must still ask for page 1 after an unchanged page 0");
+  });
+});
+
+describe("client: a Letterboxd import follows the server's continuation", () => {
+  const RESOLVE = "/api/bulk-resolve";
+
+  it("resumes from exactly what the server processed, not from the chunk size", async () => {
+    const posted = [];
+    const client = loadClient({
+      routes: {
+        [RESOLVE]: (req) => {
+          const items = req.body.items || [];
+          posted.push(items.length);
+          // A free-plan Worker: 24 titles per invocation, whatever it was sent.
+          const took = Math.min(24, items.length);
+          return { json: {
+            ok: true,
+            resolved: items.slice(0, took).map((it) => ({ title: it.title, imdbId: "tt" + it.title })),
+            nextIndex: took,
+            done: took >= items.length,
+          } };
+        },
+      },
+    });
+
+    const titles = Array.from({ length: 100 }, (_, i) => ({ title: String(i), year: 2000 }));
+    const out = await client.call("bulkResolveInChunks", titles);
+
+    assert.equal(out.length, 100, "advancing by the chunk size would silently drop 76 of these");
+    // Joined, not deepEqual'd: the bundle evaluates in a vm sandbox, so an
+    // array it built has that realm's Array.prototype and deepStrictEqual
+    // rejects it on the prototype before it ever looks at the contents.
+    assert.equal(out.map((r) => r.title).join(","), titles.map((t) => t.title).join(","), "and in order");
+    assert.equal(posted.length, Math.ceil(100 / 24));
+  });
+
+  it("still works against a Worker that sends no continuation", async () => {
+    const client = loadClient({
+      routes: {
+        [RESOLVE]: (req) => ({ json: {
+          ok: true,
+          resolved: (req.body.items || []).map((it) => ({ title: it.title, imdbId: "tt" + it.title })),
+        } }),
+      },
+    });
+    const out = await client.call("bulkResolveInChunks", Array.from({ length: 500 }, (_, i) => ({ title: String(i) })));
+    assert.equal(out.length, 500, "a missing nextIndex means the whole chunk was processed");
+  });
+
+  it("refuses to spin when the server reports no progress", async () => {
+    const client = loadClient({
+      routes: { [RESOLVE]: () => ({ json: { ok: true, resolved: [], nextIndex: 0, done: false } }) },
+    });
+    await assert.rejects(
+      () => client.call("bulkResolveInChunks", [{ title: "A" }, { title: "B" }]),
+      /no progress/,
+      "an infinite retry loop is worse than a reported failure",
+    );
+  });
+});

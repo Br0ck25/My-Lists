@@ -65,7 +65,7 @@ function renderBuilder(
         applicationCategory: "MultimediaApplication",
         operatingSystem: "Any",
         description:
-          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own free Cloudflare Worker.",
+          "Self-hosted Stremio/wako add-on that turns MDBList, Trakt, TMDB, and Simkl lists into home-screen catalog rows, with Watch History, Continue Watching, and a Custom List builder -- all running on your own Cloudflare Worker.",
         offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
         url: origin + "/",
       })}</script>`;
