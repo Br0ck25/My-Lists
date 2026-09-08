@@ -170,7 +170,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom TMDB API Key / Token</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${escapeHtmlServer(initialTmdbKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free TMDB API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent-2);">themoviedb.org/settings/api</a>.</small></p>
           </div>
         </details>
@@ -200,10 +200,10 @@
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
             <div class="row">
-              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${escapeHtmlServer(initialTraktKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <div class="row" style="margin-top:8px;">
-              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${escapeHtmlServer(initialTraktUsername)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <p style="margin-top:4px;"><small>Create a free Trakt Client ID at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--accent-2);">trakt.tv/oauth/applications</a>.</small></p>
           </div>
@@ -232,7 +232,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${escapeHtmlServer(initialMdblistKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
           </div>
         </details>
@@ -260,7 +260,7 @@
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${escapeHtmlServer(initialSimklKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>

@@ -3426,6 +3426,7 @@
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
           env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
         ]);
+        const creatorExists = makeCreatorExistsMemo(env);
         const anonCandidates = await Promise.all(
           anonResult.keys.map(async (k) => {
             const raw = await env.CONFIGS.get(k.name);
@@ -3466,6 +3467,8 @@
               const sep = rest.indexOf(":");
               if (sep === -1) return null;
               const username = rest.slice(0, sep);
+              // Same orphan filter as the directory's own fallback above.
+              if (!(await creatorExists(username))) return null;
               const listSlug = rest.slice(sep + 1);
               let creatorName = username;
               try {
@@ -3734,11 +3737,38 @@
       let creatorDisplayName = "Anonymous";
       if (isCreatorList) {
         creatorDisplayName = username;
+        // A creator list whose creator no longer exists is not servable.
+        //
+        // purgeCreatorData sweeps twice, but a save that authenticated a
+        // millisecond before the deletion tombstone was written keeps running
+        // and its KV put lands after both passes. Measured: 6 of 10 plain
+        // concurrent delete+save runs left a record behind, and because the
+        // record is genuinely `public`, it stayed readable here, stayed in the
+        // directory, and could never be removed -- every authenticated route
+        // answers 401 for that username, so the owner had no way to take down
+        // a list they had just asked to be deleted along with their account.
+        //
+        // A sweep can only narrow that window; nothing bounds how late a KV
+        // write may land. Refusing to serve an ownerless list closes it,
+        // whatever put the record there.
+        //
+        // Gated on isCreatorList: anonymous published lists live under
+        // publishedlist:user: and have no creator record BY DESIGN. Applying
+        // this to them would take every one of them offline.
+        //
+        // A read failure is not an absence: getCreator falls back to D1 and
+        // only returns null when neither store has the account, so a transient
+        // KV blip cannot 404 a live list on its own -- and this is the same
+        // read the display name already needed, so it costs nothing new.
+        const profileRaw = await getCreator(env, username);
+        if (!profileRaw) {
+          return json({ ok: false, error: "No list found at that address." }, 404);
+        }
         try {
-          const profileRaw = await getCreator(env, username);
-          if (profileRaw) creatorDisplayName = JSON.parse(profileRaw).displayName || username;
+          creatorDisplayName = JSON.parse(profileRaw).displayName || username;
         } catch {
-          // fall back to the raw username slug
+          // Unparseable record -- the account exists, so serve the list under
+          // the raw username slug rather than hiding it.
         }
       }
       const likes = listData.likes || 0;

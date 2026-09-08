@@ -265,6 +265,25 @@ const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 // invocation budget.
 const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 
+// --- Bound on /api/resolve's cross-deployment fallback -----------------------
+//
+// /api/resolve takes a `url` and, when the local config resolves to nothing,
+// refetches /api/resolve from THAT url's origin -- so one deployment can read
+// an install link minted by a sibling. Legitimate, and the client only reaches
+// it when the pasted link carried an explicit origin (resolveInstallLinkData,
+// 24_client-backup-restore-presets.js), which is at most a few times while
+// somebody imports.
+//
+// Unbounded, it was an unauthenticated outbound-request generator aimed at any
+// host on the internet, with the response echoed back to the caller. The host
+// check (isRemoteResolveOrigin, 02_http-and-creator-utils.js) is what stops it
+// reaching anything private; this is what stops it being a free reflector.
+//
+// Charged ONLY on the request that actually makes the outbound call, so an
+// ordinary import -- no `url`, or one that resolves locally -- never touches
+// the bucket.
+const RESOLVE_PROXY_PER_MINUTE = 20;
+
 // --- Env-backed API keys ----------------------------------------------------
 //
 // These five all used to be hardcoded literals here. They're declared with
@@ -1823,6 +1842,19 @@ function isPublicCorsPath(path) {
 // defaulted, so a route cannot accidentally opt out either.
 function isPrivateApiPath(path) {
   const p = String(path || "");
+  // /api/resolve is neither of those prefixes and is the one per-account GET
+  // in this Worker. It hands back the config owner's MDBList key and their
+  // Trakt/MDBList OAuth tokens to anyone holding the install id -- and being a
+  // GET, it inherited json()'s cacheable max-age default, with no Vary, so a
+  // browser (or any shared cache in front of this Worker) could store one
+  // person's OAuth tokens for an hour. The sibling page that renders the same
+  // secrets, /:config/configure, sets no-store deliberately; the two disagreed.
+  //
+  // The comment below already predicted this exact shape -- "it stops being
+  // true the day one of them gains a GET form". Named here rather than only
+  // fixed at the route, because this is the choke point that is supposed to
+  // mean a route added later cannot forget.
+  if (p === "/api/resolve") return true;
   return p.startsWith("/api/creator/") || p === "/admin" || p.startsWith("/admin/");
 }
 
@@ -2498,6 +2530,46 @@ function escapeHtmlServer(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+// JSON destined for the inside of a <script> element.
+//
+// JSON.stringify escapes " and \ , which is everything the JavaScript parser
+// needs -- and nothing the HTML parser does. An HTML tokenizer ends a script
+// element at the first "</script" sequence it sees, with no notion of being
+// inside a JS string, so a value carrying one closes the block early and every
+// byte after it is parsed as markup. That is a stored XSS on the two pages
+// that render caller-supplied data into the preamble: a published list's name
+// or item titles (/lists/:user/:slug) and the provider keys and OAuth tokens
+// baked into an install link (/:config/configure).
+//
+// escapeHtmlServer above is the wrong tool here -- it would turn the payload
+// into &lt;/script&gt;, which is correct in a text node and wrong inside a
+// script element, where the browser does not decode entities at all and the
+// literal &lt; would land in the value.
+//
+// \u003c is a valid escape in BOTH grammars this output has to satisfy: JSON
+// (the ld+json blocks) and JavaScript source (everything else). So the parsed
+// value is byte-for-byte what it was before -- only the wire bytes change,
+// and nothing downstream needs to know this ran.
+//
+// U+2028 and U+2029 are escaped for a separate, older reason: they are legal
+// inside a JSON string but were line terminators in JavaScript source before
+// ES2019, so an unescaped one used to be a SyntaxError that took the whole
+// bundle with it.
+//
+// Applied at EVERY stringify that lands in a script element, not only the ones
+// reachable by a caller today. Deciding per site is how this was missed twice:
+// two prior audits checked the client-side render, where escapeHtml is applied
+// correctly, and never the server-rendered preamble. html_checks.py now proves
+// the rule holds against a deliberately hostile render -- see its
+// MYLXSSPROBE check.
+function jsonForScript(value) {
+  return JSON.stringify(value === undefined ? null : value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 // Turns an arbitrary string (an external list's URL, for
@@ -3823,6 +3895,61 @@ const LIKEABLE_SENTINEL_PREFIXES = [
 ];
 const LIKEABLE_SENTINEL_EXACT = new Set(["tmdb:hidden-gems"]);
 
+// The origin /api/resolve is allowed to refetch from, or null.
+//
+// That route's `url` parameter named any http(s) origin and the Worker fetched
+// it and echoed the body back -- unauthenticated, with no allowlist and no rate
+// limit. Off Cloudflare (which the README documents as a supported way to run
+// this) loopback and RFC1918 are reachable, so that was an internal-network
+// SSRF; on Cloudflare they are not routable from the edge, but it was still an
+// unbounded outbound-request generator pointed at the public internet, burning
+// this deployment's subrequest budget and putting its egress behind somebody
+// else's traffic.
+//
+// /api/preview grew a provider allowlist for exactly this shape and this
+// sibling was missed. It cannot reuse that list, though: the legitimate target
+// here is not a provider, it is ANOTHER DEPLOYMENT OF THIS ADD-ON, which lives
+// on whatever workers.dev subdomain or custom domain its owner chose. So the
+// rule is "a real, public, DNS-named https origin" rather than a fixed set.
+//
+// The TLD test is what does most of the work. Every hostname that is really an
+// IP address in disguise fails it, in every encoding a URL parser accepts:
+//
+//   http://127.0.0.1/        last label "1"          -> rejected
+//   http://2130706433/       no dot at all           -> rejected
+//   http://0x7f.0.0.0xff/    last label "0xff"       -> rejected
+//   http://[::1]/            hostname has colons     -> rejected
+//   http://192.168.1.7:8080/ last label "7", + port  -> rejected
+//   https://my.workers.dev/  last label "dev"        -> allowed
+//
+// Names that resolve inside a private network by suffix are named explicitly,
+// since those do have alphabetic TLDs. The port is pinned because a sibling
+// deployment is always on 443, and a port is the other half of a scan.
+const PRIVATE_HOST_SUFFIXES = ["localhost", "local", "internal", "intranet", "lan", "home.arpa"];
+
+function isRemoteResolveOrigin(rawUrl) {
+  let u;
+  try {
+    u = new URL(String(rawUrl || ""));
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:") return null;
+  if (u.port && u.port !== "443") return null;
+  const host = u.hostname.toLowerCase();
+  // An IPv6 literal keeps its brackets in hostname; either way it has colons.
+  if (!host || host.includes(":")) return null;
+  const labels = host.split(".");
+  if (labels.length < 2) return null;
+  if (!labels.every((l) => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l))) return null;
+  // Alphabetic TLD: no IPv4 literal has one, in any encoding.
+  if (!/^[a-z]{2,}$/.test(labels[labels.length - 1])) return null;
+  for (const suffix of PRIVATE_HOST_SUFFIXES) {
+    if (host === suffix || host.endsWith("." + suffix)) return null;
+  }
+  return u.origin;
+}
+
 function normalizeExternalListUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   if (!s || s.length > 300) return null;
@@ -3972,6 +4099,24 @@ async function writePublicListIndex(env, entries) {
 async function updatePublicListIndex(env, id, entry) {
   if (!env || !env.CONFIGS) return false;
   if (!entry) await noteRemovedFromPublicIndex(env, [id]);
+  // An ADD for an account that is being deleted must not land.
+  //
+  // This runs at the very end of a save, and a save that authenticated a
+  // millisecond before its owner deleted the account keeps going: the purge's
+  // second pass removes the record and drops the id from the directory, and
+  // then THIS call puts the entry straight back. The record is gone, so the
+  // row 404s the moment anyone opens it -- the same stranded-entry problem
+  // removeListsFromPublicIndex was written to prevent, one pass later.
+  //
+  // The tombstone is the right thing to ask, and it is the FIRST thing
+  // purgeCreatorData writes, before it deletes anything -- so any index update
+  // that runs after the deletion began sees it. One KV read, on the save path
+  // only (never on a page view), and only for creator-owned ids: `a:` entries
+  // are anonymous published lists with no account behind them.
+  if (entry && typeof id === "string" && id.startsWith("c:")) {
+    const owner = id.slice(2).split(":")[0];
+    if (owner && (await isCreatorTombstoned(env, owner))) return true;
+  }
   try {
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
@@ -4158,12 +4303,28 @@ async function rebuildPublicListIndex(env, options = {}) {
     // of them should pay for the lookup.
     if (inFlightNames.has(username)) return inFlightNames.get(username);
     const p = (async () => {
-      let name = username;
+      // null means "this account does not exist", which buildEntry turns into
+      // a skip. Without the distinction an orphaned creatorlist: record -- one
+      // left behind by a save that raced its owner's account deletion -- was
+      // re-advertised in the directory on every rebuild, under the raw
+      // username, forever. The public list route refuses to serve it, so the
+      // entry was a dead row; this stops it being created at all.
+      let name = null;
       try {
         const profileRaw = await getCreator(countedEnv, username);
-        if (profileRaw) name = JSON.parse(profileRaw).displayName || username;
+        if (profileRaw) {
+          try {
+            name = JSON.parse(profileRaw).displayName || username;
+          } catch {
+            // Account exists, record unparseable -- index it under the slug.
+            name = username;
+          }
+        }
       } catch {
-        // fall back to the raw username slug
+        // A read that FAILED is not an account that is absent. Treat it as
+        // present under the raw username: dropping a live list from the
+        // directory over a transient KV error would be the worse mistake.
+        name = username;
       }
       state.names[username] = name;
       return name;
@@ -4196,11 +4357,18 @@ async function rebuildPublicListIndex(env, options = {}) {
       const data = JSON.parse(raw);
       await stampListVisibilityIfNeeded(countedEnv, keyName, data);
       if (!isPublicListVisibility(data.visibility)) return null;
+      let creatorName = null;
+      if (phase === 0) {
+        creatorName = await resolveDisplayName(username);
+        // See resolveDisplayName: null is "no such account", so this record is
+        // an orphan and must not go back into the directory.
+        if (creatorName === null) return null;
+      }
       return {
         id,
         isCreator: phase === 0,
         username,
-        ...(phase === 0 ? { creatorName: await resolveDisplayName(username) } : {}),
+        ...(phase === 0 ? { creatorName } : {}),
         slug,
         name: data.name || "List",
         type: data.type || "mixed",
@@ -4882,13 +5050,23 @@ async function purgeCreatorData(env, username, options = {}) {
   // and cannot be inherited either, because the tombstone holds the username
   // for longer than any request can run.
   if (deleteIdentity && identityRemoved) {
+    // Whatever this pass finds also has to come OUT OF THE DIRECTORY. The
+    // first pass collects its ids into purgedListIds and hands them to
+    // removeListsFromPublicIndex above; this one only deleted the KV keys, so
+    // a list that landed between the two passes had its record removed and its
+    // index entry left behind -- a directory row advertising an item count
+    // that 404s the moment anyone opens it. Same failure the batch removal
+    // exists to prevent, one pass later.
+    const lateListIds = [];
     try {
       let cursor;
       for (let page = 0; page < 5; page++) {
         const res = await env.CONFIGS.list({ prefix: `creatorlist:${u}:`, cursor });
         for (const k of res.keys) {
           await env.CONFIGS.delete(k.name);
-          try { await env.CONFIGS.delete(`listlikevoters:${k.name.slice("creatorlist:".length)}`); } catch (e) {}
+          const listPath = k.name.slice("creatorlist:".length);
+          lateListIds.push("c:" + listPath);
+          try { await env.CONFIGS.delete(`listlikevoters:${listPath}`); } catch (e) {}
           listsCleared++;
         }
         if (res.list_complete || !res.cursor) break;
@@ -4908,6 +5086,17 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.CONFIGS.delete(`creatorlastseen:${u}`);
     } catch (e) {
       console.error("purgeCreatorData: the post-deletion sweep did not finish", e);
+    }
+    if (lateListIds.length) {
+      try {
+        await removeListsFromPublicIndex(env, lateListIds);
+      } catch (e) {
+        // Best-effort, same as the sweep above: the records are gone either
+        // way, and the read path now refuses a list whose owner no longer
+        // exists (see the creator check in /lists/:user/:slug), so a stranded
+        // index entry is a dead row rather than an exposure.
+        console.error("purgeCreatorData: could not drop late lists from the directory", e);
+      }
     }
   }
 
@@ -5029,6 +5218,41 @@ async function getCreator(env, username) {
 // The cost is one indexed primary-key lookup, and only for deployments that
 // have bound D1. The caller issues it alongside the KV read rather than after
 // it, so it costs a subrequest rather than a round trip.
+// "Does this account still exist", memoized for one request.
+//
+// A creator list whose creator is gone is an orphan -- left behind by a save
+// that raced its owner's account deletion, which the two purge sweeps cannot
+// fully prevent because nothing bounds how late a KV write may land. The
+// public list route refuses to serve one; these are the two places that
+// ADVERTISE lists by reading records directly (the cold-index fallbacks in
+// /lists/public.json and /api/search-published-lists), and without this they
+// kept offering a row that 404s the moment anyone opens it.
+//
+// The promise, not the result, goes in the map: both callers fan out over a
+// page of keys with Promise.all, so a hundred lists by one creator would
+// otherwise each start their own lookup.
+//
+// A read that FAILED counts as present. getCreator already falls back to D1
+// and only returns null when neither store has the account, so this only fires
+// on a genuine absence -- and hiding live lists over a transient KV error
+// would be the worse mistake.
+function makeCreatorExistsMemo(env) {
+  const cache = new Map();
+  return function creatorExists(username) {
+    if (!username) return Promise.resolve(false);
+    if (cache.has(username)) return cache.get(username);
+    const pending = (async () => {
+      try {
+        return !!(await getCreator(env, username));
+      } catch {
+        return true;
+      }
+    })();
+    cache.set(username, pending);
+    return pending;
+  };
+}
+
 async function authoritativeKeyHash(env, username, kvKeyHash) {
   if (!env || !env.DB) return kvKeyHash;
   try {
@@ -14118,6 +14342,49 @@ function resolveChartSlug(slug) {
   return CHART_SLUG_REGISTRY[slug] || null;
 }
 
+// --- The curated shelves, in one place ---------------------------------------
+//
+// These twelve used to exist only as a literal inside buildQuickAddPresets
+// (16_client-row-core.js), so the /lists/curated/<slug> route had nothing to
+// look them up in and guessed instead:
+//
+//   const title = isShow ? "Recommended Shows" : "Recommended Movies";
+//
+// `isShow` was not declared anywhere, so that route threw a ReferenceError and
+// answered HTTP 500 on EVERY request -- and the client's own getListCleanPath
+// puts exactly that path in the address bar whenever one of these is opened,
+// so reloading or sharing any curated shelf landed on an error.
+//
+// A regex on the slug would have fixed the crash and still got the answer
+// wrong: "true-crime-mystery" is a series and contains neither "show" nor
+// "series". The type has to be looked up, not inferred -- so the list lives
+// here, is used by the route directly, and is embedded into the client (see
+// CURATED_LIST_ENTRIES in renderBuilder) so there is one copy rather than two
+// that can drift.
+const CURATED_LIST_ENTRIES = [
+  { slug: "recommended-movies", name: "Recommended Movies", type: "movie" },
+  { slug: "recommended-shows", name: "Recommended Shows", type: "series" },
+  { slug: "hidden-gems", name: "Curated: Hidden Gems", type: "movie" },
+  { slug: "top-rated-classics", name: "Curated: Top Rated Classics", type: "movie" },
+  { slug: "cult-favorites", name: "Curated: Cult Favorites", type: "movie" },
+  { slug: "binge-worthy-series", name: "Curated: Binge-Worthy Series", type: "series" },
+  { slug: "award-winners", name: "Curated: Award Winners", type: "movie" },
+  { slug: "feel-good-hits", name: "Curated: Feel-Good Hits", type: "movie" },
+  { slug: "action-thrills", name: "Curated: Action & Thrills", type: "movie" },
+  { slug: "sci-fi-journeys", name: "Curated: Sci-Fi Journeys", type: "movie" },
+  { slug: "family-movie-night", name: "Curated: Family Movie Night", type: "movie" },
+  { slug: "true-crime-mystery", name: "Curated: True Crime & Mystery", type: "series" },
+];
+
+const CURATED_LIST_REGISTRY = Object.fromEntries(CURATED_LIST_ENTRIES.map((e) => [e.slug, e]));
+
+// Null on an unknown slug, so a stale or hand-edited /lists/curated/... link
+// lands in the app rather than on an error -- same contract as
+// resolveChartSlug above.
+function resolveCuratedSlug(slug) {
+  return CURATED_LIST_REGISTRY[String(slug || "").toLowerCase()] || null;
+}
+
 function renderBuilder(
   origin,
   { initialEntries = [], initialKeys = {}, isConfigureMode = false, deepLinkList = null } = {}
@@ -14178,7 +14445,7 @@ function renderBuilder(
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${ADDON_NAME} — Self-Hosted Stremio Catalogs">
 <meta name="twitter:description" content="Turn any MDBList, Trakt, TMDB, or Simkl list into a Stremio/wako catalog row. Self-hosted on your own free Cloudflare account.">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         name: ADDON_NAME,
@@ -14196,7 +14463,7 @@ function renderBuilder(
   // apart (see the "pre-fill" block's own comment on why that distinction
   // matters for when to trust localStorage over what the server sent).
   const usingDefaultEntries = !hasInitial;
-  const initialEntriesJson = JSON.stringify(
+  const initialEntriesJson = jsonForScript(
     hasInitial
       ? initialEntries
       : [
@@ -17467,17 +17734,17 @@ ${seoHeadHtml}
 
 <script>
 /* Chart data tables -- injected at render time for renderDiscoverChartsList */
-window._CHARTS_TMDB = ${JSON.stringify(TMDB_CHART_LISTS)};
-window._CHARTS_TRAKT = ${JSON.stringify(TRAKT_CHART_LISTS)};
-window._CHARTS_TRAKT_BO = ${JSON.stringify(TRAKT_BOXOFFICE_LIST)};
-window._CHARTS_MDBLIST = ${JSON.stringify(MDBLIST_OFFICIAL_CHARTS)};
-window._CHARTS_SIMKL = ${JSON.stringify(SIMKL_CHART_LISTS)};
-window._CHARTS_SIMKL_ANIME = ${JSON.stringify(SIMKL_ANIME_LIST)};
-window._CHARTS_STREAMING_TOP10 = ${JSON.stringify(STREAMING_TOP10)};
-window._CHARTS_STREAMING_ALL = ${JSON.stringify(STREAMING_ALL)};
-window._CHARTS_KIDS = ${JSON.stringify(KIDS_LISTS)};
-window._CHARTS_HOLIDAYS = ${JSON.stringify(HOLIDAY_LISTS)};
-window._CHARTS_GENRES = ${JSON.stringify(GENRE_LISTS)};
+window._CHARTS_TMDB = ${jsonForScript(TMDB_CHART_LISTS)};
+window._CHARTS_TRAKT = ${jsonForScript(TRAKT_CHART_LISTS)};
+window._CHARTS_TRAKT_BO = ${jsonForScript(TRAKT_BOXOFFICE_LIST)};
+window._CHARTS_MDBLIST = ${jsonForScript(MDBLIST_OFFICIAL_CHARTS)};
+window._CHARTS_SIMKL = ${jsonForScript(SIMKL_CHART_LISTS)};
+window._CHARTS_SIMKL_ANIME = ${jsonForScript(SIMKL_ANIME_LIST)};
+window._CHARTS_STREAMING_TOP10 = ${jsonForScript(STREAMING_TOP10)};
+window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
+window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
+window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
+window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }
@@ -18390,7 +18657,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom TMDB API Key / Token</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${initialTmdbKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="tmdbKeyInput" placeholder="Optional: TMDB API Key (v3) or Read Access Token (v4)" value="${escapeHtmlServer(initialTmdbKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:tmdbDisconnected');}catch(e){}} saveState(); onTmdbKeyInputChanged();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free TMDB API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent-2);">themoviedb.org/settings/api</a>.</small></p>
           </div>
         </details>
@@ -18420,10 +18687,10 @@ if ('serviceWorker' in navigator) {
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Trakt Client ID & Username</summary>
           <div style="margin-top:8px;">
             <div class="row">
-              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${initialTraktKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktKeyInput" placeholder="Optional: Trakt Client ID" value="${escapeHtmlServer(initialTraktKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <div class="row" style="margin-top:8px;">
-              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${initialTraktUsername}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+              <input type="text" id="traktUsernameInput" placeholder="Optional: Trakt username" value="${escapeHtmlServer(initialTraktUsername)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:traktDisconnected');}catch(e){}} saveState(); scheduleMyTraktListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             </div>
             <p style="margin-top:4px;"><small>Create a free Trakt Client ID at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--accent-2);">trakt.tv/oauth/applications</a>.</small></p>
           </div>
@@ -18452,7 +18719,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom MDBList API Key</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${initialMdblistKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="mdblistKeyInput" placeholder="Optional: MDBList API key" value="${escapeHtmlServer(initialMdblistKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:mdblistDisconnected');}catch(e){}} saveState(); scheduleMyMdblistListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Get a free MDBList key at <a href="https://mdblist.com/preferences" target="_blank" style="color:var(--accent-2);">mdblist.com/preferences</a>.</small></p>
           </div>
         </details>
@@ -18480,7 +18747,7 @@ if ('serviceWorker' in navigator) {
         <details style="font-size:0.85rem; color:var(--muted);">
           <summary style="cursor:pointer; color:var(--text);">Advanced: Custom Simkl Client ID</summary>
           <div style="margin-top:8px;">
-            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${initialSimklKey}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            <input type="text" id="simklKeyInput" placeholder="Optional: Simkl Client ID" value="${escapeHtmlServer(initialSimklKey)}" oninput="if(this.value.trim()){try{localStorage.removeItem('myListAddon:simklDisconnected');}catch(e){}} saveState(); scheduleMySimklListsRefresh();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
             <p style="margin-top:4px;"><small>Create a free Simkl Client ID at <a href="https://simkl.com/settings/developer/" target="_blank" style="color:var(--accent-2);">simkl.com/settings/developer/</a>.</small></p>
           </div>
         </details>
@@ -18640,7 +18907,7 @@ if ('serviceWorker' in navigator) {
   element.
 -->
 <script>
-const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
+const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${jsonForScript(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
 // Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
 // exact page load resolved a known chart slug -- e.g. loading
@@ -18650,15 +18917,15 @@ const IS_CONFIGURE = ${isConfigureMode};
 // handleInitialDeepLink in 24_client-backup-restore-presets.js, which
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
-const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+const SERVER_DEEP_LINK_LIST = ${jsonForScript(deepLinkList)};
 // The signed-in person's OAuth tokens. These are the reason the preamble
 // exists at all: they are specific to one page load and must never end up
 // in the shared bundle below, which is cached publicly under a URL that is
 // identical for every visitor.
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+let traktAccessToken = ${jsonForScript(initialTraktAccessToken)};
+let mdblistAccessToken = ${jsonForScript(initialMdblistAccessToken)};
+let simklAccessToken = ${jsonForScript(initialSimklAccessToken)};
+let simklUsername = ${jsonForScript(initialSimklUsername)};
 // Resolved from an install/configure link by the route that rendered this
 // page. Previously declared far down in 24_client-backup-restore-presets.js;
 // hoisted here because they differ per config. Moving a const declaration
@@ -18675,7 +18942,13 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
-const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
+// The curated shelves, from the same table the /lists/curated/<slug> route
+// resolves against (CURATED_LIST_ENTRIES, 08_quickadd-chart-data.js). This
+// list used to be a literal down in buildQuickAddPresets, which is why the
+// route had nothing to look a slug up in and guessed the name and type
+// instead -- and guessed wrong for "true-crime-mystery", which is a series.
+const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
 
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
@@ -20293,20 +20566,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
 
   if (type === 'curated' || type === 'all') {
-    const curatedPresets = [
-      { name: 'Recommended Movies', url: 'custom:curated:recommended-movies', type: 'movie', user: 'Curated' },
-      { name: 'Recommended Shows', url: 'custom:curated:recommended-shows', type: 'series', user: 'Curated' },
-      { name: 'Curated: Hidden Gems', url: 'custom:curated:hidden-gems', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Top Rated Classics', url: 'custom:curated:top-rated-classics', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Cult Favorites', url: 'custom:curated:cult-favorites', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Binge-Worthy Series', url: 'custom:curated:binge-worthy-series', type: 'series', user: 'Curated' },
-      { name: 'Curated: Award Winners', url: 'custom:curated:award-winners', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Feel-Good Hits', url: 'custom:curated:feel-good-hits', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Action & Thrills', url: 'custom:curated:action-thrills', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Sci-Fi Journeys', url: 'custom:curated:sci-fi-journeys', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Family Movie Night', url: 'custom:curated:family-movie-night', type: 'movie', user: 'Curated' },
-      { name: 'Curated: True Crime & Mystery', url: 'custom:curated:true-crime-mystery', type: 'series', user: 'Curated' },
-    ];
+    // One table, shared with the server -- see CURATED_LIST_ENTRIES above.
+    const curatedPresets = CURATED_LIST_ENTRIES.map(function(e) {
+      return { name: e.name, url: 'custom:curated:' + e.slug, type: e.type, user: 'Curated' };
+    });
     curatedPresets.forEach(function(item) {
       pushSingle(item.name, item.url, item.type, 'Curated');
     });
@@ -23489,7 +23752,15 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   if (created.length) {
     try {
       if (typeof trackEvent === 'function') {
-        trackEvent('list-copy', listUrl || listName, listName);
+        // created[0].name, not listName: the latter is a const declared inside
+        // the chunking loop above, so this reference -- outside the loop -- was
+        // an unbound identifier that threw a ReferenceError into the
+        // surrounding catch every single time. This is the ONLY site in the app
+        // that emits a list-copy event, so stats:list_copy: never received a
+        // write and the admin Community Lists "copies" column (and the
+        // likes + copies*2 ranking beside it) has always been structurally
+        // zero.
+        trackEvent('list-copy', listUrl || created[0].name, created[0].name);
       }
     } catch (e) {}
     renderCreatorDashboard();
@@ -49732,7 +50003,7 @@ function renderGuidePage(origin) {
 <meta name="twitter:title" content="${title}">
 <meta name="twitter:description" content="${description}">
 <link rel="icon" type="image/png" href="${origin}/icon.png">
-<script type="application/ld+json">${JSON.stringify({
+<script type="application/ld+json">${jsonForScript({
     "@context": "https://schema.org",
     "@type": "FAQPage",
     mainEntity: [
@@ -51141,6 +51412,7 @@ async function handleFetch(request, env, ctx) {
         if (rest.includes(":")) listKeys.push({ key: k.name, isCreator: true });
       });
 
+      const creatorExists = makeCreatorExistsMemo(env);
       const listPromises = listKeys.slice(0, 100).map(async ({ key, isCreator }) => {
         const raw = await env.CONFIGS.get(key);
         if (!raw) return null;
@@ -51157,7 +51429,21 @@ async function handleFetch(request, env, ctx) {
           } else {
             slug = key.slice("publishedlist:user:".length);
           }
+          // Never advertise a list whose creator no longer exists -- see
+          // makeCreatorExistsMemo. The index path cannot produce one (the
+          // rebuild skips orphans); this scan reads records directly, so it
+          // has to ask.
+          if (isCreator && !(await creatorExists(username))) return null;
           const cleanSlug = slug || slugifyServer(l.name) || "list";
+          // `creator` is a display label; the URL needs the KEY NAMESPACE.
+          // An anonymous list lives at publishedlist:user:<slug> and is served
+          // from /lists/user/<slug>, but this fallback built the path out of
+          // the display label instead -- so every anonymous list in the
+          // directory advertised /lists/Anonymous/<slug>, which 404s. The
+          // index path and /api/search-published-lists both get this right;
+          // only this scan disagreed, and it is the one that runs on a fresh
+          // deployment and for the whole of the first index rebuild.
+          const urlUser = isCreator ? username : "user";
           return {
             name: l.name,
             slug: cleanSlug,
@@ -51165,9 +51451,9 @@ async function handleFetch(request, env, ctx) {
             type: l.type || "mixed",
             itemCount: Array.isArray(l.items) ? l.items.length : (l.itemCount || 0),
             likes: l.likes || 0,
-            updatedAt: l.updatedAt || l.createdAt || null,
-            url: `${url.origin}/lists/${username}/${cleanSlug}`,
-            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+            updatedAt: l.updatedAt || l.createdAt || l.publishedAt || null,
+            url: `${url.origin}/lists/${urlUser}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${urlUser}/${cleanSlug}.json`,
           };
         } catch {
           return null;
@@ -51185,10 +51471,15 @@ async function handleFetch(request, env, ctx) {
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
-      const title = isShow ? "Recommended Shows" : "Recommended Movies";
+      // Looked up, not inferred -- see CURATED_LIST_ENTRIES
+      // (08_quickadd-chart-data.js). An unknown slug falls through to the
+      // default builder page, exactly as an unknown chart slug does.
+      const curated = resolveCuratedSlug(slug);
       return await htmlPageResponse(
         request,
-        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } })
+        curated
+          ? renderBuilder(url.origin, { deepLinkList: { name: curated.name, type: curated.type, url: "custom:curated:" + curated.slug } })
+          : renderBuilderCached(url.origin, {})
       );
     }
 
@@ -53275,7 +53566,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
               "Content-Type": "application/json",
               "Authorization": `Bearer ${tokenData.access_token}`,
               "trakt-api-version": "2",
-              "trakt-api-key": clientId || TRAKT_CLIENT_ID,
+              // TRAKT_CLIENT_ID, not `clientId`: that name is declared only inside
+              // the /api/trakt/device/* blocks, which are siblings of this one,
+              // not enclosing scopes. Evaluating this object therefore threw a
+              // ReferenceError BEFORE fetch was called, the surrounding catch
+              // swallowed it, and every browser-based Trakt login silently
+              // failed to learn the user's Trakt username -- while the device
+              // flow, which does the same lookup correctly, worked. This is the
+              // value the token exchange fifteen lines above already uses.
+              "trakt-api-key": TRAKT_CLIENT_ID,
               "User-Agent": "my-list-addon/1.4",
             },
           });
@@ -56291,22 +56590,54 @@ Sitemap: ${url.origin}/sitemap.xml`;
         let resData = await resolveConfig(config, env);
         let { entries, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, watchHistory, continueWatching, watchlist, airingNext } = resData;
         if (!entries || !entries.length) {
-          if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+          // Refetch from the origin the pasted link came from, so one
+          // deployment can read an install link minted by a sibling.
+          //
+          // The test used to be `/^https?:\/\//`, which is not a check: the
+          // host, port and scheme came straight from the query string, so this
+          // was an unauthenticated fetch of any origin on the internet with the
+          // response echoed back to the caller -- an internal-network SSRF off
+          // Cloudflare, and a free outbound-request reflector on it. Its
+          // sibling /api/preview grew an allowlist for the same shape and this
+          // one was missed. See isRemoteResolveOrigin (02_http-and-creator-
+          // utils.js) for what "a real, public, DNS-named https origin"
+          // excludes and why the TLD test is what does most of the work.
+          const remoteOrigin = rawUrl ? isRemoteResolveOrigin(rawUrl) : null;
+          if (remoteOrigin) {
+            // Charged only here, on the request that actually makes the
+            // outbound call -- an ordinary import (no `url`, or one that
+            // resolved locally) never touches the bucket. No client IP means
+            // this Worker is running outside Cloudflare, where consumeRateLimit
+            // lets the request through: the host check above is the control
+            // that matters, and failing closed here would break the import
+            // button for every self-hoster rather than bound an abuse path.
+            if (await consumeRateLimit(env, ctx, "resolveproxy", clientIpKey(request), RESOLVE_PROXY_PER_MINUTE)) {
+              return json({ ok: false, error: "Too many link lookups just now. Please wait a minute and try again." }, 429);
+            }
             try {
-              const u = new URL(rawUrl);
-              const remoteResolveUrl = `${u.origin}/api/resolve?config=${encodeURIComponent(config)}`;
-              const remoteRes = await fetch(remoteResolveUrl);
+              const remoteResolveUrl = `${remoteOrigin}/api/resolve?config=${encodeURIComponent(config)}`;
+              const remoteRes = await fetchWithTimeout(remoteResolveUrl);
               if (remoteRes.ok) {
                 const remoteData = await remoteRes.json();
                 if (remoteData && remoteData.ok && Array.isArray(remoteData.entries) && remoteData.entries.length) {
-                  return json(remoteData);
+                  // jsonPrivate, not json: this body carries the OTHER
+                  // deployment's copy of the same provider keys and OAuth
+                  // tokens the local branch below returns.
+                  return jsonPrivate(remoteData);
                 }
               }
             } catch {}
           }
         }
         if (!entries || !entries.length) return json({ ok: false, error: "That link has no lists in it." });
-        return json({
+        // jsonPrivate: this body is one account's -- it carries their MDBList
+        // key and their Trakt/MDBList OAuth tokens. json()'s successful-2xx
+        // default is max-age=3600 with no Vary, and this is a GET, so a
+        // browser or any shared cache in front of this Worker could store
+        // somebody's tokens for an hour. isPrivateApiPath now names this route
+        // too, so the header is set at the boundary as well; this says so at
+        // the call site.
+        return jsonPrivate({
           ok: true,
           entries,
           watchHistory: watchHistory || [],
@@ -60219,6 +60550,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
           env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
         ]);
+        const creatorExists = makeCreatorExistsMemo(env);
         const anonCandidates = await Promise.all(
           anonResult.keys.map(async (k) => {
             const raw = await env.CONFIGS.get(k.name);
@@ -60259,6 +60591,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
               const sep = rest.indexOf(":");
               if (sep === -1) return null;
               const username = rest.slice(0, sep);
+              // Same orphan filter as the directory's own fallback above.
+              if (!(await creatorExists(username))) return null;
               const listSlug = rest.slice(sep + 1);
               let creatorName = username;
               try {
@@ -60527,11 +60861,38 @@ Sitemap: ${url.origin}/sitemap.xml`;
       let creatorDisplayName = "Anonymous";
       if (isCreatorList) {
         creatorDisplayName = username;
+        // A creator list whose creator no longer exists is not servable.
+        //
+        // purgeCreatorData sweeps twice, but a save that authenticated a
+        // millisecond before the deletion tombstone was written keeps running
+        // and its KV put lands after both passes. Measured: 6 of 10 plain
+        // concurrent delete+save runs left a record behind, and because the
+        // record is genuinely `public`, it stayed readable here, stayed in the
+        // directory, and could never be removed -- every authenticated route
+        // answers 401 for that username, so the owner had no way to take down
+        // a list they had just asked to be deleted along with their account.
+        //
+        // A sweep can only narrow that window; nothing bounds how late a KV
+        // write may land. Refusing to serve an ownerless list closes it,
+        // whatever put the record there.
+        //
+        // Gated on isCreatorList: anonymous published lists live under
+        // publishedlist:user: and have no creator record BY DESIGN. Applying
+        // this to them would take every one of them offline.
+        //
+        // A read failure is not an absence: getCreator falls back to D1 and
+        // only returns null when neither store has the account, so a transient
+        // KV blip cannot 404 a live list on its own -- and this is the same
+        // read the display name already needed, so it costs nothing new.
+        const profileRaw = await getCreator(env, username);
+        if (!profileRaw) {
+          return json({ ok: false, error: "No list found at that address." }, 404);
+        }
         try {
-          const profileRaw = await getCreator(env, username);
-          if (profileRaw) creatorDisplayName = JSON.parse(profileRaw).displayName || username;
+          creatorDisplayName = JSON.parse(profileRaw).displayName || username;
         } catch {
-          // fall back to the raw username slug
+          // Unparseable record -- the account exists, so serve the list under
+          // the raw username slug rather than hiding it.
         }
       }
       const likes = listData.likes || 0;

@@ -21,7 +21,7 @@
   element.
 -->
 <script>
-const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${JSON.stringify(origin)};
+const ORIGIN = (typeof location !== 'undefined' && location.origin) ? location.origin : ${jsonForScript(origin)};
 const IS_CONFIGURE = ${isConfigureMode};
 // Populated by the /lists/<slug> route (25_api-catalog-routes.js) when this
 // exact page load resolved a known chart slug -- e.g. loading
@@ -31,15 +31,15 @@ const IS_CONFIGURE = ${isConfigureMode};
 // handleInitialDeepLink in 24_client-backup-restore-presets.js, which
 // checks this before falling back to the older #/list?... hash format for
 // anything that isn't one of these known charts.
-const SERVER_DEEP_LINK_LIST = ${JSON.stringify(deepLinkList)};
+const SERVER_DEEP_LINK_LIST = ${jsonForScript(deepLinkList)};
 // The signed-in person's OAuth tokens. These are the reason the preamble
 // exists at all: they are specific to one page load and must never end up
 // in the shared bundle below, which is cached publicly under a URL that is
 // identical for every visitor.
-let traktAccessToken = ${JSON.stringify(initialTraktAccessToken)};
-let mdblistAccessToken = ${JSON.stringify(initialMdblistAccessToken)};
-let simklAccessToken = ${JSON.stringify(initialSimklAccessToken)};
-let simklUsername = ${JSON.stringify(initialSimklUsername)};
+let traktAccessToken = ${jsonForScript(initialTraktAccessToken)};
+let mdblistAccessToken = ${jsonForScript(initialMdblistAccessToken)};
+let simklAccessToken = ${jsonForScript(initialSimklAccessToken)};
+let simklUsername = ${jsonForScript(initialSimklUsername)};
 // Resolved from an install/configure link by the route that rendered this
 // page. Previously declared far down in 24_client-backup-restore-presets.js;
 // hoisted here because they differ per config. Moving a const declaration
@@ -56,7 +56,13 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // openListDetailsPage (23_client-list-management.js) push the clean
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
-const CHART_SLUG_ENTRIES = ${JSON.stringify(CHART_SLUG_ENTRIES)};
+const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
+// The curated shelves, from the same table the /lists/curated/<slug> route
+// resolves against (CURATED_LIST_ENTRIES, 08_quickadd-chart-data.js). This
+// list used to be a literal down in buildQuickAddPresets, which is why the
+// route had nothing to look a slug up in and guessed the name and type
+// instead -- and guessed wrong for "true-crime-mystery", which is a series.
+const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
 
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
@@ -1674,20 +1680,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
 
   if (type === 'curated' || type === 'all') {
-    const curatedPresets = [
-      { name: 'Recommended Movies', url: 'custom:curated:recommended-movies', type: 'movie', user: 'Curated' },
-      { name: 'Recommended Shows', url: 'custom:curated:recommended-shows', type: 'series', user: 'Curated' },
-      { name: 'Curated: Hidden Gems', url: 'custom:curated:hidden-gems', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Top Rated Classics', url: 'custom:curated:top-rated-classics', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Cult Favorites', url: 'custom:curated:cult-favorites', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Binge-Worthy Series', url: 'custom:curated:binge-worthy-series', type: 'series', user: 'Curated' },
-      { name: 'Curated: Award Winners', url: 'custom:curated:award-winners', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Feel-Good Hits', url: 'custom:curated:feel-good-hits', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Action & Thrills', url: 'custom:curated:action-thrills', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Sci-Fi Journeys', url: 'custom:curated:sci-fi-journeys', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Family Movie Night', url: 'custom:curated:family-movie-night', type: 'movie', user: 'Curated' },
-      { name: 'Curated: True Crime & Mystery', url: 'custom:curated:true-crime-mystery', type: 'series', user: 'Curated' },
-    ];
+    // One table, shared with the server -- see CURATED_LIST_ENTRIES above.
+    const curatedPresets = CURATED_LIST_ENTRIES.map(function(e) {
+      return { name: e.name, url: 'custom:curated:' + e.slug, type: e.type, user: 'Curated' };
+    });
     curatedPresets.forEach(function(item) {
       pushSingle(item.name, item.url, item.type, 'Curated');
     });

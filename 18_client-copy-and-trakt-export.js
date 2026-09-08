@@ -229,7 +229,15 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   if (created.length) {
     try {
       if (typeof trackEvent === 'function') {
-        trackEvent('list-copy', listUrl || listName, listName);
+        // created[0].name, not listName: the latter is a const declared inside
+        // the chunking loop above, so this reference -- outside the loop -- was
+        // an unbound identifier that threw a ReferenceError into the
+        // surrounding catch every single time. This is the ONLY site in the app
+        // that emits a list-copy event, so stats:list_copy: never received a
+        // write and the admin Community Lists "copies" column (and the
+        // likes + copies*2 ranking beside it) has always been structurally
+        // zero.
+        trackEvent('list-copy', listUrl || created[0].name, created[0].name);
       }
     } catch (e) {}
     renderCreatorDashboard();
