@@ -315,7 +315,7 @@
       </div>
 
       <div class="actions" style="margin-top:6px;">
-        <button type="button" class="primary lc-btn" id="btnUnifiedImport" style="padding:10px 24px; font-size:0.95rem;" onclick="runUnifiedListImport()">Import</button>
+        <button type="button" class="secondary lc-btn" id="btnUnifiedImport" style="padding:10px 24px; font-size:0.95rem;" onclick="runUnifiedListImport()">Import</button>
       </div>
 
       <div id="unifiedImportResult" style="margin-top:12px;"></div>
@@ -380,7 +380,7 @@
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Guide</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Step-by-step how-to guides covering every tab: adding catalogs, building Channels, Storylines &amp; Universes, importing lists, and more.</p>
-      <a href="/guide" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
+      <a href="/guide" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Open the Guide</a>
     </div>
 
     <!-- Support & Recommended Debrid Section -->
@@ -388,8 +388,8 @@
       <h2 class="panel-title">Support &amp; Recommended Debrid</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Support the continued development and hosting of My Lists Addon, or sign up for TorBox debrid using our referral link.</p>
       <div class="actions" style="flex-direction:row; width:auto; gap:10px; flex-wrap:wrap;">
-        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Buy me a coffee</a>
-        <a href="https://torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1" target="_blank" rel="noopener" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill); border-color:rgba(0,122,255,0.4); color:#ffffff;">Try TorBox Debrid (Referral)</a>
+        <a href="https://buymeacoffee.com/brock25" target="_blank" rel="noopener" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Buy me a coffee</a>
+        <a href="https://torbox.app/subscription?referral=af23795c-7706-4b02-a979-d84b5613cfd1" target="_blank" rel="noopener" class="lc-btn secondary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; padding:10px 20px; font-weight:700; font-size:0.92rem; border-radius:var(--radius-pill);">Try TorBox Debrid (Referral)</a>
       </div>
     </div>
   </div>

@@ -820,6 +820,11 @@ function switchTab(name) {
     }
   }
   if (name === 'search') {
+    // Cheap on a return visit: renderDefaultCatalogSearch keeps the view it
+    // last rendered and no-ops when the controls still describe it, so
+    // coming back from a poster, from See All, or from another tab no longer
+    // tears the results down and refetches them (see the view cache in
+    // 19_client-search-and-likes.js).
     const input = document.getElementById('catalogSearchInput');
     if (input && !input.value.trim()) {
       if (typeof renderDefaultCatalogSearch === 'function') renderDefaultCatalogSearch();
@@ -912,8 +917,17 @@ function lockBackgroundScroll(on) {
     _scrollLockDepth++;
     if (_scrollLockDepth > 1) return;
     _scrollLockY = window.pageYOffset || root.scrollTop || 0;
-    const barWidth = window.innerWidth - root.clientWidth;
+    // Measured across the change, not guessed from it. html now carries
+    // scrollbar-gutter: stable (09_page-shell.js), and whether that gutter
+    // survives overflow:hidden differs between engines -- computing the
+    // compensation from window.innerWidth - clientWidth BEFORE the switch
+    // would pad by a scrollbar width that is sometimes still reserved,
+    // shifting the page the other way. The width the lock actually removed
+    // is the difference in clientWidth across it, which is zero when the
+    // gutter stays.
+    const widthBefore = root.clientWidth;
     root.style.overflow = 'hidden';
+    const barWidth = root.clientWidth - widthBefore;
     if (barWidth > 0) root.style.paddingRight = barWidth + 'px';
     return;
   }

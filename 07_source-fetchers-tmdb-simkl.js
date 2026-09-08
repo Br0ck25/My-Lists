@@ -486,6 +486,27 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
   const filtered = [];
   let tmdbPage = 1;
   let totalPages = 1;
+  // How big the list actually is, so the browser can say "303 items" the
+  // moment See All opens instead of counting the 100 it has loaded and
+  // saying that until the rest has been scrolled in. /api/preview reads it
+  // off the returned array as `totalItems` (25_api-catalog-routes.js);
+  // every other TMDB fetcher in this file already reports one, this walk
+  // was the only one that never did.
+  //
+  // Two of the three cases are exact, and the third is deliberately left
+  // unanswered. If the walk below runs out of pages, `filtered` IS the
+  // whole list for this type. The account watchlist/favourites endpoints
+  // are per-kind (/account/{id}/watchlist/movie), so TMDB's own
+  // total_results counts exactly what this catalog will show. What cannot
+  // be known without walking every page is how a v4 list that MIXES movies
+  // and shows splits between them -- total_results counts both. So that
+  // number is only adopted while every item seen so far has been of the
+  // wanted kind; a list that has actually shown both reports no total and
+  // the header falls back to "100+", counting up as it pages, which is
+  // what it did before this and is at least honest.
+  let totalResults = null;
+  let otherKindSeen = 0;
+  let exhausted = false;
 
   while (filtered.length < skip + PAGE_SIZE && tmdbPage <= Math.min(totalPages, MAX_PAGES)) {
     let src = "";
@@ -522,17 +543,31 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
       : Array.isArray(data.items)
       ? data.items
       : [];
-    if (items.length === 0) break; // no more pages
+    if (items.length === 0) {
+      exhausted = true;
+      break; // no more pages
+    }
     if (typeof data.total_pages === "number" && data.total_pages > 0) {
       totalPages = data.total_pages;
+    }
+    if (typeof data.total_results === "number" && data.total_results >= 0) {
+      totalResults = data.total_results;
     }
 
     for (const it of items) {
       const kind = it.media_type === "tv" || it.media_type === "movie" ? it.media_type : wantKind;
       if (kind === wantKind) filtered.push(it);
+      else otherKindSeen++;
     }
     tmdbPage++;
+    if (tmdbPage > totalPages) exhausted = true;
   }
+
+  const knownTotal = exhausted
+    ? filtered.length
+    : ((isAccountWatchlist || isAccountFavorites || otherKindSeen === 0) && totalResults != null
+        ? totalResults
+        : null);
 
   const page = filtered.slice(skip, skip + PAGE_SIZE);
 
@@ -542,7 +577,9 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
     return mapTmdbItem(it, imdbId, entry.type, videos);
   });
 
-  return resolved.filter(Boolean);
+  const out = resolved.filter(Boolean);
+  if (knownTotal != null) out.totalItems = knownTotal;
+  return out;
 }
 
 async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx = null) {
@@ -601,7 +638,11 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
         return mapTmdbItem(it, imdbId, "movie", videos);
       });
 
-      return resolved.filter(Boolean);
+      // The whole collection came back in one response, so its size is
+      // known exactly -- see /api/preview's totalItems.
+      const mapped = resolved.filter(Boolean);
+      mapped.totalItems = parts.length;
+      return mapped;
     },
   });
 }

@@ -41,7 +41,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
 - Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
 
-### ⏱Continue Watching & Background Watch Sync
+### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
 - **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, and to keep the shared provider charts pre-warmed in KV.

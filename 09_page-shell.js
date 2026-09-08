@@ -105,7 +105,9 @@ function renderBuilder(
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#F2F2F7">
 <link rel="manifest" href="${origin}/app.webmanifest">
@@ -170,6 +172,7 @@ ${seoHeadHtml}
 <style>/*MYLISTS_APP_CSS_START*/
   :root {
     /* Wako-inspired iOS-native modern light theme */
+    color-scheme: light;
     --bg:           #F2F2F7;
     --surface:      #FFFFFF;
     --panel:        #FFFFFF;
@@ -202,6 +205,15 @@ ${seoHeadHtml}
     --radius-pill:  999px;
   }
   :root.dark-theme {
+    /* Not decoration: this is what tells the OS the page is dark. An
+       installed PWA paints the areas it does not hand to the document --
+       the status bar, and the strip at the bottom holding the home
+       indicator / gesture bar -- from the UA's own surface color, and that
+       surface is white for as long as the document declares a light color
+       scheme, whatever <meta name="theme-color"> or the page background
+       say. It also gets the scrollbars, form controls and <select> popups
+       to match. */
+    color-scheme: dark;
     --bg:           #000000;
     --surface:      #1C1C1E;
     --panel:        #1C1C1E;
@@ -215,7 +227,22 @@ ${seoHeadHtml}
     --sb-thumb-hover:rgba(255,255,255,0.25);
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html { touch-action: manipulation; width: 100%; max-width: 100%; overflow-x: hidden; }
+  /* scrollbar-gutter, because the page is a max-width block centred with
+     'margin: 0 auto' and every tab is one panel swapped in for another. A
+     panel whose content is shorter than the viewport takes the classic
+     scrollbar away, the content box gets ~15px wider, and the centred page
+     slides right by half of that -- which is exactly what selecting
+     Discover > Hidden Gems, Catalogs > Bulk Add, Lists > Liked or Import,
+     or Channels > Quick Add or Import did on desktop. Reserving the gutter
+     for the whole document means the layout no longer depends on whether
+     the tab currently showing happens to overflow.
+
+     'stable' (rather than 'overflow-y: scroll') so short pages do not grow
+     a dead scrollbar track; browsers without it use overlay scrollbars, so
+     there is no shift for them to fix. lockBackgroundScroll
+     (16_client-row-core.js) measures the gutter it actually removes rather
+     than assuming, so a modal still compensates correctly either way. */
+  html { touch-action: manipulation; width: 100%; max-width: 100%; overflow-x: hidden; scrollbar-gutter: stable; background: var(--bg); }
   body {
     font-family: var(--font-body);
     margin: 0;
@@ -223,7 +250,11 @@ ${seoHeadHtml}
     width: 100%;
     max-width: 100%;
     overflow-x: hidden;
-    padding: 16px 12px calc(80px + env(safe-area-inset-bottom));
+    /* viewport-fit=cover (see the <meta> above) extends the document into
+       the status-bar and home-indicator strips so the page's own dark
+       background fills them instead of the UA's white. The insets have to
+       be paid back here, or the header sits under the clock. */
+    padding: calc(16px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) calc(80px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
     background: var(--bg);
     color: var(--text);
     font-size: 15px;
@@ -672,7 +703,7 @@ ${seoHeadHtml}
   .bottom-nav { display: none; }
   @media (max-width: 640px) {
     .tab-bar { display: none; }
-    body { padding: 12px 12px calc(96px + env(safe-area-inset-bottom)); }
+    body { padding: calc(12px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) calc(96px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); }
     .bottom-nav {
       display: flex;
       position: fixed !important;
@@ -1238,6 +1269,19 @@ ${seoHeadHtml}
   }
   .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lc-btn.primary:hover:not(:disabled) { opacity: 0.85; }
+  /* The same surface 'button.secondary' gives every Connect / Disconnect /
+     Copy button, spelled with two classes so it also reaches the <a>s that
+     are styled as buttons. Those needed it: 'button, .actions a' (further
+     down this stylesheet) is more specific than a bare '.lc-btn', so an
+     <a class="lc-btn secondary"> inside .actions -- the Buy me a coffee and
+     TorBox referral links in Settings -- came out accent blue with white
+     text no matter which modifier class it carried. */
+  .lc-btn.secondary {
+    background: var(--surface);
+    color: var(--text-2);
+    border: 1.5px solid var(--border-strong);
+    box-shadow: var(--shadow-sm);
+  }
   .lc-btn.liked { color: var(--danger); border-color: rgba(255,59,48,0.4); }
   .lc-btn.view-btn { color: var(--accent); border-color: transparent; background: transparent; padding: 0; font-size: 0.82rem; }
 
