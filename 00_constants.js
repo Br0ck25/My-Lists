@@ -1,5 +1,5 @@
 const ADDON_ID = "app.my-list";
-const ADDON_VERSION = "1.5.0";
+const ADDON_VERSION = "1.5.3";
 const ADDON_NAME = "My Lists";
 
 // How many items a "Recommended Movies"/"Recommended Shows" list holds --
@@ -12,13 +12,18 @@ const ADDON_NAME = "My Lists";
 // drift apart again.
 const CURATED_RECOMMENDATION_LIMIT = 40;
 
-// --- Bounds on the two unauthenticated permanent-KV-write endpoints ---------
+// --- Bounds on the unauthenticated permanent-KV-write endpoint --------------
 //
-// /api/publish-list and /api/save both accept a body from anyone at all and
-// store it under a KV key that nothing in this Worker ever expires or
-// deletes. Neither used to bound what it stored, so a single anonymous
-// request could park multiple megabytes in KV permanently, as many times as
-// it liked.
+// /api/save accepts a body from anyone at all and stores it under a KV key
+// that nothing in this Worker ever expires or deletes. It used to bound
+// nothing, so a single anonymous request could park multiple megabytes in KV
+// permanently, as many times as it liked.
+//
+// It used to have a sibling. /api/publish-list did the same for an anonymous
+// published LIST and was removed in 1.5.3 -- unauthenticated, unowned,
+// permanent, with no caller anywhere in the shipped bundle. Its own tighter
+// ceilings went with it; the two below are still shared with the
+// authenticated list save, which is what publishes a list now.
 //
 // These ceilings are set far above real usage on purpose -- the largest
 // genuine list observed in an account export was ~1,200 items, and a
@@ -31,39 +36,11 @@ const PUBLISHED_LIST_NAME_MAX = 200;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
-// --- ...and the tighter ones for /api/publish-list specifically -------------
-//
-// PUBLISHED_LIST_ITEMS_MAX and the 2 MB byte ceiling that used to sit beside
-// it were shared with the AUTHENTICATED list save, and the two are not the
-// same risk. A creator list belongs to an account that can be found, warned
-// and deleted; an anonymous published list has no owner at all, gets no TTL
-// (the slug is a URL somebody has shared -- expiring it would break their
-// link), and can only be removed by an operator, by hand, from the admin
-// panel.
-//
-// At 10 publishes a minute and 2 MB apiece that was 20 MB a minute of
-// permanent unowned storage from one IP -- a free plan's entire 1 GB
-// namespace in under an hour, and its whole 1,000-writes-per-day budget in
-// under two minutes -- from an endpoint the shipped UI never calls. (It is
-// also the easiest route to a stored payload, which is what made it vector A
-// of this audit's XSS finding.)
-//
-// So this path gets its own, much tighter ceilings. Still far above anything
-// genuine: the largest list ever observed in a real account export was ~1,200
-// items, which serialises to roughly 130 KB. What changes is the worst case,
-// from 20 MB/minute to 2.5.
-const ANON_PUBLISH_ITEMS_MAX = 5000;
-const ANON_PUBLISH_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
-const ANON_PUBLISH_PER_MINUTE = 5;
-// An item is a catalog entry, not an arbitrary JSON document. Anything this
-// rejects could not have rendered anyway -- it could only have occupied the
-// namespace.
-const ANON_PUBLISH_ITEM_ID_MAX = 128;
-
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //
-// The two ceilings above bound /api/publish-list and /api/save, which anyone
-// at all can call. /api/creator/lists/save had no bound of any kind -- not on
+// The ceilings above bound /api/save, which anyone at all can call, and once
+// bounded /api/publish-list too. /api/creator/lists/save had no bound of any
+// kind -- not on
 // items, not on the name, not on bytes -- even though a Creator Profile costs
 // one unauthenticated POST to create. The reasoning that produced the
 // anonymous limits applies here almost unchanged; it simply was not carried
@@ -110,6 +87,26 @@ const CREATOR_LISTS_PAGE_MAX = 500;
 // rest of these bounds allow.
 const CREATOR_LISTS_MAX_PAGES = 100;
 
+// --- The transfer half of the same finding --------------------------------
+//
+// Paging bounded the KV OPERATIONS /api/creator/lists spends. It did not bound
+// the BYTES: the route still returned every list's full `items` array, and
+// renderCreatorDashboard calls it after every save, delete, tab switch and
+// background sync. Measured at 1,200 lists that was 15.08 MB, and the
+// overwhelming majority of it was data the browser already held.
+//
+// So the route no longer sends `items` at all -- it sends `itemCount` and
+// `updatedAt`, and the client asks this endpoint for the contents of only the
+// slugs whose `updatedAt` it does not already have cached. After a one-list
+// edit that is one list's items instead of every list's.
+//
+// The batch is capped so this endpoint has the same property the paged one
+// does: cost bounded by the request, not by what the account owns. 100 reads
+// plus the auth lookups is an order of magnitude clear of Cloudflare's
+// 1,000-KV-operations-per-invocation cap (which is the storage-op cap, not
+// the outbound-fetch one -- see the two caps spelled out below).
+const CREATOR_LIST_ITEMS_BATCH_MAX = 100;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
@@ -152,6 +149,92 @@ const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;
 // (someone else's TMDB quota) keeps the ceiling where it was, however the
 // work is divided up.
 const BULK_RESOLVE_ITEMS_PER_MINUTE = 4000;
+
+// --- The same budget, for /api/details/batch ---------------------------------
+//
+// Measured at 180 outbound fetches for one 60-id request (p23_subrequests.mjs)
+// -- over the free plan's 50 by more than three times, so Airing Next simply
+// could not refresh on a free Worker.
+//
+// Unlike bulk-resolve, this endpoint's cost is not a fixed multiple of the
+// request size: every id goes through fetchTmdbItemDetails, and an id already
+// in the memory, KV or edge cache spends NOTHING. The warm case is the common
+// one -- that is the whole reason the batch route exists -- so the budget is
+// spent against actual upstream resolutions rather than against the id count.
+// A fully warm 60-id refresh is still one invocation, exactly as before.
+//
+// Eight is the number of outbound fetch() sites one cache miss can pass
+// through: the find-or-search call, up to three detail calls while the type is
+// being narrowed, the Cinemeta fallback, and two season lookups
+// (fetchTmdbItemDetailsUncached, 07_source-fetchers-tmdb-simkl.js -- each of
+// them calls spend() right above the fetch, so this stays honest if one is
+// added). It is a ceiling, not an estimate: reserved before an id is started
+// and given back the moment it turns out to have cost less, so the budget is
+// never exceeded and is never wasted either.
+const TMDB_ITEM_DETAILS_MAX_FETCHES = 8;
+// 48 leaves two of the free plan's 50 for the rest of the invocation, same as
+// BULK_RESOLVE_SUBREQUEST_BUDGET. A paid deployment raises it with a
+// DETAILS_BATCH_SUBREQUEST_BUDGET var in wrangler.toml.
+const DETAILS_BATCH_SUBREQUEST_BUDGET = 48;
+// Charged in IDS rather than requests, for the reason spelled out above
+// BULK_RESOLVE_ITEMS_PER_MINUTE: the previous ceilings were 60 and 240
+// REQUESTS a minute while a request carried up to 60 ids, and splitting a
+// request into several would otherwise have cut the real ceiling by the
+// number of chunks. 3,600 and 14,400 ids are those same ceilings, counted in
+// the thing the endpoint actually spends.
+const DETAILS_BATCH_IDS_PER_MINUTE = 3600;
+const DETAILS_BATCH_IDS_PER_MINUTE_OWN_KEY = 14400;
+// A stop on the client's resume loop, so a Worker that never says done cannot
+// spin. 8 rounds x 60 ids is far past the 60-id cap on one request.
+const DETAILS_BATCH_MAX_ROUNDS = 8;
+
+// --- The same budget, for the cron tick --------------------------------------
+//
+// Measured at 186 outbound fetches for one tick (p23_subrequests.mjs), against
+// the free plan's 50. The consequence is not "the tick is slow": Cloudflare
+// terminates the invocation, so on a free Worker Continue Watching has never
+// picked up a single new episode.
+//
+// The two tasks are not equally divisible:
+//
+//   checkForNewEpisodes  is exactly two outbound fetches per show
+//                        (findNextAiredEpisodeForShow makes two season
+//                        lookups), already resumes from a KV cursor, and so
+//                        chunks perfectly -- a smaller slice per tick simply
+//                        means more ticks, and there are 240 of them a day.
+//
+//   prewarmSharedCatalogs cannot be divided below ONE chart, and one chart is
+//                        ~105 fetches: fetchTmdbPagedResults asks for
+//                        ceil(PAGE_SIZE / 20) = 5 pages and then resolves
+//                        details for every item on them. No budget under ~105
+//                        can pre-warm anything at all, so below that it is
+//                        skipped with one log line rather than taking the tick
+//                        -- and Continue Watching with it -- down every time.
+//
+// scheduled() therefore runs the episode sweep FIRST and awaits it, so the
+// user-visible half of the tick has already been written to KV before the
+// expensive optional half starts.
+//
+// The default is the free-plan number, for the same reason
+// BULK_RESOLVE_SUBREQUEST_BUDGET's is: a Worker pasted into the Cloudflare
+// dashboard has no wrangler.toml and no way to set a var, and that is exactly
+// the deployment the README documents. Anyone deploying with this repo's
+// wrangler.toml gets CRON_SUBREQUEST_BUDGET = "10000" and the full tick.
+const CRON_SUBREQUEST_BUDGET = 48;
+// Two season lookups per show, worst case -- see findNextAiredEpisodeForShow.
+const CRON_EPISODE_CHECK_FETCHES = 2;
+// 5 paged chart fetches + up to PAGE_SIZE detail resolutions. A ceiling, not
+// an average: a warm chart costs nothing, but the budget has to be sized so
+// that a COLD one still fits.
+const CRON_CHART_WARM_FETCHES = 105;
+// The episode sweep's ceiling however large the budget is -- the value this
+// sweep has always used, so a paid deployment behaves exactly as before.
+const CRON_EPISODE_CHECK_MAX = 150;
+// How much of the budget the episode sweep may claim before the pre-warm gets
+// what is left. At the free default that is 24 fetches -> 12 shows a tick,
+// which is 2,880 checks a day; at 10,000 it is 5,000 -> the 150 ceiling above,
+// leaving 9,700 for the charts, which covers all 47 of them.
+const CRON_EPISODE_CHECK_SHARE = 0.5;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //

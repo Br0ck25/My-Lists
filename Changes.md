@@ -1,5 +1,62 @@
 # Changes Log
 
+## 2026-09-08 - v1.5.3: the last open items from Adversarial Audit III
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `07_source-fetchers-tmdb-simkl.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`, `22_client-creator-profile.js`, `25_api-catalog-routes.js`, `26_api-creator-and-admin-routes.js`, `worker_entry_combined.js`, `wrangler.toml`, `README.md`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `AUDIT-2026-09-08-FIX-STATUS.md`, `tests/harness.mjs`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### Root Cause
+Five remediation rounds closed everything 🔴 and 🟠 in `AUDIT-2026-09-08-ADVERSARIAL-III.md`. What was left was one deferred scale change, two half-fixes whose second halves changed a client contract, the low-severity cleanup, and one decision the report explicitly handed to the maintainer. They share a shape: each one is cheap to state and needs a client or a storage-layout change to actually land, which is why they were deferred rather than fixed.
+
+- **One key held the whole directory.** `index:publiclists` was read-modify-written by every public save, every anonymous publish and every like — 4.45 MB parsed, sorted and re-serialised for a one-number change, against KV's limit of one write per second to a given key. Round 5 took the *like* path off it with a cooldown; the key itself was still the bottleneck for everything else, and the audit was explicit that sharding must happen in one pass with a version marker, because a half-sharded index serves a fraction of the directory.
+- **`/api/creator/lists` returned every list's full `items` array.** Round 5's paging bounded the KV *operations*; it did not bound the *bytes*, which were 15.08 MB for a 1,200-list account, re-sent after every save, delete, tab switch and background sync. The audit's own suggestion — "the dashboard renders name / type / count; it does not need the contents" — is wrong in one detail: the list card renders a nine-poster strip from `items`. So the fix could not be a projection alone.
+- **Two paths still could not run on a free Worker.** `/api/details/batch` at 180 outbound fetches and the cron tick at 186, against a cap of 50. Both are terminated rather than slowed, and the cron's termination took Continue Watching with it — so on a free deployment that feature had never worked once.
+- **The low-severity tail.** A non-string body field reaching `.trim` was the only uncaught 5xx in ~1,700 fuzzed requests; `/api/creator/reset-key` answered 200 on every failure, which round 1 had fixed for fourteen other endpoints and missed here; and `runListSearch()` was the single function in the client bundle with no reference of any kind.
+- **`/api/publish-list`.** Unauthenticated, permanent, unowned, no caller in the shipped app, and vector A of the audit's stored-XSS finding. Round 5 tightened it and left keep-or-remove to the maintainer.
+
+### What Changed
+
+**The directory index is sharded (`02`).** Entries live in `index:publiclists:s0`…`s31`, bucketed on an FNV-1a hash of the entry id. Sharded on the id rather than on the first character of the slug as the audit suggested: same 32 buckets, but slug initials are heavily skewed ("the", "top", "best") and a bucket holding a fifth of the directory would not have fixed either half of the problem — and the hash has to be computable from the id alone, because that is all `updatePublicListIndex` is given.
+
+The invariant that makes it safe to migrate incrementally: **a full publish writes all 32 shard keys, empty ones included, and only then deletes the pre-shard key.** So "shard N is absent" always means "this deployment is not sharded yet" and never "that bucket happens to be empty" — which is what lets the incremental write path decide in one KV read whether it may take the cheap route. A like now costs one get and one put against ~1/32 of the blob; a delete touches only the shards its ids are in, rather than all 32 (32 writes per delete would be a third of a free plan's daily budget for 31 deletes). The build state carries `v: 2`, so a scan started by pre-shard code is discarded rather than half-applied.
+
+Two things came out of that which are improvements in their own right. `readPublicListIndex` reports the **oldest** shard's timestamp, so one busy bucket cannot hide a directory that has otherwise stopped being maintained. And the cron's staleness check reads a small `index:publiclists:meta` marker written only by a full build, instead of merging 32 shards — which also fixes a live defect: staleness used to be read from the index blob's own `updatedAt`, and every incremental write bumped it, so a deployment busy enough to matter looked freshly built forever and the daily re-derive never ran on exactly the deployments that needed it.
+
+**`/api/creator/lists` sends metadata; the contents come separately (`26`, `22`).** The route returns `itemCount` and `updatedAt` and omits `items`. A new `POST /api/creator/lists/items` returns the contents of up to `CREATOR_LIST_ITEMS_BATCH_MAX` (100) named slugs, bounded by the request rather than by what the account owns, and mirroring the same Watchlist-from-the-tracking-blob fallback the paged route has. The client keeps a per-slug cache keyed on the server's `updatedAt` **and** `itemCount`, and asks only for what it does not already hold: after a one-list edit that is one list's items instead of all of them.
+
+Every consumer of `lastCreatorListsData` still reads `.items` synchronously — there are sixteen of them across five files, including "add to an existing mixed list", the channel builder and backup — so the array is assembled before the response is handed back, exactly as before. That is the whole design: nothing downstream changed, and a delta fetch that cannot complete falls back to `includeItems: true`, which is byte-for-byte the shape this endpoint answered with before the split. Rendering a list with a silently-empty items array would be worse than transferring too much, so the fallback is unconditional and a partial answer counts as a failure.
+
+**Three subrequest budgets, and one of them changes a default (`00`, `07`, `25`, `26`, `21`, `wrangler.toml`).** `/api/details/batch` spends its budget against *real* upstream calls rather than against the id count, because an id already in the memory, KV or edge cache costs nothing and the warm case is the entire reason the batch route exists — a fully warm 60-id refresh is still one invocation on either plan. Each id reserves its worst case (8 fetch sites, counted) before it starts and hands back the difference the moment it turns out to have cost less. Each id gets its **own** meter: six of these run concurrently, and a shared counter read before and after an `await` measures every worker's fetches rather than this id's — the first draft charged each completed id roughly six times what it spent and ran a 600-fetch budget out after 36 ids that had cost 108 between them.
+
+The cron tick splits differently because its two halves do. The episode sweep is exactly two fetches per show and already resumes from a cursor, so it chunks perfectly. Chart pre-warming cannot be divided below one chart, and one chart is ~105 fetches — `fetchTmdbPagedResults` asks for five pages and then resolves details for every item on them — so no free-plan budget can warm one, and issuing them anyway is what took the whole tick down. Below that threshold it is skipped with one log line naming the variable that turns it back on; above it, the charts rotate from a cursor so a budget that fits only a few per tick still covers all of them. The sweep also now runs **first** and is awaited before the pre-warm starts, so the half a person actually sees has landed in KV before anything expensive begins.
+
+The defaults are the Free-plan numbers, matching `BULK_RESOLVE_SUBREQUEST_BUDGET`'s existing precedent, because a Worker pasted into the Cloudflare dashboard has no `wrangler.toml` to read a variable from — and that is the deployment README documents. `wrangler.toml` sets all three to their Paid values, so anything deployed with this repository keeps today's behaviour with no action.
+
+**`/api/publish-list` removed (`25`, `00`).** The maintainer's call. Every read path is untouched — existing records still serve at `/lists/user/<slug>`, still appear in the directory and search, and are still browsable and deletable from `/admin` — and the route leaves a comment saying exactly that, because the next person to read `publishedlist:user:` keys will want to know where they came from. Its dedicated `ANON_PUBLISH_*` ceilings went with it rather than being left as constants nothing reads.
+
+**The cleanup (`25`, `26`, `19`).** `String()` at the five `/api/external-list/create` fields the audit named and the six sibling sites in the same file with the identical shape. `/api/creator/reset-key` answers 429 on its two throttles and 401 on the credential failures, with the message byte-identical across all of them so the status codes say nothing the body did not. `runListSearch()` deleted. The `item-add` / `item-remove` aliases are kept, with the reasoning in a comment: the audit said itself they cost nothing, `item-remove` is not even a pure alias, and deleting a published path breaks callers that cannot be seen from inside the repo.
+
+### Two test helpers that were not testing what they claimed
+A cron tick was driven by snapshotting `ctx.waitUntil` once and awaiting that snapshot. Several tasks call `ctx.waitUntil` *again* once they are already running — `advancePublicListIndexBuild` registers the actual rebuild chunk that way — so those were never awaited. The tests passed anyway because `prewarmSharedCatalogs` slept between ~47 chart warms, which was long enough for the deferred work to finish first. Budgeting the pre-warm removed the sleeps and the accident with them; the helper now drains in rounds, which is what the tests meant. The same fix went into the chart-cache test's own tick helper, and the new cron tests use a fresh isolate, because chart results are memoised in module scope and one test warming them left the next with nothing to write.
+
+### Verification
+`bash verify.sh` — byte-exact rebuild, `node --check`, the scope pass over both the Worker and the rendered bundle, all four render checks including the hostile one, `FUNCTION-MAP.md` drift, full suite. **428 tests pass, 1 skipped** (up from 401).
+
+Ten mutations, one per behaviour this release introduces, each caught by the test written for it and by no other:
+
+```
+A  return items from /api/creator/lists again   -> "does not ship item contents"
+B  reuse the client cache regardless of version -> "asks only for the list that changed"
+C  paper over a missing slug with []            -> "falls back when the items route answers without a slug"
+D  details/batch ignores its budget             -> "stays inside the free plan's 50 outbound fetches"
+E  prewarm ignores its budget                   -> "skips chart pre-warming"
+F  a full publish skips empty shards            -> "publishes every shard"
+G  a like rewrites the whole directory          -> "writes ONE shard for a like"
+H  the build state keeps its v1 marker          -> "restarts a build state written before the shards existed"
+I  revert String() on a body field              -> "does not 500 on a body field that is not a string"
+J  reset-key answers 200 again                  -> "answers reset-key failures with a status"
+```
+
 ## 2026-09-07f - Audit sweep: the last three open findings closed, and every audit retired
 
 ### Files Changed

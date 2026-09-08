@@ -107,7 +107,7 @@ async function bulkAddLists(btn) {
 // mdblist's Popular Lists is a fixed curated set (not a live search), so we
 // load it once lazily on first search and then just filter it client-side
 // by name/curator on every search -- feels instant. Trakt's side is a real
-// live search hitting their API each time (see runListSearch below).
+// live search hitting their API each time (see executeUnifiedListSearch below).
 let mdblistPopularCache = null;
 
 async function ensureMdblistPopularLoaded() {
@@ -441,12 +441,6 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
   });
 
   renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, box, intent);
-}
-
-async function runListSearch() {
-  const q = document.getElementById('listSearchInput').value.trim();
-  const box = document.getElementById('listSearchResult');
-  return executeUnifiedListSearch(q, box);
 }
 
 function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox, queryOrIntent) {

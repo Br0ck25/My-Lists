@@ -95,6 +95,80 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ---
 
+## [1.5.3] - 2026-09-08
+
+Closes the last open items from `AUDIT-2026-09-08-ADVERSARIAL-III.md`. Every finding in that report is now
+either fixed or a recorded decision; nothing is deferred.
+
+### ⚠️ Action required if you deploy with `wrangler`
+
+`wrangler.toml` now sets three plan-tuning variables (`BULK_RESOLVE_SUBREQUEST_BUDGET`,
+`DETAILS_BATCH_SUBREQUEST_BUDGET`, `CRON_SUBREQUEST_BUDGET`) to their **Workers Paid** values, which keeps the
+behaviour you have today. The constants in the code default to the **Free** values instead, because a Worker
+pasted into the Cloudflare dashboard has no `wrangler.toml` to read. If you deploy this file to a *free*
+Worker, comment that `[vars]` block out. See README's "Which Cloudflare plan do I need?".
+
+### 🗑️ Removed
+
+- **`POST /api/publish-list` is gone.** It was unauthenticated, minted a permanent unowned KV record on every
+  call, had no caller anywhere in the shipped app, and was the easiest route to a stored payload. Everything
+  that *reads* the records it already wrote is untouched: existing anonymous lists still serve at
+  `/lists/user/<slug>`, still appear in the directory and in search, and are still browsable and deletable
+  from `/admin`. Publishing a list now goes through the authenticated `/api/creator/lists/save`, which is
+  owned and deletable by the person who made it.
+
+### ⚡ Scale & cost
+
+- **The directory index is 32 keys, not one.** Every public save, publish and like did a read-modify-write of
+  a single key holding the whole directory — 4.45 MB at the 20,000-entry cap — against KV's limit of one
+  write per second to a given key. Entries are now sharded across `index:publiclists:s0`…`s31` on a hash of
+  the entry id, so a like touches ~1/32 of the blob and the deployment has 32 keys' worth of write throughput.
+  A deployment upgrading in place keeps serving from the old key until its first full publish converts it, so
+  the directory never serves a fraction of itself.
+- **The daily rebuild actually runs now.** Staleness was read from the index blob's own timestamp, which every
+  incremental write bumped — so a deployment busy enough to matter looked freshly built forever and never
+  re-derived, which is exactly where stranded entries accumulate. It reads a small marker written only by a
+  full build.
+- **`/api/creator/lists` no longer ships every list's contents.** It returned each list's full `items` array
+  on every dashboard render — after every save, delete and tab switch — measured at 15.08 MB for a 1,200-list
+  account. It returns `itemCount` and `updatedAt`; the browser fetches the contents of only the lists whose
+  version it does not already hold, from the new `POST /api/creator/lists/items`. After a one-list edit that
+  is one list's items instead of all of them.
+- **`/api/details/batch` fits an invocation.** 180 outbound fetches at its 60-id cap, against the free plan's
+  50. It now spends a budget against *real* upstream calls, so a warm Airing Next refresh is still one
+  request on either plan and only cold ids are metered; whatever it could not reach comes back as
+  `remainingIds` and the client asks again.
+- **The cron tick fits an invocation.** ~186 outbound fetches, so on a free Worker Cloudflare terminated it and
+  Continue Watching never picked up a single episode. The episode sweep is now budgeted (two fetches per show,
+  exactly) and runs *first*, so its work lands before the expensive optional half starts. Chart pre-warming
+  rotates through the chart list from a cursor, and is skipped with one explanatory log line when the budget
+  cannot fit even one chart — which is any free-plan budget, since one chart is ~105 fetches.
+- Rate limits on `/api/details/batch` are charged in **ids**, not requests, so splitting one refresh across
+  invocations does not quietly shrink the real ceiling. Same correction `/api/bulk-resolve` got in 1.5.2.
+
+### 🐛 Fixes
+
+- `/api/external-list/create` returned HTTP 500 and an internal error string when a body field was not a
+  string. Fixed there and at the six sibling sites in the same file with the same shape.
+- `/api/creator/reset-key` answered HTTP 200 on every failure. Throttles answer 429, credential failures 401 —
+  with the message byte-identical across all of them, so the status codes say nothing the body did not.
+- Removed `runListSearch()`, the one function in the client bundle with no reference of any kind.
+
+### 📖 Documentation
+
+- README: the three subrequest budgets and what each default costs; that the install link is a bearer
+  credential carrying your provider tokens and Creator Key; that an admin session can only be revoked by
+  rotating `ADMIN_KEY`; and that `POST /api/creator/sync/share-tracking` is supported but API-only.
+
+### 🧪 Tests
+
+428 pass, 1 skipped (up from 401). Ten mutations — one per behaviour this release introduces — each caught by
+the test written for it. Two test helpers were quietly not testing what they claimed: a cron tick was drained
+with a single snapshot of `ctx.waitUntil`, so background work registered *by* that work was never awaited, and
+the tests only passed because the pre-warm slept long enough between charts.
+
+---
+
 ## [1.5.2] - 2026-08-31
 
 ### 🛠️ Sync & Live Preview Fixes

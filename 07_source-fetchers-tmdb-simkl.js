@@ -1125,7 +1125,13 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx) {
+// `meter` is optional and exists for /api/details/batch: an object with a
+// numeric `spent` field, incremented once per outbound fetch this resolution
+// actually makes. A cache hit -- memory, KV or edge -- never reaches fetchFn
+// and so never touches it, which is what lets the batch route keep spending
+// one invocation on a whole warm refresh while still fitting a free Worker's
+// 50-fetch budget when the ids are cold. Every other caller passes nothing.
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx, meter) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
@@ -1148,11 +1154,14 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter),
   });
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter) {
+  // One call per outbound fetch below. Counted here rather than by wrapping
+  // fetch() globally, so nothing else in the Worker changes behaviour.
+  const spend = () => { if (meter) meter.spent++; };
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const today = new Date().toISOString().slice(0, 10);
@@ -1174,6 +1183,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     const baseImdbId = rawStr.startsWith("tt") ? rawStr.split(":")[0] : rawStr;
     if (baseImdbId.startsWith("tt")) {
       const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+      spend();
       const findRes = await fetch(findSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
@@ -1207,6 +1217,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
         .replace(/\s*\(\d{4}\).*$/, "")
         .trim();
       try {
+        spend();
         const searchRes = await fetch("https://api.themoviedb.org/3/search/" + searchType + "?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || baseImdbId) + "&page=1", {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 604800, cacheEverything: true },
@@ -1230,6 +1241,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   let resolvedType = type;
   if (resolvedType) {
     const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    spend();
     const detailRes = await fetch(detailSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
       cf: { cacheTtl: resolvedType === "tv" ? 3600 : 604800, cacheEverything: true },
@@ -1241,6 +1253,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   if (!match) {
     // Try movie first
     const mSrc = "https://api.themoviedb.org/3/movie/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    spend();
     const mRes = await fetch(mSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
       cf: { cacheTtl: 604800, cacheEverything: true },
@@ -1251,6 +1264,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     } else {
       // Try tv
       const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+      spend();
       const tvRes = await fetch(tvSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 3600, cacheEverything: true },
@@ -1313,6 +1327,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   if ((!poster || !overview || !genres) && realImdbId.startsWith("tt")) {
     try {
       const cinemetaKind = type === "tv" ? "series" : "movie";
+      spend();
       const cmRes = await fetch("https://v3-cinemeta.strem.io/meta/" + cinemetaKind + "/" + encodeURIComponent(realImdbId) + ".json", {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
@@ -1354,6 +1369,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     const seasonToSearch = (match.next_episode_to_air && match.next_episode_to_air.season_number) || (match.last_episode_to_air && match.last_episode_to_air.season_number);
     if (seasonToSearch && tmdbId) {
       try {
+        spend();
         const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonToSearch + "?api_key=" + encodeURIComponent(apiKey), {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -1418,6 +1434,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     // If mid-season (episodes 2..N-1), resolve the finale episode's air date
     if (!isSeasonPremiere && !isSeasonFinale && tmdbId && nextEpInfo.nextEpisodeSeasonNumber) {
       try {
+        spend();
         const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + nextEpInfo.nextEpisodeSeasonNumber + "?api_key=" + encodeURIComponent(apiKey), {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -1706,11 +1723,24 @@ async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisod
 // more like "gets covered every so often as the cursor cycles back
 // around" -- there's no hard per-account freshness guarantee here, just
 // steady, bounded progress.
-async function checkForNewEpisodes(env) {
+async function checkForNewEpisodes(env, fetchBudget) {
   if (!env || !env.CONFIGS || !env.TMDB_API_KEY) return;
 
   const ACCOUNT_BATCH_SIZE = 25;
-  const SHOW_CHECK_BUDGET = 150;
+  // How many shows this tick may look up, derived from the outbound-fetch
+  // budget it was handed rather than fixed at 150.
+  //
+  // Each check is two season lookups at worst (findNextAiredEpisodeForShow),
+  // so 150 shows is up to 300 fetches -- six times the free plan's 50, which
+  // is why the tick was terminated and Continue Watching never ran there at
+  // all. The sweep already resumes from a KV cursor, so a smaller slice costs
+  // nothing but ticks, and there are 240 of those a day.
+  //
+  // A caller that passes nothing gets the ceiling this sweep has always used.
+  // See CRON_SUBREQUEST_BUDGET (00_constants.js).
+  const SHOW_CHECK_BUDGET = Number.isFinite(fetchBudget) && fetchBudget > 0
+    ? Math.max(1, Math.min(CRON_EPISODE_CHECK_MAX, Math.floor(fetchBudget / CRON_EPISODE_CHECK_FETCHES)))
+    : CRON_EPISODE_CHECK_MAX;
 
   // Sweep position is a page cursor PLUS an offset into that page.
   //
@@ -1942,7 +1972,21 @@ async function checkForNewEpisodes(env) {
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).
 // Populates KV and in-memory cache so visitors always experience instant cache hits with zero API rate limits across all providers.
-async function prewarmSharedCatalogs(env, ctx) {
+//
+// `fetchBudget` is how many outbound fetches this tick may spend here. One
+// chart is ~105 of them (fetchTmdbPagedResults asks for 5 pages and then
+// resolves details for every item on them), so this is the half of the tick
+// that cannot be divided down to fit a free Worker's 50: below one chart's
+// worth of budget it does nothing at all and says so, rather than issuing
+// fetches the runtime will terminate the invocation on -- which is what used
+// to take Continue Watching down with it every tick. See
+// CRON_SUBREQUEST_BUDGET (00_constants.js).
+//
+// Above that, the charts are warmed a slice at a time from a rotating cursor,
+// so a budget that fits only a few per tick still covers all of them over the
+// following ticks instead of re-warming the first few forever. A budget that
+// fits the whole list warms the whole list, exactly as this always did.
+async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   if (!env || !env.CONFIGS) return;
 
   const traktKey = (env && env.TRAKT_CLIENT_ID) || TRAKT_CLIENT_ID;
@@ -1951,7 +1995,27 @@ async function prewarmSharedCatalogs(env, ctx) {
   const mdblistKey = (env && env.MDBLIST_API_KEY) || MDBLIST_API_KEY;
   const mdblistPopularKey = (env && env.MDBLIST_POPULAR_KEY) || MDBLIST_POPULAR_KEY;
 
-  // 1. Trakt Official Charts (every 6 mins)
+  const budget = Number.isFinite(fetchBudget) && fetchBudget > 0 ? fetchBudget : Infinity;
+  const maxWarms = budget === Infinity
+    ? Infinity
+    : Math.floor(budget / CRON_CHART_WARM_FETCHES);
+  if (maxWarms < 1) {
+    // Deliberately one line, not a throw: this is the documented free-plan
+    // limitation (README, "Which Cloudflare plan do I need?"), and the rest of
+    // the tick -- the episode sweep that has already run by the time this is
+    // reached -- is worth more than a chart that cannot fit either way.
+    console.warn(
+      `[Cron] chart pre-warming skipped: one chart costs about ${CRON_CHART_WARM_FETCHES} outbound fetches and this tick's budget is ${budget}. ` +
+      "Set CRON_SUBREQUEST_BUDGET in wrangler.toml (10000 on a Workers Paid plan) to turn it back on."
+    );
+    return;
+  }
+
+  // One flat list, in the order the four blocks used to run in, so a rotating
+  // cursor can walk it. Each entry warms exactly one chart.
+  const warmTasks = [];
+
+  // 1. Trakt Official Charts
   if (traktKey) {
     const traktCharts = [
       { chartKey: "trending", type: "movie" },
@@ -1965,16 +2029,15 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "box_office", type: "movie" },
     ];
     for (const item of traktCharts) {
-      try {
-        await fetchTraktChart({ type: item.type }, 0, traktKey, item.chartKey, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      } catch (e) {
-        console.warn(`[Cron] Prewarm Trakt chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
-      }
+      warmTasks.push({
+        label: `Trakt chart (${item.chartKey} ${item.type})`,
+        pauseMs: 200,
+        run: () => fetchTraktChart({ type: item.type }, 0, traktKey, item.chartKey, env, ctx),
+      });
     }
   }
 
-  // 2. TMDB Official Charts & Streaming Services (every 6 mins)
+  // 2. TMDB Official Charts & Streaming Services
   if (tmdbKey) {
     const tmdbCharts = [
       { chartKey: "trending", type: "movie" },
@@ -2003,16 +2066,15 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "paramount", type: "series" },
     ];
     for (const item of tmdbCharts) {
-      try {
-        await fetchTmdbChart({ type: item.type }, 0, tmdbKey, item.chartKey, "US", false, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      } catch (e) {
-        console.warn(`[Cron] Prewarm TMDB chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
-      }
+      warmTasks.push({
+        label: `TMDB chart (${item.chartKey} ${item.type})`,
+        pauseMs: 150,
+        run: () => fetchTmdbChart({ type: item.type }, 0, tmdbKey, item.chartKey, "US", false, env, ctx),
+      });
     }
   }
 
-  // 3. Simkl Trending Charts (every 6 mins)
+  // 3. Simkl Trending Charts
   if (simklKey) {
     const simklCharts = [
       { chartKey: "today", type: "movie" },
@@ -2024,16 +2086,58 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "anime-week", type: "series" },
     ];
     for (const item of simklCharts) {
+      warmTasks.push({
+        label: `Simkl chart (${item.chartKey} ${item.type})`,
+        pauseMs: 150,
+        run: () => fetchSimklChart({ type: item.type }, 0, simklKey, item.chartKey, env, ctx),
+      });
+    }
+  }
+
+  if (warmTasks.length) {
+    // Where the last tick stopped. A cursor past the end (the list shrank
+    // because a provider key was removed) restarts at the beginning rather
+    // than warming nothing.
+    let warmCursor = 0;
+    try {
+      const raw = await env.CONFIGS.get("cron:prewarm:cursor");
+      const parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) warmCursor = parsed % warmTasks.length;
+    } catch (e) {
+      console.warn("[Cron] could not read the pre-warm cursor:", e && e.message ? e.message : e);
+    }
+
+    const take = Math.min(warmTasks.length, maxWarms);
+    for (let n = 0; n < take; n++) {
+      const item = warmTasks[(warmCursor + n) % warmTasks.length];
       try {
-        await fetchSimklChart({ type: item.type }, 0, simklKey, item.chartKey, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 150));
+        await item.run();
+        await new Promise((resolve) => setTimeout(resolve, item.pauseMs));
       } catch (e) {
-        console.warn(`[Cron] Prewarm Simkl chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
+        console.warn(`[Cron] Prewarm ${item.label} failed:`, e && e.message ? e.message : e);
+      }
+    }
+
+    // Advanced after the slice, not before it: a tick terminated part-way
+    // through must not have already committed a move it did not make. The
+    // cost of repeating a chart is a cache hit.
+    if (take < warmTasks.length) {
+      try {
+        await env.CONFIGS.put("cron:prewarm:cursor", String((warmCursor + take) % warmTasks.length));
+      } catch (e) {
+        console.warn("[Cron] could not advance the pre-warm cursor:", e && e.message ? e.message : e);
       }
     }
   }
 
   // 4. MDBList Official Charts & Toplists (Throttled to once every 1 hour to preserve 1,000 req/day quota)
+  //
+  // Left as one all-or-nothing block rather than folded into the rotation
+  // above, because its hourly gate is a single flag for the whole group:
+  // warming a slice of it would set the flag and the rest would wait an hour.
+  // So it runs only when the budget still has room for the whole group.
+  const mdblistWarmCount = 7;
+  if (maxWarms !== Infinity && maxWarms < mdblistWarmCount) return;
   try {
     const lastMdblistWarmRaw = await env.CONFIGS.get("cron:last_warmed:mdblist");
     const lastMdblistWarm = lastMdblistWarmRaw ? parseInt(lastMdblistWarmRaw, 10) : 0;

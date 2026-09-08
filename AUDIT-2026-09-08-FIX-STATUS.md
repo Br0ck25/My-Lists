@@ -3,7 +3,7 @@
 Tracker for [`AUDIT-2026-09-08-ADVERSARIAL-III.md`](./AUDIT-2026-09-08-ADVERSARIAL-III.md).
 Baseline `932da34`. Branch `claude/my-lists-security-audit-3n895k`.
 
-**Rating movement:** `CRITICAL — do not keep serving shared links` → `CRITICAL CLOSED` (round 1) → `ALL HIGH-SEVERITY SECURITY CLOSED` (round 2) → `PHASES 1–3 COMPLETE` (round 3) → `ALL 🔴 AND 🟠 CLOSED` (round 4) → **`EVERY FINDING CLOSED BAR THE DEFERRED SHARD AND THE LOW-SEVERITY CLEANUP`** (round 5)
+**Rating movement:** `CRITICAL — do not keep serving shared links` → `CRITICAL CLOSED` (round 1) → `ALL HIGH-SEVERITY SECURITY CLOSED` (round 2) → `PHASES 1–3 COMPLETE` (round 3) → `ALL 🔴 AND 🟠 CLOSED` (round 4) → `EVERY FINDING CLOSED BAR THE DEFERRED SHARD AND THE LOW-SEVERITY CLEANUP` (round 5) → **`EVERY FINDING CLOSED. NOTHING DEFERRED.`** (round 6, shipped as v1.5.3)
 
 ---
 
@@ -251,16 +251,74 @@ F  client advances by the chunk size    -> "resumes from exactly what the server
 
 ---
 
-## 🔜 Remaining, in order
+## ✅ Round 6 — the deferred shard, the two free-plan endpoints, the transfer half, and the cleanup
 
-Nothing 🔴 or 🟠 is open, and the production fix order (Addendum A) is complete. What is left is one
-deferred scale change and the low-severity cleanup.
+Everything that was left. Shipped as **v1.5.3**.
 
-| # | Severity | Issue | Where |
-|---|---|---|---|
-| 1 | 🟡 | Shard `index:publiclists` across 32 keys — one change, with a version marker in the build state. Not urgent below a few thousand public lists; see the note above | fix order 19 (second half) |
-| 2 | 🟡 | Chunk `/api/details/batch` (180 outbound fetches) and the cron tick (186) to a 50-subrequest budget, the way `/api/bulk-resolve` now is | free-plan finding |
-| 3 | 🟡 | Drop `items` from `/api/creator/lists` and give the three call sites that need them a per-list read. Paging removed the wall; this is the transfer half | fix order 15 (second half) |
-| 4 | 🔵 | `String()` the five `/api/external-list/create` body fields; `/api/creator/reset-key` 401/429 instead of 200; remove `runListSearch()` and the dead aliases | fix order 20, 21, 23 |
-| 5 | ℹ️ | Document that the install link carries provider tokens and the Creator Key; consider an `ADMIN_KEY` generation counter so admin sessions can be revoked | fix order 24–26 |
-| — | ❓ | **Maintainer decision:** remove `/api/publish-list` outright, or keep the tightened version | fix order 22 |
+| # | Severity | Issue | Fix | Verified by |
+|---|---|---|---|---|
+| 19b | 🟡 | **`index:publiclists` is one global key.** Round 5 took the *like* path off it with a cooldown and made truncation visible, but the key itself was still read-modify-written by every public save and every anonymous publish — 4.45 MB at the cap, against KV's one-write-per-second-per-key limit on both plans. The audit was explicit that sharding must land in one pass with a version marker, because a half-sharded index serves a fraction of the directory and is worse than not sharding. | 32 shards, `index:publiclists:s0`…`s31`, bucketed on an FNV-1a hash of the entry **id** — not the first slug character the audit suggested, because slug initials are heavily skewed and the bucket has to be computable from the id alone (that is all `updatePublicListIndex` is given). One invariant makes the migration safe: **a full publish writes all 32 keys, empty ones included, and only then deletes the pre-shard key**, so an absent shard always means "not sharded yet" and the incremental path can tell in one read. Build state carries `v: 2`. | 9 tests: all 32 keys written; entries spread across >8 buckets with no bucket over half; a like writes **1** index key; a delete touches only its own shards; the merged read serves all of it; a pre-shard deployment keeps serving and converts on the next write; a `v: 1` build state is rescanned, not half-applied |
+| 15b | 🟡 | **`/api/creator/lists` returned every list's full `items`.** Paging bounded the KV operations; it did not bound the bytes — 15.08 MB at 1,200 lists, re-sent after every save, delete, tab switch and background sync. | The route sends `itemCount` + `updatedAt`. New `POST /api/creator/lists/items` returns the contents of up to 100 named slugs. The client caches per slug on the server's `updatedAt` **and** `itemCount` and asks only for what changed. `lastCreatorListsData` is assembled with real items before it is handed back, so all sixteen synchronous `.items` consumers are untouched — and a delta fetch that cannot complete falls back to `includeItems: true`, the exact shape this endpoint answered with before. | 7 client tests + 5 server tests. `/api/creator/lists/items` is bounded by the request: three slugs against a 400-list account spend **<20** KV ops |
+| — | 🟡 | **`/api/details/batch` (180 outbound fetches) and the cron tick (186), against the free plan's 50.** Both are terminated, not slowed — and the cron's termination took Continue Watching with it, so on a free deployment that feature had never worked once. | `/api/details/batch` spends its budget against *real* upstream calls, so a warm refresh is still one invocation on either plan; what it could not reach comes back as `remainingIds`. The cron budgets the episode sweep (exactly two fetches per show) and runs it **first**, awaited, so the user-visible half lands before the expensive half starts; chart pre-warming rotates from a cursor and is skipped with one explanatory log line below one chart's worth of budget (~105 fetches — no free-plan budget can fit one). | `48` fetches at the 60-id cap, was 180. A warm 60-id batch spends **0**. A free-budget tick stays under 50; a paid one warms every chart, as before |
+| 20, 21, 23 | 🔵 | The low-severity cleanup. | `String()` at the five `/api/external-list/create` fields **and** the six sibling sites in the same file with the identical shape. `reset-key`: 429 on both throttles, 401 on the credential failures, message byte-identical across all of them. `runListSearch()` removed. | Fuzzed non-string bodies produce no 5xx at any of the sites; the reset-key matrix asserts the statuses and that the messages still match |
+| 24, 25, 26 | ℹ️ | Documentation. | README gains: the three subrequest budgets and what each default costs; that the install link is a bearer credential carrying provider tokens and the Creator Key, and what to do if you have shared one; that an admin session is revocable only by rotating `ADMIN_KEY`; and that `/api/creator/sync/share-tracking` is supported but API-only, with its contract. | — |
+| 22 | ❓ → ✅ | **Maintainer decision on `/api/publish-list`.** | **Removed.** Every read path is untouched: existing records still serve at `/lists/user/<slug>`, still appear in the directory and search, and are still browsable and deletable from `/admin`. The route leaves a comment saying so. Its dedicated `ANON_PUBLISH_*` ceilings went with it. | The route 404s and writes nothing; an existing record still serves, still lists, and an admin can still delete it |
+
+### One thing the audit got wrong, and what it changed
+
+The recommendation for finding 15 says the dashboard "renders name / type / count / visibility / likes; it
+does not need every list's full contents in the list view." It does: `buildServerListCardHtml` renders a
+nine-poster strip from `items`. A projection alone would have emptied every card on the dashboard, and a
+truncated `items` array would have silently shortened every list the sixteen synchronous consumers read.
+That is why the fix is a delta fetch that keeps `items` populated rather than the removal the report asked
+for — the byte cost the finding is actually about is removed either way.
+
+### Two behaviour changes worth knowing about
+
+**The three subrequest budgets default to the free-plan numbers.** That matches
+`BULK_RESOLVE_SUBREQUEST_BUDGET`'s existing precedent and it protects the deployment README documents — a
+Worker pasted into the Cloudflare dashboard, which has no `wrangler.toml` to read a variable from. Anything
+deployed with this repository's `wrangler.toml` gets the Paid values and behaves exactly as before. A free
+deployment gets working Continue Watching for the first time, at 12 shows a tick, and no chart pre-warming.
+
+**The daily index rebuild starts running on busy deployments.** Staleness was read from the index blob's own
+`updatedAt`, which every incremental write bumped — so a directory busy enough to matter looked freshly built
+forever and never re-derived, which is exactly where stranded entries accumulate. It now reads a marker
+written only by a full build. This was not in the report; it fell out of having to give the cron a cheap
+staleness check that did not merge 32 shards.
+
+### Mutation-tested
+
+Ten mutations, one per behaviour this round introduces; each caught by the test written for it and by no other:
+
+```
+A  return items from /api/creator/lists again   -> "does not ship item contents"
+B  reuse the client cache regardless of version -> "asks only for the list that changed"
+C  paper over a missing slug with []            -> "falls back when the items route answers without a slug"
+D  details/batch ignores its budget             -> "stays inside the free plan's 50 outbound fetches"
+E  prewarm ignores its budget                   -> "skips chart pre-warming"
+F  a full publish skips empty shards            -> "publishes every shard"
+G  a like rewrites the whole directory          -> "writes ONE shard for a like"
+H  the build state keeps its v1 marker          -> "restarts a build state written before the shards existed"
+I  revert String() on a body field              -> "does not 500 on a body field that is not a string"
+J  reset-key answers 200 again                  -> "answers reset-key failures with a status"
+```
+
+### What the tests were not testing
+
+A cron tick was driven by snapshotting `ctx.waitUntil` once and awaiting that snapshot. Several tasks call
+`ctx.waitUntil` *again* once they are already running — `advancePublicListIndexBuild` registers the actual
+rebuild chunk that way — so those were never awaited. The tests passed because `prewarmSharedCatalogs` slept
+between ~47 chart warms, which was long enough for the deferred work to land first. Budgeting the pre-warm
+removed the sleeps and the accident with them. The helper drains in rounds now, which is what those tests
+meant all along.
+
+`bash verify.sh` green — **428 tests pass**, 1 skipped (up from 401).
+
+---
+
+## 🔜 Remaining
+
+Nothing. Every finding in [`AUDIT-2026-09-08-ADVERSARIAL-III.md`](./AUDIT-2026-09-08-ADVERSARIAL-III.md) —
+including the addendum's byte-count finding and both halves of every finding that had two — is closed, and the
+one item the report left to the maintainer has been decided and actioned.

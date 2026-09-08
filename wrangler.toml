@@ -60,8 +60,29 @@ id = "YOUR_KV_NAMESPACE_ID"
 # On a Paid plan you can raise this and finish an import in far fewer
 # invocations. 400 covers a full 200-title request in one go.
 #
-# [vars]
-# BULK_RESOLVE_SUBREQUEST_BUDGET = "400"
+# DETAILS_BATCH_SUBREQUEST_BUDGET -- the same knob for /api/details/batch, which
+# is what rebuilds the Airing Next shelf. An id already in the memory, KV or
+# edge cache costs nothing, so a warm refresh is one invocation on either plan;
+# this only bounds how many COLD ids one invocation may resolve. The client
+# re-posts whatever the server did not get to.
+#
+# CRON_SUBREQUEST_BUDGET -- how many outbound fetches ONE cron tick may spend.
+# Half of it goes to the Continue Watching sweep (two fetches per show), the
+# rest to chart pre-warming. One chart is about 105 fetches, so under that the
+# pre-warm is skipped with a log line and only the episode sweep runs -- which
+# is the free plan's reality and is why the code's default is 48.
+#
+# The three defaults are all the FREE-plan numbers, because a Worker pasted
+# into the Cloudflare dashboard has no wrangler.toml to read a var from and
+# that is the deployment README.md documents. Anything deployed with THIS file
+# is assumed to be on Workers Paid: the values below restore the full
+# behaviour -- a 200-title import in one invocation, a whole cold Airing Next
+# refresh in one, and a 6-minute tick that sweeps 150 shows and warms all 47
+# charts. Comment the block out if you deploy this file to a free Worker.
+[vars]
+BULK_RESOLVE_SUBREQUEST_BUDGET = "400"
+DETAILS_BATCH_SUBREQUEST_BUDGET = "600"
+CRON_SUBREQUEST_BUDGET = "10000"
 
 # --- Cron trigger (REQUIRED for Continue Watching) ---------------------------
 # Drives the scheduled() export at the bottom of

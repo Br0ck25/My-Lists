@@ -3173,6 +3173,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     // /api/external-list/item-mutate -> adds or removes items on external provider accounts (Trakt, Simkl, TMDB, MDBList)
+    //
+    // The item-add / item-remove spellings are kept deliberately. The 2026-09-08
+    // audit listed them as dead code (no client reference) and said so itself:
+    // "they are cheap aliases -- leaving them costs nothing". item-remove is not
+    // even a pure alias, it is the path form of `action: "remove"`. They share
+    // this handler's validation and limits, so keeping them adds no surface,
+    // while deleting a published path breaks any out-of-band caller -- which
+    // cannot be verified from inside the repo. Same reasoning as /api/publish-list.
     if ((path === "/api/external-list/item-mutate" || path === "/api/external-list/item-add" || path === "/api/external-list/item-remove") && request.method === "POST") {
       let body = {};
       try {
@@ -3182,8 +3190,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
       }
 
       const action = (path.endsWith("/item-remove") || body.action === "remove") ? "remove" : "add";
-      const provider = (body.provider || "").toLowerCase().trim();
-      const target = (body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
+      const provider = String(body.provider || "").toLowerCase().trim();
+      const target = String(body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
       const listId = body.listId || body.status || "";
       const mediaType = (body.mediaType === "series" || body.type === "series" || body.type === "tv" || body.type === "episode") ? "series" : "movie";
       const title = body.title || body.name || "";
@@ -3465,7 +3473,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 4. MDBLIST
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || body.token || "").trim();
         const token = accessToken || apiKey;
         if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
@@ -3620,7 +3628,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
+      const provider = String(body.provider || "").toLowerCase().trim();
       const items = Array.isArray(body.items) ? body.items : [];
       if (!items.length) {
         return json({ ok: true, syncedCount: 0, message: "No items to sync." });
@@ -3840,7 +3848,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 3. MDBLIST BATCH HISTORY SYNC
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || "").trim();
         const token = accessToken || apiKey || body.token || "";
         if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
@@ -3934,11 +3942,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
-      const name = (body.name || "").trim();
-      const description = (body.description || "").trim();
-      const privacy = (body.privacy || "private").toLowerCase().trim();
-      const listType = (body.type || "mixed").toLowerCase().trim();
+      // String() every one of these before .trim(). A JSON body is caller data,
+      // not a contract: `{"name":{}}` reached `.trim` on an object and was the
+      // only uncaught 5xx in ~1,700 fuzzed requests. The sibling route at
+      // 26_...:1816 has always done it this way.
+      const provider = String(body.provider || "").toLowerCase().trim();
+      const name = String(body.name || "").trim();
+      const description = String(body.description || "").trim();
+      const privacy = String(body.privacy || "private").toLowerCase().trim();
+      const listType = String(body.type || "mixed").toLowerCase().trim();
 
       if (!name) {
         return json({ ok: false, error: "List name is required." }, 400);
@@ -4118,7 +4130,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
+      const provider = String(body.provider || "").toLowerCase().trim();
       const listId = String(body.listId || "").trim();
 
       if (!listId) {
@@ -4179,7 +4191,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 3. MDBLIST
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || "").trim();
         const token = accessToken || apiKey;
         if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
@@ -5773,112 +5785,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
       return json({ ok: true, id });
     }
 
-    if (path === "/api/publish-list" && request.method === "POST") {
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      // Unauthenticated, and every call mints a permanent KV key. Same
-      // per-IP bucket as /api/creator/create, just a little more permissive
-      // because publishing several lists in one sitting is normal.
-      //
-      // "that no route in this Worker can ever delete again" is what this
-      // comment used to say, and it was true until /admin/api/published-lists
-      // and /admin/api/delete-published-list (26_) gave an operator a way to
-      // browse and remove these. What is still deliberate is the absence of a
-      // TTL: the slug is a shared list URL somebody has handed to other
-      // people, and expiring it would break their link rather than free
-      // anything worth freeing. Bounded at the door instead, by this limit
-      // and the ANON_PUBLISH_* ceilings (00_constants.js).
-      //
-      // Those ceilings used to be the ones the AUTHENTICATED save uses, and
-      // the two are not the same risk: a creator list belongs to an account
-      // that can be found and deleted, an anonymous one has no owner at all
-      // and only an operator, by hand, can remove it. At the old 10 publishes
-      // a minute and 2 MB apiece this was 20 MB a minute of permanent unowned
-      // storage from one IP -- from an endpoint the shipped UI never calls.
-      const plIp = clientIpKey(request);
-      if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
-      const plRateKey = `ratelimit:publishlist:${plIp}`;
-      const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
-      if (plAttempts >= ANON_PUBLISH_PER_MINUTE) {
-        return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
-      }
-      await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
-
-      let plBody;
-      try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
-      const baseSlug = slugifyServer(plBody.name || "");
-      const plType = (plBody.type === "series" || plBody.type === "mixed") ? plBody.type : (plBody.type === "movie" ? "movie" : null);
-      const plItems = Array.isArray(plBody.items) ? plBody.items : [];
-      if (!baseSlug) return json({ ok: false, error: "Missing a list name." }, 400);
-      if (!plType) return json({ ok: false, error: "Missing or invalid list type." }, 400);
-      // Bounds, deliberately REJECTING rather than truncating: silently
-      // storing a shortened list is exactly the kind of quiet data loss
-      // this endpoint should not be capable of, and a real list that is
-      // over the limit deserves to be told so. The ceilings are far above
-      // anything genuine -- a real account's largest observed list was
-      // ~1,200 items (see compactCustomListItem, 22_client-creator-
-      // profile.js) -- and exist only to stop an anonymous caller storing
-      // multi-megabyte payloads permanently.
-      if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
-        return json({ ok: false, error: "That list name is too long." }, 400);
-      }
-      if (plItems.length > ANON_PUBLISH_ITEMS_MAX) {
-        return json({ ok: false, error: `That list is too large to publish (limit ${ANON_PUBLISH_ITEMS_MAX} items).` }, 413);
-      }
-      // An item is a catalog entry, not an arbitrary JSON document. Without
-      // this the endpoint accepted any shape at all -- nested objects, whole
-      // strings, nulls -- none of which can render, so the only thing they
-      // could ever do is occupy the namespace permanently. Rejected rather
-      // than filtered, for the same reason the size bounds reject: quietly
-      // storing something other than what was sent is the worse bug.
-      for (const it of plItems) {
-        if (!it || typeof it !== "object" || Array.isArray(it)) {
-          return json({ ok: false, error: "That list contains an entry that is not a list item." }, 400);
-        }
-        const itId = it.id != null ? it.id : it.imdbId;
-        if (typeof itId !== "string" || !itId || itId.length > ANON_PUBLISH_ITEM_ID_MAX) {
-          return json({ ok: false, error: "That list contains an entry with no usable id." }, 400);
-        }
-      }
-      // Never falls through onto a slug that is taken -- see pickFreeSlug.
-      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
-        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
-      );
-      if (!listSlug) {
-        return json(
-          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
-          409
-        );
-      }
-      const plKey = "publishedlist:user:" + listSlug;
-      const plVisibility = normalizeListVisibility(plBody.visibility);
-      const plNow = Date.now();
-      const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
-      // Item COUNT alone is not a size bound -- individual items carry
-      // titles, overviews and poster URLs, so a few thousand of them can
-      // still be many megabytes. This is the bound that actually protects
-      // storage, checked on the exact bytes about to be written -- bytes,
-      // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
-      // mirrored to D1 on this path, so unlike the creator guard this one is
-      // only a storage bound; the two were deliberately kept in step.
-      if (utf8ByteLength(plPayload) > ANON_PUBLISH_BYTES_MAX) {
-        return json({ ok: false, error: "That list is too large to publish." }, 413);
-      }
-      await env.CONFIGS.put(plKey, plPayload);
-      // Anonymous publishes belong in the directory index too.
-      if (isPublicListVisibility(plVisibility)) {
-        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
-          isCreator: false,
-          username: "user",
-          slug: listSlug,
-          name: plBody.name || baseSlug,
-          type: plType,
-          itemCount: plItems.length,
-          likes: 0,
-          updatedAt: plNow,
-        }));
-      }
-      return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
-    }
+    // /api/publish-list was removed in 1.5.3.
+    //
+    // It was an unauthenticated endpoint that minted a permanent KV key on
+    // every call, it had no caller anywhere in the shipped bundle, and it was
+    // vector A of the stored-XSS finding in AUDIT-2026-09-08-ADVERSARIAL-III.
+    // Round 5 tightened it (5,000 items, 512 KB, 5 publishes a minute,
+    // per-item shape validation) and left the keep-or-remove call to the
+    // maintainer, who chose remove.
+    //
+    // What is NOT removed: everything that reads these records. Lists already
+    // published under `publishedlist:user:<slug>` still serve at
+    // /lists/user/<slug>, still appear in the directory and search, and are
+    // still browsable and deletable from /admin (see
+    // /admin/api/published-lists and /admin/api/delete-published-list, 26_).
+    // Only the ability to create a new one anonymously is gone -- a signed-in
+    // account publishes through /api/creator/lists/save, which is
+    // authenticated, owned, and deletable by the person who made it.
 
     if (path === "/api/lists/like" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
@@ -6125,7 +6048,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // a time).
       const batchIp = clientIpKey(request);
       if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
-      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, reqBody.tmdbKey ? 240 : 60)) {
+      // Charged in IDS, not requests. The ceilings used to be 60 and 240
+      // REQUESTS a minute while one request carried up to 60 ids; now that the
+      // budget below can split a refresh across invocations, counting requests
+      // would have quietly cut the real ceiling by the number of chunks. See
+      // DETAILS_BATCH_IDS_PER_MINUTE (00_constants.js).
+      const batchIdCeiling = reqBody.tmdbKey ? DETAILS_BATCH_IDS_PER_MINUTE_OWN_KEY : DETAILS_BATCH_IDS_PER_MINUTE;
+      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, batchIdCeiling, 60, ids.length)) {
         return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
@@ -6133,26 +6062,72 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const region = reqBody.region || "";
       const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true;
 
+      // How much of this invocation's OUTBOUND-fetch budget the pool may
+      // spend. Measured at 180 fetches for one 60-id request -- more than
+      // three times the free plan's 50, so Airing Next could not refresh at
+      // all on the deployment target the README documents.
+      //
+      // Spent against real upstream resolutions rather than against the id
+      // count, because an id already in the memory, KV or edge cache costs
+      // nothing and the warm case is the common one: a fully cached 60-id
+      // refresh still completes in one invocation, exactly as it did before.
+      // See DETAILS_BATCH_SUBREQUEST_BUDGET (00_constants.js).
+      const detailsEnvBudget = parseInt(env && env.DETAILS_BATCH_SUBREQUEST_BUDGET, 10);
+      const detailsBudget = Number.isFinite(detailsEnvBudget) && detailsEnvBudget >= TMDB_ITEM_DETAILS_MAX_FETCHES
+        ? detailsEnvBudget
+        : DETAILS_BATCH_SUBREQUEST_BUDGET;
+
       const results = {};
+      // `reserved` is the worst case of everything started but not finished:
+      // an id may not begin unless its whole worst case still fits, and the
+      // difference is handed straight back when it turns out to have cost
+      // less. That is what keeps a warm batch whole -- a cached id releases
+      // its entire reservation -- while still guaranteeing the invocation
+      // cannot exceed the budget.
+      //
+      // Each id gets its OWN meter rather than sharing one counter. Six of
+      // these run concurrently, so a shared counter read before and after an
+      // await measures every worker's fetches, not this id's: each completed
+      // id was charged roughly six times what it spent, and a 600-fetch budget
+      // ran out after 36 ids that had cost 108 between them.
+      const pool = { reserved: 0 };
       let cursor = 0;
       async function worker() {
         while (cursor < ids.length) {
+          if (pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > detailsBudget) return;
           const id = ids[cursor++];
+          pool.reserved += TMDB_ITEM_DETAILS_MAX_FETCHES;
+          const meter = { spent: 0 };
           try {
-            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx);
+            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx, meter);
           } catch {
             results[id] = null;
           }
+          // Clamped, so a resolution that somehow passed more fetch sites than
+          // the ceiling names can only fail to release -- never hand the pool
+          // back budget it did not have.
+          pool.reserved -= TMDB_ITEM_DETAILS_MAX_FETCHES - Math.min(meter.spent, TMDB_ITEM_DETAILS_MAX_FETCHES);
         }
       }
       await Promise.all(
         Array.from({ length: Math.min(6, ids.length) }, () => worker())
       );
 
+      // Ids are handed out in order and every id taken is finished, so
+      // everything before `cursor` was resolved and everything from it on was
+      // not. Returned as the ids themselves rather than as an index: this
+      // route de-duplicates what it was sent, so an index into its own array
+      // would not mean anything to the caller.
+      //
+      // Both fields are additive. A caller that ignores them sees the same
+      // { ok, results } it always did -- which is why the client treats a
+      // missing `done` as "there is nothing left", the behaviour of any older
+      // deployment.
+      const remainingIds = ids.slice(cursor);
       // Same short max-age as /api/details for the same reason -- this
       // response's shape changes occasionally and an hour-old copy would
       // strand anyone who had just opened it.
-      return json({ ok: true, results }, 200, { "Cache-Control": "max-age=60" });
+      return json({ ok: true, results, remainingIds, done: remainingIds.length === 0 }, 200, { "Cache-Control": "max-age=60" });
     }
 
     // /api/details (GET or POST) -> { ok: true, details: { title, overview, rating, releaseYear, poster, background } }
