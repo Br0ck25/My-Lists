@@ -2509,25 +2509,41 @@ async function refreshAiringNext(force) {
   // calls. See /api/details/batch, 25_api-catalog-routes.js.
   let batchOk = false;
   try {
-    const batchRes = await fetch(ORIGIN + '/api/details/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ids: candidates,
-        type: 'series',
-        tmdbKey: tmdbKey,
-        fresh: bypassFresh ? '1' : '',
-      }),
-    });
-    const batchData = await batchRes.json();
-    if (batchData && batchData.ok && batchData.results) {
+    // The server now stops when it has spent an invocation's outbound-fetch
+    // budget and hands back the ids it did not get to (see
+    // DETAILS_BATCH_SUBREQUEST_BUDGET). A warm refresh still comes back whole
+    // in one round; a cold one arrives over a few. Ignoring the continuation
+    // would silently drop shows from this shelf, which is the same quiet loss
+    // the Letterboxd import loop exists to prevent.
+    const merged = {};
+    let pending = candidates;
+    for (let round = 0; round < ${DETAILS_BATCH_MAX_ROUNDS} && pending.length; round++) {
+      const batchRes = await fetch(ORIGIN + '/api/details/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ids: pending,
+          type: 'series',
+          tmdbKey: tmdbKey,
+          fresh: bypassFresh ? '1' : '',
+        }),
+      });
+      const batchData = await batchRes.json();
+      if (!batchData || !batchData.ok || !batchData.results) break;
       batchOk = true;
+      Object.assign(merged, batchData.results);
+      // An older Worker sends neither field. done !== false reads that as
+      // "there is nothing left", which is exactly what it meant.
+      if (batchData.done !== false || !Array.isArray(batchData.remainingIds) || !batchData.remainingIds.length) break;
+      pending = batchData.remainingIds;
+    }
+    if (batchOk) {
       // Iterated over candidates rather than over the response keys so
       // entries stay in candidate order, which is what the dedupe below
       // relies on for its "keep the earliest" behaviour.
       for (let i = 0; i < candidates.length; i++) {
         const showId = candidates[i];
-        const entry = airingEntryFrom(showId, batchData.results[showId]);
+        const entry = airingEntryFrom(showId, merged[showId]);
         if (entry) results.push(entry);
       }
     }

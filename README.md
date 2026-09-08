@@ -95,25 +95,44 @@ The limits that matter (Cloudflare's, not this add-on's):
 
 Measured against those, on the free plan:
 
-- **Letterboxd CSV import stops at about 25 titles.** `/api/bulk-resolve` spends up to two TMDB calls per
-  title, so its documented 200-item maximum is ~400 subrequests against a cap of 50. `/api/details/batch`
-  (~180 subrequests at its 60-id cap) is over it too.
-- **The 6-minute cron does not run at all.** One tick over 30 accounts is ~186 subrequests. That is the job
-  that fills Continue Watching and pre-warms the shared provider charts, so both are simply absent — and it
-  fails quietly, at the edge, where you will not see it.
 - **CPU is tight on sign-in.** Creator Key verification is PBKDF2 at 100,000 iterations, ~15–18 ms measured,
   against a 10 ms cap. A key check that is not already memoized in the isolate can be cut off.
 - **About 500 page views per day exhausts the KV write budget — unless D1 is bound.** Every page view bumps
   two KV counters; with D1 bound the same page view costs **zero** KV writes, because the counters move into
   D1 entirely. After the 1,000-write budget is gone, *every* KV write in the app fails for the rest of the
   day: rate limiters, list saves, sync, feedback.
+- **Chart pre-warming does not run.** One chart warm is ~105 subrequests on its own — five paged TMDB reads
+  and a detail call per item — so no free-plan budget can fit even one. The tick skips it and logs one line
+  saying so. Catalogs still load; they are simply colder, and the deployment leans harder on the provider
+  rate limits.
 
 So: **D1 is optional for correctness and close to required for anything shared.** Step 4 below is written as
 optional because the app genuinely works without it — every accessor tries D1 and falls back to KV — but if
 more than a handful of people will open your deployment, bind it. It is the single change that keeps a free
 Worker inside its own write budget.
 
-If you want the import and the cron, you want the Paid plan. Nothing else here needs it.
+### The three subrequest budgets
+
+Three paths used to exceed the 50-subrequest cap outright, which meant Cloudflare terminated the invocation
+and the feature was simply absent on a free Worker. As of 1.5.3 each of them works to a budget instead, and
+each budget is a variable you can raise:
+
+| Variable | Default | What it bounds | What the default costs you on Free |
+|---|---|---|---|
+| `BULK_RESOLVE_SUBREQUEST_BUDGET` | 48 | `/api/bulk-resolve` — the Letterboxd CSV import | 24 titles per invocation; the client re-posts the rest, so the import finishes either way |
+| `DETAILS_BATCH_SUBREQUEST_BUDGET` | 48 | `/api/details/batch` — rebuilding the Airing Next shelf | only *cold* ids are charged; a warm refresh is one invocation on either plan |
+| `CRON_SUBREQUEST_BUDGET` | 48 | one 6-minute cron tick | Continue Watching sweeps 12 shows a tick (2,880 a day) and chart pre-warming is skipped |
+
+The defaults are the free-plan numbers because a Worker pasted into the Cloudflare dashboard has no
+`wrangler.toml` to read a variable from, and that is the deployment [Step 2](#step-2--deploy-the-add-on-code)
+documents. **If you deploy with this repository's `wrangler.toml` you get the Paid values already set** — a
+whole 200-title import in one invocation, a whole cold Airing Next refresh in one, and a tick that sweeps 150
+shows and warms all 47 charts. Comment that `[vars]` block out if you are deploying this file to a free
+Worker.
+
+Nothing is dropped at any budget. Each endpoint reports what it did not reach and the client asks again; the
+cron resumes from a stored cursor, so a smaller slice costs ticks, not coverage — and there are 240 ticks a
+day.
 
 > The plan limits above were read from Cloudflare's docs on 2026-09-08 and the per-request counts were measured
 > against this code with provider responses stubbed. The *consequences* on a free plan follow from those two
@@ -354,10 +373,33 @@ node --test tests/*.test.mjs
 | `/api/trakt/device/code` | `POST` | Generate Trakt TV / Device Code login flow |
 | `/api/trakt/device/token` | `POST` | Poll Trakt device token status |
 | `/api/creator/*` | `POST` | Creator Profile authentication, list management, and cloud sync |
+| `/api/creator/lists` | `POST` | The creator dashboard's list index — paged, and metadata only |
+| `/api/creator/lists/items` | `POST` | The contents of up to 100 named lists, so the index above does not have to ship them |
 | `/admin` | `GET` | Admin analytics dashboard UI |
 | `/admin/api/*` | `GET/POST` | Admin analytics, API usage counters, leaderboard, feedback, and moderation API (list index rebuild, creator-list and anonymous-list deletion) |
 | `/sw.js` | `GET` | Service worker for offline PWA support |
 | `/app.webmanifest` | `GET` | Web App Manifest for mobile/desktop PWA installation |
+
+### Two things worth knowing about credentials
+
+- **Your install link is a bearer credential. Treat it like one.** The configuration behind
+  `/<config>/manifest.json` carries whichever provider keys and OAuth tokens you have entered — TMDB, MDBList,
+  Trakt, Simkl — and, if Auto-track Playback is on, your Creator Name and **Creator Key**. With KV bound that
+  all sits behind a 12-character id (72 bits, not guessable); without KV it is base64 **in the URL itself**.
+  Anyone you hand the link to can install your catalogs *and* can read those secrets back out of
+  `/api/resolve`. Share it the way you would share a password, and if you have shared one you should not
+  have: rotate the provider keys, and use **Reset my Creator Key** in the account panel.
+- **An admin session cannot be revoked individually.** The `/admin` cookie is a self-contained signature over
+  its own expiry, valid for up to 7 days, with no server-side session record — so `/admin/logout` clears your
+  browser's copy and nothing else. If you believe a cookie has been captured, rotate `ADMIN_KEY`; that
+  invalidates every issued session, including your own.
+
+### API-only endpoints
+
+`POST /api/creator/sync/share-tracking` is authenticated, supported, and has **no UI**. It is the only way to
+opt a Watchlist, Watch History or Continue Watching shelf into being visible at its public
+`/lists/:username/:slug` address — they are private by default and nothing else can make them public. Call it
+with `{ creatorName, creatorKey, slug, shared }`, or with no `slug` to read the current state back.
 
 ---
 

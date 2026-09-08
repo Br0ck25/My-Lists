@@ -3241,18 +3241,114 @@ let _lastCreatorListsResponse = null;
 // version is per page too. Almost every account is one page, where this
 // behaves exactly as the single-version cache did.
 let _creatorListsPages = [];
+// slug -> { updatedAt, itemCount, items }. /api/creator/lists no longer sends
+// the items arrays (15.08 MB at 1,200 lists, re-sent after every save, delete
+// and tab switch); it sends itemCount and updatedAt, and the contents come from
+// /api/creator/lists/items for the slugs this map does not already hold at
+// that version. After a one-list edit that is one list's items instead of
+// every list's.
+//
+// Keyed on the server's own updatedAt rather than on a local timestamp, so a
+// change made on another device invalidates the entry here too. A record with
+// no updatedAt (a legacy one, written before the conflict guard existed) is
+// treated as always stale -- correct, just not cached.
+let _creatorListItemsCache = new Map();
 
 // Cleared whenever the cached lists are dropped, so the browser can never
 // claim to hold a version it no longer has.
 function resetCreatorListsCache() {
   _lastCreatorListsResponse = null;
   _creatorListsPages = [];
+  _creatorListItemsCache = new Map();
+}
+
+// Fills in the item contents /api/creator/lists no longer sends.
+//
+// Returns true when every list in the response ended up with a real items
+// array, false when it could not finish. False is not "carry on with what we
+// have": a dashboard that renders a list as empty because a fetch failed is
+// worse than one that transfers too much, so the caller re-asks for the whole
+// thing with includeItems -- which is exactly the shape this endpoint
+// answered with before the split.
+async function hydrateCreatorListItems(data, creatorKey) {
+  const lists = (data && Array.isArray(data.lists)) ? data.lists : null;
+  if (!lists) return true;
+
+  const stale = [];
+  for (const l of lists) {
+    if (!l || !l.slug) continue;
+    if (Array.isArray(l.items)) {
+      // Already carries its contents -- either a reused page from a previous
+      // render, or an includeItems reply. Record the version so the next
+      // render can skip it.
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: l.items.length, items: l.items });
+      continue;
+    }
+    const hit = _creatorListItemsCache.get(l.slug);
+    // itemCount is checked as well as updatedAt, so a cache entry can only be
+    // reused when it agrees with the server on BOTH the version and the size.
+    // A legacy record with no updatedAt fails Number.isFinite and is refetched
+    // every time rather than being served from a key that cannot change.
+    if (hit && Number.isFinite(l.updatedAt) && hit.updatedAt === l.updatedAt && hit.itemCount === l.itemCount) {
+      l.items = hit.items;
+      continue;
+    }
+    stale.push(l.slug);
+  }
+
+  if (stale.length) {
+    const fetched = new Map();
+    try {
+      for (let i = 0; i < stale.length; i += ${CREATOR_LIST_ITEMS_BATCH_MAX}) {
+        const slice = stale.slice(i, i + ${CREATOR_LIST_ITEMS_BATCH_MAX});
+        const res = await fetch(ORIGIN + '/api/creator/lists/items', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slugs: slice,
+          }),
+        });
+        const d = await res.json();
+        if (!d || !d.ok || !Array.isArray(d.lists)) return false;
+        for (const e of d.lists) {
+          if (e && e.slug && Array.isArray(e.items)) fetched.set(e.slug, e);
+        }
+      }
+    } catch (e) {
+      return false;
+    }
+    for (const l of lists) {
+      if (!l || !l.slug || Array.isArray(l.items)) continue;
+      const got = fetched.get(l.slug);
+      if (!got) {
+        // A slug the paged endpoint listed and this one did not return. That
+        // is a record that disappeared between the two calls, or a shape this
+        // client does not understand; either way it is not something to paper
+        // over with an empty array.
+        return false;
+      }
+      l.items = got.items;
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: got.items.length, items: got.items });
+    }
+  }
+
+  // Drop cache entries for slugs the account no longer has, so this cannot
+  // grow without bound across a long session of creating and deleting lists.
+  if (_creatorListItemsCache.size > lists.length) {
+    const live = new Set(lists.map((l) => l && l.slug).filter(Boolean));
+    for (const slug of [..._creatorListItemsCache.keys()]) {
+      if (!live.has(slug)) _creatorListItemsCache.delete(slug);
+    }
+  }
+  return true;
 }
 
 async function fetchCreatorListsOnce(creatorKey) {
   if (_creatorListsInFlight) return await _creatorListsInFlight;
   const p = (async () => {
-    const askFor = async (offset, knownVersion) => {
+    const askFor = async (offset, knownVersion, includeItems) => {
       const res = await fetch(ORIGIN + '/api/creator/lists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3262,75 +3358,94 @@ async function fetchCreatorListsOnce(creatorKey) {
           offset: offset,
           limit: ${CREATOR_LISTS_PAGE_DEFAULT},
           knownVersion: knownVersion || '',
+          includeItems: !!includeItems,
         }),
       });
       return await res.json();
     };
 
-    // Only claim a version if the data that version describes is still
-    // here; otherwise an "unchanged" reply would leave nothing to render.
-    const canReuse = !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
-    const pages = [];
-    let combined = null;
-    for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
-      const cached = canReuse ? _creatorListsPages[i] : null;
-      let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '');
-      if (data && data.ok && data.unchanged) {
-        if (cached && cached.page) {
-          // Nothing changed on this page -- reuse the copy already in memory.
-          pages.push({ version: data.version || cached.version, page: cached.page });
-          if (!data.hasMore) break;
-          continue;
+    // The paging loop, factored out so the includeItems fallback below can run
+    // exactly the same walk rather than a second, subtly different one.
+    const loadPages = async (includeItems) => {
+      // Only claim a version if the data that version describes is still
+      // here; otherwise an "unchanged" reply would leave nothing to render.
+      // The fallback pass never claims one -- it is asking for a different
+      // shape than the version it holds describes.
+      const canReuse = !includeItems && !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+      const pages = [];
+      let combined = null;
+      for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
+        const cached = canReuse ? _creatorListsPages[i] : null;
+        let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '', includeItems);
+        if (data && data.ok && data.unchanged) {
+          if (cached && cached.page) {
+            // Nothing changed on this page -- reuse the copy already in memory.
+            pages.push({ version: data.version || cached.version, page: cached.page });
+            if (!data.hasMore) break;
+            continue;
+          }
+          // Should be unreachable (a version is only sent when reusable), but
+          // if it ever happens, ask again without one rather than assembling a
+          // response with a page missing from it.
+          data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '', includeItems);
         }
-        // Should be unreachable (a version is only sent when reusable), but
-        // if it ever happens, ask again without one rather than assembling a
-        // response with a page missing from it.
-        data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '');
+        if (!data || !data.ok) {
+          resetCreatorListsCache();
+          return { failed: data };
+        }
+        pages.push({ version: data.version || '', page: data });
+        if (!combined) combined = data;
+        if (!data.hasMore) break;
       }
-      if (!data || !data.ok) {
+      if (!pages.length) {
         resetCreatorListsCache();
-        return data;
+        return { failed: combined };
       }
-      pages.push({ version: data.version || '', page: data });
-      if (!combined) combined = data;
-      if (!data.hasMore) break;
-    }
-    if (!pages.length) {
-      resetCreatorListsCache();
-      return combined;
-    }
 
-    // One page is the overwhelmingly common case and is handed back as-is,
-    // so nothing downstream sees a synthesised object where it used to see
-    // the server's own response.
-    let out;
-    if (pages.length === 1) {
-      out = pages[0].page;
-    } else {
-      const first = pages[0].page;
-      const lists = [];
-      const deleted = [];
-      const seenDeleted = new Set();
-      for (const p2 of pages) {
-        const pg = p2.page || {};
-        if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
-        for (const s of (pg.deletedSlugs || [])) {
-          if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+      // One page is the overwhelmingly common case and is handed back as-is,
+      // so nothing downstream sees a synthesised object where it used to see
+      // the server's own response.
+      let out;
+      if (pages.length === 1) {
+        out = pages[0].page;
+      } else {
+        const first = pages[0].page;
+        const lists = [];
+        const deleted = [];
+        const seenDeleted = new Set();
+        for (const p2 of pages) {
+          const pg = p2.page || {};
+          if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
+          for (const s of (pg.deletedSlugs || [])) {
+            if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+          }
         }
+        out = {
+          ok: true,
+          displayName: first.displayName,
+          lists: lists,
+          order: first.order || [],
+          deletedSlugs: deleted,
+          total: first.total,
+          version: pages.map((x) => x.version).join('.'),
+        };
       }
-      out = {
-        ok: true,
-        displayName: first.displayName,
-        lists: lists,
-        order: first.order || [],
-        deletedSlugs: deleted,
-        total: first.total,
-        version: pages.map((x) => x.version).join('.'),
-      };
+      return { out: out, pages: pages };
+    };
+
+    let res = await loadPages(false);
+    if (!res.out) return res.failed;
+    if (!(await hydrateCreatorListItems(res.out, creatorKey))) {
+      // The delta fetch could not complete. Fall back to the shape this
+      // endpoint answered with before the split -- slower, and correct.
+      resetCreatorListsCache();
+      res = await loadPages(true);
+      if (!res.out) return res.failed;
+      await hydrateCreatorListItems(res.out, creatorKey);
     }
-    _lastCreatorListsResponse = out;
-    _creatorListsPages = pages;
-    return out;
+    _lastCreatorListsResponse = res.out;
+    _creatorListsPages = res.pages;
+    return res.out;
   })();
   _creatorListsInFlight = p;
   try {

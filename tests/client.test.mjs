@@ -1650,6 +1650,153 @@ describe("client: the dashboard pages through every list the account owns", () =
   });
 });
 
+// --- AIII-15, second half: the transfer, not just the op count -------------
+//
+// /api/creator/lists stopped shipping every list's items (15.08 MB at 1,200
+// lists, re-sent after every save, delete and tab switch). The client fills
+// them in from /api/creator/lists/items for the slugs whose version it does
+// not already hold. Every consumer of lastCreatorListsData still reads
+// `.items` synchronously, so what these tests are really pinning is that the
+// array is always there and always right -- an empty one would silently drop
+// items from "add to an existing mixed list", the channel builder and backup.
+describe("client: the dashboard fills in the item contents the list route no longer sends", () => {
+  const ITEMS = "/api/creator/lists/items";
+
+  function splitRoutes(state) {
+    return {
+      [LISTS]: (req) => {
+        state.listCalls.push(req.body);
+        return { json: {
+          ok: true, displayName: "alice", order: [], deletedSlugs: [],
+          total: state.lists.length, offset: 0, limit: 200, hasMore: false,
+          version: state.version,
+          lists: state.lists.map((l) => (
+            req.body.includeItems
+              ? { slug: l.slug, name: l.slug, type: "movie", items: l.items, itemCount: l.items.length, updatedAt: l.updatedAt }
+              : { slug: l.slug, name: l.slug, type: "movie", itemCount: l.items.length, updatedAt: l.updatedAt }
+          )),
+        } };
+      },
+      [ITEMS]: (req) => {
+        state.itemCalls.push(req.body.slugs);
+        if (state.itemsFail) return { json: { ok: false, error: "nope" } };
+        return { json: { ok: true, lists: state.lists
+          .filter((l) => req.body.slugs.includes(l.slug) && l.slug !== state.dropSlug)
+          .map((l) => ({ slug: l.slug, items: l.items, itemCount: l.items.length, updatedAt: l.updatedAt })) } };
+      },
+    };
+  }
+
+  function makeState(n) {
+    return {
+      version: "v1",
+      listCalls: [], itemCalls: [], itemsFail: false, dropSlug: null,
+      lists: Array.from({ length: n }, (_, i) => ({
+        slug: "l" + i, updatedAt: 1000 + i, items: [{ id: "tt" + i }],
+      })),
+    };
+  }
+
+  function signedIn(state) {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123", "myListAddon:creatorName": "alice" },
+      routes: splitRoutes(state),
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    return client;
+  }
+
+  it("gives every list a real items array on a cold load", async () => {
+    const state = makeState(3);
+    const client = signedIn(state);
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.deepEqual(data.lists.map((l) => l.items[0].id), ["tt0", "tt1", "tt2"],
+      "a consumer reading .items synchronously must never see an empty array");
+    assert.deepEqual(state.itemCalls, [["l0", "l1", "l2"]]);
+  });
+
+  it("asks only for the list that changed on the next render", async () => {
+    const state = makeState(3);
+    const client = signedIn(state);
+    await client.call("fetchCreatorListsOnce", "KEY-123");
+    client.set("lastCreatorListsData", []);
+
+    // One list edited elsewhere: new contents, new version. The other two are
+    // untouched, and re-sending them is the whole cost this change removes.
+    state.version = "v2";
+    state.lists[1] = { slug: "l1", updatedAt: 9999, items: [{ id: "tt-new" }, { id: "tt-new2" }] };
+    state.itemCalls.length = 0;
+
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.deepEqual(state.itemCalls, [["l1"]], "only the changed slug should be refetched");
+    assert.deepEqual(data.lists.map((l) => l.items.length), [1, 2, 1]);
+    assert.equal(data.lists[1].items[0].id, "tt-new");
+  });
+
+  it("refetches when the count disagrees even though the version does not", async () => {
+    // Belt and braces: a record whose updatedAt did not move but whose size
+    // did is a record this client cannot trust its copy of.
+    const state = makeState(1);
+    const client = signedIn(state);
+    await client.call("fetchCreatorListsOnce", "KEY-123");
+    client.set("lastCreatorListsData", []);
+
+    state.version = "v2";
+    state.lists[0].items = [{ id: "a" }, { id: "b" }];
+    state.itemCalls.length = 0;
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.deepEqual(state.itemCalls, [["l0"]]);
+    assert.equal(data.lists[0].items.length, 2);
+  });
+
+  it("refetches a legacy record with no version, every time", async () => {
+    const state = makeState(1);
+    state.lists[0].updatedAt = undefined;
+    const client = signedIn(state);
+    await client.call("fetchCreatorListsOnce", "KEY-123");
+    client.set("lastCreatorListsData", []);
+    state.version = "v2";
+    state.itemCalls.length = 0;
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.deepEqual(state.itemCalls, [["l0"]],
+      "with no version to cache on, the only safe answer is to ask");
+    assert.equal(data.lists[0].items.length, 1);
+  });
+
+  it("falls back to the whole payload rather than rendering empty lists", async () => {
+    const state = makeState(2);
+    state.itemsFail = true;
+    const client = signedIn(state);
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.ok(state.listCalls.some((b) => b.includeItems === true),
+      "a failed delta fetch must re-ask for the old shape");
+    assert.deepEqual(data.lists.map((l) => l.items[0].id), ["tt0", "tt1"]);
+  });
+
+  it("falls back when the items route answers without a slug it was asked for", async () => {
+    // A record that vanished between the two calls. Papering over it with an
+    // empty array is exactly the silent loss this endpoint split could cause.
+    const state = makeState(2);
+    state.dropSlug = "l1";
+    const client = signedIn(state);
+    const data = await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.ok(state.listCalls.some((b) => b.includeItems === true),
+      "a partial answer must be treated as a failed delta fetch, not as an empty list");
+    assert.deepEqual(data.lists.map((l) => l.items[0].id), ["tt0", "tt1"]);
+  });
+
+  it("batches the requests so one call cannot exceed the server's cap", async () => {
+    const state = makeState(250);
+    const client = signedIn(state);
+    await client.call("fetchCreatorListsOnce", "KEY-123");
+    assert.equal(state.itemCalls.length, 3);
+    for (const batch of state.itemCalls) {
+      assert.ok(batch.length <= 100, "a batch over the cap is refused with a 400");
+    }
+    assert.equal(state.itemCalls.reduce((n, b) => n + b.length, 0), 250);
+  });
+});
+
 describe("client: a Letterboxd import follows the server's continuation", () => {
   const RESOLVE = "/api/bulk-resolve";
 

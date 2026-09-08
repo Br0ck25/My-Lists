@@ -1754,11 +1754,29 @@ async function removeListsFromPublicIndex(env, ids) {
   // republish these when it lands -- see noteRemovedFromPublicIndex.
   await noteRemovedFromPublicIndex(env, ids);
   try {
+    const gone = new Set(ids);
+    // Only the shards these ids can be in. A bulk delete of one account's
+    // lists used to rewrite the entire directory; rewriting all 32 shards
+    // instead would have been strictly worse -- 32 KV writes per delete is a
+    // third of a free plan's daily budget for 31 deletes.
+    const shards = [...new Set(ids.map((id) => publicIndexShardOf(id)))];
+    const current = await Promise.all(shards.map((n) => readPublicIndexShard(env, n)));
+    if (current.every((c) => c !== null)) {
+      await Promise.all(
+        shards.map((n, i) => {
+          const kept = current[i].filter((e) => e && !gone.has(e.id));
+          if (kept.length === current[i].length) return null;
+          return writePublicIndexShard(env, n, kept);
+        }).filter(Boolean)
+      );
+      return true;
+    }
+
+    // Not sharded yet -- the pre-shard key, converted by one full publish.
     const idx = await readPublicListIndex(env);
     // No index at all: nothing is being advertised, so there is nothing to
     // remove and this succeeded.
     if (!idx) return true;
-    const gone = new Set(ids);
     await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
     return true;
   } catch (e) {
@@ -2238,6 +2256,79 @@ const PUBLIC_INDEX_KEY = "index:publiclists";
 // size. Beyond this the tail is dropped (least-liked first).
 const PUBLIC_INDEX_MAX = 20000;
 
+// --- ...and why that blob is 32 keys rather than one -------------------------
+//
+// Every public save, every anonymous publish and every like used to do a
+// read-modify-write of ONE key holding the whole directory. Measured at the
+// 20,000-entry cap that is 4.45 MB parsed, sorted and re-serialised for a
+// one-number change -- and Cloudflare allows one write per second to a given
+// key, on both plans. Past roughly one like a second across the deployment the
+// index was being written faster than KV accepts it, and the failure there is
+// not "one entry is late", it is "the directory is hours stale for everyone".
+//
+// The cooldown below took the like path off that key. This takes the key
+// itself off the critical path: entries live in 32 shards, so a write touches
+// ~1/32 of the blob and the deployment has 32 keys' worth of write throughput
+// instead of one.
+//
+// Sharded on a hash of the entry ID rather than on the first character of the
+// slug, which is what the audit suggested. Same 32 buckets, but slug initials
+// are heavily skewed -- "the", "top", "best" -- and a bucket holding a fifth of
+// the directory would not have fixed either half of the problem. The hash is
+// over the id because that is the only thing updatePublicListIndex is given,
+// and a write has to know its shard without reading anything first.
+//
+// THE INVARIANT that makes this safe to do incrementally: a full publish
+// always writes ALL 32 shard keys, empty ones included, and only then deletes
+// the pre-shard key. So "shard N is absent" means "this deployment is not
+// sharded yet", never "that bucket happens to be empty" -- which is what lets
+// the single-shard write path below decide in one KV read whether it may take
+// the cheap route. A half-sharded index would serve a fraction of the
+// directory, and that is worse than the unsharded one.
+const PUBLIC_INDEX_SHARDS = 32;
+const PUBLIC_INDEX_SHARD_PREFIX = "index:publiclists:s";
+// The cap one shard may reach on the INCREMENTAL path, where no global view is
+// loaded. Deliberately double the even split (20,000 / 32 = 625): the hash
+// spreads to about 625 +/- 25 per shard at the global cap, so a cap of exactly
+// 625 would start dropping entries from busy shards while the directory as a
+// whole was still well under its limit. The global policy -- keep the
+// most-liked PUBLIC_INDEX_MAX, drop the tail -- is applied by every full
+// publish; this is only a bound on one blob between rebuilds.
+const PUBLIC_INDEX_SHARD_MAX = Math.ceil(PUBLIC_INDEX_MAX / PUBLIC_INDEX_SHARDS) * 2;
+// Merging 32 shards is 32 KV reads where the single key cost 1. The two routes
+// that pay it -- /lists/public.json and list search -- both answer with
+// max-age=120, so the edge absorbs the repeat traffic and the amplification
+// lands on cache misses only.
+//
+// The one caller that would have paid it on a timer is the cron's staleness
+// check, which runs every 6 minutes and needs two facts, not the directory.
+// It reads this instead: one small key holding when the index was last built
+// in FULL.
+//
+// That is also more correct than what it replaces. Staleness used to be read
+// from the index blob's own updatedAt, which every incremental write bumped --
+// so a deployment busy enough to matter looked freshly built forever and the
+// daily re-derive, the thing that clears stranded entries, never ran on
+// exactly the deployments that needed it.
+const PUBLIC_INDEX_META_KEY = "index:publiclists:meta";
+
+function publicIndexShardKey(n) {
+  return PUBLIC_INDEX_SHARD_PREFIX + n;
+}
+
+// FNV-1a. Not cryptographic -- it needs to be fast, stable across isolates and
+// deployments, and evenly spread, and it is all three.
+function publicIndexShardOf(id) {
+  const str = String(id || "");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % PUBLIC_INDEX_SHARDS;
+}
+
+
 // --- Rebuild chunking --------------------------------------------------------
 //
 // A full rebuild costs roughly one KV read per list, plus (the first time a
@@ -2282,14 +2373,75 @@ const PUBLIC_INDEX_BUILD_PAGE = 400;
 // serialised round-trip per list.
 const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
 
+// Merges the 32 shards into the single view every caller has always been
+// handed. `sharded` says which layout answered, which is the one thing the
+// write paths need to know.
+//
+// `updatedAt` is the OLDEST shard's, not the newest: staleness drives the daily
+// rebuild, and reporting the freshest shard would let one busy bucket hide a
+// directory that had otherwise stopped being maintained.
 async function readPublicListIndex(env) {
   if (!env || !env.CONFIGS) return null;
+  let result = null;
+  try {
+    const raws = await Promise.all(
+      Array.from({ length: PUBLIC_INDEX_SHARDS }, (_, n) => env.CONFIGS.get(publicIndexShardKey(n)))
+    );
+    const entries = [];
+    let oldest = 0;
+    let sharded = false;
+    for (const raw of raws) {
+      if (!raw) continue;
+      let parsed = null;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (!parsed || !Array.isArray(parsed.entries)) continue;
+      sharded = true;
+      for (const e of parsed.entries) if (e) entries.push(e);
+      const at = Number(parsed.updatedAt) || 0;
+      if (at && (!oldest || at < oldest)) oldest = at;
+    }
+    if (sharded) {
+      result = { updatedAt: oldest || Date.now(), entries: sortPublicIndexEntries(entries), sharded: true };
+    } else {
+      // The pre-shard key. A deployment upgrading in place keeps serving from
+      // it, unchanged, until the first full publish converts it -- so the
+      // directory never goes through a state where only part of it exists.
+      const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.entries)) result = { ...parsed, sharded: false };
+      }
+    }
+  } catch {
+    result = null;
+  }
+  return result;
+}
+
+// What the cron's staleness check reads instead of merging 32 shards: whether
+// an index exists at all, and when it was last built in full. Written by
+// writePublicListIndex, which is the only thing that builds one.
+//
+// A deployment that has not published since the upgrade has no meta key, so
+// this falls back to the pre-shard blob's own timestamp -- one KV read either
+// way, and the first rebuild writes the marker.
+async function readPublicListIndexMeta(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_META_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Number.isFinite(parsed.builtAt)) return parsed;
+    }
+  } catch {
+    // Fall through to the legacy key.
+  }
   try {
     const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.entries)) return null;
-    return parsed;
+    return { builtAt: Number(parsed.updatedAt) || 0, shards: 1, entries: parsed.entries.length };
   } catch {
     return null;
   }
@@ -2321,11 +2473,10 @@ function sortPublicIndexEntries(entries) {
 // votes are picked up by the list's next save or the daily rebuild, the same
 // backstops that already cover a lost concurrent publish.
 //
-// Deliberately NOT the whole of the audit's recommendation: sharding the index
-// across 32 keys is the other half and is not done here, because a half-sharded
-// index serves a fraction of the directory and that is worse than the current
-// behaviour. It wants one change, with a version marker in the build state,
-// and it is not urgent below a few thousand public lists.
+// The other half of the same finding -- sharding the index across 32 keys --
+// landed in 1.5.3; see PUBLIC_INDEX_SHARDS above. The cooldown is still worth
+// keeping on top of it: a shard is 1/32 the bytes but it is still one key, and
+// likes are still the write that arrives fastest.
 const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
 const LIKE_INDEX_COOLDOWN_SEC = 10;
 
@@ -2342,13 +2493,64 @@ async function claimLikeIndexWrite(env) {
   }
 }
 
+// A FULL publish: every shard is rewritten, empty ones included, and only then
+// is the pre-shard key removed. That order is what upholds the invariant the
+// single-shard path relies on -- a reader can never find the old key gone and
+// the shards not yet there, and an absent shard always means "not sharded".
+//
+// Used by the rebuild and by the one-off migration off the old key. The
+// frequent writes do not come through here; they take the single-shard path in
+// updatePublicListIndex.
 async function writePublicListIndex(env, entries) {
   const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
-  await env.CONFIGS.put(
-    PUBLIC_INDEX_KEY,
-    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  const buckets = Array.from({ length: PUBLIC_INDEX_SHARDS }, () => []);
+  for (const e of trimmed) {
+    if (!e) continue;
+    buckets[publicIndexShardOf(e.id)].push(e);
+  }
+  const now = Date.now();
+  await Promise.all(
+    buckets.map((bucket, n) =>
+      env.CONFIGS.put(publicIndexShardKey(n), JSON.stringify({ updatedAt: now, entries: bucket }))
+    )
   );
+  // Written after the shards, so the marker can never claim a build that has
+  // not landed. It is what the cron's staleness check reads.
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_META_KEY,
+    JSON.stringify({ builtAt: now, shards: PUBLIC_INDEX_SHARDS, entries: trimmed.length })
+  );
+  try {
+    await env.CONFIGS.delete(PUBLIC_INDEX_KEY);
+  } catch {
+    // Leaving it behind is harmless: readPublicListIndex prefers the shards
+    // and only falls back to it when no shard exists at all.
+  }
   return trimmed;
+}
+
+// Reads one shard. Returns null when the key is absent, which -- see the
+// invariant above -- means this deployment has not been sharded yet.
+async function readPublicIndexShard(env, n) {
+  const raw = await env.CONFIGS.get(publicIndexShardKey(n));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed.entries.filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+async function writePublicIndexShard(env, n, entries) {
+  const bounded = entries.length > PUBLIC_INDEX_SHARD_MAX
+    ? sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_SHARD_MAX)
+    : entries;
+  await env.CONFIGS.put(
+    publicIndexShardKey(n),
+    JSON.stringify({ updatedAt: Date.now(), entries: bounded })
+  );
 }
 
 // Incremental update for one list. `entry` null => remove (unpublished,
@@ -2389,6 +2591,25 @@ async function updatePublicListIndex(env, id, entry) {
     if (owner && (await isCreatorTombstoned(env, owner))) return true;
   }
   try {
+    // The whole point of the sharding: one KV read and one KV write, against
+    // ~1/32 of the directory, instead of a read-modify-write of all 4.45 MB of
+    // it. The merged 32-shard view is deliberately NOT loaded here -- doing so
+    // would put the cost straight back.
+    const shard = publicIndexShardOf(id);
+    const current = await readPublicIndexShard(env, shard);
+    if (current) {
+      const prev = current.find((e) => e && e.id === id);
+      const next = current.filter((e) => e && e.id !== id);
+      // Merge onto the previous entry rather than replacing it: callers that
+      // only know part of the record (the like route has no displayName, for
+      // instance) must not blank out fields they never loaded.
+      if (entry) next.push({ ...(prev || {}), ...entry, id });
+      await writePublicIndexShard(env, shard, next);
+      return true;
+    }
+
+    // No shard, so this deployment is still on the pre-shard key (or has no
+    // index at all -- see the invariant above writePublicListIndex).
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
     // would show exactly one list. Leave it absent so the read path falls
@@ -2397,10 +2618,9 @@ async function updatePublicListIndex(env, id, entry) {
     if (!idx) return true;
     const prev = idx.entries.find((e) => e && e.id === id);
     const entries = idx.entries.filter((e) => e && e.id !== id);
-    // Merge onto the previous entry rather than replacing it: callers that
-    // only know part of the record (the like route has no displayName, for
-    // instance) must not blank out fields they never loaded.
     if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    // One full publish converts the old key into the 32 shards; from here on
+    // every update takes the cheap path above.
     await writePublicListIndex(env, entries);
     return true;
   } catch (err) {
@@ -2503,8 +2723,12 @@ async function dropStaleRemovalsFromEntries(env, entries) {
 
 // Persisted progress for an in-flight rebuild. Anything unparseable, or from
 // an older shape, simply restarts the build rather than half-applying.
+// v2 is the shard-era marker the audit asked for. A build state written by a
+// pre-shard deployment parses fine and its entries are still valid, but it was
+// produced by code that would publish them to one key -- so it is discarded and
+// the scan restarts rather than half-applying across the two layouts.
 function emptyPublicIndexBuildState() {
-  return { v: 1, phase: 0, cursor: "", pending: [], entries: [], names: {} };
+  return { v: 2, phase: 0, cursor: "", pending: [], entries: [], names: {} };
 }
 
 async function readPublicIndexBuildState(env) {
@@ -2512,11 +2736,11 @@ async function readPublicIndexBuildState(env) {
     const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
     if (!raw) return emptyPublicIndexBuildState();
     const s = JSON.parse(raw);
-    if (!s || s.v !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
+    if (!s || s.v !== 2 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
       return emptyPublicIndexBuildState();
     }
     return {
-      v: 1,
+      v: 2,
       phase: Number(s.phase) || 0,
       cursor: typeof s.cursor === "string" ? s.cursor : "",
       pending: s.pending.filter((k) => typeof k === "string"),
@@ -2822,8 +3046,11 @@ const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 async function refreshPublicListIndexIfStale(env, ctx) {
   if (!env || !env.CONFIGS) return;
-  const idx = await readPublicListIndex(env);
-  if (!idx) {
+  // One small key, not a merge of 32 shards: this runs every 6 minutes and
+  // needs only "is there an index" and "how old is it". See
+  // readPublicListIndexMeta.
+  const meta = await readPublicListIndexMeta(env);
+  if (!meta) {
     // Cold start -- same path as a live request would take.
     await advancePublicListIndexBuild(env, ctx);
     return;
@@ -2837,7 +3064,7 @@ async function refreshPublicListIndexIfStale(env, ctx) {
   } catch {
     building = false;
   }
-  const age = idx.updatedAt ? (Date.now() - idx.updatedAt) : Infinity;
+  const age = meta.builtAt ? (Date.now() - meta.builtAt) : Infinity;
   if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
     await advancePublicListIndexBuild(env, ctx);
   }

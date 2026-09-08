@@ -49,7 +49,7 @@
  */
 
 const ADDON_ID = "app.my-list";
-const ADDON_VERSION = "1.5.0";
+const ADDON_VERSION = "1.5.3";
 const ADDON_NAME = "My Lists";
 
 // How many items a "Recommended Movies"/"Recommended Shows" list holds --
@@ -62,13 +62,18 @@ const ADDON_NAME = "My Lists";
 // drift apart again.
 const CURATED_RECOMMENDATION_LIMIT = 40;
 
-// --- Bounds on the two unauthenticated permanent-KV-write endpoints ---------
+// --- Bounds on the unauthenticated permanent-KV-write endpoint --------------
 //
-// /api/publish-list and /api/save both accept a body from anyone at all and
-// store it under a KV key that nothing in this Worker ever expires or
-// deletes. Neither used to bound what it stored, so a single anonymous
-// request could park multiple megabytes in KV permanently, as many times as
-// it liked.
+// /api/save accepts a body from anyone at all and stores it under a KV key
+// that nothing in this Worker ever expires or deletes. It used to bound
+// nothing, so a single anonymous request could park multiple megabytes in KV
+// permanently, as many times as it liked.
+//
+// It used to have a sibling. /api/publish-list did the same for an anonymous
+// published LIST and was removed in 1.5.3 -- unauthenticated, unowned,
+// permanent, with no caller anywhere in the shipped bundle. Its own tighter
+// ceilings went with it; the two below are still shared with the
+// authenticated list save, which is what publishes a list now.
 //
 // These ceilings are set far above real usage on purpose -- the largest
 // genuine list observed in an account export was ~1,200 items, and a
@@ -81,39 +86,11 @@ const PUBLISHED_LIST_NAME_MAX = 200;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
 
-// --- ...and the tighter ones for /api/publish-list specifically -------------
-//
-// PUBLISHED_LIST_ITEMS_MAX and the 2 MB byte ceiling that used to sit beside
-// it were shared with the AUTHENTICATED list save, and the two are not the
-// same risk. A creator list belongs to an account that can be found, warned
-// and deleted; an anonymous published list has no owner at all, gets no TTL
-// (the slug is a URL somebody has shared -- expiring it would break their
-// link), and can only be removed by an operator, by hand, from the admin
-// panel.
-//
-// At 10 publishes a minute and 2 MB apiece that was 20 MB a minute of
-// permanent unowned storage from one IP -- a free plan's entire 1 GB
-// namespace in under an hour, and its whole 1,000-writes-per-day budget in
-// under two minutes -- from an endpoint the shipped UI never calls. (It is
-// also the easiest route to a stored payload, which is what made it vector A
-// of this audit's XSS finding.)
-//
-// So this path gets its own, much tighter ceilings. Still far above anything
-// genuine: the largest list ever observed in a real account export was ~1,200
-// items, which serialises to roughly 130 KB. What changes is the worst case,
-// from 20 MB/minute to 2.5.
-const ANON_PUBLISH_ITEMS_MAX = 5000;
-const ANON_PUBLISH_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
-const ANON_PUBLISH_PER_MINUTE = 5;
-// An item is a catalog entry, not an arbitrary JSON document. Anything this
-// rejects could not have rendered anyway -- it could only have occupied the
-// namespace.
-const ANON_PUBLISH_ITEM_ID_MAX = 128;
-
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //
-// The two ceilings above bound /api/publish-list and /api/save, which anyone
-// at all can call. /api/creator/lists/save had no bound of any kind -- not on
+// The ceilings above bound /api/save, which anyone at all can call, and once
+// bounded /api/publish-list too. /api/creator/lists/save had no bound of any
+// kind -- not on
 // items, not on the name, not on bytes -- even though a Creator Profile costs
 // one unauthenticated POST to create. The reasoning that produced the
 // anonymous limits applies here almost unchanged; it simply was not carried
@@ -160,6 +137,26 @@ const CREATOR_LISTS_PAGE_MAX = 500;
 // rest of these bounds allow.
 const CREATOR_LISTS_MAX_PAGES = 100;
 
+// --- The transfer half of the same finding --------------------------------
+//
+// Paging bounded the KV OPERATIONS /api/creator/lists spends. It did not bound
+// the BYTES: the route still returned every list's full `items` array, and
+// renderCreatorDashboard calls it after every save, delete, tab switch and
+// background sync. Measured at 1,200 lists that was 15.08 MB, and the
+// overwhelming majority of it was data the browser already held.
+//
+// So the route no longer sends `items` at all -- it sends `itemCount` and
+// `updatedAt`, and the client asks this endpoint for the contents of only the
+// slugs whose `updatedAt` it does not already have cached. After a one-list
+// edit that is one list's items instead of every list's.
+//
+// The batch is capped so this endpoint has the same property the paged one
+// does: cost bounded by the request, not by what the account owns. 100 reads
+// plus the auth lookups is an order of magnitude clear of Cloudflare's
+// 1,000-KV-operations-per-invocation cap (which is the storage-op cap, not
+// the outbound-fetch one -- see the two caps spelled out below).
+const CREATOR_LIST_ITEMS_BATCH_MAX = 100;
+
 // --- Bound on /api/bulk-resolve's fan-out ------------------------------------
 //
 // That endpoint issues up to two TMDB calls per item and always uses the
@@ -202,6 +199,92 @@ const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;
 // (someone else's TMDB quota) keeps the ceiling where it was, however the
 // work is divided up.
 const BULK_RESOLVE_ITEMS_PER_MINUTE = 4000;
+
+// --- The same budget, for /api/details/batch ---------------------------------
+//
+// Measured at 180 outbound fetches for one 60-id request (p23_subrequests.mjs)
+// -- over the free plan's 50 by more than three times, so Airing Next simply
+// could not refresh on a free Worker.
+//
+// Unlike bulk-resolve, this endpoint's cost is not a fixed multiple of the
+// request size: every id goes through fetchTmdbItemDetails, and an id already
+// in the memory, KV or edge cache spends NOTHING. The warm case is the common
+// one -- that is the whole reason the batch route exists -- so the budget is
+// spent against actual upstream resolutions rather than against the id count.
+// A fully warm 60-id refresh is still one invocation, exactly as before.
+//
+// Eight is the number of outbound fetch() sites one cache miss can pass
+// through: the find-or-search call, up to three detail calls while the type is
+// being narrowed, the Cinemeta fallback, and two season lookups
+// (fetchTmdbItemDetailsUncached, 07_source-fetchers-tmdb-simkl.js -- each of
+// them calls spend() right above the fetch, so this stays honest if one is
+// added). It is a ceiling, not an estimate: reserved before an id is started
+// and given back the moment it turns out to have cost less, so the budget is
+// never exceeded and is never wasted either.
+const TMDB_ITEM_DETAILS_MAX_FETCHES = 8;
+// 48 leaves two of the free plan's 50 for the rest of the invocation, same as
+// BULK_RESOLVE_SUBREQUEST_BUDGET. A paid deployment raises it with a
+// DETAILS_BATCH_SUBREQUEST_BUDGET var in wrangler.toml.
+const DETAILS_BATCH_SUBREQUEST_BUDGET = 48;
+// Charged in IDS rather than requests, for the reason spelled out above
+// BULK_RESOLVE_ITEMS_PER_MINUTE: the previous ceilings were 60 and 240
+// REQUESTS a minute while a request carried up to 60 ids, and splitting a
+// request into several would otherwise have cut the real ceiling by the
+// number of chunks. 3,600 and 14,400 ids are those same ceilings, counted in
+// the thing the endpoint actually spends.
+const DETAILS_BATCH_IDS_PER_MINUTE = 3600;
+const DETAILS_BATCH_IDS_PER_MINUTE_OWN_KEY = 14400;
+// A stop on the client's resume loop, so a Worker that never says done cannot
+// spin. 8 rounds x 60 ids is far past the 60-id cap on one request.
+const DETAILS_BATCH_MAX_ROUNDS = 8;
+
+// --- The same budget, for the cron tick --------------------------------------
+//
+// Measured at 186 outbound fetches for one tick (p23_subrequests.mjs), against
+// the free plan's 50. The consequence is not "the tick is slow": Cloudflare
+// terminates the invocation, so on a free Worker Continue Watching has never
+// picked up a single new episode.
+//
+// The two tasks are not equally divisible:
+//
+//   checkForNewEpisodes  is exactly two outbound fetches per show
+//                        (findNextAiredEpisodeForShow makes two season
+//                        lookups), already resumes from a KV cursor, and so
+//                        chunks perfectly -- a smaller slice per tick simply
+//                        means more ticks, and there are 240 of them a day.
+//
+//   prewarmSharedCatalogs cannot be divided below ONE chart, and one chart is
+//                        ~105 fetches: fetchTmdbPagedResults asks for
+//                        ceil(PAGE_SIZE / 20) = 5 pages and then resolves
+//                        details for every item on them. No budget under ~105
+//                        can pre-warm anything at all, so below that it is
+//                        skipped with one log line rather than taking the tick
+//                        -- and Continue Watching with it -- down every time.
+//
+// scheduled() therefore runs the episode sweep FIRST and awaits it, so the
+// user-visible half of the tick has already been written to KV before the
+// expensive optional half starts.
+//
+// The default is the free-plan number, for the same reason
+// BULK_RESOLVE_SUBREQUEST_BUDGET's is: a Worker pasted into the Cloudflare
+// dashboard has no wrangler.toml and no way to set a var, and that is exactly
+// the deployment the README documents. Anyone deploying with this repo's
+// wrangler.toml gets CRON_SUBREQUEST_BUDGET = "10000" and the full tick.
+const CRON_SUBREQUEST_BUDGET = 48;
+// Two season lookups per show, worst case -- see findNextAiredEpisodeForShow.
+const CRON_EPISODE_CHECK_FETCHES = 2;
+// 5 paged chart fetches + up to PAGE_SIZE detail resolutions. A ceiling, not
+// an average: a warm chart costs nothing, but the budget has to be sized so
+// that a COLD one still fits.
+const CRON_CHART_WARM_FETCHES = 105;
+// The episode sweep's ceiling however large the budget is -- the value this
+// sweep has always used, so a paid deployment behaves exactly as before.
+const CRON_EPISODE_CHECK_MAX = 150;
+// How much of the budget the episode sweep may claim before the pre-warm gets
+// what is left. At the free default that is 24 fetches -> 12 shows a tick,
+// which is 2,880 checks a day; at 10,000 it is 5,000 -> the 150 ceiling above,
+// leaving 9,700 for the charts, which covers all 47 of them.
+const CRON_EPISODE_CHECK_SHARE = 0.5;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
@@ -3638,11 +3721,29 @@ async function removeListsFromPublicIndex(env, ids) {
   // republish these when it lands -- see noteRemovedFromPublicIndex.
   await noteRemovedFromPublicIndex(env, ids);
   try {
+    const gone = new Set(ids);
+    // Only the shards these ids can be in. A bulk delete of one account's
+    // lists used to rewrite the entire directory; rewriting all 32 shards
+    // instead would have been strictly worse -- 32 KV writes per delete is a
+    // third of a free plan's daily budget for 31 deletes.
+    const shards = [...new Set(ids.map((id) => publicIndexShardOf(id)))];
+    const current = await Promise.all(shards.map((n) => readPublicIndexShard(env, n)));
+    if (current.every((c) => c !== null)) {
+      await Promise.all(
+        shards.map((n, i) => {
+          const kept = current[i].filter((e) => e && !gone.has(e.id));
+          if (kept.length === current[i].length) return null;
+          return writePublicIndexShard(env, n, kept);
+        }).filter(Boolean)
+      );
+      return true;
+    }
+
+    // Not sharded yet -- the pre-shard key, converted by one full publish.
     const idx = await readPublicListIndex(env);
     // No index at all: nothing is being advertised, so there is nothing to
     // remove and this succeeded.
     if (!idx) return true;
-    const gone = new Set(ids);
     await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
     return true;
   } catch (e) {
@@ -4122,6 +4223,79 @@ const PUBLIC_INDEX_KEY = "index:publiclists";
 // size. Beyond this the tail is dropped (least-liked first).
 const PUBLIC_INDEX_MAX = 20000;
 
+// --- ...and why that blob is 32 keys rather than one -------------------------
+//
+// Every public save, every anonymous publish and every like used to do a
+// read-modify-write of ONE key holding the whole directory. Measured at the
+// 20,000-entry cap that is 4.45 MB parsed, sorted and re-serialised for a
+// one-number change -- and Cloudflare allows one write per second to a given
+// key, on both plans. Past roughly one like a second across the deployment the
+// index was being written faster than KV accepts it, and the failure there is
+// not "one entry is late", it is "the directory is hours stale for everyone".
+//
+// The cooldown below took the like path off that key. This takes the key
+// itself off the critical path: entries live in 32 shards, so a write touches
+// ~1/32 of the blob and the deployment has 32 keys' worth of write throughput
+// instead of one.
+//
+// Sharded on a hash of the entry ID rather than on the first character of the
+// slug, which is what the audit suggested. Same 32 buckets, but slug initials
+// are heavily skewed -- "the", "top", "best" -- and a bucket holding a fifth of
+// the directory would not have fixed either half of the problem. The hash is
+// over the id because that is the only thing updatePublicListIndex is given,
+// and a write has to know its shard without reading anything first.
+//
+// THE INVARIANT that makes this safe to do incrementally: a full publish
+// always writes ALL 32 shard keys, empty ones included, and only then deletes
+// the pre-shard key. So "shard N is absent" means "this deployment is not
+// sharded yet", never "that bucket happens to be empty" -- which is what lets
+// the single-shard write path below decide in one KV read whether it may take
+// the cheap route. A half-sharded index would serve a fraction of the
+// directory, and that is worse than the unsharded one.
+const PUBLIC_INDEX_SHARDS = 32;
+const PUBLIC_INDEX_SHARD_PREFIX = "index:publiclists:s";
+// The cap one shard may reach on the INCREMENTAL path, where no global view is
+// loaded. Deliberately double the even split (20,000 / 32 = 625): the hash
+// spreads to about 625 +/- 25 per shard at the global cap, so a cap of exactly
+// 625 would start dropping entries from busy shards while the directory as a
+// whole was still well under its limit. The global policy -- keep the
+// most-liked PUBLIC_INDEX_MAX, drop the tail -- is applied by every full
+// publish; this is only a bound on one blob between rebuilds.
+const PUBLIC_INDEX_SHARD_MAX = Math.ceil(PUBLIC_INDEX_MAX / PUBLIC_INDEX_SHARDS) * 2;
+// Merging 32 shards is 32 KV reads where the single key cost 1. The two routes
+// that pay it -- /lists/public.json and list search -- both answer with
+// max-age=120, so the edge absorbs the repeat traffic and the amplification
+// lands on cache misses only.
+//
+// The one caller that would have paid it on a timer is the cron's staleness
+// check, which runs every 6 minutes and needs two facts, not the directory.
+// It reads this instead: one small key holding when the index was last built
+// in FULL.
+//
+// That is also more correct than what it replaces. Staleness used to be read
+// from the index blob's own updatedAt, which every incremental write bumped --
+// so a deployment busy enough to matter looked freshly built forever and the
+// daily re-derive, the thing that clears stranded entries, never ran on
+// exactly the deployments that needed it.
+const PUBLIC_INDEX_META_KEY = "index:publiclists:meta";
+
+function publicIndexShardKey(n) {
+  return PUBLIC_INDEX_SHARD_PREFIX + n;
+}
+
+// FNV-1a. Not cryptographic -- it needs to be fast, stable across isolates and
+// deployments, and evenly spread, and it is all three.
+function publicIndexShardOf(id) {
+  const str = String(id || "");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % PUBLIC_INDEX_SHARDS;
+}
+
+
 // --- Rebuild chunking --------------------------------------------------------
 //
 // A full rebuild costs roughly one KV read per list, plus (the first time a
@@ -4166,14 +4340,75 @@ const PUBLIC_INDEX_BUILD_PAGE = 400;
 // serialised round-trip per list.
 const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
 
+// Merges the 32 shards into the single view every caller has always been
+// handed. `sharded` says which layout answered, which is the one thing the
+// write paths need to know.
+//
+// `updatedAt` is the OLDEST shard's, not the newest: staleness drives the daily
+// rebuild, and reporting the freshest shard would let one busy bucket hide a
+// directory that had otherwise stopped being maintained.
 async function readPublicListIndex(env) {
   if (!env || !env.CONFIGS) return null;
+  let result = null;
+  try {
+    const raws = await Promise.all(
+      Array.from({ length: PUBLIC_INDEX_SHARDS }, (_, n) => env.CONFIGS.get(publicIndexShardKey(n)))
+    );
+    const entries = [];
+    let oldest = 0;
+    let sharded = false;
+    for (const raw of raws) {
+      if (!raw) continue;
+      let parsed = null;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (!parsed || !Array.isArray(parsed.entries)) continue;
+      sharded = true;
+      for (const e of parsed.entries) if (e) entries.push(e);
+      const at = Number(parsed.updatedAt) || 0;
+      if (at && (!oldest || at < oldest)) oldest = at;
+    }
+    if (sharded) {
+      result = { updatedAt: oldest || Date.now(), entries: sortPublicIndexEntries(entries), sharded: true };
+    } else {
+      // The pre-shard key. A deployment upgrading in place keeps serving from
+      // it, unchanged, until the first full publish converts it -- so the
+      // directory never goes through a state where only part of it exists.
+      const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.entries)) result = { ...parsed, sharded: false };
+      }
+    }
+  } catch {
+    result = null;
+  }
+  return result;
+}
+
+// What the cron's staleness check reads instead of merging 32 shards: whether
+// an index exists at all, and when it was last built in full. Written by
+// writePublicListIndex, which is the only thing that builds one.
+//
+// A deployment that has not published since the upgrade has no meta key, so
+// this falls back to the pre-shard blob's own timestamp -- one KV read either
+// way, and the first rebuild writes the marker.
+async function readPublicListIndexMeta(env) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_INDEX_META_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Number.isFinite(parsed.builtAt)) return parsed;
+    }
+  } catch {
+    // Fall through to the legacy key.
+  }
   try {
     const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.entries)) return null;
-    return parsed;
+    return { builtAt: Number(parsed.updatedAt) || 0, shards: 1, entries: parsed.entries.length };
   } catch {
     return null;
   }
@@ -4205,11 +4440,10 @@ function sortPublicIndexEntries(entries) {
 // votes are picked up by the list's next save or the daily rebuild, the same
 // backstops that already cover a lost concurrent publish.
 //
-// Deliberately NOT the whole of the audit's recommendation: sharding the index
-// across 32 keys is the other half and is not done here, because a half-sharded
-// index serves a fraction of the directory and that is worse than the current
-// behaviour. It wants one change, with a version marker in the build state,
-// and it is not urgent below a few thousand public lists.
+// The other half of the same finding -- sharding the index across 32 keys --
+// landed in 1.5.3; see PUBLIC_INDEX_SHARDS above. The cooldown is still worth
+// keeping on top of it: a shard is 1/32 the bytes but it is still one key, and
+// likes are still the write that arrives fastest.
 const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
 const LIKE_INDEX_COOLDOWN_SEC = 10;
 
@@ -4226,13 +4460,64 @@ async function claimLikeIndexWrite(env) {
   }
 }
 
+// A FULL publish: every shard is rewritten, empty ones included, and only then
+// is the pre-shard key removed. That order is what upholds the invariant the
+// single-shard path relies on -- a reader can never find the old key gone and
+// the shards not yet there, and an absent shard always means "not sharded".
+//
+// Used by the rebuild and by the one-off migration off the old key. The
+// frequent writes do not come through here; they take the single-shard path in
+// updatePublicListIndex.
 async function writePublicListIndex(env, entries) {
   const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
-  await env.CONFIGS.put(
-    PUBLIC_INDEX_KEY,
-    JSON.stringify({ updatedAt: Date.now(), entries: trimmed })
+  const buckets = Array.from({ length: PUBLIC_INDEX_SHARDS }, () => []);
+  for (const e of trimmed) {
+    if (!e) continue;
+    buckets[publicIndexShardOf(e.id)].push(e);
+  }
+  const now = Date.now();
+  await Promise.all(
+    buckets.map((bucket, n) =>
+      env.CONFIGS.put(publicIndexShardKey(n), JSON.stringify({ updatedAt: now, entries: bucket }))
+    )
   );
+  // Written after the shards, so the marker can never claim a build that has
+  // not landed. It is what the cron's staleness check reads.
+  await env.CONFIGS.put(
+    PUBLIC_INDEX_META_KEY,
+    JSON.stringify({ builtAt: now, shards: PUBLIC_INDEX_SHARDS, entries: trimmed.length })
+  );
+  try {
+    await env.CONFIGS.delete(PUBLIC_INDEX_KEY);
+  } catch {
+    // Leaving it behind is harmless: readPublicListIndex prefers the shards
+    // and only falls back to it when no shard exists at all.
+  }
   return trimmed;
+}
+
+// Reads one shard. Returns null when the key is absent, which -- see the
+// invariant above -- means this deployment has not been sharded yet.
+async function readPublicIndexShard(env, n) {
+  const raw = await env.CONFIGS.get(publicIndexShardKey(n));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return parsed.entries.filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+async function writePublicIndexShard(env, n, entries) {
+  const bounded = entries.length > PUBLIC_INDEX_SHARD_MAX
+    ? sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_SHARD_MAX)
+    : entries;
+  await env.CONFIGS.put(
+    publicIndexShardKey(n),
+    JSON.stringify({ updatedAt: Date.now(), entries: bounded })
+  );
 }
 
 // Incremental update for one list. `entry` null => remove (unpublished,
@@ -4273,6 +4558,25 @@ async function updatePublicListIndex(env, id, entry) {
     if (owner && (await isCreatorTombstoned(env, owner))) return true;
   }
   try {
+    // The whole point of the sharding: one KV read and one KV write, against
+    // ~1/32 of the directory, instead of a read-modify-write of all 4.45 MB of
+    // it. The merged 32-shard view is deliberately NOT loaded here -- doing so
+    // would put the cost straight back.
+    const shard = publicIndexShardOf(id);
+    const current = await readPublicIndexShard(env, shard);
+    if (current) {
+      const prev = current.find((e) => e && e.id === id);
+      const next = current.filter((e) => e && e.id !== id);
+      // Merge onto the previous entry rather than replacing it: callers that
+      // only know part of the record (the like route has no displayName, for
+      // instance) must not blank out fields they never loaded.
+      if (entry) next.push({ ...(prev || {}), ...entry, id });
+      await writePublicIndexShard(env, shard, next);
+      return true;
+    }
+
+    // No shard, so this deployment is still on the pre-shard key (or has no
+    // index at all -- see the invariant above writePublicListIndex).
     const idx = await readPublicListIndex(env);
     // No index yet: don't build one from a single entry, or the directory
     // would show exactly one list. Leave it absent so the read path falls
@@ -4281,10 +4585,9 @@ async function updatePublicListIndex(env, id, entry) {
     if (!idx) return true;
     const prev = idx.entries.find((e) => e && e.id === id);
     const entries = idx.entries.filter((e) => e && e.id !== id);
-    // Merge onto the previous entry rather than replacing it: callers that
-    // only know part of the record (the like route has no displayName, for
-    // instance) must not blank out fields they never loaded.
     if (entry) entries.push({ ...(prev || {}), ...entry, id });
+    // One full publish converts the old key into the 32 shards; from here on
+    // every update takes the cheap path above.
     await writePublicListIndex(env, entries);
     return true;
   } catch (err) {
@@ -4387,8 +4690,12 @@ async function dropStaleRemovalsFromEntries(env, entries) {
 
 // Persisted progress for an in-flight rebuild. Anything unparseable, or from
 // an older shape, simply restarts the build rather than half-applying.
+// v2 is the shard-era marker the audit asked for. A build state written by a
+// pre-shard deployment parses fine and its entries are still valid, but it was
+// produced by code that would publish them to one key -- so it is discarded and
+// the scan restarts rather than half-applying across the two layouts.
 function emptyPublicIndexBuildState() {
-  return { v: 1, phase: 0, cursor: "", pending: [], entries: [], names: {} };
+  return { v: 2, phase: 0, cursor: "", pending: [], entries: [], names: {} };
 }
 
 async function readPublicIndexBuildState(env) {
@@ -4396,11 +4703,11 @@ async function readPublicIndexBuildState(env) {
     const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
     if (!raw) return emptyPublicIndexBuildState();
     const s = JSON.parse(raw);
-    if (!s || s.v !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
+    if (!s || s.v !== 2 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
       return emptyPublicIndexBuildState();
     }
     return {
-      v: 1,
+      v: 2,
       phase: Number(s.phase) || 0,
       cursor: typeof s.cursor === "string" ? s.cursor : "",
       pending: s.pending.filter((k) => typeof k === "string"),
@@ -4706,8 +5013,11 @@ const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 async function refreshPublicListIndexIfStale(env, ctx) {
   if (!env || !env.CONFIGS) return;
-  const idx = await readPublicListIndex(env);
-  if (!idx) {
+  // One small key, not a merge of 32 shards: this runs every 6 minutes and
+  // needs only "is there an index" and "how old is it". See
+  // readPublicListIndexMeta.
+  const meta = await readPublicListIndexMeta(env);
+  if (!meta) {
     // Cold start -- same path as a live request would take.
     await advancePublicListIndexBuild(env, ctx);
     return;
@@ -4721,7 +5031,7 @@ async function refreshPublicListIndexIfStale(env, ctx) {
   } catch {
     building = false;
   }
-  const age = idx.updatedAt ? (Date.now() - idx.updatedAt) : Infinity;
+  const age = meta.builtAt ? (Date.now() - meta.builtAt) : Infinity;
   if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
     await advancePublicListIndexBuild(env, ctx);
   }
@@ -13051,7 +13361,13 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
 // not to be shared. Keyed on the resolved identity (imdbId + fallbackType)
 // rather than the internally-resolved tmdbId, since that's the only thing
 // known before the resolution work runs.
-async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx) {
+// `meter` is optional and exists for /api/details/batch: an object with a
+// numeric `spent` field, incremented once per outbound fetch this resolution
+// actually makes. A cache hit -- memory, KV or edge -- never reaches fetchFn
+// and so never touches it, which is what lets the batch route keep spending
+// one invocation on a whole warm refresh while still fitting a free Worker's
+// 50-fetch budget when the ids are cold. Every other caller passes nothing.
+async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx, meter) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
@@ -13074,11 +13390,14 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter),
   });
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter) {
+  // One call per outbound fetch below. Counted here rather than by wrapping
+  // fetch() globally, so nothing else in the Worker changes behaviour.
+  const spend = () => { if (meter) meter.spent++; };
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const today = new Date().toISOString().slice(0, 10);
@@ -13100,6 +13419,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     const baseImdbId = rawStr.startsWith("tt") ? rawStr.split(":")[0] : rawStr;
     if (baseImdbId.startsWith("tt")) {
       const findSrc = "https://api.themoviedb.org/3/find/" + encodeURIComponent(baseImdbId) + "?api_key=" + encodeURIComponent(apiKey) + "&external_source=imdb_id";
+      spend();
       const findRes = await fetch(findSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
@@ -13133,6 +13453,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
         .replace(/\s*\(\d{4}\).*$/, "")
         .trim();
       try {
+        spend();
         const searchRes = await fetch("https://api.themoviedb.org/3/search/" + searchType + "?api_key=" + encodeURIComponent(apiKey) + "&query=" + encodeURIComponent(cleanTitle || baseImdbId) + "&page=1", {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 604800, cacheEverything: true },
@@ -13156,6 +13477,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   let resolvedType = type;
   if (resolvedType) {
     const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    spend();
     const detailRes = await fetch(detailSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
       cf: { cacheTtl: resolvedType === "tv" ? 3600 : 604800, cacheEverything: true },
@@ -13167,6 +13489,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   if (!match) {
     // Try movie first
     const mSrc = "https://api.themoviedb.org/3/movie/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    spend();
     const mRes = await fetch(mSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
       cf: { cacheTtl: 604800, cacheEverything: true },
@@ -13177,6 +13500,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     } else {
       // Try tv
       const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+      spend();
       const tvRes = await fetch(tvSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 3600, cacheEverything: true },
@@ -13239,6 +13563,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   if ((!poster || !overview || !genres) && realImdbId.startsWith("tt")) {
     try {
       const cinemetaKind = type === "tv" ? "series" : "movie";
+      spend();
       const cmRes = await fetch("https://v3-cinemeta.strem.io/meta/" + cinemetaKind + "/" + encodeURIComponent(realImdbId) + ".json", {
         headers: { "User-Agent": "my-list-addon/1.14" },
         cf: { cacheTtl: 604800, cacheEverything: true },
@@ -13280,6 +13605,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     const seasonToSearch = (match.next_episode_to_air && match.next_episode_to_air.season_number) || (match.last_episode_to_air && match.last_episode_to_air.season_number);
     if (seasonToSearch && tmdbId) {
       try {
+        spend();
         const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonToSearch + "?api_key=" + encodeURIComponent(apiKey), {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -13344,6 +13670,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     // If mid-season (episodes 2..N-1), resolve the finale episode's air date
     if (!isSeasonPremiere && !isSeasonFinale && tmdbId && nextEpInfo.nextEpisodeSeasonNumber) {
       try {
+        spend();
         const sRes = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + nextEpInfo.nextEpisodeSeasonNumber + "?api_key=" + encodeURIComponent(apiKey), {
           headers: { "User-Agent": "my-list-addon/1.14" },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -13632,11 +13959,24 @@ async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisod
 // more like "gets covered every so often as the cursor cycles back
 // around" -- there's no hard per-account freshness guarantee here, just
 // steady, bounded progress.
-async function checkForNewEpisodes(env) {
+async function checkForNewEpisodes(env, fetchBudget) {
   if (!env || !env.CONFIGS || !env.TMDB_API_KEY) return;
 
   const ACCOUNT_BATCH_SIZE = 25;
-  const SHOW_CHECK_BUDGET = 150;
+  // How many shows this tick may look up, derived from the outbound-fetch
+  // budget it was handed rather than fixed at 150.
+  //
+  // Each check is two season lookups at worst (findNextAiredEpisodeForShow),
+  // so 150 shows is up to 300 fetches -- six times the free plan's 50, which
+  // is why the tick was terminated and Continue Watching never ran there at
+  // all. The sweep already resumes from a KV cursor, so a smaller slice costs
+  // nothing but ticks, and there are 240 of those a day.
+  //
+  // A caller that passes nothing gets the ceiling this sweep has always used.
+  // See CRON_SUBREQUEST_BUDGET (00_constants.js).
+  const SHOW_CHECK_BUDGET = Number.isFinite(fetchBudget) && fetchBudget > 0
+    ? Math.max(1, Math.min(CRON_EPISODE_CHECK_MAX, Math.floor(fetchBudget / CRON_EPISODE_CHECK_FETCHES)))
+    : CRON_EPISODE_CHECK_MAX;
 
   // Sweep position is a page cursor PLUS an offset into that page.
   //
@@ -13868,7 +14208,21 @@ async function checkForNewEpisodes(env) {
 
 // Pre-warms official Trakt, TMDB, Simkl, and MDBList charts in the background on a scheduled cron trigger (e.g. every 6 mins).
 // Populates KV and in-memory cache so visitors always experience instant cache hits with zero API rate limits across all providers.
-async function prewarmSharedCatalogs(env, ctx) {
+//
+// `fetchBudget` is how many outbound fetches this tick may spend here. One
+// chart is ~105 of them (fetchTmdbPagedResults asks for 5 pages and then
+// resolves details for every item on them), so this is the half of the tick
+// that cannot be divided down to fit a free Worker's 50: below one chart's
+// worth of budget it does nothing at all and says so, rather than issuing
+// fetches the runtime will terminate the invocation on -- which is what used
+// to take Continue Watching down with it every tick. See
+// CRON_SUBREQUEST_BUDGET (00_constants.js).
+//
+// Above that, the charts are warmed a slice at a time from a rotating cursor,
+// so a budget that fits only a few per tick still covers all of them over the
+// following ticks instead of re-warming the first few forever. A budget that
+// fits the whole list warms the whole list, exactly as this always did.
+async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   if (!env || !env.CONFIGS) return;
 
   const traktKey = (env && env.TRAKT_CLIENT_ID) || TRAKT_CLIENT_ID;
@@ -13877,7 +14231,27 @@ async function prewarmSharedCatalogs(env, ctx) {
   const mdblistKey = (env && env.MDBLIST_API_KEY) || MDBLIST_API_KEY;
   const mdblistPopularKey = (env && env.MDBLIST_POPULAR_KEY) || MDBLIST_POPULAR_KEY;
 
-  // 1. Trakt Official Charts (every 6 mins)
+  const budget = Number.isFinite(fetchBudget) && fetchBudget > 0 ? fetchBudget : Infinity;
+  const maxWarms = budget === Infinity
+    ? Infinity
+    : Math.floor(budget / CRON_CHART_WARM_FETCHES);
+  if (maxWarms < 1) {
+    // Deliberately one line, not a throw: this is the documented free-plan
+    // limitation (README, "Which Cloudflare plan do I need?"), and the rest of
+    // the tick -- the episode sweep that has already run by the time this is
+    // reached -- is worth more than a chart that cannot fit either way.
+    console.warn(
+      `[Cron] chart pre-warming skipped: one chart costs about ${CRON_CHART_WARM_FETCHES} outbound fetches and this tick's budget is ${budget}. ` +
+      "Set CRON_SUBREQUEST_BUDGET in wrangler.toml (10000 on a Workers Paid plan) to turn it back on."
+    );
+    return;
+  }
+
+  // One flat list, in the order the four blocks used to run in, so a rotating
+  // cursor can walk it. Each entry warms exactly one chart.
+  const warmTasks = [];
+
+  // 1. Trakt Official Charts
   if (traktKey) {
     const traktCharts = [
       { chartKey: "trending", type: "movie" },
@@ -13891,16 +14265,15 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "box_office", type: "movie" },
     ];
     for (const item of traktCharts) {
-      try {
-        await fetchTraktChart({ type: item.type }, 0, traktKey, item.chartKey, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      } catch (e) {
-        console.warn(`[Cron] Prewarm Trakt chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
-      }
+      warmTasks.push({
+        label: `Trakt chart (${item.chartKey} ${item.type})`,
+        pauseMs: 200,
+        run: () => fetchTraktChart({ type: item.type }, 0, traktKey, item.chartKey, env, ctx),
+      });
     }
   }
 
-  // 2. TMDB Official Charts & Streaming Services (every 6 mins)
+  // 2. TMDB Official Charts & Streaming Services
   if (tmdbKey) {
     const tmdbCharts = [
       { chartKey: "trending", type: "movie" },
@@ -13929,16 +14302,15 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "paramount", type: "series" },
     ];
     for (const item of tmdbCharts) {
-      try {
-        await fetchTmdbChart({ type: item.type }, 0, tmdbKey, item.chartKey, "US", false, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      } catch (e) {
-        console.warn(`[Cron] Prewarm TMDB chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
-      }
+      warmTasks.push({
+        label: `TMDB chart (${item.chartKey} ${item.type})`,
+        pauseMs: 150,
+        run: () => fetchTmdbChart({ type: item.type }, 0, tmdbKey, item.chartKey, "US", false, env, ctx),
+      });
     }
   }
 
-  // 3. Simkl Trending Charts (every 6 mins)
+  // 3. Simkl Trending Charts
   if (simklKey) {
     const simklCharts = [
       { chartKey: "today", type: "movie" },
@@ -13950,16 +14322,58 @@ async function prewarmSharedCatalogs(env, ctx) {
       { chartKey: "anime-week", type: "series" },
     ];
     for (const item of simklCharts) {
+      warmTasks.push({
+        label: `Simkl chart (${item.chartKey} ${item.type})`,
+        pauseMs: 150,
+        run: () => fetchSimklChart({ type: item.type }, 0, simklKey, item.chartKey, env, ctx),
+      });
+    }
+  }
+
+  if (warmTasks.length) {
+    // Where the last tick stopped. A cursor past the end (the list shrank
+    // because a provider key was removed) restarts at the beginning rather
+    // than warming nothing.
+    let warmCursor = 0;
+    try {
+      const raw = await env.CONFIGS.get("cron:prewarm:cursor");
+      const parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) warmCursor = parsed % warmTasks.length;
+    } catch (e) {
+      console.warn("[Cron] could not read the pre-warm cursor:", e && e.message ? e.message : e);
+    }
+
+    const take = Math.min(warmTasks.length, maxWarms);
+    for (let n = 0; n < take; n++) {
+      const item = warmTasks[(warmCursor + n) % warmTasks.length];
       try {
-        await fetchSimklChart({ type: item.type }, 0, simklKey, item.chartKey, env, ctx);
-        await new Promise((resolve) => setTimeout(resolve, 150));
+        await item.run();
+        await new Promise((resolve) => setTimeout(resolve, item.pauseMs));
       } catch (e) {
-        console.warn(`[Cron] Prewarm Simkl chart failed (${item.chartKey} ${item.type}):`, e && e.message ? e.message : e);
+        console.warn(`[Cron] Prewarm ${item.label} failed:`, e && e.message ? e.message : e);
+      }
+    }
+
+    // Advanced after the slice, not before it: a tick terminated part-way
+    // through must not have already committed a move it did not make. The
+    // cost of repeating a chart is a cache hit.
+    if (take < warmTasks.length) {
+      try {
+        await env.CONFIGS.put("cron:prewarm:cursor", String((warmCursor + take) % warmTasks.length));
+      } catch (e) {
+        console.warn("[Cron] could not advance the pre-warm cursor:", e && e.message ? e.message : e);
       }
     }
   }
 
   // 4. MDBList Official Charts & Toplists (Throttled to once every 1 hour to preserve 1,000 req/day quota)
+  //
+  // Left as one all-or-nothing block rather than folded into the rotation
+  // above, because its hourly gate is a single flag for the whole group:
+  // warming a slice of it would set the flag and the rest would wait an hour.
+  // So it runs only when the budget still has room for the whole group.
+  const mdblistWarmCount = 7;
+  if (maxWarms !== Infinity && maxWarms < mdblistWarmCount) return;
   try {
     const lastMdblistWarmRaw = await env.CONFIGS.get("cron:last_warmed:mdblist");
     const lastMdblistWarm = lastMdblistWarmRaw ? parseInt(lastMdblistWarmRaw, 10) : 0;
@@ -25785,7 +26199,7 @@ async function bulkAddLists(btn) {
 // mdblist's Popular Lists is a fixed curated set (not a live search), so we
 // load it once lazily on first search and then just filter it client-side
 // by name/curator on every search -- feels instant. Trakt's side is a real
-// live search hitting their API each time (see runListSearch below).
+// live search hitting their API each time (see executeUnifiedListSearch below).
 let mdblistPopularCache = null;
 
 async function ensureMdblistPopularLoaded() {
@@ -26119,12 +26533,6 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
   });
 
   renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, box, intent);
-}
-
-async function runListSearch() {
-  const q = document.getElementById('listSearchInput').value.trim();
-  const box = document.getElementById('listSearchResult');
-  return executeUnifiedListSearch(q, box);
 }
 
 function renderListSearchResults(mdblistMatches, traktMatches, traktError, myListsMatches, tmdbMatches, targetBox, queryOrIntent) {
@@ -38747,25 +39155,41 @@ async function refreshAiringNext(force) {
   // calls. See /api/details/batch, 25_api-catalog-routes.js.
   let batchOk = false;
   try {
-    const batchRes = await fetch(ORIGIN + '/api/details/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ids: candidates,
-        type: 'series',
-        tmdbKey: tmdbKey,
-        fresh: bypassFresh ? '1' : '',
-      }),
-    });
-    const batchData = await batchRes.json();
-    if (batchData && batchData.ok && batchData.results) {
+    // The server now stops when it has spent an invocation's outbound-fetch
+    // budget and hands back the ids it did not get to (see
+    // DETAILS_BATCH_SUBREQUEST_BUDGET). A warm refresh still comes back whole
+    // in one round; a cold one arrives over a few. Ignoring the continuation
+    // would silently drop shows from this shelf, which is the same quiet loss
+    // the Letterboxd import loop exists to prevent.
+    const merged = {};
+    let pending = candidates;
+    for (let round = 0; round < ${DETAILS_BATCH_MAX_ROUNDS} && pending.length; round++) {
+      const batchRes = await fetch(ORIGIN + '/api/details/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ids: pending,
+          type: 'series',
+          tmdbKey: tmdbKey,
+          fresh: bypassFresh ? '1' : '',
+        }),
+      });
+      const batchData = await batchRes.json();
+      if (!batchData || !batchData.ok || !batchData.results) break;
       batchOk = true;
+      Object.assign(merged, batchData.results);
+      // An older Worker sends neither field. done !== false reads that as
+      // "there is nothing left", which is exactly what it meant.
+      if (batchData.done !== false || !Array.isArray(batchData.remainingIds) || !batchData.remainingIds.length) break;
+      pending = batchData.remainingIds;
+    }
+    if (batchOk) {
       // Iterated over candidates rather than over the response keys so
       // entries stay in candidate order, which is what the dedupe below
       // relies on for its "keep the earliest" behaviour.
       for (let i = 0; i < candidates.length; i++) {
         const showId = candidates[i];
-        const entry = airingEntryFrom(showId, batchData.results[showId]);
+        const entry = airingEntryFrom(showId, merged[showId]);
         if (entry) results.push(entry);
       }
     }
@@ -42479,18 +42903,114 @@ let _lastCreatorListsResponse = null;
 // version is per page too. Almost every account is one page, where this
 // behaves exactly as the single-version cache did.
 let _creatorListsPages = [];
+// slug -> { updatedAt, itemCount, items }. /api/creator/lists no longer sends
+// the items arrays (15.08 MB at 1,200 lists, re-sent after every save, delete
+// and tab switch); it sends itemCount and updatedAt, and the contents come from
+// /api/creator/lists/items for the slugs this map does not already hold at
+// that version. After a one-list edit that is one list's items instead of
+// every list's.
+//
+// Keyed on the server's own updatedAt rather than on a local timestamp, so a
+// change made on another device invalidates the entry here too. A record with
+// no updatedAt (a legacy one, written before the conflict guard existed) is
+// treated as always stale -- correct, just not cached.
+let _creatorListItemsCache = new Map();
 
 // Cleared whenever the cached lists are dropped, so the browser can never
 // claim to hold a version it no longer has.
 function resetCreatorListsCache() {
   _lastCreatorListsResponse = null;
   _creatorListsPages = [];
+  _creatorListItemsCache = new Map();
+}
+
+// Fills in the item contents /api/creator/lists no longer sends.
+//
+// Returns true when every list in the response ended up with a real items
+// array, false when it could not finish. False is not "carry on with what we
+// have": a dashboard that renders a list as empty because a fetch failed is
+// worse than one that transfers too much, so the caller re-asks for the whole
+// thing with includeItems -- which is exactly the shape this endpoint
+// answered with before the split.
+async function hydrateCreatorListItems(data, creatorKey) {
+  const lists = (data && Array.isArray(data.lists)) ? data.lists : null;
+  if (!lists) return true;
+
+  const stale = [];
+  for (const l of lists) {
+    if (!l || !l.slug) continue;
+    if (Array.isArray(l.items)) {
+      // Already carries its contents -- either a reused page from a previous
+      // render, or an includeItems reply. Record the version so the next
+      // render can skip it.
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: l.items.length, items: l.items });
+      continue;
+    }
+    const hit = _creatorListItemsCache.get(l.slug);
+    // itemCount is checked as well as updatedAt, so a cache entry can only be
+    // reused when it agrees with the server on BOTH the version and the size.
+    // A legacy record with no updatedAt fails Number.isFinite and is refetched
+    // every time rather than being served from a key that cannot change.
+    if (hit && Number.isFinite(l.updatedAt) && hit.updatedAt === l.updatedAt && hit.itemCount === l.itemCount) {
+      l.items = hit.items;
+      continue;
+    }
+    stale.push(l.slug);
+  }
+
+  if (stale.length) {
+    const fetched = new Map();
+    try {
+      for (let i = 0; i < stale.length; i += ${CREATOR_LIST_ITEMS_BATCH_MAX}) {
+        const slice = stale.slice(i, i + ${CREATOR_LIST_ITEMS_BATCH_MAX});
+        const res = await fetch(ORIGIN + '/api/creator/lists/items', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slugs: slice,
+          }),
+        });
+        const d = await res.json();
+        if (!d || !d.ok || !Array.isArray(d.lists)) return false;
+        for (const e of d.lists) {
+          if (e && e.slug && Array.isArray(e.items)) fetched.set(e.slug, e);
+        }
+      }
+    } catch (e) {
+      return false;
+    }
+    for (const l of lists) {
+      if (!l || !l.slug || Array.isArray(l.items)) continue;
+      const got = fetched.get(l.slug);
+      if (!got) {
+        // A slug the paged endpoint listed and this one did not return. That
+        // is a record that disappeared between the two calls, or a shape this
+        // client does not understand; either way it is not something to paper
+        // over with an empty array.
+        return false;
+      }
+      l.items = got.items;
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: got.items.length, items: got.items });
+    }
+  }
+
+  // Drop cache entries for slugs the account no longer has, so this cannot
+  // grow without bound across a long session of creating and deleting lists.
+  if (_creatorListItemsCache.size > lists.length) {
+    const live = new Set(lists.map((l) => l && l.slug).filter(Boolean));
+    for (const slug of [..._creatorListItemsCache.keys()]) {
+      if (!live.has(slug)) _creatorListItemsCache.delete(slug);
+    }
+  }
+  return true;
 }
 
 async function fetchCreatorListsOnce(creatorKey) {
   if (_creatorListsInFlight) return await _creatorListsInFlight;
   const p = (async () => {
-    const askFor = async (offset, knownVersion) => {
+    const askFor = async (offset, knownVersion, includeItems) => {
       const res = await fetch(ORIGIN + '/api/creator/lists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -42500,75 +43020,94 @@ async function fetchCreatorListsOnce(creatorKey) {
           offset: offset,
           limit: ${CREATOR_LISTS_PAGE_DEFAULT},
           knownVersion: knownVersion || '',
+          includeItems: !!includeItems,
         }),
       });
       return await res.json();
     };
 
-    // Only claim a version if the data that version describes is still
-    // here; otherwise an "unchanged" reply would leave nothing to render.
-    const canReuse = !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
-    const pages = [];
-    let combined = null;
-    for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
-      const cached = canReuse ? _creatorListsPages[i] : null;
-      let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '');
-      if (data && data.ok && data.unchanged) {
-        if (cached && cached.page) {
-          // Nothing changed on this page -- reuse the copy already in memory.
-          pages.push({ version: data.version || cached.version, page: cached.page });
-          if (!data.hasMore) break;
-          continue;
+    // The paging loop, factored out so the includeItems fallback below can run
+    // exactly the same walk rather than a second, subtly different one.
+    const loadPages = async (includeItems) => {
+      // Only claim a version if the data that version describes is still
+      // here; otherwise an "unchanged" reply would leave nothing to render.
+      // The fallback pass never claims one -- it is asking for a different
+      // shape than the version it holds describes.
+      const canReuse = !includeItems && !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+      const pages = [];
+      let combined = null;
+      for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
+        const cached = canReuse ? _creatorListsPages[i] : null;
+        let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '', includeItems);
+        if (data && data.ok && data.unchanged) {
+          if (cached && cached.page) {
+            // Nothing changed on this page -- reuse the copy already in memory.
+            pages.push({ version: data.version || cached.version, page: cached.page });
+            if (!data.hasMore) break;
+            continue;
+          }
+          // Should be unreachable (a version is only sent when reusable), but
+          // if it ever happens, ask again without one rather than assembling a
+          // response with a page missing from it.
+          data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '', includeItems);
         }
-        // Should be unreachable (a version is only sent when reusable), but
-        // if it ever happens, ask again without one rather than assembling a
-        // response with a page missing from it.
-        data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '');
+        if (!data || !data.ok) {
+          resetCreatorListsCache();
+          return { failed: data };
+        }
+        pages.push({ version: data.version || '', page: data });
+        if (!combined) combined = data;
+        if (!data.hasMore) break;
       }
-      if (!data || !data.ok) {
+      if (!pages.length) {
         resetCreatorListsCache();
-        return data;
+        return { failed: combined };
       }
-      pages.push({ version: data.version || '', page: data });
-      if (!combined) combined = data;
-      if (!data.hasMore) break;
-    }
-    if (!pages.length) {
-      resetCreatorListsCache();
-      return combined;
-    }
 
-    // One page is the overwhelmingly common case and is handed back as-is,
-    // so nothing downstream sees a synthesised object where it used to see
-    // the server's own response.
-    let out;
-    if (pages.length === 1) {
-      out = pages[0].page;
-    } else {
-      const first = pages[0].page;
-      const lists = [];
-      const deleted = [];
-      const seenDeleted = new Set();
-      for (const p2 of pages) {
-        const pg = p2.page || {};
-        if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
-        for (const s of (pg.deletedSlugs || [])) {
-          if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+      // One page is the overwhelmingly common case and is handed back as-is,
+      // so nothing downstream sees a synthesised object where it used to see
+      // the server's own response.
+      let out;
+      if (pages.length === 1) {
+        out = pages[0].page;
+      } else {
+        const first = pages[0].page;
+        const lists = [];
+        const deleted = [];
+        const seenDeleted = new Set();
+        for (const p2 of pages) {
+          const pg = p2.page || {};
+          if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
+          for (const s of (pg.deletedSlugs || [])) {
+            if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+          }
         }
+        out = {
+          ok: true,
+          displayName: first.displayName,
+          lists: lists,
+          order: first.order || [],
+          deletedSlugs: deleted,
+          total: first.total,
+          version: pages.map((x) => x.version).join('.'),
+        };
       }
-      out = {
-        ok: true,
-        displayName: first.displayName,
-        lists: lists,
-        order: first.order || [],
-        deletedSlugs: deleted,
-        total: first.total,
-        version: pages.map((x) => x.version).join('.'),
-      };
+      return { out: out, pages: pages };
+    };
+
+    let res = await loadPages(false);
+    if (!res.out) return res.failed;
+    if (!(await hydrateCreatorListItems(res.out, creatorKey))) {
+      // The delta fetch could not complete. Fall back to the shape this
+      // endpoint answered with before the split -- slower, and correct.
+      resetCreatorListsCache();
+      res = await loadPages(true);
+      if (!res.out) return res.failed;
+      await hydrateCreatorListItems(res.out, creatorKey);
     }
-    _lastCreatorListsResponse = out;
-    _creatorListsPages = pages;
-    return out;
+    _lastCreatorListsResponse = res.out;
+    _creatorListsPages = res.pages;
+    return res.out;
   })();
   _creatorListsInFlight = p;
   try {
@@ -54483,6 +55022,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     // /api/external-list/item-mutate -> adds or removes items on external provider accounts (Trakt, Simkl, TMDB, MDBList)
+    //
+    // The item-add / item-remove spellings are kept deliberately. The 2026-09-08
+    // audit listed them as dead code (no client reference) and said so itself:
+    // "they are cheap aliases -- leaving them costs nothing". item-remove is not
+    // even a pure alias, it is the path form of `action: "remove"`. They share
+    // this handler's validation and limits, so keeping them adds no surface,
+    // while deleting a published path breaks any out-of-band caller -- which
+    // cannot be verified from inside the repo. Same reasoning as /api/publish-list.
     if ((path === "/api/external-list/item-mutate" || path === "/api/external-list/item-add" || path === "/api/external-list/item-remove") && request.method === "POST") {
       let body = {};
       try {
@@ -54492,8 +55039,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
       }
 
       const action = (path.endsWith("/item-remove") || body.action === "remove") ? "remove" : "add";
-      const provider = (body.provider || "").toLowerCase().trim();
-      const target = (body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
+      const provider = String(body.provider || "").toLowerCase().trim();
+      const target = String(body.target || "watchlist").toLowerCase().trim(); // watchlist | favorite | history | custom | status
       const listId = body.listId || body.status || "";
       const mediaType = (body.mediaType === "series" || body.type === "series" || body.type === "tv" || body.type === "episode") ? "series" : "movie";
       const title = body.title || body.name || "";
@@ -54775,7 +55322,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 4. MDBLIST
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || body.token || "").trim();
         const token = accessToken || apiKey;
         if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
@@ -54930,7 +55477,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
+      const provider = String(body.provider || "").toLowerCase().trim();
       const items = Array.isArray(body.items) ? body.items : [];
       if (!items.length) {
         return json({ ok: true, syncedCount: 0, message: "No items to sync." });
@@ -55150,7 +55697,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 3. MDBLIST BATCH HISTORY SYNC
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || "").trim();
         const token = accessToken || apiKey || body.token || "";
         if (!token) return json({ ok: false, error: "Please connect your MDBList account or API key first." }, 400);
@@ -55244,11 +55791,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
-      const name = (body.name || "").trim();
-      const description = (body.description || "").trim();
-      const privacy = (body.privacy || "private").toLowerCase().trim();
-      const listType = (body.type || "mixed").toLowerCase().trim();
+      // String() every one of these before .trim(). A JSON body is caller data,
+      // not a contract: `{"name":{}}` reached `.trim` on an object and was the
+      // only uncaught 5xx in ~1,700 fuzzed requests. The sibling route at
+      // 26_...:1816 has always done it this way.
+      const provider = String(body.provider || "").toLowerCase().trim();
+      const name = String(body.name || "").trim();
+      const description = String(body.description || "").trim();
+      const privacy = String(body.privacy || "private").toLowerCase().trim();
+      const listType = String(body.type || "mixed").toLowerCase().trim();
 
       if (!name) {
         return json({ ok: false, error: "List name is required." }, 400);
@@ -55428,7 +55979,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "Invalid JSON body." }, 400);
       }
 
-      const provider = (body.provider || "").toLowerCase().trim();
+      const provider = String(body.provider || "").toLowerCase().trim();
       const listId = String(body.listId || "").trim();
 
       if (!listId) {
@@ -55489,7 +56040,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       // 3. MDBLIST
       if (provider === "mdblist") {
-        const accessToken = (body.mdblistAccessToken || "").trim();
+        const accessToken = String(body.mdblistAccessToken || "").trim();
         const apiKey = (body.mdblistKey || body.apikey || "").trim();
         const token = accessToken || apiKey;
         if (!token) return json({ ok: false, error: "Please connect your MDBList account first." }, 400);
@@ -57083,112 +57634,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
       return json({ ok: true, id });
     }
 
-    if (path === "/api/publish-list" && request.method === "POST") {
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      // Unauthenticated, and every call mints a permanent KV key. Same
-      // per-IP bucket as /api/creator/create, just a little more permissive
-      // because publishing several lists in one sitting is normal.
-      //
-      // "that no route in this Worker can ever delete again" is what this
-      // comment used to say, and it was true until /admin/api/published-lists
-      // and /admin/api/delete-published-list (26_) gave an operator a way to
-      // browse and remove these. What is still deliberate is the absence of a
-      // TTL: the slug is a shared list URL somebody has handed to other
-      // people, and expiring it would break their link rather than free
-      // anything worth freeing. Bounded at the door instead, by this limit
-      // and the ANON_PUBLISH_* ceilings (00_constants.js).
-      //
-      // Those ceilings used to be the ones the AUTHENTICATED save uses, and
-      // the two are not the same risk: a creator list belongs to an account
-      // that can be found and deleted, an anonymous one has no owner at all
-      // and only an operator, by hand, can remove it. At the old 10 publishes
-      // a minute and 2 MB apiece this was 20 MB a minute of permanent unowned
-      // storage from one IP -- from an endpoint the shipped UI never calls.
-      const plIp = clientIpKey(request);
-      if (!plIp) return json({ ok: false, error: "Could not process this request." }, 400);
-      const plRateKey = `ratelimit:publishlist:${plIp}`;
-      const plAttempts = parseInt((await env.CONFIGS.get(plRateKey)) || "0", 10);
-      if (plAttempts >= ANON_PUBLISH_PER_MINUTE) {
-        return json({ ok: false, error: "Too many lists published just now. Please wait a minute and try again." }, 429);
-      }
-      await env.CONFIGS.put(plRateKey, String(plAttempts + 1), { expirationTtl: 60 });
-
-      let plBody;
-      try { plBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body." }, 400); }
-      const baseSlug = slugifyServer(plBody.name || "");
-      const plType = (plBody.type === "series" || plBody.type === "mixed") ? plBody.type : (plBody.type === "movie" ? "movie" : null);
-      const plItems = Array.isArray(plBody.items) ? plBody.items : [];
-      if (!baseSlug) return json({ ok: false, error: "Missing a list name." }, 400);
-      if (!plType) return json({ ok: false, error: "Missing or invalid list type." }, 400);
-      // Bounds, deliberately REJECTING rather than truncating: silently
-      // storing a shortened list is exactly the kind of quiet data loss
-      // this endpoint should not be capable of, and a real list that is
-      // over the limit deserves to be told so. The ceilings are far above
-      // anything genuine -- a real account's largest observed list was
-      // ~1,200 items (see compactCustomListItem, 22_client-creator-
-      // profile.js) -- and exist only to stop an anonymous caller storing
-      // multi-megabyte payloads permanently.
-      if (String(plBody.name || "").length > PUBLISHED_LIST_NAME_MAX) {
-        return json({ ok: false, error: "That list name is too long." }, 400);
-      }
-      if (plItems.length > ANON_PUBLISH_ITEMS_MAX) {
-        return json({ ok: false, error: `That list is too large to publish (limit ${ANON_PUBLISH_ITEMS_MAX} items).` }, 413);
-      }
-      // An item is a catalog entry, not an arbitrary JSON document. Without
-      // this the endpoint accepted any shape at all -- nested objects, whole
-      // strings, nulls -- none of which can render, so the only thing they
-      // could ever do is occupy the namespace permanently. Rejected rather
-      // than filtered, for the same reason the size bounds reject: quietly
-      // storing something other than what was sent is the worse bug.
-      for (const it of plItems) {
-        if (!it || typeof it !== "object" || Array.isArray(it)) {
-          return json({ ok: false, error: "That list contains an entry that is not a list item." }, 400);
-        }
-        const itId = it.id != null ? it.id : it.imdbId;
-        if (typeof itId !== "string" || !itId || itId.length > ANON_PUBLISH_ITEM_ID_MAX) {
-          return json({ ok: false, error: "That list contains an entry with no usable id." }, 400);
-        }
-      }
-      // Never falls through onto a slug that is taken -- see pickFreeSlug.
-      const listSlug = await pickFreeSlug(baseSlug, async (candidate) =>
-        !!(await env.CONFIGS.get("publishedlist:user:" + candidate))
-      );
-      if (!listSlug) {
-        return json(
-          { ok: false, error: "Couldn't find a free URL for that list name. Please try a slightly different name." },
-          409
-        );
-      }
-      const plKey = "publishedlist:user:" + listSlug;
-      const plVisibility = normalizeListVisibility(plBody.visibility);
-      const plNow = Date.now();
-      const plPayload = JSON.stringify({ name: plBody.name || baseSlug, type: plType, items: plItems, visibility: plVisibility, likes: 0, publishedAt: plNow });
-      // Item COUNT alone is not a size bound -- individual items carry
-      // titles, overviews and poster URLs, so a few thousand of them can
-      // still be many megabytes. This is the bound that actually protects
-      // storage, checked on the exact bytes about to be written -- bytes,
-      // not UTF-16 code units, which is 3x apart for CJK text. Nothing is
-      // mirrored to D1 on this path, so unlike the creator guard this one is
-      // only a storage bound; the two were deliberately kept in step.
-      if (utf8ByteLength(plPayload) > ANON_PUBLISH_BYTES_MAX) {
-        return json({ ok: false, error: "That list is too large to publish." }, 413);
-      }
-      await env.CONFIGS.put(plKey, plPayload);
-      // Anonymous publishes belong in the directory index too.
-      if (isPublicListVisibility(plVisibility)) {
-        ctx.waitUntil(updatePublicListIndex(env, `a:${listSlug}`, {
-          isCreator: false,
-          username: "user",
-          slug: listSlug,
-          name: plBody.name || baseSlug,
-          type: plType,
-          itemCount: plItems.length,
-          likes: 0,
-          updatedAt: plNow,
-        }));
-      }
-      return json({ ok: true, listName: listSlug, url: url.origin + "/lists/user/" + listSlug });
-    }
+    // /api/publish-list was removed in 1.5.3.
+    //
+    // It was an unauthenticated endpoint that minted a permanent KV key on
+    // every call, it had no caller anywhere in the shipped bundle, and it was
+    // vector A of the stored-XSS finding in AUDIT-2026-09-08-ADVERSARIAL-III.
+    // Round 5 tightened it (5,000 items, 512 KB, 5 publishes a minute,
+    // per-item shape validation) and left the keep-or-remove call to the
+    // maintainer, who chose remove.
+    //
+    // What is NOT removed: everything that reads these records. Lists already
+    // published under `publishedlist:user:<slug>` still serve at
+    // /lists/user/<slug>, still appear in the directory and search, and are
+    // still browsable and deletable from /admin (see
+    // /admin/api/published-lists and /admin/api/delete-published-list, 26_).
+    // Only the ability to create a new one anonymously is gone -- a signed-in
+    // account publishes through /api/creator/lists/save, which is
+    // authenticated, owned, and deletable by the person who made it.
 
     if (path === "/api/lists/like" && request.method === "POST") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
@@ -57435,7 +57897,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // a time).
       const batchIp = clientIpKey(request);
       if (!batchIp) return json({ ok: false, error: "Could not load those details." }, 400);
-      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, reqBody.tmdbKey ? 240 : 60)) {
+      // Charged in IDS, not requests. The ceilings used to be 60 and 240
+      // REQUESTS a minute while one request carried up to 60 ids; now that the
+      // budget below can split a refresh across invocations, counting requests
+      // would have quietly cut the real ceiling by the number of chunks. See
+      // DETAILS_BATCH_IDS_PER_MINUTE (00_constants.js).
+      const batchIdCeiling = reqBody.tmdbKey ? DETAILS_BATCH_IDS_PER_MINUTE_OWN_KEY : DETAILS_BATCH_IDS_PER_MINUTE;
+      if (await consumeRateLimit(env, ctx, "detailsbatch", batchIp, batchIdCeiling, 60, ids.length)) {
         return json({ ok: false, error: "Too many lookups just now. Please wait a minute and try again." }, 429);
       }
       if (!reqBody.tmdbKey) ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
@@ -57443,26 +57911,72 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const region = reqBody.region || "";
       const isFreshReq = reqBody.fresh === "1" || reqBody.fresh === true;
 
+      // How much of this invocation's OUTBOUND-fetch budget the pool may
+      // spend. Measured at 180 fetches for one 60-id request -- more than
+      // three times the free plan's 50, so Airing Next could not refresh at
+      // all on the deployment target the README documents.
+      //
+      // Spent against real upstream resolutions rather than against the id
+      // count, because an id already in the memory, KV or edge cache costs
+      // nothing and the warm case is the common one: a fully cached 60-id
+      // refresh still completes in one invocation, exactly as it did before.
+      // See DETAILS_BATCH_SUBREQUEST_BUDGET (00_constants.js).
+      const detailsEnvBudget = parseInt(env && env.DETAILS_BATCH_SUBREQUEST_BUDGET, 10);
+      const detailsBudget = Number.isFinite(detailsEnvBudget) && detailsEnvBudget >= TMDB_ITEM_DETAILS_MAX_FETCHES
+        ? detailsEnvBudget
+        : DETAILS_BATCH_SUBREQUEST_BUDGET;
+
       const results = {};
+      // `reserved` is the worst case of everything started but not finished:
+      // an id may not begin unless its whole worst case still fits, and the
+      // difference is handed straight back when it turns out to have cost
+      // less. That is what keeps a warm batch whole -- a cached id releases
+      // its entire reservation -- while still guaranteeing the invocation
+      // cannot exceed the budget.
+      //
+      // Each id gets its OWN meter rather than sharing one counter. Six of
+      // these run concurrently, so a shared counter read before and after an
+      // await measures every worker's fetches, not this id's: each completed
+      // id was charged roughly six times what it spent, and a 600-fetch budget
+      // ran out after 36 ids that had cost 108 between them.
+      const pool = { reserved: 0 };
       let cursor = 0;
       async function worker() {
         while (cursor < ids.length) {
+          if (pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > detailsBudget) return;
           const id = ids[cursor++];
+          pool.reserved += TMDB_ITEM_DETAILS_MAX_FETCHES;
+          const meter = { spent: 0 };
           try {
-            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx);
+            results[id] = await fetchTmdbItemDetails(id, tmdbKey, wantType, region, isFreshReq, env, ctx, meter);
           } catch {
             results[id] = null;
           }
+          // Clamped, so a resolution that somehow passed more fetch sites than
+          // the ceiling names can only fail to release -- never hand the pool
+          // back budget it did not have.
+          pool.reserved -= TMDB_ITEM_DETAILS_MAX_FETCHES - Math.min(meter.spent, TMDB_ITEM_DETAILS_MAX_FETCHES);
         }
       }
       await Promise.all(
         Array.from({ length: Math.min(6, ids.length) }, () => worker())
       );
 
+      // Ids are handed out in order and every id taken is finished, so
+      // everything before `cursor` was resolved and everything from it on was
+      // not. Returned as the ids themselves rather than as an index: this
+      // route de-duplicates what it was sent, so an index into its own array
+      // would not mean anything to the caller.
+      //
+      // Both fields are additive. A caller that ignores them sees the same
+      // { ok, results } it always did -- which is why the client treats a
+      // missing `done` as "there is nothing left", the behaviour of any older
+      // deployment.
+      const remainingIds = ids.slice(cursor);
       // Same short max-age as /api/details for the same reason -- this
       // response's shape changes occasionally and an hour-old copy would
       // strand anyone who had just opened it.
-      return json({ ok: true, results }, 200, { "Cache-Control": "max-age=60" });
+      return json({ ok: true, results, remainingIds, done: remainingIds.length === 0 }, 200, { "Cache-Control": "max-age=60" });
     }
 
     // /api/details (GET or POST) -> { ok: true, details: { title, overview, rating, releaseYear, poster, background } }
@@ -58849,7 +59363,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
       if (rateCount >= 10) {
-        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." });
+        // 429, not 200. Round 1 moved fourteen endpoints off "HTTP 200 with
+        // ok:false" on an auth failure; this one kept it, so a client that
+        // branches on the status code read a refused reset as a success.
+        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." }, 429);
       }
       await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
 
@@ -58859,17 +59376,20 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // recovery answer on file, wrong answer) -- distinguishing them
       // would let this endpoint be used to enumerate which usernames
       // exist and which have a recovery answer set at all.
+      // The message stays byte-identical across all of them so the status
+      // code carries no more information than the body already did: 401 on
+      // every one of these, 429 on the two throttles.
       const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
-      if (!v.ok || !answer) return json({ ok: false, error: genericError });
+      if (!v.ok || !answer) return json({ ok: false, error: genericError }, 401);
       const raw = await getCreator(env, v.normalized);
-      if (!raw) return json({ ok: false, error: genericError });
+      if (!raw) return json({ ok: false, error: genericError }, 401);
       let profile;
       try {
         profile = JSON.parse(raw);
       } catch {
-        return json({ ok: false, error: genericError });
+        return json({ ok: false, error: genericError }, 401);
       }
-      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError }, 401);
 
       // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
       // counter alone did not defend this endpoint at all: rotating source
@@ -58886,8 +59406,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const resetScope = `reset:${v.normalized}`;
       if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
         // Same generic message as every other failure path here, so this
-        // does not become a way to ask whether an account exists.
-        return json({ ok: false, error: genericError });
+        // does not become a way to ask whether an account exists. 429 rather
+        // than 401 because it IS a throttle -- but the message is the same
+        // string, so the pair still says nothing about the account.
+        return json({ ok: false, error: genericError }, 429);
       }
 
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
@@ -58895,7 +59417,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // Failures only: answering correctly must never consume the budget
         // that protects you.
         await noteAuthFailure(env, resetScope, resetDay);
-        return json({ ok: false, error: genericError });
+        return json({ ok: false, error: genericError }, 401);
       }
 
       const creatorKey = generateCreatorKey();
@@ -59085,6 +59607,20 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const rawOffset = parseInt(body.offset, 10);
       const listOffset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
 
+      // The transfer half of the same finding. Paging bounded the KV
+      // operations; the response still carried every list's full `items`
+      // array -- 15.08 MB at 1,200 lists, re-sent after every save, delete
+      // and tab switch. It now carries `itemCount` and `updatedAt`, and the
+      // contents come from /api/creator/lists/items for the slugs whose
+      // version the caller does not already hold.
+      //
+      // includeItems is the way back to the old shape, and it exists for one
+      // reason: it is what the client falls back to if the delta fetch fails.
+      // A dashboard that renders lists with silently-empty items is worse
+      // than one that transfers too much, so the degraded path is exactly
+      // the behaviour this endpoint had before.
+      const includeItems = body.includeItems === true;
+
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -59196,7 +59732,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const lists = (
         await Promise.all(
           pageSlugs.map(async (slug) => {
-            if (slug === "\u0000watchlist") return watchlistFallback;
+            if (slug === "\u0000watchlist") {
+              return includeItems ? watchlistFallback : { ...watchlistFallback, items: undefined };
+            }
             const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
@@ -59205,7 +59743,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
                 slug,
                 name: data.name,
                 type: data.type,
-                items: data.items || [],
+                // Omitted unless asked for -- see includeItems above. The key
+                // is left off entirely rather than set to [], so a client that
+                // reads it can tell "not sent" from "empty list".
+                items: includeItems ? (data.items || []) : undefined,
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
@@ -59292,6 +59833,93 @@ Sitemap: ${url.origin}/sitemap.xml`;
         });
       }
       return jsonPrivate({ ...listsPayload, version: listsVersion });
+    }
+
+    // /api/creator/lists/items  (POST)
+    //   { creatorName, creatorKey, slugs: [...] } -> { ok, lists: [{ slug, items, itemCount, updatedAt }] }
+    //
+    // The per-list read that lets /api/creator/lists stop returning `items`.
+    // The dashboard asks for the contents of only the slugs whose updatedAt
+    // it does not already hold, so a re-render after a one-list edit costs
+    // one list's items instead of every list's.
+    //
+    // Bounded the same way the paged endpoint is: at most
+    // CREATOR_LIST_ITEMS_BATCH_MAX slugs per call, so the KV cost is set by
+    // the request rather than by what the account owns. Over the cap is a
+    // 400, not a silent truncation -- a caller that got back fewer lists than
+    // it asked for and could not tell would render them empty.
+    if (path === "/api/creator/lists/items" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+
+      const rawSlugs = Array.isArray(body.slugs) ? body.slugs : [];
+      // De-duplicated before the cap is applied, so a caller that repeats a
+      // slug spends one read for it and cannot be refused for a length its
+      // own duplicates produced.
+      const slugs = [...new Set(rawSlugs.filter((sl) => typeof sl === "string" && sl))];
+      if (!slugs.length) return jsonPrivate({ ok: true, lists: [] });
+      if (slugs.length > CREATOR_LIST_ITEMS_BATCH_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (max ${CREATOR_LIST_ITEMS_BATCH_MAX}).`,
+        }, 400);
+      }
+
+      const out = (
+        await Promise.all(
+          slugs.map(async (slug) => {
+            const raw = await getCreatorList(env, auth.username, slug);
+            if (raw) {
+              try {
+                const data = JSON.parse(raw);
+                const items = Array.isArray(data.items) ? data.items : [];
+                return {
+                  slug,
+                  items,
+                  itemCount: items.length,
+                  updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
+                };
+              } catch {
+                return null;
+              }
+            }
+            // The same Watchlist fallback /api/creator/lists applies: when no
+            // creatorlist: record exists the tracking blob is the only place
+            // the Watchlist lives, and the dashboard shows it from there. If
+            // this endpoint did not mirror that, the one list most accounts
+            // have would be the one that came back empty.
+            if (slug !== "watchlist") return null;
+            const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+            if (!trackingRaw) return null;
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (!Array.isArray(tb.watchlist)) return null;
+              return {
+                slug,
+                items: tb.watchlist,
+                itemCount: tb.watchlist.length,
+                updatedAt: Number.isFinite(tb.updatedAt) ? tb.updatedAt : undefined,
+              };
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter(Boolean);
+
+      // jsonPrivate, not json: this is one account's list contents. The
+      // /api/creator/ prefix in isPrivateApiPath() already forces no-store on
+      // it, which is the point of that choke point -- a route added later
+      // cannot forget. This says so at the route as well, the way its
+      // siblings do.
+      return jsonPrivate({ ok: true, lists: out });
     }
 
     // /api/creator/lists/save  (POST)
@@ -60811,6 +61439,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
     //   { creatorName, creatorKey, slug, shared } -> { ok, shared: {...} }
     //   { creatorName, creatorKey } (no slug)     -> { ok, shared: {...} }  (read current state)
     //
+    // API-ONLY, deliberately. Nothing in the shipped UI calls this, which the
+    // 2026-09-08 audit listed under dead code with the note "keep the route,
+    // add the UI or document it as API-only". Documented: see README's
+    // "API-only endpoints". It is authenticated and it is the only way to make
+    // these three shelves public at all, so removing it would remove the
+    // feature rather than tidy it up.
+    //
     // Owner-controlled opt-in for exposing Watchlist / Watch History /
     // Continue Watching at the public /lists/:username/:slug address.
     // Those three come out of the private `creatorsynctracking:` blob,
@@ -62060,6 +62695,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
             max: PUBLIC_INDEX_MAX,
             truncated: idx.entries.length >= PUBLIC_INDEX_MAX,
             updatedAt: idx.updatedAt || null,
+            // Which layout answered. A deployment upgrading in place serves
+            // from the pre-shard key until its next full publish converts it,
+            // and "is that conversion done" is exactly the kind of question
+            // this panel exists to answer.
+            shards: idx.sharded ? PUBLIC_INDEX_SHARDS : 1,
           };
         }
       } catch (e) {
@@ -62972,10 +63612,38 @@ export default {
     // empty API key just because this isolate's first event happened to be a
     // cron tick rather than a request. See applyEnvApiKeys.
     applyEnvApiKeys(env);
+    // How many outbound fetches this tick may spend, and how it is split.
+    //
+    // Measured at 186 for one tick, against the free plan's 50 -- so on a free
+    // Worker the invocation was terminated and Continue Watching never picked
+    // up a single new episode. See CRON_SUBREQUEST_BUDGET (00_constants.js)
+    // for why the two halves are budgeted differently and why the default is
+    // the free-plan number.
+    const cronEnvBudget = parseInt(env && env.CRON_SUBREQUEST_BUDGET, 10);
+    const cronBudget = Number.isFinite(cronEnvBudget) && cronEnvBudget >= CRON_EPISODE_CHECK_FETCHES
+      ? cronEnvBudget
+      : CRON_SUBREQUEST_BUDGET;
+    const episodeBudget = Math.max(
+      CRON_EPISODE_CHECK_FETCHES,
+      Math.floor(cronBudget * CRON_EPISODE_CHECK_SHARE)
+    );
+    // The episode sweep no longer races the pre-warm.
+    //
+    // Both spend outbound fetches, and the pre-warm spends far more of them.
+    // Interleaved, a pre-warm's fetch storm could take the invocation past the
+    // cap before the sweep had written its cursor -- so the sweep lost its
+    // work AND its position, which is what happened on every free-plan tick.
+    // Chaining the pre-warm behind it means the thing a person actually sees
+    // has already landed in KV before anything expensive begins.
+    //
+    // Only those two are ordered. The other two are started immediately, as
+    // they always were: neither issues outbound fetches, and holding the index
+    // rebuild behind a TMDB sweep would delay it for no reason.
+    const episodeSweep = guard("checkForNewEpisodes", checkForNewEpisodes(env, episodeBudget));
     ctx.waitUntil(
       Promise.all([
-        guard("checkForNewEpisodes", checkForNewEpisodes(env)),
-        guard("prewarmSharedCatalogs", prewarmSharedCatalogs(env, ctx)),
+        episodeSweep,
+        guard("prewarmSharedCatalogs", episodeSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

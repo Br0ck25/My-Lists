@@ -300,3 +300,101 @@ export async function createUser(env, name, extra = {}) {
   }
   return { ...r.body, ip };
 }
+
+// Seeds an anonymously published list straight into KV.
+//
+// These records used to be created by POSTing /api/publish-list, which 1.5.3
+// removed: unauthenticated, unowned, permanent, and with no caller anywhere in
+// the shipped bundle. The RECORDS still exist and every read path still serves
+// them -- /lists/user/<slug>, the directory, search, the admin browse-and-
+// delete tools -- so the tests that cover those read paths still need one, and
+// writing the key is now the only way to get one.
+//
+// Deliberately writes the same shape the removed route wrote, so a test that
+// used to seed through the route is testing the same record it always was.
+export function seedAnonPublishedList(env, slug, extra = {}) {
+  const now = extra.publishedAt || Date.now();
+  const record = {
+    name: extra.name || slug,
+    type: extra.type || "movie",
+    items: extra.items || [{ id: "tt0000001" }],
+    visibility: extra.visibility || "public",
+    likes: extra.likes || 0,
+    publishedAt: now,
+  };
+  env.CONFIGS._store.set("publishedlist:user:" + slug, JSON.stringify(record));
+  return { slug, record, url: "/lists/user/" + slug };
+}
+
+// Runs one cron tick and drains its background work to a standstill.
+//
+// scheduled() hands its tasks to ctx.waitUntil, and some of those tasks call
+// ctx.waitUntil AGAIN once they are already running -- advancePublicListIndexBuild
+// is the one that matters, since it registers the actual rebuild chunk and
+// returns immediately. A test that snapshots the queue once and awaits that
+// snapshot therefore misses the rebuild entirely.
+//
+// It used to get away with it by accident: prewarmSharedCatalogs slept between
+// ~47 chart warms, which was long enough for the chunk to finish before the
+// first snapshot resolved. Budgeting the pre-warm removed those sleeps and the
+// accident with them. Draining in rounds is what the test actually meant.
+//
+// `w` defaults to the shared module instance. Pass a freshIsolate() when the
+// tick warms provider caches: those live in module scope, so a second test in
+// the same process would find them already warm and see no KV write at all.
+export async function runScheduledTick(env, event = {}, w = worker) {
+  let queue = [];
+  const ctx = { waitUntil: (p) => queue.push(Promise.resolve(p).catch(() => {})) };
+  await w.scheduled(event, env, ctx);
+  for (let round = 0; round < 20 && queue.length; round++) {
+    const batch = queue;
+    queue = [];
+    await Promise.all(batch);
+  }
+}
+
+// --- The directory index, after it was sharded across 32 keys ---------------
+//
+// 1.5.3 replaced the single `index:publiclists` blob with
+// `index:publiclists:s0` .. `:s31` plus an `index:publiclists:meta` marker,
+// because one key holding the whole directory was a 4.45 MB read-modify-write
+// against KV's one-write-per-second-per-key limit. Tests that used to poke the
+// single key go through these three so they say what they mean rather than
+// naming a storage layout.
+export const PUBLIC_INDEX_SHARD_COUNT = 32;
+
+/** Is there a published directory index at all? */
+export function hasPublicIndex(kv) {
+  return kv._store.has("index:publiclists:meta") || kv._store.has("index:publiclists");
+}
+
+/** Every entry in it, whichever layout it is stored in. */
+export function publicIndexEntries(kv) {
+  if (kv._store.has("index:publiclists:meta")) {
+    const out = [];
+    for (let n = 0; n < PUBLIC_INDEX_SHARD_COUNT; n++) {
+      const raw = kv._store.get("index:publiclists:s" + n);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.entries)) out.push(...parsed.entries);
+      } catch { /* a shard this test corrupted on purpose */ }
+    }
+    return out;
+  }
+  const raw = kv._store.get("index:publiclists");
+  if (!raw) return [];
+  try { return JSON.parse(raw).entries || []; } catch { return []; }
+}
+
+/** A stable snapshot of the whole index, for "was this rebuilt needlessly". */
+export function publicIndexSnapshot(kv) {
+  const keys = ["index:publiclists", "index:publiclists:meta"];
+  for (let n = 0; n < PUBLIC_INDEX_SHARD_COUNT; n++) keys.push("index:publiclists:s" + n);
+  return keys.map((k) => k + "=" + String(kv._store.get(k) || "")).join("\n");
+}
+
+/** Every key a directory write can land on, for hooks and write counters. */
+export function isPublicIndexKey(key) {
+  return key === "index:publiclists" || String(key || "").startsWith("index:publiclists:s");
+}

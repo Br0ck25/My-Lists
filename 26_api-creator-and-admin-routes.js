@@ -1351,7 +1351,10 @@
       const rateCountRaw = await env.CONFIGS.get(rateLimitKey);
       const rateCount = parseInt(rateCountRaw, 10) || 0;
       if (rateCount >= 10) {
-        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." });
+        // 429, not 200. Round 1 moved fourteen endpoints off "HTTP 200 with
+        // ok:false" on an auth failure; this one kept it, so a client that
+        // branches on the status code read a refused reset as a success.
+        return json({ ok: false, error: "Too many attempts today -- please try again tomorrow, or reach out via Feedback & Support." }, 429);
       }
       await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
 
@@ -1361,17 +1364,20 @@
       // recovery answer on file, wrong answer) -- distinguishing them
       // would let this endpoint be used to enumerate which usernames
       // exist and which have a recovery answer set at all.
+      // The message stays byte-identical across all of them so the status
+      // code carries no more information than the body already did: 401 on
+      // every one of these, 429 on the two throttles.
       const genericError = "That username and recovery answer don't match, or no recovery answer is set for this account.";
-      if (!v.ok || !answer) return json({ ok: false, error: genericError });
+      if (!v.ok || !answer) return json({ ok: false, error: genericError }, 401);
       const raw = await getCreator(env, v.normalized);
-      if (!raw) return json({ ok: false, error: genericError });
+      if (!raw) return json({ ok: false, error: genericError }, 401);
       let profile;
       try {
         profile = JSON.parse(raw);
       } catch {
-        return json({ ok: false, error: genericError });
+        return json({ ok: false, error: genericError }, 401);
       }
-      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError });
+      if (!profile.recoveryAnswerHash) return json({ ok: false, error: genericError }, 401);
 
       // Per-ACCOUNT failure budget, on top of the per-IP one above. The IP
       // counter alone did not defend this endpoint at all: rotating source
@@ -1388,8 +1394,10 @@
       const resetScope = `reset:${v.normalized}`;
       if (await readAuthFailureCount(env, resetScope, resetDay) >= RESET_KEY_ACCOUNT_MAX_FAILURES) {
         // Same generic message as every other failure path here, so this
-        // does not become a way to ask whether an account exists.
-        return json({ ok: false, error: genericError });
+        // does not become a way to ask whether an account exists. 429 rather
+        // than 401 because it IS a throttle -- but the message is the same
+        // string, so the pair still says nothing about the account.
+        return json({ ok: false, error: genericError }, 429);
       }
 
       const matches = await verifyCreatorKey(answer.toLowerCase(), profile.recoveryAnswerHash);
@@ -1397,7 +1405,7 @@
         // Failures only: answering correctly must never consume the budget
         // that protects you.
         await noteAuthFailure(env, resetScope, resetDay);
-        return json({ ok: false, error: genericError });
+        return json({ ok: false, error: genericError }, 401);
       }
 
       const creatorKey = generateCreatorKey();
@@ -1587,6 +1595,20 @@
       const rawOffset = parseInt(body.offset, 10);
       const listOffset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
 
+      // The transfer half of the same finding. Paging bounded the KV
+      // operations; the response still carried every list's full `items`
+      // array -- 15.08 MB at 1,200 lists, re-sent after every save, delete
+      // and tab switch. It now carries `itemCount` and `updatedAt`, and the
+      // contents come from /api/creator/lists/items for the slugs whose
+      // version the caller does not already hold.
+      //
+      // includeItems is the way back to the old shape, and it exists for one
+      // reason: it is what the client falls back to if the delta fetch fails.
+      // A dashboard that renders lists with silently-empty items is worse
+      // than one that transfers too much, so the degraded path is exactly
+      // the behaviour this endpoint had before.
+      const includeItems = body.includeItems === true;
+
       const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
       let order = [];
       try {
@@ -1698,7 +1720,9 @@
       const lists = (
         await Promise.all(
           pageSlugs.map(async (slug) => {
-            if (slug === "\u0000watchlist") return watchlistFallback;
+            if (slug === "\u0000watchlist") {
+              return includeItems ? watchlistFallback : { ...watchlistFallback, items: undefined };
+            }
             const raw = await getCreatorList(env, auth.username, slug);
             if (!raw) return null;
             try {
@@ -1707,7 +1731,10 @@
                 slug,
                 name: data.name,
                 type: data.type,
-                items: data.items || [],
+                // Omitted unless asked for -- see includeItems above. The key
+                // is left off entirely rather than set to [], so a client that
+                // reads it can tell "not sent" from "empty list".
+                items: includeItems ? (data.items || []) : undefined,
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
@@ -1794,6 +1821,93 @@
         });
       }
       return jsonPrivate({ ...listsPayload, version: listsVersion });
+    }
+
+    // /api/creator/lists/items  (POST)
+    //   { creatorName, creatorKey, slugs: [...] } -> { ok, lists: [{ slug, items, itemCount, updatedAt }] }
+    //
+    // The per-list read that lets /api/creator/lists stop returning `items`.
+    // The dashboard asks for the contents of only the slugs whose updatedAt
+    // it does not already hold, so a re-render after a one-list edit costs
+    // one list's items instead of every list's.
+    //
+    // Bounded the same way the paged endpoint is: at most
+    // CREATOR_LIST_ITEMS_BATCH_MAX slugs per call, so the KV cost is set by
+    // the request rather than by what the account owns. Over the cap is a
+    // 400, not a silent truncation -- a caller that got back fewer lists than
+    // it asked for and could not tell would render them empty.
+    if (path === "/api/creator/lists/items" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+
+      const rawSlugs = Array.isArray(body.slugs) ? body.slugs : [];
+      // De-duplicated before the cap is applied, so a caller that repeats a
+      // slug spends one read for it and cannot be refused for a length its
+      // own duplicates produced.
+      const slugs = [...new Set(rawSlugs.filter((sl) => typeof sl === "string" && sl))];
+      if (!slugs.length) return jsonPrivate({ ok: true, lists: [] });
+      if (slugs.length > CREATOR_LIST_ITEMS_BATCH_MAX) {
+        return json({
+          ok: false,
+          error: `Too many lists in one request (max ${CREATOR_LIST_ITEMS_BATCH_MAX}).`,
+        }, 400);
+      }
+
+      const out = (
+        await Promise.all(
+          slugs.map(async (slug) => {
+            const raw = await getCreatorList(env, auth.username, slug);
+            if (raw) {
+              try {
+                const data = JSON.parse(raw);
+                const items = Array.isArray(data.items) ? data.items : [];
+                return {
+                  slug,
+                  items,
+                  itemCount: items.length,
+                  updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
+                };
+              } catch {
+                return null;
+              }
+            }
+            // The same Watchlist fallback /api/creator/lists applies: when no
+            // creatorlist: record exists the tracking blob is the only place
+            // the Watchlist lives, and the dashboard shows it from there. If
+            // this endpoint did not mirror that, the one list most accounts
+            // have would be the one that came back empty.
+            if (slug !== "watchlist") return null;
+            const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+            if (!trackingRaw) return null;
+            try {
+              const tb = JSON.parse(trackingRaw);
+              if (!Array.isArray(tb.watchlist)) return null;
+              return {
+                slug,
+                items: tb.watchlist,
+                itemCount: tb.watchlist.length,
+                updatedAt: Number.isFinite(tb.updatedAt) ? tb.updatedAt : undefined,
+              };
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter(Boolean);
+
+      // jsonPrivate, not json: this is one account's list contents. The
+      // /api/creator/ prefix in isPrivateApiPath() already forces no-store on
+      // it, which is the point of that choke point -- a route added later
+      // cannot forget. This says so at the route as well, the way its
+      // siblings do.
+      return jsonPrivate({ ok: true, lists: out });
     }
 
     // /api/creator/lists/save  (POST)
@@ -3313,6 +3427,13 @@
     //   { creatorName, creatorKey, slug, shared } -> { ok, shared: {...} }
     //   { creatorName, creatorKey } (no slug)     -> { ok, shared: {...} }  (read current state)
     //
+    // API-ONLY, deliberately. Nothing in the shipped UI calls this, which the
+    // 2026-09-08 audit listed under dead code with the note "keep the route,
+    // add the UI or document it as API-only". Documented: see README's
+    // "API-only endpoints". It is authenticated and it is the only way to make
+    // these three shelves public at all, so removing it would remove the
+    // feature rather than tidy it up.
+    //
     // Owner-controlled opt-in for exposing Watchlist / Watch History /
     // Continue Watching at the public /lists/:username/:slug address.
     // Those three come out of the private `creatorsynctracking:` blob,
@@ -4562,6 +4683,11 @@
             max: PUBLIC_INDEX_MAX,
             truncated: idx.entries.length >= PUBLIC_INDEX_MAX,
             updatedAt: idx.updatedAt || null,
+            // Which layout answered. A deployment upgrading in place serves
+            // from the pre-shard key until its next full publish converts it,
+            // and "is that conversion done" is exactly the kind of question
+            // this panel exists to answer.
+            shards: idx.sharded ? PUBLIC_INDEX_SHARDS : 1,
           };
         }
       } catch (e) {
@@ -5474,10 +5600,38 @@ export default {
     // empty API key just because this isolate's first event happened to be a
     // cron tick rather than a request. See applyEnvApiKeys.
     applyEnvApiKeys(env);
+    // How many outbound fetches this tick may spend, and how it is split.
+    //
+    // Measured at 186 for one tick, against the free plan's 50 -- so on a free
+    // Worker the invocation was terminated and Continue Watching never picked
+    // up a single new episode. See CRON_SUBREQUEST_BUDGET (00_constants.js)
+    // for why the two halves are budgeted differently and why the default is
+    // the free-plan number.
+    const cronEnvBudget = parseInt(env && env.CRON_SUBREQUEST_BUDGET, 10);
+    const cronBudget = Number.isFinite(cronEnvBudget) && cronEnvBudget >= CRON_EPISODE_CHECK_FETCHES
+      ? cronEnvBudget
+      : CRON_SUBREQUEST_BUDGET;
+    const episodeBudget = Math.max(
+      CRON_EPISODE_CHECK_FETCHES,
+      Math.floor(cronBudget * CRON_EPISODE_CHECK_SHARE)
+    );
+    // The episode sweep no longer races the pre-warm.
+    //
+    // Both spend outbound fetches, and the pre-warm spends far more of them.
+    // Interleaved, a pre-warm's fetch storm could take the invocation past the
+    // cap before the sweep had written its cursor -- so the sweep lost its
+    // work AND its position, which is what happened on every free-plan tick.
+    // Chaining the pre-warm behind it means the thing a person actually sees
+    // has already landed in KV before anything expensive begins.
+    //
+    // Only those two are ordered. The other two are started immediately, as
+    // they always were: neither issues outbound fetches, and holding the index
+    // rebuild behind a TMDB sweep would delay it for no reason.
+    const episodeSweep = guard("checkForNewEpisodes", checkForNewEpisodes(env, episodeBudget));
     ctx.waitUntil(
       Promise.all([
-        guard("checkForNewEpisodes", checkForNewEpisodes(env)),
-        guard("prewarmSharedCatalogs", prewarmSharedCatalogs(env, ctx)),
+        episodeSweep,
+        guard("prewarmSharedCatalogs", episodeSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

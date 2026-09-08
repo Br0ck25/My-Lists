@@ -4,7 +4,13 @@ import vm from "node:vm";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { call, createUser, freshIsolate, lapseCreatorTombstone, makeD1, makeEnv, makeKv, nextIp, worker } from "./harness.mjs";
+import { call, createUser, freshIsolate, hasPublicIndex, isPublicIndexKey, lapseCreatorTombstone, makeD1, makeEnv, makeKv, nextIp, publicIndexEntries, publicIndexSnapshot, runScheduledTick, seedAnonPublishedList, worker } from "./harness.mjs";
+
+// The slug the removed publish route derived from a name, for the tests that
+// used to let it do that for them.
+function slugifyForTest(name) {
+  return String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
 
 async function adminCookie(env) {
   const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
@@ -672,71 +678,60 @@ describe("audit fix: credential endpoints bound guesses across rolling windows",
 // Past the bound that is a slug which is taken, and the write went straight
 // over the existing list.
 describe("audit fix: slug allocation never lands on a taken slug", () => {
-  it("does not overwrite an existing published list once the numbered range fills", async () => {
-    const kv = makeKv();
-    kv._store.set("publishedlist:user:movies", JSON.stringify({ name: "Movies", items: [] }));
-    for (let i = 2; i <= 500; i++) {
-      kv._store.set(`publishedlist:user:movies-${i}`, JSON.stringify({
-        name: "Movies", type: "movie", visibility: "public",
-        items: [{ id: `tt-EXISTING-${i}`, name: `someone else's list ${i}` }],
-      }));
-    }
-    const env = makeEnv({ CONFIGS: kv });
-    const before = kv._store.get("publishedlist:user:movies-500");
-
-    const r = await call(env, "/api/publish-list", {
-      method: "POST",
-      json: { name: "Movies", type: "movie", items: [{ id: "tt-MINE" }], visibility: "public" },
-    });
-    assert.equal(r.body.ok, true, r.body.error);
-    assert.equal(kv._store.get("publishedlist:user:movies-500"), before,
-      "publishing over a full numbered range destroyed an existing list");
-    // Whatever slug it did hand back must be free and must be where the new
-    // list actually landed.
-    const mine = JSON.parse(kv._store.get(`publishedlist:user:${r.body.listName}`));
-    assert.equal(mine.items[0].id, "tt-MINE");
-    assert.match(r.body.url, new RegExp(`/lists/user/${r.body.listName}$`));
-  });
-
+  // The anonymous half of this used to be driven through /api/publish-list,
+  // which 1.5.3 removed. pickFreeSlug is shared, so the creator route below
+  // covers the same allocator -- what these two keep is the cost property and
+  // the tidy-numbering property, which nothing else asserts.
   it("allocates a slug in constant KV reads however crowded the name is", async () => {
-    // Each numbered attempt used to be its own KV read, so one publish of a
-    // heavily-collided name cost ~501 subrequests -- half the per-invocation
-    // budget, on an unauthenticated endpoint, in a state anyone could
-    // manufacture by publishing the same name repeatedly.
-    async function readsForPublish(existing) {
-      const kv = makeKv();
-      kv._store.set("publishedlist:user:movies", "{}");
-      for (let i = 2; i <= existing; i++) kv._store.set(`publishedlist:user:movies-${i}`, "{}");
+    // Each numbered attempt used to be its own KV read, so one save of a
+    // heavily-collided name cost ~501 KV operations -- half of Cloudflare's
+    // per-invocation budget, in a state anyone could manufacture by saving
+    // the same name repeatedly.
+    async function readsForSave(existing) {
+      const env = makeEnv();
+      const u = await createUser(env, "slugcost" + existing);
+      const order = ["movies"];
+      await env.CONFIGS.put(`creatorlist:${u.creatorName}:movies`, "{}");
+      for (let i = 2; i <= existing; i++) {
+        order.push(`movies-${i}`);
+        await env.CONFIGS.put(`creatorlist:${u.creatorName}:movies-${i}`, "{}");
+      }
+      await env.CONFIGS.put(`creatorlistorder:${u.creatorName}`, JSON.stringify({ order }));
       let reads = 0;
-      const realGet = kv.get.bind(kv);
-      kv.get = async (...a) => { reads++; return realGet(...a); };
-      const env = makeEnv({ CONFIGS: kv });
-      const r = await call(env, "/api/publish-list", {
+      const realGet = env.CONFIGS.get.bind(env.CONFIGS);
+      env.CONFIGS.get = async (...a) => { reads++; return realGet(...a); };
+      const r = await call(env, "/api/creator/lists/save", {
         method: "POST",
-        json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+        json: {
+          creatorName: u.creatorName, creatorKey: u.creatorKey,
+          name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public",
+        },
       });
       assert.equal(r.body.ok, true, r.body.error);
       return reads;
     }
-    const few = await readsForPublish(1);
-    const many = await readsForPublish(499);
+    const few = await readsForSave(1);
+    const many = await readsForSave(499);
     assert.ok(many <= few + 20, `499 collisions cost ${many} KV reads vs ${few} for one -- the scan is still linear`);
-    assert.ok(many < 100, `one publish spent ${many} KV reads`);
+    assert.ok(many < 100, `one save spent ${many} KV reads`);
   });
 
   it("keeps tidy numbered slugs for the ordinary case", async () => {
     // The random suffix is the fallback, not the default: a second list of
     // the same name should still get "-2", not a token.
     const env = makeEnv();
-    const first = await call(env, "/api/publish-list", {
-      method: "POST", json: { name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public" },
+    const u = await createUser(env, "slugtidy");
+    const save = (items) => call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name: "Movies", type: "movie", items, visibility: "public",
+      },
     });
-    const second = await call(env, "/api/publish-list", {
-      method: "POST", ip: nextIp(),
-      json: { name: "Movies", type: "movie", items: [{ id: "tt2" }], visibility: "public" },
-    });
-    assert.equal(first.body.listName, "movies");
-    assert.equal(second.body.listName, "movies-2");
+    const first = await save([{ id: "tt1" }]);
+    const second = await save([{ id: "tt2" }]);
+    assert.equal(first.body.slug, "movies");
+    assert.equal(second.body.slug, "movies-2");
   });
 
   it("does not overwrite a creator's own list once their numbered range fills", async () => {
@@ -1123,9 +1118,7 @@ describe("bug: a stale public index never repaired itself", () => {
   async function runCron(env, kv, maxTicks = 40) {
     for (let t = 1; t <= maxTicks; t++) {
       kv._store.delete("lock:publiclistindex");
-      const pending = [];
-      await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
-      await Promise.all(pending);
+      await runScheduledTick(env);
       if (!kv._store.has("index:publiclists:build")) return t;
     }
     return -1;
@@ -1153,13 +1146,11 @@ describe("bug: a stale public index never repaired itself", () => {
     const { kv, entries } = seedWithPhantoms(3);
     kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
     const env = makeEnv({ CONFIGS: kv });
-    const snapshot = kv._store.get("index:publiclists");
+    const snapshot = publicIndexSnapshot(kv);
 
-    const pending = [];
-    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
-    await Promise.all(pending);
+    await runScheduledTick(env);
 
-    assert.equal(kv._store.get("index:publiclists"), snapshot, "a fresh index was rebuilt needlessly");
+    assert.equal(publicIndexSnapshot(kv), snapshot, "a fresh index was rebuilt needlessly");
   });
 
   it("keeps serving the old index while a multi-chunk refresh is in flight", async () => {
@@ -1509,11 +1500,10 @@ describe("the cold-index directory advertises reachable urls", () => {
   // runs on a fresh deployment and for the whole of the first index rebuild.
   it("points an anonymous list at /lists/user/<slug>, and that url resolves", async () => {
     const env = makeEnv({ CONFIGS: makeKv() });
-    const pub = await call(env, "/api/publish-list", {
-      method: "POST",
-      json: { name: "Anon List", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
-    });
-    assert.equal(pub.body.ok, true);
+    // Seeded straight into KV: /api/publish-list was removed in 1.5.3, but
+    // every read path still serves the records it left behind, which is what
+    // this test is about. See seedAnonPublishedList.
+    const pub = seedAnonPublishedList(env, "anon-list", { name: "Anon List", items: [{ id: "tt0111161" }] });
     // Drop the index so the legacy scan is what answers.
     for (const k of [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("index:"))) {
       env.CONFIGS._store.delete(k);
@@ -1524,7 +1514,7 @@ describe("the cold-index directory advertises reachable urls", () => {
     assert.equal(dir.body.lists.length, 1);
     const entry = dir.body.lists[0];
     assert.equal(entry.creator, "Anonymous", "the display label stays Anonymous");
-    assert.ok(entry.url.endsWith(`/lists/user/${pub.body.listName}`), `url was ${entry.url}`);
+    assert.ok(entry.url.endsWith(`/lists/user/${pub.slug}`), `url was ${entry.url}`);
     assert.ok(entry.updatedAt, "an anonymous list stores publishedAt, which the fallback must read");
 
     const followed = await call(env, new URL(entry.url).pathname + ".json");
@@ -1643,13 +1633,13 @@ describe("directory pagination", () => {
         items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
       }));
     }
-    assert.equal(await kv.get("index:publiclists"), null);
+    assert.equal(hasPublicIndex(kv), false);
 
     const cookie = await adminCookie(env);
     const r = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
     assert.equal(r.body.ok, true);
     assert.equal(r.body.count, n);
-    assert.notEqual(await kv.get("index:publiclists"), null);
+    assert.equal(hasPublicIndex(kv), true);
 
     // Now served straight from the index, no bounded-scan fallback needed.
     const listing = await call(env, "/lists/public.json?limit=500");
@@ -1667,14 +1657,14 @@ describe("directory pagination", () => {
         items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
       }));
     }
-    assert.equal(await kv.get("index:publiclists"), null);
+    assert.equal(hasPublicIndex(kv), false);
 
-    const pending = [];
-    const ctx = { waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); } };
-    await worker.scheduled({}, env, ctx);
-    await Promise.all(pending);
+    // Drained in rounds: advancePublicListIndexBuild registers the rebuild
+    // chunk with a SECOND ctx.waitUntil once it is already running, so a
+    // single snapshot of the queue misses it. See runScheduledTick.
+    await runScheduledTick(env);
 
-    assert.notEqual(await kv.get("index:publiclists"), null);
+    assert.equal(hasPublicIndex(kv), true);
     const listing = await call(env, "/lists/public.json?limit=500");
     assert.equal(listing.body.total, n);
   });
@@ -1735,7 +1725,7 @@ describe("audit fix: the public list index rebuilds at any scale", () => {
       kv._resetInvocation();
       kv._store.delete("lock:publiclistindex");
       await call(env, "/lists/public.json");
-      if (kv._store.has("index:publiclists")) return tick;
+      if (hasPublicIndex(kv)) return tick;
     }
     return -1;
   }
@@ -1758,9 +1748,11 @@ describe("audit fix: the public list index rebuilds at any scale", () => {
   it("survives invisible records that cost a read but never reach the directory", async () => {
     // rebuildPublicListIndex must read a record before it can test
     // visibility, so a private list costs the same as a public one.
-    // /api/publish-list is unauthenticated and its records default to
+    // /api/publish-list was unauthenticated and its records defaulted to
     // private, which made this a way to break the directory on purpose:
-    // ~900 of them took a 20-list deployment past the limit for good.
+    // ~900 of them took a 20-list deployment past the limit for good. The
+    // route is gone as of 1.5.3; the records it left behind are not, and the
+    // rebuild still has to read every one of them.
     const kv = cappedKv({}, 1000);
     seedPublicLists(kv._store, 20);
     for (let i = 0; i < 900; i++) {
@@ -1787,12 +1779,12 @@ describe("audit fix: the public list index rebuilds at any scale", () => {
     // A partial scan must never be published as though it were complete,
     // and the resume state must not outlive the build that used it.
     assert.equal(kv._store.has("index:publiclists:build"), false, "build state leaked");
-    const settled = kv._store.get("index:publiclists");
+    const settled = publicIndexSnapshot(kv);
     for (let i = 0; i < 3; i++) {
       kv._resetInvocation();
       await call(env, "/lists/public.json");
     }
-    assert.equal(kv._store.get("index:publiclists"), settled, "a completed index was rebuilt needlessly");
+    assert.equal(publicIndexSnapshot(kv), settled, "a completed index was rebuilt needlessly");
   });
 
   it("restarts cleanly from unparseable or stale resume state", async () => {
@@ -1819,11 +1811,11 @@ describe("audit fix: the public list index rebuilds at any scale", () => {
     seedPublicLists(kv._store, n);
     const env = makeEnv({ CONFIGS: kv });
 
-    for (let round = 0; round < 60 && !kv._store.has("index:publiclists"); round++) {
+    for (let round = 0; round < 60 && !hasPublicIndex(kv); round++) {
       kv._store.delete("lock:publiclistindex");
       await Promise.all([0, 1, 2, 3, 4].map(() => call(env, "/lists/public.json")));
     }
-    const entries = JSON.parse(kv._store.get("index:publiclists") || '{"entries":[]}').entries;
+    const entries = publicIndexEntries(kv);
     assert.equal(entries.length, n);
     assert.equal(new Set(entries.map((e) => e.id)).size, n, "duplicate entries in the index");
   });
@@ -2970,43 +2962,11 @@ describe("audit fix 2: a like cannot revert a concurrent list save", () => {
 });
 
 describe("audit fix 4: unauthenticated permanent writes are bounded", () => {
-  it("rejects an oversized published list instead of storing it", async () => {
-    const env = makeEnv();
-    const items = Array.from({ length: 20000 }, (_, i) => ({ id: "tt" + i, title: "X".repeat(200) }));
-    const r = await call(env, "/api/publish-list", {
-      method: "POST",
-      json: { name: "spam list", type: "movie", items },
-    });
-    assert.equal(r.status, 413);
-    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0);
-  });
-
-  it("still publishes a realistically large list", async () => {
-    const env = makeEnv();
-    // Larger than the biggest real account list observed (~1,200 items).
-    const items = Array.from({ length: 2000 }, (_, i) => ({ id: "tt" + i }));
-    const r = await call(env, "/api/publish-list", {
-      method: "POST",
-      json: { name: "Big But Real", type: "movie", items },
-    });
-    assert.equal(r.body.ok, true, `expected a normal publish to succeed, got ${JSON.stringify(r.body).slice(0, 200)}`);
-    assert.equal(JSON.parse(env.CONFIGS._store.get("publishedlist:user:big-but-real")).items.length, 2000,
-      "and it must be stored in full, not silently truncated");
-  });
-
-  it("rate-limits repeated anonymous publishes from one IP", async () => {
-    const env = makeEnv();
-    const ip = nextIp();
-    let limited = 0;
-    for (let i = 0; i < 15; i++) {
-      const r = await call(env, "/api/publish-list", {
-        method: "POST", ip,
-        json: { name: "list " + i, type: "movie", items: [{ id: "tt1" }] },
-      });
-      if (r.status === 429) limited++;
-    }
-    assert.ok(limited > 0, "expected the per-IP bucket to reject some of 15 rapid publishes");
-  });
+  // The three anonymous-publish cases that used to open this block went with
+  // /api/publish-list itself in 1.5.3 -- an unbounded write is not something to
+  // keep bounding once nothing can reach it. /api/save is the only
+  // unauthenticated permanent write left, and the route's absence is pinned
+  // below ("the removed anonymous publish route").
 
   it("rejects an oversized install config instead of storing it", async () => {
     const env = makeEnv();
@@ -3275,37 +3235,31 @@ describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
   // unlocked an unlimited 60-id fan-out against this Worker's budget.
   // The correct property is a HIGHER ceiling, not the absence of one.
   it("gives bring-your-own-key callers more headroom on /api/details/batch, not an exemption", async () => {
+    // Charged in IDS since 1.5.3, not requests. The ceilings were 60 and 240
+    // REQUESTS a minute while one request carried up to 60 ids; now that the
+    // subrequest budget can split a refresh across invocations, counting
+    // requests would have cut the real ceiling by the number of chunks. 3,600
+    // and 14,400 ids are the same ceilings in the unit the endpoint spends.
     const env = makeEnv();
-    const ip = nextIp();
-    let sharedLimited = 0;
-    for (let i = 0; i < 70; i++) {
-      const r = await call(env, "/api/details/batch", { method: "POST", ip, json: { ids: ["tt1"] } });
-      if (r.status === 429) sharedLimited++;
-    }
-    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+    const spend = async (used, extra = {}) => {
+      const ip = nextIp();
+      await env.CONFIGS.put(`ratelimit:detailsbatch:${ip}`, String(used));
+      return call(env, "/api/details/batch", { method: "POST", ip, json: { ids: ["tt1"], ...extra } });
+    };
 
-    // The headroom the exemption existed to give is preserved: a caller with
-    // their own key sails past the shared-key ceiling.
-    const ownKeyIp = nextIp();
-    let ownKeyLimited = 0;
-    for (let i = 0; i < 70; i++) {
-      const r = await call(env, "/api/details/batch", {
-        method: "POST", ip: ownKeyIp, json: { ids: ["tt1"], tmdbKey: "user-own-key" },
-      });
-      if (r.status === 429) ownKeyLimited++;
-    }
-    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+    assert.notEqual((await spend(3599)).status, 429, "under the shared ceiling must still be served");
+    assert.equal((await spend(3600)).status, 429, "shared-key callers should hit the limit");
 
-    // ...but it is a ceiling, not an exemption.
-    const floodIp = nextIp();
-    let floodLimited = 0;
-    for (let i = 0; i < 260; i++) {
-      const r = await call(env, "/api/details/batch", {
-        method: "POST", ip: floodIp, json: { ids: ["tt1"], tmdbKey: "anything-at-all" },
-      });
-      if (r.status === 429) floodLimited++;
-    }
-    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
+    // The headroom the old exemption existed to give is preserved: a caller
+    // with their own key sails past the shared-key ceiling.
+    assert.notEqual((await spend(3600, { tmdbKey: "user-own-key" })).status, 429,
+      "a caller with their own key should still clear the shared-key ceiling");
+
+    // ...but it is a ceiling, not an exemption. Bringing your own key means
+    // you are spending your own TMDB quota; it never meant you were spending
+    // your own subrequests.
+    assert.equal((await spend(14400, { tmdbKey: "anything-at-all" })).status, 429,
+      "any non-empty tmdbKey still bought unlimited fan-out");
   });
 
   it("gives bring-your-own-key callers more headroom on /api/recommendations, not an exemption", async () => {
@@ -3447,8 +3401,11 @@ describe("audit fix 10: admin Community Lists ranks by likes, not by key order",
     let gets = 0;
     const og = env.CONFIGS.get.bind(env.CONFIGS);
     env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
-    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
-    assert.ok(gets < 20, `expected a handful of KV reads, got ${gets}`);
+    // The directory index is 32 shards since 1.5.3, so reading it costs 32
+    // gets. What this test is about is that the panel does NOT spend one get
+    // per candidate list: 119 candidates, a bound well under that.
+    assert.ok(gets < 40, `expected the index read and little else, got ${gets}`);
+    assert.ok(gets < 119, "the panel is reading one key per candidate again");
   });
 });
 
@@ -3952,8 +3909,12 @@ describe("duplicate lists: creatorlistorder: is not the last word on what exists
     const slugs = (r.body.lists || []).map((l) => l.slug).sort();
     assert.deepEqual(slugs, ["coming-of-age", "food-network", "hgtv"],
       "records with no order entry were dropped from the dashboard, which is what made the client re-upload them");
-    const items = (r.body.lists || []).find((l) => l.slug === "hgtv");
-    assert.equal(items.items.length, 1, "a recovered list must come back with its items, not as an empty shell");
+    const recovered = (r.body.lists || []).find((l) => l.slug === "hgtv");
+    // itemCount, not items: the route no longer ships the contents (see
+    // CREATOR_LIST_ITEMS_BATCH_MAX). What the recovery has to prove is that
+    // the record was READ, not that its bytes came down the wire -- and an
+    // empty shell would report 0 here.
+    assert.equal(recovered.itemCount, 1, "a recovered list must come back with its items, not as an empty shell");
   });
 
   it("repairs the order key so the drift does not persist", async () => {
@@ -4754,7 +4715,7 @@ describe("A7/A8: unpublishing must actually remove a list from public discovery"
     assert.equal((await call(env, "/lists/public.json")).body.lists.length, 1);
 
     env.CONFIGS._hooks.beforePut = async (key) => {
-      if (key === "index:publiclists") throw new Error("KV put failed");
+      if (isPublicIndexKey(key)) throw new Error("KV put failed");
     };
     const un = await call(env, "/api/creator/lists/save", {
       method: "POST",
@@ -4781,10 +4742,7 @@ describe("A7/A8: unpublishing must actually remove a list from public discovery"
       json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
     });
     const cookie = await adminCookie(env);
-    const inIndex = () => {
-      const raw = kv._store.get("index:publiclists");
-      return !!raw && JSON.parse(raw).entries.some((e) => e.id === "c:alice7:family-photos");
-    };
+    const inIndex = () => publicIndexEntries(kv).some((e) => e.id === "c:alice7:family-photos");
 
     let done = false;
     for (let i = 0; i < 50 && !done; i++) {
@@ -5167,7 +5125,87 @@ describe("AIII fix: /api/creator/lists pages instead of reading every list", () 
     assert.equal(r.body.lists.length, 6);
     assert.equal(r.body.hasMore, false);
     assert.equal(r.body.total, 6);
-    assert.ok(Array.isArray(r.body.lists[0].items), "items are still returned -- dropping them needs a client change");
+    assert.equal(r.body.lists[0].items, undefined, "the contents are no longer shipped by this route");
+    assert.equal(typeof r.body.lists[0].itemCount, "number", "itemCount is what replaces them");
+  });
+
+  // --- AIII-15, second half: the transfer, not just the op count -----------
+  //
+  // Paging bounded the KV operations. The response still carried every list's
+  // full items array -- 15.08 MB at 1,200 lists, re-sent after every save,
+  // delete and tab switch.
+  it("does not ship item contents, and says how many there are", async () => {
+    const { env, K } = await accountWith(3);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    for (const l of r.body.lists) {
+      assert.equal(l.items, undefined, "items must not be in the paged response");
+      assert.equal(typeof l.itemCount, "number");
+    }
+    const withItems = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, includeItems: true },
+    });
+    for (const l of withItems.body.lists) {
+      assert.ok(Array.isArray(l.items), "includeItems is the fallback shape and must still work");
+      assert.equal(l.items.length, l.itemCount);
+    }
+  });
+
+  it("serves the contents from /api/creator/lists/items, by slug", async () => {
+    const { env, K } = await accountWith(3);
+    const meta = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const slugs = meta.body.lists.map((l) => l.slug);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.lists.length, slugs.length);
+    for (const l of r.body.lists) {
+      assert.ok(Array.isArray(l.items));
+      assert.equal(l.items.length, l.itemCount);
+      // The version the client caches on. Without it every render refetches.
+      assert.equal(typeof l.updatedAt, "number");
+    }
+    // no-store, like every other per-account answer.
+    assert.match(r.headers.get("cache-control") || "", /no-store/);
+  });
+
+  it("refuses a batch over the cap instead of truncating it", async () => {
+    const { env, K } = await accountWith(1);
+    const many = Array.from({ length: 101 }, (_, i) => "slug-" + i);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: many },
+    });
+    assert.equal(r.status, 400, "a truncated answer would render the missing lists empty");
+    assert.equal(r.body.ok, false);
+  });
+
+  it("de-duplicates slugs before applying the cap", async () => {
+    const { env, K } = await accountWith(1);
+    const meta = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const slug = meta.body.lists[0].slug;
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: Array.from({ length: 150 }, () => slug) },
+    });
+    assert.equal(r.status, 200, "150 copies of one slug is one read, not 150");
+    assert.equal(r.body.lists.length, 1);
+  });
+
+  it("needs the account's own key", async () => {
+    const { env, K } = await accountWith(1);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { creatorName: K.creatorName, creatorKey: "wrong-key", slugs: ["anything"] },
+    });
+    assert.equal(r.status, 401);
+  });
+
+  it("spends a bounded number of KV operations however many lists the account owns", async () => {
+    const { env, kv, K } = await accountWith(400);
+    const counter = countOps(kv);
+    await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: ["l0000", "l0001", "l0002"] },
+    });
+    assert.ok(counter.ops < 20,
+      `three slugs against a 400-list account spent ${counter.ops} KV operations -- cost must track the request`);
   });
 });
 
@@ -5229,7 +5267,7 @@ describe("AIII fix: likes no longer rewrite the whole directory on every vote", 
 
     let indexWrites = 0;
     const realPut = kv.put.bind(kv);
-    kv.put = async (k, ...rest) => { if (k === "index:publiclists") indexWrites++; return realPut(k, ...rest); };
+    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) indexWrites++; return realPut(k, ...rest); };
 
     // Ten distinct voters in the same instant. Each one used to read, sort and
     // re-serialise the whole directory blob -- 4.45 MB of it at the entry cap
@@ -5264,59 +5302,481 @@ describe("AIII fix: likes no longer rewrite the whole directory on every vote", 
   });
 });
 
-// --- AIII-22: /api/publish-list is unauthenticated and writes permanently ---
-describe("AIII fix: the anonymous publish route is bounded for what it actually is", () => {
-  const pub = (env, extra) => call(env, "/api/publish-list", {
-    method: "POST", ip: nextIp(),
-    json: { name: "A List", type: "movie", visibility: "public", ...extra },
-  });
-
-  it("still publishes a realistically large list", async () => {
+// --- AIII-22: /api/publish-list was unauthenticated and wrote permanently ---
+//
+// Round 5 tightened it and left the keep-or-remove call to the maintainer,
+// who chose remove. What replaces those bound-checking tests is the one thing
+// that has to stay true: the route is gone, and everything that READS the
+// records it left behind still works.
+describe("AIII fix: the anonymous publish route is removed", () => {
+  it("no longer accepts a publish", async () => {
     const env = makeEnv();
-    const r = await pub(env, { items: Array.from({ length: 2000 }, (_, i) => ({ id: "tt" + i })) });
-    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
-  });
-
-  it("refuses the multi-megabyte payloads the old 2 MB ceiling allowed", async () => {
-    // An anonymous list has no owner to warn or delete, gets no TTL, and can
-    // only be removed by an operator by hand. 10 a minute at 2 MB each was
-    // 20 MB a minute of permanent unowned storage from one address.
-    const env = makeEnv();
-    const r = await pub(env, {
-      items: Array.from({ length: 3000 }, (_, i) => ({ id: "tt" + i, title: "X".repeat(400) })),
+    const r = await call(env, "/api/publish-list", {
+      method: "POST", ip: nextIp(),
+      json: { name: "A List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
     });
-    assert.equal(r.status, 413);
-    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0);
-  });
-
-  it("refuses entries that are not list items at all", async () => {
-    const env = makeEnv();
-    for (const items of [["just a string"], [null], [[1, 2]], [{ title: "no id" }], [{ id: "x".repeat(200) }]]) {
-      const r = await pub(env, { items });
-      assert.equal(r.status, 400, `expected ${JSON.stringify(items).slice(0, 40)} to be refused`);
-    }
+    assert.equal(r.status, 404, "an unauthenticated permanent write must not answer");
     assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0,
-      "nothing that cannot render should be able to occupy the namespace");
+      "and must not have written anything on the way to saying so");
   });
 
-  it("accepts an item identified by imdbId as well as id", async () => {
-    const env = makeEnv();
-    const r = await pub(env, { items: [{ imdbId: "tt0111161", title: "The Shawshank Redemption" }] });
-    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+  it("still serves, lists and searches the records that already exist", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    seedAnonPublishedList(env, "already-here", { name: "Already Here", items: [{ id: "tt0111161" }] });
+
+    const feed = await call(env, "/lists/user/already-here.json");
+    assert.equal(feed.status, 200, "an existing anonymous list must still resolve");
+    assert.equal(feed.body[0].imdbId, "tt0111161");
+
+    // Sec-Fetch-Mode: navigate is what tells this route a browser is asking;
+    // without it the same path answers with the Stremio feed, which is the
+    // other half of what still has to work. See isBrowserNavigation.
+    const page = await call(env, "/lists/user/already-here", { headers: { "Sec-Fetch-Mode": "navigate" } });
+    assert.equal(page.status, 200, "and its shared page must still render");
+    assert.ok(page.text.includes("Already Here"), "with the name it was published under");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.ok((dir.body.lists || []).some((l) => l.slug === "already-here"),
+      "and must still appear in the directory");
   });
 
-  it("holds one address to a tighter publish rate", async () => {
-    const env = makeEnv();
-    const ip = nextIp();
-    let accepted = 0;
-    for (let i = 0; i < 12; i++) {
-      const r = await call(env, "/api/publish-list", {
-        method: "POST", ip,
-        json: { name: "List " + i, type: "movie", items: [{ id: "tt1" }], visibility: "public" },
-      });
-      if (r.body.ok) accepted++;
+  it("still lets an admin remove one", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    seedAnonPublishedList(env, "removable", { name: "Removable" });
+    const cookie = await adminCookie(env);
+    const del = await call(env, "/admin/api/delete-published-list", {
+      method: "POST", cookie, json: { slug: "removable" },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body).slice(0, 200));
+    assert.equal(env.CONFIGS._store.get("publishedlist:user:removable"), undefined);
+  });
+});
+
+// --- AIII free-plan finding: /api/details/batch and the cron tick -----------
+//
+// Measured at 180 and 186 outbound fetches, against the free plan's 50. In
+// both cases the invocation is terminated, so on a free Worker the Airing Next
+// shelf could not refresh and Continue Watching never picked up an episode.
+describe("AIII fix: /api/details/batch fits an invocation's outbound-fetch budget", () => {
+  // A cold id costs several TMDB calls; a cached one costs nothing. The stub
+  // counts what actually goes out, which is what the budget is spent against.
+  function stubTmdbDetails() {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async (u) => {
+      calls++;
+      const href = typeof u === "string" ? u : (u && u.url) || "";
+      const body = href.includes("/find/")
+        ? { movie_results: [], tv_results: [{ id: 100, name: "Show" }] }
+        : { id: 100, name: "Show", seasons: [], episodes: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+  }
+
+  const coldIds = (n) => Array.from({ length: n }, (_, i) => "tt" + String(1000000 + i));
+
+  it("stays inside the free plan's 50 outbound fetches and says what it did not reach", async () => {
+    const env = await freshIsolate().then(() => makeEnv({ TMDB_API_KEY: "k" }));
+    const tmdb = stubTmdbDetails();
+    try {
+      const ids = coldIds(60);
+      const r = await call(env, "/api/details/batch", { method: "POST", json: { ids, type: "series" } });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+      assert.ok(tmdb.count() <= 48, `spent ${tmdb.count()} outbound fetches, over the free plan's budget`);
+      assert.equal(r.body.done, false, "a request it could not finish must say so");
+      assert.ok(r.body.remainingIds.length > 0, "and must name what is left");
+      // Nothing may be both answered and reported as remaining, and nothing
+      // may fall between the two -- that is the silent-loss failure.
+      const answered = Object.keys(r.body.results);
+      assert.equal(answered.length + r.body.remainingIds.length, ids.length);
+      assert.equal(new Set([...answered, ...r.body.remainingIds]).size, ids.length);
+    } finally {
+      tmdb.restore();
     }
-    assert.equal(accepted, 5, "5 permanent unowned records a minute, not 10");
+  });
+
+  it("does the whole batch in one call when the ids are already cached", async () => {
+    // The warm case is the common one and is the entire reason this batch
+    // route exists. Budgeting it against the ID count rather than against real
+    // upstream calls would have split every refresh for no reason: here the
+    // second pass runs on the FREE default, which could not have resolved
+    // these ids cold, and still returns all 60 in one invocation.
+    const w = await freshIsolate();
+    const tmdb = stubTmdbDetails();
+    try {
+      const ids = coldIds(60);
+      const ctx = { waitUntil() {} };
+      const post = (env) => w.fetch(new Request("https://example.test/api/details/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.5" },
+        body: JSON.stringify({ ids, type: "series" }),
+      }), env, ctx);
+
+      const paid = makeEnv({ TMDB_API_KEY: "k", DETAILS_BATCH_SUBREQUEST_BUDGET: "600" });
+      const first = await (await post(paid)).json();
+      assert.equal(first.done, true, "600 fetches is room for all 60 cold ids");
+      const spentCold = tmdb.count();
+      assert.ok(spentCold > 48, `precondition: cold ids must cost more than the free budget, spent ${spentCold}`);
+
+      const free = makeEnv({ TMDB_API_KEY: "k" });
+      const second = await (await post(free)).json();
+      assert.equal(second.done, true, "a warm batch must fit one invocation on either plan");
+      assert.equal(Object.keys(second.results).length, 60);
+      assert.equal(tmdb.count(), spentCold, "and must not spend the budget at all");
+    } finally {
+      tmdb.restore();
+    }
+  });
+
+  it("resumes across calls until nothing is left", async () => {
+    // The client loop's server-side contract: what one call could not reach
+    // is exactly what the next call is given, and the two never overlap or
+    // leave a gap. A dropped id is a show silently missing from Airing Next.
+    const w = await freshIsolate();
+    const env = makeEnv({ TMDB_API_KEY: "k" });
+    const tmdb = stubTmdbDetails();
+    try {
+      const ctx = { waitUntil() {} };
+      let pending = coldIds(60);
+      const seen = {};
+      let rounds = 0;
+      while (pending.length && rounds < 8) {
+        rounds++;
+        const res = await (await w.fetch(new Request("https://example.test/api/details/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.6" },
+          body: JSON.stringify({ ids: pending, type: "series" }),
+        }), env, ctx)).json();
+        assert.equal(res.ok, true);
+        Object.assign(seen, res.results);
+        if (res.done) { pending = []; break; }
+        pending = res.remainingIds;
+      }
+      assert.equal(pending.length, 0, "the resume loop never finished");
+      assert.equal(Object.keys(seen).length, 60, "every id must be answered exactly once across the rounds");
+      assert.ok(rounds > 1, "precondition: 60 cold ids must not have fitted one free-plan invocation");
+    } finally {
+      tmdb.restore();
+    }
+  });
+});
+
+describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
+  const chartEnv = (extra = {}) => ({
+    CONFIGS: makeKv(), TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m", ...extra,
+  });
+
+  function stubEverything() {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response(JSON.stringify({ results: [], data: [], episodes: [] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+  }
+
+  it("skips chart pre-warming when the budget cannot fit even one chart", async () => {
+    // One chart is ~105 outbound fetches (5 paged reads plus a detail call per
+    // item), so no free-plan budget can warm one. Issuing them anyway is what
+    // took the whole tick down -- and the episode sweep with it.
+    const env = chartEnv();
+    const net = stubEverything();
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => warnings.push(a.join(" "));
+    try {
+      await runScheduledTick(env);
+      assert.ok(warnings.some((w) => w.includes("chart pre-warming skipped")),
+        "a skipped pre-warm must say so rather than being silent");
+      assert.ok(net.count() <= 50, `one tick spent ${net.count()} outbound fetches on the free budget`);
+    } finally {
+      console.warn = realWarn;
+      net.restore();
+    }
+  });
+
+  it("warms the charts on a paid budget, exactly as it always did", async () => {
+    // A fresh isolate: chart results are memoised in module scope, so warming
+    // them here would leave a later test's tick with nothing to write.
+    const w = await freshIsolate();
+    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "10000" });
+    const net = stubEverything();
+    try {
+      await runScheduledTick(env, {}, w);
+      assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("cache:trakt:chart:")),
+        "a paid budget must still warm the whole chart list");
+      // The whole list fits, so nothing is left for a next tick to resume.
+      assert.equal(env.CONFIGS._store.get("cron:prewarm:cursor"), undefined);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("rotates through the charts when only some of them fit", async () => {
+    // A budget between one chart and all of them: every chart still gets
+    // warmed, just over more ticks. Re-warming the first few forever would be
+    // worse than not chunking at all.
+    const w = await freshIsolate();
+    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "500" });
+    const net = stubEverything();
+    try {
+      await runScheduledTick(env, {}, w);
+      const first = env.CONFIGS._store.get("cron:prewarm:cursor");
+      assert.ok(first && Number(first) > 0, `expected a resume position, got ${first}`);
+      await runScheduledTick(env, {}, w);
+      const second = env.CONFIGS._store.get("cron:prewarm:cursor");
+      assert.notEqual(second, first, "the next tick must carry on rather than re-warm the same slice");
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("sweeps fewer shows on a small budget, and the full 150 on a large one", async () => {
+    // The sweep is exactly two fetches per show, so this half chunks cleanly:
+    // a smaller slice per tick costs ticks, and there are 240 a day.
+    const seen = [];
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    assert.match(src, /const SHOW_CHECK_BUDGET = Number\.isFinite\(fetchBudget\)/,
+      "the sweep's slice must come from the budget it was handed");
+    assert.match(src, /Math\.min\(CRON_EPISODE_CHECK_MAX, Math\.floor\(fetchBudget \/ CRON_EPISODE_CHECK_FETCHES\)\)/,
+      "and must still cap at the 150 this sweep has always used");
+    void seen;
+  });
+});
+
+// --- AIII-19, second half: index:publiclists is 32 keys, not one -----------
+//
+// Every public save, publish and like did a read-modify-write of ONE key
+// holding the whole directory -- 4.45 MB at the 20,000-entry cap, against
+// KV's one-write-per-second-per-key limit on both plans.
+describe("AIII fix: the directory index is sharded", () => {
+  const SHARDS = 32;
+  const shardKeys = (kv) => [...kv._store.keys()].filter((k) => /^index:publiclists:s\d+$/.test(k));
+
+  async function seeded(n) {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "sharder");
+    for (let i = 0; i < n; i++) {
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: "sharder", creatorKey: u.creatorKey,
+          name: "List " + i, type: "movie", visibility: "public", items: [{ id: "tt" + i }],
+        },
+      });
+    }
+    await call(env, "/lists/public.json"); // materialise the index
+    return { kv, env, u };
+  }
+
+  it("publishes every shard, so an absent shard always means 'not sharded'", async () => {
+    // The invariant the single-shard write path depends on. If a full publish
+    // skipped empty buckets, a write could not tell an empty bucket from an
+    // un-migrated deployment, and would half-shard the directory.
+    const { kv } = await seeded(3);
+    assert.equal(shardKeys(kv).length, SHARDS, "a full publish must write all 32 keys");
+    assert.ok(kv._store.has("index:publiclists:meta"), "and the build marker");
+    assert.equal(kv._store.get("index:publiclists"), undefined,
+      "and must remove the pre-shard key, but only after the shards landed");
+  });
+
+  it("spreads the directory across the shards", async () => {
+    const { kv } = await seeded(40);
+    const counts = shardKeys(kv).map((k) => JSON.parse(kv._store.get(k)).entries.length);
+    assert.equal(counts.reduce((a, b) => a + b, 0), 40, "no entry may be lost in the split");
+    assert.ok(counts.filter((c) => c > 0).length > 8,
+      `40 lists landed in only ${counts.filter((c) => c > 0).length} buckets -- the hash is not spreading`);
+    assert.ok(Math.max(...counts) < 20, "one bucket is holding half the directory");
+  });
+
+  it("writes ONE shard for a like, not the whole directory", async () => {
+    const { kv, env } = await seeded(20);
+    const touched = new Set();
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) touched.add(k); return realPut(k, ...rest); };
+    const r = await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "sharder", slug: "list-0" },
+    });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+    assert.equal(touched.size, 1, `a one-number change rewrote ${touched.size} index keys`);
+  });
+
+  it("removes a list by touching only the shards its ids are in", async () => {
+    const { kv, env, u } = await seeded(20);
+    const touched = new Set();
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) touched.add(k); return realPut(k, ...rest); };
+    const r = await call(env, "/api/creator/lists/delete", {
+      method: "POST", json: { creatorName: "sharder", creatorKey: u.creatorKey, slug: "list-3" },
+    });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+    assert.equal(touched.size, 1, `one delete rewrote ${touched.size} index keys`);
+    assert.ok(!publicIndexEntries(kv).some((e) => e.id === "c:sharder:list-3"),
+      "and the entry must actually be gone");
+  });
+
+  it("serves the whole directory from the merged shards", async () => {
+    const { kv, env } = await seeded(25);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal(dir.body.total, 25, "the merge must return every shard's entries");
+    assert.equal(new Set(dir.body.lists.map((l) => l.slug)).size, 25, "and no duplicates");
+    void kv;
+  });
+
+  it("keeps serving a pre-shard index, and converts it on the next write", async () => {
+    // A deployment upgrading in place. The old key has to keep answering until
+    // a full publish converts it -- a directory that serves a fraction of
+    // itself is worse than one that is not sharded at all.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "legacyidx");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "legacyidx", creatorKey: u.creatorKey, name: "Old One", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    await call(env, "/lists/public.json"); // materialise the index
+    // Hand-write the pre-shard layout and clear the new one.
+    const entries = publicIndexEntries(kv);
+    assert.equal(entries.length, 1);
+    for (const k of [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"))) kv._store.delete(k);
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+
+    const before = await call(env, "/lists/public.json");
+    assert.equal(before.body.total, 1, "the pre-shard key must still be served");
+
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "legacyidx", creatorKey: u.creatorKey, name: "New One", type: "movie", visibility: "public", items: [{ id: "tt2" }] },
+    });
+    assert.equal(shardKeys(kv).length, SHARDS, "the first write after the upgrade must convert it");
+    assert.equal(kv._store.get("index:publiclists"), undefined);
+    const after = await call(env, "/lists/public.json");
+    assert.equal(after.body.total, 2, "and must carry both lists across");
+  });
+
+  it("restarts a build state written before the shards existed", async () => {
+    // The version marker the audit asked for: a v1 state's entries are fine,
+    // but they were gathered by code that would publish them to one key.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "buildver");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "buildver", creatorKey: u.creatorKey, name: "A List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    for (const k of [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"))) kv._store.delete(k);
+    kv._store.set("index:publiclists:build", JSON.stringify({
+      v: 1, phase: 1, cursor: "", pending: [], entries: [{ id: "c:nobody:ghost", slug: "ghost", name: "Ghost" }], names: {},
+    }));
+
+    for (let i = 0; i < 20 && !hasPublicIndex(kv); i++) {
+      kv._store.delete("lock:publiclistindex");
+      await call(env, "/lists/public.json");
+    }
+    const ids = publicIndexEntries(kv).map((e) => e.id);
+    assert.deepEqual(ids, ["c:buildver:a-list"],
+      "a v1 state must be discarded and rescanned, not half-applied");
+  });
+
+  it("tells the admin panel which layout is live", async () => {
+    const { kv, env } = await seeded(2);
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.publicIndex.shards, SHARDS);
+    assert.equal(r.body.publicIndex.entries, 2);
+    void kv;
+  });
+
+  it("drives the daily rebuild off the last FULL build, not the last write", async () => {
+    // Staleness used to be read from the index blob's own updatedAt, which
+    // every incremental write bumped -- so a busy deployment looked freshly
+    // built forever and never re-derived, which is exactly the deployment
+    // where stranded entries accumulate.
+    const { kv, env } = await seeded(3);
+    const meta = JSON.parse(kv._store.get("index:publiclists:meta"));
+    assert.ok(Number.isFinite(meta.builtAt));
+    const aged = Date.now() - 25 * 3600 * 1000;
+    kv._store.set("index:publiclists:meta", JSON.stringify({ ...meta, builtAt: aged }));
+    // An incremental write lands on a shard and must NOT reset the marker.
+    await call(env, "/api/lists/like", { method: "POST", ip: nextIp(), json: { username: "sharder", slug: "list-1" } });
+    assert.equal(JSON.parse(kv._store.get("index:publiclists:meta")).builtAt, aged,
+      "a like must not look like a rebuild");
+  });
+});
+
+// --- AIII LOW findings 20, 21 and 23 ----------------------------------------
+describe("AIII fix: the low-severity cleanup", () => {
+  it("does not 500 on a body field that is not a string", async () => {
+    // (body.name || "").trim() reached .trim on an object. It was the only
+    // uncaught 5xx in ~1,700 fuzzed requests, and the same shape sat at six
+    // more sites in the same file.
+    const env = makeEnv();
+    for (const bad of [{}, [], 5, true]) {
+      for (const field of ["name", "provider", "description", "privacy", "type"]) {
+        const r = await call(env, "/api/external-list/create", {
+          method: "POST", json: { provider: "trakt", name: "ok", [field]: bad },
+        });
+        assert.notEqual(r.status, 500, `${field}=${JSON.stringify(bad)} produced a 500`);
+      }
+    }
+  });
+
+  it("does not 500 on a non-string body field at the sibling sites either", async () => {
+    const env = makeEnv();
+    for (const path of ["/api/external-list/item-mutate", "/api/external-list/delete"]) {
+      const r = await call(env, path, { method: "POST", json: { provider: {}, target: [], listId: 1 } });
+      assert.notEqual(r.status, 500, `${path} produced a 500`);
+    }
+  });
+
+  it("answers reset-key failures with a status, not 200", async () => {
+    // Round 1 moved fourteen endpoints off "200 with ok:false" on an auth
+    // failure. This one kept it, so a client branching on the status code read
+    // a refused reset as a success.
+    const env = makeEnv();
+    const u = await createUser(env, "resetstatus", { recoveryAnswer: "blue horizon 42" });
+
+    const unknown = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: "nobody-here", recoveryAnswer: "blue" },
+    });
+    assert.equal(unknown.status, 401);
+
+    const wrong = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: u.creatorName, recoveryAnswer: "not the answer" },
+    });
+    assert.equal(wrong.status, 401);
+    // The message must stay identical across them, or the status pair becomes
+    // a way to ask whether an account exists.
+    assert.equal(wrong.body.error, unknown.body.error);
+
+    const ip = nextIp();
+    let throttled = null;
+    for (let i = 0; i < 14 && !throttled; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip, json: { username: "nobody-here", recoveryAnswer: "x" },
+      });
+      if (r.status === 429) throttled = r;
+    }
+    assert.ok(throttled, "the per-IP throttle must answer 429");
+
+    // The real answer still works, and still hands back a key.
+    const good = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: u.creatorName, recoveryAnswer: "blue horizon 42" },
+    });
+    assert.equal(good.status, 200, JSON.stringify(good.body).slice(0, 200));
+    assert.ok(good.body.creatorKey);
+  });
+
+  it("no longer ships runListSearch", async () => {
+    // The only function in the client bundle with neither an identifier
+    // reference nor an inline-handler reference.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "19_client-search-and-likes.js"), "utf8");
+    assert.ok(!/function runListSearch/.test(src), "dead function is back");
   });
 });
 
@@ -5785,11 +6245,7 @@ describe("Test-suite blind spots named by the audit", () => {
 
   it("the index rebuild picks up anonymously published lists, not only creator ones", async () => {
     const env = makeEnv({ CONFIGS: makeKv() });
-    const pub = await call(env, "/api/publish-list", {
-      method: "POST", ip: "198.51.77.7",
-      json: { name: "Anon Picks", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
-    });
-    assert.equal(pub.body.ok, true, JSON.stringify(pub.body));
+    seedAnonPublishedList(env, "anon-picks", { name: "Anon Picks", items: [{ id: "tt0111161" }] });
     const cookie = await adminCookie(env);
     let done = false;
     for (let i = 0; i < 20 && !done; i++) {
@@ -5879,10 +6335,8 @@ describe("N1/N2: a delete that did not delete must not report success", () => {
     await call(env, "/lists/public.json"); // materialise the directory index
     return u;
   };
-  const inDirectory = (kv, frag) => {
-    const raw = kv._store.get("index:publiclists");
-    return raw ? JSON.parse(raw).entries.some((e) => String(e.id).includes(frag)) : false;
-  };
+  const inDirectory = (kv, frag) =>
+    publicIndexEntries(kv).some((e) => String(e.id).includes(frag));
 
   it("lists/delete reports failure when the KV record could not be removed", async () => {
     const kv = makeKv();
@@ -5918,7 +6372,7 @@ describe("N1/N2: a delete that did not delete must not report success", () => {
       const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
       const user = "n2" + label.replace(/[^a-z]/g, "").slice(0, 12);
       const u = await seedPublicList(env, user);
-      kv._hooks.beforePut = async (k) => { if (k === "index:publiclists") throw new Error("KV unavailable"); };
+      kv._hooks.beforePut = async (k) => { if (isPublicIndexKey(k)) throw new Error("KV unavailable"); };
       const r = await run(env, user, u.creatorKey);
       kv._hooks.beforePut = null;
       // removeListsFromPublicIndex's own comment: "a caller that ignores a
@@ -5934,7 +6388,7 @@ describe("N1/N2: a delete that did not delete must not report success", () => {
     const kv = makeKv();
     const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
     const u = await seedPublicList(env, "n2serve");
-    kv._hooks.beforePut = async (k) => { if (k === "index:publiclists") throw new Error("KV unavailable"); };
+    kv._hooks.beforePut = async (k) => { if (isPublicIndexKey(k)) throw new Error("KV unavailable"); };
     await call(env, "/api/creator/lists/delete", { method: "POST", json: {
       creatorName: "n2serve", creatorKey: u.creatorKey, slug: "live-list",
     }});
@@ -6295,17 +6749,29 @@ describe("audit II §11.1: a provider answering 200 with nothing must not erase 
     const real = globalThis.fetch;
     globalThis.fetch = async () => { fetches++; return new Response(body, { status: 200, headers: { "content-type": "application/json" } }); };
     try {
-      const pending = [];
+      // Drained in rounds. The chart fetchers register their KV cache write
+      // with a SECOND ctx.waitUntil once they are already running, so a single
+      // snapshot of the queue returns before the cache has been written. See
+      // runScheduledTick, which does the same thing.
+      let queue = [];
       await w.scheduled({ cron: "x" }, env, {
-        waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+        waitUntil(p) { queue.push(Promise.resolve(p).catch(() => {})); },
       });
-      await Promise.all(pending);
+      for (let round = 0; round < 20 && queue.length; round++) {
+        const batch = queue;
+        queue = [];
+        await Promise.all(batch);
+      }
     } finally { globalThis.fetch = real; }
   };
 
   it("keeps the last non-empty copy of a shared chart", async () => {
     const kv = makeKv();
-    const env = { CONFIGS: kv, TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m" };
+    // CRON_SUBREQUEST_BUDGET is what wrangler.toml sets on a Workers Paid
+    // plan. Without it the tick gets the free-plan default, which cannot fit
+    // even one chart warm (~105 outbound fetches) and skips pre-warming
+    // altogether -- so this test would have nothing to assert against.
+    const env = { CONFIGS: kv, TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m", CRON_SUBREQUEST_BUDGET: "10000" };
     await tick(worker, env, goodTraktChart);
     const key = [...kv._store.keys()].find((k) => k.startsWith("cache:trakt:chart:"));
     assert.ok(key, "precondition: the prewarm cached a Trakt chart");
@@ -6405,13 +6871,11 @@ describe("N4: a new account starts clean however data got under its username", (
 // The audit's remaining open items, closed after the report.
 // ---------------------------------------------------------------------------
 describe("R1: an anonymously published list can be removed", () => {
-  // A fresh IP per publish. The anonymous bucket is 5/minute (it mints
-  // permanent, unowned records), and these tests are about the admin paging
-  // and delete contract, not about the bucket -- which has its own test.
-  const publish = (env, name) => call(env, "/api/publish-list", {
-    method: "POST", ip: nextIp(),
-    json: { name, type: "movie", items: [{ id: "tt1" }], visibility: "public" },
-  });
+  // Seeded straight into KV. /api/publish-list was removed in 1.5.3, but the
+  // admin browse-and-delete contract is precisely what has to keep working
+  // for the records it already wrote -- that was the whole argument for
+  // removing the route rather than leaving unowned writes reachable.
+  const publish = (env, name) => seedAnonPublishedList(env, slugifyForTest(name), { name });
 
   it("an admin can enumerate and delete them", async () => {
     const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
@@ -7453,7 +7917,7 @@ describe("the last open items from the 2026-09-05 audit", () => {
     const routes = fs.readFileSync(path.join(REPO_ROOT, "25_api-catalog-routes.js"), "utf8");
     assert.match(routes, /The id IS somebody's install\s*\n\s*\/\/ URL/,
       "no TTL on /api/save: expiring it breaks a live install months later");
-    assert.match(routes, /expiring it would break their link/,
-      "no TTL on /api/publish-list: the slug is a URL somebody has shared");
+    assert.match(routes, /\/api\/publish-list was removed in 1\.5\.3/,
+      "the removed route leaves a note saying what still reads its records");
   });
 });
