@@ -37,6 +37,26 @@ jobs:
       - name: Syntax check combined Worker
         run: node --check worker_entry_combined.js
 
+      # `node --check` above proves the file PARSES. It says nothing about
+      # whether the names in it exist, and this codebase is unusually exposed
+      # to that gap: 27 sources are concatenated into ONE scope, so a const
+      # declared inside one route's block is invisible to the next route's
+      # block while looking, in the source, like it is right there.
+      #
+      # Three live bugs came from exactly that, and two of them sat behind a
+      # bare catch, which is why 358 tests and five audits went past them:
+      #   isShow    -> /lists/curated/<slug> answered HTTP 500 on every request
+      #   clientId  -> Trakt OAuth silently never learned the user's username
+      #   listName  -> the only list-copy event in the app never fired
+      #
+      # Mutation-tested: reintroducing any one of the three fails this step.
+      - name: Every identifier resolves
+        run: |
+          npm install --no-save --no-audit --no-fund acorn@8.14.0 eslint-scope@8.2.0
+          node scope_check.mjs worker worker_entry_combined.js
+          node render_check.js rendered-scope.html > /dev/null
+          node scope_check.mjs page rendered-scope.html
+
       # node --check above only parses the outer JS file. The served page
       # is a giant template literal that renderBuilder() returns as a
       # STRING -- a syntax error in the inline <script> it contains (i.e.

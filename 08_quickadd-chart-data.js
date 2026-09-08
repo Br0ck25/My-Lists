@@ -515,3 +515,46 @@ function resolveChartSlug(slug) {
   return CHART_SLUG_REGISTRY[slug] || null;
 }
 
+// --- The curated shelves, in one place ---------------------------------------
+//
+// These twelve used to exist only as a literal inside buildQuickAddPresets
+// (16_client-row-core.js), so the /lists/curated/<slug> route had nothing to
+// look them up in and guessed instead:
+//
+//   const title = isShow ? "Recommended Shows" : "Recommended Movies";
+//
+// `isShow` was not declared anywhere, so that route threw a ReferenceError and
+// answered HTTP 500 on EVERY request -- and the client's own getListCleanPath
+// puts exactly that path in the address bar whenever one of these is opened,
+// so reloading or sharing any curated shelf landed on an error.
+//
+// A regex on the slug would have fixed the crash and still got the answer
+// wrong: "true-crime-mystery" is a series and contains neither "show" nor
+// "series". The type has to be looked up, not inferred -- so the list lives
+// here, is used by the route directly, and is embedded into the client (see
+// CURATED_LIST_ENTRIES in renderBuilder) so there is one copy rather than two
+// that can drift.
+const CURATED_LIST_ENTRIES = [
+  { slug: "recommended-movies", name: "Recommended Movies", type: "movie" },
+  { slug: "recommended-shows", name: "Recommended Shows", type: "series" },
+  { slug: "hidden-gems", name: "Curated: Hidden Gems", type: "movie" },
+  { slug: "top-rated-classics", name: "Curated: Top Rated Classics", type: "movie" },
+  { slug: "cult-favorites", name: "Curated: Cult Favorites", type: "movie" },
+  { slug: "binge-worthy-series", name: "Curated: Binge-Worthy Series", type: "series" },
+  { slug: "award-winners", name: "Curated: Award Winners", type: "movie" },
+  { slug: "feel-good-hits", name: "Curated: Feel-Good Hits", type: "movie" },
+  { slug: "action-thrills", name: "Curated: Action & Thrills", type: "movie" },
+  { slug: "sci-fi-journeys", name: "Curated: Sci-Fi Journeys", type: "movie" },
+  { slug: "family-movie-night", name: "Curated: Family Movie Night", type: "movie" },
+  { slug: "true-crime-mystery", name: "Curated: True Crime & Mystery", type: "series" },
+];
+
+const CURATED_LIST_REGISTRY = Object.fromEntries(CURATED_LIST_ENTRIES.map((e) => [e.slug, e]));
+
+// Null on an unknown slug, so a stale or hand-edited /lists/curated/... link
+// lands in the app rather than on an error -- same contract as
+// resolveChartSlug above.
+function resolveCuratedSlug(slug) {
+  return CURATED_LIST_REGISTRY[String(slug || "").toLowerCase()] || null;
+}
+

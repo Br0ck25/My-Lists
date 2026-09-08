@@ -3,7 +3,7 @@
 Tracker for [`AUDIT-2026-09-08-ADVERSARIAL-III.md`](./AUDIT-2026-09-08-ADVERSARIAL-III.md).
 Baseline `932da34`. Branch `claude/my-lists-security-audit-3n895k`.
 
-**Rating movement:** `CRITICAL — do not keep serving shared links` → `CRITICAL CLOSED` (round 1) → **`ALL HIGH-SEVERITY SECURITY CLOSED`** (round 2)
+**Rating movement:** `CRITICAL — do not keep serving shared links` → `CRITICAL CLOSED` (round 1) → `ALL HIGH-SEVERITY SECURITY CLOSED` (round 2) → **`PHASES 1–3 COMPLETE`** (round 3)
 
 ---
 
@@ -115,6 +115,42 @@ XSS probes all re-run clean.
 
 ---
 
+## ✅ Round 3 — the three unbound identifiers, the dead directory url, and the check that finds them
+
+Items 10–14. Four defects, one root cause: **27 sources concatenated into one scope, with
+nothing checking that identifiers resolve.** Two of the three sat behind a bare `catch`, which
+is why 358 tests, a full render check and five prior audits all went past them.
+
+| # | Severity | Issue | Fix | Verified by |
+|---|---|---|---|---|
+| 10 | 🟠 | **`/lists/curated/<slug>` answered HTTP 500 on every request.** `isShow` was declared nowhere. The client's own `getListCleanPath` puts that path in the address bar whenever one of the twelve curated shelves is opened, so reloading or sharing any of them landed on an error. | The twelve shelves now live in one `CURATED_LIST_ENTRIES` table (`08_quickadd-chart-data.js`), read by the route **and** embedded into the client, which builds its own preset list from it. A slug regex would have fixed the crash and still got `true-crime-mystery` wrong — it is a series and its slug says neither. | 5 slugs asserted for name/type/url + an unknown slug falling through; `p03_curated.mjs` |
+| 11 | 🟡 | **Trakt OAuth never learned the user's username.** `clientId` is declared only inside the `/api/trakt/device/*` blocks — siblings, not enclosing scopes — so the header object threw before `fetch` was called and the surrounding catch ate it. The device flow did the same lookup correctly, so the two paths silently disagreed. | `TRAKT_CLIENT_ID`, the value the token exchange fifteen lines above already uses. | `p02_clientid.mjs`: `/users/me` is now fetched and the redirect carries `&trakt_username=` |
+| 12 | 🟡 | **The only `list-copy` event in the app never fired.** `listName` is a `const` inside the chunking loop; the reference was outside it. `stats:list_copy:` never received a write, so the admin “copies” column — and the `likes + copies×2` ranking beside it — has always been structurally zero. A previous round rewired the *server* side of this namespace and shipped it without checking a client event could reach it. | `created[0].name`, already in scope. | `p04b_listcopy_e2e.mjs`: **1** `/api/track-event` request, was 0 |
+| 14 | 🟡 | **The cold-index directory advertised urls that 404.** Anonymous lists live at `publishedlist:user:<slug>` and serve from `/lists/user/<slug>`, but the fallback scan built the path from the display label — `/lists/Anonymous/<slug>`. Not an edge case: that scan runs on a fresh deployment and for the whole of the first index rebuild. | Build the url from the key namespace, keep `Anonymous` as the label. Also reads `publishedAt`, so `updatedAt` is no longer `null` for anonymous lists. | New test follows the advertised url and asserts it resolves; `p19_anonurl.mjs` |
+| 13 | 🔴 | **Nothing checked that identifiers resolve.** `node --check` proves a file parses and says nothing about whether the names in it exist. | New `scope_check.mjs` (acorn + eslint-scope), run over the combined Worker **and** the rendered client bundle, in `verify.sh` (step 3b) and CI. Allows only what is genuinely a global by construction: the runtime's own names, `window.*` exports, sloppy-mode implicit globals, and anything the author guarded with `typeof`. | Mutation-tested — below |
+
+### Mutation test of the new check
+
+Each of the three original bugs, reintroduced one at a time:
+
+```
+MUTATION A  bring back isShow    -> FAIL: isShow (1 reference, first at line 51477)      exit=1
+MUTATION B  bring back clientId  -> FAIL: clientId (9 references, first at line 53514)   exit=1
+MUTATION C  bring back listName  -> FAIL: listName (2 references, bundle line 5106)      exit=1
+```
+
+Clean run: `2,194` global references in the Worker and `8,290` in the bundle, all resolving —
+across `675` top-level declarations, `135` `window.*` exports and `218` `typeof` guards.
+
+### One thing worth knowing
+
+`scope_check.mjs` is the first thing in this repo that needs npm. It is two pinned packages,
+`--no-save`, into an already-gitignored `node_modules`; `verify.sh` installs them only if they
+are missing. That is a real change to a deliberately bare setup, and it is the trade for
+catching a bug class that had three live instances and no other way to see them.
+
+`bash verify.sh` green — **360 tests pass**.
+
 ## 🔜 Remaining, in order
 
 Next up is the rest of Phase 1 and Phase 2 — the two `/api/resolve` findings and the ghost-list
@@ -122,11 +158,6 @@ deletion race.
 
 | # | Severity | Issue | Where |
 |---|---|---|---|
-| 8 | 🟡 | `saveLocalCustomListEdit`: surface 401/409/500 instead of showing “saved” | `21_…:663` |
-| 9 | 🟡 | Route the three slug-bearing `lists/save` call sites through `saveCreatorListWithBaseline` | `19_…:3109`, `21_…:663`, `21_…:1320` |
-| 10 | 🟠 | `isShow` → `/lists/curated/:slug` | `25_…:485` |
-| 11 | 🟡 | `clientId` → `TRAKT_CLIENT_ID` in the Trakt OAuth callback | `25_…:2575` |
-| 12 | 🟡 | `listName` → `created[0].name`, so copy telemetry can fire | `18_…:232` |
-| 13 | 🔴 | CI: a `no-undef` scope pass over the Worker **and** the rendered bundle — 10, 11 and 12 are the same defect | `.github/workflows/ci.yml` |
-| 14 | 🟡 | Directory fallback: `/lists/user/<slug>`, not `/lists/Anonymous/…` | `25_…:452` |
-| 15+ | 🟡🔵 | README free-plan note, `TextEncoder` byte guard, `/api/creator/lists` paging, dead code | see the audit’s fix order |
+| 1 | 🟡 | `saveLocalCustomListEdit`: surface 401/409/500 instead of showing “saved” | `21_…:663` |
+| 2 | 🟡 | Route the three slug-bearing `lists/save` call sites through `saveCreatorListWithBaseline` | `19_…:3109`, `21_…:663`, `21_…:1320` |
+| 3+ | 🟡🔵 | README free-plan note, `TextEncoder` byte guard, `/api/creator/lists` paging, dead code | see the audit’s fix order |

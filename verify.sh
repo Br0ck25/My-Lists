@@ -21,6 +21,25 @@ echo "=== 3. node --check ==="
 node --check worker_entry_combined.js && echo "  OK"
 
 echo
+echo "=== 3b. every identifier resolves ==="
+# node --check above proves the file PARSES. It says nothing about whether the
+# names in it exist -- and with 27 sources sharing one scope, a const declared
+# in one route's block looks, in the source, like it is available in the next
+# one's. Three live bugs came from exactly that (isShow, clientId, listName),
+# two of them hidden behind a bare catch. See scope_check.mjs.
+#
+# The one place this repo needs npm. Pinned, --no-save, and node_modules is
+# already gitignored.
+if [ ! -d node_modules/acorn ] || [ ! -d node_modules/eslint-scope ]; then
+  echo "  installing the parser (acorn, eslint-scope)..."
+  npm install --no-save --no-audit --no-fund --silent acorn@8.14.0 eslint-scope@8.2.0
+fi
+node scope_check.mjs worker worker_entry_combined.js
+node render_check.js rendered-scope.html > /dev/null
+node scope_check.mjs page rendered-scope.html
+rm -f rendered-scope.html
+
+echo
 echo "=== 4. render + validate the builder page ==="
 # node --check above only parses the outer JS file; the inline <script> the
 # rendered page returns as a template-literal STRING is invisible to it. See

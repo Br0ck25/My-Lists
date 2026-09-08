@@ -461,6 +461,15 @@ async function handleFetch(request, env, ctx) {
           // has to ask.
           if (isCreator && !(await creatorExists(username))) return null;
           const cleanSlug = slug || slugifyServer(l.name) || "list";
+          // `creator` is a display label; the URL needs the KEY NAMESPACE.
+          // An anonymous list lives at publishedlist:user:<slug> and is served
+          // from /lists/user/<slug>, but this fallback built the path out of
+          // the display label instead -- so every anonymous list in the
+          // directory advertised /lists/Anonymous/<slug>, which 404s. The
+          // index path and /api/search-published-lists both get this right;
+          // only this scan disagreed, and it is the one that runs on a fresh
+          // deployment and for the whole of the first index rebuild.
+          const urlUser = isCreator ? username : "user";
           return {
             name: l.name,
             slug: cleanSlug,
@@ -468,9 +477,9 @@ async function handleFetch(request, env, ctx) {
             type: l.type || "mixed",
             itemCount: Array.isArray(l.items) ? l.items.length : (l.itemCount || 0),
             likes: l.likes || 0,
-            updatedAt: l.updatedAt || l.createdAt || null,
-            url: `${url.origin}/lists/${username}/${cleanSlug}`,
-            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+            updatedAt: l.updatedAt || l.createdAt || l.publishedAt || null,
+            url: `${url.origin}/lists/${urlUser}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${urlUser}/${cleanSlug}.json`,
           };
         } catch {
           return null;
@@ -488,10 +497,15 @@ async function handleFetch(request, env, ctx) {
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
-      const title = isShow ? "Recommended Shows" : "Recommended Movies";
+      // Looked up, not inferred -- see CURATED_LIST_ENTRIES
+      // (08_quickadd-chart-data.js). An unknown slug falls through to the
+      // default builder page, exactly as an unknown chart slug does.
+      const curated = resolveCuratedSlug(slug);
       return await htmlPageResponse(
         request,
-        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } })
+        curated
+          ? renderBuilder(url.origin, { deepLinkList: { name: curated.name, type: curated.type, url: "custom:curated:" + curated.slug } })
+          : renderBuilderCached(url.origin, {})
       );
     }
 
@@ -2578,7 +2592,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
               "Content-Type": "application/json",
               "Authorization": `Bearer ${tokenData.access_token}`,
               "trakt-api-version": "2",
-              "trakt-api-key": clientId || TRAKT_CLIENT_ID,
+              // TRAKT_CLIENT_ID, not `clientId`: that name is declared only inside
+              // the /api/trakt/device/* blocks, which are siblings of this one,
+              // not enclosing scopes. Evaluating this object therefore threw a
+              // ReferenceError BEFORE fetch was called, the surrounding catch
+              // swallowed it, and every browser-based Trakt login silently
+              // failed to learn the user's Trakt username -- while the device
+              // flow, which does the same lookup correctly, worked. This is the
+              // value the token exchange fifteen lines above already uses.
+              "trakt-api-key": TRAKT_CLIENT_ID,
               "User-Agent": "my-list-addon/1.4",
             },
           });

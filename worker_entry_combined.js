@@ -14342,6 +14342,49 @@ function resolveChartSlug(slug) {
   return CHART_SLUG_REGISTRY[slug] || null;
 }
 
+// --- The curated shelves, in one place ---------------------------------------
+//
+// These twelve used to exist only as a literal inside buildQuickAddPresets
+// (16_client-row-core.js), so the /lists/curated/<slug> route had nothing to
+// look them up in and guessed instead:
+//
+//   const title = isShow ? "Recommended Shows" : "Recommended Movies";
+//
+// `isShow` was not declared anywhere, so that route threw a ReferenceError and
+// answered HTTP 500 on EVERY request -- and the client's own getListCleanPath
+// puts exactly that path in the address bar whenever one of these is opened,
+// so reloading or sharing any curated shelf landed on an error.
+//
+// A regex on the slug would have fixed the crash and still got the answer
+// wrong: "true-crime-mystery" is a series and contains neither "show" nor
+// "series". The type has to be looked up, not inferred -- so the list lives
+// here, is used by the route directly, and is embedded into the client (see
+// CURATED_LIST_ENTRIES in renderBuilder) so there is one copy rather than two
+// that can drift.
+const CURATED_LIST_ENTRIES = [
+  { slug: "recommended-movies", name: "Recommended Movies", type: "movie" },
+  { slug: "recommended-shows", name: "Recommended Shows", type: "series" },
+  { slug: "hidden-gems", name: "Curated: Hidden Gems", type: "movie" },
+  { slug: "top-rated-classics", name: "Curated: Top Rated Classics", type: "movie" },
+  { slug: "cult-favorites", name: "Curated: Cult Favorites", type: "movie" },
+  { slug: "binge-worthy-series", name: "Curated: Binge-Worthy Series", type: "series" },
+  { slug: "award-winners", name: "Curated: Award Winners", type: "movie" },
+  { slug: "feel-good-hits", name: "Curated: Feel-Good Hits", type: "movie" },
+  { slug: "action-thrills", name: "Curated: Action & Thrills", type: "movie" },
+  { slug: "sci-fi-journeys", name: "Curated: Sci-Fi Journeys", type: "movie" },
+  { slug: "family-movie-night", name: "Curated: Family Movie Night", type: "movie" },
+  { slug: "true-crime-mystery", name: "Curated: True Crime & Mystery", type: "series" },
+];
+
+const CURATED_LIST_REGISTRY = Object.fromEntries(CURATED_LIST_ENTRIES.map((e) => [e.slug, e]));
+
+// Null on an unknown slug, so a stale or hand-edited /lists/curated/... link
+// lands in the app rather than on an error -- same contract as
+// resolveChartSlug above.
+function resolveCuratedSlug(slug) {
+  return CURATED_LIST_REGISTRY[String(slug || "").toLowerCase()] || null;
+}
+
 function renderBuilder(
   origin,
   { initialEntries = [], initialKeys = {}, isConfigureMode = false, deepLinkList = null } = {}
@@ -18900,6 +18943,12 @@ const serverShuffleItems = ${initialShuffleItems ? 'true' : 'false'};
 // /lists/<slug> path when the list it's opening is one of these, instead
 // of always falling back to the older #/list?... hash format.
 const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
+// The curated shelves, from the same table the /lists/curated/<slug> route
+// resolves against (CURATED_LIST_ENTRIES, 08_quickadd-chart-data.js). This
+// list used to be a literal down in buildQuickAddPresets, which is why the
+// route had nothing to look a slug up in and guessed the name and type
+// instead -- and guessed wrong for "true-crime-mystery", which is a series.
+const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
 
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
@@ -20517,20 +20566,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
   }
 
   if (type === 'curated' || type === 'all') {
-    const curatedPresets = [
-      { name: 'Recommended Movies', url: 'custom:curated:recommended-movies', type: 'movie', user: 'Curated' },
-      { name: 'Recommended Shows', url: 'custom:curated:recommended-shows', type: 'series', user: 'Curated' },
-      { name: 'Curated: Hidden Gems', url: 'custom:curated:hidden-gems', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Top Rated Classics', url: 'custom:curated:top-rated-classics', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Cult Favorites', url: 'custom:curated:cult-favorites', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Binge-Worthy Series', url: 'custom:curated:binge-worthy-series', type: 'series', user: 'Curated' },
-      { name: 'Curated: Award Winners', url: 'custom:curated:award-winners', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Feel-Good Hits', url: 'custom:curated:feel-good-hits', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Action & Thrills', url: 'custom:curated:action-thrills', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Sci-Fi Journeys', url: 'custom:curated:sci-fi-journeys', type: 'movie', user: 'Curated' },
-      { name: 'Curated: Family Movie Night', url: 'custom:curated:family-movie-night', type: 'movie', user: 'Curated' },
-      { name: 'Curated: True Crime & Mystery', url: 'custom:curated:true-crime-mystery', type: 'series', user: 'Curated' },
-    ];
+    // One table, shared with the server -- see CURATED_LIST_ENTRIES above.
+    const curatedPresets = CURATED_LIST_ENTRIES.map(function(e) {
+      return { name: e.name, url: 'custom:curated:' + e.slug, type: e.type, user: 'Curated' };
+    });
     curatedPresets.forEach(function(item) {
       pushSingle(item.name, item.url, item.type, 'Curated');
     });
@@ -23713,7 +23752,15 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   if (created.length) {
     try {
       if (typeof trackEvent === 'function') {
-        trackEvent('list-copy', listUrl || listName, listName);
+        // created[0].name, not listName: the latter is a const declared inside
+        // the chunking loop above, so this reference -- outside the loop -- was
+        // an unbound identifier that threw a ReferenceError into the
+        // surrounding catch every single time. This is the ONLY site in the app
+        // that emits a list-copy event, so stats:list_copy: never received a
+        // write and the admin Community Lists "copies" column (and the
+        // likes + copies*2 ranking beside it) has always been structurally
+        // zero.
+        trackEvent('list-copy', listUrl || created[0].name, created[0].name);
       }
     } catch (e) {}
     renderCreatorDashboard();
@@ -51388,6 +51435,15 @@ async function handleFetch(request, env, ctx) {
           // has to ask.
           if (isCreator && !(await creatorExists(username))) return null;
           const cleanSlug = slug || slugifyServer(l.name) || "list";
+          // `creator` is a display label; the URL needs the KEY NAMESPACE.
+          // An anonymous list lives at publishedlist:user:<slug> and is served
+          // from /lists/user/<slug>, but this fallback built the path out of
+          // the display label instead -- so every anonymous list in the
+          // directory advertised /lists/Anonymous/<slug>, which 404s. The
+          // index path and /api/search-published-lists both get this right;
+          // only this scan disagreed, and it is the one that runs on a fresh
+          // deployment and for the whole of the first index rebuild.
+          const urlUser = isCreator ? username : "user";
           return {
             name: l.name,
             slug: cleanSlug,
@@ -51395,9 +51451,9 @@ async function handleFetch(request, env, ctx) {
             type: l.type || "mixed",
             itemCount: Array.isArray(l.items) ? l.items.length : (l.itemCount || 0),
             likes: l.likes || 0,
-            updatedAt: l.updatedAt || l.createdAt || null,
-            url: `${url.origin}/lists/${username}/${cleanSlug}`,
-            jsonUrl: `${url.origin}/lists/${username}/${cleanSlug}.json`,
+            updatedAt: l.updatedAt || l.createdAt || l.publishedAt || null,
+            url: `${url.origin}/lists/${urlUser}/${cleanSlug}`,
+            jsonUrl: `${url.origin}/lists/${urlUser}/${cleanSlug}.json`,
           };
         } catch {
           return null;
@@ -51415,10 +51471,15 @@ async function handleFetch(request, env, ctx) {
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
       const slug = m[1];
-      const title = isShow ? "Recommended Shows" : "Recommended Movies";
+      // Looked up, not inferred -- see CURATED_LIST_ENTRIES
+      // (08_quickadd-chart-data.js). An unknown slug falls through to the
+      // default builder page, exactly as an unknown chart slug does.
+      const curated = resolveCuratedSlug(slug);
       return await htmlPageResponse(
         request,
-        renderBuilder(url.origin, { deepLinkList: { name: title, type: isShow ? "series" : "movie", url: "custom:curated:" + slug } })
+        curated
+          ? renderBuilder(url.origin, { deepLinkList: { name: curated.name, type: curated.type, url: "custom:curated:" + curated.slug } })
+          : renderBuilderCached(url.origin, {})
       );
     }
 
@@ -53505,7 +53566,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
               "Content-Type": "application/json",
               "Authorization": `Bearer ${tokenData.access_token}`,
               "trakt-api-version": "2",
-              "trakt-api-key": clientId || TRAKT_CLIENT_ID,
+              // TRAKT_CLIENT_ID, not `clientId`: that name is declared only inside
+              // the /api/trakt/device/* blocks, which are siblings of this one,
+              // not enclosing scopes. Evaluating this object therefore threw a
+              // ReferenceError BEFORE fetch was called, the surrounding catch
+              // swallowed it, and every browser-based Trakt login silently
+              // failed to learn the user's Trakt username -- while the device
+              // flow, which does the same lookup correctly, worked. This is the
+              // value the token exchange fifteen lines above already uses.
+              "trakt-api-key": TRAKT_CLIENT_ID,
               "User-Agent": "my-list-addon/1.4",
             },
           });

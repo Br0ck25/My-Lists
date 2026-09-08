@@ -1453,6 +1453,85 @@ describe("key rotation", () => {
   });
 });
 
+describe("curated shelves resolve from one shared table", () => {
+  // /lists/curated/<slug> read `isShow`, which was declared nowhere, so the
+  // route threw a ReferenceError and answered HTTP 500 on EVERY request --
+  // and getListCleanPath puts exactly that path in the address bar whenever
+  // one of these shelves is opened, so reloading or sharing one landed on an
+  // error. A regex on the slug would have fixed the crash and still got
+  // "true-crime-mystery" wrong, which is why the type is looked up.
+  const BROWSER = {
+    Accept: "text/html",
+    "User-Agent": "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+  };
+  const deepLink = (html) => {
+    const m = /const SERVER_DEEP_LINK_LIST = ([^\n]+);/.exec(html);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch { return null; }
+  };
+
+  it("serves every curated slug with the right name, type and url", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const expected = [
+      ["recommended-movies", "Recommended Movies", "movie"],
+      ["recommended-shows", "Recommended Shows", "series"],
+      ["hidden-gems", "Curated: Hidden Gems", "movie"],
+      ["binge-worthy-series", "Curated: Binge-Worthy Series", "series"],
+      // The one a slug regex gets wrong: a series whose slug says neither.
+      ["true-crime-mystery", "Curated: True Crime & Mystery", "series"],
+    ];
+    for (const [slug, name, type] of expected) {
+      const r = await call(env, `/lists/curated/${slug}`, { headers: BROWSER });
+      assert.equal(r.status, 200, `${slug} should render, got ${r.status}`);
+      const d = deepLink(r.text);
+      assert.ok(d, `${slug} should carry a deep link`);
+      assert.equal(d.name, name, `${slug} name`);
+      assert.equal(d.type, type, `${slug} type`);
+      assert.equal(d.url, `custom:curated:${slug}`, `${slug} url`);
+    }
+  });
+
+  it("lands an unknown curated slug in the app rather than on an error", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const r = await call(env, "/lists/curated/not-a-real-shelf", { headers: BROWSER });
+    assert.equal(r.status, 200);
+    assert.equal(deepLink(r.text), null, "an unknown slug must not fabricate a deep link");
+  });
+});
+
+describe("the cold-index directory advertises reachable urls", () => {
+  // The index path and /api/search-published-lists both built an anonymous
+  // list's url from the "user" key namespace; this fallback built it from the
+  // display label instead, so every anonymous list in the directory advertised
+  // /lists/Anonymous/<slug>, which 404s. The fallback is not an edge case: it
+  // runs on a fresh deployment and for the whole of the first index rebuild.
+  it("points an anonymous list at /lists/user/<slug>, and that url resolves", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const pub = await call(env, "/api/publish-list", {
+      method: "POST",
+      json: { name: "Anon List", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(pub.body.ok, true);
+    // Drop the index so the legacy scan is what answers.
+    for (const k of [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("index:"))) {
+      env.CONFIGS._store.delete(k);
+    }
+    env.CONFIGS._store.set("index:publiclists:lock", "1");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.length, 1);
+    const entry = dir.body.lists[0];
+    assert.equal(entry.creator, "Anonymous", "the display label stays Anonymous");
+    assert.ok(entry.url.endsWith(`/lists/user/${pub.body.listName}`), `url was ${entry.url}`);
+    assert.ok(entry.updatedAt, "an anonymous list stores publishedAt, which the fallback must read");
+
+    const followed = await call(env, new URL(entry.url).pathname + ".json");
+    assert.equal(followed.status, 200, "the advertised url must actually resolve");
+  });
+});
+
 describe("a list whose creator is gone is not servable", () => {
   // A save that authenticated a millisecond before its owner deleted the
   // account keeps running, and its KV put lands after both of
