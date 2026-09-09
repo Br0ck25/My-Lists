@@ -280,31 +280,41 @@ async function migrateGenreDecadeStatsIfNeeded(env) {
 // locally). Writing it here lets the dashboard read last-active straight
 // out of the creators SELECT it already runs. Accounts that predate this
 // have NULL in D1 and are repaired lazily by backfillCreatorLastActive.
+const _lastSeenMemo = new Map();
+const LAST_SEEN_THROTTLE_MS = 30 * 60 * 1000;
+
 async function touchCreatorLastSeen(env, username) {
-  if (!env || !env.CONFIGS || !username) return;
-  try {
-    const key = `creatorlastseen:${username}`;
-    const raw = await env.CONFIGS.get(key);
-    const last = parseInt(raw, 10) || 0;
-    if (Date.now() - last < 30 * 60 * 1000) return; // updated recently enough
-    const now = Date.now();
-    await env.CONFIGS.put(key, String(now));
-    if (env.DB) {
-      // Mirrored, never authoritative: KV above is written unconditionally
-      // and remains the source of truth. An UPDATE that matches no row
-      // (account not yet migrated into D1) is harmless -- the dashboard's
-      // backfill fills it once the row exists. Best-effort so a D1 hiccup
-      // can never fail the auth this is riding along on.
-      try {
-        await env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ?")
-          .bind(now, username)
-          .run();
-      } catch (dbErr) {
-        // KV write above already happened; cosmetic value only.
-      }
+  if (!env || !username) return;
+  const now = Date.now();
+  const last = _lastSeenMemo.get(username) || 0;
+  if (now - last < LAST_SEEN_THROTTLE_MS) return;
+
+  _lastSeenMemo.set(username, now);
+  if (_lastSeenMemo.size > 2000) {
+    const pruneBefore = now - LAST_SEEN_THROTTLE_MS;
+    for (const [u, ts] of _lastSeenMemo.entries()) {
+      if (ts < pruneBefore) _lastSeenMemo.delete(u);
     }
-  } catch (e) {
-    // best-effort -- a missing/stale "Last Active" value is cosmetic only
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ?")
+        .bind(now, username)
+        .run();
+      return;
+    } catch (dbErr) {
+      // D1 write error, best-effort fallback to KV
+    }
+  }
+
+  if (env.CONFIGS) {
+    try {
+      const key = `creatorlastseen:${username}`;
+      await env.CONFIGS.put(key, String(now));
+    } catch (e) {
+      // best-effort
+    }
   }
 }
 

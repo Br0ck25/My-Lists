@@ -7042,7 +7042,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });
@@ -8200,5 +8200,267 @@ describe("Discover: every sub-nav pill gets a header and a Refresh button", () =
     // shared-feed pill to Popular/Curated would leave the old title showing
     // behind the popular/curated panel.
     assert.match(fn, /if \(feedHeader\) feedHeader\.style\.display = 'none';/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 of STORAGE-PLAN-KV-D1.md: Identity and lists become D1-authoritative
+// ---------------------------------------------------------------------------
+describe("Phase 2: Identity and lists become D1-authoritative", () => {
+  it("getCreator reads D1 first and ignores stale/tampered KV keyHash", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2auth");
+    const K = { creatorName: "p2auth", creatorKey: u.creatorKey };
+
+    // Tamper with the KV record: set a bogus keyHash in KV
+    const kvRecord = JSON.parse(kv._store.get("creator:p2auth"));
+    kvRecord.keyHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    kv._store.set("creator:p2auth", JSON.stringify(kvRecord));
+
+    // Authenticated request must succeed because D1 is authoritative
+    const res = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(res.status, 200, "D1-authoritative keyHash must authenticate successfully despite stale KV");
+
+    // Also verify KV was refreshed with the authoritative D1 record
+    const refreshedKv = JSON.parse(kv._store.get("creator:p2auth"));
+    assert.equal(refreshedKv.keyHash, db.q("SELECT key_hash FROM creators WHERE username = 'p2auth'")[0].key_hash);
+  });
+
+  it("getCreator falls back to KV when missing in D1 and lazy-backfills D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2unmigrated");
+    const K = { creatorName: "p2unmigrated", creatorKey: u.creatorKey };
+
+    // Delete the row from D1 to simulate an unmigrated pre-Phase-2 account that exists only in KV
+    db.exec("DELETE FROM creators WHERE username = 'p2unmigrated';");
+    assert.equal(db.q("SELECT COUNT(*) AS n FROM creators WHERE username = 'p2unmigrated'")[0].n, 0);
+
+    // An authenticated call should fall back to KV, succeed, and lazy-backfill D1
+    const res = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(res.status, 200, "must authenticate via KV fallback when D1 row is missing");
+
+    // Verify D1 was backfilled
+    const d1Row = db.q("SELECT * FROM creators WHERE username = 'p2unmigrated'")[0];
+    assert.ok(d1Row, "must lazy-backfill missing account into D1 creators table");
+    assert.equal(d1Row.username, "p2unmigrated");
+    assert.ok(d1Row.key_hash, "must have key_hash populated");
+  });
+
+  it("getCreatorList reads D1 first and ignores stale KV list data", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2listauth");
+    const K = { creatorName: "p2listauth", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Authoritative List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    assert.equal(saveRes.body.ok, true);
+    const slug = saveRes.body.slug;
+
+    // Tamper KV list record with older timestamp and modified name/items
+    const kvRecord = JSON.parse(kv._store.get(`creatorlist:p2listauth:${slug}`));
+    kvRecord.name = "Stale KV Name";
+    kvRecord.items = [{ id: "tt_stale" }];
+    kvRecord.updatedAt = saveRes.body.updatedAt - 1000;
+    kv._store.set(`creatorlist:p2listauth:${slug}`, JSON.stringify(kvRecord));
+
+    // Read via /api/creator/lists
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listsRes.body.lists.find((l) => l.slug === slug);
+    assert.equal(list.name, "Authoritative List", "D1 data must take precedence over stale KV");
+
+    // Also read public endpoint /lists/:user/:slug
+    const publicRes = await call(env, `/lists/p2listauth/${slug}`);
+    assert.equal(publicRes.status, 200);
+    assert.match(publicRes.text, /tt1/);
+    assert.ok(!publicRes.text.includes("tt_stale"), "must not serve stale KV items");
+  });
+
+  it("getCreatorList self-heals D1 if KV contains a newer edit", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2heal");
+    const K = { creatorName: "p2heal", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Initial List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const slug = saveRes.body.slug;
+
+    // Simulate fresher KV write (e.g. D1 write had dropped or failed during save)
+    const freshKv = JSON.parse(kv._store.get(`creatorlist:p2heal:${slug}`));
+    freshKv.name = "Healed From KV";
+    freshKv.updatedAt = saveRes.body.updatedAt + 10000;
+    freshKv.items = [{ id: "tt1" }, { id: "tt2" }];
+    kv._store.set(`creatorlist:p2heal:${slug}`, JSON.stringify(freshKv));
+
+    // Calling /api/creator/lists runs getCreatorList, which detects fresher KV and heals D1
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listsRes.body.lists.find((l) => l.slug === slug);
+    assert.equal(list.name, "Healed From KV", "must serve fresher edit from KV");
+
+    // Verify D1 was healed
+    const d1Row = db.q("SELECT name, updated_at, items_json FROM creator_lists WHERE id = ?", `p2heal:${slug}`)[0];
+    assert.equal(d1Row.name, "Healed From KV");
+    assert.equal(d1Row.updated_at, freshKv.updatedAt);
+    assert.ok(d1Row.items_json.includes("tt2"));
+  });
+
+  it("creator_lists.sort_order drives ordering and survives missing creatorlistorder KV key", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2order");
+    const K = { creatorName: "p2order", creatorKey: u.creatorKey };
+
+    // Create 3 lists
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List A", type: "movie", visibility: "private", items: [] } });
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List B", type: "movie", visibility: "private", items: [] } });
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List C", type: "movie", visibility: "private", items: [] } });
+
+    // Initial order is A, B, C
+    const initLists = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(initLists.body.lists.map((l) => l.name), ["List A", "List B", "List C"]);
+
+    // Reorder to C, A, B
+    const reorderRes = await call(env, "/api/creator/lists/reorder", {
+      method: "POST",
+      json: { ...K, order: ["list-c", "list-a", "list-b"] },
+    });
+    assert.equal(reorderRes.body.ok, true);
+
+    // Check D1 sort_order values
+    const d1Rows = db.q("SELECT id, sort_order FROM creator_lists WHERE username = 'p2order' ORDER BY sort_order ASC");
+    assert.deepEqual(d1Rows.map((r) => r.id), ["p2order:list-c", "p2order:list-a", "p2order:list-b"]);
+    assert.deepEqual(d1Rows.map((r) => r.sort_order), [0, 1, 2]);
+
+    // Delete creatorlistorder: from KV
+    kv._store.delete("creatorlistorder:p2order");
+
+    // /api/creator/lists must still report in [C, A, B] order from D1 sort_order
+    const afterDeleteKv = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(afterDeleteKv.body.lists.map((l) => l.name), ["List C", "List A", "List B"]);
+  });
+
+  it("creators.lists_stamp is D1-authoritative and survives missing KV stamp", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2stamp");
+    const K = { creatorName: "p2stamp", creatorKey: u.creatorKey };
+
+    // Initially lists_stamp is 0 in D1
+    const initMeta = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(initMeta.body.lists, 0);
+
+    // Save a list -> moves the stamp
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "List 1", type: "movie", visibility: "private", items: [] },
+    });
+    const d1Stamp = db.q("SELECT lists_stamp FROM creators WHERE username = 'p2stamp'")[0].lists_stamp;
+    assert.ok(d1Stamp > 0, "D1 creators.lists_stamp must be updated");
+
+    // Delete KV stamp
+    kv._store.delete("creatorliststamp:p2stamp");
+
+    // /api/creator/sync/meta must still return the D1 stamp
+    const afterMeta = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(afterMeta.body.lists, d1Stamp, "sync/meta must read lists_stamp from D1");
+  });
+
+  it("creators.share_json is D1-authoritative and persists share tracking", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2share");
+    const K = { creatorName: "p2share", creatorKey: u.creatorKey };
+
+    // Save share tracking for "watchlist"
+    const postRes = await call(env, "/api/creator/sync/share-tracking", {
+      method: "POST",
+      json: { ...K, slug: "watchlist", shared: true },
+    });
+    assert.equal(postRes.body.ok, true);
+
+    // Check D1 share_json column
+    const d1ShareJson = db.q("SELECT share_json FROM creators WHERE username = 'p2share'")[0].share_json;
+    assert.equal(JSON.parse(d1ShareJson).watchlist, true);
+
+    // Delete KV creatorshare: key
+    kv._store.delete("creatorshare:p2share");
+
+    // Read back via POST /api/creator/sync/share-tracking (no slug = query status)
+    const getRes = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: K });
+    assert.equal(getRes.body.ok, true);
+    assert.equal(getRes.body.shared.watchlist, true);
+  });
+
+  it("list_tombstones table is D1-authoritative across deletes and re-creates", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2tomb");
+    const K = { creatorName: "p2tomb", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", type: "movie", visibility: "private", items: [] },
+    });
+    const slug = saveRes.body.slug;
+
+    // Delete the list
+    const delRes = await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+    assert.equal(delRes.body.ok, true);
+
+    // Check D1 list_tombstones table
+    const tombstones = db.q("SELECT * FROM list_tombstones WHERE username = 'p2tomb' AND slug = ?", slug);
+    assert.equal(tombstones.length, 1, "tombstone must be recorded in D1");
+    assert.ok(tombstones[0].until > Date.now(), "until timestamp must be in future");
+
+    // Wipe KV creatorlistdeleted: key
+    kv._store.delete("creatorlistdeleted:p2tomb");
+
+    // /api/creator/lists must still report deletedSlugs from D1
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(listsRes.body.deletedSlugs, [slug], "must read tombstones from D1 even when KV is wiped");
+
+    // Re-create the list at the same slug
+    const reRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", slug, type: "movie", visibility: "private", items: [] },
+    });
+    assert.equal(reRes.body.ok, true);
+
+    // Check D1 list_tombstones was cleared
+    const afterTombstones = db.q("SELECT * FROM list_tombstones WHERE username = 'p2tomb' AND slug = ?", slug);
+    assert.equal(afterTombstones.length, 0, "tombstone must be cleared in D1 on re-create");
+  });
+
+  it("touchCreatorLastSeen writes directly to D1 and drops creatorlastseen: in KV", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2lastseen");
+    const K = { creatorName: "p2lastseen", creatorKey: u.creatorKey };
+
+    // Authenticate
+    await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+
+    // Verify creatorlastseen: is NOT in KV
+    assert.ok(!kv._store.has("creatorlastseen:p2lastseen"), "creatorlastseen: KV write must be dropped when D1 is bound");
+
+    // Verify creators.last_active in D1 is updated
+    const d1Row = db.q("SELECT last_active FROM creators WHERE username = 'p2lastseen'")[0];
+    assert.ok(d1Row.last_active > 0, "creators.last_active in D1 must be updated");
   });
 });

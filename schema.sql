@@ -16,7 +16,9 @@ CREATE TABLE creators (
     key_hash TEXT NOT NULL,
     recovery_answer_hash TEXT,
     created_at INTEGER NOT NULL,
-    last_active INTEGER
+    last_active INTEGER,
+    share_json TEXT,
+    lists_stamp INTEGER
 );
 
 DROP TABLE IF EXISTS creator_lists;
@@ -30,6 +32,7 @@ CREATE TABLE creator_lists (
     likes INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    sort_order INTEGER,
     FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE
 );
 
@@ -108,4 +111,13 @@ CREATE VIRTUAL TABLE lists_fts USING fts5(
     username,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+
+DROP TABLE IF EXISTS list_tombstones;
+CREATE TABLE list_tombstones (
+    username TEXT NOT NULL,
+    slug     TEXT NOT NULL,
+    until    INTEGER NOT NULL,
+    PRIMARY KEY (username, slug)
+);
+CREATE INDEX idx_list_tombstones_user_until ON list_tombstones(username, until);
 

@@ -1809,7 +1809,25 @@ function creatorListTombstoneKey(username) {
 // an unreadable record means "no deletions known", which is the behaviour this
 // whole mechanism replaces, not a worse one.
 async function readCreatorListDeletions(env, username) {
-  if (!env || !env.CONFIGS || !username) return {};
+  if (!env || !username) return {};
+  const now = Date.now();
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT slug, until FROM list_tombstones WHERE username = ? AND until > ?"
+      ).bind(username, now).all();
+      if (results && results.length > 0) {
+        const out = {};
+        for (const row of results) {
+          out[row.slug] = row.until;
+        }
+        return out;
+      }
+    } catch (e) {
+      console.error("D1 read error (readCreatorListDeletions), falling back to KV:", e);
+    }
+  }
+  if (!env.CONFIGS) return {};
   let raw = null;
   try {
     raw = await env.CONFIGS.get(creatorListTombstoneKey(username));
@@ -1825,7 +1843,6 @@ async function readCreatorListDeletions(env, username) {
   }
   const slugs = parsed && typeof parsed === "object" ? (parsed.slugs || parsed) : null;
   if (!slugs || typeof slugs !== "object") return {};
-  const now = Date.now();
   const out = {};
   for (const [slug, at] of Object.entries(slugs)) {
     const ts = Number(at) || 0;
@@ -1863,24 +1880,53 @@ async function writeCreatorListDeletions(env, username, slugs) {
 }
 
 async function recordCreatorListDeletions(env, username, slugs) {
-  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return;
-  const known = await readCreatorListDeletions(env, username);
+  if (!env || !username || !slugs || !slugs.length) return;
   const now = Date.now();
-  for (const slug of slugs) {
-    if (slug) known[String(slug)] = now;
+  const until = now + CREATOR_LIST_TOMBSTONE_TTL_MS;
+  if (env.DB) {
+    try {
+      const stmts = slugs.filter(Boolean).map((s) =>
+        env.DB.prepare(
+          "INSERT INTO list_tombstones (username, slug, until) VALUES (?, ?, ?) ON CONFLICT(username, slug) DO UPDATE SET until = excluded.until"
+        ).bind(username, String(s), until)
+      );
+      if (stmts.length > 0) {
+        await env.DB.batch(stmts);
+      }
+    } catch (e) {
+      console.error("D1 write error (recordCreatorListDeletions):", e);
+    }
   }
-  await writeCreatorListDeletions(env, username, known);
+  if (env.CONFIGS) {
+    const known = await readCreatorListDeletions(env, username);
+    for (const slug of slugs) {
+      if (slug) known[String(slug)] = now;
+    }
+    await writeCreatorListDeletions(env, username, known);
+  }
 }
 
 // The other half: re-creating a list at a slug that was deleted is a
 // deliberate act and has to win, or the tombstone would tell every other
 // device to throw the new list away. Called by /api/creator/lists/save.
 async function clearCreatorListDeletion(env, username, slug) {
-  if (!env || !env.CONFIGS || !username || !slug) return;
-  const known = await readCreatorListDeletions(env, username);
-  if (!Object.prototype.hasOwnProperty.call(known, String(slug))) return;
-  delete known[String(slug)];
-  await writeCreatorListDeletions(env, username, known);
+  if (!env || !username || !slug) return;
+  if (env.DB) {
+    try {
+      await env.DB.prepare("DELETE FROM list_tombstones WHERE username = ? AND slug = ?").bind(username, String(slug)).run();
+    } catch (e) {
+      console.error("D1 delete error (clearCreatorListDeletion):", e);
+    }
+  }
+  if (env.CONFIGS) {
+    try {
+      const known = await readCreatorListDeletions(env, username);
+      if (Object.prototype.hasOwnProperty.call(known, String(slug))) {
+        delete known[String(slug)];
+        await writeCreatorListDeletions(env, username, known);
+      }
+    } catch (e) {}
+  }
 }
 
 // Deletes one or more of a creator's lists: the KV record, the D1 row, the
@@ -2452,19 +2498,46 @@ function nextSyncVersion(currentUpdatedAt) {
 // this stamp exists to prevent. CI caught that as a flake; it is a real hole,
 // not a flaky test.
 async function bumpCreatorListsStamp(env, username, notBefore) {
+  if (!env || !username) return;
   try {
-    const raw = await env.CONFIGS.get(`creatorliststamp:${username}`);
     let prev = Number(notBefore) || 0;
-    if (raw) {
-      try { prev = Math.max(prev, Number(JSON.parse(raw).updatedAt) || 0); } catch {}
+    if (env.DB) {
+      try {
+        const { results } = await env.DB.prepare("SELECT lists_stamp FROM creators WHERE username = ?").bind(username).all();
+        if (results && results.length > 0 && results[0].lists_stamp != null) {
+          prev = Math.max(prev, Number(results[0].lists_stamp) || 0);
+        }
+      } catch (dbErr) {
+        console.error("D1 read error (bumpCreatorListsStamp):", dbErr);
+      }
+    }
+    if (prev === (Number(notBefore) || 0) && env.CONFIGS) {
+      try {
+        const raw = await env.CONFIGS.get(`creatorliststamp:${username}`);
+        if (raw) {
+          try { prev = Math.max(prev, Number(JSON.parse(raw).updatedAt) || 0); } catch {}
+        }
+      } catch (e) {}
     }
     // Strictly increasing, for the same reason the sync blob's own version is:
     // the client compares with >, so two saves inside one millisecond must not
     // land on the same number.
-    await env.CONFIGS.put(
-      `creatorliststamp:${username}`,
-      JSON.stringify({ updatedAt: nextSyncVersion(prev) })
-    );
+    const nextStamp = nextSyncVersion(prev);
+    if (env.DB) {
+      try {
+        await env.DB.prepare("UPDATE creators SET lists_stamp = ? WHERE username = ?")
+          .bind(nextStamp, username)
+          .run();
+      } catch (dbErr) {
+        console.error("D1 write error (bumpCreatorListsStamp):", dbErr);
+      }
+    }
+    if (env.CONFIGS) {
+      await env.CONFIGS.put(
+        `creatorliststamp:${username}`,
+        JSON.stringify({ updatedAt: nextStamp })
+      );
+    }
   } catch (e) {
     console.error("bumpCreatorListsStamp: could not record a list change", e);
   }
@@ -2676,6 +2749,7 @@ async function purgeCreatorData(env, username, options = {}) {
       // row.
       await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM lists_fts WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM list_tombstones WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
       dataSweepFailed = true;
@@ -2918,60 +2992,51 @@ async function purgeCreatorData(env, username, options = {}) {
 //   * a visibility change whose D1 write was dropped left the owner's own
 //     dashboard saying "private" about a list the world could read.
 //
-// Reading KV first removes all four at once, because KV is the store every
-// write path touches unconditionally. It is not slower either: this is one
-// edge-cached KV get instead of one D1 query.
-//
-// D1 stays as the FALLBACK, which is what keeps the earlier fix intact in
-// both directions. A missing row means "not migrated yet", not "does not
-// exist" -- and now a missing KV record means "ask the mirror" rather than
-// "no such creator", so an account is reachable as long as EITHER store has
-// it. Every field returned here also lives in KV, so nothing is lost by
-// preferring it.
+// D1 is the authoritative store for creator identities when bound.
+// KV serves as a read-through cache and fallback for unmigrated accounts.
 async function getCreator(env, username) {
-  try {
-    const raw = await env.CONFIGS.get(`creator:${username}`);
-    if (raw) return raw;
-  } catch (e) {
-    console.error("KV read error (getCreator), falling back to D1:", e);
-  }
-  if (env.DB) {
+  if (env && env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
       if (results && results.length > 0) {
         const row = results[0];
-        return JSON.stringify({ displayName: row.display_name, keyHash: row.key_hash, recoveryAnswerHash: row.recovery_answer_hash, createdAt: row.created_at });
+        const payload = {
+          displayName: row.display_name,
+          keyHash: row.key_hash,
+          recoveryAnswerHash: row.recovery_answer_hash,
+          createdAt: row.created_at,
+          lastActive: row.last_active || null,
+          shareJson: row.share_json || null,
+          listsStamp: row.lists_stamp != null ? row.lists_stamp : null,
+        };
+        const raw = JSON.stringify(payload);
+        try {
+          if (env.CONFIGS) await env.CONFIGS.put(`creator:${username}`, raw);
+        } catch (kvErr) {
+          console.error("KV cache write error (getCreator):", kvErr);
+        }
+        return raw;
       }
-    } catch(e) {
-      console.error("D1 read error (getCreator):", e);
+    } catch (e) {
+      console.error("D1 read error (getCreator), falling back to KV:", e);
+    }
+  }
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(`creator:${username}`);
+      if (raw) {
+        if (env.DB) {
+          backfillCreatorRowInD1(env, username).catch((e) => console.error("Lazy backfill creator to D1 error:", e));
+        }
+        return raw;
+      }
+    } catch (e) {
+      console.error("KV read error (getCreator):", e);
     }
   }
   return null;
 }
 
-// The key hash to actually verify against, preferring the store that can
-// answer immediately.
-//
-// getCreator reads KV first and falls back to D1 only on a MISS, which is the
-// right rule for reading a profile and the wrong one for authenticating.
-// KV reads are edge-cached, so for a while after a rotation a colo that did
-// not serve the write keeps answering with the pre-rotation record -- and a
-// hit is a hit, so the D1 fallback never runs. Measured against modelled KV
-// semantics: the rotated-away key still authenticated on such a colo, and the
-// NEW key was rejected there, which is a support-visible correctness bug as
-// well as a security one. Every rotation path writes D1 FIRST and only then
-// KV (see rotateCreatorKeyHashInD1), precisely so the authoritative answer
-// exists somewhere the instant the rotation is accepted; this is what reads
-// it.
-//
-// A missing D1 row still means "not migrated yet", never "no such account",
-// so KV remains the answer for it -- the lazy-migration state the accessors
-// are built to tolerate. D1 unavailable falls back to KV too: an outage in an
-// optional accelerator must not lock anyone out.
-//
-// The cost is one indexed primary-key lookup, and only for deployments that
-// have bound D1. The caller issues it alongside the KV read rather than after
-// it, so it costs a subrequest rather than a round trip.
 // "Does this account still exist", memoized for one request.
 //
 // A creator list whose creator is gone is an orphan -- left behind by a save
@@ -3005,19 +3070,6 @@ function makeCreatorExistsMemo(env) {
     cache.set(username, pending);
     return pending;
   };
-}
-
-async function authoritativeKeyHash(env, username, kvKeyHash) {
-  if (!env || !env.DB) return kvKeyHash;
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT key_hash FROM creators WHERE username = ?"
-    ).bind(username).all();
-    if (results && results.length && results[0].key_hash) return results[0].key_hash;
-  } catch (e) {
-    console.error("D1 read error (authoritativeKeyHash), using the KV copy:", e);
-  }
-  return kvKeyHash;
 }
 
 // Copies an account's identity row from KV into D1, if it is not there
@@ -3104,48 +3156,85 @@ async function rotateCreatorKeyHashInD1(env, username, keyHash) {
   }
 }
 
-// Same rule as getCreator above, and the same reasons: KV first, D1 as the
-// fallback for a record KV does not have.
-//
-// This one carried the sharpest version of the old asymmetry. `likes` is
-// denormalised onto the record from the voter ledger, and /api/lists/like
-// writes it to KV unconditionally but to D1 inside a swallowing catch -- so
-// a D1 row that was missing or behind reported a like count of 0, and
-// /api/creator/lists/save read that 0 back through here and wrote it into
-// the KV record. One rename, and a real count was gone from every store and
-// from the public directory. The public read paths (/lists/:user/:slug, the
-// directory, search) all read KV directly, so preferring D1 here also meant
-// the owner's dashboard and the public page could disagree indefinitely
-// about the same list.
+// D1 is the authoritative store for creator lists when bound.
+// KV serves as a read-through cache and fallback for unmigrated lists.
 //
 // Note the slug: a D1 row's id is `{username}:{slug}`, and splitting on ":"
 // would truncate a slug containing one. slugifyServer cannot produce such a
 // slug, but the caller already knows the right answer, so use it.
 async function getCreatorList(env, username, slug) {
-  try {
-    const raw = await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
-    if (raw) return raw;
-  } catch (e) {
-    console.error("KV read error (getCreatorList), falling back to D1:", e);
-  }
-  if (env.DB) {
+  if (env && env.DB) {
     try {
       const { results } = await env.DB.prepare('SELECT * FROM creator_lists WHERE id = ?').bind(`${username}:${slug}`).all();
       if (results && results.length > 0) {
         const row = results[0];
-        return JSON.stringify({
+        let kvData = null;
+        if (env.CONFIGS) {
+          try {
+            const rawKv = await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+            if (rawKv) kvData = JSON.parse(rawKv);
+          } catch {}
+        }
+
+        // If KV has a fresher edit because a D1 write was dropped, prefer KV and repair D1
+        const kvIsFresher = kvData && typeof kvData.updatedAt === "number" && kvData.updatedAt > (row.updated_at || 0);
+        const name = kvIsFresher && kvData.name ? kvData.name : row.name;
+        const type = kvIsFresher && kvData.type ? kvData.type : row.type;
+        const visibility = kvIsFresher && kvData.visibility ? kvData.visibility : row.visibility;
+        const items = kvIsFresher && Array.isArray(kvData.items) ? kvData.items : JSON.parse(row.items_json || '[]');
+
+        let likes = row.likes || 0;
+        if (kvData && typeof kvData.likes === "number" && kvData.likes > likes) {
+          likes = kvData.likes;
+        }
+
+        let updatedAt;
+        if (kvData && !("updatedAt" in kvData)) {
+          // Explicit legacy record without updatedAt
+          updatedAt = undefined;
+        } else if (kvIsFresher) {
+          updatedAt = kvData.updatedAt;
+        } else {
+          updatedAt = row.updated_at > 0 ? row.updated_at : (kvData && kvData.updatedAt ? kvData.updatedAt : undefined);
+        }
+
+        if (kvIsFresher) {
+          try {
+            env.DB.prepare(
+              "UPDATE creator_lists SET name = ?, type = ?, visibility = ?, items_json = ?, updated_at = ? WHERE id = ?"
+            ).bind(name, type, visibility, JSON.stringify(items), updatedAt || 0, `${username}:${slug}`).run().catch(() => {});
+          } catch {}
+        }
+
+        const payload = {
           slug,
-          name: row.name,
-          type: row.type,
-          visibility: row.visibility,
-          items: JSON.parse(row.items_json || '[]'),
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-          likes: row.likes || 0
-        });
+          name,
+          type,
+          visibility,
+          items,
+          createdAt: row.created_at || (kvData && kvData.createdAt ? kvData.createdAt : 0),
+          updatedAt,
+          likes,
+          sortOrder: row.sort_order != null ? row.sort_order : undefined,
+        };
+        const raw = JSON.stringify(payload);
+        try {
+          if (env.CONFIGS && !kvIsFresher) await env.CONFIGS.put(`creatorlist:${username}:${slug}`, raw);
+        } catch (kvErr) {
+          console.error("KV cache write error (getCreatorList):", kvErr);
+        }
+        return raw;
       }
-    } catch(e) {
-      console.error("D1 read error (getCreatorList):", e);
+    } catch (e) {
+      console.error("D1 read error (getCreatorList), falling back to KV:", e);
+    }
+  }
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(`creatorlist:${username}:${slug}`);
+      if (raw) return raw;
+    } catch (e) {
+      console.error("KV read error (getCreatorList):", e);
     }
   }
   return null;

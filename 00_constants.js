@@ -555,5 +555,25 @@ const D1_SCHEMA_MANIFEST = [
     migration: "0007", kind: "table", name: "lists_fts",
     consequence: "Full-text search over public lists falls back or fails.",
   },
+  {
+    migration: "0008", kind: "column", table: "creators", name: "share_json",
+    consequence: "Per-slug tracking share opt-in settings fall back to KV only.",
+  },
+  {
+    migration: "0008", kind: "column", table: "creators", name: "lists_stamp",
+    consequence: "List change synchronization stamp falls back to KV only.",
+  },
+  {
+    migration: "0008", kind: "column", table: "creator_lists", name: "sort_order",
+    consequence: "Creator list display ordering falls back to KV creatorlistorder.",
+  },
+  {
+    migration: "0008", kind: "table", name: "list_tombstones",
+    consequence: "Deleted list sync tombstones fall back to KV creatorlistdeleted.",
+  },
+  {
+    migration: "0008", kind: "index", name: "idx_list_tombstones_user_until",
+    consequence: "Querying active list tombstones scans the table instead of an index.",
+  },
 ];
 
