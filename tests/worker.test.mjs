@@ -7042,7 +7042,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });
@@ -8462,5 +8462,382 @@ describe("Phase 2: Identity and lists become D1-authoritative", () => {
     // Verify creators.last_active in D1 is updated
     const d1Row = db.q("SELECT last_active FROM creators WHERE username = 'p2lastseen'")[0];
     assert.ok(d1Row.last_active > 0, "creators.last_active in D1 must be updated");
+  });
+});
+
+describe("Phase 3: Likes, feedback, telemetry, tokens, tombstones", () => {
+  it("list_likes: applyLikeVote and /api/lists/like write to D1 list_likes and update creator_lists.likes", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3likeowner");
+    const K = { creatorName: "p3likeowner", creatorKey: u.creatorKey };
+
+    // Save a public list
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Favorite Movies", visibility: "public", type: "movie", items: [{ id: "tt0111161", name: "Shawshank" }] },
+    });
+    const slug = saveRes.body.slug;
+    const listId = `c:p3likeowner:${slug}`;
+    const voterIp = nextIp();
+
+    // 1. First like vote
+    const likeRes1 = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug },
+    });
+    assert.equal(likeRes1.body.ok, true);
+    assert.equal(likeRes1.body.likes, 1);
+    assert.equal(likeRes1.body.liked, true);
+
+    // Verify D1 list_likes has voter
+    const likesRows1 = db.q("SELECT * FROM list_likes WHERE list_id = ?", listId);
+    assert.equal(likesRows1.length, 1);
+    // Verify D1 creator_lists.likes is 1
+    const listRow1 = db.q("SELECT likes FROM creator_lists WHERE id = ?", `p3likeowner:${slug}`)[0];
+    assert.equal(listRow1.likes, 1);
+
+    // 2. Unlike vote
+    const unlikeRes = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug, action: "unlike" },
+    });
+    assert.equal(unlikeRes.body.ok, true);
+    assert.equal(unlikeRes.body.likes, 0);
+    assert.equal(unlikeRes.body.liked, false);
+
+    // Verify D1 list_likes is empty
+    const likesRows2 = db.q("SELECT * FROM list_likes WHERE list_id = ?", listId);
+    assert.equal(likesRows2.length, 0);
+    // Verify D1 creator_lists.likes is 0
+    const listRow2 = db.q("SELECT likes FROM creator_lists WHERE id = ?", `p3likeowner:${slug}`)[0];
+    assert.equal(listRow2.likes, 0);
+
+    // 3. Lazy migration from KV to D1:
+    // When KV has legacy voter array and D1 has no rows, reading or voting migrates KV voters into D1.
+    kv._store.set(`listlikevoters:p3likeowner:${slug}`, JSON.stringify(["legacy_voter_1", "legacy_voter_2"]));
+    const likeRes3 = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug, action: "like" },
+    });
+    assert.equal(likeRes3.body.ok, true);
+    const likesRows3 = db.q("SELECT voter_id FROM list_likes WHERE list_id = ? ORDER BY voter_id", listId);
+    const voterIds = likesRows3.map((r) => r.voter_id);
+    assert.ok(voterIds.includes("legacy_voter_1"), "must lazy-migrate legacy_voter_1");
+    assert.ok(voterIds.includes("legacy_voter_2"), "must lazy-migrate legacy_voter_2");
+  });
+
+  it("list_likes: purgeCreatorData clears list_likes for deleted creator lists", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3purgelikes");
+    const K = { creatorName: "p3purgelikes", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", visibility: "public", type: "movie", items: [] },
+    });
+    const slug = saveRes.body.slug;
+    const listId = `c:p3purgelikes:${slug}`;
+
+    await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: nextIp(),
+      json: { username: "p3purgelikes", slug },
+    });
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?", listId)[0].c, 1);
+
+    // Purge creator via delete-account
+    const purgeRes = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(purgeRes.body.ok, true);
+
+    // list_likes must be deleted
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?", listId)[0].c, 0);
+  });
+
+  it("feedback: /api/feedback and admin endpoints read/write D1 feedback table", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // 1. Submit feedback via /api/feedback with an allowed category ('idea')
+    const postRes = await call(env, "/api/feedback", {
+      method: "POST",
+      ip: nextIp(),
+      json: { category: "idea", message: "Add dark mode option", contact: "tester@example.com" },
+    });
+    assert.equal(postRes.body.ok, true);
+    const entryId = postRes.body.entry.id;
+    assert.ok(entryId, "feedback ID must be returned");
+
+    // Verify D1 feedback row
+    const fbRows = db.q("SELECT * FROM feedback WHERE id = ?", entryId);
+    assert.equal(fbRows.length, 1);
+    assert.equal(fbRows[0].status, "open");
+    assert.equal(fbRows[0].subject, "idea");
+    assert.ok(fbRows[0].body_json.includes("Add dark mode option"));
+
+    // 2. Admin lists feedback via /admin/api/feedback
+    const listRes = await call(env, "/admin/api/feedback", { cookie });
+    assert.equal(listRes.body.ok, true);
+    const found = listRes.body.entries.find((e) => e.id === entryId);
+    assert.ok(found, "feedback entry must be listed by admin");
+    assert.equal(found.category, "idea");
+
+    // 3. Admin replies via /admin/api/feedback/reply
+    const replyRes = await call(env, "/admin/api/feedback/reply", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, message: "We are considering it!" },
+    });
+    assert.equal(replyRes.body.ok, true);
+    const fbAfterReply = db.q("SELECT body_json FROM feedback WHERE id = ?", entryId)[0];
+    assert.ok(fbAfterReply.body_json.includes("We are considering it!"));
+
+    // 4. Admin edits status via /admin/api/feedback/status
+    const statusRes = await call(env, "/admin/api/feedback/status", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, completed: true },
+    });
+    assert.equal(statusRes.body.ok, true);
+    assert.equal(db.q("SELECT status FROM feedback WHERE id = ?", entryId)[0].status, "closed");
+
+    // 5. Admin edits category via /admin/api/feedback/edit
+    const editRes = await call(env, "/admin/api/feedback/edit", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, category: "improvement", message: "Add dark mode option revised" },
+    });
+    assert.equal(editRes.body.ok, true);
+    assert.equal(db.q("SELECT subject FROM feedback WHERE id = ?", entryId)[0].subject, "improvement");
+
+    // 6. Admin deletes feedback via /admin/api/feedback/delete
+    const delRes = await call(env, "/admin/api/feedback/delete", {
+      method: "POST",
+      cookie,
+      json: { id: entryId },
+    });
+    assert.equal(delRes.body.ok, true);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM feedback WHERE id = ?", entryId)[0].c, 0);
+  });
+
+  it("event_meta & audience analytics: track-event populates event_meta, and audience reads normalized stats", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // 1. POST /api/track-event writes to D1 event_meta
+    await call(env, "/api/track-event", {
+      method: "POST",
+      ip: nextIp(),
+      json: {
+        events: [
+          { eventType: "watched", id: "tt1234567", title: "Interstellar Space", mediaType: "movie" },
+        ],
+      },
+    });
+    const metaRows = db.q("SELECT * FROM event_meta WHERE event_type = 'watched' AND item_id = 'tt1234567'");
+    assert.equal(metaRows.length, 1);
+    assert.equal(metaRows[0].title, "Interstellar Space");
+    assert.equal(metaRows[0].media_type, "movie");
+
+    // Leaderboard uses event_meta to attach title
+    const lbRes = await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie });
+    assert.equal(lbRes.body.ok, true);
+    const entry = lbRes.body.entries.find((e) => e.id === "tt1234567");
+    assert.ok(entry);
+    assert.equal(entry.title, "Interstellar Space");
+
+    // 2. Audience analytics reads normalized genre:* and decade:* rows from D1 stats
+    db.q("INSERT INTO stats (kind, day, n) VALUES ('genre:Science Fiction', 'total', 42)");
+    db.q("INSERT INTO stats (kind, day, n) VALUES ('decade:2010s', 'total', 38)");
+    const audRes = await call(env, "/admin/api/analytics?section=audience", { cookie });
+    assert.equal(audRes.body.ok, true);
+    const sf = audRes.body.genres.find((g) => g.name === "Science Fiction");
+    assert.ok(sf, "genre Science Fiction must be returned from D1 stats");
+    assert.equal(sf.count, 42);
+    const d10 = audRes.body.decades.find((d) => d.name === "2010s");
+    assert.ok(d10, "decade 2010s must be returned from D1 stats");
+    assert.equal(d10.count, 38);
+  });
+
+  it("scrobble_tokens: atomic token rotation in D1 and instant revocation of old tokens", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3scrobbler");
+    const K = { creatorName: "p3scrobbler", creatorKey: u.creatorKey };
+
+    // 1. Issue first token
+    const r1 = await call(env, "/api/creator/scrobble-token", { method: "POST", json: K });
+    assert.equal(r1.body.ok, true);
+    const token1 = r1.body.token;
+    assert.ok(token1);
+
+    // Verify token1 in D1
+    const tRows1 = db.q("SELECT * FROM scrobble_tokens WHERE token = ?", token1);
+    assert.equal(tRows1.length, 1);
+    assert.equal(tRows1[0].username, "p3scrobbler");
+
+    // Scrobble webhook works with token1
+    const sRes1 = await call(env, `/api/scrobble?st=${encodeURIComponent(token1)}`, {
+      method: "POST",
+      json: { event: "media.play" },
+    });
+    assert.notEqual(sRes1.status, 401);
+
+    // 2. Rotate token
+    const r2 = await call(env, "/api/creator/scrobble-token", {
+      method: "POST",
+      json: { ...K, rotate: true },
+    });
+    assert.equal(r2.body.ok, true);
+    const token2 = r2.body.token;
+    assert.ok(token2);
+    assert.notEqual(token1, token2);
+
+    // D1 must have token2 and MUST NOT have token1
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE token = ?", token1)[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE token = ?", token2)[0].c, 1);
+
+    // Old token is immediately revoked (fails auth)
+    const sResOld = await call(env, `/api/scrobble?st=${encodeURIComponent(token1)}`, {
+      method: "POST",
+      json: { event: "media.play" },
+    });
+    assert.equal(sResOld.status, 401);
+
+    // Purge creator removes scrobble_tokens
+    await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE username = 'p3scrobbler'")[0].c, 0);
+  });
+
+  it("pruneTombstones: cron scheduled() prunes expired tombstones and preserves active ones", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db, TMDB_API_KEY: "k" });
+
+    const past = Date.now() - 60000;
+    const future = Date.now() + 60000;
+
+    // Seed expired and active tombstones
+    db.q("INSERT INTO creator_tombstones (username, until) VALUES ('expired_creator', ?)", past);
+    db.q("INSERT INTO creator_tombstones (username, until) VALUES ('active_creator', ?)", future);
+    db.q("INSERT INTO list_tombstones (username, slug, until) VALUES ('u1', 'expired_slug', ?)", past);
+    db.q("INSERT INTO list_tombstones (username, slug, until) VALUES ('u1', 'active_slug', ?)", future);
+
+    // Run scheduled tick
+    await runScheduledTick(env);
+
+    // Check creator_tombstones
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM creator_tombstones WHERE username = 'expired_creator'")[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM creator_tombstones WHERE username = 'active_creator'")[0].c, 1);
+
+    // Check list_tombstones
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_tombstones WHERE slug = 'expired_slug'")[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_tombstones WHERE slug = 'active_slug'")[0].c, 1);
+  });
+
+  it("databaseStats: /admin/api/schema-status reports page count, page size, and table row counts", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.status, 200);
+    assert.ok(r.body.databaseStats, "databaseStats must be returned in response");
+    const ds = r.body.databaseStats;
+    assert.equal(typeof ds.pageSize, "number");
+    assert.ok(ds.pageSize > 0);
+    assert.equal(typeof ds.pageCount, "number");
+    assert.ok(ds.pageCount >= 0);
+    assert.equal(typeof ds.estimatedSizeBytes, "number");
+    assert.ok(ds.estimatedSizeBytes >= 0);
+    assert.ok(ds.rowCounts && typeof ds.rowCounts === "object");
+    assert.equal(typeof ds.rowCounts.creators, "number");
+    assert.equal(typeof ds.rowCounts.list_likes, "number");
+    assert.equal(typeof ds.rowCounts.feedback, "number");
+    assert.equal(typeof ds.rowCounts.scrobble_tokens, "number");
+    assert.equal(typeof ds.rowCounts.event_meta, "number");
+  });
+
+  it("/admin/api/migrate-d1 backfills likes, feedback, event_meta, scrobble_tokens, and explodes genre/decade stats", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // Seed creator row so foreign key doesn't reject list
+    db.q("INSERT INTO creators (username, display_name, key_hash, created_at) VALUES ('miguser', 'miguser', 'hash', 1)");
+
+    // Seed KV keys for phases 4, 5, 6, 7, 8
+    kv._store.set("stats:genres:alltime", JSON.stringify({ Animation: 25, Mystery: 14 }));
+    kv._store.set("stats:decades:alltime", JSON.stringify({ "1960s": 9 }));
+    kv._store.set("listlikevoters:miguser:favs", JSON.stringify(["voter_a", "voter_b"]));
+    kv._store.set("feedback:thread101", JSON.stringify({
+      id: "thread101",
+      status: "open",
+      category: "Feature",
+      subject: "Dark mode",
+      messages: [{ text: "Please add dark mode" }],
+      createdAt: 1000,
+      updatedAt: 2000,
+    }));
+    kv._store.set("evtmeta:movie:tt7777777", JSON.stringify({
+      title: "Interstellar Odyssey",
+      mediaType: "movie",
+      lastSeen: 5000,
+    }));
+    kv._store.set("creatorscrobbletoken:migscrob", "scrob_secret_token_123");
+
+    // Run migrate-d1 to completion
+    let last;
+    for (let i = 0; i < 30; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+
+    // Verify D1:
+    // 1. Stats exploded
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'genre:Animation' AND day = 'total'")[0].n, 25);
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'genre:Mystery' AND day = 'total'")[0].n, 14);
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'decade:1960s' AND day = 'total'")[0].n, 9);
+
+    // 2. Likes migrated
+    const likeRows = db.q("SELECT voter_id FROM list_likes WHERE list_id = 'c:miguser:favs' ORDER BY voter_id");
+    assert.deepEqual(likeRows.map((r) => r.voter_id), ["voter_a", "voter_b"]);
+
+    // 3. Feedback migrated
+    const fb = db.q("SELECT * FROM feedback WHERE id = 'thread101'")[0];
+    assert.ok(fb);
+    assert.equal(fb.status, "open");
+    assert.equal(fb.subject, "Feature");
+
+    // 4. Event meta migrated
+    const em = db.q("SELECT * FROM event_meta WHERE event_type = 'movie' AND item_id = 'tt7777777'")[0];
+    assert.ok(em);
+    assert.equal(em.title, "Interstellar Odyssey");
+    assert.equal(em.media_type, "movie");
+
+    // 5. Scrobble token migrated
+    const st = db.q("SELECT * FROM scrobble_tokens WHERE token = 'scrob_secret_token_123'")[0];
+    assert.ok(st);
+    assert.equal(st.username, "migscrob");
   });
 });

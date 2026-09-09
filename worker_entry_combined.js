@@ -330,7 +330,17 @@ const CRON_EPISODE_CHECK_SHARE = 0.5;
 // derived only from KV), so re-processing a key across a chunk boundary is
 // harmless -- which is what makes chunking safe here.
 const MIGRATE_D1_STATE_KEY = "migrated1:state";
-const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+const MIGRATE_D1_PREFIXES = [
+  "creator:",
+  "creatorlist:",
+  "publishedlist:user:",
+  "stats:sourcegroup:",
+  "stats:",
+  "listlikevoters:",
+  "feedback:",
+  "evtmeta:",
+  "creatorscrobbletoken:",
+];
 // This endpoint has its invocation to itself (it is admin-triggered, not
 // ridden along on the cron), so it can claim more of the 1,000 storage
 // operations than the index rebuild does -- but still well short of it,
@@ -624,6 +634,34 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0008", kind: "index", name: "idx_list_tombstones_user_until",
     consequence: "Querying active list tombstones scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "list_likes",
+    consequence: "Per-voter like ledgers fall back to KV listlikevoters.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_list_likes_voter",
+    consequence: "Querying likes by voter scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "feedback",
+    consequence: "Feedback threads fall back to KV feedback:* multi-page list scanning.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_feedback_status_updated",
+    consequence: "Querying feedback by status and date scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "scrobble_tokens",
+    consequence: "Scrobble webhook tokens fall back to KV scrobbletoken.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_scrobble_tokens_user",
+    consequence: "Looking up scrobble tokens by username scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "event_meta",
+    consequence: "Title event display metadata falls back to KV evtmeta.",
   },
 ];
 
@@ -3640,10 +3678,37 @@ async function likeVoterId(request, env, creatorUsername, scopeId) {
   return `a:${hash}`;
 }
 
-// Reads a ledger key's voter list, tolerating both storage shapes this
-// function has ever written (a bare array, or {voters: [...]}).
-async function readLikeVoters(env, ledgerKey) {
+function ledgerKeyToListId(ledgerKey) {
+  if (typeof ledgerKey !== "string") return "";
+  if (ledgerKey.startsWith("listlikevoters:user:")) {
+    return "a:" + ledgerKey.slice("listlikevoters:user:".length);
+  }
+  if (ledgerKey.startsWith("listlikevoters:")) {
+    return "c:" + ledgerKey.slice("listlikevoters:".length);
+  }
+  if (ledgerKey.startsWith("extlikevoters:")) {
+    return "ext:" + ledgerKey.slice("extlikevoters:".length);
+  }
+  return ledgerKey;
+}
+
+function listIdToLedgerKey(listId) {
+  if (typeof listId !== "string") return "";
+  if (listId.startsWith("a:")) {
+    return "listlikevoters:user:" + listId.slice(2);
+  }
+  if (listId.startsWith("c:")) {
+    return "listlikevoters:" + listId.slice(2);
+  }
+  if (listId.startsWith("ext:")) {
+    return "extlikevoters:" + listId.slice(4);
+  }
+  return "listlikevoters:" + listId;
+}
+
+async function readLikeVotersFromKv(env, ledgerKey) {
   try {
+    if (!env || !env.CONFIGS) return [];
     const raw = await env.CONFIGS.get(ledgerKey);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
@@ -3655,34 +3720,37 @@ async function readLikeVoters(env, ledgerKey) {
   return [];
 }
 
+// Reads a ledger key's voter list. When D1 is bound, queries list_likes first;
+// falls back to KV if D1 returns no rows.
+async function readLikeVoters(env, ledgerKey) {
+  const listId = ledgerKeyToListId(ledgerKey);
+  if (env && env.DB) {
+    try {
+      const res = await env.DB.prepare(
+        "SELECT voter_id FROM list_likes WHERE list_id = ?"
+      ).bind(listId).all();
+      if (res && Array.isArray(res.results) && res.results.length > 0) {
+        return res.results.map((r) => r.voter_id);
+      }
+    } catch {
+      // D1 query failed or table not migrated yet; fall through to KV
+    }
+  }
+  return readLikeVotersFromKv(env, ledgerKey);
+}
+
 // Applies one vote to a ledger key and returns the resulting count.
 // `capped: true` means the ledger is full (see LIKE_VOTER_CAP) and this
 // would have been a new voter -- the caller keeps the existing count rather
 // than silently discarding the vote or growing the key without bound.
 //
-// Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
-// here can lose a vote: two requests can both read the same snapshot, and
-// whichever PUT lands last wins. This writes, re-reads, and retries against
-// the fresh state if its own vote did not survive.
-//
-// The subtlety is WHEN to retry. KV does not promise read-your-writes -- its
-// reads are edge-cached -- so "my vote is not in the value I just read back"
-// has two completely different causes: another writer really did land on top
-// of us, or KV simply served a stale copy and nothing happened at all.
-// Retrying on both treats every stale read as contention, which on an
-// otherwise idle list spends several writes against a key KV limits to one
-// write per second, and can still report a count that does not match
-// storage.
-//
-// So the retry is gated on EVIDENCE of another writer: an id present now
-// that was not in our own pre-write snapshot and is not ours. A real
-// clobber leaves that trace (the other request wrote its own voter); a
-// stale read cannot, because a stale read is by definition the state we
-// already saw. No evidence means our PUT is good and the read was simply
-// behind, so we trust it and stop.
+// When D1 is bound, list_likes is authoritative and creator_lists.likes /
+// published_lists.likes is updated in D1. KV is mirrored with retry-and-verify
+// to support KV-only readers and detect any racing writes across stores.
 const LIKE_VOTE_MAX_ATTEMPTS = 3;
 
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  const listId = ledgerKeyToListId(ledgerKey);
   let lastCount = 0;
   for (let attempt = 0; attempt < LIKE_VOTE_MAX_ATTEMPTS; attempt++) {
     const voters = await readLikeVoters(env, ledgerKey);
@@ -3703,9 +3771,52 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
     if (had === liked && set.size === voters.length) {
       return { count: set.size, capped: false };
     }
-    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    if (env && env.CONFIGS) {
+      await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    }
 
-    const after = await readLikeVoters(env, ledgerKey);
+    if (env && env.DB) {
+      try {
+        // If this list had voters in KV that haven't been migrated to D1 yet,
+        // seed them into D1 so votes are not dropped.
+        if (voters.length > 0) {
+          const countRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?").bind(listId).first();
+          if (!countRow || countRow.c === 0) {
+            const seedBatch = voters.map((v) =>
+              env.DB.prepare("INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)").bind(listId, v, Date.now())
+            );
+            await env.DB.batch(seedBatch);
+          }
+        }
+        if (liked) {
+          await env.DB.prepare(
+            "INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)"
+          ).bind(listId, voterId, Date.now()).run();
+        } else {
+          await env.DB.prepare(
+            "DELETE FROM list_likes WHERE list_id = ? AND voter_id = ?"
+          ).bind(listId, voterId).run();
+        }
+        const updatedRow = await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?"
+        ).bind(listId).first();
+        const d1Count = updatedRow ? Number(updatedRow.c || 0) : set.size;
+
+        if (listId.startsWith("c:")) {
+          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(d1Count, listId.slice(2)).run();
+        } else if (listId.startsWith("a:")) {
+          await env.DB.prepare("UPDATE published_lists SET likes = ? WHERE slug = ?").bind(d1Count, listId.slice(2)).run();
+        }
+      } catch (dbErr) {
+        console.error("D1 write error (applyLikeVote):", dbErr);
+      }
+    }
+
+    if (!env || !env.CONFIGS) {
+      return { count: lastCount, capped: false };
+    }
+
+    const after = await readLikeVotersFromKv(env, ledgerKey);
     const afterSet = new Set(after);
     if (afterSet.has(voterId) === liked) {
       // Our vote is visible in storage. Done.
@@ -3718,11 +3829,21 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
       // lost update. Trust our own PUT rather than writing it again.
       return { count: lastCount, capped: false };
     }
-    // Someone else's write really did land on top of ours -- loop and merge
-    // against their now-current state.
+    // Someone else's write really did land on top of ours -- sync racing voters into D1 as well
+    if (env && env.DB) {
+      try {
+        for (const racingId of afterSet) {
+          if (!before.has(racingId)) {
+            await env.DB.prepare(
+              "INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)"
+            ).bind(listId, racingId, Date.now()).run();
+          }
+        }
+      } catch {}
+    }
   }
   // Sustained genuine contention on this one list: report what is actually
-  // in KV rather than guessing.
+  // in storage rather than guessing.
   const finalVoters = await readLikeVoters(env, ledgerKey);
   return { count: finalVoters.length, capped: false };
 }
@@ -3734,16 +3855,10 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
 // URL then lives in the media server's configuration, in its logs, and in
 // any request log along the way.
 //
-// It used to carry the Creator Key itself, which is the credential for the
-// whole account and has no expiry. Anyone who read that URL out of a log had
-// full access, and the only remedy was rotating the key -- which breaks
-// every other device the owner had signed in on.
-//
 // A scrobble token is a separate, revocable credential that authorises
-// exactly one thing: recording playback for one account. Regenerating it
-// invalidates the old webhook URL and touches nothing else. One per account,
-// stored both ways so it can be looked up by token on the hot path and
-// found by username for revocation and account deletion.
+// exactly one thing: recording playback for one account. In D1, rotation is
+// an atomic batch (DELETE old + INSERT new) so revocation takes effect
+// immediately everywhere.
 function scrobbleTokenKey(token) {
   return `scrobbletoken:${token}`;
 }
@@ -3754,28 +3869,53 @@ function creatorScrobbleTokenKey(username) {
 // Returns the account's current token, minting one if it has none.
 // `rotate` forces a fresh token and revokes the previous one.
 async function getOrCreateScrobbleToken(env, username, rotate = false) {
-  if (!env || !env.CONFIGS) return "";
   let existing = "";
-  try {
-    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
-  } catch {
-    existing = "";
+  if (env && env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT token FROM scrobble_tokens WHERE username = ?").bind(username).first();
+      if (row && row.token) existing = row.token;
+    } catch {}
   }
-  if (existing && !rotate) return existing;
+  if (!existing && env && env.CONFIGS) {
+    try {
+      existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+    } catch {
+      existing = "";
+    }
+  }
+  if (existing && !rotate) {
+    if (env && env.DB) {
+      try {
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)"
+        ).bind(existing, username, Date.now()).run();
+      } catch {}
+    }
+    return existing;
+  }
 
   // Same CSPRNG helper the OAuth state cookies use.
   const token = generateShortId() + generateShortId();
-  await env.CONFIGS.put(scrobbleTokenKey(token), username);
-  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
-  if (existing) {
-    // Revoke the old one, so a leaked webhook URL actually stops working.
+  if (env && env.DB) {
     try {
-      await env.CONFIGS.delete(scrobbleTokenKey(existing));
-    } catch {
-      // A stranded token is the one failure worth shouting about here, but
-      // it cannot be helped from inside this request; the reverse index no
-      // longer points at it either way.
-      console.error("scrobble token rotation: could not revoke the previous token");
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(username),
+        env.DB.prepare("INSERT INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)").bind(token, username, Date.now()),
+      ]);
+    } catch (dbErr) {
+      console.error("D1 write error (scrobble_tokens):", dbErr);
+    }
+  }
+  if (env && env.CONFIGS) {
+    await env.CONFIGS.put(scrobbleTokenKey(token), username);
+    await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+    if (existing) {
+      // Revoke the old one, so a leaked webhook URL actually stops working.
+      try {
+        await env.CONFIGS.delete(scrobbleTokenKey(existing));
+      } catch {
+        console.error("scrobble token rotation: could not revoke the previous token");
+      }
     }
   }
   return token;
@@ -3783,12 +3923,32 @@ async function getOrCreateScrobbleToken(env, username, rotate = false) {
 
 // Resolves a presented token to the account it belongs to, or "" .
 async function usernameForScrobbleToken(env, token) {
-  if (!env || !env.CONFIGS) return "";
   const t = String(token || "").trim();
-  // Shape check before touching KV, so a junk value cannot mint reads.
+  // Shape check before touching KV/D1, so a junk value cannot mint reads.
   if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  if (env && env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT username FROM scrobble_tokens WHERE token = ?").bind(t).first();
+      if (row && row.username) return row.username;
+    } catch {}
+  }
+  if (!env || !env.CONFIGS) return "";
   try {
-    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+    const u = (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+    if (u && env && env.DB) {
+      // Check if D1 has an active token for this user; if so, but it doesn't match t, t was revoked
+      try {
+        const active = await env.DB.prepare("SELECT token FROM scrobble_tokens WHERE username = ?").bind(u).first();
+        if (active && active.token && active.token !== t) {
+          return "";
+        }
+        // Lazy backfill into D1
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)"
+        ).bind(t, u, Date.now()).run();
+      } catch {}
+    }
+    return u;
   } catch {
     return "";
   }
@@ -3951,6 +4111,32 @@ async function clearCreatorListDeletion(env, username, slug) {
   }
 }
 
+// Prunes expired tombstone markers from D1 (creator_tombstones and list_tombstones).
+// Note: per STORAGE-PLAN-KV-D1.md §5.4, no analytics, telemetry or feedback data is ever pruned.
+async function pruneTombstones(env) {
+  if (!env || !env.DB) return { prunedCreators: 0, prunedLists: 0 };
+  const now = Date.now();
+  let prunedCreators = 0;
+  let prunedLists = 0;
+  try {
+    const resCreators = await env.DB.prepare(
+      "DELETE FROM creator_tombstones WHERE until < ?"
+    ).bind(now).run();
+    prunedCreators = (resCreators && resCreators.meta && resCreators.meta.changes) || 0;
+  } catch (e) {
+    console.error("pruneTombstones (creator_tombstones) error:", e);
+  }
+  try {
+    const resLists = await env.DB.prepare(
+      "DELETE FROM list_tombstones WHERE until < ?"
+    ).bind(now).run();
+    prunedLists = (resLists && resLists.meta && resLists.meta.changes) || 0;
+  } catch (e) {
+    console.error("pruneTombstones (list_tombstones) error:", e);
+  }
+  return { prunedCreators, prunedLists };
+}
+
 // Deletes one or more of a creator's lists: the KV record, the D1 row, the
 // like ledger, the entry in their display order, and the directory index --
 // with a single index write and a single order write however many slugs are
@@ -3988,6 +4174,9 @@ async function deleteCreatorLists(env, username, slugs) {
         await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
+        } catch {}
+        try {
+          await env.DB.prepare("DELETE FROM list_likes WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deleteCreatorLists):", dbErr);
@@ -4082,6 +4271,9 @@ async function deletePublishedLists(env, slugs) {
         await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`).run();
+        } catch {}
+        try {
+          await env.DB.prepare("DELETE FROM list_likes WHERE list_id = ?").bind(`a:${slug}`).run();
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deletePublishedLists):", dbErr);
@@ -4772,6 +4964,12 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM lists_fts WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM list_tombstones WHERE username = ?").bind(u).run();
+      const escapedU = u.replace(/([%_\\])/g, "\\$1");
+      await env.DB.prepare("DELETE FROM list_likes WHERE list_id LIKE ? ESCAPE '\\'").bind(`c:${escapedU}:%`).run();
+      if (deleteIdentity) {
+        await env.DB.prepare("DELETE FROM list_likes WHERE voter_id = ?").bind(`u:${u}`).run();
+      }
+      await env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
       dataSweepFailed = true;
@@ -5518,7 +5716,24 @@ async function bumpStatBy(env, kind, amount) {
 // conspicuously missing from), not because undercounting is free in
 // general.
 async function bumpJsonCounterBlob(env, key, fields) {
-  if (!env || !env.CONFIGS || !fields || !fields.length) return;
+  if (!fields || !fields.length) return;
+  // If D1 is bound, explode genres and decades into atomic stats rows per §5.2
+  if (env && env.DB) {
+    try {
+      const isGenre = key === "stats:genres:alltime";
+      const isDecade = key === "stats:decades:alltime";
+      if (isGenre || isDecade) {
+        const prefix = isGenre ? "genre:" : "decade:";
+        for (const f of fields) {
+          if (!f) continue;
+          await d1BumpStat(env, prefix + f, ["total"], 1);
+        }
+      }
+    } catch (e) {
+      // best-effort
+    }
+  }
+  if (!env || !env.CONFIGS) return;
   try {
     const raw = await env.CONFIGS.get(key);
     let counts = {};
@@ -5752,42 +5967,87 @@ const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
 const FEEDBACK_ADMIN_GET_CAP = 300;
 
 async function putFeedbackThread(env, key, entry) {
-  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+  const id = key.startsWith("feedback:") ? key.slice("feedback:".length) : (entry.id || key);
+  const status = (entry.completed ? "closed" : null) || entry.status || "open";
+  const subject = entry.category || entry.subject || (entry.messages && entry.messages[0] && entry.messages[0].text ? entry.messages[0].text.slice(0, 100) : null);
+  const createdAt = Number(entry.createdAt) || Date.now();
+  const updatedAt = Number(entry.updatedAt) || createdAt;
+  const bodyJson = JSON.stringify(entry);
+
+  if (env && env.DB) {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO feedback (id, status, subject, body_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           status = excluded.status,
+           subject = excluded.subject,
+           body_json = excluded.body_json,
+           updated_at = excluded.updated_at`
+      ).bind(id, status, subject, bodyJson, createdAt, updatedAt).run();
+    } catch (dbErr) {
+      console.error("D1 write error (putFeedbackThread):", dbErr);
+    }
+  }
+  if (env && env.CONFIGS) {
+    await env.CONFIGS.put(key, bodyJson, { expirationTtl: FEEDBACK_TTL_SEC });
+  }
 }
 
-// The display fields for a tracked title -- its name and media type -- stay in
-// KV on every deployment, D1-bound or not. The COUNTS are what were spending
-// the write budget, and those move to D1 in recordTrackedEvent; this blob is
-// read only by the leaderboard, only for the candidates it is about to render.
-//
-// It used to be written on EVERY event, with the comment "overwritten every
-// time rather than only on first sight -- keeps title/mediaType current if
-// either ever changes upstream, and lastSeen doubles as a cheap staleness
-// signal". Both of those still hold, and neither needs a write per event to
-// hold them: it is rewritten when the title or media type has actually
-// changed, and otherwise at most once a day per title, so lastSeen stays
-// meaningful. The KV read that costs is the cheap side of the trade --
-// 100,000 reads a day on the free plan against 1,000 writes.
+// The display fields for a tracked title -- its name and media type.
+// In D1 they live in the event_meta table; in KV they live at evtmeta:{type}:{id}.
+// Written when the title or media type has actually changed, and otherwise
+// at most once a day per title so lastSeen stays meaningful.
 //
 // Returns whether it wrote, which is what the tests assert on.
 const EVT_META_REFRESH_MS = 24 * 60 * 60 * 1000;
 async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
-  const metaKey = `evtmeta:${eventType}:${id}`;
-  const metaRaw = await env.CONFIGS.get(metaKey);
-  try {
-    const prev = metaRaw ? JSON.parse(metaRaw) : null;
-    if (prev
-      && (prev.title || "") === (title || "")
-      && (prev.mediaType || "") === (mediaType || "")
-      && Number.isFinite(prev.lastSeen)
-      && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
-      return false;
+  let changed = false;
+  if (env && env.DB) {
+    try {
+      const existing = await env.DB.prepare(
+        "SELECT title, media_type, last_seen FROM event_meta WHERE event_type = ? AND item_id = ?"
+      ).bind(eventType, id).first();
+      if (
+        !existing ||
+        (existing.title || "") !== (title || "") ||
+        (existing.media_type || "") !== (mediaType || "") ||
+        Date.now() - (existing.last_seen || 0) >= EVT_META_REFRESH_MS
+      ) {
+        await env.DB.prepare(
+          `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(event_type, item_id) DO UPDATE SET
+             title = excluded.title,
+             media_type = excluded.media_type,
+             last_seen = excluded.last_seen`
+        ).bind(eventType, id, title || "", mediaType || "", Date.now()).run();
+        changed = true;
+      }
+    } catch (e) {
+      console.error("D1 write error (event_meta):", e);
     }
-  } catch {
-    // Unreadable -- rewrite it.
   }
-  await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
-  return true;
+
+  if (env && env.CONFIGS) {
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const metaRaw = await env.CONFIGS.get(metaKey);
+    try {
+      const prev = metaRaw ? JSON.parse(metaRaw) : null;
+      if (prev
+        && (prev.title || "") === (title || "")
+        && (prev.mediaType || "") === (mediaType || "")
+        && Number.isFinite(prev.lastSeen)
+        && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
+        return changed;
+      }
+    } catch {
+      // Unreadable -- rewrite it.
+    }
+    await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
+    return true;
+  }
+  return changed;
 }
 
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
@@ -5900,16 +6160,37 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
 // only ever READ here, bounded by the candidate cap. Reads are the cheap
 // side: 100,000 a day against 1,000 writes.
 async function attachEventMeta(env, eventType, ids) {
+  if (!ids || !ids.length) return [];
+  const metaMap = new Map();
+  if (env && env.DB) {
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = await env.DB.prepare(
+        `SELECT item_id, title, media_type FROM event_meta WHERE event_type = ? AND item_id IN (${placeholders})`
+      ).bind(eventType, ...ids).all();
+      if (rows && Array.isArray(rows.results)) {
+        for (const r of rows.results) {
+          metaMap.set(r.item_id, { title: r.title || r.item_id, mediaType: r.media_type || "" });
+        }
+      }
+    } catch {}
+  }
   return await Promise.all(
     ids.map(async (id) => {
+      if (metaMap.has(id)) {
+        const m = metaMap.get(id);
+        return { id, title: m.title, mediaType: m.mediaType };
+      }
       let title = id;
       let mediaType = "";
       try {
-        const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
-        if (metaRaw) {
-          const meta = JSON.parse(metaRaw);
-          title = meta.title || id;
-          mediaType = meta.mediaType || "";
+        if (env && env.CONFIGS) {
+          const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
+          if (metaRaw) {
+            const meta = JSON.parse(metaRaw);
+            title = meta.title || id;
+            mediaType = meta.mediaType || "";
+          }
         }
       } catch {
         // fall back to the raw id as the title
@@ -6042,6 +6323,16 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
             if (det && det.title) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
+              if (env && env.DB) {
+                env.DB.prepare(
+                  `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(event_type, item_id) DO UPDATE SET
+                     title = excluded.title,
+                     media_type = excluded.media_type,
+                     last_seen = excluded.last_seen`
+                ).bind(eventType, e.id, det.title, e.mediaType || "", Date.now()).run().catch(() => {});
+              }
               if (env && env.CONFIGS) {
                 env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
@@ -6470,44 +6761,76 @@ async function computeCatalogAndCommunityLeaderboards(env, ctx) {
 }
 
 async function computeAudienceAnalytics(env) {
-  if (!env || !env.CONFIGS) return { watchTypes: {}, genres: [], decades: [] };
+  if (!env || (!env.CONFIGS && !env.DB)) return { watchTypes: {}, genres: [], decades: [] };
 
-  // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
-  // add-on: runs the old-keys-into-new-blob migration once (see its own
-  // comment), a no-op single read on every call after that.
-  await migrateGenreDecadeStatsIfNeeded(env);
+  if (env.CONFIGS) {
+    // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
+    // add-on: runs the old-keys-into-new-blob migration once (see its own
+    // comment), a no-op single read on every call after that.
+    await migrateGenreDecadeStatsIfNeeded(env);
+  }
 
   const [movies, series, episodes, genreBlobRaw, decadeBlobRaw] = await Promise.all([
     readStatCount(env, "watch_type:movie", "total"),
     readStatCount(env, "watch_type:series", "total"),
     readStatCount(env, "watch_type:episode", "total"),
-    env.CONFIGS.get("stats:genres:alltime"),
-    env.CONFIGS.get("stats:decades:alltime"),
+    env.CONFIGS ? env.CONFIGS.get("stats:genres:alltime") : null,
+    env.CONFIGS ? env.CONFIGS.get("stats:decades:alltime") : null,
   ]);
 
   const totalWatch = movies + series + episodes;
 
-  let genreCounts = {};
-  try {
-    genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
-  } catch {
-    genreCounts = {};
-  }
-  const validGenres = Object.entries(genreCounts)
-    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
-    .filter((g) => g.count > 0 && g.name);
-  validGenres.sort((a, b) => b.count - a.count);
+  let validGenres = null;
+  let validDecades = null;
 
-  let decadeCounts = {};
-  try {
-    decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
-  } catch {
-    decadeCounts = {};
+  if (env.DB) {
+    try {
+      const genreRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'genre:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (genreRows && Array.isArray(genreRows.results) && genreRows.results.length > 0) {
+        validGenres = genreRows.results.map((r) => ({
+          name: r.kind.slice("genre:".length),
+          count: Number(r.n) || 0,
+        })).filter((g) => g.count > 0 && g.name);
+      }
+      const decadeRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'decade:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (decadeRows && Array.isArray(decadeRows.results) && decadeRows.results.length > 0) {
+        validDecades = decadeRows.results.map((r) => ({
+          name: r.kind.slice("decade:".length),
+          count: Number(r.n) || 0,
+        })).filter((d) => d.count > 0 && d.name);
+      }
+    } catch {}
   }
-  const validDecades = Object.entries(decadeCounts)
-    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
-    .filter((d) => d.count > 0 && d.name);
-  validDecades.sort((a, b) => b.count - a.count);
+
+  if (!validGenres) {
+    let genreCounts = {};
+    try {
+      genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+    } catch {
+      genreCounts = {};
+    }
+    validGenres = Object.entries(genreCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((g) => g.count > 0 && g.name);
+    validGenres.sort((a, b) => b.count - a.count);
+  }
+
+  if (!validDecades) {
+    let decadeCounts = {};
+    try {
+      decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+    } catch {
+      decadeCounts = {};
+    }
+    validDecades = Object.entries(decadeCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((d) => d.count > 0 && d.name);
+    validDecades.sort((a, b) => b.count - a.count);
+  }
 
   return {
     watchTypes: { movies, series, episodes, total: totalWatch },
@@ -8347,9 +8670,22 @@ async function renderAdminDashboard(env) {
           btn.disabled = false;
           return;
         }
+        var dbStats = data.databaseStats;
+        var dbStatsNote = '';
+        if (dbStats && dbStats.estimatedSizeBytes != null) {
+          var mb = (dbStats.estimatedSizeBytes / (1024 * 1024)).toFixed(2);
+          var rowsStr = dbStats.rowCounts
+            ? Object.entries(dbStats.rowCounts).map(function (e) { return e[0] + ': ' + e[1].toLocaleString(); }).join(', ')
+            : '';
+          dbStatsNote = '<p style="color:#8E8E93; margin:8px 0 0; font-size:0.82rem;">Database size: ~' +
+            mb + ' MB (' + (dbStats.pageCount || 0).toLocaleString() + ' pages &times; ' +
+            (dbStats.pageSize || 0).toLocaleString() + ' B).' +
+            (rowsStr ? ('<br><span style="font-size:0.78rem;">Rows: ' + escapeHtmlAdmin(rowsStr) + '</span>') : '') +
+            '</p>';
+        }
         if (data.upToDate) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + indexNote;
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + dbStatsNote + indexNote;
           btn.disabled = false;
           return;
         }
@@ -8367,7 +8703,7 @@ async function renderAdminDashboard(env) {
           '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
           '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
           '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table></div>' + indexNote;
+          '<tbody>' + rows + '</tbody></table></div>' + dbStatsNote + indexNote;
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -56627,11 +56963,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // If replying to an existing thread
       if (threadId) {
         let entry = null;
-        try {
-          const raw = await env.CONFIGS.get(`feedback:${threadId}`);
-          if (raw) entry = JSON.parse(raw);
-        } catch (e) {
-          entry = null;
+        if (env && env.DB) {
+          try {
+            const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(threadId).first();
+            if (row && row.body_json) entry = JSON.parse(row.body_json);
+          } catch {}
+        }
+        if (!entry && env && env.CONFIGS) {
+          try {
+            const raw = await env.CONFIGS.get(`feedback:${threadId}`);
+            if (raw) entry = JSON.parse(raw);
+          } catch (e) {
+            entry = null;
+          }
         }
 
         // A thread id is a capability, and for a thread nobody owns that is
@@ -56829,9 +57173,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (threadIds.length) {
         const lookups = threadIds.slice(0, 20).map(async (tid) => {
           try {
-            const raw = await env.CONFIGS.get(`feedback:${tid}`);
-            if (raw) {
-              const entry = JSON.parse(raw);
+            let entry = null;
+            if (env && env.DB) {
+              try {
+                const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(tid).first();
+                if (row && row.body_json) entry = JSON.parse(row.body_json);
+              } catch {}
+            }
+            if (!entry && env && env.CONFIGS) {
+              const raw = await env.CONFIGS.get(`feedback:${tid}`);
+              if (raw) entry = JSON.parse(raw);
+            }
+            if (entry) {
               if (!Array.isArray(entry.messages) || !entry.messages.length) {
                 entry.messages = [{
                   id: `msg_init`,
@@ -56848,57 +57201,79 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await Promise.all(lookups);
       }
 
-      // 2. If creatorName is given, also scan recent feedback keys for this creator
-      //
-      // KV list() on `feedback:` returns oldest-first (keys sort
-      // chronologically -- see /admin/api/feedback). A single unpaginated
-      // list({limit:200}) therefore only ever sees the 200 OLDEST entries
-      // system-wide, not the newest -- once total feedback volume passes
-      // that, a real creator's own recent thread falls outside the window
-      // and this scan silently stops finding it, forever, for every
-      // creator whose thread isn't in that fixed oldest-200 slice. Same
-      // fix as /admin/api/feedback: walk every page but only keep a
-      // rolling tail of the newest FEEDBACK_USER_SCAN_CAP keys, bounded so
-      // this stays cheap even with a very large feedback table.
+      // 2. If creatorName is given, also scan recent feedback for this creator
       if (creatorName) {
-        try {
-          const FEEDBACK_USER_SCAN_CAP = 300; // matches /admin/api/feedback's cap
-          let scanKeys = [];
-          let cursor;
-          let pages = 0;
-          while (pages < 30) {
-            const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-            scanKeys.push(...(listRes.keys || []).map((k) => k.name));
-            if (scanKeys.length > FEEDBACK_USER_SCAN_CAP) scanKeys = scanKeys.slice(-FEEDBACK_USER_SCAN_CAP);
-            pages++;
-            if (listRes.list_complete || !listRes.cursor) break;
-            cursor = listRes.cursor;
-          }
-          scanKeys.reverse();
-          const scanLookups = scanKeys.map(async (kName) => {
-            const tid = kName.replace(/^feedback:/, "");
-            if (threadsMap.has(tid)) return;
-            try {
-              const raw = await env.CONFIGS.get(kName);
-              if (raw) {
-                const entry = JSON.parse(raw);
-                if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
-                  if (!Array.isArray(entry.messages) || !entry.messages.length) {
-                    entry.messages = [{
-                      id: `msg_init`,
-                      sender: "user",
-                      senderName: entry.creatorName || "User",
-                      text: entry.message || "(Initial message)",
-                      timestamp: entry.createdAt || Date.now()
-                    }];
+        let searchedD1 = false;
+        if (env && env.DB) {
+          try {
+            const rows = await env.DB.prepare(
+              "SELECT body_json FROM feedback ORDER BY updated_at DESC LIMIT 300"
+            ).all();
+            if (rows && Array.isArray(rows.results) && rows.results.length > 0) {
+              searchedD1 = true;
+              for (const r of rows.results) {
+                if (!r.body_json) continue;
+                try {
+                  const entry = JSON.parse(r.body_json);
+                  if (entry && entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                    if (!threadsMap.has(entry.id)) {
+                      if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                        entry.messages = [{
+                          id: `msg_init`,
+                          sender: "user",
+                          senderName: entry.creatorName || "User",
+                          text: entry.message || "(Initial message)",
+                          timestamp: entry.createdAt || Date.now()
+                        }];
+                      }
+                      threadsMap.set(entry.id, entry);
+                    }
                   }
-                  threadsMap.set(entry.id, entry);
-                }
+                } catch {}
               }
-            } catch {}
-          });
-          await Promise.all(scanLookups);
-        } catch {}
+            }
+          } catch {}
+        }
+        if (!searchedD1 && env && env.CONFIGS) {
+          try {
+            const FEEDBACK_USER_SCAN_CAP = 300; // matches /admin/api/feedback's cap
+            let scanKeys = [];
+            let cursor;
+            let pages = 0;
+            while (pages < 30) {
+              const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
+              scanKeys.push(...(listRes.keys || []).map((k) => k.name));
+              if (scanKeys.length > FEEDBACK_USER_SCAN_CAP) scanKeys = scanKeys.slice(-FEEDBACK_USER_SCAN_CAP);
+              pages++;
+              if (listRes.list_complete || !listRes.cursor) break;
+              cursor = listRes.cursor;
+            }
+            scanKeys.reverse();
+            const scanLookups = scanKeys.map(async (kName) => {
+              const tid = kName.replace(/^feedback:/, "");
+              if (threadsMap.has(tid)) return;
+              try {
+                const raw = await env.CONFIGS.get(kName);
+                if (raw) {
+                  const entry = JSON.parse(raw);
+                  if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                    if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                      entry.messages = [{
+                        id: `msg_init`,
+                        sender: "user",
+                        senderName: entry.creatorName || "User",
+                        text: entry.message || "(Initial message)",
+                        timestamp: entry.createdAt || Date.now()
+                      }];
+                    }
+                    threadsMap.set(entry.id, entry);
+                  }
+                }
+              } catch {}
+            });
+            await Promise.all(scanLookups);
+          } catch {}
+        }
       }
 
       const threads = Array.from(threadsMap.values()).sort((a, b) => {
@@ -62157,12 +62532,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
       if (typeof results.skipped !== "number") results.skipped = 0;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, skipped: 0 };
+      if (typeof results.likes !== "number") results.likes = 0;
+      if (typeof results.feedback !== "number") results.feedback = 0;
+      if (typeof results.eventmeta !== "number") results.eventmeta = 0;
+      if (typeof results.tokens !== "number") results.tokens = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0 };
       // A key this sweep looked at and deliberately did not migrate. These
       // used to vanish: `if (!raw) return;`, a key that failed its shape
       // check, a counter whose value was not a number -- each returned with
@@ -62351,32 +62730,142 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // skipped -- phase 3 above already migrated it into its own table,
         // and copying it here too would count it twice in the Installed
         // Catalogs panel, which sums both.
-        const rest = keyName.slice("stats:".length);
-        const sep = rest.lastIndexOf(":");
-        if (sep === -1) return;
-        const kind = rest.slice(0, sep);
-        const bucket = rest.slice(sep + 1);
-        if (!kind || !bucket) return;
-        // Not "skipped": phase 3 has already migrated these into their own
-        // table, and counting them here would report them twice.
-        if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
-        // Only the numeric counters. stats:genres:alltime and
-        // stats:decades:alltime are JSON blobs, and
-        // stats:genredecade:migrated is a sentinel -- none of them belong
-        // in an integer column.
-        if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
-        const raw = await countedKv.get(keyName);
-        const n = parseInt(raw, 10);
-        if (!Number.isFinite(n)) { noteSkipped(); return; }
-        try {
-          const statRes = await d1Run(env.DB.prepare(
-            "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
-          ).bind(kind, bucket, n));
-          // DO NOTHING on conflict, so a second run legitimately writes
-          // nothing -- that is "already migrated", not "skipped".
-          if (wrote(statRes)) { results.stats++; thisCall.stats++; }
-        } catch (e) {
-          noteError(`Stat ${keyName}: ` + e.message);
+        if (phase === 4) {
+          if (keyName === "stats:genres:alltime" || keyName === "stats:decades:alltime") {
+            const raw = await countedKv.get(keyName);
+            if (!raw) { noteSkipped(); return; }
+            try {
+              const counts = JSON.parse(raw);
+              if (counts && typeof counts === "object") {
+                const prefix = keyName === "stats:genres:alltime" ? "genre:" : "decade:";
+                for (const [name, count] of Object.entries(counts)) {
+                  const n = parseInt(count, 10);
+                  if (name && Number.isFinite(n) && n > 0) {
+                    const sRes = await d1Run(env.DB.prepare(
+                      "INSERT INTO stats (kind, day, n) VALUES (?, 'total', ?) ON CONFLICT(kind, day) DO UPDATE SET n = excluded.n"
+                    ).bind(prefix + name, n));
+                    if (wrote(sRes)) { results.stats++; thisCall.stats++; }
+                  }
+                }
+              }
+            } catch (e) {
+              noteError(`Stats blob ${keyName}: ` + e.message);
+            }
+            return;
+          }
+          if (keyName === "stats:genredecade:migrated") {
+            noteSkipped();
+            return;
+          }
+
+          const rest = keyName.slice("stats:".length);
+          const sep = rest.lastIndexOf(":");
+          if (sep === -1) return;
+          const kind = rest.slice(0, sep);
+          const bucket = rest.slice(sep + 1);
+          if (!kind || !bucket) return;
+          // Not "skipped": phase 3 has already migrated these into their own
+          // table, and counting them here would report them twice.
+          if (kind.startsWith("sourcegroup:") || kind === "sourcegroup") return;
+          // Only the numeric counters.
+          if (bucket !== "total" && !/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return;
+          const raw = await countedKv.get(keyName);
+          const n = parseInt(raw, 10);
+          if (!Number.isFinite(n)) { noteSkipped(); return; }
+          try {
+            const statRes = await d1Run(env.DB.prepare(
+              "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO NOTHING"
+            ).bind(kind, bucket, n));
+            // DO NOTHING on conflict, so a second run legitimately writes
+            // nothing -- that is "already migrated", not "skipped".
+            if (wrote(statRes)) { results.stats++; thisCall.stats++; }
+          } catch (e) {
+            noteError(`Stat ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 5. Likes (listlikevoters:* -> list_likes)
+        if (phase === 5) {
+          const listId = ledgerKeyToListId(keyName);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const parsed = JSON.parse(raw);
+            const voters = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.voters) ? parsed.voters : []);
+            if (!voters.length) { noteSkipped(); return; }
+            for (const v of voters) {
+              if (!v) continue;
+              const lRes = await d1Run(env.DB.prepare(
+                "INSERT INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?) ON CONFLICT(list_id, voter_id) DO NOTHING"
+              ).bind(listId, v, Date.now()));
+              if (wrote(lRes)) { results.likes++; thisCall.likes++; }
+            }
+          } catch (e) {
+            noteError(`Like ledger ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 6. Feedback (feedback:* -> feedback table)
+        if (phase === 6) {
+          const id = keyName.slice("feedback:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            const status = data.status || (data.completed ? "closed" : "open");
+            const subject = data.category || data.subject || (data.messages && data.messages[0] && data.messages[0].text ? data.messages[0].text.slice(0, 100) : null);
+            const createdAt = Number(data.createdAt) || Date.now();
+            const updatedAt = Number(data.updatedAt) || createdAt;
+            const fbRes = await d1Run(env.DB.prepare(
+              "INSERT INTO feedback (id, status, subject, body_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, subject=excluded.subject, body_json=excluded.body_json, updated_at=excluded.updated_at"
+            ).bind(id, status, subject, raw, createdAt, updatedAt));
+            if (wrote(fbRes)) { results.feedback++; thisCall.feedback++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`Feedback ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 7. Event metadata (evtmeta:* -> event_meta table)
+        if (phase === 7) {
+          const rest = keyName.slice("evtmeta:".length);
+          const sep = rest.indexOf(":");
+          if (sep === -1) { noteSkipped(); return; }
+          const eventType = rest.slice(0, sep);
+          const itemId = rest.slice(sep + 1);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            const title = data.title || itemId;
+            const mediaType = data.mediaType || "";
+            const lastSeen = Number(data.lastSeen) || Date.now();
+            const emRes = await d1Run(env.DB.prepare(
+              "INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen) VALUES (?, ?, ?, ?, ?) ON CONFLICT(event_type, item_id) DO UPDATE SET title=excluded.title, media_type=excluded.media_type, last_seen=excluded.last_seen"
+            ).bind(eventType, itemId, title, mediaType, lastSeen));
+            if (wrote(emRes)) { results.eventmeta++; thisCall.eventmeta++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`Event meta ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 8. Scrobble tokens (creatorscrobbletoken:* -> scrobble_tokens table)
+        if (phase === 8) {
+          const username = keyName.slice("creatorscrobbletoken:".length);
+          const token = await countedKv.get(keyName);
+          if (!token || typeof token !== "string") { noteSkipped(); return; }
+          try {
+            const stRes = await d1Run(env.DB.prepare(
+              "INSERT INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?) ON CONFLICT(token) DO UPDATE SET username=excluded.username"
+            ).bind(token.trim(), username, Date.now()));
+            if (wrote(stRes)) { results.tokens++; thisCall.tokens++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`Scrobble token ${keyName}: ` + e.message);
+          }
+          return;
         }
       }
 
@@ -62720,6 +63209,47 @@ Sitemap: ${url.origin}/sitemap.xml`;
       } catch (e) {
         console.error("schema-status: could not read public index status", e);
       }
+
+      let databaseStats = null;
+      if (env && env.DB) {
+        try {
+          const pageCountRow = await env.DB.prepare("PRAGMA page_count").first();
+          const pageSizeRow = await env.DB.prepare("PRAGMA page_size").first();
+          const pageCount = pageCountRow ? Number(Object.values(pageCountRow)[0] || 0) : 0;
+          const pageSize = pageSizeRow ? Number(Object.values(pageSizeRow)[0] || 0) : 0;
+          const estimatedSizeBytes = pageCount * pageSize;
+
+          const tables = [
+            "creators",
+            "creator_lists",
+            "published_lists",
+            "source_groups",
+            "stats",
+            "creator_tombstones",
+            "list_tombstones",
+            "list_likes",
+            "feedback",
+            "scrobble_tokens",
+            "event_meta",
+          ];
+          const rowCounts = {};
+          for (const tbl of tables) {
+            try {
+              const cRow = await env.DB.prepare(`SELECT count(*) AS c FROM ${tbl}`).first();
+              rowCounts[tbl] = cRow ? Number(cRow.c || 0) : 0;
+            } catch {}
+          }
+          databaseStats = {
+            pageCount,
+            pageSize,
+            estimatedSizeBytes,
+            rowCounts,
+          };
+        } catch (dbErr) {
+          console.error("schema-status: could not read databaseStats", dbErr);
+        }
+      }
+
       return json({
         ok: true,
         bound: status.bound,
@@ -62731,6 +63261,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         })),
         pendingMigrations: status.pendingMigrations,
         publicIndex,
+        databaseStats,
       }, 200, { "Cache-Control": "no-store" });
     }
 
@@ -62927,13 +63458,40 @@ Sitemap: ${url.origin}/sitemap.xml`;
     }
 
     // /admin/api/feedback -> { ok, entries } -- backs the Feedback tab,
-    // newest first. Keys sort chronologically (see /api/feedback), so
-    // list() is oldest-first: walk pages keeping a rolling tail, then
-    // GET only the newest FEEDBACK_ADMIN_GET_CAP. Getting every thread
-    // used to grow without bound (no TTL, no prune).
+    // newest first. In D1, queries the indexed feedback table directly
+    // replacing the multi-page KV list scan.
     if (path === "/admin/api/feedback" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (env && env.DB) {
+        try {
+          const rows = await env.DB.prepare(
+            "SELECT body_json FROM feedback ORDER BY updated_at DESC LIMIT ?"
+          ).bind(FEEDBACK_ADMIN_GET_CAP).all();
+          if (rows && Array.isArray(rows.results) && rows.results.length > 0) {
+            const entries = rows.results.map((r) => {
+              try {
+                const entry = JSON.parse(r.body_json);
+                if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                  entry.messages = [{
+                    id: `msg_init`,
+                    sender: entry.creatorName === "admin" ? "admin" : "user",
+                    senderName: entry.creatorName === "admin" ? "Admin" : (entry.creatorName || "User"),
+                    text: entry.message || "(Initial message)",
+                    timestamp: entry.createdAt || Date.now()
+                  }];
+                }
+                return entry;
+              } catch {
+                return null;
+              }
+            }).filter(Boolean);
+            return json({ ok: true, entries, truncated: false }, 200, { "Cache-Control": "no-store" });
+          }
+        } catch (e) {
+          // fall through to KV
+        }
+      }
       if (!env || !env.CONFIGS) return json({ ok: true, entries: [] }, 200, { "Cache-Control": "no-store" });
       let newestKeys = [];
       let cursor = undefined;
@@ -62985,7 +63543,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/admin/api/feedback/reply" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
       try {
         body = await request.json();
@@ -62998,22 +63556,26 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (!message) return json({ ok: false, error: "Reply message can't be empty." }, 400);
 
       const key = `feedback:${id}`;
-      const raw = await env.CONFIGS.get(key);
-      if (!raw) return json({ ok: false, error: "Feedback thread not found." }, 404);
-      let entry;
-      try {
-        entry = JSON.parse(raw);
-      } catch {
-        return json({ ok: false, error: "Could not parse feedback thread." }, 500);
+      let entry = null;
+      if (env && env.DB) {
+        try {
+          const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(id).first();
+          if (row && row.body_json) entry = JSON.parse(row.body_json);
+        } catch {}
       }
+      if (!entry && env && env.CONFIGS) {
+        const raw = await env.CONFIGS.get(key);
+        if (raw) {
+          try {
+            entry = JSON.parse(raw);
+          } catch {
+            return json({ ok: false, error: "Could not parse feedback thread." }, 500);
+          }
+        }
+      }
+      if (!entry) return json({ ok: false, error: "Feedback thread not found." }, 404);
 
       if (!Array.isArray(entry.messages) || !entry.messages.length) {
-        // sender here mirrors renderFeedbackList's own fallback logic
-        // (isSelfLogged ? 'admin' : 'user') -- this used to be hardcoded
-        // to "user" unconditionally, which meant a self-logged "Log
-        // something yourself" entry's original message would flip to
-        // showing as if a user had written it the moment it got its
-        // first reply, instead of staying attributed to the admin.
         entry.messages = [{
           id: `msg_init`,
           sender: entry.creatorName === "admin" ? "admin" : "user",
@@ -63038,23 +63600,17 @@ Sitemap: ${url.origin}/sitemap.xml`;
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        // safeErrorMessage, not a fixed string: it logs the real error and
-        // hands back a redacted version of it. See the status route below for
-        // why these four writes stopped swallowing what went wrong.
         return json({ ok: false, error: safeErrorMessage(e, "Could not save reply.") }, 500);
       }
       return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/feedback/status  (POST)  { id, completed } -> { ok }
-    // Toggles the "completed" flag on one feedback entry -- id here is the
-    // entry's own id field (the part of the KV key after "feedback:"), not
-    // the full key name, so the client never needs to know the storage
-    // layout to mark something done.
+    // Toggles the "completed" flag on one feedback entry.
     if (path === "/admin/api/feedback/status" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
       try {
         body = await request.json();
@@ -63064,33 +63620,30 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const id = String(body.id || "").trim();
       if (!id) return json({ ok: false, error: "Missing id." }, 400);
       const key = `feedback:${id}`;
-      const raw = await env.CONFIGS.get(key);
-      if (!raw) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
-      let entry;
-      try {
-        entry = JSON.parse(raw);
-      } catch {
-        return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+      let entry = null;
+      if (env && env.DB) {
+        try {
+          const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(id).first();
+          if (row && row.body_json) entry = JSON.parse(row.body_json);
+        } catch {}
       }
+      if (!entry && env && env.CONFIGS) {
+        const raw = await env.CONFIGS.get(key);
+        if (raw) {
+          try {
+            entry = JSON.parse(raw);
+          } catch {
+            return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+          }
+        }
+      }
+      if (!entry) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
       entry.completed = !!body.completed;
+      if (entry.completed) entry.status = "closed";
+      else if (entry.status === "closed") entry.status = "open";
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        // This catch used to bind `e` and drop it, returning a fixed "please
-        // try again" whatever had actually happened -- so an admin hitting a
-        // 500 here (and whoever they reported it to) had no way to find out
-        // why, and nothing was written to the log either. Every comparable
-        // failure path in this Worker logs; these four feedback writes were
-        // the exception.
-        //
-        // safeErrorMessage does both halves: it console.errors the raw error,
-        // so it shows up in `wrangler tail` and the Cloudflare dashboard, and
-        // it returns the message with urls and anything credential-shaped
-        // redacted. This route is behind isAdminRequest, so the person who
-        // sees it is the operator -- exactly who needs to know whether this
-        // was, say, the KV write budget rather than a transient blip. The old
-        // wording stays as the fallback for an error that carries no usable
-        // message of its own.
         return json({ ok: false, error: safeErrorMessage(e, "Could not save that change. Please try again.") }, 500);
       }
       return json({ ok: true }, 200, { "Cache-Control": "no-store" });
@@ -63101,7 +63654,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/admin/api/feedback/edit" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
       try {
         body = await request.json();
@@ -63111,27 +63664,27 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const id = String(body.id || "").trim();
       if (!id) return json({ ok: false, error: "Missing id." }, 400);
       const key = `feedback:${id}`;
-      const raw = await env.CONFIGS.get(key);
-      if (!raw) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
-      let entry;
-      try {
-        entry = JSON.parse(raw);
-      } catch {
-        return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+      let entry = null;
+      if (env && env.DB) {
+        try {
+          const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(id).first();
+          if (row && row.body_json) entry = JSON.parse(row.body_json);
+        } catch {}
       }
+      if (!entry && env && env.CONFIGS) {
+        const raw = await env.CONFIGS.get(key);
+        if (raw) {
+          try {
+            entry = JSON.parse(raw);
+          } catch {
+            return json({ ok: false, error: "Could not read that feedback entry." }, 500);
+          }
+        }
+      }
+      if (!entry) return json({ ok: false, error: "That feedback entry no longer exists." }, 404);
       if (typeof body.message === "string" && body.message.trim()) {
         const trimmedMessage = body.message.trim().slice(0, 4000);
         entry.message = trimmedMessage;
-        // Once a reply has landed on this entry (self-logged or not), the
-        // dashboard list renders from entry.messages[...] instead of the
-        // top-level entry.message that this edit form actually posts (see
-        // renderFeedbackList's own fallback: it only synthesizes a single
-        // message from entry.message when entry.messages is empty).
-        // Editing only entry.message left it invisible on any entry that
-        // already had a thread -- the save genuinely succeeded, nothing
-        // in the list ever reflected it. Keeping the first message in the
-        // thread (the original log/report) in sync fixes that regardless
-        // of which shape a given entry happens to be in.
         if (Array.isArray(entry.messages) && entry.messages.length && entry.messages[0]) {
           entry.messages[0].text = trimmedMessage;
         }
@@ -63144,17 +63697,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
-        // Logged and reported rather than swallowed -- see the status route.
         return json({ ok: false, error: safeErrorMessage(e, "Could not save edits. Please try again.") }, 500);
       }
     }
 
     // /admin/api/feedback/delete (POST) { id } -> { ok }
-    // Allows the admin to permanently delete a feedback entry from KV storage.
+    // Allows the admin to permanently delete a feedback entry from storage.
     if (path === "/admin/api/feedback/delete" && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "Feedback storage isn't configured on this deployment." });
       let body;
       try {
         body = await request.json();
@@ -63164,8 +63716,17 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const id = String(body.id || "").trim();
       if (!id) return json({ ok: false, error: "Missing id." }, 400);
       const key = `feedback:${id}`;
+      if (env && env.DB) {
+        try {
+          await env.DB.prepare("DELETE FROM feedback WHERE id = ?").bind(id).run();
+        } catch (dbErr) {
+          console.error("D1 write error (feedback delete):", dbErr);
+        }
+      }
       try {
-        await env.CONFIGS.delete(key);
+        if (env && env.CONFIGS) {
+          await env.CONFIGS.delete(key);
+        }
         return json({ ok: true }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
         return json({ ok: false, error: "Could not delete feedback entry. Please try again." }, 500);
@@ -63691,6 +64252,7 @@ export default {
             );
           }
         })()),
+        guard("pruneTombstones", pruneTombstones(env)),
       ])
     );
     } catch (err) {

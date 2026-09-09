@@ -121,3 +121,41 @@ CREATE TABLE list_tombstones (
 );
 CREATE INDEX idx_list_tombstones_user_until ON list_tombstones(username, until);
 
+DROP TABLE IF EXISTS list_likes;
+CREATE TABLE list_likes (
+    list_id    TEXT NOT NULL,
+    voter_id   TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (list_id, voter_id)
+);
+CREATE INDEX idx_list_likes_voter ON list_likes(voter_id);
+
+DROP TABLE IF EXISTS feedback;
+CREATE TABLE feedback (
+    id         TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'open',
+    subject    TEXT,
+    body_json  TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_feedback_status_updated ON feedback(status, updated_at DESC);
+
+DROP TABLE IF EXISTS scrobble_tokens;
+CREATE TABLE scrobble_tokens (
+    token      TEXT PRIMARY KEY,
+    username   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_scrobble_tokens_user ON scrobble_tokens(username);
+
+DROP TABLE IF EXISTS event_meta;
+CREATE TABLE event_meta (
+    event_type TEXT NOT NULL,
+    item_id    TEXT NOT NULL,
+    title      TEXT,
+    media_type TEXT,
+    last_seen  INTEGER NOT NULL,
+    PRIMARY KEY (event_type, item_id)
+);
+

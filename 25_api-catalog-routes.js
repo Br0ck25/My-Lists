@@ -4897,11 +4897,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // If replying to an existing thread
       if (threadId) {
         let entry = null;
-        try {
-          const raw = await env.CONFIGS.get(`feedback:${threadId}`);
-          if (raw) entry = JSON.parse(raw);
-        } catch (e) {
-          entry = null;
+        if (env && env.DB) {
+          try {
+            const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(threadId).first();
+            if (row && row.body_json) entry = JSON.parse(row.body_json);
+          } catch {}
+        }
+        if (!entry && env && env.CONFIGS) {
+          try {
+            const raw = await env.CONFIGS.get(`feedback:${threadId}`);
+            if (raw) entry = JSON.parse(raw);
+          } catch (e) {
+            entry = null;
+          }
         }
 
         // A thread id is a capability, and for a thread nobody owns that is
@@ -5099,9 +5107,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (threadIds.length) {
         const lookups = threadIds.slice(0, 20).map(async (tid) => {
           try {
-            const raw = await env.CONFIGS.get(`feedback:${tid}`);
-            if (raw) {
-              const entry = JSON.parse(raw);
+            let entry = null;
+            if (env && env.DB) {
+              try {
+                const row = await env.DB.prepare("SELECT body_json FROM feedback WHERE id = ?").bind(tid).first();
+                if (row && row.body_json) entry = JSON.parse(row.body_json);
+              } catch {}
+            }
+            if (!entry && env && env.CONFIGS) {
+              const raw = await env.CONFIGS.get(`feedback:${tid}`);
+              if (raw) entry = JSON.parse(raw);
+            }
+            if (entry) {
               if (!Array.isArray(entry.messages) || !entry.messages.length) {
                 entry.messages = [{
                   id: `msg_init`,
@@ -5118,57 +5135,79 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await Promise.all(lookups);
       }
 
-      // 2. If creatorName is given, also scan recent feedback keys for this creator
-      //
-      // KV list() on `feedback:` returns oldest-first (keys sort
-      // chronologically -- see /admin/api/feedback). A single unpaginated
-      // list({limit:200}) therefore only ever sees the 200 OLDEST entries
-      // system-wide, not the newest -- once total feedback volume passes
-      // that, a real creator's own recent thread falls outside the window
-      // and this scan silently stops finding it, forever, for every
-      // creator whose thread isn't in that fixed oldest-200 slice. Same
-      // fix as /admin/api/feedback: walk every page but only keep a
-      // rolling tail of the newest FEEDBACK_USER_SCAN_CAP keys, bounded so
-      // this stays cheap even with a very large feedback table.
+      // 2. If creatorName is given, also scan recent feedback for this creator
       if (creatorName) {
-        try {
-          const FEEDBACK_USER_SCAN_CAP = 300; // matches /admin/api/feedback's cap
-          let scanKeys = [];
-          let cursor;
-          let pages = 0;
-          while (pages < 30) {
-            const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
-            scanKeys.push(...(listRes.keys || []).map((k) => k.name));
-            if (scanKeys.length > FEEDBACK_USER_SCAN_CAP) scanKeys = scanKeys.slice(-FEEDBACK_USER_SCAN_CAP);
-            pages++;
-            if (listRes.list_complete || !listRes.cursor) break;
-            cursor = listRes.cursor;
-          }
-          scanKeys.reverse();
-          const scanLookups = scanKeys.map(async (kName) => {
-            const tid = kName.replace(/^feedback:/, "");
-            if (threadsMap.has(tid)) return;
-            try {
-              const raw = await env.CONFIGS.get(kName);
-              if (raw) {
-                const entry = JSON.parse(raw);
-                if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
-                  if (!Array.isArray(entry.messages) || !entry.messages.length) {
-                    entry.messages = [{
-                      id: `msg_init`,
-                      sender: "user",
-                      senderName: entry.creatorName || "User",
-                      text: entry.message || "(Initial message)",
-                      timestamp: entry.createdAt || Date.now()
-                    }];
+        let searchedD1 = false;
+        if (env && env.DB) {
+          try {
+            const rows = await env.DB.prepare(
+              "SELECT body_json FROM feedback ORDER BY updated_at DESC LIMIT 300"
+            ).all();
+            if (rows && Array.isArray(rows.results) && rows.results.length > 0) {
+              searchedD1 = true;
+              for (const r of rows.results) {
+                if (!r.body_json) continue;
+                try {
+                  const entry = JSON.parse(r.body_json);
+                  if (entry && entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                    if (!threadsMap.has(entry.id)) {
+                      if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                        entry.messages = [{
+                          id: `msg_init`,
+                          sender: "user",
+                          senderName: entry.creatorName || "User",
+                          text: entry.message || "(Initial message)",
+                          timestamp: entry.createdAt || Date.now()
+                        }];
+                      }
+                      threadsMap.set(entry.id, entry);
+                    }
                   }
-                  threadsMap.set(entry.id, entry);
-                }
+                } catch {}
               }
-            } catch {}
-          });
-          await Promise.all(scanLookups);
-        } catch {}
+            }
+          } catch {}
+        }
+        if (!searchedD1 && env && env.CONFIGS) {
+          try {
+            const FEEDBACK_USER_SCAN_CAP = 300; // matches /admin/api/feedback's cap
+            let scanKeys = [];
+            let cursor;
+            let pages = 0;
+            while (pages < 30) {
+              const listRes = await env.CONFIGS.list({ prefix: "feedback:", limit: 1000, cursor });
+              scanKeys.push(...(listRes.keys || []).map((k) => k.name));
+              if (scanKeys.length > FEEDBACK_USER_SCAN_CAP) scanKeys = scanKeys.slice(-FEEDBACK_USER_SCAN_CAP);
+              pages++;
+              if (listRes.list_complete || !listRes.cursor) break;
+              cursor = listRes.cursor;
+            }
+            scanKeys.reverse();
+            const scanLookups = scanKeys.map(async (kName) => {
+              const tid = kName.replace(/^feedback:/, "");
+              if (threadsMap.has(tid)) return;
+              try {
+                const raw = await env.CONFIGS.get(kName);
+                if (raw) {
+                  const entry = JSON.parse(raw);
+                  if (entry.creatorName && entry.creatorName.trim().toLowerCase() === creatorName) {
+                    if (!Array.isArray(entry.messages) || !entry.messages.length) {
+                      entry.messages = [{
+                        id: `msg_init`,
+                        sender: "user",
+                        senderName: entry.creatorName || "User",
+                        text: entry.message || "(Initial message)",
+                        timestamp: entry.createdAt || Date.now()
+                      }];
+                    }
+                    threadsMap.set(entry.id, entry);
+                  }
+                }
+              } catch {}
+            });
+            await Promise.all(scanLookups);
+          } catch {}
+        }
       }
 
       const threads = Array.from(threadsMap.values()).sort((a, b) => {

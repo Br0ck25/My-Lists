@@ -159,7 +159,24 @@ async function bumpStatBy(env, kind, amount) {
 // conspicuously missing from), not because undercounting is free in
 // general.
 async function bumpJsonCounterBlob(env, key, fields) {
-  if (!env || !env.CONFIGS || !fields || !fields.length) return;
+  if (!fields || !fields.length) return;
+  // If D1 is bound, explode genres and decades into atomic stats rows per §5.2
+  if (env && env.DB) {
+    try {
+      const isGenre = key === "stats:genres:alltime";
+      const isDecade = key === "stats:decades:alltime";
+      if (isGenre || isDecade) {
+        const prefix = isGenre ? "genre:" : "decade:";
+        for (const f of fields) {
+          if (!f) continue;
+          await d1BumpStat(env, prefix + f, ["total"], 1);
+        }
+      }
+    } catch (e) {
+      // best-effort
+    }
+  }
+  if (!env || !env.CONFIGS) return;
   try {
     const raw = await env.CONFIGS.get(key);
     let counts = {};
@@ -393,42 +410,87 @@ const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
 const FEEDBACK_ADMIN_GET_CAP = 300;
 
 async function putFeedbackThread(env, key, entry) {
-  await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
+  const id = key.startsWith("feedback:") ? key.slice("feedback:".length) : (entry.id || key);
+  const status = (entry.completed ? "closed" : null) || entry.status || "open";
+  const subject = entry.category || entry.subject || (entry.messages && entry.messages[0] && entry.messages[0].text ? entry.messages[0].text.slice(0, 100) : null);
+  const createdAt = Number(entry.createdAt) || Date.now();
+  const updatedAt = Number(entry.updatedAt) || createdAt;
+  const bodyJson = JSON.stringify(entry);
+
+  if (env && env.DB) {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO feedback (id, status, subject, body_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           status = excluded.status,
+           subject = excluded.subject,
+           body_json = excluded.body_json,
+           updated_at = excluded.updated_at`
+      ).bind(id, status, subject, bodyJson, createdAt, updatedAt).run();
+    } catch (dbErr) {
+      console.error("D1 write error (putFeedbackThread):", dbErr);
+    }
+  }
+  if (env && env.CONFIGS) {
+    await env.CONFIGS.put(key, bodyJson, { expirationTtl: FEEDBACK_TTL_SEC });
+  }
 }
 
-// The display fields for a tracked title -- its name and media type -- stay in
-// KV on every deployment, D1-bound or not. The COUNTS are what were spending
-// the write budget, and those move to D1 in recordTrackedEvent; this blob is
-// read only by the leaderboard, only for the candidates it is about to render.
-//
-// It used to be written on EVERY event, with the comment "overwritten every
-// time rather than only on first sight -- keeps title/mediaType current if
-// either ever changes upstream, and lastSeen doubles as a cheap staleness
-// signal". Both of those still hold, and neither needs a write per event to
-// hold them: it is rewritten when the title or media type has actually
-// changed, and otherwise at most once a day per title, so lastSeen stays
-// meaningful. The KV read that costs is the cheap side of the trade --
-// 100,000 reads a day on the free plan against 1,000 writes.
+// The display fields for a tracked title -- its name and media type.
+// In D1 they live in the event_meta table; in KV they live at evtmeta:{type}:{id}.
+// Written when the title or media type has actually changed, and otherwise
+// at most once a day per title so lastSeen stays meaningful.
 //
 // Returns whether it wrote, which is what the tests assert on.
 const EVT_META_REFRESH_MS = 24 * 60 * 60 * 1000;
 async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
-  const metaKey = `evtmeta:${eventType}:${id}`;
-  const metaRaw = await env.CONFIGS.get(metaKey);
-  try {
-    const prev = metaRaw ? JSON.parse(metaRaw) : null;
-    if (prev
-      && (prev.title || "") === (title || "")
-      && (prev.mediaType || "") === (mediaType || "")
-      && Number.isFinite(prev.lastSeen)
-      && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
-      return false;
+  let changed = false;
+  if (env && env.DB) {
+    try {
+      const existing = await env.DB.prepare(
+        "SELECT title, media_type, last_seen FROM event_meta WHERE event_type = ? AND item_id = ?"
+      ).bind(eventType, id).first();
+      if (
+        !existing ||
+        (existing.title || "") !== (title || "") ||
+        (existing.media_type || "") !== (mediaType || "") ||
+        Date.now() - (existing.last_seen || 0) >= EVT_META_REFRESH_MS
+      ) {
+        await env.DB.prepare(
+          `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(event_type, item_id) DO UPDATE SET
+             title = excluded.title,
+             media_type = excluded.media_type,
+             last_seen = excluded.last_seen`
+        ).bind(eventType, id, title || "", mediaType || "", Date.now()).run();
+        changed = true;
+      }
+    } catch (e) {
+      console.error("D1 write error (event_meta):", e);
     }
-  } catch {
-    // Unreadable -- rewrite it.
   }
-  await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
-  return true;
+
+  if (env && env.CONFIGS) {
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const metaRaw = await env.CONFIGS.get(metaKey);
+    try {
+      const prev = metaRaw ? JSON.parse(metaRaw) : null;
+      if (prev
+        && (prev.title || "") === (title || "")
+        && (prev.mediaType || "") === (mediaType || "")
+        && Number.isFinite(prev.lastSeen)
+        && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
+        return changed;
+      }
+    } catch {
+      // Unreadable -- rewrite it.
+    }
+    await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
+    return true;
+  }
+  return changed;
 }
 
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
@@ -541,16 +603,37 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
 // only ever READ here, bounded by the candidate cap. Reads are the cheap
 // side: 100,000 a day against 1,000 writes.
 async function attachEventMeta(env, eventType, ids) {
+  if (!ids || !ids.length) return [];
+  const metaMap = new Map();
+  if (env && env.DB) {
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = await env.DB.prepare(
+        `SELECT item_id, title, media_type FROM event_meta WHERE event_type = ? AND item_id IN (${placeholders})`
+      ).bind(eventType, ...ids).all();
+      if (rows && Array.isArray(rows.results)) {
+        for (const r of rows.results) {
+          metaMap.set(r.item_id, { title: r.title || r.item_id, mediaType: r.media_type || "" });
+        }
+      }
+    } catch {}
+  }
   return await Promise.all(
     ids.map(async (id) => {
+      if (metaMap.has(id)) {
+        const m = metaMap.get(id);
+        return { id, title: m.title, mediaType: m.mediaType };
+      }
       let title = id;
       let mediaType = "";
       try {
-        const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
-        if (metaRaw) {
-          const meta = JSON.parse(metaRaw);
-          title = meta.title || id;
-          mediaType = meta.mediaType || "";
+        if (env && env.CONFIGS) {
+          const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
+          if (metaRaw) {
+            const meta = JSON.parse(metaRaw);
+            title = meta.title || id;
+            mediaType = meta.mediaType || "";
+          }
         }
       } catch {
         // fall back to the raw id as the title
@@ -683,6 +766,16 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
             if (det && det.title) {
               e.title = det.title;
               if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
+              if (env && env.DB) {
+                env.DB.prepare(
+                  `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(event_type, item_id) DO UPDATE SET
+                     title = excluded.title,
+                     media_type = excluded.media_type,
+                     last_seen = excluded.last_seen`
+                ).bind(eventType, e.id, det.title, e.mediaType || "", Date.now()).run().catch(() => {});
+              }
               if (env && env.CONFIGS) {
                 env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
               }
@@ -1111,44 +1204,76 @@ async function computeCatalogAndCommunityLeaderboards(env, ctx) {
 }
 
 async function computeAudienceAnalytics(env) {
-  if (!env || !env.CONFIGS) return { watchTypes: {}, genres: [], decades: [] };
+  if (!env || (!env.CONFIGS && !env.DB)) return { watchTypes: {}, genres: [], decades: [] };
 
-  // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
-  // add-on: runs the old-keys-into-new-blob migration once (see its own
-  // comment), a no-op single read on every call after that.
-  await migrateGenreDecadeStatsIfNeeded(env);
+  if (env.CONFIGS) {
+    // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
+    // add-on: runs the old-keys-into-new-blob migration once (see its own
+    // comment), a no-op single read on every call after that.
+    await migrateGenreDecadeStatsIfNeeded(env);
+  }
 
   const [movies, series, episodes, genreBlobRaw, decadeBlobRaw] = await Promise.all([
     readStatCount(env, "watch_type:movie", "total"),
     readStatCount(env, "watch_type:series", "total"),
     readStatCount(env, "watch_type:episode", "total"),
-    env.CONFIGS.get("stats:genres:alltime"),
-    env.CONFIGS.get("stats:decades:alltime"),
+    env.CONFIGS ? env.CONFIGS.get("stats:genres:alltime") : null,
+    env.CONFIGS ? env.CONFIGS.get("stats:decades:alltime") : null,
   ]);
 
   const totalWatch = movies + series + episodes;
 
-  let genreCounts = {};
-  try {
-    genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
-  } catch {
-    genreCounts = {};
-  }
-  const validGenres = Object.entries(genreCounts)
-    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
-    .filter((g) => g.count > 0 && g.name);
-  validGenres.sort((a, b) => b.count - a.count);
+  let validGenres = null;
+  let validDecades = null;
 
-  let decadeCounts = {};
-  try {
-    decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
-  } catch {
-    decadeCounts = {};
+  if (env.DB) {
+    try {
+      const genreRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'genre:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (genreRows && Array.isArray(genreRows.results) && genreRows.results.length > 0) {
+        validGenres = genreRows.results.map((r) => ({
+          name: r.kind.slice("genre:".length),
+          count: Number(r.n) || 0,
+        })).filter((g) => g.count > 0 && g.name);
+      }
+      const decadeRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'decade:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (decadeRows && Array.isArray(decadeRows.results) && decadeRows.results.length > 0) {
+        validDecades = decadeRows.results.map((r) => ({
+          name: r.kind.slice("decade:".length),
+          count: Number(r.n) || 0,
+        })).filter((d) => d.count > 0 && d.name);
+      }
+    } catch {}
   }
-  const validDecades = Object.entries(decadeCounts)
-    .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
-    .filter((d) => d.count > 0 && d.name);
-  validDecades.sort((a, b) => b.count - a.count);
+
+  if (!validGenres) {
+    let genreCounts = {};
+    try {
+      genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+    } catch {
+      genreCounts = {};
+    }
+    validGenres = Object.entries(genreCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((g) => g.count > 0 && g.name);
+    validGenres.sort((a, b) => b.count - a.count);
+  }
+
+  if (!validDecades) {
+    let decadeCounts = {};
+    try {
+      decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+    } catch {
+      decadeCounts = {};
+    }
+    validDecades = Object.entries(decadeCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((d) => d.count > 0 && d.name);
+    validDecades.sort((a, b) => b.count - a.count);
+  }
 
   return {
     watchTypes: { movies, series, episodes, total: totalWatch },
@@ -2988,9 +3113,22 @@ async function renderAdminDashboard(env) {
           btn.disabled = false;
           return;
         }
+        var dbStats = data.databaseStats;
+        var dbStatsNote = '';
+        if (dbStats && dbStats.estimatedSizeBytes != null) {
+          var mb = (dbStats.estimatedSizeBytes / (1024 * 1024)).toFixed(2);
+          var rowsStr = dbStats.rowCounts
+            ? Object.entries(dbStats.rowCounts).map(function (e) { return e[0] + ': ' + e[1].toLocaleString(); }).join(', ')
+            : '';
+          dbStatsNote = '<p style="color:#8E8E93; margin:8px 0 0; font-size:0.82rem;">Database size: ~' +
+            mb + ' MB (' + (dbStats.pageCount || 0).toLocaleString() + ' pages &times; ' +
+            (dbStats.pageSize || 0).toLocaleString() + ' B).' +
+            (rowsStr ? ('<br><span style="font-size:0.78rem;">Rows: ' + escapeHtmlAdmin(rowsStr) + '</span>') : '') +
+            '</p>';
+        }
         if (data.upToDate) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + indexNote;
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + dbStatsNote + indexNote;
           btn.disabled = false;
           return;
         }
@@ -3008,7 +3146,7 @@ async function renderAdminDashboard(env) {
           '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
           '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
           '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table></div>' + indexNote;
+          '<tbody>' + rows + '</tbody></table></div>' + dbStatsNote + indexNote;
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

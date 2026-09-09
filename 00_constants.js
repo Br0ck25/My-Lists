@@ -280,7 +280,17 @@ const CRON_EPISODE_CHECK_SHARE = 0.5;
 // derived only from KV), so re-processing a key across a chunk boundary is
 // harmless -- which is what makes chunking safe here.
 const MIGRATE_D1_STATE_KEY = "migrated1:state";
-const MIGRATE_D1_PREFIXES = ["creator:", "creatorlist:", "publishedlist:user:", "stats:sourcegroup:", "stats:"];
+const MIGRATE_D1_PREFIXES = [
+  "creator:",
+  "creatorlist:",
+  "publishedlist:user:",
+  "stats:sourcegroup:",
+  "stats:",
+  "listlikevoters:",
+  "feedback:",
+  "evtmeta:",
+  "creatorscrobbletoken:",
+];
 // This endpoint has its invocation to itself (it is admin-triggered, not
 // ridden along on the cron), so it can claim more of the 1,000 storage
 // operations than the index rebuild does -- but still well short of it,
@@ -574,6 +584,34 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0008", kind: "index", name: "idx_list_tombstones_user_until",
     consequence: "Querying active list tombstones scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "list_likes",
+    consequence: "Per-voter like ledgers fall back to KV listlikevoters.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_list_likes_voter",
+    consequence: "Querying likes by voter scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "feedback",
+    consequence: "Feedback threads fall back to KV feedback:* multi-page list scanning.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_feedback_status_updated",
+    consequence: "Querying feedback by status and date scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "scrobble_tokens",
+    consequence: "Scrobble webhook tokens fall back to KV scrobbletoken.",
+  },
+  {
+    migration: "0009", kind: "index", name: "idx_scrobble_tokens_user",
+    consequence: "Looking up scrobble tokens by username scans the table instead of an index.",
+  },
+  {
+    migration: "0009", kind: "table", name: "event_meta",
+    consequence: "Title event display metadata falls back to KV evtmeta.",
   },
 ];
 

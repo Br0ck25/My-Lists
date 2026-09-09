@@ -1618,10 +1618,37 @@ async function likeVoterId(request, env, creatorUsername, scopeId) {
   return `a:${hash}`;
 }
 
-// Reads a ledger key's voter list, tolerating both storage shapes this
-// function has ever written (a bare array, or {voters: [...]}).
-async function readLikeVoters(env, ledgerKey) {
+function ledgerKeyToListId(ledgerKey) {
+  if (typeof ledgerKey !== "string") return "";
+  if (ledgerKey.startsWith("listlikevoters:user:")) {
+    return "a:" + ledgerKey.slice("listlikevoters:user:".length);
+  }
+  if (ledgerKey.startsWith("listlikevoters:")) {
+    return "c:" + ledgerKey.slice("listlikevoters:".length);
+  }
+  if (ledgerKey.startsWith("extlikevoters:")) {
+    return "ext:" + ledgerKey.slice("extlikevoters:".length);
+  }
+  return ledgerKey;
+}
+
+function listIdToLedgerKey(listId) {
+  if (typeof listId !== "string") return "";
+  if (listId.startsWith("a:")) {
+    return "listlikevoters:user:" + listId.slice(2);
+  }
+  if (listId.startsWith("c:")) {
+    return "listlikevoters:" + listId.slice(2);
+  }
+  if (listId.startsWith("ext:")) {
+    return "extlikevoters:" + listId.slice(4);
+  }
+  return "listlikevoters:" + listId;
+}
+
+async function readLikeVotersFromKv(env, ledgerKey) {
   try {
+    if (!env || !env.CONFIGS) return [];
     const raw = await env.CONFIGS.get(ledgerKey);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
@@ -1633,34 +1660,37 @@ async function readLikeVoters(env, ledgerKey) {
   return [];
 }
 
+// Reads a ledger key's voter list. When D1 is bound, queries list_likes first;
+// falls back to KV if D1 returns no rows.
+async function readLikeVoters(env, ledgerKey) {
+  const listId = ledgerKeyToListId(ledgerKey);
+  if (env && env.DB) {
+    try {
+      const res = await env.DB.prepare(
+        "SELECT voter_id FROM list_likes WHERE list_id = ?"
+      ).bind(listId).all();
+      if (res && Array.isArray(res.results) && res.results.length > 0) {
+        return res.results.map((r) => r.voter_id);
+      }
+    } catch {
+      // D1 query failed or table not migrated yet; fall through to KV
+    }
+  }
+  return readLikeVotersFromKv(env, ledgerKey);
+}
+
 // Applies one vote to a ledger key and returns the resulting count.
 // `capped: true` means the ledger is full (see LIKE_VOTER_CAP) and this
 // would have been a new voter -- the caller keeps the existing count rather
 // than silently discarding the vote or growing the key without bound.
 //
-// Cloudflare KV has no atomic compare-and-swap, so a plain read-modify-write
-// here can lose a vote: two requests can both read the same snapshot, and
-// whichever PUT lands last wins. This writes, re-reads, and retries against
-// the fresh state if its own vote did not survive.
-//
-// The subtlety is WHEN to retry. KV does not promise read-your-writes -- its
-// reads are edge-cached -- so "my vote is not in the value I just read back"
-// has two completely different causes: another writer really did land on top
-// of us, or KV simply served a stale copy and nothing happened at all.
-// Retrying on both treats every stale read as contention, which on an
-// otherwise idle list spends several writes against a key KV limits to one
-// write per second, and can still report a count that does not match
-// storage.
-//
-// So the retry is gated on EVIDENCE of another writer: an id present now
-// that was not in our own pre-write snapshot and is not ours. A real
-// clobber leaves that trace (the other request wrote its own voter); a
-// stale read cannot, because a stale read is by definition the state we
-// already saw. No evidence means our PUT is good and the read was simply
-// behind, so we trust it and stop.
+// When D1 is bound, list_likes is authoritative and creator_lists.likes /
+// published_lists.likes is updated in D1. KV is mirrored with retry-and-verify
+// to support KV-only readers and detect any racing writes across stores.
 const LIKE_VOTE_MAX_ATTEMPTS = 3;
 
 async function applyLikeVote(env, ledgerKey, voterId, liked) {
+  const listId = ledgerKeyToListId(ledgerKey);
   let lastCount = 0;
   for (let attempt = 0; attempt < LIKE_VOTE_MAX_ATTEMPTS; attempt++) {
     const voters = await readLikeVoters(env, ledgerKey);
@@ -1681,9 +1711,52 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
     if (had === liked && set.size === voters.length) {
       return { count: set.size, capped: false };
     }
-    await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    if (env && env.CONFIGS) {
+      await env.CONFIGS.put(ledgerKey, JSON.stringify([...set]));
+    }
 
-    const after = await readLikeVoters(env, ledgerKey);
+    if (env && env.DB) {
+      try {
+        // If this list had voters in KV that haven't been migrated to D1 yet,
+        // seed them into D1 so votes are not dropped.
+        if (voters.length > 0) {
+          const countRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?").bind(listId).first();
+          if (!countRow || countRow.c === 0) {
+            const seedBatch = voters.map((v) =>
+              env.DB.prepare("INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)").bind(listId, v, Date.now())
+            );
+            await env.DB.batch(seedBatch);
+          }
+        }
+        if (liked) {
+          await env.DB.prepare(
+            "INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)"
+          ).bind(listId, voterId, Date.now()).run();
+        } else {
+          await env.DB.prepare(
+            "DELETE FROM list_likes WHERE list_id = ? AND voter_id = ?"
+          ).bind(listId, voterId).run();
+        }
+        const updatedRow = await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?"
+        ).bind(listId).first();
+        const d1Count = updatedRow ? Number(updatedRow.c || 0) : set.size;
+
+        if (listId.startsWith("c:")) {
+          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(d1Count, listId.slice(2)).run();
+        } else if (listId.startsWith("a:")) {
+          await env.DB.prepare("UPDATE published_lists SET likes = ? WHERE slug = ?").bind(d1Count, listId.slice(2)).run();
+        }
+      } catch (dbErr) {
+        console.error("D1 write error (applyLikeVote):", dbErr);
+      }
+    }
+
+    if (!env || !env.CONFIGS) {
+      return { count: lastCount, capped: false };
+    }
+
+    const after = await readLikeVotersFromKv(env, ledgerKey);
     const afterSet = new Set(after);
     if (afterSet.has(voterId) === liked) {
       // Our vote is visible in storage. Done.
@@ -1696,11 +1769,21 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
       // lost update. Trust our own PUT rather than writing it again.
       return { count: lastCount, capped: false };
     }
-    // Someone else's write really did land on top of ours -- loop and merge
-    // against their now-current state.
+    // Someone else's write really did land on top of ours -- sync racing voters into D1 as well
+    if (env && env.DB) {
+      try {
+        for (const racingId of afterSet) {
+          if (!before.has(racingId)) {
+            await env.DB.prepare(
+              "INSERT OR IGNORE INTO list_likes (list_id, voter_id, created_at) VALUES (?, ?, ?)"
+            ).bind(listId, racingId, Date.now()).run();
+          }
+        }
+      } catch {}
+    }
   }
   // Sustained genuine contention on this one list: report what is actually
-  // in KV rather than guessing.
+  // in storage rather than guessing.
   const finalVoters = await readLikeVoters(env, ledgerKey);
   return { count: finalVoters.length, capped: false };
 }
@@ -1712,16 +1795,10 @@ async function applyLikeVote(env, ledgerKey, voterId, liked) {
 // URL then lives in the media server's configuration, in its logs, and in
 // any request log along the way.
 //
-// It used to carry the Creator Key itself, which is the credential for the
-// whole account and has no expiry. Anyone who read that URL out of a log had
-// full access, and the only remedy was rotating the key -- which breaks
-// every other device the owner had signed in on.
-//
 // A scrobble token is a separate, revocable credential that authorises
-// exactly one thing: recording playback for one account. Regenerating it
-// invalidates the old webhook URL and touches nothing else. One per account,
-// stored both ways so it can be looked up by token on the hot path and
-// found by username for revocation and account deletion.
+// exactly one thing: recording playback for one account. In D1, rotation is
+// an atomic batch (DELETE old + INSERT new) so revocation takes effect
+// immediately everywhere.
 function scrobbleTokenKey(token) {
   return `scrobbletoken:${token}`;
 }
@@ -1732,28 +1809,53 @@ function creatorScrobbleTokenKey(username) {
 // Returns the account's current token, minting one if it has none.
 // `rotate` forces a fresh token and revokes the previous one.
 async function getOrCreateScrobbleToken(env, username, rotate = false) {
-  if (!env || !env.CONFIGS) return "";
   let existing = "";
-  try {
-    existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
-  } catch {
-    existing = "";
+  if (env && env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT token FROM scrobble_tokens WHERE username = ?").bind(username).first();
+      if (row && row.token) existing = row.token;
+    } catch {}
   }
-  if (existing && !rotate) return existing;
+  if (!existing && env && env.CONFIGS) {
+    try {
+      existing = (await env.CONFIGS.get(creatorScrobbleTokenKey(username))) || "";
+    } catch {
+      existing = "";
+    }
+  }
+  if (existing && !rotate) {
+    if (env && env.DB) {
+      try {
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)"
+        ).bind(existing, username, Date.now()).run();
+      } catch {}
+    }
+    return existing;
+  }
 
   // Same CSPRNG helper the OAuth state cookies use.
   const token = generateShortId() + generateShortId();
-  await env.CONFIGS.put(scrobbleTokenKey(token), username);
-  await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
-  if (existing) {
-    // Revoke the old one, so a leaked webhook URL actually stops working.
+  if (env && env.DB) {
     try {
-      await env.CONFIGS.delete(scrobbleTokenKey(existing));
-    } catch {
-      // A stranded token is the one failure worth shouting about here, but
-      // it cannot be helped from inside this request; the reverse index no
-      // longer points at it either way.
-      console.error("scrobble token rotation: could not revoke the previous token");
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(username),
+        env.DB.prepare("INSERT INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)").bind(token, username, Date.now()),
+      ]);
+    } catch (dbErr) {
+      console.error("D1 write error (scrobble_tokens):", dbErr);
+    }
+  }
+  if (env && env.CONFIGS) {
+    await env.CONFIGS.put(scrobbleTokenKey(token), username);
+    await env.CONFIGS.put(creatorScrobbleTokenKey(username), token);
+    if (existing) {
+      // Revoke the old one, so a leaked webhook URL actually stops working.
+      try {
+        await env.CONFIGS.delete(scrobbleTokenKey(existing));
+      } catch {
+        console.error("scrobble token rotation: could not revoke the previous token");
+      }
     }
   }
   return token;
@@ -1761,12 +1863,32 @@ async function getOrCreateScrobbleToken(env, username, rotate = false) {
 
 // Resolves a presented token to the account it belongs to, or "" .
 async function usernameForScrobbleToken(env, token) {
-  if (!env || !env.CONFIGS) return "";
   const t = String(token || "").trim();
-  // Shape check before touching KV, so a junk value cannot mint reads.
+  // Shape check before touching KV/D1, so a junk value cannot mint reads.
   if (!t || t.length > 64 || !/^[A-Za-z0-9_-]+$/.test(t)) return "";
+  if (env && env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT username FROM scrobble_tokens WHERE token = ?").bind(t).first();
+      if (row && row.username) return row.username;
+    } catch {}
+  }
+  if (!env || !env.CONFIGS) return "";
   try {
-    return (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+    const u = (await env.CONFIGS.get(scrobbleTokenKey(t))) || "";
+    if (u && env && env.DB) {
+      // Check if D1 has an active token for this user; if so, but it doesn't match t, t was revoked
+      try {
+        const active = await env.DB.prepare("SELECT token FROM scrobble_tokens WHERE username = ?").bind(u).first();
+        if (active && active.token && active.token !== t) {
+          return "";
+        }
+        // Lazy backfill into D1
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO scrobble_tokens (token, username, created_at) VALUES (?, ?, ?)"
+        ).bind(t, u, Date.now()).run();
+      } catch {}
+    }
+    return u;
   } catch {
     return "";
   }
@@ -1929,6 +2051,32 @@ async function clearCreatorListDeletion(env, username, slug) {
   }
 }
 
+// Prunes expired tombstone markers from D1 (creator_tombstones and list_tombstones).
+// Note: per STORAGE-PLAN-KV-D1.md §5.4, no analytics, telemetry or feedback data is ever pruned.
+async function pruneTombstones(env) {
+  if (!env || !env.DB) return { prunedCreators: 0, prunedLists: 0 };
+  const now = Date.now();
+  let prunedCreators = 0;
+  let prunedLists = 0;
+  try {
+    const resCreators = await env.DB.prepare(
+      "DELETE FROM creator_tombstones WHERE until < ?"
+    ).bind(now).run();
+    prunedCreators = (resCreators && resCreators.meta && resCreators.meta.changes) || 0;
+  } catch (e) {
+    console.error("pruneTombstones (creator_tombstones) error:", e);
+  }
+  try {
+    const resLists = await env.DB.prepare(
+      "DELETE FROM list_tombstones WHERE until < ?"
+    ).bind(now).run();
+    prunedLists = (resLists && resLists.meta && resLists.meta.changes) || 0;
+  } catch (e) {
+    console.error("pruneTombstones (list_tombstones) error:", e);
+  }
+  return { prunedCreators, prunedLists };
+}
+
 // Deletes one or more of a creator's lists: the KV record, the D1 row, the
 // like ledger, the entry in their display order, and the directory index --
 // with a single index write and a single order write however many slugs are
@@ -1966,6 +2114,9 @@ async function deleteCreatorLists(env, username, slugs) {
         await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
+        } catch {}
+        try {
+          await env.DB.prepare("DELETE FROM list_likes WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deleteCreatorLists):", dbErr);
@@ -2060,6 +2211,9 @@ async function deletePublishedLists(env, slugs) {
         await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`).run();
+        } catch {}
+        try {
+          await env.DB.prepare("DELETE FROM list_likes WHERE list_id = ?").bind(`a:${slug}`).run();
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deletePublishedLists):", dbErr);
@@ -2750,6 +2904,12 @@ async function purgeCreatorData(env, username, options = {}) {
       await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM lists_fts WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM list_tombstones WHERE username = ?").bind(u).run();
+      const escapedU = u.replace(/([%_\\])/g, "\\$1");
+      await env.DB.prepare("DELETE FROM list_likes WHERE list_id LIKE ? ESCAPE '\\'").bind(`c:${escapedU}:%`).run();
+      if (deleteIdentity) {
+        await env.DB.prepare("DELETE FROM list_likes WHERE voter_id = ?").bind(`u:${u}`).run();
+      }
+      await env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
       dataSweepFailed = true;
