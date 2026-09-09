@@ -1854,3 +1854,141 @@ describe("client: a Letterboxd import follows the server's continuation", () => 
     );
   });
 });
+
+// A Discover/My Lists/Search card's poster strip going blank and staying
+// blank forever -- "sometimes lists just doesn't load" -- traced to
+// populateSearchResultPosters treating one failed /api/preview call as
+// final: nothing rendered, nothing logged anywhere visible, and no way back
+// short of a full page reload. loadPosterSlot (one card's fetch-and-render,
+// extracted so this and the Retry button can share it) now retries once
+// automatically, and only gives up -- visibly, with a Retry button -- after
+// that second attempt also fails.
+describe("client: a card's poster preview retries once before giving up", () => {
+  const PREVIEW = "/api/preview";
+  const okBody = (name) => ({
+    ok: true, count: 1, totalItems: 1,
+    sample: [{ id: "tt1", type: "movie", name: name || "Film", poster: "https://img.example/1.jpg" }],
+  });
+
+  function makeSlot(client, id, opts = {}) {
+    const slot = client.document.getElementById(id);
+    slot.dataset.url = opts.url || "mdblist:list:abc";
+    slot.dataset.type = opts.type || "movie";
+    slot.dataset.name = opts.name || "Some List";
+    return slot;
+  }
+
+  it("a single transient failure self-heals -- the retry renders the card", async () => {
+    let calls = 0;
+    const client = loadClient({
+      routes: {
+        [PREVIEW]: () => { calls++; return calls === 1 ? { status: 500, json: { ok: false } } : { json: okBody() }; },
+      },
+    });
+    const slot = makeSlot(client, "slot1");
+    await client.call("loadPosterSlot", slot);
+    assert.equal(calls, 2, "exactly one retry");
+    assert.equal(slot.className, "list-card-posters");
+    assert.match(slot.innerHTML, /Film/);
+  });
+
+  it("a healthy first response costs exactly one request", async () => {
+    let calls = 0;
+    const client = loadClient({
+      routes: { [PREVIEW]: () => { calls++; return { json: okBody() }; } },
+    });
+    const slot = makeSlot(client, "slot2");
+    await client.call("loadPosterSlot", slot);
+    assert.equal(calls, 1, "no retry when nothing failed");
+  });
+
+  it("gives up after the retry and leaves the card retryable, not blank", () => {
+    return (async () => {
+      let calls = 0;
+      const client = loadClient({
+        routes: { [PREVIEW]: () => { calls++; return { status: 500, json: { ok: false } }; } },
+      });
+      const slot = makeSlot(client, "slot3");
+      await client.call("loadPosterSlot", slot);
+      assert.equal(calls, 2, "one retry, not a loop against a real outage");
+      assert.match(slot.className, /poster-preview-error/);
+      assert.doesNotMatch(slot.className, /poster-preview-slot/,
+        "must resolve out of the in-flight class -- stashCatalogSearchView reads that class to mean still loading");
+      assert.match(slot.innerHTML, /onclick="retryPosterSlot\(this\)"/,
+        "a way back that does not require reloading the whole page");
+    })();
+  });
+
+  it("mixed-type cards retry each half independently and merge whichever succeeds", async () => {
+    let movieCalls = 0;
+    let seriesCalls = 0;
+    const client = loadClient({
+      routes: {
+        [PREVIEW]: (req) => {
+          if (req.body.type === "series") { seriesCalls++; return { status: 500, json: { ok: false } }; }
+          movieCalls++;
+          return { json: okBody("Movie Half") };
+        },
+      },
+    });
+    const slot = makeSlot(client, "slotMixed", { type: "mixed" });
+    await client.call("loadPosterSlot", slot);
+    assert.equal(seriesCalls, 2, "the failing half still gets its own retry");
+    assert.equal(movieCalls, 1, "the healthy half is not retried");
+    assert.equal(slot.className, "list-card-posters");
+    assert.match(slot.innerHTML, /Movie Half/, "renders from whichever half actually came back");
+  });
+
+  it("Retry re-fetches and can recover a card that failed twice", async () => {
+    let calls = 0;
+    const client = loadClient({
+      routes: {
+        [PREVIEW]: () => { calls++; return calls <= 2 ? { status: 500, json: { ok: false } } : { json: okBody() }; },
+      },
+    });
+    const slot = makeSlot(client, "slot4");
+    await client.call("loadPosterSlot", slot);
+    assert.match(slot.className, /poster-preview-error/);
+
+    const btn = client.document.getElementById("retryBtn4");
+    btn.closest = () => slot;
+    client.call("retryPosterSlot", btn);
+    // Fire-and-forget, the way an onclick attribute calls it -- the reset is
+    // synchronous, the re-fetch is not.
+    assert.equal(slot.className, "list-card-posters poster-preview-slot", "reset before the re-fetch starts");
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls, 3, "Retry fires exactly one more request");
+    assert.equal(slot.className, "list-card-posters");
+    assert.match(slot.innerHTML, /Film/, "and recovers once the list actually loads");
+  });
+});
+
+// Behavioural companion to the source-level Discover header tests in
+// worker.test.mjs: those check the markup and the code shape, this drives
+// filterDiscoverShelves for real and checks what actually lands on the
+// header element -- which a source-text match can't tell apart from a
+// mutation like `if (false) { ...same lines... }`.
+describe("client: Discover's shared-feed header follows the active pill", () => {
+  it("shows the right title for each shared-feed pill, and hides for Popular/Curated", () => {
+    const client = loadClient();
+    const header = client.document.getElementById("discoverListsFeedHeader");
+    const title = client.document.getElementById("discoverListsFeedTitle");
+
+    const cases = [
+      ["all", "All"], ["movie", "Movies"], ["series", "Shows"],
+      ["gems", "Hidden Gems"], ["kids", "Kids"], ["holidays", "Holidays"], ["genres", "Genres"],
+    ];
+    for (const [filter, label] of cases) {
+      client.call("filterDiscoverShelves", filter, null);
+      assert.equal(header.style.display, "flex", `${filter}: the header must be visible`);
+      assert.equal(title.textContent, label, `${filter}: wrong title text`);
+    }
+
+    client.call("filterDiscoverShelves", "popular", null);
+    assert.equal(header.style.display, "none", "Popular has its own header -- the shared one must hide");
+    client.call("filterDiscoverShelves", "curated", null);
+    assert.equal(header.style.display, "none", "Curated has its own header too");
+  });
+});

@@ -1,5 +1,72 @@
 # Changes Log
 
+## 2026-09-09 - Discover: a header and Refresh on every sub-nav tab, and poster previews that retry
+
+### Files Changed
+`09_page-shell.js`, `11_tab-quick-add.js`, `16_client-row-core.js`, `19_client-search-and-likes.js`,
+`worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`,
+`tests/worker.test.mjs`
+
+### Root Cause
+
+Two reports, one screenshot: "Discover, Popular Lists, has this at the top Popular Community Lists, Curated
+has this at the top Curated For You ... and all the other sub nav tabs doesn't have anything at the top.
+Popular Lists and Curated has a refresh button and the others does not," and separately, "Sometimes lists just
+doesn't load in of the sub nav tabs."
+
+The inconsistency was real and simple: `discoverSubPopular` and `discoverSubCurated` are each their own
+`<div class="discover-subpanel">` with their own `.shelf-header` (a title plus a Refresh button that calls
+`loadPopularListsFeed(true)` / `loadCuratedListsFeed(true)`). The other six pills — All, Movies, Shows, Hidden
+Gems, Kids, Holidays, Genres — all share one container, `discoverListsFeed`, and it had never gotten either.
+
+The loading bug took more digging, and turned out to explain itself once found. Every list card's 9-poster
+strip is filled in by its own `POST /api/preview` call (`populateSearchResultPosters`,
+`19_client-search-and-likes.js`) — up to 40 cards per render, 5 fetches running at once, and a mixed
+movie+show card costing two calls. That is enough concurrent traffic to occasionally trip the endpoint's own
+per-IP rate limit (`ratelimit:preview:`, 80/minute — `25_api-catalog-routes.js`) or hit a single slow upstream
+response, and the code treated `!res.ok` or a network error as final: the slot's `catch (e) {}` did nothing,
+and the `if (data.ok && ...)` guard around the rendering code meant a falsy `data.ok` just... rendered
+nothing. No error, no log a user could see, no retry — the poster grid stayed exactly as empty as before the
+fetch ever ran. Worse, the render is cached the moment it "completes" (`window._discoverFeedsCache[type]`), so
+switching tabs away and back served the same blank result from the cache instead of trying again, and there
+was no Refresh button on these six tabs to force a real reload either — the two reports were the same root
+cause wearing two symptoms.
+
+### What Changed
+
+**`loadPosterSlot`, one card's fetch-and-render, pulled out on its own (`19`).** Previously inline in
+`populateSearchResultPosters`'s concurrency loop. Fetching moved to two new top-level functions:
+`fetchListPreviewOnce` (the unchanged single-attempt request) and `fetchListPreviewWithRetry`, which retries
+once, immediately, on any failure. That is what makes the common case — a rate-limit burst, one timeout — self
+heal with no visible symptom at all. `fetchPreviewForSlot`'s mixed-type branch retries each half
+independently, so a card whose show half failed and movie half didn't only retries the half that needed it.
+
+**A card that still fails after the retry says so, with a way back (`19`, `09`).** `loadPosterSlot` renders
+"Couldn't load previews for this list." and a Retry button instead of leaving the slot's markup untouched.
+`retryPosterSlot(btn)` resets the slot to its pre-fetch shape and calls `loadPosterSlot` again — the same code
+a fresh render would run, reachable without a page reload. The slot keeps the `.poster-preview-slot` class for
+exactly as long as the fetch (retry included) is in flight, success or failure: `stashCatalogSearchView`
+(Search tab's view cache) reads that class to know a card has not resolved yet and skips snapshotting around
+it, and that contract had to survive this untouched.
+
+**A shared header for the six pills that share `discoverListsFeed` (`11`, `16`, `09`).** Same shape as Popular
+Lists' and Curated's own: a `.shelf-header` with a title and a Refresh button. One header rather than six,
+since one container is shared — `filterDiscoverShelves` sets its title from a `DISCOVER_FEED_TITLES` lookup
+matching the active pill's label, and shows/hides it in the same place it already shows/hides the feed
+container itself. Refresh calls `renderDiscoverChartsList(filter, true)` directly, which forces a real
+re-render past `window._discoverFeedsCache` — the same call already wired to Popular/Curated's own Refresh
+buttons, and, because a fresh render means a fresh `populateSearchResultPosters` pass, a working manual retry
+for the loading bug above, on top of the automatic one.
+
+### Verification
+`bash verify.sh` — 464 pass, 1 skipped. Ten new tests (four behavioural, via `tests/client-harness.mjs`,
+driving `loadPosterSlot`/`retryPosterSlot` against a stubbed `/api/preview`; six against the rendered markup
+and `filterDiscoverShelves`'s own logic). Six mutations — the automatic retry removed, the failure state
+reverted to blank, `retryPosterSlot`'s reset dropped, the header markup deleted, the header-visibility branch
+disabled, one pill's title entry removed — each caught by the test written for it; one of those (the
+visibility branch) was missed by a source-text match alone and needed a behavioural test that actually drives
+`filterDiscoverShelves` and reads the header element back.
+
 ## 2026-09-09 - The KV write budget: telemetry counters move to D1
 
 ### Files Changed
