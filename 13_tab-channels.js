@@ -78,7 +78,7 @@
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Instant 1-click TV channels with automatic daily episode rotation:</p>
+      <p class="qa-shelf-sub">Instant 1-click TV channels with automatic daily episode rotation:</p>
       <div class="channel-quick-grid">
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="A&amp;E" data-networkid="129">A&amp;E</button>
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="ABC" data-networkid="2">ABC</button>
