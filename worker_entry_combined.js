@@ -57108,7 +57108,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
-        } catch (e) {}
+        } catch (e) {
+          // This was `catch (e) {}` -- an empty one, and the worst of the five
+          // feedback writes that dropped their error.
+          //
+          // Falling out of this block does not stop here: execution carries on
+          // into the "New Thread" path below, which mints a fresh id and files
+          // the message as its own report. So a reply that failed to save was
+          // silently turned into a DUPLICATE THREAD, detached from the
+          // conversation it was answering -- the sender was told it went
+          // through, the admin saw a new orphan report, and nothing was logged
+          // either way.
+          //
+          // A reply that cannot be saved is an error, so it is reported as
+          // one. The empty-entry case is unaffected: that never enters this
+          // `if (entry)` block, so an unknown thread id still falls through to
+          // New Thread exactly as it always did.
+          return json({ ok: false, error: safeErrorMessage(e, "Could not save your reply right now. Please try again in a moment.") }, 500);
+        }
       }
 
       // New Thread
@@ -57147,6 +57164,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
+        // Logged rather than swallowed, for the reason spelled out at the
+        // admin status route (26_...). This one is NOT admin-only, so the
+        // caller keeps the generic wording -- safeErrorMessage still writes
+        // the real error to the log, which is the half that was missing.
+        safeErrorMessage(e);
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
       }
       return json({ ok: true, entry });
@@ -63317,7 +63339,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        return json({ ok: false, error: "Could not save reply." }, 500);
+        // safeErrorMessage, not a fixed string: it logs the real error and
+        // hands back a redacted version of it. See the status route below for
+        // why these four writes stopped swallowing what went wrong.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save reply.") }, 500);
       }
       return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
     }
@@ -63352,7 +63377,22 @@ Sitemap: ${url.origin}/sitemap.xml`;
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
+        // This catch used to bind `e` and drop it, returning a fixed "please
+        // try again" whatever had actually happened -- so an admin hitting a
+        // 500 here (and whoever they reported it to) had no way to find out
+        // why, and nothing was written to the log either. Every comparable
+        // failure path in this Worker logs; these four feedback writes were
+        // the exception.
+        //
+        // safeErrorMessage does both halves: it console.errors the raw error,
+        // so it shows up in `wrangler tail` and the Cloudflare dashboard, and
+        // it returns the message with urls and anything credential-shaped
+        // redacted. This route is behind isAdminRequest, so the person who
+        // sees it is the operator -- exactly who needs to know whether this
+        // was, say, the KV write budget rather than a transient blip. The old
+        // wording stays as the fallback for an error that carries no usable
+        // message of its own.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save that change. Please try again.") }, 500);
       }
       return json({ ok: true }, 200, { "Cache-Control": "no-store" });
     }
@@ -63405,7 +63445,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
-        return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
+        // Logged and reported rather than swallowed -- see the status route.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save edits. Please try again.") }, 500);
       }
     }
 
