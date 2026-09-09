@@ -2132,9 +2132,9 @@ async function renderAdminDashboard(env) {
     </div>
 
     <div class="panel" style="margin:0; padding:14px 16px;">
-      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory index</div>
-      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The list directory and in-app search read from one maintained index instead of scanning every list on every request. It is kept up to date on every publish/like, rebuilt if it is ever found missing, and re-derived from scratch once a day so that any entry left stranded by a burst of edits is cleaned up on its own. This button forces that rebuild right now -- useful right after first setting this Worker up, or if the directory is showing a list that no longer opens.</p>
-      <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Public List Index</button>
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory &amp; search index</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The public list directory and in-app search query D1 tables and the full-text search index (lists_fts). This button rebuilds the search index directly from creator_lists and published_lists &mdash; useful after importing data or to recreate the index after a D1 database export.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Search Index</button>
       <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
 

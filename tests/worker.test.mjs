@@ -1090,88 +1090,45 @@ describe("bug: Trakt popular lists were all typed movie, with display-name URLs"
 // merely wrong. A live bulk delete left 76 entries advertising item counts for
 // records that no longer existed, and they stayed there indefinitely.
 describe("bug: a stale public index never repaired itself", () => {
-  function seedWithPhantoms(phantomCount) {
-    const kv = makeKv();
-    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
-    const entries = [];
-    const order = [];
+  it("drops entries whose record is gone without retaining phantom entries", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const alice = await createUser(env, "someone");
     for (const [slug, n] of [["hgtv", 79], ["travel", 47]]) {
-      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
-        name: slug, slug, type: "series", visibility: "public",
-        items: Array.from({ length: n }, (_, i) => ({ id: "tt" + i })), likes: 0, updatedAt: 1,
-      }));
-      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
-                     slug, name: slug, type: "series", itemCount: n, likes: 0, updatedAt: 1 });
-      order.push(slug);
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: slug,
+          slug,
+          type: "series",
+          visibility: "public",
+          items: Array.from({ length: n }, (_, i) => ({ id: "tt" + i })),
+        },
+      });
     }
-    // Entries whose record is gone: the directory shows a count, opening 404s.
-    for (let i = 0; i < phantomCount; i++) {
-      const slug = `ghost-${i}`;
-      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
-                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
-      order.push(slug);
-    }
-    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
-    return { kv, entries };
-  }
-
-  async function runCron(env, kv, maxTicks = 40) {
-    for (let t = 1; t <= maxTicks; t++) {
-      kv._store.delete("lock:publiclistindex");
-      await runScheduledTick(env);
-      if (!kv._store.has("index:publiclists:build")) return t;
-    }
-    return -1;
-  }
-
-  it("re-derives a stale index and drops entries whose record is gone", async () => {
-    const { kv, entries } = seedWithPhantoms(76);
-    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
-    const env = makeEnv({ CONFIGS: kv });
 
     const before = await call(env, "/lists/public.json?limit=500");
-    assert.equal(before.body.total, 78, "expected the phantom entries to start out visible");
+    assert.equal(before.body.total, 2);
+    assert.deepEqual((before.body.lists || []).map((l) => l.slug).sort(), ["hgtv", "travel"]);
 
-    assert.notEqual(await runCron(env, kv), -1, "the refresh never completed");
+    // Deleting a list immediately removes it from the public directory
+    await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug: "travel" },
+    });
 
     const after = await call(env, "/lists/public.json?limit=500");
-    assert.equal(after.body.total, 2, "phantom entries survived the refresh");
-    assert.deepEqual((after.body.lists || []).map((l) => l.slug).sort(), ["hgtv", "travel"]);
-    // The real lists must come through intact, not merely survive.
-    assert.equal(after.body.lists.find((l) => l.slug === "hgtv").itemCount, 79);
+    assert.equal(after.body.total, 1);
+    assert.equal(after.body.lists[0].slug, "hgtv");
+    assert.equal(after.body.lists[0].itemCount, 79);
   });
 
-  it("leaves a fresh index alone", async () => {
-    // Re-deriving on every tick would be a full scan of every list, forever.
-    const { kv, entries } = seedWithPhantoms(3);
-    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
-    const env = makeEnv({ CONFIGS: kv });
-    const snapshot = publicIndexSnapshot(kv);
-
+  it("scheduled() no longer runs public index rebuild", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
     await runScheduledTick(env);
-
-    assert.equal(publicIndexSnapshot(kv), snapshot, "a fresh index was rebuilt needlessly");
-  });
-
-  it("keeps serving the old index while a multi-chunk refresh is in flight", async () => {
-    // A partial scan must never be published as though it were the whole
-    // directory, or the listing would shrink and grow while it runs.
-    const { kv, entries } = seedWithPhantoms(400);
-    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now() - 25 * 3600 * 1000, entries }));
-    const env = makeEnv({ CONFIGS: kv });
-
-    kv._store.delete("lock:publiclistindex");
-    const pending = [];
-    await worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
-    await Promise.all(pending);
-
-    if (kv._store.has("index:publiclists:build")) {
-      const mid = await call(env, "/lists/public.json?limit=500");
-      assert.equal(mid.body.total, 402, "the directory changed mid-refresh");
-    }
-    assert.notEqual(await runCron(env, kv), -1);
-    const after = await call(env, "/lists/public.json?limit=500");
-    assert.equal(after.body.total, 2);
+    assert.equal(env.CONFIGS._store.has("index:publiclists:build"), false);
   });
 });
 
@@ -1619,229 +1576,111 @@ describe("directory pagination", () => {
     assert.equal(second.body.lists.length, n);
   });
 
-  it("/admin/api/rebuild-public-index seeds a cold index synchronously", async () => {
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
-    // Seeded directly into KV (bypassing the save endpoint, so the
-    // incremental index update never ran) to simulate a genuinely cold
-    // index -- a fresh deploy, or the index key lost some other way.
+  it("/admin/api/rebuild-public-index rebuilds search index in D1", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
     const n = 12;
-    await kv.put("creator:idxuser", JSON.stringify({ displayName: "idxuser", keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
+    const alice = await createUser(env, "idxuser");
     for (let i = 0; i < n; i++) {
-      await kv.put(`creatorlist:idxuser:list-${i}`, JSON.stringify({
-        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
-        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
-      }));
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: `List ${i}`,
+          slug: `list-${i}`,
+          type: "movie",
+          visibility: "public",
+          items: [{ id: "tt0111161", name: "Item" }],
+        },
+      });
     }
-    assert.equal(hasPublicIndex(kv), false);
 
     const cookie = await adminCookie(env);
     const r = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
     assert.equal(r.body.ok, true);
     assert.equal(r.body.count, n);
-    assert.equal(hasPublicIndex(kv), true);
 
-    // Now served straight from the index, no bounded-scan fallback needed.
+    // Searchable via lists_fts
+    const search = await call(env, "/api/search-published-lists?q=List");
+    assert.equal(search.body.ok, true);
+    assert.equal(search.body.lists.length, n);
+
+    // Served straight from the D1 query
     const listing = await call(env, "/lists/public.json?limit=500");
     assert.equal(listing.body.total, n);
   });
 
-  it("scheduled() self-heals a missing index without any admin action", async () => {
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
+  it("serves public lists without needing any cron action", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
     const n = 7;
+    const alice = await createUser(env, "cronuser");
     for (let i = 0; i < n; i++) {
-      await kv.put("creator:cronuser", JSON.stringify({ displayName: "cronuser", keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
-      await kv.put(`creatorlist:cronuser:list-${i}`, JSON.stringify({
-        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
-        items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
-      }));
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: `List ${i}`,
+          slug: `list-${i}`,
+          type: "movie",
+          visibility: "public",
+          items: [{ id: "tt0111161", name: "Item" }],
+        },
+      });
     }
-    assert.equal(hasPublicIndex(kv), false);
 
-    // Drained in rounds: advancePublicListIndexBuild registers the rebuild
-    // chunk with a SECOND ctx.waitUntil once it is already running, so a
-    // single snapshot of the queue misses it. See runScheduledTick.
-    await runScheduledTick(env);
-
-    assert.equal(hasPublicIndex(kv), true);
+    // Direct D1 query serves lists immediately, no scheduled tick needed
     const listing = await call(env, "/lists/public.json?limit=500");
     assert.equal(listing.body.total, n);
   });
 });
 
-// Cloudflare aborts a Worker invocation after 1,000 subrequests, and KV
-// reads count. The index rebuild used to be a single unbounded pass at
-// roughly two reads per list, so past ~500 public lists it threw partway,
-// the throw was swallowed by the ctx.waitUntil(...).catch(...) at its only
-// call sites, the index was never written, and /lists/public.json fell back
-// to the legacy bounded scan -- the alphabetically-first 100 creators,
-// permanently, with nothing logged that a user or operator would ever see.
-//
-// These tests run the rebuild against a KV that enforces the real limit, so
-// a regression to any single-pass scan fails here instead of silently in
-// production.
-describe("audit fix: the public list index rebuilds at any scale", () => {
-  // Throws exactly the way the runtime does once an invocation has spent
-  // its subrequest budget. Reset between invocations, never within one.
-  function cappedKv(initial = {}, cap = 1000) {
-    const inner = makeKv(initial);
-    let n = 0;
-    let peak = 0;
-    const charge = () => {
-      n += 1;
-      if (n > peak) peak = n;
-      if (n > cap) throw new Error("Too many subrequests.");
-    };
-    return {
-      _store: inner._store,
-      _resetInvocation: () => { n = 0; },
-      _peak: () => peak,
-      async get(...a) { charge(); return inner.get(...a); },
-      async put(...a) { charge(); return inner.put(...a); },
-      async delete(...a) { charge(); return inner.delete(...a); },
-      async list(...a) { charge(); return inner.list(...a); },
-    };
-  }
-
-  function seedPublicLists(store, count) {
-    for (let i = 0; i < count; i++) {
-      const username = `user${String(i).padStart(5, "0")}`;
-      store.set(`creator:${username}`, JSON.stringify({
-        displayName: `Real ${username}`, keyHash: "pbkdf2:1:00:00", createdAt: 1,
-      }));
-      store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
-        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
-        items: [{ id: "tt0111161", name: "Item" }], likes: i % 7, createdAt: 1, updatedAt: 1,
-      }));
+describe("Phase 1: the public list directory and search scale with D1", () => {
+  it("indexes and serves public lists at scale in D1", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const n = 250;
+    for (let i = 0; i < n; i++) {
+      const username = `u${i}`;
+      db.prepare("INSERT INTO creators (username, display_name, key_hash, created_at, last_active) VALUES (?, ?, 'hash', 1, 1)")
+        .bind(username, username).run();
+      db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'public', '[{\"id\":\"tt1\"}]', ?, 1, 1)")
+        .bind(`${username}:list-${i}`, username, `List ${i}`, i % 7).run();
     }
-  }
-
-  // Drives cron-shaped ticks until the index lands. Each tick is a separate
-  // invocation, so each gets a fresh subrequest budget -- which is the whole
-  // point of chunking the rebuild.
-  async function driveToCompletion(env, kv, maxTicks = 200) {
-    for (let tick = 1; tick <= maxTicks; tick++) {
-      kv._resetInvocation();
-      kv._store.delete("lock:publiclistindex");
-      await call(env, "/lists/public.json");
-      if (hasPublicIndex(kv)) return tick;
-    }
-    return -1;
-  }
-
-  it("indexes every list past the point a single-pass scan died", async () => {
-    const n = 1000;
-    const kv = cappedKv({}, 1000);
-    seedPublicLists(kv._store, n);
-    const env = makeEnv({ CONFIGS: kv });
-
-    const ticks = await driveToCompletion(env, kv);
-    assert.notEqual(ticks, -1, "index never completed");
-    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
-
-    kv._resetInvocation();
-    const listing = await call(env, "/lists/public.json?limit=500");
-    assert.equal(listing.body.total, n, `directory reports ${listing.body.total} of ${n} lists`);
-  });
-
-  it("survives invisible records that cost a read but never reach the directory", async () => {
-    // rebuildPublicListIndex must read a record before it can test
-    // visibility, so a private list costs the same as a public one.
-    // /api/publish-list was unauthenticated and its records defaulted to
-    // private, which made this a way to break the directory on purpose:
-    // ~900 of them took a 20-list deployment past the limit for good. The
-    // route is gone as of 1.5.3; the records it left behind are not, and the
-    // rebuild still has to read every one of them.
-    const kv = cappedKv({}, 1000);
-    seedPublicLists(kv._store, 20);
-    for (let i = 0; i < 900; i++) {
-      kv._store.set(`publishedlist:user:junk-${i}`, JSON.stringify({
-        name: "junk", visibility: "private", items: [{ id: "tt0111161" }],
-      }));
-    }
-    const env = makeEnv({ CONFIGS: kv });
-
-    assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
-    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
-
-    kv._resetInvocation();
-    const listing = await call(env, "/lists/public.json?limit=500");
-    assert.equal(listing.body.total, 20, "the 20 real lists must still all be listed");
-  });
-
-  it("publishes the index only once, and cleans up after itself", async () => {
-    const kv = cappedKv({}, 1000);
-    seedPublicLists(kv._store, 700);
-    const env = makeEnv({ CONFIGS: kv });
-
-    await driveToCompletion(env, kv);
-    // A partial scan must never be published as though it were complete,
-    // and the resume state must not outlive the build that used it.
-    assert.equal(kv._store.has("index:publiclists:build"), false, "build state leaked");
-    const settled = publicIndexSnapshot(kv);
-    for (let i = 0; i < 3; i++) {
-      kv._resetInvocation();
-      await call(env, "/lists/public.json");
-    }
-    assert.equal(publicIndexSnapshot(kv), settled, "a completed index was rebuilt needlessly");
-  });
-
-  it("restarts cleanly from unparseable or stale resume state", async () => {
-    for (const bad of ["{not json", JSON.stringify({ v: 0, phase: 99 })]) {
-      const kv = cappedKv({}, 1000);
-      seedPublicLists(kv._store, 200);
-      kv._store.set("index:publiclists:build", bad);
-      const env = makeEnv({ CONFIGS: kv });
-      assert.notEqual(await driveToCompletion(env, kv), -1, "index never completed");
-      kv._resetInvocation();
-      const listing = await call(env, "/lists/public.json?limit=500");
-      assert.equal(listing.body.total, 200, `stale state ${bad.slice(0, 12)} lost lists`);
-    }
-  });
-
-  it("loses nothing and duplicates nothing under concurrent rebuild attempts", async () => {
-    const n = 900;
-    // Deliberately NOT the capped KV here: five concurrent requests are five
-    // separate Worker invocations with five separate subrequest budgets, and
-    // a single shared counter would model that wrongly. The budget is
-    // covered by the tests above; this one is about the lock and the resume
-    // state holding up when chunks race.
-    const kv = makeKv();
-    seedPublicLists(kv._store, n);
-    const env = makeEnv({ CONFIGS: kv });
-
-    for (let round = 0; round < 60 && !hasPublicIndex(kv); round++) {
-      kv._store.delete("lock:publiclistindex");
-      await Promise.all([0, 1, 2, 3, 4].map(() => call(env, "/lists/public.json")));
-    }
-    const entries = publicIndexEntries(kv);
-    assert.equal(entries.length, n);
-    assert.equal(new Set(entries.map((e) => e.id)).size, n, "duplicate entries in the index");
-  });
-
-  it("/admin/api/rebuild-public-index reports progress and finishes across calls", async () => {
-    const n = 1500;
-    const kv = cappedKv({}, 1000);
-    seedPublicLists(kv._store, n);
-    const env = makeEnv({ CONFIGS: kv });
     const cookie = await adminCookie(env);
+    const rebuild = await call(env, "/admin/api/rebuild-search-index", { method: "POST", cookie });
+    assert.equal(rebuild.body.ok, true);
+    assert.equal(rebuild.body.count, n);
 
-    let calls = 0;
-    let scanned = 0;
-    let last;
-    do {
-      calls += 1;
-      kv._resetInvocation();
-      last = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
-      assert.equal(last.body.ok, true);
-      scanned += last.body.scanned || 0;
-    } while (!last.body.done && calls < 100);
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
 
-    assert.equal(last.body.done, true, "rebuild never reported done");
-    assert.equal(last.body.count, n);
-    assert.ok(scanned >= n, `scanned ${scanned}, expected at least ${n}`);
-    assert.ok(kv._peak() <= 1000, `one invocation spent ${kv._peak()} subrequests, over the limit`);
+    const search = await call(env, "/api/search-published-lists?q=List");
+    assert.equal(search.body.ok, true);
+    assert.ok(search.body.lists.length > 0);
+  });
+
+  it("survives private records without indexing them in lists_fts", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    db.prepare("INSERT INTO creators (username, display_name, key_hash, created_at, last_active) VALUES ('alice', 'Alice', 'hash', 1, 1)").run();
+    db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'public', '[{\"id\":\"tt1\"}]', 0, 1, 1)")
+      .bind("alice:pub", "alice", "Public List").run();
+    db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'private', '[{\"id\":\"tt1\"}]', 0, 1, 1)")
+      .bind("alice:priv", "alice", "Private Secret List").run();
+
+    const cookie = await adminCookie(env);
+    const rebuild = await call(env, "/admin/api/rebuild-search-index", { method: "POST", cookie });
+    assert.equal(rebuild.body.ok, true);
+    assert.equal(rebuild.body.count, 1);
+
+    const searchPriv = await call(env, "/api/search-published-lists?q=Secret");
+    assert.deepEqual(searchPriv.body.lists, []);
+
+    const searchPub = await call(env, "/api/search-published-lists?q=Public");
+    assert.equal(searchPub.body.lists.length, 1);
   });
 });
 
@@ -4956,19 +4795,9 @@ describe("A2/A6: D1 is an accelerator, so it must never overrule the store that 
 });
 
 describe("A7/A8: unpublishing must actually remove a list from public discovery", () => {
-  const seedFiller = (kv, n) => {
-    for (let i = 0; i < n; i++) {
-      const slug = `filler${String(i).padStart(4, "0")}`;
-      kv._store.set(`creatorlist:alice7:${slug}`, JSON.stringify({
-        name: `F${i}`, slug, type: "movie", items: [], visibility: "public", likes: 0, createdAt: 1, updatedAt: 1,
-      }));
-    }
-  };
-
-  // A8 -- the index removal rode on ctx.waitUntil and swallowed its own
-  // failure, so unpublishing answered ok:true while the list stayed listed.
-  it("reports failure rather than ok:true when the index removal cannot be written", async () => {
-    const env = makeEnv({ CONFIGS: makeKv() });
+  it("reports failure rather than ok:true when the unpublishing write fails", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
     const u = await createUser(env, "alice7");
     const K = { creatorName: "alice7", creatorKey: u.creatorKey };
     await call(env, "/api/creator/lists/save", {
@@ -4980,7 +4809,7 @@ describe("A7/A8: unpublishing must actually remove a list from public discovery"
     assert.equal((await call(env, "/lists/public.json")).body.lists.length, 1);
 
     env.CONFIGS._hooks.beforePut = async (key) => {
-      if (isPublicIndexKey(key)) throw new Error("KV put failed");
+      if (key.startsWith("creatorlist:")) throw new Error("KV put failed");
     };
     const un = await call(env, "/api/creator/lists/save", {
       method: "POST",
@@ -4989,84 +4818,68 @@ describe("A7/A8: unpublishing must actually remove a list from public discovery"
     env.CONFIGS._hooks.beforePut = null;
 
     assert.notEqual(un.body.ok, true,
-      "unpublishing cannot report success while the list is still in the directory");
-    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:alice7:family-photos")).visibility, "private",
-      "the record itself is still correctly private");
+      "unpublishing cannot report success while the record write fails");
   });
 
-  // A7 -- a rebuild carries a pre-change snapshot and overwrites the live
-  // index when it finishes, so a removal applied mid-build was undone.
-  it("an in-flight rebuild does not re-publish a list that was made private under it", async () => {
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
+  it("unpublishing removes a list from directory and search, and rebuild does not re-publish it", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
     const u = await createUser(env, "alice7");
     const K = { creatorName: "alice7", creatorKey: u.creatorKey };
-    seedFiller(kv, 900);
     await call(env, "/api/creator/lists/save", {
       method: "POST",
       json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
     });
     const cookie = await adminCookie(env);
-    const inIndex = () => publicIndexEntries(kv).some((e) => e.id === "c:alice7:family-photos");
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
 
-    let done = false;
-    for (let i = 0; i < 50 && !done; i++) {
-      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
-    }
-    assert.equal(inIndex(), true, "precondition: it starts out listed");
+    const dirBefore = await call(env, "/lists/public.json");
+    assert.equal(dirBefore.body.lists.some((l) => l.slug === "family-photos"), true);
 
-    // Start a fresh rebuild and stop after its first chunk.
-    kv._store.delete("index:publiclists:build");
-    const chunk1 = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
-    assert.equal(chunk1.body.done, false, "precondition: the rebuild needs more than one chunk");
-
-    // Mid-rebuild, the owner unpublishes.
+    // Unpublish
     const un = await call(env, "/api/creator/lists/save", {
       method: "POST",
       json: { ...K, slug: "family-photos", name: "Family Photos", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
     });
     assert.equal(un.body.ok, true);
-    assert.equal(inIndex(), false, "the live index drops it immediately");
 
-    done = false;
-    for (let i = 0; i < 50 && !done; i++) {
-      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
-    }
-    assert.equal(inIndex(), false, "the finishing rebuild must not put it back");
-    assert.equal((await call(env, "/lists/public.json?limit=500")).body.lists.some((l) => l.slug === "family-photos"),
-      false, "and it must not be advertised by the directory");
-    const search = await call(env, "/api/search-published-lists?q=family");
-    assert.deepEqual(search.body.lists, [], "nor returned by search");
+    // Immediate removal from public discovery and search
+    const dirAfter = await call(env, "/lists/public.json");
+    assert.equal(dirAfter.body.lists.some((l) => l.slug === "family-photos"), false);
+    const searchAfter = await call(env, "/api/search-published-lists?q=family");
+    assert.deepEqual(searchAfter.body.lists, []);
+
+    // Rebuild does not re-publish private list
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    const dirRebuilt = await call(env, "/lists/public.json");
+    assert.equal(dirRebuilt.body.lists.some((l) => l.slug === "family-photos"), false);
   });
 
-  // The inverse: a list unpublished and then published again during a later
-  // build must survive, so the fix cannot be "once removed, always removed".
   it("a list republished after being unpublished still comes back", async () => {
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
     const u = await createUser(env, "alice7");
     const K = { creatorName: "alice7", creatorKey: u.creatorKey };
     await call(env, "/api/creator/lists/save", {
       method: "POST",
       json: { ...K, name: "On Off", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
     });
-    const cookie = await adminCookie(env);
-    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
 
-    for (const visibility of ["private", "public"]) {
-      const r = await call(env, "/api/creator/lists/save", {
-        method: "POST",
-        json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility, items: [{ id: "tt0111161" }] },
-      });
-      assert.equal(r.body.ok, true);
-    }
-    kv._store.delete("index:publiclists:build");
-    let done = false;
-    for (let i = 0; i < 50 && !done; i++) {
-      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
-    }
-    assert.equal((await call(env, "/lists/public.json")).body.lists.some((l) => l.slug === "on-off"), true,
-      "a list that is public again must be listed again");
+    // Unpublish
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    const dirMid = await call(env, "/lists/public.json");
+    assert.equal(dirMid.body.lists.some((l) => l.slug === "on-off"), false);
+
+    // Republish
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const dirFinal = await call(env, "/lists/public.json");
+    assert.equal(dirFinal.body.lists.some((l) => l.slug === "on-off"), true);
   });
 });
 
@@ -5838,164 +5651,129 @@ describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
   });
 });
 
-// --- AIII-19, second half: index:publiclists is 32 keys, not one -----------
+// --- Phase 1: the public list directory is backed by D1 ---------------------
 //
-// Every public save, publish and like did a read-modify-write of ONE key
-// holding the whole directory -- 4.45 MB at the 20,000-entry cap, against
-// KV's one-write-per-second-per-key limit on both plans.
-describe("AIII fix: the directory index is sharded", () => {
-  const SHARDS = 32;
-  const shardKeys = (kv) => [...kv._store.keys()].filter((k) => /^index:publiclists:s\d+$/.test(k));
-
-  async function seeded(n) {
+// Replaces the 32-shard KV index with a direct UNION ALL query over
+// creator_lists and published_lists in D1, filtered by visibility = 'public'
+// and ordered by likes DESC, updated_at DESC.
+describe("Phase 1: the public list directory is backed by D1", () => {
+  async function seeded(n, { withD1 = true } = {}) {
     const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
-    const u = await createUser(env, "sharder");
+    const db = withD1 ? makeD1() : undefined;
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "d1dir");
     for (let i = 0; i < n; i++) {
       await call(env, "/api/creator/lists/save", {
         method: "POST",
         json: {
-          creatorName: "sharder", creatorKey: u.creatorKey,
+          creatorName: "d1dir", creatorKey: u.creatorKey,
           name: "List " + i, type: "movie", visibility: "public", items: [{ id: "tt" + i }],
         },
       });
     }
-    await call(env, "/lists/public.json"); // materialise the index
-    return { kv, env, u };
+    return { kv, db, env, u };
   }
 
-  it("publishes every shard, so an absent shard always means 'not sharded'", async () => {
-    // The invariant the single-shard write path depends on. If a full publish
-    // skipped empty buckets, a write could not tell an empty bucket from an
-    // un-migrated deployment, and would half-shard the directory.
-    const { kv } = await seeded(3);
-    assert.equal(shardKeys(kv).length, SHARDS, "a full publish must write all 32 keys");
-    assert.ok(kv._store.has("index:publiclists:meta"), "and the build marker");
-    assert.equal(kv._store.get("index:publiclists"), undefined,
-      "and must remove the pre-shard key, but only after the shards landed");
+  it("serves public lists directly from D1, without writing KV index keys", async () => {
+    const { kv, env } = await seeded(3);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 3);
+    assert.equal(dir.body.lists.length, 3);
+    const indexKeys = [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"));
+    assert.equal(indexKeys.length, 0, "D1 public directory must not write KV index keys");
   });
 
-  it("spreads the directory across the shards", async () => {
-    const { kv } = await seeded(40);
-    const counts = shardKeys(kv).map((k) => JSON.parse(kv._store.get(k)).entries.length);
-    assert.equal(counts.reduce((a, b) => a + b, 0), 40, "no entry may be lost in the split");
-    assert.ok(counts.filter((c) => c > 0).length > 8,
-      `40 lists landed in only ${counts.filter((c) => c > 0).length} buckets -- the hash is not spreading`);
-    assert.ok(Math.max(...counts) < 20, "one bucket is holding half the directory");
+  it("serves the whole directory with correct ordering and no duplicates", async () => {
+    const { env } = await seeded(25);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal(dir.body.total, 25, "must return all lists");
+    assert.equal(new Set(dir.body.lists.map((l) => l.slug)).size, 25, "and no duplicates");
   });
 
-  it("writes ONE shard for a like, not the whole directory", async () => {
-    const { kv, env } = await seeded(20);
+  it("ranks lists by likes DESC, updated_at DESC", async () => {
+    const { env } = await seeded(3);
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-1" },
+    });
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-1" },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists[0].slug, "list-1", "most-liked list must rank first");
+    assert.equal(dir.body.lists[0].likes, 2);
+  });
+
+  it("writing a like does not touch any KV index keys", async () => {
+    const { kv, env } = await seeded(5);
     const touched = new Set();
     const realPut = kv.put.bind(kv);
     kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) touched.add(k); return realPut(k, ...rest); };
     const r = await call(env, "/api/lists/like", {
-      method: "POST", ip: nextIp(), json: { username: "sharder", slug: "list-0" },
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-0" },
     });
-    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
-    assert.equal(touched.size, 1, `a one-number change rewrote ${touched.size} index keys`);
+    assert.equal(r.body.ok, true);
+    assert.equal(touched.size, 0, "likes in D1 must not touch KV index shards");
   });
 
-  it("removes a list by touching only the shards its ids are in", async () => {
-    const { kv, env, u } = await seeded(20);
-    const touched = new Set();
-    const realPut = kv.put.bind(kv);
-    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) touched.add(k); return realPut(k, ...rest); };
+  it("removes a list from the directory immediately upon deletion", async () => {
+    const { env, u } = await seeded(5);
     const r = await call(env, "/api/creator/lists/delete", {
-      method: "POST", json: { creatorName: "sharder", creatorKey: u.creatorKey, slug: "list-3" },
+      method: "POST", json: { creatorName: "d1dir", creatorKey: u.creatorKey, slug: "list-2" },
     });
-    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
-    assert.equal(touched.size, 1, `one delete rewrote ${touched.size} index keys`);
-    assert.ok(!publicIndexEntries(kv).some((e) => e.id === "c:sharder:list-3"),
-      "and the entry must actually be gone");
+    assert.equal(r.body.ok, true);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 4);
+    assert.ok(!dir.body.lists.some((l) => l.slug === "list-2"), "deleted list must not appear");
   });
 
-  it("serves the whole directory from the merged shards", async () => {
-    const { kv, env } = await seeded(25);
-    const dir = await call(env, "/lists/public.json?limit=500");
-    assert.equal(dir.body.total, 25, "the merge must return every shard's entries");
-    assert.equal(new Set(dir.body.lists.map((l) => l.slug)).size, 25, "and no duplicates");
-    void kv;
-  });
-
-  it("keeps serving a pre-shard index, and converts it on the next write", async () => {
-    // A deployment upgrading in place. The old key has to keep answering until
-    // a full publish converts it -- a directory that serves a fraction of
-    // itself is worse than one that is not sharded at all.
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
-    const u = await createUser(env, "legacyidx");
-    await call(env, "/api/creator/lists/save", {
+  it("unpublishing a list removes it immediately from public discovery", async () => {
+    const { env, u } = await seeded(3);
+    const unpub = await call(env, "/api/creator/lists/save", {
       method: "POST",
-      json: { creatorName: "legacyidx", creatorKey: u.creatorKey, name: "Old One", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+      json: {
+        creatorName: "d1dir", creatorKey: u.creatorKey, slug: "list-0",
+        name: "List 0", type: "movie", visibility: "private", items: [{ id: "tt0" }],
+      },
     });
-    await call(env, "/lists/public.json"); // materialise the index
-    // Hand-write the pre-shard layout and clear the new one.
-    const entries = publicIndexEntries(kv);
-    assert.equal(entries.length, 1);
-    for (const k of [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"))) kv._store.delete(k);
-    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
-
-    const before = await call(env, "/lists/public.json");
-    assert.equal(before.body.total, 1, "the pre-shard key must still be served");
-
-    await call(env, "/api/creator/lists/save", {
-      method: "POST",
-      json: { creatorName: "legacyidx", creatorKey: u.creatorKey, name: "New One", type: "movie", visibility: "public", items: [{ id: "tt2" }] },
-    });
-    assert.equal(shardKeys(kv).length, SHARDS, "the first write after the upgrade must convert it");
-    assert.equal(kv._store.get("index:publiclists"), undefined);
-    const after = await call(env, "/lists/public.json");
-    assert.equal(after.body.total, 2, "and must carry both lists across");
+    assert.equal(unpub.body.ok, true);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 2);
+    assert.ok(!dir.body.lists.some((l) => l.slug === "list-0"), "private list must not appear");
   });
 
-  it("restarts a build state written before the shards existed", async () => {
-    // The version marker the audit asked for: a v1 state's entries are fine,
-    // but they were gathered by code that would publish them to one key.
-    const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv });
-    const u = await createUser(env, "buildver");
-    await call(env, "/api/creator/lists/save", {
-      method: "POST",
-      json: { creatorName: "buildver", creatorKey: u.creatorKey, name: "A List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
-    });
-    for (const k of [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"))) kv._store.delete(k);
-    kv._store.set("index:publiclists:build", JSON.stringify({
-      v: 1, phase: 1, cursor: "", pending: [], entries: [{ id: "c:nobody:ghost", slug: "ghost", name: "Ghost" }], names: {},
-    }));
+  it("unions creator lists and anonymous published lists seamlessly", async () => {
+    const { db, env } = await seeded(2);
+    db.prepare(`
+      INSERT INTO published_lists (slug, name, type, visibility, items_json, likes, created_at, updated_at)
+      VALUES (?, ?, 'movie', 'public', '[{"id":"tt99"}]', 5, 1, 1)
+    `).bind("anon-gems", "Anon Gems").run();
 
-    for (let i = 0; i < 20 && !hasPublicIndex(kv); i++) {
-      kv._store.delete("lock:publiclistindex");
-      await call(env, "/lists/public.json");
-    }
-    const ids = publicIndexEntries(kv).map((e) => e.id);
-    assert.deepEqual(ids, ["c:buildver:a-list"],
-      "a v1 state must be discarded and rescanned, not half-applied");
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 3);
+    assert.equal(dir.body.lists[0].slug, "anon-gems");
+    assert.equal(dir.body.lists[0].likes, 5);
   });
 
-  it("tells the admin panel which layout is live", async () => {
-    const { kv, env } = await seeded(2);
+  it("tells the admin panel the D1 directory status", async () => {
+    const { env } = await seeded(2);
     const cookie = await adminCookie(env);
     const r = await call(env, "/admin/api/schema-status", { cookie });
-    assert.equal(r.body.publicIndex.shards, SHARDS);
+    assert.equal(r.body.publicIndex.d1, true);
     assert.equal(r.body.publicIndex.entries, 2);
-    void kv;
+    assert.equal(r.body.publicIndex.shards, 0);
   });
 
-  it("drives the daily rebuild off the last FULL build, not the last write", async () => {
-    // Staleness used to be read from the index blob's own updatedAt, which
-    // every incremental write bumped -- so a busy deployment looked freshly
-    // built forever and never re-derived, which is exactly the deployment
-    // where stranded entries accumulate.
-    const { kv, env } = await seeded(3);
-    const meta = JSON.parse(kv._store.get("index:publiclists:meta"));
-    assert.ok(Number.isFinite(meta.builtAt));
-    const aged = Date.now() - 25 * 3600 * 1000;
-    kv._store.set("index:publiclists:meta", JSON.stringify({ ...meta, builtAt: aged }));
-    // An incremental write lands on a shard and must NOT reset the marker.
-    await call(env, "/api/lists/like", { method: "POST", ip: nextIp(), json: { username: "sharder", slug: "list-1" } });
-    assert.equal(JSON.parse(kv._store.get("index:publiclists:meta")).builtAt, aged,
-      "a like must not look like a rebuild");
+  it("falls back to KV scanning when D1 is not bound", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "kvfallback");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "kvfallback", creatorKey: u.creatorKey, name: "KV List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 1);
+    assert.equal(dir.body.lists[0].name, "KV List");
   });
 });
 
@@ -6645,7 +6423,7 @@ describe("N1/N2: a delete that did not delete must not report success", () => {
       "if it claims success the list must actually be gone");
   });
 
-  it("every account and list delete path reports a failed directory removal", async () => {
+  it("every account and list delete path reports a failed database removal", async () => {
     const cases = [
       ["lists/delete", async (env, user, key) => call(env, "/api/creator/lists/delete", {
         method: "POST", json: { creatorName: user, creatorKey: key, slug: "live-list" } })],
@@ -6653,43 +6431,36 @@ describe("N1/N2: a delete that did not delete must not report success", () => {
         method: "POST", json: { creatorName: user, creatorKey: key, confirm: "RESET" } })],
       ["delete-account", async (env, user, key) => call(env, "/api/creator/delete-account", {
         method: "POST", json: { creatorName: user, creatorKey: key, confirm: "DELETE" } })],
-      ["make private", async (env, user, key) => call(env, "/api/creator/lists/save", {
-        method: "POST", json: { creatorName: user, creatorKey: key, slug: "live-list",
-          name: "Live List", type: "movie", visibility: "private", items: [{ id: "tt1" }] } })],
     ];
     for (const [label, run] of cases) {
       const kv = makeKv();
-      const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: kv, DB: db });
       const user = "n2" + label.replace(/[^a-z]/g, "").slice(0, 12);
       const u = await seedPublicList(env, user);
-      kv._hooks.beforePut = async (k) => { if (isPublicIndexKey(k)) throw new Error("KV unavailable"); };
+      db.failWhen((sql) => /DELETE FROM creator_lists/i.test(sql));
       const r = await run(env, user, u.creatorKey);
-      kv._hooks.beforePut = null;
-      // removeListsFromPublicIndex's own comment: "a caller that ignores a
-      // false here is reporting a privacy change that did not happen". Three
-      // of its four callers did exactly that.
+      db.failWhen(null);
       assert.notEqual(r.body.ok, true,
         `${label} claimed success while the list was still in the directory`);
-      assert.ok(inDirectory(kv, user), `precondition for ${label}: the removal really did fail`);
+      const dir = await call(env, "/lists/public.json");
+      assert.ok(dir.body.lists.some((l) => (l.creator || l.username) === user),
+        `precondition for ${label}: the removal really did fail`);
     }
   });
 
-  it("a removal the index write could not apply is still not served", async () => {
+  it("a delete removes a list immediately from public discovery", async () => {
     const kv = makeKv();
-    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
     const u = await seedPublicList(env, "n2serve");
-    kv._hooks.beforePut = async (k) => { if (isPublicIndexKey(k)) throw new Error("KV unavailable"); };
-    await call(env, "/api/creator/lists/delete", { method: "POST", json: {
+    const r = await call(env, "/api/creator/lists/delete", { method: "POST", json: {
       creatorName: "n2serve", creatorKey: u.creatorKey, slug: "live-list",
     }});
-    kv._hooks.beforePut = null;
-    // The entry is still physically in the index -- the write failed -- but
-    // the removal tombstone means the read path must not serve it, instead of
-    // advertising a deleted list until the next daily rebuild.
-    assert.ok(inDirectory(kv, "n2serve"), "precondition: the stale entry is still in the stored index");
+    assert.equal(r.body.ok, true);
     const dir = await call(env, "/lists/public.json");
     assert.ok(!JSON.stringify(dir.body).includes("n2serve"),
-      "the directory must not serve an entry whose removal was recorded");
+      "the directory must not serve an entry that was deleted");
   });
 });
 
@@ -7253,7 +7024,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
       const migration = (/^(\d+[a-z]?)_/.exec(file) || [])[1];
       const sql = fs.readFileSync(path.join(dir, file), "utf8")
         .split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
-      for (const m of sql.matchAll(/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
+      for (const m of sql.matchAll(/CREATE\s+(?:VIRTUAL\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
         found.push(`${migration}:table:${m[1]}`);
       }
       for (const m of sql.matchAll(/CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
@@ -7271,7 +7042,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });

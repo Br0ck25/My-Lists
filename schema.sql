@@ -86,3 +86,26 @@ CREATE INDEX idx_creator_lists_vis_likes ON creator_lists(visibility, likes DESC
 -- full scan plus a sort -- over a table whose `kind` dimension is unbounded,
 -- because list_copy:{slug} mints one per list. See migrations/0005.
 CREATE INDEX idx_stats_day_totals ON stats(day, n DESC, kind);
+
+DROP TABLE IF EXISTS published_lists;
+CREATE TABLE published_lists (
+    slug        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    visibility  TEXT NOT NULL DEFAULT 'private',
+    items_json  TEXT NOT NULL DEFAULT '[]',
+    likes       INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_published_vis_likes ON published_lists(visibility, likes DESC, updated_at DESC);
+
+DROP TABLE IF EXISTS lists_fts;
+CREATE VIRTUAL TABLE lists_fts USING fts5(
+    list_id UNINDEXED,
+    name,
+    creator_name,
+    username,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+

@@ -2197,43 +2197,18 @@
       // to prevent. See bumpCreatorListsStamp (02_http-and-creator-utils.js).
       await bumpCreatorListsStamp(env, auth.username);
 
-      // Keep the directory index in step with this save. A list turned
-      // private is removed rather than updated, otherwise unpublishing would
-      // leave it listed publicly.
-      //
-      // The two directions get different treatment on purpose. Adding stays
-      // on ctx.waitUntil: a list that takes a moment to appear in the
-      // directory is cosmetic, and the daily rebuild repairs it. REMOVING is
-      // awaited and its result is reported, because it is the mechanism by
-      // which "make this private" stops the list being advertised -- and it
-      // used to be a fire-and-forget task whose failure was swallowed, so
-      // unpublishing answered ok:true while the list stayed in the directory
-      // AND in search until the next rebuild, up to a day later.
-      const indexEntry = isPublicListVisibility(visibility) ? {
-        isCreator: true,
-        username: auth.username,
-        creatorName: auth.displayName || auth.username,
-        slug,
-        name,
-        type: type || "mixed",
-        itemCount: Array.isArray(items) ? items.length : 0,
-        likes: likes || 0,
-        updatedAt,
-      } : null;
-      if (indexEntry) {
-        ctx.waitUntil(updatePublicListIndex(env, `c:${auth.username}:${slug}`, indexEntry));
-      } else {
-        const removed = await updatePublicListIndex(env, `c:${auth.username}:${slug}`, null);
-        if (!removed) {
-          // The record IS private now -- the save above is unconditional and
-          // already landed, so /lists/:user/:slug already 404s. What failed is
-          // the directory listing, so say so rather than claiming the list is
-          // fully unpublished.
-          return json({
-            ok: false,
-            slug,
-            error: "Saved as private, but the public directory could not be updated just yet. It may keep listing this for a few minutes -- please try again.",
-          }, 500);
+      // Keep search index (lists_fts) in step with this save.
+      if (env.DB) {
+        try {
+          const ftsListId = `c:${auth.username}:${slug}`;
+          await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(ftsListId).run();
+          if (isPublicListVisibility(visibility)) {
+            await env.DB.prepare(
+              "INSERT INTO lists_fts (list_id, name, creator_name, username) VALUES (?, ?, ?, ?)"
+            ).bind(ftsListId, name, auth.displayName || auth.username, auth.username).run();
+          }
+        } catch (dbErr) {
+          console.error("D1 write error (lists_fts save):", dbErr);
         }
       }
       // updatedAt comes back so the client can advance its own baseline
@@ -3526,11 +3501,63 @@
       const isMyListsSearch = isMyListsSentinel || !userTerm;
 
       try {
-        // Same index as /lists/public.json: searching used to scan at most
-        // 80-250 keys, so lists outside that lexicographic window were
-        // unfindable no matter what the user typed. The index also carries
-        // the display fields, which removes the per-list getCreator lookup
-        // that made this route's subrequest count scale with result size.
+        if (env.DB) {
+          const targetFilterIdx = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
+          const tokensIdx = targetFilterIdx.split(/\s+/).filter(Boolean);
+
+          if (tokensIdx.length && !isMyListsSentinel) {
+            const ftsQuery = tokensIdx
+              .map((t) => `"${t.replace(/[^\p{L}\p{N}_]+/gu, "")}"*`)
+              .filter((t) => t !== '""*')
+              .join(" ");
+
+            if (ftsQuery) {
+              const ftsSql = `
+                SELECT
+                  f.list_id,
+                  COALESCE(cl.name, pl.name) AS name,
+                  COALESCE(cl.type, pl.type) AS type,
+                  CASE
+                    WHEN cl.id IS NOT NULL THEN (CASE WHEN json_valid(cl.items_json) THEN json_array_length(cl.items_json) ELSE 0 END)
+                    WHEN pl.slug IS NOT NULL THEN (CASE WHEN json_valid(pl.items_json) THEN json_array_length(pl.items_json) ELSE 0 END)
+                    ELSE 0
+                  END AS items,
+                  COALESCE(cl.likes, pl.likes, 0) AS likes,
+                  COALESCE(f.creator_name, 'Anonymous') AS creatorName,
+                  CASE WHEN cl.id IS NOT NULL THEN cl.username ELSE 'user' END AS username,
+                  CASE WHEN cl.id IS NOT NULL THEN substr(cl.id, length(cl.username) + 2) ELSE pl.slug END AS slug,
+                  CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS isCreator,
+                  f.rank
+                FROM lists_fts f
+                LEFT JOIN creator_lists cl ON ('c:' || cl.id) = f.list_id AND cl.visibility = 'public'
+                LEFT JOIN published_lists pl ON ('a:' || pl.slug) = f.list_id AND pl.visibility = 'public'
+                WHERE lists_fts MATCH ? AND (cl.id IS NOT NULL OR pl.slug IS NOT NULL)
+                ORDER BY likes DESC, items DESC;
+              `;
+              try {
+                const ftsRes = await env.DB.prepare(ftsSql).bind(ftsQuery).all();
+                const ftsRows = (ftsRes && ftsRes.results) ? ftsRes.results : [];
+                const matchesIdx = ftsRows
+                  .filter((e) => (e.items || 0) > 0)
+                  .map((e) => ({
+                    name: e.name,
+                    type: e.type,
+                    items: e.items || 0,
+                    likes: e.likes || 0,
+                    creatorName: e.isCreator ? (e.creatorName || e.username) : "Anonymous",
+                    username: e.isCreator ? e.username : "user",
+                    url: `${url.origin}/lists/${e.isCreator ? e.username : "user"}/${e.slug}`,
+                    source: "My Lists Addon",
+                  }));
+                return json({ ok: true, lists: isMyListsSearch ? matchesIdx : matchesIdx.slice(0, 50) },
+                  200, { "Cache-Control": "public, max-age=60" });
+              } catch (ftsErr) {
+                console.error("lists_fts search error:", ftsErr);
+              }
+            }
+          }
+        }
+
         const searchIndex = await getPublicListIndex(env, ctx);
         if (searchIndex) {
           const targetFilterIdx = (userTerm || (isMyListsSentinel ? "" : q)).replace(/@+/g, "").trim();
@@ -4314,16 +4341,42 @@
           return;
         }
 
-        // 2. Anonymous published lists live only in KV. Stamp missing /
-        // garbage visibility the same way as creator lists so the inverted
-        // public-read checks don't hide currently-served lists.
+        // 2. Anonymous published lists: backfill into published_lists table
+        // and lists_fts index.
         if (phase === 2) {
           const raw = await countedKv.get(keyName);
           if (!raw) { noteSkipped(); return; }
           try {
             const data = JSON.parse(raw);
             await stampListVisibilityIfNeeded(countedEnv, keyName, data);
-            results.published++; thisCall.published++;
+            const slug = keyName.slice("publishedlist:user:".length);
+            const name = data.name || slug;
+            const type = data.type || "mixed";
+            const vis = data.visibility || "private";
+            const items = Array.isArray(data.items) ? data.items : [];
+            const itemsJson = JSON.stringify(items);
+            if (itemsJson.length > D1_ROW_SIZE_WARN_BYTES) {
+              noteSkipped();
+              return;
+            }
+            const likes = Math.max(0, Number(data.likes) || 0);
+            const createdAt = data.createdAt || data.publishedAt || 0;
+            const updatedAt = data.updatedAt || data.publishedAt || data.createdAt || 0;
+
+            const plRes = await d1Run(env.DB.prepare(
+              "INSERT INTO published_lists (slug, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, likes=excluded.likes, updated_at=excluded.updated_at"
+            ).bind(slug, name, type, vis, itemsJson, likes, createdAt, updatedAt));
+
+            if (isPublicListVisibility(vis)) {
+              await d1Run(env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`));
+              await d1Run(env.DB.prepare(
+                "INSERT INTO lists_fts (list_id, name, creator_name, username) VALUES (?, ?, ?, ?)"
+              ).bind(`a:${slug}`, name, "Anonymous", "user"));
+            } else {
+              await d1Run(env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`));
+            }
+
+            if (wrote(plRes)) { results.published++; thisCall.published++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Published ${keyName}: ` + e.message);
           }
@@ -4431,40 +4484,57 @@
       return json({ ok: true, done, results, thisCall, scanned: state.scanned });
     }
 
-    // /admin/api/rebuild-public-index  (POST) -> { ok, done, count, scanned, ms }
-    // Drives a rebuild of index:publiclists (see getPublicListIndex/
-    // rebuildPublicListIndex, 02_http-and-creator-utils.js) on demand
-    // instead of waiting for it to happen lazily. Without this, a fresh
-    // deployment -- or the index key being lost some other way -- serves
-    // every visitor of /lists/public.json and list search a truncated,
-    // lexicographically-biased result (capped at 150/250/80 keys) until
-    // the build finishes. scheduled() below drives the same build
-    // automatically whenever the index is found missing (self-healing
-    // without any admin action), so this endpoint is for an immediate,
-    // verifiable seed right after a fresh deploy rather than the only way
-    // it happens.
-    //
-    // ONE CHUNK PER CALL, not a full rebuild: the scan is bounded by
-    // Cloudflare's 1,000-storage-operations per-invocation limit and a
-    // large deployment needs
-    // several passes. Keep calling until `done` is true -- exactly like
-    // /admin/api/migrate-day-counts, and runRebuildPublicIndex (03_admin.js)
-    // does that loop for you. A chunk here gets a bigger op budget than the
-    // cron's, since this request has the invocation to itself. Safe to run
-    // any time, repeatedly: progress is idempotent and the live index is
-    // only replaced once the final chunk lands.
-    if (path === "/admin/api/rebuild-public-index" && request.method === "POST") {
+    // /admin/api/rebuild-search-index (and alias /admin/api/rebuild-public-index) (POST) -> { ok, done, count, scanned, ms }
+    // Rebuilds lists_fts from creator_lists and published_lists in D1.
+    // Also serves as the post-export recreation procedure.
+    if ((path === "/admin/api/rebuild-search-index" || path === "/admin/api/rebuild-public-index") && request.method === "POST") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
       const started = Date.now();
+      if (!env || !env.DB) {
+        return json({ ok: true, done: true, count: 0, scanned: 0, ms: Date.now() - started });
+      }
       try {
-        const res = await rebuildPublicListIndex(env, { opBudget: PUBLIC_INDEX_BUILD_OPS_ADMIN });
+        await env.DB.prepare(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS lists_fts USING fts5(
+            list_id UNINDEXED,
+            name,
+            creator_name,
+            username,
+            tokenize = 'unicode61 remove_diacritics 2'
+          )
+        `).run();
+        await env.DB.prepare("DELETE FROM lists_fts").run();
+        await env.DB.prepare(`
+          INSERT INTO lists_fts (list_id, name, creator_name, username)
+          SELECT
+            'c:' || cl.id,
+            cl.name,
+            COALESCE(c.display_name, cl.username),
+            cl.username
+          FROM creator_lists cl
+          LEFT JOIN creators c ON c.username = cl.username
+          WHERE cl.visibility = 'public'
+        `).run();
+        await env.DB.prepare(`
+          INSERT INTO lists_fts (list_id, name, creator_name, username)
+          SELECT
+            'a:' || pl.slug,
+            pl.name,
+            'Anonymous',
+            'user'
+          FROM published_lists pl
+          WHERE pl.visibility = 'public'
+        `).run();
+
+        const countRes = await env.DB.prepare("SELECT COUNT(*) AS n FROM lists_fts").all();
+        const count = (countRes && countRes.results && countRes.results[0]) ? Number(countRes.results[0].n) || 0 : 0;
+
         return json({
           ok: true,
-          done: !!res.done,
-          count: res.entriesSoFar,
-          scanned: res.scanned,
+          done: true,
+          count,
+          scanned: count,
           ms: Date.now() - started,
         });
       } catch (e) {
@@ -4676,22 +4746,43 @@
       // count goes here.
       let publicIndex = null;
       try {
-        const idx = await readPublicListIndex(env);
-        if (idx) {
+        if (env && env.DB) {
+          let count = 0;
+          try {
+            const row = await env.DB.prepare(`
+              SELECT (
+                (SELECT count(*) FROM creator_lists WHERE visibility = 'public') +
+                (SELECT count(*) FROM published_lists WHERE visibility = 'public')
+              ) AS cnt
+            `).first();
+            count = row ? Number(row.cnt || 0) : 0;
+          } catch {
+            // In case tables do not exist yet
+          }
           publicIndex = {
-            entries: idx.entries.length,
+            entries: count,
             max: PUBLIC_INDEX_MAX,
-            truncated: idx.entries.length >= PUBLIC_INDEX_MAX,
-            updatedAt: idx.updatedAt || null,
-            // Which layout answered. A deployment upgrading in place serves
-            // from the pre-shard key until its next full publish converts it,
-            // and "is that conversion done" is exactly the kind of question
-            // this panel exists to answer.
-            shards: idx.sharded ? PUBLIC_INDEX_SHARDS : 1,
+            truncated: count >= PUBLIC_INDEX_MAX,
+            updatedAt: Date.now(),
+            shards: 0,
+            d1: true,
           };
+        } else if (env && env.CONFIGS) {
+          const raw = await env.CONFIGS.get("index:publiclists");
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+            publicIndex = {
+              entries: entries.length,
+              max: PUBLIC_INDEX_MAX,
+              truncated: entries.length >= PUBLIC_INDEX_MAX,
+              updatedAt: parsed.updatedAt || null,
+              shards: 1,
+            };
+          }
         }
       } catch (e) {
-        console.error("schema-status: could not read the public list index", e);
+        console.error("schema-status: could not read public index status", e);
       }
       return json({
         ok: true,
@@ -5664,29 +5755,6 @@ export default {
             );
           }
         })()),
-        // Cheap when index:publiclists already exists (one KV get, no-op).
-        // When it doesn't -- a fresh deployment, or the index key lost
-        // some other way -- this is what keeps a self-hoster who never
-        // visits /admin from serving every visitor a truncated,
-        // lexicographically-biased directory/search result indefinitely,
-        // instead of relying on whichever live request happens to hit the
-        // cold index first.
-        //
-        // One bounded chunk per tick, not a whole rebuild (see
-        // rebuildPublicListIndex): a small deployment is done on the first
-        // tick, a large one converges over the following few hours. That is
-        // the point -- the previous single-pass version simply threw and
-        // rebuilt nothing at all once there were more than ~500 lists.
-        // /admin/api/rebuild-public-index drives the same chunks back to
-        // back for an immediate seed right after a fresh deploy.
-        //
-        // This also re-derives the index once a day even when one already
-        // exists. The index is maintained incrementally by a read-modify-write
-        // on a single key, so rapid updates lose each other -- and nothing
-        // used to repair that, because a rebuild only ever ran when the index
-        // was MISSING, never when it was merely wrong. See
-        // refreshPublicListIndexIfStale.
-        guard("refreshPublicListIndexIfStale", refreshPublicListIndexIfStale(env, ctx)),
       ])
     );
     } catch (err) {

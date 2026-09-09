@@ -5916,44 +5916,17 @@ Sitemap: ${url.origin}/sitemap.xml`;
         }
         if (updated) {
           await env.CONFIGS.put(likeKey, JSON.stringify(updated));
-          // The directory ranks by likes, so the index has to see this or the
-          // ordering freezes at whatever it was when the index was built.
-          // Only on an actual change -- a repeated like writes nothing.
-          // Anonymous lists are indexed as `a:<slug>`, creator-owned as
-          // `c:<user>:<slug>` -- using the wrong prefix here would append a
-          // duplicate entry instead of updating the existing one.
-          // Fed from `updated`, not the pre-vote snapshot, so the indexed
-          // name/type/itemCount match what is actually stored.
-          const likeIsCreator = likeKey === likeCreatorKey;
-          if (isPublicListVisibility(updated.visibility)) {
-            // Behind a short global cooldown. This is a read-modify-write of
-            // the single key holding the whole directory -- 4.45 MB at the
-            // entry cap -- and likes are the frequent write, so at any real
-            // like rate it was being issued faster than KV's one-write-per-
-            // second-per-key allows. Below that rate the cooldown is always
-            // free and this behaves exactly as it did; above it the writes
-            // coalesce and the skipped votes ride along on the list's next
-            // save or the daily rebuild. See claimLikeIndexWrite.
-            ctx.waitUntil((async () => {
-              if (!(await claimLikeIndexWrite(env))) return;
-              await updatePublicListIndex(env, likeIsCreator ? `c:${likeUser}:${likeSlug}` : `a:${likeSlug}`, {
-                isCreator: likeIsCreator,
-                username: likeIsCreator ? likeUser : "user",
-                slug: likeSlug,
-                name: updated.name || "List",
-                type: updated.type || "mixed",
-                itemCount: Array.isArray(updated.items) ? updated.items.length : 0,
-                likes: count,
-                updatedAt: updated.updatedAt || updated.createdAt || null,
-              });
-            })().catch(() => {}));
-          }
         }
       }
 
       if (env.DB) {
         try {
-          await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
+          const likeIsCreator = likeKey === likeCreatorKey;
+          if (likeIsCreator) {
+            await env.DB.prepare("UPDATE creator_lists SET likes = ? WHERE id = ?").bind(count, listScopeId).run();
+          } else {
+            await env.DB.prepare("UPDATE published_lists SET likes = ? WHERE slug = ?").bind(count, likeSlug).run();
+          }
         } catch (dbErr) {
           // Non-fatal: KV above holds the authoritative count, so a like is
           // never lost by D1 being unavailable. Requires the `likes` column

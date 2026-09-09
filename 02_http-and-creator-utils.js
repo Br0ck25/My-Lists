@@ -1772,54 +1772,8 @@ async function usernameForScrobbleToken(env, token) {
   }
 }
 
-// Drops a batch of ids from the public index in ONE write.
-//
-// Deliberately not one updatePublicListIndex call per list: that is a
-// read-modify-write on a single key, so a run of them loses each other's
-// updates and strands entries in the directory pointing at records that no
-// longer exist -- a list that advertises an item count and then 404s when
-// opened. That is not hypothetical: a bulk delete left 76 such entries in a
-// live deployment, and nothing ever cleaned them up because the index only
-// used to rebuild when it was MISSING, never when it was merely wrong (see
-// refreshPublicListIndexIfStale).
-async function removeListsFromPublicIndex(env, ids) {
-  if (!env || !env.CONFIGS || !ids || !ids.length) return true;
-  // Recorded before the index is touched, so an in-flight rebuild cannot
-  // republish these when it lands -- see noteRemovedFromPublicIndex.
-  await noteRemovedFromPublicIndex(env, ids);
-  try {
-    const gone = new Set(ids);
-    // Only the shards these ids can be in. A bulk delete of one account's
-    // lists used to rewrite the entire directory; rewriting all 32 shards
-    // instead would have been strictly worse -- 32 KV writes per delete is a
-    // third of a free plan's daily budget for 31 deletes.
-    const shards = [...new Set(ids.map((id) => publicIndexShardOf(id)))];
-    const current = await Promise.all(shards.map((n) => readPublicIndexShard(env, n)));
-    if (current.every((c) => c !== null)) {
-      await Promise.all(
-        shards.map((n, i) => {
-          const kept = current[i].filter((e) => e && !gone.has(e.id));
-          if (kept.length === current[i].length) return null;
-          return writePublicIndexShard(env, n, kept);
-        }).filter(Boolean)
-      );
-      return true;
-    }
-
-    // Not sharded yet -- the pre-shard key, converted by one full publish.
-    const idx = await readPublicListIndex(env);
-    // No index at all: nothing is being advertised, so there is nothing to
-    // remove and this succeeded.
-    if (!idx) return true;
-    await writePublicListIndex(env, idx.entries.filter((e) => e && !gone.has(e.id)));
-    return true;
-  } catch (e) {
-    console.error("public list index cleanup failed", e);
-    return false;
-  }
-}
-
 // --- "this account deleted that list" ----------------------------------------
+
 //
 // A list deleted on one device came back a few minutes later on another, and
 // this key is what stops it.
@@ -1964,8 +1918,12 @@ async function deleteCreatorLists(env, username, slugs) {
     if (env.DB) {
       try {
         await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+        try {
+          await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
+        } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deleteCreatorLists):", dbErr);
+        out.ok = false;
       }
     }
     // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
@@ -1987,17 +1945,6 @@ async function deleteCreatorLists(env, username, slugs) {
     (existed ? out.deleted : out.missing).push(slug);
   }
 
-  // Every slug asked for comes out of the index, including ones whose record
-  // was already gone -- those phantom entries are the whole reason an admin
-  // reaches for this.
-  //
-  // The result is checked, not discarded: removeListsFromPublicIndex's own
-  // comment says a caller that ignores a false here "is reporting a privacy
-  // change that did not happen", and this was one of the three call sites
-  // doing exactly that.
-  if (!(await removeListsFromPublicIndex(env, slugs.map((slug) => `c:${username}:${slug}`)))) {
-    out.ok = false;
-  }
 
   try {
     const orderRaw = await env.CONFIGS.get(`creatorlistorder:${username}`);
@@ -2062,6 +2009,16 @@ async function deletePublishedLists(env, slugs) {
     } catch {
       existed = false;
     }
+    if (env.DB) {
+      try {
+        await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
+        try {
+          await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`).run();
+        } catch {}
+      } catch (dbErr) {
+        console.error("D1 write error (deletePublishedLists):", dbErr);
+      }
+    }
     try {
       await env.CONFIGS.delete(key);
     } catch (e) {
@@ -2076,11 +2033,6 @@ async function deletePublishedLists(env, slugs) {
       // A stranded ledger is untidy, not harmful on its own.
     }
     (existed ? out.deleted : out.missing).push(slug);
-  }
-
-  // Anonymous lists are indexed as `a:{slug}`, not `c:{user}:{slug}`.
-  if (!(await removeListsFromPublicIndex(env, slugs.map((slug) => `a:${slug}`)))) {
-    out.ok = false;
   }
 
   return out;
@@ -2265,843 +2217,130 @@ function normalizeExternalListUrl(rawUrl) {
 }
 
 // ---------------------------------------------------------------------------
-// Public list directory index
+// Public list directory index (D1-backed)
 // ---------------------------------------------------------------------------
-// The directory and search used to do list({prefix:"creatorlist:", limit:150})
-// with no cursor and then slice(0,100). KV returns keys in lexicographic
-// order, so past ~150 lists only usernames sorting earliest were ever visible
-// -- everyone else silently vanished from the directory with no error.
+// Replaces the legacy 32-shard KV index with a direct UNION ALL query over
+// creator_lists and published_lists in D1, filtered by visibility = 'public'
+// and ordered by likes DESC, updated_at DESC.
 //
-// Paginating that properly is worse, not better: it means reading EVERY list
-// on every directory load (10k lists = 10k KV reads per page view, well past
-// the 1,000-storage-operations/invocation cap -- the KV/D1 one, 1,000 on both
-// plans, not the outbound-fetch cap). So the directory reads a single
-// maintained index blob instead, updated on publish/unpublish. Directory cost
-// is now ONE KV read regardless of how many lists exist.
-//
-// The index stores the display fields the directory needs (name, creator,
-// counts, likes) so no per-list get is required. It is a derived cache: if it
-// is missing or stale, rebuildPublicListIndex() regenerates it from the
-// authoritative creatorlist:/publishedlist: keys. Never treat it as the
-// source of truth.
-const PUBLIC_INDEX_KEY = "index:publiclists";
-// 25 MiB is the KV value ceiling. At ~200 bytes/entry, 20k entries is ~4 MB --
-// comfortably inside it while still bounding worst-case memory and response
-// size. Beyond this the tail is dropped (least-liked first).
-const PUBLIC_INDEX_MAX = 20000;
-
-// --- ...and why that blob is 32 keys rather than one -------------------------
-//
-// Every public save, every anonymous publish and every like used to do a
-// read-modify-write of ONE key holding the whole directory. Measured at the
-// 20,000-entry cap that is 4.45 MB parsed, sorted and re-serialised for a
-// one-number change -- and Cloudflare allows one write per second to a given
-// key, on both plans. Past roughly one like a second across the deployment the
-// index was being written faster than KV accepts it, and the failure there is
-// not "one entry is late", it is "the directory is hours stale for everyone".
-//
-// The cooldown below took the like path off that key. This takes the key
-// itself off the critical path: entries live in 32 shards, so a write touches
-// ~1/32 of the blob and the deployment has 32 keys' worth of write throughput
-// instead of one.
-//
-// Sharded on a hash of the entry ID rather than on the first character of the
-// slug, which is what the audit suggested. Same 32 buckets, but slug initials
-// are heavily skewed -- "the", "top", "best" -- and a bucket holding a fifth of
-// the directory would not have fixed either half of the problem. The hash is
-// over the id because that is the only thing updatePublicListIndex is given,
-// and a write has to know its shard without reading anything first.
-//
-// THE INVARIANT that makes this safe to do incrementally: a full publish
-// always writes ALL 32 shard keys, empty ones included, and only then deletes
-// the pre-shard key. So "shard N is absent" means "this deployment is not
-// sharded yet", never "that bucket happens to be empty" -- which is what lets
-// the single-shard write path below decide in one KV read whether it may take
-// the cheap route. A half-sharded index would serve a fraction of the
-// directory, and that is worse than the unsharded one.
-const PUBLIC_INDEX_SHARDS = 32;
-const PUBLIC_INDEX_SHARD_PREFIX = "index:publiclists:s";
-// The cap one shard may reach on the INCREMENTAL path, where no global view is
-// loaded. Deliberately double the even split (20,000 / 32 = 625): the hash
-// spreads to about 625 +/- 25 per shard at the global cap, so a cap of exactly
-// 625 would start dropping entries from busy shards while the directory as a
-// whole was still well under its limit. The global policy -- keep the
-// most-liked PUBLIC_INDEX_MAX, drop the tail -- is applied by every full
-// publish; this is only a bound on one blob between rebuilds.
-const PUBLIC_INDEX_SHARD_MAX = Math.ceil(PUBLIC_INDEX_MAX / PUBLIC_INDEX_SHARDS) * 2;
-// Merging 32 shards is 32 KV reads where the single key cost 1. The two routes
-// that pay it -- /lists/public.json and list search -- both answer with
-// max-age=120, so the edge absorbs the repeat traffic and the amplification
-// lands on cache misses only.
-//
-// The one caller that would have paid it on a timer is the cron's staleness
-// check, which runs every 6 minutes and needs two facts, not the directory.
-// It reads this instead: one small key holding when the index was last built
-// in FULL.
-//
-// That is also more correct than what it replaces. Staleness used to be read
-// from the index blob's own updatedAt, which every incremental write bumped --
-// so a deployment busy enough to matter looked freshly built forever and the
-// daily re-derive, the thing that clears stranded entries, never ran on
-// exactly the deployments that needed it.
-const PUBLIC_INDEX_META_KEY = "index:publiclists:meta";
-
-function publicIndexShardKey(n) {
-  return PUBLIC_INDEX_SHARD_PREFIX + n;
-}
-
-// FNV-1a. Not cryptographic -- it needs to be fast, stable across isolates and
-// deployments, and evenly spread, and it is all three.
-function publicIndexShardOf(id) {
-  const str = String(id || "");
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h % PUBLIC_INDEX_SHARDS;
-}
-
-
-// --- Rebuild chunking --------------------------------------------------------
-//
-// A full rebuild costs roughly one KV read per list, plus (the first time a
-// given record is seen) one for its creator's display name and one to stamp a
-// missing visibility. Cloudflare caps a Worker invocation at 1,000
-// subrequests, so the old single-pass scan stopped working entirely somewhere
-// around 500 public lists: it threw partway through, and because every call
-// site runs it inside ctx.waitUntil(...).catch(...) the throw was swallowed,
-// the index was never written, and the directory fell back to the legacy
-// bounded scan -- the alphabetically-first 100 creators, forever, with no
-// error surfaced anywhere.
-//
-// It was also reachable on purpose. rebuildPublicListIndex reads each record
-// BEFORE testing visibility, so a list that never appears in the directory
-// still costs a read, and /api/publish-list mints permanent, private-by-
-// default records for anyone at 10/minute. ~900 of those were enough to push
-// a deployment holding only 20 real public lists past the limit for good.
-//
-// So a rebuild now runs in resumable chunks, the same shape
-// /admin/api/migrate-day-counts already uses: one page of keys per
-// invocation, progress parked in index:publiclists:build, and the finished
-// index published only once the final page lands. The cron ticks every 6
-// minutes, so a cold index converges on its own at any scale instead of
-// never completing at all.
-const PUBLIC_INDEX_BUILD_KEY = "index:publiclists:build";
-const PUBLIC_INDEX_BUILD_PREFIXES = ["creatorlist:", "publishedlist:user:"];
-// KV operations one chunk may spend. Deliberately a minority of the 1,000
-// available, because a chunk usually runs inside the cron invocation and
-// shares that budget with prewarmSharedCatalogs (~142 subrequests) and
-// checkForNewEpisodes (up to ~400: 25 accounts plus a 150-show check
-// budget). This has to be low enough that a chunk can never be the thing
-// that trips the limit -- a chunk that throws saves no progress, so an
-// over-generous budget would reproduce the exact "never completes" failure
-// this chunking exists to fix.
-const PUBLIC_INDEX_BUILD_OPS_PER_RUN = 300;
-// ...and the ceiling for a chunk kicked off by /admin/api/rebuild-public-index,
-// which has the invocation to itself.
-const PUBLIC_INDEX_BUILD_OPS_ADMIN = 800;
-const PUBLIC_INDEX_BUILD_PAGE = 400;
-// Records are fetched in parallel within a chunk. The old code awaited each
-// get in sequence, so even a rebuild that fit inside the limit was one
-// serialised round-trip per list.
-const PUBLIC_INDEX_BUILD_CONCURRENCY = 12;
-
-// Merges the 32 shards into the single view every caller has always been
-// handed. `sharded` says which layout answered, which is the one thing the
-// write paths need to know.
-//
-// `updatedAt` is the OLDEST shard's, not the newest: staleness drives the daily
-// rebuild, and reporting the freshest shard would let one busy bucket hide a
-// directory that had otherwise stopped being maintained.
-async function readPublicListIndex(env) {
-  if (!env || !env.CONFIGS) return null;
-  let result = null;
-  try {
-    const raws = await Promise.all(
-      Array.from({ length: PUBLIC_INDEX_SHARDS }, (_, n) => env.CONFIGS.get(publicIndexShardKey(n)))
-    );
-    const entries = [];
-    let oldest = 0;
-    let sharded = false;
-    for (const raw of raws) {
-      if (!raw) continue;
-      let parsed = null;
-      try { parsed = JSON.parse(raw); } catch { parsed = null; }
-      if (!parsed || !Array.isArray(parsed.entries)) continue;
-      sharded = true;
-      for (const e of parsed.entries) if (e) entries.push(e);
-      const at = Number(parsed.updatedAt) || 0;
-      if (at && (!oldest || at < oldest)) oldest = at;
-    }
-    if (sharded) {
-      result = { updatedAt: oldest || Date.now(), entries: sortPublicIndexEntries(entries), sharded: true };
-    } else {
-      // The pre-shard key. A deployment upgrading in place keeps serving from
-      // it, unchanged, until the first full publish converts it -- so the
-      // directory never goes through a state where only part of it exists.
-      const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.entries)) result = { ...parsed, sharded: false };
-      }
-    }
-  } catch {
-    result = null;
-  }
-  return result;
-}
-
-// What the cron's staleness check reads instead of merging 32 shards: whether
-// an index exists at all, and when it was last built in full. Written by
-// writePublicListIndex, which is the only thing that builds one.
-//
-// A deployment that has not published since the upgrade has no meta key, so
-// this falls back to the pre-shard blob's own timestamp -- one KV read either
-// way, and the first rebuild writes the marker.
-async function readPublicListIndexMeta(env) {
-  if (!env || !env.CONFIGS) return null;
-  try {
-    const raw = await env.CONFIGS.get(PUBLIC_INDEX_META_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && Number.isFinite(parsed.builtAt)) return parsed;
-    }
-  } catch {
-    // Fall through to the legacy key.
-  }
-  try {
-    const raw = await env.CONFIGS.get(PUBLIC_INDEX_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.entries)) return null;
-    return { builtAt: Number(parsed.updatedAt) || 0, shards: 1, entries: parsed.entries.length };
-  } catch {
-    return null;
-  }
-}
-
-// Sorted by likes so that if anything downstream truncates, it drops the
-// least popular rather than an arbitrary lexicographic slice.
-function sortPublicIndexEntries(entries) {
-  return entries.sort(
-    (a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0)
-  );
-}
-
-// Like/unlike is the frequent directory write, and it is the one that makes
-// index:publiclists a hot key.
-//
-// Every vote that changed a count did a read-modify-write of the single key
-// holding the WHOLE directory: 4.45 MB parsed, sorted and re-serialised at the
-// 20,000-entry cap, measured, for a one-number change. Cloudflare allows one
-// write per second to a given key on both plans, so past roughly one like per
-// second across the entire deployment the index was being written faster than
-// KV accepts it -- and the failure mode there is not "one entry is late", it
-// is "the directory is hours stale for everyone".
-//
-// So a like-driven index update now claims a short global cooldown first. Below
-// one like every LIKE_INDEX_COOLDOWN_SEC the cooldown is always free and every
-// vote updates the directory exactly as before -- which is every deployment
-// this code has ever run on. Above it, the writes coalesce and the skipped
-// votes are picked up by the list's next save or the daily rebuild, the same
-// backstops that already cover a lost concurrent publish.
-//
-// The other half of the same finding -- sharding the index across 32 keys --
-// landed in 1.5.3; see PUBLIC_INDEX_SHARDS above. The cooldown is still worth
-// keeping on top of it: a shard is 1/32 the bytes but it is still one key, and
-// likes are still the write that arrives fastest.
-const LIKE_INDEX_COOLDOWN_KEY = "index:publiclists:likecooldown";
-const LIKE_INDEX_COOLDOWN_SEC = 10;
-
-async function claimLikeIndexWrite(env) {
-  if (!env || !env.CONFIGS) return false;
-  try {
-    if (await env.CONFIGS.get(LIKE_INDEX_COOLDOWN_KEY)) return false;
-    await env.CONFIGS.put(LIKE_INDEX_COOLDOWN_KEY, "1", { expirationTtl: LIKE_INDEX_COOLDOWN_SEC });
-    return true;
-  } catch {
-    // The cooldown is an optimisation, not a correctness control. If KV is
-    // unhappy, fall back to the old behaviour rather than dropping the update.
-    return true;
-  }
-}
-
-// A FULL publish: every shard is rewritten, empty ones included, and only then
-// is the pre-shard key removed. That order is what upholds the invariant the
-// single-shard path relies on -- a reader can never find the old key gone and
-// the shards not yet there, and an absent shard always means "not sharded".
-//
-// Used by the rebuild and by the one-off migration off the old key. The
-// frequent writes do not come through here; they take the single-shard path in
-// updatePublicListIndex.
-async function writePublicListIndex(env, entries) {
-  const trimmed = sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_MAX);
-  const buckets = Array.from({ length: PUBLIC_INDEX_SHARDS }, () => []);
-  for (const e of trimmed) {
-    if (!e) continue;
-    buckets[publicIndexShardOf(e.id)].push(e);
-  }
-  const now = Date.now();
-  await Promise.all(
-    buckets.map((bucket, n) =>
-      env.CONFIGS.put(publicIndexShardKey(n), JSON.stringify({ updatedAt: now, entries: bucket }))
-    )
-  );
-  // Written after the shards, so the marker can never claim a build that has
-  // not landed. It is what the cron's staleness check reads.
-  await env.CONFIGS.put(
-    PUBLIC_INDEX_META_KEY,
-    JSON.stringify({ builtAt: now, shards: PUBLIC_INDEX_SHARDS, entries: trimmed.length })
-  );
-  try {
-    await env.CONFIGS.delete(PUBLIC_INDEX_KEY);
-  } catch {
-    // Leaving it behind is harmless: readPublicListIndex prefers the shards
-    // and only falls back to it when no shard exists at all.
-  }
-  return trimmed;
-}
-
-// Reads one shard. Returns null when the key is absent, which -- see the
-// invariant above -- means this deployment has not been sharded yet.
-async function readPublicIndexShard(env, n) {
-  const raw = await env.CONFIGS.get(publicIndexShardKey(n));
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.entries)) return null;
-    return parsed.entries.filter(Boolean);
-  } catch {
-    return null;
-  }
-}
-
-async function writePublicIndexShard(env, n, entries) {
-  const bounded = entries.length > PUBLIC_INDEX_SHARD_MAX
-    ? sortPublicIndexEntries(entries).slice(0, PUBLIC_INDEX_SHARD_MAX)
-    : entries;
-  await env.CONFIGS.put(
-    publicIndexShardKey(n),
-    JSON.stringify({ updatedAt: Date.now(), entries: bounded })
-  );
-}
-
-// Incremental update for one list. `entry` null => remove (unpublished,
-// deleted, or made private).
-//
-// This is a read-modify-write on a single key, so concurrent publishes can
-// lose an update. That is acceptable here in a way it was NOT for like counts:
-// the index is a rebuildable cache, a lost entry costs one list's directory
-// visibility until its next save or the next rebuild, and publishes are rare
-// and self-correcting. Like counts had no such backstop.
-// Returns true when the index now reflects `entry` (including "there is no
-// index, so there is nothing advertising this"), false when it does not.
-//
-// Callers may treat an ADDITION failing as non-fatal -- a list that is slow
-// to appear in the directory is a cosmetic problem and the daily rebuild
-// repairs it. A REMOVAL is different: it is the mechanism by which making a
-// list private stops it being advertised, so a caller that ignores a false
-// here is reporting a privacy change that did not happen.
-async function updatePublicListIndex(env, id, entry) {
-  if (!env || !env.CONFIGS) return false;
-  if (!entry) await noteRemovedFromPublicIndex(env, [id]);
-  // An ADD for an account that is being deleted must not land.
-  //
-  // This runs at the very end of a save, and a save that authenticated a
-  // millisecond before its owner deleted the account keeps going: the purge's
-  // second pass removes the record and drops the id from the directory, and
-  // then THIS call puts the entry straight back. The record is gone, so the
-  // row 404s the moment anyone opens it -- the same stranded-entry problem
-  // removeListsFromPublicIndex was written to prevent, one pass later.
-  //
-  // The tombstone is the right thing to ask, and it is the FIRST thing
-  // purgeCreatorData writes, before it deletes anything -- so any index update
-  // that runs after the deletion began sees it. One KV read, on the save path
-  // only (never on a page view), and only for creator-owned ids: `a:` entries
-  // are anonymous published lists with no account behind them.
-  if (entry && typeof id === "string" && id.startsWith("c:")) {
-    const owner = id.slice(2).split(":")[0];
-    if (owner && (await isCreatorTombstoned(env, owner))) return true;
-  }
-  try {
-    // The whole point of the sharding: one KV read and one KV write, against
-    // ~1/32 of the directory, instead of a read-modify-write of all 4.45 MB of
-    // it. The merged 32-shard view is deliberately NOT loaded here -- doing so
-    // would put the cost straight back.
-    const shard = publicIndexShardOf(id);
-    const current = await readPublicIndexShard(env, shard);
-    if (current) {
-      const prev = current.find((e) => e && e.id === id);
-      const next = current.filter((e) => e && e.id !== id);
-      // Merge onto the previous entry rather than replacing it: callers that
-      // only know part of the record (the like route has no displayName, for
-      // instance) must not blank out fields they never loaded.
-      if (entry) next.push({ ...(prev || {}), ...entry, id });
-      await writePublicIndexShard(env, shard, next);
-      return true;
-    }
-
-    // No shard, so this deployment is still on the pre-shard key (or has no
-    // index at all -- see the invariant above writePublicListIndex).
-    const idx = await readPublicListIndex(env);
-    // No index yet: don't build one from a single entry, or the directory
-    // would show exactly one list. Leave it absent so the read path falls
-    // back to a scan and rebuilds the whole thing. Nothing is advertised in
-    // that state, so a removal has already got what it wanted.
-    if (!idx) return true;
-    const prev = idx.entries.find((e) => e && e.id === id);
-    const entries = idx.entries.filter((e) => e && e.id !== id);
-    if (entry) entries.push({ ...(prev || {}), ...entry, id });
-    // One full publish converts the old key into the 32 shards; from here on
-    // every update takes the cheap path above.
-    await writePublicListIndex(env, entries);
-    return true;
-  } catch (err) {
-    console.error("public list index update failed:", err);
-    return false;
-  }
-}
-
-// --- Removals recorded against an in-flight rebuild --------------------------
-//
-// A rebuild scans the whole keyspace over many chunks, holds the result in
-// index:publiclists:build, and replaces the live index only when the final
-// chunk lands. That makes its snapshot older than the index it overwrites --
-// and a list unpublished after it was scanned was silently PUT BACK into the
-// directory and into search when the rebuild finished, for up to a day, with
-// the owner having been told (correctly, at the time) that it was removed.
-//
-// The rebuild's own comment documents the opposite case, a list published
-// behind the cursor being missed, and calls that an acceptable tradeoff. It is
-// not the same trade: missing a publish costs visibility, clobbering an
-// unpublish costs privacy.
-//
-// So every removal drops its id here, and the rebuild re-verifies those ids
-// against the authoritative record before it publishes. Re-verifying rather
-// than just subtracting is what keeps PUBLIC -> PRIVATE -> PUBLIC working: a
-// list that is public again passes the check and stays. The set is small (one
-// build window's removals), bounded, and expires on its own.
-const PUBLIC_INDEX_REMOVED_KEY = "index:publiclists:removed";
-const PUBLIC_INDEX_REMOVED_MAX = 500;
-// Comfortably longer than any rebuild -- the cron drives one chunk per tick,
-// so even a 20,000-list deployment converges well inside a day.
-const PUBLIC_INDEX_REMOVED_TTL_SEC = 24 * 60 * 60;
-
-async function noteRemovedFromPublicIndex(env, ids) {
-  if (!env || !env.CONFIGS || !ids || !ids.length) return;
-  try {
-    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
-    let existing = [];
-    try {
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && Array.isArray(parsed.ids)) existing = parsed.ids.filter((x) => typeof x === "string");
-    } catch {
-      existing = [];
-    }
-    const merged = [...existing.filter((x) => !ids.includes(x)), ...ids];
-    const trimmed = merged.slice(-PUBLIC_INDEX_REMOVED_MAX);
-    await env.CONFIGS.put(
-      PUBLIC_INDEX_REMOVED_KEY,
-      JSON.stringify({ ids: trimmed }),
-      { expirationTtl: PUBLIC_INDEX_REMOVED_TTL_SEC }
-    );
-  } catch (e) {
-    // Best-effort. Worst case is the behaviour this exists to fix, which is
-    // bounded by the next rebuild rather than permanent.
-    console.error("could not record a public-index removal:", e);
-  }
-}
-
-// The authoritative key behind an index id. `c:{user}:{slug}` is a creator
-// list; anything else is an anonymous published one, indexed as `a:{slug}`.
-function publicIndexIdToRecordKey(id) {
-  const s = String(id || "");
-  if (s.startsWith("c:")) return "creatorlist:" + s.slice(2);
-  if (s.startsWith("a:")) return "publishedlist:user:" + s.slice(2);
-  return null;
-}
-
-// Drops entries whose record is no longer public, for the handful of ids
-// removed while this build was running. One KV read per such id, and only
-// for ids the build actually collected.
-async function dropStaleRemovalsFromEntries(env, entries) {
-  if (!entries || !entries.length) return entries;
-  let ids = [];
-  try {
-    const raw = await env.CONFIGS.get(PUBLIC_INDEX_REMOVED_KEY);
-    const parsed = raw ? JSON.parse(raw) : null;
-    if (parsed && Array.isArray(parsed.ids)) ids = parsed.ids;
-  } catch {
-    return entries;
-  }
-  if (!ids.length) return entries;
-  const suspect = new Set(ids);
-  const stillPublic = new Set();
-  const checked = new Set();
-  for (const entry of entries) {
-    if (!entry || !suspect.has(entry.id) || checked.has(entry.id)) continue;
-    checked.add(entry.id);
-    const key = publicIndexIdToRecordKey(entry.id);
-    if (!key) continue;
-    try {
-      const raw = await env.CONFIGS.get(key);
-      if (raw && isPublicListVisibility(JSON.parse(raw).visibility)) stillPublic.add(entry.id);
-    } catch {
-      // Unreadable right now -- leave it out rather than risk republishing
-      // something whose owner asked for it to be taken down.
-    }
-  }
-  return entries.filter((e) => e && (!suspect.has(e.id) || stillPublic.has(e.id)));
-}
-
-// Persisted progress for an in-flight rebuild. Anything unparseable, or from
-// an older shape, simply restarts the build rather than half-applying.
-// v2 is the shard-era marker the audit asked for. A build state written by a
-// pre-shard deployment parses fine and its entries are still valid, but it was
-// produced by code that would publish them to one key -- so it is discarded and
-// the scan restarts rather than half-applying across the two layouts.
-function emptyPublicIndexBuildState() {
-  return { v: 2, phase: 0, cursor: "", pending: [], entries: [], names: {} };
-}
-
-async function readPublicIndexBuildState(env) {
-  try {
-    const raw = await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY);
-    if (!raw) return emptyPublicIndexBuildState();
-    const s = JSON.parse(raw);
-    if (!s || s.v !== 2 || !Array.isArray(s.entries) || !Array.isArray(s.pending)) {
-      return emptyPublicIndexBuildState();
-    }
-    return {
-      v: 2,
-      phase: Number(s.phase) || 0,
-      cursor: typeof s.cursor === "string" ? s.cursor : "",
-      pending: s.pending.filter((k) => typeof k === "string"),
-      entries: s.entries.filter(Boolean),
-      names: s.names && typeof s.names === "object" ? s.names : {},
-    };
-  } catch {
-    return emptyPublicIndexBuildState();
-  }
-}
-
-// Runs ONE chunk of a rebuild and returns:
-//   { done: true,  entries }                     -- index written and published
-//   { done: false, entries: null, ... }          -- progress saved, call again
-//
-// Callers that need the finished article must keep calling (the cron does).
-// Until it reports done the live index key is left exactly as it was, so a
-// partial scan is never published as if it were complete.
-//
-// One caveat worth knowing: a list published *behind* the cursor while a
-// multi-chunk rebuild is in flight is not picked up by that rebuild. It lands
-// in the index the moment the build finishes and updatePublicListIndex takes
-// over again, or on the next rebuild. Directory visibility lagging a cold
-// start by a few minutes is the tradeoff for it converging at all.
-async function rebuildPublicListIndex(env, options = {}) {
-  const opBudget = Number(options.opBudget) || PUBLIC_INDEX_BUILD_OPS_PER_RUN;
-
-  // Every KV call this chunk makes goes through here, so the budget tracks
-  // what was actually spent rather than a worst-case guess -- which matters
-  // because the per-key cost varies (a cached display name and an
-  // already-stamped visibility cost nothing extra).
-  let ops = 0;
-  const kv = env.CONFIGS;
-  const counted = {
-    get: (...a) => { ops++; return kv.get(...a); },
-    put: (...a) => { ops++; return kv.put(...a); },
-    delete: (...a) => { ops++; return kv.delete(...a); },
-    list: (...a) => { ops++; return kv.list(...a); },
-  };
-  // stampListVisibilityIfNeeded and getCreator take an env, not a namespace.
-  const countedEnv = { ...env, CONFIGS: counted };
-
-  ops++; // readPublicIndexBuildState's own get
-  const state = await readPublicIndexBuildState(env);
-  const seen = new Set(state.entries.map((e) => e && e.id).filter(Boolean));
-
-  // Search matches against the creator's display name too, so the index has
-  // to carry it. Cached across chunks in the build state -- creators are far
-  // fewer than lists, and without this the rebuild would do a second get for
-  // every list, every time.
-  const inFlightNames = new Map();
-  async function resolveDisplayName(username) {
-    if (Object.prototype.hasOwnProperty.call(state.names, username)) return state.names[username];
-    // Two workers in the same batch can miss on the same username; only one
-    // of them should pay for the lookup.
-    if (inFlightNames.has(username)) return inFlightNames.get(username);
-    const p = (async () => {
-      // null means "this account does not exist", which buildEntry turns into
-      // a skip. Without the distinction an orphaned creatorlist: record -- one
-      // left behind by a save that raced its owner's account deletion -- was
-      // re-advertised in the directory on every rebuild, under the raw
-      // username, forever. The public list route refuses to serve it, so the
-      // entry was a dead row; this stops it being created at all.
-      let name = null;
-      try {
-        const profileRaw = await getCreator(countedEnv, username);
-        if (profileRaw) {
-          try {
-            name = JSON.parse(profileRaw).displayName || username;
-          } catch {
-            // Account exists, record unparseable -- index it under the slug.
-            name = username;
-          }
-        }
-      } catch {
-        // A read that FAILED is not an account that is absent. Treat it as
-        // present under the raw username: dropping a live list from the
-        // directory over a transient KV error would be the worse mistake.
-        name = username;
-      }
-      state.names[username] = name;
-      return name;
-    })();
-    inFlightNames.set(username, p);
-    try {
-      return await p;
-    } finally {
-      inFlightNames.delete(username);
-    }
-  }
-
-  async function buildEntry(phase, keyName) {
-    const prefix = PUBLIC_INDEX_BUILD_PREFIXES[phase];
-    const rest = keyName.slice(prefix.length);
-    let username = "user";
-    let slug = rest;
-    let id = `a:${rest}`;
-    if (phase === 0) {
-      const sep = rest.indexOf(":");
-      if (sep === -1) return null;
-      username = rest.slice(0, sep);
-      slug = rest.slice(sep + 1);
-      id = `c:${username}:${slug}`;
-    }
-    if (seen.has(id)) return null;
-    const raw = await counted.get(keyName);
-    if (!raw) return null;
-    try {
-      const data = JSON.parse(raw);
-      await stampListVisibilityIfNeeded(countedEnv, keyName, data);
-      if (!isPublicListVisibility(data.visibility)) return null;
-      let creatorName = null;
-      if (phase === 0) {
-        creatorName = await resolveDisplayName(username);
-        // See resolveDisplayName: null is "no such account", so this record is
-        // an orphan and must not go back into the directory.
-        if (creatorName === null) return null;
-      }
-      return {
-        id,
-        isCreator: phase === 0,
-        username,
-        ...(phase === 0 ? { creatorName } : {}),
-        slug,
-        name: data.name || "List",
-        type: data.type || "mixed",
-        itemCount: Array.isArray(data.items) ? data.items.length : (data.itemCount || 0),
-        likes: data.likes || 0,
-        updatedAt: data.updatedAt || data.createdAt || null,
-      };
-    } catch {
-      // skip unparseable record
-      return null;
-    }
-  }
-
-  let scanned = 0;
-
-  // Outer loop: keep taking work until the budget runs out or every prefix is
-  // exhausted. A small deployment finishes all of this in a single chunk, so
-  // its behaviour is exactly what it was before.
-  while (state.phase < PUBLIC_INDEX_BUILD_PREFIXES.length && ops < opBudget) {
-    if (!state.pending.length) {
-      if (state.cursor === null) {
-        // This prefix is finished; move to the next one.
-        state.phase++;
-        state.cursor = "";
-        continue;
-      }
-      const listOpts = { prefix: PUBLIC_INDEX_BUILD_PREFIXES[state.phase], limit: PUBLIC_INDEX_BUILD_PAGE };
-      if (state.cursor) listOpts.cursor = state.cursor;
-      const res = await counted.list(listOpts);
-      state.pending = (res.keys || []).map((k) => k.name);
-      state.cursor = (res.list_complete || !res.cursor) ? null : res.cursor;
-      if (!state.pending.length) continue;
-    }
-
-    // Claim keys from the head of `pending` in bounded-concurrency batches,
-    // stopping as soon as the budget is gone. Workers claim strictly in
-    // order, so everything before `next` was fully processed and everything
-    // from `next` on is still owed -- which is what gets persisted.
-    const phase = state.phase;
-    const batch = state.pending;
-    let next = 0;
-    const collected = [];
-    const worker = async () => {
-      while (next < batch.length && ops < opBudget) {
-        const keyName = batch[next++];
-        const entry = await buildEntry(phase, keyName);
-        if (entry) collected.push(entry);
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(PUBLIC_INDEX_BUILD_CONCURRENCY, batch.length) }, worker)
-    );
-    scanned += next;
-    state.pending = batch.slice(next);
-
-    for (const entry of collected) {
-      if (seen.has(entry.id)) continue;
-      seen.add(entry.id);
-      state.entries.push(entry);
-    }
-    // Bound the state blob the same way the published index is bounded, so a
-    // very large deployment cannot grow it past what KV will hold.
-    if (state.entries.length > PUBLIC_INDEX_MAX) {
-      state.entries = sortPublicIndexEntries(state.entries).slice(0, PUBLIC_INDEX_MAX);
-      seen.clear();
-      for (const e of state.entries) seen.add(e.id);
-    }
-  }
-
-  if (state.phase >= PUBLIC_INDEX_BUILD_PREFIXES.length) {
-    // Anything unpublished or deleted while this build was running has to
-    // lose to the removal, not to this build's older snapshot.
-    const publishable = await dropStaleRemovalsFromEntries(env, state.entries);
-    const trimmed = await writePublicListIndex(env, publishable);
-    try {
-      await kv.delete(PUBLIC_INDEX_BUILD_KEY);
-    } catch {
-      // A stranded build state is harmless: the next rebuild that starts
-      // from it simply resumes a scan whose result is already published,
-      // and readPublicListIndex short-circuits before ever getting there.
-    }
-    return { done: true, entries: trimmed, scanned, ops, entriesSoFar: trimmed.length };
-  }
-
-  await kv.put(PUBLIC_INDEX_BUILD_KEY, JSON.stringify(state));
-  return { done: false, entries: null, scanned, ops, entriesSoFar: state.entries.length };
-}
-
-// Runs ONE rebuild chunk under a shared short lock, so a burst of traffic
-// against a cold or stale index cannot start a rebuild per request. Returns
-// the finished entries when this chunk completed the build, else null.
-async function advancePublicListIndexBuild(env, ctx) {
-  let gotLock = false;
-  try {
-    const lock = await env.CONFIGS.get("lock:publiclistindex");
-    if (!lock) {
-      await env.CONFIGS.put("lock:publiclistindex", "1", { expirationTtl: 60 });
-      gotLock = true;
-    }
-  } catch {
-    // If the lock read fails, do nothing rather than risk a stampede.
-  }
-  if (!gotLock) return null;
-
-  const runChunk = async () => {
-    try {
-      return await rebuildPublicListIndex(env);
-    } catch (err) {
-      console.error("public list index rebuild failed:", err);
-      return null;
-    } finally {
-      // Released as soon as the chunk ends rather than left to expire: a
-      // rebuild takes many chunks, and sitting on the lock for its full 60s
-      // TTL would cap progress at one chunk a minute for no benefit. The TTL
-      // stays as the backstop for a chunk that dies outright.
-      try {
-        await env.CONFIGS.delete("lock:publiclistindex");
-      } catch {
-        // Expiry will clear it.
-      }
-    }
-  };
-
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(runChunk());
-    return null;
-  }
-  const res = await runChunk();
-  return res && res.done ? res.entries : null;
-}
-
-// Returns index entries, rebuilding if absent. `ctx` (optional) lets the
-// rebuild run after the response so the requesting user doesn't pay for it.
+// When D1 is not bound, falls back to scanning public lists from KV.
 async function getPublicListIndex(env, ctx) {
-  const idx = await readPublicListIndex(env);
-  // Removals are applied on the way OUT as well as on the way in.
-  //
-  // updatePublicListIndex records every removal as a tombstone and then
-  // rewrites the index. When that rewrite fails -- KV being unavailable, or
-  // rate-limiting this single hot key -- the caller is now told (see
-  // deleteCreatorLists and purgeCreatorData), but the entry is still sitting
-  // in the live index, and until this it kept being advertised by the
-  // directory and by search until the next daily rebuild.
-  //
-  // Filtering here makes the removal effective immediately regardless, which
-  // is what "make this private" and "delete this" are supposed to mean.
-  // dropStaleRemovalsFromEntries is the same function the rebuild uses and it
-  // RE-VERIFIES against the authoritative record rather than subtracting
-  // blindly, so a list that is public again (PRIVATE -> PUBLIC -> PRIVATE ->
-  // PUBLIC) is not hidden by its own stale tombstone.
-  //
-  // It costs one KV get for the tombstone set, and nothing more on the normal
-  // path: when the index write succeeded, the removed id is not in the index,
-  // so there is no suspect entry left to re-verify.
-  if (idx) return await dropStaleRemovalsFromEntries(env, idx.entries);
-  // A small deployment finishes in this one chunk and gets its index
-  // immediately; a large one makes bounded progress and is served the legacy
-  // scan meanwhile, with the cron carrying the build to completion.
-  return await advancePublicListIndexBuild(env, ctx);
-}
+  if (env && env.DB) {
+    try {
+      const query = `
+        SELECT
+          'c:' || cl.id AS id,
+          1 AS isCreator,
+          cl.username AS username,
+          COALESCE(c.display_name, cl.username) AS creatorName,
+          substr(cl.id, length(cl.username) + 2) AS slug,
+          cl.name AS name,
+          cl.type AS type,
+          CASE WHEN json_valid(cl.items_json) THEN json_array_length(cl.items_json) ELSE 0 END AS itemCount,
+          cl.likes AS likes,
+          cl.updated_at AS updatedAt
+        FROM creator_lists cl
+        LEFT JOIN creators c ON c.username = cl.username
+        WHERE cl.visibility = 'public'
 
-// The index is a DERIVED cache maintained incrementally by
-// updatePublicListIndex, which is a read-modify-write on one key -- so
-// concurrent or rapid-fire updates lose each other. Its own comment accepts
-// that on the grounds that a lost entry costs one list's visibility "until
-// the next rebuild". The gap was that nothing ever caused one: a rebuild
-// only ever ran when the index was MISSING, never when it was merely wrong,
-// so a lost update was permanent.
-//
-// It was: a bulk delete left 76 entries in a live directory advertising item
-// counts for records that no longer existed, and they stayed there. This is
-// what closes that -- the cron re-derives the whole index from the
-// authoritative creatorlist:/publishedlist: keys once a day, so anything
-// stranded is gone within one cycle without anyone having to notice.
-//
-// The live index keeps serving untouched while a refresh runs: the chunked
-// rebuild only writes when its final chunk lands, so readers never see a
-// half-scanned directory.
-const PUBLIC_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+        UNION ALL
 
-async function refreshPublicListIndexIfStale(env, ctx) {
-  if (!env || !env.CONFIGS) return;
-  // One small key, not a merge of 32 shards: this runs every 6 minutes and
-  // needs only "is there an index" and "how old is it". See
-  // readPublicListIndexMeta.
-  const meta = await readPublicListIndexMeta(env);
-  if (!meta) {
-    // Cold start -- same path as a live request would take.
-    await advancePublicListIndexBuild(env, ctx);
-    return;
+        SELECT
+          'a:' || pl.slug AS id,
+          0 AS isCreator,
+          'user' AS username,
+          'Anonymous' AS creatorName,
+          pl.slug AS slug,
+          pl.name AS name,
+          pl.type AS type,
+          CASE WHEN json_valid(pl.items_json) THEN json_array_length(pl.items_json) ELSE 0 END AS itemCount,
+          pl.likes AS likes,
+          pl.updated_at AS updatedAt
+        FROM published_lists pl
+        WHERE pl.visibility = 'public'
+
+        ORDER BY likes DESC, updatedAt DESC
+      `;
+      const res = await env.DB.prepare(query).all();
+      const rows = (res && res.results) ? res.results : [];
+      return rows.map((r) => ({
+        ...r,
+        isCreator: Boolean(r.isCreator),
+      }));
+    } catch (e) {
+      console.error("getPublicListIndex D1 query error:", e);
+      return null;
+    }
   }
-  // A build already part-way through has to keep being advanced, or it stalls
-  // forever at whatever chunk it reached: the read path above returns early
-  // while an index exists, so the cron is the only thing driving it.
-  let building = false;
-  try {
-    building = !!(await env.CONFIGS.get(PUBLIC_INDEX_BUILD_KEY));
-  } catch {
-    building = false;
+
+  // KV fallback when D1 is not bound
+  if (env && env.CONFIGS) {
+    try {
+      const fetchLimit = 200;
+      const [pubRes, creatorRes] = await Promise.all([
+        env.CONFIGS.list({ prefix: "publishedlist:user:", limit: fetchLimit }),
+        env.CONFIGS.list({ prefix: "creatorlist:", limit: fetchLimit }),
+      ]);
+      const listKeys = [];
+      (pubRes.keys || []).forEach(k => listKeys.push({ key: k.name, isCreator: false }));
+      (creatorRes.keys || []).forEach(k => {
+        const rest = k.name.slice("creatorlist:".length);
+        if (rest.includes(":")) listKeys.push({ key: k.name, isCreator: true });
+      });
+
+      const creatorExists = makeCreatorExistsMemo(env);
+      const entries = (await Promise.all(
+        listKeys.slice(0, fetchLimit).map(async ({ key, isCreator }) => {
+          const raw = await env.CONFIGS.get(key);
+          if (!raw) return null;
+          try {
+            const l = JSON.parse(raw);
+            if (!isPublicListVisibility(l.visibility)) return null;
+            let username = "user";
+            let slug = l.slug || "";
+            let creatorName = "Anonymous";
+            let id = "";
+            if (isCreator) {
+              const parts = key.slice("creatorlist:".length).split(":");
+              username = parts[0] || "creator";
+              slug = parts[1] || slug;
+              id = `c:${username}:${slug}`;
+              if (!(await creatorExists(username))) return null;
+              try {
+                const profileRaw = await getCreator(env, username);
+                if (profileRaw) creatorName = JSON.parse(profileRaw).displayName || username;
+              } catch {
+                creatorName = username;
+              }
+            } else {
+              slug = key.slice("publishedlist:user:".length);
+              id = `a:${slug}`;
+            }
+            return {
+              id,
+              isCreator,
+              username,
+              creatorName,
+              slug,
+              name: l.name || slug,
+              type: l.type || "mixed",
+              itemCount: Array.isArray(l.items) ? l.items.length : 0,
+              likes: Number(l.likes) || 0,
+              updatedAt: l.updatedAt || l.publishedAt || l.createdAt || null,
+            };
+          } catch {
+            return null;
+          }
+        })
+      )).filter(Boolean);
+
+      return entries.sort((a, b) => (b.likes || 0) - (a.likes || 0) || (b.updatedAt || 0) - (a.updatedAt || 0));
+    } catch {
+      return null;
+    }
   }
-  const age = meta.builtAt ? (Date.now() - meta.builtAt) : Infinity;
-  if (building || age > PUBLIC_INDEX_MAX_AGE_MS) {
-    await advancePublicListIndexBuild(env, ctx);
-  }
+
+  return null;
 }
 
 // Pages a whole prefix, following the cursor to completion.
@@ -3436,25 +2675,11 @@ async function purgeCreatorData(env, username, options = {}) {
       // it is the only thing covering account/reset, which keeps the creator
       // row.
       await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM lists_fts WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
       dataSweepFailed = true;
     }
-  }
-
-  // One index write for the whole account rather than one per list --
-  // deleting an account with 200 lists should not be 200 read-modify-writes
-  // against the same key (KV allows 1 write/sec/key).
-  //
-  // Checked, not discarded. This is what stops the list being advertised, and
-  // ignoring it meant "delete my account" reported success, removed the
-  // identity, freed the username -- and left /lists/public.json and list
-  // search still listing the account's lists under a name nobody owned, until
-  // the next daily rebuild. The list-save path already treats a failed
-  // removal as a failure to report; the two account paths did not.
-  if (!(await removeListsFromPublicIndex(env, purgedListIds))) {
-    console.error("purgeCreatorData: the public directory still lists this account");
-    dataSweepFailed = true;
   }
 
   // The scrobble token is keyed by the token, not the username, so it has to
@@ -3619,15 +2844,12 @@ async function purgeCreatorData(env, username, options = {}) {
     } catch (e) {
       console.error("purgeCreatorData: the post-deletion sweep did not finish", e);
     }
-    if (lateListIds.length) {
+    if (lateListIds.length && env.DB) {
       try {
-        await removeListsFromPublicIndex(env, lateListIds);
+        await env.DB.prepare("DELETE FROM creator_lists WHERE username = ?").bind(u).run();
+        await env.DB.prepare("DELETE FROM lists_fts WHERE username = ?").bind(u).run();
       } catch (e) {
-        // Best-effort, same as the sweep above: the records are gone either
-        // way, and the read path now refuses a list whose owner no longer
-        // exists (see the creator check in /lists/:user/:slug), so a stranded
-        // index entry is a dead row rather than an exposure.
-        console.error("purgeCreatorData: could not drop late lists from the directory", e);
+        console.error("purgeCreatorData: could not drop late lists from D1", e);
       }
     }
   }

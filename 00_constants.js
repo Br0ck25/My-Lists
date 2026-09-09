@@ -491,6 +491,8 @@ function buildRegionOptionsHtml(selectedRegion) {
 
 
 
+const PUBLIC_INDEX_MAX = 20000;
+
 // --- D1 schema manifest ------------------------------------------------------
 //
 // What each file under migrations/ adds, so the Worker can tell an operator
@@ -541,4 +543,17 @@ const D1_SCHEMA_MANIFEST = [
     migration: "0005", kind: "index", name: "idx_stats_day_totals",
     consequence: "The dashboard's counter panels scan and sort the whole stats table on every load. Slower, not broken.",
   },
+  {
+    migration: "0006", kind: "table", name: "published_lists",
+    consequence: "Anonymous published lists cannot be mirrored or served from D1.",
+  },
+  {
+    migration: "0006", kind: "index", name: "idx_published_vis_likes",
+    consequence: "Ordering published lists by likes scans the table instead of using an index. Slower, not broken.",
+  },
+  {
+    migration: "0007", kind: "table", name: "lists_fts",
+    consequence: "Full-text search over public lists falls back or fails.",
+  },
 ];
+
