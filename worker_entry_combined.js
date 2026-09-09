@@ -18823,11 +18823,18 @@ if ('serviceWorker' in navigator) {
 
   <!-- Submenu 2: Liked Lists Feed -->
   <div class="lists-subpanel" id="listsSubLiked" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Lists You Liked</h2>
-      <button type="button" class="secondary lc-btn" onclick="renderLikedListsFeed()">Refresh</button>
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title">Lists You Liked</h2>
+        <button type="button" class="secondary lc-btn" onclick="renderLikedListsFeed(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists you've saved with the heart, from the community directory and from your connected accounts.</p>
+      <!-- The placeholder here is the pre-JS state only. renderLikedListsFeed
+           overwrites it on every switch to this tab and is authoritative for
+           the empty case -- nothing may read this element's children to decide
+           whether the feed has loaded. See switchListsSubmenu. -->
+      <div id="likedListsFeed"><p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p></div>
     </div>
-    <div id="likedListsFeed"><p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p></div>
   </div>
 
   <!-- Submenu 5: Create Custom List Builder -->
@@ -20857,9 +20864,21 @@ function switchListsSubmenu(name, btn) {
     }
   }
   if (name === 'liked') {
-    const likedBox = document.getElementById('likedListsFeed');
-    const hasLikedContent = likedBox && likedBox.children.length > 0;
-    if (!hasLikedContent && typeof renderLikedListsFeed === 'function') {
+    // Called unconditionally, unlike the five above, because #likedListsFeed
+    // is the one feed container that ships with a child in the markup -- the
+    // "No liked lists yet" placeholder. The "has it already loaded?" test the
+    // others use (children.length > 0) was therefore true from the very first
+    // paint here, so this never ran: the feed stayed empty until the Refresh
+    // button called it directly, and a browser reload put it straight back to
+    // empty. The others are genuinely empty divs, which is why only this one
+    // was affected.
+    //
+    // Nothing is lost by dropping the guard. renderLikedListsFeed already
+    // owns that decision and does it properly -- it returns early when the
+    // liked count it last rendered still matches and the container is not
+    // mid-load -- so this was a second, wrong copy of a check that was
+    // already being made one level down.
+    if (typeof renderLikedListsFeed === 'function') {
       renderLikedListsFeed();
     }
   }

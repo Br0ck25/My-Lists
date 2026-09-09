@@ -3414,6 +3414,70 @@ describe("audit fix 10: admin Community Lists ranks by likes, not by key order",
 // buttons inside one card. These pin the two on the same shape -- the risk is
 // not that a card looks wrong, it is that a section added later quietly goes
 // back to a naked heading and nobody notices until it is live.
+// Lists -> Liked showed nothing until the Refresh button was pressed, and a
+// browser reload put it straight back to empty.
+//
+// #likedListsFeed is the one feed container that ships with a child in the
+// markup -- the "No liked lists yet" placeholder -- and switchListsSubmenu
+// used the same "children.length > 0" test as the five genuinely-empty
+// containers beside it to decide whether the feed had already loaded. That
+// test was true from the first paint, so the loader never ran.
+describe("Lists -> Liked: the feed loads without being asked twice", () => {
+  const markup = fs.readFileSync(path.join(REPO_ROOT, "12_tab-custom-lists.js"), "utf8");
+  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8");
+  // Anchored inside switchListsSubmenu specifically: switchTab earlier in the
+  // same file has its own `if (name === ...)` chain, so an unanchored search
+  // finds that one and silently tests nothing.
+  const switcher = core.slice(core.indexOf("function switchListsSubmenu"));
+  // Comments stripped: the branch carries an explanation of this very bug,
+  // which names both #likedListsFeed and children.length. Asserting over the
+  // raw text would fail on the prose describing the fix rather than on the
+  // code, and would push the next person to delete the explanation.
+  const likedBranch = switcher
+    .slice(switcher.indexOf("if (name === 'liked')"), switcher.indexOf("\n}"))
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("never decides the feed has loaded by looking at the placeholder", () => {
+    // The bug itself. #likedListsFeed carries a child before anything has
+    // loaded, so nothing may read its children to answer "is it loaded".
+    assert.ok(!/likedListsFeed/.test(likedBranch),
+      "switchListsSubmenu must not inspect #likedListsFeed to decide whether to load it");
+    assert.ok(!/children\.length/.test(likedBranch),
+      "a has-content guard here is what stopped the feed loading at all");
+    assert.match(likedBranch, /renderLikedListsFeed\(\)/,
+      "switching to Liked must call the loader");
+  });
+
+  it("leaves the load-or-skip decision to the one function that does it right", () => {
+    // renderLikedListsFeed returns early when the liked count it last
+    // rendered still matches and the container is not mid-load. The caller's
+    // job is to call it, not to second-guess it.
+    const feed = fs.readFileSync(path.join(REPO_ROOT, "19_client-search-and-likes.js"), "utf8");
+    const fn = feed.slice(feed.indexOf("async function renderLikedListsFeed"));
+    assert.match(fn.slice(0, 1200), /if \(!forceRefresh && container\.dataset\.likedCount === String\(likedUrls\.length\)/,
+      "the loader's own guard is what makes the unconditional call cheap");
+  });
+
+  it("gives Refresh something to do", () => {
+    // Without the argument the button hit the loader's early return the
+    // moment the feed had rendered once, so it refreshed nothing -- the same
+    // shape as Discover's own Refresh buttons, which pass true.
+    assert.match(markup, /onclick="renderLikedListsFeed\(true\)"/,
+      "the Refresh button must force a refresh");
+  });
+
+  it("puts the panel in a card like every other Lists sub-panel", () => {
+    const liked = markup.slice(markup.indexOf('id="listsSubLiked"'), markup.indexOf('id="listsSubCreateList"'));
+    assert.match(liked, /<div class="panel">/, "Lists -> Liked must be a card");
+    assert.match(liked, /class="shelf-title">Lists You Liked</);
+    assert.match(liked, /<p style="margin:0 0 10px; color:var\(--muted\)/,
+      "and carry the same one-line description its siblings do");
+    // The card has to close after the feed, not before it.
+    assert.ok(liked.indexOf('id="likedListsFeed"') < liked.lastIndexOf("</div>"),
+      "the feed must be inside the card");
+  });
+});
+
 describe("Catalogs -> Quick Add: every section is a card with a subtitle", () => {
   const catalogs = fs.readFileSync(path.join(REPO_ROOT, "10_tab-search-add.js"), "utf8");
   const channels = fs.readFileSync(path.join(REPO_ROOT, "13_tab-channels.js"), "utf8");
