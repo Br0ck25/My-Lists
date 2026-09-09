@@ -969,6 +969,27 @@ ${seoHeadHtml}
     gap: 8px;
     margin-bottom: 8px;
   }
+  /* Catalogs -> Quick Add sits each section in its own card, the way
+     Channels -> Quick Add already did. Composed onto .panel rather than
+     restating the surface/border/radius/shadow, so the two cannot drift:
+     .panel supplies the card, this supplies only what a shelf inside one
+     needs. The larger gap is because these are now separate cards rather
+     than headings on one continuous background -- at 8px they read as one
+     block with lines through it. */
+  .qa-shelf-card {
+    margin-bottom: 16px;
+    gap: 0;
+  }
+  /* The line under a Quick Add card's title. Shared with Channels -> Quick
+     Add, which is where the pattern comes from -- one class so a change to
+     one is a change to both. */
+  .qa-shelf-sub {
+    margin: 0 0 12px;
+    padding: 0 2px;
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1.45;
+  }
   .shelf-header {
     display: flex;
     align-items: baseline;

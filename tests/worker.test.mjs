@@ -3409,6 +3409,56 @@ describe("audit fix 10: admin Community Lists ranks by likes, not by key order",
   });
 });
 
+// Catalogs -> Quick Add used to be ten bare headings on the page background,
+// while Channels -> Quick Add put its heading, its explanatory line and its
+// buttons inside one card. These pin the two on the same shape -- the risk is
+// not that a card looks wrong, it is that a section added later quietly goes
+// back to a naked heading and nobody notices until it is live.
+describe("Catalogs -> Quick Add: every section is a card with a subtitle", () => {
+  const catalogs = fs.readFileSync(path.join(REPO_ROOT, "10_tab-search-add.js"), "utf8");
+  const channels = fs.readFileSync(path.join(REPO_ROOT, "13_tab-channels.js"), "utf8");
+  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8");
+  const count = (src, re) => (src.match(re) || []).length;
+
+  it("gives every section a card, a title and a subtitle -- one of each", () => {
+    // The "+ Add all" button is the thing that makes a section a section, so
+    // it is what the other three are counted against. A new section added
+    // without a card or without its subtitle fails here rather than shipping.
+    const sections = count(catalogs, /qa-add-all-btn/g);
+    assert.ok(sections >= 10, `expected the Quick Add sections, found ${sections}`);
+    assert.equal(count(catalogs, /class="shelf-section discover-shelf panel qa-shelf-card"/g), sections,
+      "every Quick Add section must be a card");
+    assert.equal(count(catalogs, /class="qa-shelf-sub"/g), sections,
+      "every Quick Add section must carry the line explaining what it adds");
+    // Not counted against `sections`: this file also holds the My Catalogs
+    // sub-panel, whose "Live Preview & Editor" is a shelf-title outside Quick
+    // Add entirely. That each card has its own title is checked below, where
+    // the scope is one card rather than the whole file.
+  });
+
+  it("keeps the header, the subtitle and the grid INSIDE the card", () => {
+    // The whole point of the change. A card that closes before its grid would
+    // render as a header strip with the shelf loose underneath it.
+    const blocks = catalogs.split('<div class="shelf-section discover-shelf panel qa-shelf-card"').slice(1);
+    assert.ok(blocks.length >= 10);
+    for (const block of blocks) {
+      const body = block.slice(0, block.indexOf("\n    </div>"));
+      assert.match(body, /class="shelf-title"/, "the title must be inside the card");
+      assert.match(body, /qa-add-all-btn/, "the Add all button must be inside the card");
+      assert.match(body, /class="qa-shelf-sub"/, "the subtitle must be inside the card");
+      assert.match(body, /\$\{\w+Html\}/, "the shelf grid must be inside the card");
+    }
+  });
+
+  it("shares one subtitle class with Channels -> Quick Add", () => {
+    // This is where the pattern came from. Two copies of the same inline style
+    // is how the two drift apart.
+    assert.match(channels, /<p class="qa-shelf-sub">Instant 1-click TV channels/);
+    assert.match(shell, /\.qa-shelf-sub\s*\{/, "the shared class must be defined in the stylesheet");
+    assert.match(shell, /\.qa-shelf-card\s*\{/);
+  });
+});
+
 describe("audit fix 14: every env var the code requires is documented", () => {
   it("names MDBLIST_CLIENT_SECRET in both README.md and wrangler.toml", () => {
     const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
