@@ -386,13 +386,68 @@ async function putFeedbackThread(env, key, entry) {
   await env.CONFIGS.put(key, JSON.stringify(entry), { expirationTtl: FEEDBACK_TTL_SEC });
 }
 
+// The display fields for a tracked title -- its name and media type -- stay in
+// KV on every deployment, D1-bound or not. The COUNTS are what were spending
+// the write budget, and those move to D1 in recordTrackedEvent; this blob is
+// read only by the leaderboard, only for the candidates it is about to render.
+//
+// It used to be written on EVERY event, with the comment "overwritten every
+// time rather than only on first sight -- keeps title/mediaType current if
+// either ever changes upstream, and lastSeen doubles as a cheap staleness
+// signal". Both of those still hold, and neither needs a write per event to
+// hold them: it is rewritten when the title or media type has actually
+// changed, and otherwise at most once a day per title, so lastSeen stays
+// meaningful. The KV read that costs is the cheap side of the trade --
+// 100,000 reads a day on the free plan against 1,000 writes.
+//
+// Returns whether it wrote, which is what the tests assert on.
+const EVT_META_REFRESH_MS = 24 * 60 * 60 * 1000;
+async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
+  const metaKey = `evtmeta:${eventType}:${id}`;
+  const metaRaw = await env.CONFIGS.get(metaKey);
+  try {
+    const prev = metaRaw ? JSON.parse(metaRaw) : null;
+    if (prev
+      && (prev.title || "") === (title || "")
+      && (prev.mediaType || "") === (mediaType || "")
+      && Number.isFinite(prev.lastSeen)
+      && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
+      return false;
+    }
+  } catch {
+    // Unreadable -- rewrite it.
+  }
+  await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
+  return true;
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
   if (!env || !env.CONFIGS || !id) return;
   try {
     const day = statsToday();
+    // With D1 bound the counts go there and cost ZERO KV writes, the same way
+    // bumpStat's counters already did. This function was the biggest consumer
+    // of the free plan's 1,000-writes-a-day budget that bumpStat's move left
+    // behind: four KV writes per tracked title, so a browser posting a
+    // ten-title batch spent 41 of them and roughly 250 watched titles in a
+    // day exhausted the whole allowance -- at which point every KV write in
+    // the app fails, which is how this was found (marking a feedback item
+    // done started answering "KV put() limit exceeded for the day").
+    //
+    // No migration was needed: `stats` is keyed (kind, day) and its `kind`
+    // dimension is already unbounded (list_copy:{slug} mints one per list),
+    // so `evt:{eventType}:{id}` just goes in beside them. The day index is
+    // not written at all on this path -- a range scan over `day` is what
+    // replaces it (see d1LeaderboardCounts).
+    if (env.DB) {
+      await d1BumpStat(env, `evt:${eventType}:${id}`, ["total", day], 1);
+      // The display fields still live in KV, and are still written at most
+      // once a day per title rather than on every event.
+      await writeEventMetaIfChanged(env, eventType, id, title, mediaType);
+      return;
+    }
     const daysKey = `evtcount:${eventType}:${id}:days`;
     const totalKey = `evtcount:${eventType}:${id}:alltime`;
-    const metaKey = `evtmeta:${eventType}:${id}`;
     const indexKey = `evtdayindex:${eventType}:${day}`;
 
     const [daysRaw, totalRaw, indexRaw] = await Promise.all([
@@ -431,17 +486,25 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
     } catch {
       index = [];
     }
-    if (!index.includes(id) && index.length < EVT_DAY_INDEX_CAP) index.push(id);
+    // Written only when it actually changed. This key is one list per
+    // (eventType, day), so after the first event for a given title every
+    // later one rewrote a blob it had not altered.
+    const indexChanged = !index.includes(id) && index.length < EVT_DAY_INDEX_CAP;
+    if (indexChanged) index.push(id);
 
-    await Promise.all([
+    const writes = [
       env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
-      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
-      // Overwritten every time rather than only on first sight -- keeps
-      // title/mediaType current if either ever changes upstream, and
-      // lastSeen doubles as a cheap staleness signal in the dashboard.
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
-    ]);
+    ];
+    if (indexChanged) {
+      writes.push(env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }));
+    }
+    // Both this and the day index above were rewritten on EVERY event even
+    // when their contents had not changed -- half of this function's four
+    // KV writes per tracked title, so a ten-title batch spent 41 of the free
+    // plan's 1,000 a day.
+    writes.push(writeEventMetaIfChanged(env, eventType, id, title, mediaType));
+    await Promise.all(writes);
   } catch (e) {
     // best-effort -- never breaks the actual watch/list action riding along
   }
@@ -459,139 +522,148 @@ async function recordTrackedEvent(env, eventType, id, title, mediaType) {
 // after, so filtering to just movies still returns up to 100 movies
 // instead of whatever happened to survive filtering an already-mixed
 // top 100.
-async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
-  if (!env || !env.CONFIGS) return [];
-  const prefix = `evtcount:${eventType}:`;
-  const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
-
-  if (window === "alltime") {
-    const listResult = await listAllKeys(env.CONFIGS, prefix);
-    // Cap the candidate pool. This branch reads the running-total key AND
-    // metadata for EVERY title ever tracked before cutting to 100 -- 2 KV
-    // reads each, which is ~2,000 reads at 1,000 titles and crosses
-    // Cloudflare's 1,000-storage-operations/invocation cap around 500 titles,
-    // killing the whole Trending tab. We surface only 100, so a fixed
-    // candidate ceiling bounds the cost regardless of corpus size; the
-    // day-index windows below are capped the same way.
-    const ALLTIME_CANDIDATE_CAP = 400;
-    const alltimeKeys = listResult.keys
-      .filter((k) => k.name.endsWith(":alltime"))
-      .slice(0, ALLTIME_CANDIDATE_CAP);
-    const entries = await Promise.all(
-      alltimeKeys.map(async (k) => {
-        const id = k.name.slice(prefix.length, -":alltime".length);
-        const [countRaw, metaRaw] = await Promise.all([
-          env.CONFIGS.get(k.name),
-          env.CONFIGS.get(`evtmeta:${eventType}:${id}`),
-        ]);
-        let title = id;
-        let mediaType = "";
-        try {
-          if (metaRaw) {
-            const meta = JSON.parse(metaRaw);
-            title = meta.title || id;
-            mediaType = meta.mediaType || "";
-          }
-        } catch {
-          // fall back to raw id as the title
-        }
-        return { id, title, mediaType, count: parseInt(countRaw, 10) || 0 };
-      })
-    );
-    const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
-    filtered.sort((a, b) => b.count - a.count);
-    const topEntries = filtered.slice(0, 100);
-
-    // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
-    await Promise.all(
-      topEntries.map(async (e) => {
-        if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
-          try {
-            if (typeof fetchTmdbItemDetails === "function") {
-              const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
-              if (det && det.title) {
-                e.title = det.title;
-                if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
-                if (env && env.CONFIGS) {
-                  env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
-                }
-              }
-            }
-          } catch {}
-        }
-      })
-    );
-
-    return topEntries;
-  }
-
-  const days = window === "today" ? 1 : parseInt(window, 10) || 7;
-  const nowMs = Date.now();
-  const dateKeys = [];
-  for (let i = 0; i < days; i++) {
-    dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
-  }
-
-  // Union of every title id that had any activity anywhere in this window.
-  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtdayindex:${eventType}:${d}`)));
-  const idSet = new Set();
-  indexResults.forEach((raw) => {
-    if (!raw) return;
-    try {
-      JSON.parse(raw).forEach((id) => idSet.add(id));
-    } catch {
-      // skip an unparseable day index rather than failing the whole window
-    }
-  });
-  // Flat top-100 cap regardless of window width: each candidate now costs
-  // exactly 2 KV reads below (one evtcount days-blob, one evtmeta) since
-  // recordTrackedEvent stores every day's count for a title in a single
-  // JSON blob rather than one key per day -- summing a 90-day window no
-  // longer means 90 reads per candidate, just one. See
-  // recordTrackedEvent's own comment for why that changed.
-  const ids = [...idSet].slice(0, 100);
-
-  const entries = await Promise.all(
+// Attaches the display fields (title, media type) to a set of tracked ids.
+//
+// These stay in KV on every deployment, D1-bound or not. The COUNTS are what
+// were spending the write budget -- four KV writes per tracked title, and a
+// ten-title batch was 41 -- and those move to D1 below. This blob is now
+// written at most once a day per title (see recordTrackedEvent), and it is
+// only ever READ here, bounded by the candidate cap. Reads are the cheap
+// side: 100,000 a day against 1,000 writes.
+async function attachEventMeta(env, eventType, ids) {
+  return await Promise.all(
     ids.map(async (id) => {
-      const daysRaw = await env.CONFIGS.get(`evtcount:${eventType}:${id}:days`);
-      let dayCounts = {};
-      try {
-        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
-      } catch {
-        dayCounts = {};
-      }
-      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
-      const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
       let title = id;
       let mediaType = "";
       try {
+        const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
         if (metaRaw) {
           const meta = JSON.parse(metaRaw);
           title = meta.title || id;
           mediaType = meta.mediaType || "";
         }
       } catch {
-        // fall back to raw id as the title
+        // fall back to the raw id as the title
       }
-      return { id, title, mediaType, count };
+      return { id, title, mediaType };
     })
   );
+}
+
+// The D1 candidate source. One indexed query replaces the whole day-index
+// dance the KV branches need: `stats` is keyed (kind, day), so a window is a
+// range scan and "alltime" is the single day='total' row per title.
+//
+// The kind is `evt:{eventType}:{id}` -- the same shape bumpStat has always
+// written into this table for its own counters, and the same unbounded
+// `kind` dimension list_copy:{slug} already uses. That is why this needed no
+// migration: the table it wants already exists.
+async function d1CountsByKindPrefix(env, prefix, window, candidateCap) {
+  const like = prefix.replace(/[%_]/g, "\\$&") + "%";
+  let rows;
+  if (window === "alltime") {
+    rows = await env.DB.prepare(
+      "SELECT kind, n AS total FROM stats WHERE kind LIKE ? ESCAPE '\\' AND day = 'total' ORDER BY n DESC LIMIT ?"
+    ).bind(like, candidateCap).all();
+  } else {
+    const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+    const nowMs = Date.now();
+    const oldest = easternDateKey(new Date(nowMs - (days - 1) * 86400000));
+    const newest = easternDateKey(new Date(nowMs));
+    rows = await env.DB.prepare(
+      "SELECT kind, SUM(n) AS total FROM stats WHERE kind LIKE ? ESCAPE '\\' AND day >= ? AND day <= ? GROUP BY kind ORDER BY total DESC LIMIT ?"
+    ).bind(like, oldest, newest, candidateCap).all();
+  }
+  return (rows && rows.results ? rows.results : [])
+    .map((r) => ({ key: String(r.kind).slice(prefix.length), count: Number(r.total) || 0 }))
+    .filter((e) => e.key);
+}
+
+async function d1LeaderboardCounts(env, eventType, window, candidateCap) {
+  const rows = await d1CountsByKindPrefix(env, `evt:${eventType}:`, window, candidateCap);
+  return rows.map((r) => ({ id: r.key, count: r.count }));
+}
+
+async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
+  if (!env || !env.CONFIGS) return [];
+  const prefix = `evtcount:${eventType}:`;
+  const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
+
+  // Cap the candidate pool before any per-title work. The KV branches below
+  // pay reads per candidate, so this is what stops the Trending tab crossing
+  // Cloudflare's 1,000-storage-operations-per-invocation cap on a large
+  // corpus; the D1 branch does not need it for cost, but keeping the same
+  // ceiling keeps the three paths returning the same shape of answer.
+  const CANDIDATE_CAP = 400;
+
+  // Candidates: { id, count }. Three sources, one tail.
+  let candidates;
+  // Only the KV window branch can produce a zero -- see the note where it
+  // builds its id set.
+  let dropZero = false;
+
+  if (env.DB) {
+    candidates = await d1LeaderboardCounts(env, eventType, window, CANDIDATE_CAP);
+  } else if (window === "alltime") {
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, CANDIDATE_CAP);
+    candidates = await Promise.all(
+      alltimeKeys.map(async (k) => ({
+        id: k.name.slice(prefix.length, -":alltime".length),
+        count: parseInt(await env.CONFIGS.get(k.name), 10) || 0,
+      }))
+    );
+  } else {
+    const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+    const nowMs = Date.now();
+    const dateKeys = [];
+    for (let i = 0; i < days; i++) {
+      dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+    }
+    // Union of every title id that had any activity anywhere in this window.
+    const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtdayindex:${eventType}:${d}`)));
+    const idSet = new Set();
+    indexResults.forEach((raw) => {
+      if (!raw) return;
+      try {
+        JSON.parse(raw).forEach((id) => idSet.add(id));
+      } catch {
+        // skip an unparseable day index rather than failing the whole window
+      }
+    });
+    const ids = [...idSet].slice(0, CANDIDATE_CAP);
+    candidates = await Promise.all(
+      ids.map(async (id) => {
+        const daysRaw = await env.CONFIGS.get(`evtcount:${eventType}:${id}:days`);
+        let dayCounts = {};
+        try {
+          dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+        } catch {
+          dayCounts = {};
+        }
+        return { id, count: dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0) };
+      })
+    );
+    // An id in the day index with no data in the counts blob -- e.g. one only
+    // ever tracked before the blob format shipped -- would otherwise show as a
+    // real-looking row stuck at 0 forever. The other two branches cannot
+    // produce one: both read the count itself rather than an index of ids.
+    dropZero = true;
+  }
+
+  const meta = await attachEventMeta(env, eventType, candidates.map((c) => c.id));
+  const entries = candidates.map((c, i) => ({ ...meta[i], count: c.count }));
+
   const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
-  // count > 0 filter: without it, an id that's in today's/this window's
-  // day-index (written unconditionally on every tracked event, regardless
-  // of counter format) but has no data in the current evtcount:...:days
-  // blob -- e.g. an id only ever tracked before this blob-based format
-  // shipped, whose history lives solely under the old per-day-per-id keys
-  // this branch no longer reads -- would show up as a real-looking
-  // leaderboard row stuck at 0 forever. Matches the filter
-  // computeSearchLeaderboard's equivalent branch already has; the alltime
-  // branch above doesn't need one since it only ever lists ids that
-  // already have a nonzero running total by construction.
-  const nonZero = filtered.filter((e) => e.count > 0);
+  const nonZero = dropZero ? filtered.filter((e) => e.count > 0) : filtered;
   nonZero.sort((a, b) => b.count - a.count);
   const topEntries = nonZero.slice(0, 100);
 
-  // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing
+  // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing. This is
+  // also what repopulates evtmeta after it expires, and what fills it in on a
+  // D1 deployment for a title first seen since the counters moved.
   await Promise.all(
     topEntries.map(async (e) => {
       if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
@@ -630,13 +702,23 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
 async function backfillTitleCount(env, eventType, id, title, mediaType, incrementBy) {
   if (!env || !env.CONFIGS || !id || !incrementBy) return false;
   try {
+    // Has to follow recordTrackedEvent onto D1, not just for the write
+    // budget: computeLeaderboard reads its counts from D1 wherever D1 is
+    // bound, so a backfill that only wrote KV would run to completion, report
+    // its title counts, and leave the All Time board showing nothing.
+    //
+    // "total" only, no day bucket -- see this function's comment above.
+    if (env.DB) {
+      await d1BumpStat(env, `evt:${eventType}:${id}`, ["total"], incrementBy);
+      await writeEventMetaIfChanged(env, eventType, id, title, mediaType);
+      return true;
+    }
     const totalKey = `evtcount:${eventType}:${id}:alltime`;
-    const metaKey = `evtmeta:${eventType}:${id}`;
     const totalRaw = await env.CONFIGS.get(totalKey);
     const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
     await Promise.all([
       env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
-      env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      writeEventMetaIfChanged(env, eventType, id, title, mediaType),
     ]);
     return true;
   } catch (e) {
@@ -651,6 +733,19 @@ async function recordSearchQuery(env, query) {
   if (q.length < 2) return;
   try {
     const day = statsToday();
+    // Same move as recordTrackedEvent above, and the same reason: three KV
+    // writes per search, none of which the free plan's write budget can
+    // afford. Nothing but counts here, so there is no meta to keep.
+    //
+    // The per-day unique-query cap that the KV path enforces through
+    // SEARCH_DAY_INDEX_CAP is not needed on this path: `stats` rows are
+    // bounded by (kind, day) and a query string mints one row per day rather
+    // than an unbounded keyspace of KV keys, and D1 writes do not come out of
+    // the KV write budget that cap exists to protect.
+    if (env.DB) {
+      await d1BumpStat(env, `searchq:${q}`, ["total", day], 1);
+      return;
+    }
     const daysKey = `searchquery:${q}:days`;
     const totalKey = `searchquery:${q}:alltime`;
     const indexKey = `searchquerydayindex:${day}`;
@@ -686,26 +781,52 @@ async function recordSearchQuery(env, query) {
     } catch {
       index = [];
     }
-    let listed = index.includes(q);
-    if (!listed && index.length < SEARCH_DAY_INDEX_CAP) {
-      index.push(q);
-      listed = true;
-    }
+    const alreadyListed = index.includes(q);
+    // Written only when it actually changed -- the same waste
+    // recordTrackedEvent had. This is one list per day, so the second and
+    // every later search for the same term rewrote a blob identical to the
+    // one already there. `listed` keeps its old meaning (is this query in
+    // the day index at all) for the guard below; `indexChanged` is the
+    // narrower question of whether the blob needs storing again.
+    const indexChanged = !alreadyListed && index.length < SEARCH_DAY_INDEX_CAP;
+    if (indexChanged) index.push(q);
+    const listed = alreadyListed || indexChanged;
     // Day index full of other queries: still bump counters for a query
     // that already has keys, but do not mint a brand-new unique-query
     // pair -- that is the unbounded, user-controlled keyspace.
     if (!listed && !daysRaw && !totalRaw) return;
 
-    await Promise.all([
+    const writes = [
       env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
       env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
-      env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
-    ]);
+    ];
+    if (indexChanged) {
+      writes.push(env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }));
+    }
+    await Promise.all(writes);
   } catch (e) {}
 }
 
 async function computeSearchLeaderboard(env, window) {
   if (!env || !env.CONFIGS) return [];
+  // D1 is where recordSearchQuery puts the counts when it is bound, so read
+  // them back from there. Same shape of query as the Trending leaderboard
+  // (see d1CountsByKindPrefix), minus the meta join -- a search term is its
+  // own display value, so there is nothing to attach.
+  //
+  // Deployments that switched over see their Search & Queries numbers start
+  // from the switchover: the KV history is still there under its existing
+  // TTL, but it is not merged in. Merging would mean reading the whole KV
+  // corpus on every call to add a shrinking tail of pre-switch counts to
+  // rows that D1 already answers in one query, and the two would double-count
+  // for any day both paths wrote.
+  if (env.DB) {
+    const rows = await d1CountsByKindPrefix(env, "searchq:", window, 100);
+    return rows
+      .map((r) => ({ query: r.key, count: r.count }))
+      .filter((e) => e.count > 0)
+      .slice(0, 100);
+  }
   const prefix = "searchquery:";
   if (window === "alltime") {
     const listResult = await listAllKeys(env.CONFIGS, prefix);
