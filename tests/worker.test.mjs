@@ -8367,3 +8367,67 @@ describe("1.5.3: the admin dashboard reads those counters back out of D1", () =>
     assert.deepEqual(board.entries.map((e) => [e.id, e.title]), [["tt555", "Backfilled Movie"]]);
   });
 });
+
+// Discover's six shared-view pills (Movies, Shows, Hidden Gems, Kids,
+// Holidays, Genres -- plus All when it renders through the same feed) had no
+// header and no Refresh button, unlike the Popular Lists and Curated pills
+// right beside them in the same sub-nav, which both have one. Reported
+// directly: "Popular Lists and Curated has a refresh button and the others
+// does not."
+describe("Discover: every sub-nav pill gets a header and a Refresh button", () => {
+  const tab = fs.readFileSync(path.join(REPO_ROOT, "11_tab-quick-add.js"), "utf8");
+  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8");
+  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8");
+
+  it("gives the shared discoverListsFeed its own header and Refresh button", () => {
+    const before = tab.slice(0, tab.indexOf('id="discoverListsFeed"'));
+    const header = before.slice(before.indexOf('<div class="shelf-header" id="discoverListsFeedHeader"'));
+    assert.match(header, /class="shelf-header"/, "same header shape as Popular Lists and Curated");
+    assert.match(header, /id="discoverListsFeedTitle"/, "a title element filterDiscoverShelves can update");
+    assert.match(header, /onclick="[^"]*renderDiscoverChartsList\([^)]*true\)/,
+      "Refresh must force a real refresh, not hit the cache/loaded guard");
+  });
+
+  it("hides the shared header pre-hydration exactly where it hides the feed itself", () => {
+    // Popular and Curated get their own dedicated panel and header, so the
+    // shared one must stay hidden under those two initial subs the same way
+    // #discoverListsFeed already does -- otherwise a saved "popular" or
+    // "curated" sub flashes the wrong header before JS swaps the panels.
+    for (const sub of ["popular", "curated"]) {
+      const re = new RegExp(
+        `html\\[data-initial-discover-sub="${sub}"\\] #discoverListsFeedHeader,`
+      );
+      assert.match(shell, re, `#discoverListsFeedHeader must be hidden alongside #discoverListsFeed for "${sub}"`);
+    }
+  });
+
+  it("filterDiscoverShelves shows the header for every shared-feed pill and titles it correctly", () => {
+    const start = core.indexOf("function filterDiscoverShelves");
+    const fn = core.slice(start, core.indexOf("\n}\n", start) + 3);
+    assert.match(fn, /feedHeader\.style\.display = 'flex'/, "the header must be shown, not just the feed");
+    assert.match(fn, /DISCOVER_FEED_TITLES\[window\._currentDiscoverFilter\]/,
+      "the title must track the active pill rather than staying fixed");
+
+    const titles = core.slice(core.indexOf("const DISCOVER_FEED_TITLES"));
+    const obj = titles.slice(0, titles.indexOf("};") + 2);
+    // Every pill 11_tab-quick-add.js wires to filterDiscoverShelves, other
+    // than popular/curated (which get their own header, not this one), must
+    // have a title here -- a pill added to the sub-nav without one falls
+    // back to "All" silently instead of failing a test.
+    const pillFilters = [...tab.matchAll(/data-sub="(\w+)"/g)].map((m) => m[1]).filter((f) => f !== "popular" && f !== "curated");
+    assert.ok(pillFilters.length >= 6, `expected the shared-feed pills, found ${JSON.stringify(pillFilters)}`);
+    for (const f of pillFilters) {
+      assert.match(obj, new RegExp(`\\b${f}:\\s*'`), `DISCOVER_FEED_TITLES is missing an entry for "${f}"`);
+    }
+  });
+
+  it("hides popular's and curated's own header state from the shared one, and back", () => {
+    const start = core.indexOf("function filterDiscoverShelves");
+    const fn = core.slice(start, core.indexOf("\n}\n", start) + 3);
+    // The unconditional reset near the top of the function is what this
+    // depends on -- it must run before either branch, or switching from a
+    // shared-feed pill to Popular/Curated would leave the old title showing
+    // behind the popular/curated panel.
+    assert.match(fn, /if \(feedHeader\) feedHeader\.style\.display = 'none';/);
+  });
+});

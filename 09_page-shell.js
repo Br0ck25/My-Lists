@@ -645,8 +645,10 @@ ${seoHeadHtml}
 
   /* Discover */
   html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="popular"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="popular"] #discoverListsFeed,
   html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="curated"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="curated"] #discoverListsFeed {
     display: none !important;
   }
@@ -1462,6 +1464,23 @@ ${seoHeadHtml}
       grid-template-columns: repeat(9, 1fr);
       gap: 6px;
     }
+  }
+  /* loadPosterSlot's failure state (19_client-search-and-likes.js) -- a
+     one-line message and a Retry button in place of the poster grid, so a
+     card that could not be fetched (even after its own automatic retry)
+     says so instead of just sitting there blank. */
+  .list-card-posters.poster-preview-error {
+    display: flex;
+    grid-template-columns: none;
+  }
+  .poster-preview-error-msg {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 0.85rem;
   }
   .list-card-mini-poster {
     aspect-ratio: 2 / 3;

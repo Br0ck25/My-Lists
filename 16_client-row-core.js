@@ -1596,6 +1596,7 @@ function filterDiscoverShelves(filter, btn) {
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
   const feedContainer = document.getElementById('discoverListsFeed');
+  const feedHeader = document.getElementById('discoverListsFeedHeader');
   const popularContainer = document.getElementById('discoverSubPopular');
   const curatedContainer = document.getElementById('discoverSubCurated');
 
@@ -1603,6 +1604,7 @@ function filterDiscoverShelves(filter, btn) {
   if (curatedContainer) curatedContainer.style.display = 'none';
   if (shelvesContainer) shelvesContainer.style.display = 'none';
   if (feedContainer) feedContainer.style.display = 'none';
+  if (feedHeader) feedHeader.style.display = 'none';
 
   if (filter === 'popular') {
     if (popularContainer) {
@@ -1617,6 +1619,11 @@ function filterDiscoverShelves(filter, btn) {
   } else {
     if (feedContainer) {
       feedContainer.style.display = 'block';
+      if (feedHeader) {
+        feedHeader.style.display = 'flex';
+        const titleEl = document.getElementById('discoverListsFeedTitle');
+        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'All';
+      }
       window._discoverFeedsCache = window._discoverFeedsCache || {};
       if (window._discoverFeedsCache[filter]) {
         feedContainer.innerHTML = window._discoverFeedsCache[filter];
@@ -1627,6 +1634,19 @@ function filterDiscoverShelves(filter, btn) {
     }
   }
 }
+
+// Title text for discoverListsFeedHeader, above -- the six pills that share
+// discoverListsFeed (all, Movies, Shows, Hidden Gems, Kids, Holidays,
+// Genres) each need their own, matching the pill label.
+const DISCOVER_FEED_TITLES = {
+  all: 'All',
+  movie: 'Movies',
+  series: 'Shows',
+  gems: 'Hidden Gems',
+  kids: 'Kids',
+  holidays: 'Holidays',
+  genres: 'Genres',
+};
 
 // Renders the chart lists for the Movies or Shows tab in Discover as list-cards
 // (matching how search results and the Lists tab look) by converting the

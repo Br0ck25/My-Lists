@@ -48,7 +48,17 @@
     ${genresHtml}
   </div>
 
-  <!-- Discover Lists Feed (Movies / Shows list view matching search) -->
+  <!-- Discover Lists Feed (Movies / Shows / Hidden Gems / Kids / Holidays /
+       Genres list view matching search). Same header + Refresh shape as the
+       Popular Lists and Curated cards below -- one shared header, since all
+       six share this one container, with filterDiscoverShelves swapping its
+       title text to match the active pill. Refresh re-runs
+       renderDiscoverChartsList with forceRefresh, which also retries any
+       poster preview that failed to load the first time. -->
+  <div class="shelf-header" id="discoverListsFeedHeader" style="display:none; margin-bottom:10px;">
+    <h2 class="shelf-title" id="discoverListsFeedTitle">All</h2>
+    <button type="button" class="secondary lc-btn" onclick="if (typeof renderDiscoverChartsList === 'function') renderDiscoverChartsList(window._currentDiscoverFilter || 'all', true);">Refresh</button>
+  </div>
   <div id="discoverListsFeed" style="display:none;"></div>
 
   <!-- Popular Lists Feed in Discover -->

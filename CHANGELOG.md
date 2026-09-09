@@ -160,6 +160,18 @@ need?".
 
 ### 🐛 Fixes
 
+- **A card's poster preview could go blank and stay blank.** Reported as "sometimes lists just doesn't load"
+  on Discover's sub-nav tabs. Every list card's 9-poster strip is its own `/api/preview` call, up to 40 cards
+  at once (5 concurrently, a mixed movie+show card costing two) — enough to occasionally catch its own per-IP
+  rate limit or a single upstream timeout, and one failed call was treated as final: nothing rendered, nothing
+  logged anywhere visible, and no way back short of a full page reload, since the render is cached once it
+  completes and switching tabs away and back just replayed the same blank result. A failed preview now retries
+  once automatically, which clears the common case silently; a card that still fails renders a plain
+  "Couldn't load previews for this list" message with its own Retry button instead of staying blank.
+- **Discover's sub-nav tabs get a header and a Refresh button.** Movies, Shows, Hidden Gems, Kids, Holidays and
+  Genres had neither — Popular Lists and Curated, two pills over, had both. All six now show the same header
+  shape with a title matching the pill and a Refresh button, which forces a real re-render rather than the
+  cached one and so is also a manual way to clear the poster-preview failures above.
 - **"KV put() limit exceeded for the day."** Marking a support thread done started failing on the live site,
   and the cause was nowhere near the admin panel: the two telemetry recorders were still on KV. Every tracked
   title cost **four** KV writes — a day-counts blob, a running total, a day index and a display blob — so a
@@ -193,7 +205,7 @@ need?".
 
 ### 🧪 Tests
 
-454 pass, 1 skipped (up from 401). Seventeen mutations — one per behaviour this release introduces — each
+464 pass, 1 skipped (up from 401). Twenty-three mutations — one per behaviour this release introduces — each
 caught by the test written for it. Two test helpers were quietly not testing what they claimed: a cron tick was drained
 with a single snapshot of `ctx.waitUntil`, so background work registered *by* that work was never awaited, and
 the tests only passed because the pre-warm slept long enough between charts.

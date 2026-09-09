@@ -15834,8 +15834,10 @@ ${seoHeadHtml}
 
   /* Discover */
   html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="popular"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="popular"] #discoverListsFeed,
   html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
+  html[data-initial-discover-sub="curated"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="curated"] #discoverListsFeed {
     display: none !important;
   }
@@ -16651,6 +16653,23 @@ ${seoHeadHtml}
       grid-template-columns: repeat(9, 1fr);
       gap: 6px;
     }
+  }
+  /* loadPosterSlot's failure state (19_client-search-and-likes.js) -- a
+     one-line message and a Retry button in place of the poster grid, so a
+     card that could not be fetched (even after its own automatic retry)
+     says so instead of just sitting there blank. */
+  .list-card-posters.poster-preview-error {
+    display: flex;
+    grid-template-columns: none;
+  }
+  .poster-preview-error-msg {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 0.85rem;
   }
   .list-card-mini-poster {
     aspect-ratio: 2 / 3;
@@ -18848,7 +18867,17 @@ if ('serviceWorker' in navigator) {
     ${genresHtml}
   </div>
 
-  <!-- Discover Lists Feed (Movies / Shows list view matching search) -->
+  <!-- Discover Lists Feed (Movies / Shows / Hidden Gems / Kids / Holidays /
+       Genres list view matching search). Same header + Refresh shape as the
+       Popular Lists and Curated cards below -- one shared header, since all
+       six share this one container, with filterDiscoverShelves swapping its
+       title text to match the active pill. Refresh re-runs
+       renderDiscoverChartsList with forceRefresh, which also retries any
+       poster preview that failed to load the first time. -->
+  <div class="shelf-header" id="discoverListsFeedHeader" style="display:none; margin-bottom:10px;">
+    <h2 class="shelf-title" id="discoverListsFeedTitle">All</h2>
+    <button type="button" class="secondary lc-btn" onclick="if (typeof renderDiscoverChartsList === 'function') renderDiscoverChartsList(window._currentDiscoverFilter || 'all', true);">Refresh</button>
+  </div>
   <div id="discoverListsFeed" style="display:none;"></div>
 
   <!-- Popular Lists Feed in Discover -->
@@ -21366,6 +21395,7 @@ function filterDiscoverShelves(filter, btn) {
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
   const feedContainer = document.getElementById('discoverListsFeed');
+  const feedHeader = document.getElementById('discoverListsFeedHeader');
   const popularContainer = document.getElementById('discoverSubPopular');
   const curatedContainer = document.getElementById('discoverSubCurated');
 
@@ -21373,6 +21403,7 @@ function filterDiscoverShelves(filter, btn) {
   if (curatedContainer) curatedContainer.style.display = 'none';
   if (shelvesContainer) shelvesContainer.style.display = 'none';
   if (feedContainer) feedContainer.style.display = 'none';
+  if (feedHeader) feedHeader.style.display = 'none';
 
   if (filter === 'popular') {
     if (popularContainer) {
@@ -21387,6 +21418,11 @@ function filterDiscoverShelves(filter, btn) {
   } else {
     if (feedContainer) {
       feedContainer.style.display = 'block';
+      if (feedHeader) {
+        feedHeader.style.display = 'flex';
+        const titleEl = document.getElementById('discoverListsFeedTitle');
+        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'All';
+      }
       window._discoverFeedsCache = window._discoverFeedsCache || {};
       if (window._discoverFeedsCache[filter]) {
         feedContainer.innerHTML = window._discoverFeedsCache[filter];
@@ -21397,6 +21433,19 @@ function filterDiscoverShelves(filter, btn) {
     }
   }
 }
+
+// Title text for discoverListsFeedHeader, above -- the six pills that share
+// discoverListsFeed (all, Movies, Shows, Hidden Gems, Kids, Holidays,
+// Genres) each need their own, matching the pill label.
+const DISCOVER_FEED_TITLES = {
+  all: 'All',
+  movie: 'Movies',
+  series: 'Shows',
+  gems: 'Hidden Gems',
+  kids: 'Kids',
+  holidays: 'Holidays',
+  genres: 'Genres',
+};
 
 // Renders the chart lists for the Movies or Shows tab in Discover as list-cards
 // (matching how search results and the Lists tab look) by converting the
@@ -27061,161 +27110,222 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
   populateSearchResultPosters();
 }
 
+// Fetches one page of a list preview from /api/preview. Pulled out of
+// populateSearchResultPosters (its only caller before this) so
+// fetchListPreviewWithRetry, right below, and the per-card retry button it
+// backs can both reach it without duplicating the six external-key lookups.
+async function fetchListPreviewOnce(listUrl, type, sample) {
+  const payload = { url: listUrl, type: type, sample: sample || 12 };
+  const mkInput = document.getElementById('mdblistKeyInput');
+  payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const tkInput = document.getElementById('tmdbKeyInput');
+  payload.tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+  const trkInput = document.getElementById('traktKeyInput');
+  payload.traktKey = (trkInput && trkInput.value ? trkInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
+
+  const trkToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  if (trkToken) payload.traktAccessToken = trkToken;
+  const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  if (mdbToken) payload.mdblistAccessToken = mdbToken;
+  const smkToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  if (smkToken) payload.simklAccessToken = smkToken;
+  const skInput = document.getElementById('simklKeyInput');
+  payload.simklKey = (skInput && skInput.value ? skInput.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      cache: 'no-store',
+    });
+    if (!res.ok) return { ok: false };
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return { ok: false };
+    return await res.json();
+  } catch (e) {
+    return { ok: false };
+  }
+}
+
+// One immediate retry, no backoff. This is what a Discover/My Lists/Search
+// card's poster strip going permanently blank almost always was: not a real
+// failure, but a burst of concurrent /api/preview calls (up to 40 cards at
+// once, 5 at a time, a mixed-type card costing two) catching the per-IP
+// preview rate limit (25_api-catalog-routes.js), or one upstream timeout.
+// The caller used to treat "not ok" as final and leave the slot empty
+// forever -- nothing rendered, nothing logged anywhere a user could see,
+// and no way to get the card back short of a full page reload. This clears
+// the common transient case silently; loadPosterSlot below still leaves a
+// visible, retryable failure state for whatever is left after this.
+async function fetchListPreviewWithRetry(listUrl, type, sample) {
+  const first = await fetchListPreviewOnce(listUrl, type, sample);
+  if (first && first.ok) return first;
+  return fetchListPreviewOnce(listUrl, type, sample);
+}
+
+// Retry button inside the failure state loadPosterSlot renders below.
+// Restores the slot to its pre-fetch shape and re-runs the same per-card
+// logic a fresh render would have.
+function retryPosterSlot(btn) {
+  const slot = btn && btn.closest('.list-card-posters');
+  if (!slot) return;
+  slot.className = 'list-card-posters poster-preview-slot';
+  slot.innerHTML = '';
+  loadPosterSlot(slot);
+}
+
+async function fetchPreviewForSlot(listUrl, type) {
+  if (type !== 'mixed') {
+    return fetchListPreviewWithRetry(listUrl, type);
+  }
+  const [movieResult, seriesResult] = await Promise.all([
+    fetchListPreviewWithRetry(listUrl, 'movie').catch(() => null),
+    fetchListPreviewWithRetry(listUrl, 'series').catch(() => null),
+  ]);
+  const movieOk = movieResult && movieResult.ok;
+  const seriesOk = seriesResult && seriesResult.ok;
+  if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
+  const movieSample = movieOk ? (movieResult.sample || []) : [];
+  const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
+  const merged = [];
+  const maxLen = Math.max(movieSample.length, seriesSample.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (movieSample[i]) merged.push(movieSample[i]);
+    if (seriesSample[i]) merged.push(seriesSample[i]);
+  }
+  // totalItems only when BOTH halves reported one -- adding a known count
+  // to an unknown one produces a number that looks authoritative and is
+  // simply wrong. maybeMore if either half has more to give.
+  const movieTotal = movieOk && typeof movieResult.totalItems === 'number' ? movieResult.totalItems : null;
+  const seriesTotal = seriesOk && typeof seriesResult.totalItems === 'number' ? seriesResult.totalItems : null;
+  return {
+    ok: true,
+    sample: merged,
+    count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
+    totalItems: (movieTotal != null && seriesTotal != null) ? (movieTotal + seriesTotal) : null,
+    maybeMore: !!((movieOk && movieResult.maybeMore) || (seriesOk && seriesResult.maybeMore)),
+  };
+}
+
+// Fetches and renders one card's poster strip in place. Shared by
+// populateSearchResultPosters' concurrent worker loop and by
+// retryPosterSlot above, so a card that still fails after
+// fetchListPreviewWithRetry's own automatic retry can be retried by hand
+// without reloading the page or losing whatever else already loaded.
+//
+// The slot keeps the .poster-preview-slot class for exactly as long as this
+// is in flight, success or failure -- stashCatalogSearchView (below) reads
+// that class to know a card has not resolved yet and skips caching the view
+// around it, so this must not drop the class before it is actually done.
+async function loadPosterSlot(slot) {
+  if (!slot) return;
+  const listUrl = slot.dataset.url;
+  const type = slot.dataset.type || 'movie';
+  const listName = slot.dataset.name || listUrl;
+  const parentCard = slot.closest('.list-card');
+  const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
+  const cardItems = (parentCard && parentCard.dataset.items) || slot.dataset.items || '';
+  const cardLikes = (parentCard && parentCard.dataset.likes) || slot.dataset.likes || '';
+
+  try {
+    const data = await fetchPreviewForSlot(listUrl, type);
+    if (data.ok && data.sample && data.sample.length) {
+      const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
+      if (validPosters.length) {
+        // What this card can honestly claim about the list's size.
+        //
+        // This used to be data.count -- the number of items on the FIRST
+        // PAGE, which /api/preview caps at 100. So every list longer than
+        // that advertised "100", and the badge carried that 100 into the
+        // See All page as an exact item count (see the searchViewListBtn
+        // handler and openListDetailsPage's knownTotalItems), where it
+        // then overrode the real count as more pages loaded. A 303-item
+        // chart said 100 items, and went on saying it after the whole
+        // list had been scrolled through.
+        //
+        // So: a real total when the source reports one (totalItems), the
+        // stored count when the directory knows it (cardItems), and
+        // otherwise "100+" -- which is all that is actually known when a
+        // full page came back and more remains. exactCount is what the
+        // details page may adopt as a total; the "+" estimate is
+        // deliberately not passed on, so that page counts what it loads
+        // rather than believing a floor.
+        const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
+        const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
+        const totalCount = exactCount || ((data.count || validPosters.length) + '+');
+        const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
+        const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
+
+        let inner = '';
+        validPosters.forEach((s, i) => {
+          const isMobileEnd = (i === 2 && validPosters.length > 3);
+          const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
+
+          let overlays = '';
+          if (isMobileEnd) {
+            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          if (isDesktopEnd) {
+            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+
+          let removeBtn = '';
+          if (isTraktSlot) {
+            const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
+            const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
+            const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
+            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+          } else if (isMdblistSlot) {
+            const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+            const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
+            const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
+            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+          }
+
+          inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+            '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
+              '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
+              removeBtn +
+              '<div class="poster-add-overlay">+</div>' +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
+            (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
+          '</div>';
+        });
+        slot.className = 'list-card-posters';
+        slot.innerHTML = inner;
+        return;
+      }
+    }
+    // Reached with nothing to show -- the fetch (and its automatic retry)
+    // both failed, or /api/preview genuinely came back with no posters. A
+    // sample this thin is rare enough among what this renders (charts,
+    // published lists, search results) that erring toward "couldn't load"
+    // and offering Retry is more useful than leaving the card silently
+    // blank, which is what a caller reported as "sometimes lists just don't
+    // load" with no way to tell why or fix it short of a page reload.
+    slot.className = 'list-card-posters poster-preview-error';
+    slot.innerHTML = '<p class="poster-preview-error-msg">Couldn’t load previews for this list.' +
+      ' <button type="button" class="lc-btn secondary" onclick="retryPosterSlot(this)">Retry</button></p>';
+  } catch (e) {
+    slot.className = 'list-card-posters poster-preview-error';
+    slot.innerHTML = '<p class="poster-preview-error-msg">Couldn’t load previews for this list.' +
+      ' <button type="button" class="lc-btn secondary" onclick="retryPosterSlot(this)">Retry</button></p>';
+  }
+}
+
 async function populateSearchResultPosters() {
   const slots = [...document.querySelectorAll('.poster-preview-slot')];
   let idx = 0;
   const CONCURRENCY = 5;
 
-  async function fetchPreviewOnce(listUrl, type) {
-    const payload = { url: listUrl, type: type, sample: 12 };
-    const mkInput = document.getElementById('mdblistKeyInput');
-    payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
-    const tkInput = document.getElementById('tmdbKeyInput');
-    payload.tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
-    const trkInput = document.getElementById('traktKeyInput');
-    payload.traktKey = (trkInput && trkInput.value ? trkInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
-    
-    const trkToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
-    if (trkToken) payload.traktAccessToken = trkToken;
-    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
-    if (mdbToken) payload.mdblistAccessToken = mdbToken;
-    const smkToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
-    if (smkToken) payload.simklAccessToken = smkToken;
-    const skInput = document.getElementById('simklKeyInput');
-    payload.simklKey = (skInput && skInput.value ? skInput.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
-    
-    try {
-      const res = await fetch(ORIGIN + '/api/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        cache: 'no-store',
-      });
-      if (!res.ok) return { ok: false };
-      const ct = res.headers.get('content-type') || '';
-      if (!ct.includes('application/json')) return { ok: false };
-      return await res.json();
-    } catch (e) {
-      return { ok: false };
-    }
-  }
-
-  async function fetchPreviewForSlot(listUrl, type) {
-    if (type !== 'mixed') {
-      return fetchPreviewOnce(listUrl, type);
-    }
-    const [movieResult, seriesResult] = await Promise.all([
-      fetchPreviewOnce(listUrl, 'movie').catch(() => null),
-      fetchPreviewOnce(listUrl, 'series').catch(() => null),
-    ]);
-    const movieOk = movieResult && movieResult.ok;
-    const seriesOk = seriesResult && seriesResult.ok;
-    if (!movieOk && !seriesOk) return movieResult || seriesResult || { ok: false };
-    const movieSample = movieOk ? (movieResult.sample || []) : [];
-    const seriesSample = seriesOk ? (seriesResult.sample || []) : [];
-    const merged = [];
-    const maxLen = Math.max(movieSample.length, seriesSample.length);
-    for (let i = 0; i < maxLen; i++) {
-      if (movieSample[i]) merged.push(movieSample[i]);
-      if (seriesSample[i]) merged.push(seriesSample[i]);
-    }
-    // totalItems only when BOTH halves reported one -- adding a known count
-    // to an unknown one produces a number that looks authoritative and is
-    // simply wrong. maybeMore if either half has more to give.
-    const movieTotal = movieOk && typeof movieResult.totalItems === 'number' ? movieResult.totalItems : null;
-    const seriesTotal = seriesOk && typeof seriesResult.totalItems === 'number' ? seriesResult.totalItems : null;
-    return {
-      ok: true,
-      sample: merged,
-      count: (movieOk ? (movieResult.count || 0) : 0) + (seriesOk ? (seriesResult.count || 0) : 0),
-      totalItems: (movieTotal != null && seriesTotal != null) ? (movieTotal + seriesTotal) : null,
-      maybeMore: !!((movieOk && movieResult.maybeMore) || (seriesOk && seriesResult.maybeMore)),
-    };
-  }
-
   async function worker() {
     while (idx < slots.length) {
       const slot = slots[idx++];
       if (!slot) continue;
-      const listUrl = slot.dataset.url;
-      const type = slot.dataset.type || 'movie';
-      const listName = slot.dataset.name || listUrl;
-      const parentCard = slot.closest('.list-card');
-      const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
-      const cardItems = (parentCard && parentCard.dataset.items) || slot.dataset.items || '';
-      const cardLikes = (parentCard && parentCard.dataset.likes) || slot.dataset.likes || '';
-
-      try {
-        const data = await fetchPreviewForSlot(listUrl, type);
-        if (data.ok && data.sample && data.sample.length) {
-          const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
-          if (validPosters.length) {
-            // What this card can honestly claim about the list's size.
-            //
-            // This used to be data.count -- the number of items on the FIRST
-            // PAGE, which /api/preview caps at 100. So every list longer than
-            // that advertised "100", and the badge carried that 100 into the
-            // See All page as an exact item count (see the searchViewListBtn
-            // handler and openListDetailsPage's knownTotalItems), where it
-            // then overrode the real count as more pages loaded. A 303-item
-            // chart said 100 items, and went on saying it after the whole
-            // list had been scrolled through.
-            //
-            // So: a real total when the source reports one (totalItems), the
-            // stored count when the directory knows it (cardItems), and
-            // otherwise "100+" -- which is all that is actually known when a
-            // full page came back and more remains. exactCount is what the
-            // details page may adopt as a total; the "+" estimate is
-            // deliberately not passed on, so that page counts what it loads
-            // rather than believing a floor.
-            const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
-            const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
-            const totalCount = exactCount || ((data.count || validPosters.length) + '+');
-            const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
-            const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
-
-            let inner = '';
-            validPosters.forEach((s, i) => {
-              const isMobileEnd = (i === 2 && validPosters.length > 3);
-              const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
-
-              let overlays = '';
-              if (isMobileEnd) {
-                overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-              }
-              if (isDesktopEnd) {
-                overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-              }
-
-              let removeBtn = '';
-              if (isTraktSlot) {
-                const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
-                const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
-                const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
-                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
-              } else if (isMdblistSlot) {
-                const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
-                const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
-                const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
-                removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
-              }
-
-              inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
-                '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
-                  '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
-                  removeBtn +
-                  '<div class="poster-add-overlay">+</div>' +
-                  overlays +
-                '</div>' +
-                '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
-                (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
-              '</div>';
-            });
-            slot.className = 'list-card-posters';
-            slot.innerHTML = inner;
-          }
-        }
-      } catch (e) {}
+      await loadPosterSlot(slot);
     }
   }
 
