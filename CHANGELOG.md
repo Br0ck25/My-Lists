@@ -160,6 +160,25 @@ need?".
 
 ### 🐛 Fixes
 
+- **"KV put() limit exceeded for the day."** Marking a support thread done started failing on the live site,
+  and the cause was nowhere near the admin panel: the two telemetry recorders were still on KV. Every tracked
+  title cost **four** KV writes — a day-counts blob, a running total, a day index and a display blob — so a
+  browser posting a ten-title batch spent 41 of the free plan's 1,000 writes a day, and roughly 250 watched
+  titles exhausted the allowance for *everything*, admin actions included. A search cost three more. Counters
+  moved to D1 where D1 is bound, which is the same move `bumpStat` made a while back and these two never
+  followed. **No migration to run:** `stats` is keyed `(kind, day)` and its `kind` dimension was already
+  unbounded, so `evt:{type}:{id}` and `searchq:{q}` go in beside the counters already there. A ten-title batch
+  now costs one write per *newly seen* title and nothing at all on a repeat; a search costs nothing.
+  - On the Trending and Search & Queries panels, a D1 deployment's numbers start from the switchover. The KV
+    history stays under its existing TTL (120 days daily, 400 all-time) and is not merged in — merging would
+    double-count every day both paths wrote.
+  - Deployments with **no D1 bound are unchanged** and still read and write KV, with the two wasteful writes
+    fixed there too: neither the day index nor the display blob is rewritten when its contents have not
+    changed, and the display blob refreshes at most once a day per title (immediately if the title or media
+    type actually changed). That is one KV read traded for one KV write, which on the free plan is 100 000
+    reads a day against 1 000.
+  - "Backfill Existing Data" follows the counters onto D1. Left on KV it would have run to completion, reported
+    its title counts, and left the All Time board showing nothing.
 - `/api/external-list/create` returned HTTP 500 and an internal error string when a body field was not a
   string. Fixed there and at the six sibling sites in the same file with the same shape.
 - `/api/creator/reset-key` answered HTTP 200 on every failure. Throttles answer 429, credential failures 401 —
@@ -174,8 +193,8 @@ need?".
 
 ### 🧪 Tests
 
-428 pass, 1 skipped (up from 401). Ten mutations — one per behaviour this release introduces — each caught by
-the test written for it. Two test helpers were quietly not testing what they claimed: a cron tick was drained
+454 pass, 1 skipped (up from 401). Seventeen mutations — one per behaviour this release introduces — each
+caught by the test written for it. Two test helpers were quietly not testing what they claimed: a cron tick was drained
 with a single snapshot of `ctx.waitUntil`, so background work registered *by* that work was never awaited, and
 the tests only passed because the pre-warm slept long enough between charts.
 

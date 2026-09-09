@@ -8211,3 +8211,159 @@ describe("the last open items from the 2026-09-05 audit", () => {
       "the removed route leaves a note saying what still reads its records");
   });
 });
+
+// The bug this closes was visible as "KV put() limit exceeded for the day" on
+// an unrelated admin action: the free plan allows 1,000 KV writes a day, and
+// the telemetry recorders were spending them four at a time per tracked title.
+// bumpStat's counters moved to D1 a while back; these two never did.
+describe("1.5.3: telemetry counters go to D1 when it is bound", () => {
+  const watch = (env, events, ip) =>
+    call(env, "/api/track-event", { method: "POST", ip: ip || nextIp(), json: { events } });
+  const titles = (n) =>
+    Array.from({ length: n }, (_, i) => ({ eventType: "watched", id: "tt" + i, title: "T" + i, mediaType: "movie" }));
+
+  function countPuts(kv) {
+    const c = { n: 0, keys: [] };
+    const put = kv.put.bind(kv);
+    kv.put = async (...a) => { c.n++; c.keys.push(String(a[0])); return put(...a); };
+    return c;
+  }
+
+  it("writes no per-title count keys to KV at all", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    await watch(env, titles(10));
+    const countKeys = [...kv._store.keys()].filter((k) => k.startsWith("evtcount:") || k.startsWith("evtdayindex:"));
+    assert.deepEqual(countKeys, [],
+      "these are what exhausted the write budget -- with D1 bound they must not be written at all");
+    // ...and the counts really are in D1, under the same `stats` table
+    // bumpStat already uses, so no migration was needed.
+    assert.equal(env.DB._stat("evt:watched:tt0", "total"), 1);
+  });
+
+  it("charges one KV write per tracked title, not four -- and none at all on a repeat", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const cold = countPuts(kv);
+    await watch(env, titles(10));
+    // 10 display-field blobs + the one per-IP rate-limit counter. It was 41.
+    assert.equal(cold.n, 11, `cold: ${JSON.stringify(cold.keys)}`);
+
+    const warm = countPuts(kv);
+    await watch(env, titles(10));
+    assert.equal(warm.n, 1, `a second batch of the same titles must only touch the rate-limit key, got ${JSON.stringify(warm.keys)}`);
+  });
+
+  it("still records a search, and spends nothing on it", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1(), TMDB_API_KEY: "k" });
+    const c = countPuts(kv);
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    assert.equal(c.n, 0, `a search must cost zero KV writes with D1 bound, got ${JSON.stringify(c.keys)}`);
+    assert.equal(env.DB._stat("searchq:matrix", "total"), 1);
+  });
+
+  it("the display fields are refreshed when a title is renamed, not on every event", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const one = (title) => watch(env, [{ eventType: "watched", id: "tt7", title, mediaType: "movie" }]);
+    await one("Old Name");
+    const c = countPuts(kv);
+    await one("Old Name");
+    assert.ok(!c.keys.some((k) => k.startsWith("evtmeta:")), "unchanged meta must not be rewritten");
+    await one("New Name");
+    assert.ok(c.keys.some((k) => k === "evtmeta:watched:tt7"), "a renamed title must still update");
+    assert.equal(JSON.parse(kv._store.get("evtmeta:watched:tt7")).title, "New Name");
+  });
+});
+
+describe("1.5.3: the admin dashboard reads those counters back out of D1", () => {
+  async function adminCookie(env) {
+    const login = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "test-admin-secret" } });
+    return (login.headers.get("set-cookie") || "").split(";")[0];
+  }
+
+  it("Trending shows D1-recorded titles, ranked, with their names attached", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const events = [
+      ...Array.from({ length: 3 }, () => ({ eventType: "watched", id: "tt111", title: "Popular", mediaType: "movie" })),
+      { eventType: "watched", id: "tt222", title: "Quiet One", mediaType: "series" },
+    ];
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: { events } });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie });
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.entries.map((e) => [e.id, e.title, e.count]),
+      [["tt111", "Popular", 3], ["tt222", "Quiet One", 1]]);
+  });
+
+  it("the media-type filter still applies before the top-100 cut", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: { events: [
+      { eventType: "watched", id: "tt111", title: "A Movie", mediaType: "movie" },
+      { eventType: "watched", id: "tt222", title: "A Show", mediaType: "series" },
+    ] } });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/leaderboard?type=watched&window=alltime&mediaType=series", { cookie });
+    assert.deepEqual(body.entries.map((e) => e.id), ["tt222"]);
+  });
+
+  it("a window means a window -- yesterday's count is not in today's board", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    // Written straight into the table the way a previous day's traffic would
+    // have left it, since the recorder can only ever write "today".
+    const old = new Date(Date.now() - 40 * 86400000).toISOString().slice(0, 10);
+    await env.DB.prepare("INSERT INTO stats (kind, day, n) VALUES (?, ?, ?)").bind("evt:watched:tt999", old, 99).run();
+    await env.DB.prepare("INSERT INTO stats (kind, day, n) VALUES (?, ?, ?)").bind("evt:watched:tt999", "total", 99).run();
+    const cookie = await adminCookie(env);
+    const today = (await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie })).body;
+    assert.deepEqual(today.entries, [], "a title last seen 40 days ago is not trending today");
+    const alltime = (await call(env, "/admin/api/leaderboard?type=watched&window=alltime", { cookie })).body;
+    assert.deepEqual(alltime.entries.map((e) => [e.id, e.count]), [["tt999", 99]], "but all-time still has it");
+    const ninety = (await call(env, "/admin/api/leaderboard?type=watched&window=90", { cookie })).body;
+    assert.deepEqual(ninety.entries.map((e) => e.count), [99], "and so does a window wide enough to reach it");
+  });
+
+  it("Search & Queries shows D1-recorded searches", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1(), TMDB_API_KEY: "k" });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    await call(env, "/api/title-search?q=alien", { ip: nextIp() });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/analytics?section=search&window=today", { cookie });
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.searches.map((s) => [s.query, s.count]), [["matrix", 2], ["alien", 1]]);
+  });
+
+  it("the leaderboards keep working on a deployment with no D1 bound", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), TMDB_API_KEY: "k" });
+    assert.equal(env.DB, undefined);
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: {
+      events: [{ eventType: "watched", id: "tt111", title: "KV Title", mediaType: "movie" }],
+    } });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    const cookie = await adminCookie(env);
+    const trending = (await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie })).body;
+    assert.deepEqual(trending.entries.map((e) => [e.id, e.title, e.count]), [["tt111", "KV Title", 1]]);
+    const search = (await call(env, "/admin/api/analytics?section=search&window=today", { cookie })).body;
+    assert.deepEqual(search.searches.map((s) => [s.query, s.count]), [["matrix", 1]]);
+  });
+
+  it("Backfill Existing Data lands where the board actually reads from", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const U = await createUser(env, "backfilluser");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: U.creatorName, creatorKey: U.creatorKey, name: "Faves", type: "movie",
+      items: [{ id: "tt555", title: "Backfilled Movie" }],
+    } });
+    const cookie = await adminCookie(env);
+    let guard = 0;
+    while (guard++ < 20) {
+      const { body } = await call(env, "/admin/api/backfill-trending", { method: "POST", cookie, json: {} });
+      if (body.done) break;
+    }
+    // Written to KV alone, this would have reported success and shown nothing.
+    const board = (await call(env, "/admin/api/leaderboard?type=list-add&window=alltime", { cookie })).body;
+    assert.deepEqual(board.entries.map((e) => [e.id, e.title]), [["tt555", "Backfilled Movie"]]);
+  });
+});

@@ -1,5 +1,86 @@
 # Changes Log
 
+## 2026-09-09 - The KV write budget: telemetry counters move to D1
+
+### Files Changed
+`03_admin.js`, `worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Reported as an admin bug: marking a support thread done answered `500`, and once the swallowed error was made
+visible (previous change) it read **"KV put() limit exceeded for the day."** The feedback write was the victim,
+not the cause. The free plan allows 1,000 KV writes a day across the whole namespace, and the two telemetry
+recorders were spending them faster than anything else in the app:
+
+- `recordTrackedEvent` wrote **four** keys per tracked title — `evtcount:{type}:{id}:days`,
+  `evtcount:{type}:{id}:alltime`, `evtdayindex:{type}:{day}` and `evtmeta:{type}:{id}`. Measured end to end, a
+  browser posting a ten-title batch to `/api/track-event` spent **41** KV writes. Roughly 250 watched titles in
+  a day exhausted the whole allowance, at which point *every* KV write in the app fails — which is why a bug in
+  the analytics beacon surfaced as a broken button in the admin panel.
+- `recordSearchQuery` wrote three per search: **3** KV writes for one `/api/title-search`.
+
+Two of those four were pure waste. `evtdayindex:` is one list per (type, day): the first event for a title
+appends its id, and every later event that day re-serialised and rewrote a blob it had not altered.
+`evtmeta:` was written on *every* event by design — the comment said "overwritten every time rather than only
+on first sight — keeps title/mediaType current if either ever changes upstream, and lastSeen doubles as a cheap
+staleness signal" — which is a real requirement that does not need a write per event to meet.
+
+The larger point is the one the report asked: `bumpStat` moved its counters to D1 a while back. These two never
+followed, so a D1-bound deployment was still paying KV write costs for the noisiest counters it has.
+
+### What Changed
+
+**Both recorders take the D1 branch `bumpStat` already had (`03`).** `d1BumpStat(env, kind, buckets, amount)`
+with `kind` = `evt:{eventType}:{id}` or `searchq:{q}`, buckets `["total", day]` — one batched upsert,
+`ON CONFLICT(kind, day) DO UPDATE SET n = n + excluded.n`, which is atomic where the KV read-modify-write never
+was. **No migration:** `stats` is keyed `(kind, day)` and its `kind` dimension is already unbounded —
+`list_copy:{slug}` mints one row per list — so these go in beside the rows already there. The day index is not
+written at all on this path; a range scan over `day` replaces it.
+
+**The readers gained matching D1 branches (`03`).** `d1CountsByKindPrefix(env, prefix, window, cap)` is the
+shared query: `day = 'total'` for all-time, `day >= ? AND day <= ? GROUP BY kind` for a window, `LIKE` with an
+explicit `ESCAPE` so a `%` or `_` in an id or a search term stays a literal. `computeLeaderboard` uses it for
+its candidates; `computeSearchLeaderboard` uses it directly, since a search term is its own display value and
+has nothing to attach.
+
+**`writeEventMetaIfChanged` (`03`), one helper both paths call.** The display blob is rewritten when the title
+or media type has actually changed, and otherwise at most once a day per title so `lastSeen` stays meaningful.
+It costs one KV read; on the free plan that is 100,000 a day against 1,000 writes. The day index on the KV path
+got the same treatment — written only when an id is actually added.
+
+**`backfillTitleCount` follows them (`03`).** Not for the write budget: `computeLeaderboard` now reads counts
+from D1, so a backfill that only wrote KV would run to completion, report its title counts, and leave the All
+Time board empty. It bumps `evt:{type}:{id}` at `total` only — no day bucket, for the reason its own comment
+already gives.
+
+**Deployments with no D1 bound are unchanged in behaviour** and keep both KV paths, with the two wasteful
+writes fixed there too.
+
+### The cost, measured
+
+Per request, against a stub KV that counts `put()`:
+
+| | before | after |
+|---|---|---|
+| `POST /api/track-event`, 10 titles, first sight | 41 | 11 |
+| `POST /api/track-event`, 10 titles, seen before | 41 | 1 |
+| `GET /api/title-search`, any term | 3 | 0 |
+
+The 11 is ten first-sight display blobs plus the per-IP rate-limit counter; the 1 is that counter alone, which
+is now the only KV write left on the beacon path.
+
+### What an operator sees
+
+Trending and Search & Queries restart from the switchover on a D1 deployment. The KV history stays under its
+existing TTL (120 days daily, 400 all-time) and is not merged in — merging would mean reading the whole KV
+corpus on every call to add a shrinking tail to rows D1 answers in one query, and the two would double-count
+every day both paths wrote.
+
+### Verification
+`bash verify.sh` — 454 pass, 1 skipped. Ten new tests, and seven mutations — the D1 branch removed from each of the two recorders,
+each of the two readers and the backfill; the once-a-day meta throttle disabled; and the window predicate
+dropped from the range query — each caught by the test written for it.
+
 ## 2026-09-08 - UI reports from real use: page shift, PWA bars, See All counts, Search reloads
 
 ### Files Changed
