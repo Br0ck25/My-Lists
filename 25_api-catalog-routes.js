@@ -4965,7 +4965,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
             return json({ ok: true, entry });
           }
-        } catch (e) {}
+        } catch (e) {
+          // This was `catch (e) {}` -- an empty one, and the worst of the five
+          // feedback writes that dropped their error.
+          //
+          // Falling out of this block does not stop here: execution carries on
+          // into the "New Thread" path below, which mints a fresh id and files
+          // the message as its own report. So a reply that failed to save was
+          // silently turned into a DUPLICATE THREAD, detached from the
+          // conversation it was answering -- the sender was told it went
+          // through, the admin saw a new orphan report, and nothing was logged
+          // either way.
+          //
+          // A reply that cannot be saved is an error, so it is reported as
+          // one. The empty-entry case is unaffected: that never enters this
+          // `if (entry)` block, so an unknown thread id still falls through to
+          // New Thread exactly as it always did.
+          return json({ ok: false, error: safeErrorMessage(e, "Could not save your reply right now. Please try again in a moment.") }, 500);
+        }
       }
 
       // New Thread
@@ -5004,6 +5021,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
         await putFeedbackThread(env, `feedback:${id}`, entry);
         if (!isAdmin) await env.CONFIGS.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 86400 });
       } catch (e) {
+        // Logged rather than swallowed, for the reason spelled out at the
+        // admin status route (26_...). This one is NOT admin-only, so the
+        // caller keeps the generic wording -- safeErrorMessage still writes
+        // the real error to the log, which is the half that was missing.
+        safeErrorMessage(e);
         return json({ ok: false, error: "Could not save your feedback right now. Please try again in a moment." }, 500);
       }
       return json({ ok: true, entry });

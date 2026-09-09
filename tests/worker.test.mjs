@@ -3414,6 +3414,157 @@ describe("audit fix 10: admin Community Lists ranks by likes, not by key order",
 // buttons inside one card. These pin the two on the same shape -- the risk is
 // not that a card looks wrong, it is that a section added later quietly goes
 // back to a naked heading and nobody notices until it is live.
+// Marking a feedback item done answered 500 with "Could not save that change.
+// Please try again." whatever had actually gone wrong, and wrote nothing to the
+// log -- so neither the admin looking at the toast nor anyone reading the logs
+// afterwards could tell a exhausted KV write budget from a transient blip.
+// All four feedback writes bound the caught error and dropped it.
+describe("admin feedback: a failed write says what failed", () => {
+  const entry = {
+    id: "1757380000000:abc123def456",
+    message: "Something is broken",
+    category: "bug",
+    createdAt: 1757380000000,
+    completed: false,
+    messages: [{ id: "m1", sender: "user", senderName: "User", text: "Something is broken", timestamp: 1757380000000 }],
+  };
+
+  // Reads keep working while writes throw -- which is what an exhausted KV
+  // write budget looks like from inside a Worker, and is the shape of the
+  // report: the inbox lists fine, marking one done 500s.
+  async function withFailingWrite(pathname, body, failure) {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, ADMIN_KEY: "test-admin-key" });
+    kv._store.set("feedback:" + entry.id, JSON.stringify(entry));
+    const cookie = await adminCookie(env);
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => {
+      if (String(k).startsWith("feedback:")) throw failure;
+      return realPut(k, ...rest);
+    };
+    const logged = [];
+    const realErr = console.error;
+    console.error = (...a) => logged.push(a.map(String).join(" "));
+    try {
+      const r = await call(env, pathname, { method: "POST", cookie, json: body });
+      return { status: r.status, error: r.body && r.body.error, logged };
+    } finally {
+      console.error = realErr;
+    }
+  }
+
+  const budgetGone = () => new Error("KV PUT failed: 429 Too Many Requests - daily request limit exceeded");
+
+  it("tells the admin what went wrong instead of a fixed 'try again'", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, budgetGone());
+    assert.equal(r.status, 500);
+    assert.match(r.error, /daily request limit exceeded/,
+      "the operator has to be able to tell a spent write budget from a blip");
+  });
+
+  it("writes the real error to the log as well", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, budgetGone());
+    assert.ok(r.logged.some((l) => /daily request limit exceeded/.test(l)),
+      "nothing reached the log at all before this, so a report of it was unanswerable");
+  });
+
+  it("keeps the old wording when the error carries no message of its own", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, new Error(""));
+    assert.equal(r.error, "Could not save that change. Please try again.",
+      "an empty error must not surface as a blank or as the literal word Error");
+  });
+
+  it("redacts a url or a credential out of what it shows", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true },
+      // Deliberately not shaped like any real provider's key: long enough to
+      // trip safeErrorMessage's bare-credential rule ([A-Za-z0-9_-]{32,}) and
+      // its labelled token= rule, without imitating a live key well enough for
+      // GitHub's push protection to reject the commit carrying it.
+      new Error("PUT https://kv.example/ns failed, token=EXAMPLE-NOT-A-REAL-CREDENTIAL-0123456789"));
+    assert.doesNotMatch(r.error, /EXAMPLE-NOT-A-REAL-CREDENTIAL/, "a credential must not come back in the response");
+    assert.doesNotMatch(r.error, /https:\/\/kv\.example/);
+    assert.ok(r.logged.some((l) => /EXAMPLE-NOT-A-REAL-CREDENTIAL/.test(l)),
+      "but the raw error still has to reach the log");
+  });
+
+  it("does the same for the reply and edit writes", async () => {
+    const reply = await withFailingWrite("/admin/api/feedback/reply", { id: entry.id, message: "on it" }, budgetGone());
+    assert.match(reply.error, /daily request limit exceeded/);
+    const edit = await withFailingWrite("/admin/api/feedback/edit", { id: entry.id, message: "reworded" }, budgetGone());
+    assert.match(edit.error, /daily request limit exceeded/);
+  });
+
+  it("does not turn a failed reply into a duplicate thread", async () => {
+    // The fifth swallowed catch, and the one that lost data rather than just
+    // context: it was `catch (e) {}`, and falling out of that block carries on
+    // into the New Thread path below it. A reply whose write failed was filed
+    // as its own fresh report, detached from the conversation it answered --
+    // sender told it went through, admin left with an orphan.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    kv._store.set("feedback:" + entry.id, JSON.stringify(entry));
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => {
+      if (String(k).startsWith("feedback:")) throw new Error("KV PUT failed: daily request limit exceeded");
+      return realPut(k, ...rest);
+    };
+    const realErr = console.error;
+    console.error = () => {};
+    let r;
+    try {
+      r = await call(env, "/api/feedback", {
+        method: "POST", ip: nextIp(),
+        json: { message: "any progress on this?", threadId: entry.id },
+      });
+    } finally {
+      console.error = realErr;
+    }
+    assert.equal(r.status, 500, "a reply that could not be saved must say so");
+    assert.notEqual(r.body.ok, true);
+    const threads = [...kv._store.keys()].filter((k) => k.startsWith("feedback:"));
+    assert.deepEqual(threads, ["feedback:" + entry.id],
+      `a failed reply minted a second thread: ${JSON.stringify(threads)}`);
+  });
+
+  it("still falls through to a new thread when the id is simply unknown", async () => {
+    // The fallthrough the empty catch was sitting next to is legitimate and
+    // has to survive: an unknown thread id never enters that block at all.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const r = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { message: "first report", threadId: "1700000000000:doesnotexist" },
+    });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+    const threads = [...kv._store.keys()].filter((k) => k.startsWith("feedback:"));
+    assert.equal(threads.length, 1, "an unknown thread id still files a new report");
+    assert.notEqual(threads[0], "feedback:1700000000000:doesnotexist",
+      "and it gets its own id rather than adopting the one it was handed");
+  });
+
+  it("leaves no feedback write that drops the error it caught", () => {
+    // The defect was structural: four catches that bound `e` and never used
+    // it. This is what stops a fifth being added the same way.
+    const sources = ["25_api-catalog-routes.js", "26_api-creator-and-admin-routes.js"];
+    for (const rel of sources) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
+      let from = 0;
+      for (;;) {
+        const at = src.indexOf("await putFeedbackThread(", from);
+        if (at === -1) break;
+        from = at + 1;
+        // The catch belonging to this write, up to the end of its block.
+        const after = src.slice(at, at + 1600);
+        const catchAt = after.indexOf("} catch");
+        assert.notEqual(catchAt, -1, `${rel}: a putFeedbackThread with no catch at all`);
+        const block = after.slice(catchAt, after.indexOf("}", after.indexOf("return", catchAt)) + 1);
+        assert.match(block, /safeErrorMessage\(/,
+          `${rel}: a putFeedbackThread failure is being swallowed again:\n${block}`);
+      }
+    }
+  });
+});
+
 // Lists -> Liked showed nothing until the Refresh button was pressed, and a
 // browser reload put it straight back to empty.
 //

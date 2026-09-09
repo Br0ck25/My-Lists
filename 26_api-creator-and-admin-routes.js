@@ -5011,7 +5011,10 @@
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        return json({ ok: false, error: "Could not save reply." }, 500);
+        // safeErrorMessage, not a fixed string: it logs the real error and
+        // hands back a redacted version of it. See the status route below for
+        // why these four writes stopped swallowing what went wrong.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save reply.") }, 500);
       }
       return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
     }
@@ -5046,7 +5049,22 @@
       try {
         await putFeedbackThread(env, key, entry);
       } catch (e) {
-        return json({ ok: false, error: "Could not save that change. Please try again." }, 500);
+        // This catch used to bind `e` and drop it, returning a fixed "please
+        // try again" whatever had actually happened -- so an admin hitting a
+        // 500 here (and whoever they reported it to) had no way to find out
+        // why, and nothing was written to the log either. Every comparable
+        // failure path in this Worker logs; these four feedback writes were
+        // the exception.
+        //
+        // safeErrorMessage does both halves: it console.errors the raw error,
+        // so it shows up in `wrangler tail` and the Cloudflare dashboard, and
+        // it returns the message with urls and anything credential-shaped
+        // redacted. This route is behind isAdminRequest, so the person who
+        // sees it is the operator -- exactly who needs to know whether this
+        // was, say, the KV write budget rather than a transient blip. The old
+        // wording stays as the fallback for an error that carries no usable
+        // message of its own.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save that change. Please try again.") }, 500);
       }
       return json({ ok: true }, 200, { "Cache-Control": "no-store" });
     }
@@ -5099,7 +5117,8 @@
         await putFeedbackThread(env, key, entry);
         return json({ ok: true, entry }, 200, { "Cache-Control": "no-store" });
       } catch (e) {
-        return json({ ok: false, error: "Could not save edits. Please try again." }, 500);
+        // Logged and reported rather than swallowed -- see the status route.
+        return json({ ok: false, error: safeErrorMessage(e, "Could not save edits. Please try again.") }, 500);
       }
     }
 
