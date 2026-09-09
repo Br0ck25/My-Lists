@@ -72,11 +72,18 @@
 
   <!-- Submenu 2: Liked Lists Feed -->
   <div class="lists-subpanel" id="listsSubLiked" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Lists You Liked</h2>
-      <button type="button" class="secondary lc-btn" onclick="renderLikedListsFeed()">Refresh</button>
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title">Lists You Liked</h2>
+        <button type="button" class="secondary lc-btn" onclick="renderLikedListsFeed(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Lists you've saved with the heart, from the community directory and from your connected accounts.</p>
+      <!-- The placeholder here is the pre-JS state only. renderLikedListsFeed
+           overwrites it on every switch to this tab and is authoritative for
+           the empty case -- nothing may read this element's children to decide
+           whether the feed has loaded. See switchListsSubmenu. -->
+      <div id="likedListsFeed"><p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p></div>
     </div>
-    <div id="likedListsFeed"><p style="color:var(--muted); font-size:0.88rem;">No liked lists yet. Tap the heart &#x2661; on any list to save it here.</p></div>
   </div>
 
   <!-- Submenu 5: Create Custom List Builder -->

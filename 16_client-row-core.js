@@ -1215,9 +1215,21 @@ function switchListsSubmenu(name, btn) {
     }
   }
   if (name === 'liked') {
-    const likedBox = document.getElementById('likedListsFeed');
-    const hasLikedContent = likedBox && likedBox.children.length > 0;
-    if (!hasLikedContent && typeof renderLikedListsFeed === 'function') {
+    // Called unconditionally, unlike the five above, because #likedListsFeed
+    // is the one feed container that ships with a child in the markup -- the
+    // "No liked lists yet" placeholder. The "has it already loaded?" test the
+    // others use (children.length > 0) was therefore true from the very first
+    // paint here, so this never ran: the feed stayed empty until the Refresh
+    // button called it directly, and a browser reload put it straight back to
+    // empty. The others are genuinely empty divs, which is why only this one
+    // was affected.
+    //
+    // Nothing is lost by dropping the guard. renderLikedListsFeed already
+    // owns that decision and does it properly -- it returns early when the
+    // liked count it last rendered still matches and the container is not
+    // mid-load -- so this was a second, wrong copy of a check that was
+    // already being made one level down.
+    if (typeof renderLikedListsFeed === 'function') {
       renderLikedListsFeed();
     }
   }
