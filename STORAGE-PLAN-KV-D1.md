@@ -79,6 +79,26 @@ Indexes: `idx_creator_lists_username`, `idx_creator_lists_visibility`,
 **2,000,000 bytes**. `CREATOR_LIST_BYTES_MAX = 1_800_000` exists precisely because a
 list over that ceiling silently stops being mirrored.
 
+**D1 platform limits** (verified against Cloudflare's docs, September 2026). These are
+the numbers every decision below is checked against:
+
+| Limit | Value | Where it bites |
+| --- | --- | --- |
+| Maximum database size | **10 GB** (Paid) / 500 MB (Free) | The real ceiling for the "keep everything" retention policy (§5.4) |
+| Maximum string, BLOB, or row size | **2,000,000 bytes** | `items_json`; and why the 24 MB sync blobs cannot move wholesale (§4.4) |
+| Queries per Worker invocation | **1,000** (Paid) / 50 (Free) | Was the binding constraint on the index rebuild; gone on Paid |
+| Maximum bound parameters per query | **100** | Batch sizing for backfills — chunk at ≤100 params, not ≤100 rows |
+| Maximum **LIKE or GLOB pattern: 50 bytes** | 50 bytes | **Decides §5.1's search.** A user-supplied query longer than 50 bytes cannot be a `LIKE` pattern at all |
+| Maximum SQL statement length | 100 KB | Fine for everything here |
+| Maximum SQL query duration | 30 seconds | Fine |
+| Maximum columns per table | 100 | Fine |
+| Maximum rows per table | Unlimited (within database size) | — |
+
+Existing `LIKE` call sites are all short fixed prefixes — `catalog_add:%`,
+`list_copy:%`, `sourcegroup:%`, `evt:{type}:%` — so none of them is near the 50-byte
+pattern cap today. It is only a problem for search over user-supplied text, which is
+exactly what §5.1 was undecided about.
+
 ### 2.3 KV today — complete namespace inventory
 
 Grouped by what the data actually *is*, with the verdict from §4.
@@ -90,8 +110,8 @@ Grouped by what the data actually *is*, with the verdict from §4.
 | `creator:{username}` | displayName, keyHash, recoveryAnswerHash, createdAt | get by key; `list()`-scanned by admin | Yes (`creators`) | **D1 authoritative**, KV read-through cache |
 | `creatorlastseen:{username}` | timestamp | get/put by key | Yes (`creators.last_active`) | **D1 only** |
 | `creatordeleted:{username}` | tombstone, TTL 300s | get by key | Yes (`creator_tombstones`) | **Keep in KV** as cheap first check; D1 stays the authority |
-| `creatorscrobbletoken:{username}` | token | get by key | No | Keep in KV (pure lookup) — but see §4.3 |
-| `scrobbletoken:{token}` | username (reverse index) | get by key | No | Keep in KV (pure lookup) |
+| `creatorscrobbletoken:{username}` | token | get by key | No | **D1** — revocation is not safe on KV, see §4.3 |
+| `scrobbletoken:{token}` | username (reverse index) | get by key | No | **D1** — same table, unique index |
 | `creatorshare:{username}` | share/profile settings | get/put by key | No | **D1** — column(s) on `creators` |
 | `authfail:{scope}:{day}` | int, TTL 86400 | get/put | Partial (D1 read at `02:1571`) | **Keep in KV** — approximate is fine, TTL-scoped |
 | rate-limit keys (`feedbackrate:`, register/recovery/login limiters) | int, TTL 60/86400 | get/put | No | **Keep in KV** |
@@ -254,8 +274,8 @@ now, worth a retention policy (§5.4).
 ### 4.2 Records that move to D1 as the source of truth
 
 `creators`, `creator_lists`, `published_lists` (new), `list_likes` (new),
-`list_tombstones` (new), `feedback` (new), `creator_tombstones`, `stats`, `source_groups`,
-plus `event_meta` (new).
+`list_tombstones` (new), `feedback` (new), `scrobble_tokens` (new), `creator_tombstones`,
+`stats`, `source_groups`, plus `event_meta` (new).
 
 KV keeps a **read-through cache** for the two hottest public reads — `creator:{username}`
 and `creatorlist:{username}:{slug}` — written on read-miss and invalidated on write, with
@@ -268,9 +288,15 @@ reconciling.
 - `cache:*`, `tmdbdetail:*` — provider response caches.
 - Rate limiters, `authfail:*`, `creatordeleted:*` — TTL'd, approximate-tolerant.
 - Cron cursors and migration state — single-writer scalars.
-- `scrobbletoken:{token}` ↔ `creatorscrobbletoken:{username}` — a genuine bidirectional
-  key lookup on a hot path. *Optional:* a `scrobble_tokens` table would let you list and
-  revoke tokens from the admin panel; if that is not wanted, KV is correct here.
+**Scrobble tokens are the one thing that moves out of this list.** They look KV-shaped
+— a bidirectional lookup on a hot path — but `getOrCreateScrobbleToken(env, username,
+rotate)` makes them a *rotating credential*, and rotation on KV has the exact failure
+`authoritativeKeyHash` was written to defeat: the write deleting the old token key is
+edge-cached, so a colo that has not seen it keeps accepting a revoked token for the
+length of that window. A revoked credential that still authenticates is not a
+performance issue. D1 is strongly consistent and this is a primary-key lookup, so the
+cost is one indexed read. **Do not put a KV cache in front of it** — that reintroduces
+precisely the staleness being removed.
 
 ### 4.4 The sync blobs — split, don't move wholesale
 
@@ -333,6 +359,16 @@ CREATE TABLE feedback (
 );
 CREATE INDEX idx_feedback_status_updated ON feedback(status, updated_at DESC);
 
+-- Replaces scrobbletoken:{token} + creatorscrobbletoken:{username}.
+-- One row per issued token; rotation is a DELETE + INSERT in one batch, so a
+-- revoked token stops working everywhere at once.
+CREATE TABLE scrobble_tokens (
+    token      TEXT PRIMARY KEY,
+    username   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_scrobble_tokens_user ON scrobble_tokens(username);
+
 -- Replaces evtmeta:{type}:{id}
 CREATE TABLE event_meta (
     event_type TEXT NOT NULL,
@@ -341,6 +377,19 @@ CREATE TABLE event_meta (
     media_type TEXT,
     last_seen  INTEGER NOT NULL,
     PRIMARY KEY (event_type, item_id)
+);
+```
+
+Search index — see §5.1 for why this is FTS5 and not `LIKE`:
+
+```sql
+-- Derived, fully rebuildable from the two base tables. Never a source of truth.
+CREATE VIRTUAL TABLE lists_fts USING fts5(
+    list_id UNINDEXED,
+    name,
+    creator_name,
+    username,
+    tokenize = 'unicode61 remove_diacritics 2'
 );
 ```
 
@@ -357,18 +406,68 @@ ALTER TABLE creator_lists ADD COLUMN sort_order  INTEGER;   -- creatorlistorder:
 | Today | After |
 | --- | --- |
 | Merge 32 KV shards, sort in memory | `SELECT … FROM creator_lists WHERE visibility='public' ORDER BY likes DESC, updated_at DESC LIMIT ?` (uses `idx_creator_lists_vis_likes`, already present) |
-| `list(prefix)` + get-per-key + substring match | `WHERE visibility='public' AND (name LIKE ? OR username LIKE ?)` — or FTS5 if D1 supports it in your account |
+| `list(prefix)` + get-per-key + substring match | `SELECT list_id FROM lists_fts WHERE lists_fts MATCH ? ORDER BY rank` joined back to the base tables — **FTS5, confirmed available** (§5.1a) |
 | `readLikeVoters` → parse → mutate → put | `INSERT OR IGNORE INTO list_likes …` / `DELETE FROM list_likes …`; count is `SELECT COUNT(*)` |
 | `feedback:` list-scan of up to 1,000 keys | `WHERE status=? ORDER BY updated_at DESC LIMIT ?` |
 | `evtdayindex:` fan-out | `WHERE day BETWEEN ? AND ? GROUP BY kind` (already implemented in `d1CountsByKindPrefix`) |
 
+### 5.1a Search: FTS5, with one operational string attached
+
+**FTS5 is available on D1.** Cloudflare's SQL-support docs list "FTS5 module for
+full-text search (including `fts5vocab`)" as supported, alongside the JSON extension and
+math functions. Nothing account-specific gates it — if your database runs the migrations
+in this repo today, it will accept a `CREATE VIRTUAL TABLE … USING fts5(…)`.
+
+**Use it rather than `LIKE`, and the deciding factor is not speed.** D1 caps a `LIKE` or
+`GLOB` pattern at **50 bytes**. A search box is user-supplied text, so a `LIKE`-based
+search is not merely slow on long queries — it cannot express them. `LIKE` was never a
+viable primary path here; it is at best a fallback for short queries, and FTS5 also gives
+ranking (`ORDER BY rank`) that the current in-memory substring match has no equivalent for.
+
+**The string attached — this is the one real cost, and it needs a decision recorded:**
+
+> "Export is not supported for virtual tables, including databases with virtual tables."
+
+So once `lists_fts` exists, `wrangler d1 export` and the dashboard's export button stop
+working **for the whole database**, not just that table. Cloudflare's documented
+workaround is to drop the virtual table, export, and recreate it.
+
+That is acceptable here for one specific reason: `lists_fts` is **derived**. It is an
+index over `creator_lists` and `published_lists` and contains no fact that is not in
+those tables. Losing it costs a rebuild, never data. Concretely:
+
+1. Populate it from the same write path that writes the base row (or a trigger), never
+   independently — it must not be able to hold something the base tables do not.
+2. Ship an admin **"Rebuild search index"** action: `DROP TABLE lists_fts; CREATE …;
+   INSERT INTO lists_fts SELECT …`. This is the direct replacement for the
+   "Rebuild public index" button Phase 1 deletes, and it is also the export procedure.
+3. Document the backup sequence in README's D1 section: drop `lists_fts` → export →
+   recreate via the admin action.
+
+**If losing one-command export is unacceptable**, the fallback is a `search_text` column
+on each base table (lowercased `name || ' ' || creator_name || ' ' || username`) with a
+`LIKE ?` query, accepting the 50-byte pattern cap by truncating the query server-side.
+It keeps export working and is strictly worse at its job. The recommendation is FTS5.
+
 ### 5.2 Counters still missing from D1
 
 `stats:creator_count` → `SELECT COUNT(*) FROM creators` (drop the key entirely).
-`stats:genres:alltime` / `stats:decades:alltime` → JSON blobs today; either keep as KV
-(they are read whole, written by one aggregation path) or normalize into
-`stats` rows with kinds `genre:{name}` / `decade:{n}`. **Recommendation: normalize** —
-they are already displayed as a ranked list, which is a sort.
+`stats:genres:alltime` / `stats:decades:alltime` → **normalize** into `stats` rows with
+kinds `genre:{name}` and `decade:{n}`. **Decided.** Three reasons:
+
+- They are rendered as a *ranked list*, which is a sort — the operation KV is worst at.
+  Today the whole blob is read and sorted in memory on every dashboard load.
+- They are written by `bumpJsonCounterBlob`, a read-modify-write of a single JSON key, and
+  so carry the same lost-update race `migrations/0002` removed from every other counter.
+  Normalizing puts them on the atomic `ON CONFLICT … n = n + excluded.n` upsert with
+  everything else.
+- `idx_stats_day_totals` is covering for `WHERE day='total' … ORDER BY n DESC`, so the
+  ranked read becomes an index seek with no sort and no table access.
+
+Note this makes them the *only* two kinds where an existing KV blob must be exploded into
+many rows rather than copied one-for-one, so `/admin/api/migrate-d1` needs a small extra
+branch (the current code explicitly skips them: "JSON blobs … none of them belong in an
+integer column").
 
 ### 5.3 Make D1 required
 
@@ -378,11 +477,35 @@ forces every accessor into the KV-first-then-fallback shape, and it is what make
 dual-write divergence unfixable. Dropping it is the precondition for most of the
 simplification below.
 
-### 5.4 Retention
+### 5.4 Retention — keep everything
 
-Add a cron-driven prune: `stats` rows older than N days for daily buckets,
-`list_tombstones`/`creator_tombstones` past `until`, `event_meta` past 400 days
-(matching the TTL KV gave it for free). D1 has no TTL; this must be explicit.
+D1 has no TTL. Several of these namespaces get expiry for free from KV today
+(`evtmeta:` 400 days, `evtcount:` 120/400 days, `feedback:` 180 days); once they move,
+nothing expires unless something deletes it. **That is the desired outcome: no analytics,
+telemetry or feedback prune. Keep the full history.**
+
+What that commits you to:
+
+- **The ceiling is the 10 GB database size limit** (Workers Paid). That is the number to
+  watch — not a row count, and not an age.
+- `stats` grows as (distinct `kind` values) × (days). The `kind` dimension is unbounded
+  by construction: `list_copy:{slug}`, `watch_type:{type}`, `evt:{type}:{id}`, `genre:{…}`
+  and the search-analytics kinds each mint new values. At roughly 40 bytes per row, a
+  million rows is ~40 MB — the ceiling is a long way off, but it is not infinite.
+- Growth is a **storage** question, not a latency one: `idx_stats_day_totals` is covering
+  for the hot totals query, so reads do not degrade as the table fills.
+
+**Add a size monitor, not a prune.** Surface row counts and database size on the admin
+dashboard's existing diagnostics panel, so the ceiling is something you watch approaching
+rather than discover. If it ever does come into view, the first move is **rollup, not
+deletion** — fold daily buckets older than N months into monthly ones (`day = 'YYYY-MM'`),
+which preserves every series at lower resolution. Deletion stays off the table.
+
+**One exception: tombstones.** `creator_tombstones` and `list_tombstones` rows are
+semantically spent once `until` has passed — `migrations/0004` already states a
+deployment "can safely delete rows whose `until` has passed". Pruning those is not data
+loss, and it keeps "a row means deleted, full stop" unambiguous. Prune those on the cron;
+keep everything else indefinitely.
 
 ---
 
@@ -412,7 +535,9 @@ failure modes, and touches no write path that users can see.
 2. Rewrite `/lists/public.json` and `getPublicListIndex` as a `UNION ALL` over
    `creator_lists` and `published_lists`, both filtered on `visibility` and ordered by
    `likes DESC, updated_at DESC`.
-3. Rewrite `/api/search-published-lists` as an indexed query.
+3. Rewrite `/api/search-published-lists` against `lists_fts` (§5.1a), populated from the
+   same write path as the base rows, plus the admin "Rebuild search index" action that
+   doubles as the export procedure.
 4. Delete: `readPublicListIndex`, `readPublicListIndexMeta`, `writePublicListIndex`,
    `updatePublicListIndex`, `rebuildPublicListIndex`, `advancePublicListIndexBuild`,
    `refreshPublicListIndexIfStale`, `claimLikeIndexWrite`, `removeListsFromPublicIndex`,
@@ -453,8 +578,12 @@ one full release cycle, and watch the `sync_conflict` / auth-failure counters.
 3. Add `event_meta`; migrate `evtmeta:*`. Route `evtcount:*` and `searchquery:*` writes
    through `d1BumpStat` (the read path already prefers D1). Delete `evtdayindex:*` and
    `searchquerydayindex:*`.
-4. Migrate `stats:creator_count`, `stats:genres:alltime`, `stats:decades:alltime`.
-5. Add the retention cron from §5.4.
+4. Migrate `stats:creator_count` (or drop it — it is `SELECT COUNT(*) FROM creators`),
+   and explode `stats:genres:alltime` / `stats:decades:alltime` into `genre:{name}` /
+   `decade:{n}` rows per §5.2. Route `bumpJsonCounterBlob` through `d1BumpStat`.
+5. Add `scrobble_tokens`; migrate both token keys; make rotation a single D1 batch
+   (`DELETE` old + `INSERT` new) so revocation takes effect everywhere at once.
+6. Add the tombstone-only prune and the size monitor from §5.4. **No analytics prune.**
 
 ### Phase 4 — Sync blob split (largest, least urgent)
 
@@ -481,7 +610,7 @@ it needs its own design pass.
 
 ---
 
-## 8. Risks and open questions
+## 8. Risks
 
 | Risk | Mitigation |
 | --- | --- |
@@ -490,13 +619,19 @@ it needs its own design pass.
 | D1 row/read pricing at scale | Paid plan removes the free-tier cliff, but the directory query should still be capped and cached. |
 | Backfill correctness | Every phase's backfill should be idempotent and resumable, following the existing `/admin/api/migrate-d1` pattern (phase cursor in KV, op budget, `ON CONFLICT DO UPDATE`). |
 | Ordering drift between old and new directory | Fixture test diffing both paths, per Phase 1. |
+| `lists_fts` disables `wrangler d1 export` for the whole database | The table is derived and rebuildable; ship the admin rebuild action *before* the FTS5 table exists, and document drop → export → recreate in README (§5.1a). |
+| Unbounded `stats` growth under "keep everything" | 10 GB ceiling, a dashboard size monitor, and rollup-to-monthly as the escape hatch — never deletion (§5.4). |
 
-**Open questions for the owner:**
+---
 
-1. Is D1 FTS5 available on your account? It decides whether §5.1's search is `LIKE`
-   or a real index.
-2. Should `scrobble_tokens` move to D1 for admin visibility/revocation, or stay a pure
-   KV lookup?
-3. `stats:genres:alltime` / `stats:decades:alltime` — normalize into `stats` rows
-   (recommended), or leave as KV blobs?
-4. Retention windows for `stats` daily buckets and `event_meta` — what is worth keeping?
+## 9. Decisions taken
+
+The four questions this plan opened with are now closed. Recorded here with the reasoning,
+because each one shapes a phase.
+
+| # | Question | Decision | Why |
+| --- | --- | --- | --- |
+| 1 | FTS5 available? | **Yes — use it.** | Cloudflare's docs list FTS5 (incl. `fts5vocab`) as supported; nothing is account-gated. The deciding factor turned out not to be availability but D1's **50-byte cap on `LIKE`/`GLOB` patterns**, which makes `LIKE` unable to express a normal search query at all. Cost: virtual tables disable database export — accepted, because `lists_fts` is derived and rebuildable. See §5.1a. |
+| 2 | Scrobble tokens → D1? | **Yes, move them.** | They are a *rotating credential*, not a static lookup. KV's edge cache lets a revoked token keep authenticating on colos that have not seen the delete — the same failure `authoritativeKeyHash` exists to defeat. No KV cache in front of it. See §4.3. |
+| 3 | Genres/decades? | **Normalize into `stats` rows.** | They are rendered as a ranked list (a sort), and they are written by a read-modify-write of one JSON key, carrying the lost-update race every other counter had removed in `migrations/0002`. See §5.2. |
+| 4 | Retention? | **Keep everything.** | No analytics, telemetry or feedback prune. The constraint becomes the 10 GB database ceiling rather than an age cutoff; manage it with a dashboard size monitor and, only if needed, rollup to monthly buckets rather than deletion. Expired tombstone rows are the sole exception. See §5.4. |
