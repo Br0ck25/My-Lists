@@ -624,7 +624,73 @@ it needs its own design pass.
 
 ---
 
-## 9. Decisions taken
+## 9. Readiness — what exists, what is missing
+
+**Everything needed to execute this plan already exists in the repo.** The gaps are
+additive work, not prerequisites to go acquire.
+
+### Already in place
+
+| Need | Status |
+| --- | --- |
+| A D1 database with all migrations applied | Confirmed by the owner (`0001a`–`0005`) |
+| A test harness that exercises D1 | `tests/harness.mjs` backs D1 with **real SQLite** (`node:sqlite`), loaded from the committed `schema.sql`, with `PRAGMA foreign_keys = ON` to match D1's documented default |
+| Fault injection for partial-write paths | `makeD1().failWhen` / the matching KV hook already cover "KV healthy, D1 fails" — the exact class Phase 2 changes |
+| Realistic KV semantics in tests | The harness models opaque, key-positioned cursors rather than offsets |
+| Regression coverage | 405 worker tests, 95 client tests, 10 helper tests |
+| Schema-drift protection | Test **A15** already asserts a fresh `schema.sql` and a migrated database end up the same shape — every new migration below must keep that green |
+| FTS5 testability | **Verified:** `node:sqlite` on Node 22.22 supports `CREATE VIRTUAL TABLE … USING fts5` and `MATCH … ORDER BY rank`, so the Phase 1 search path is coverable by the existing harness |
+| Build + CI | `build.py` (byte-exact concat), `verify.sh` (build-drift, `node --check`, `scope_check.mjs`), `.github/workflows/ci.yml` |
+
+The test harness is the single most important asset here: a refactor that moves the
+source of truth is exactly the kind of change that a KV/D1 mock would wave through and a
+real-SQLite harness with fault injection will catch.
+
+### Gaps to close as part of the work
+
+1. **`wrangler.toml` still has `[[d1_databases]]` commented out.** If you deploy from the
+   dashboard the binding is set there and this file is not read — but Phase 0 must
+   uncomment it regardless, or a `wrangler` deploy silently ships without D1.
+2. **Migrations `0006`+ do not exist yet** — one per new table (§5), each idempotent and
+   each mirrored into `schema.sql` to keep test A15 green.
+3. **No backfill jobs yet** for the new tables. Follow the existing
+   `/admin/api/migrate-d1` pattern: phase cursor in KV, op budget, resumable,
+   `ON CONFLICT DO UPDATE`.
+4. **No "Rebuild search index" admin action** — required by §5.1a *before* `lists_fts`
+   exists, since it doubles as the database-export procedure.
+5. **No dashboard size monitor** — required by §5.4, because "keep everything" makes the
+   10 GB ceiling the thing to watch.
+
+### Does this actually end the inverted model?
+
+**After Phases 0–3: yes, for every record.** Accounts, lists, anonymous published lists,
+likes, list ordering, tombstones, feedback, scrobble tokens, counters and telemetry all
+become D1-authoritative. What remains in KV — response caches, saved addon configs,
+rate limiters, cron cursors — is there because it is genuinely key-value, not because KV
+is standing in for a database. The read-through caches added in Phase 2 are caches: never
+read as an authority, never reconciled.
+
+**But the inversion is not fully gone until Phase 4.** The per-user sync blobs
+(`creatorsync:`, `creatorsynctracking:`) stay KV-authoritative through Phase 3, and they
+contain relational data — `watchHistory`, `continueWatching`, `airingNext`, `likedLists`,
+`hiddenLists`. Those are queried, sorted by date, and swept by cron out of a whole-blob
+rewrite. That is the same inversion, just confined to one place.
+
+**One transitional hazard to plan for:** between Phase 3 and Phase 4 there are two
+sources of truth for "which lists has this user liked" — the new `list_likes` table and
+`likedLists` inside the sync blob. Phase 3 should make `list_likes` authoritative and
+treat the blob's copy as a client-side cache the server ignores on read, rather than
+leaving both live. Otherwise Phase 3 reintroduces, for one field, the divergence the
+whole plan exists to remove.
+
+So: **Phases 0–3 fix the model; Phase 4 finishes the job.** Phase 4 is deferred not
+because it is optional but because it changes the client sync protocol and its
+optimistic-concurrency contract (`nextSyncVersion`, the 409 path), and that deserves its
+own design pass on a foundation that has already proven itself.
+
+---
+
+## 10. Decisions taken
 
 The four questions this plan opened with are now closed. Recorded here with the reasoning,
 because each one shapes a phase.
