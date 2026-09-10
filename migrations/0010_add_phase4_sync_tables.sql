@@ -68,11 +68,11 @@ CREATE TABLE IF NOT EXISTS airing_next (
 );
 CREATE INDEX IF NOT EXISTS idx_airing_next_user ON airing_next(username, air_date ASC);
 
--- 4. User List Relationships (liked lists, hidden lists, hidden sections)
+-- 4. User List Relationships: list_type in ('liked', 'hidden', 'hidden_section')
 CREATE TABLE IF NOT EXISTS creator_user_lists (
     username    TEXT NOT NULL,
     list_id     TEXT NOT NULL,
-    list_type   TEXT NOT NULL, -- 'liked', 'hidden', 'hidden_section'
+    list_type   TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (username, list_id, list_type)
 );
