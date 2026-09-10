@@ -2805,6 +2805,10 @@ async function renderAdminDashboard(env) {
           status.textContent = 'Failed: ' + (data.error || 'unknown error');
           return;
         }
+        if (data.username && data.username !== username) {
+          document.getElementById('deleteListUserInput').value = data.username;
+          creatorListsUser = data.username;
+        }
         creatorListsLoaded = creatorListsLoaded.concat(data.lists || []);
         creatorListsCursor = data.cursor || null;
         moreBtn.hidden = !creatorListsCursor;
@@ -2925,6 +2929,8 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
           ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
           (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
+        document.getElementById('deleteListSlugsInput').value = '';
+        await loadCreatorLists(true);
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }

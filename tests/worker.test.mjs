@@ -7802,6 +7802,49 @@ describe("admin: browsing one creator's stored lists", () => {
     const owner = await call(env, "/api/creator/lists", { method: "POST", json: K });
     assert.deepEqual([...owner.body.deletedSlugs].sort(), [...doomed].sort());
   });
+
+  it("reads lists directly from D1 and deletes them accurately when missing from KV", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await createUser(env, "canadutchy");
+    const cookie = await adminCookie(env);
+    // Insert directly into D1 creator_lists table, leaving KV empty
+    await env.DB.prepare(`
+      INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at, sort_order)
+      VALUES (?, ?, ?, 'movie', 'public', ?, 5, 1000, 2000, 0)
+    `).bind("canadutchy:coming-of-age", "canadutchy", "Coming Of Age", JSON.stringify([{ id: "tt1" }, { id: "tt2" }])).run();
+
+    // Verify KV has no key for this
+    assert.ok(!env.CONFIGS._store.has("creatorlist:canadutchy:coming-of-age"));
+
+    // Browse via admin endpoint (also test stripping leading @)
+    const res = await call(env, "/admin/api/creator-lists?username=@canadutchy", { cookie });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.username, "canadutchy");
+    assert.equal(res.body.lists.length, 1);
+    assert.equal(res.body.lists[0].slug, "coming-of-age");
+    assert.equal(res.body.lists[0].name, "Coming Of Age");
+    assert.equal(res.body.lists[0].itemCount, 2);
+    assert.equal(res.body.lists[0].likes, 5);
+
+    // Also verify alias lookup with hyphen: searching "cana-dutchy" resolves to "canadutchy"
+    const resHyphen = await call(env, "/admin/api/creator-lists?username=cana-dutchy", { cookie });
+    assert.equal(resHyphen.body.ok, true);
+    assert.equal(resHyphen.body.username, "canadutchy");
+    assert.equal(resHyphen.body.lists.length, 1);
+
+    // Delete the list via admin endpoint
+    const del = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "canadutchy", slugs: ["coming-of-age"] },
+    });
+    assert.equal(del.body.ok, true);
+    assert.deepEqual(del.body.deleted, ["coming-of-age"]);
+    assert.deepEqual(del.body.missing, []);
+    assert.equal(del.body.remaining, 0);
+
+    // Verify row is deleted from D1
+    const d1Check = await env.DB.prepare("SELECT * FROM creator_lists WHERE id = 'canadutchy:coming-of-age'").all();
+    assert.equal((d1Check.results || []).length, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------

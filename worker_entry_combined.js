@@ -4205,19 +4205,24 @@ async function pruneTombstones(env) {
 // say so.
 async function deleteCreatorLists(env, username, slugs) {
   const out = { deleted: [], missing: [], ok: true };
-  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
+  if (!env || (!env.CONFIGS && !env.DB) || !username || !slugs || !slugs.length) return out;
 
   for (const slug of slugs) {
     const key = `creatorlist:${username}:${slug}`;
     let existed = false;
-    try {
-      existed = !!(await env.CONFIGS.get(key));
-    } catch {
-      existed = false;
+    if (env.CONFIGS) {
+      try {
+        existed = !!(await env.CONFIGS.get(key));
+      } catch {
+        existed = false;
+      }
     }
     if (env.DB) {
       try {
-        await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+        const d1Res = await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+        if (d1Res && d1Res.meta && d1Res.meta.changes > 0) {
+          existed = true;
+        }
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
         } catch {}
@@ -4232,18 +4237,20 @@ async function deleteCreatorLists(env, username, slugs) {
     // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
     // skipping the KV delete on that basis leaves the list live in KV -- a
     // delete that reports success and deletes nothing.
-    try {
-      await env.CONFIGS.delete(key);
-    } catch (e) {
-      console.error("deleteCreatorLists: could not delete", key, e);
-      // KV is the authoritative store and the one every public read path
-      // uses, so this is the failure that means the list is still out there.
-      out.ok = false;
-    }
-    try {
-      await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
-    } catch (e) {
-      // A stranded ledger is untidy, not harmful on its own.
+    if (env.CONFIGS) {
+      try {
+        await env.CONFIGS.delete(key);
+      } catch (e) {
+        console.error("deleteCreatorLists: could not delete", key, e);
+        // KV is the authoritative store and the one every public read path
+        // uses, so this is the failure that means the list is still out there.
+        out.ok = false;
+      }
+      try {
+        await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
+      } catch (e) {
+        // A stranded ledger is untidy, not harmful on its own.
+      }
     }
     (existed ? out.deleted : out.missing).push(slug);
   }
@@ -4302,19 +4309,24 @@ async function deleteCreatorLists(env, username, slugs) {
 // failure rather than swallowing it -- is shared here explicitly.
 async function deletePublishedLists(env, slugs) {
   const out = { deleted: [], missing: [], ok: true };
-  if (!env || !env.CONFIGS || !slugs || !slugs.length) return out;
+  if (!env || (!env.CONFIGS && !env.DB) || !slugs || !slugs.length) return out;
 
   for (const slug of slugs) {
     const key = `publishedlist:user:${slug}`;
     let existed = false;
-    try {
-      existed = !!(await env.CONFIGS.get(key));
-    } catch {
-      existed = false;
+    if (env.CONFIGS) {
+      try {
+        existed = !!(await env.CONFIGS.get(key));
+      } catch {
+        existed = false;
+      }
     }
     if (env.DB) {
       try {
-        await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
+        const d1Res = await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
+        if (d1Res && d1Res.meta && d1Res.meta.changes > 0) {
+          existed = true;
+        }
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`).run();
         } catch {}
@@ -4323,20 +4335,21 @@ async function deletePublishedLists(env, slugs) {
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deletePublishedLists):", dbErr);
+        out.ok = false;
       }
     }
-    try {
-      await env.CONFIGS.delete(key);
-    } catch (e) {
-      console.error("deletePublishedLists: could not delete", key, e);
-      out.ok = false;
-    }
-    // Keyed by the same {user}:{slug} scope /api/lists/like uses, which for an
-    // anonymous list is the literal "user".
-    try {
-      await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
-    } catch (e) {
-      // A stranded ledger is untidy, not harmful on its own.
+    if (env.CONFIGS) {
+      try {
+        await env.CONFIGS.delete(key);
+      } catch (e) {
+        console.error("deletePublishedLists: could not delete", key, e);
+        out.ok = false;
+      }
+      try {
+        await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
+      } catch (e) {
+        // A stranded ledger is untidy, not harmful on its own.
+      }
     }
     (existed ? out.deleted : out.missing).push(slug);
   }
@@ -8786,6 +8799,10 @@ async function renderAdminDashboard(env) {
           status.textContent = 'Failed: ' + (data.error || 'unknown error');
           return;
         }
+        if (data.username && data.username !== username) {
+          document.getElementById('deleteListUserInput').value = data.username;
+          creatorListsUser = data.username;
+        }
         creatorListsLoaded = creatorListsLoaded.concat(data.lists || []);
         creatorListsCursor = data.cursor || null;
         moreBtn.hidden = !creatorListsCursor;
@@ -8906,6 +8923,8 @@ async function renderAdminDashboard(env) {
         status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
           ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
           (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
+        document.getElementById('deleteListSlugsInput').value = '';
+        await loadCreatorLists(true);
       } catch (e) {
         status.textContent = 'Failed: network error.';
       }
@@ -63646,65 +63665,153 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/admin/api/creator-lists" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
-      const v = validateCreatorUsername(url.searchParams.get("username"));
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "no-storage" });
+      const rawUser = (url.searchParams.get("username") || "").replace(/^@+/, "").trim();
+      const v = validateCreatorUsername(rawUser);
       if (!v.ok) return json({ ok: false, error: "Invalid username." }, 400);
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 1), 200);
       const cursor = url.searchParams.get("cursor") || "";
-      const prefix = `creatorlist:${v.normalized}:`;
 
-      let listed;
-      try {
-        listed = await env.CONFIGS.list({ prefix, limit, ...(cursor ? { cursor } : {}) });
-      } catch (e) {
-        return json({ ok: false, error: "Could not read this creator's lists right now." }, 500, { "Cache-Control": "no-store" });
-      }
-
-      // One read for the whole page, not one per row.
-      let order = [];
-      try {
-        const orderRaw = await env.CONFIGS.get(`creatorlistorder:${v.normalized}`);
-        order = orderRaw ? (JSON.parse(orderRaw).order || []) : [];
-      } catch {
-        order = [];
-      }
-      const inOrder = new Set(Array.isArray(order) ? order : []);
-
-      const lists = await Promise.all((listed.keys || []).map(async (k) => {
-        const slug = k.name.slice(prefix.length);
-        let data = null;
+      let targetUsername = v.normalized;
+      if (env.DB) {
         try {
-          const raw = await env.CONFIGS.get(k.name);
-          data = raw ? JSON.parse(raw) : null;
-        } catch {
-          data = null;
+          const directCheck = await env.DB.prepare(
+            "SELECT 1 FROM creator_lists WHERE username = ? LIMIT 1"
+          ).bind(targetUsername).first();
+          if (!directCheck) {
+            const altCreator = await env.DB.prepare(
+              "SELECT username FROM creators WHERE username = ? OR LOWER(display_name) = ? OR REPLACE(username, '-', '') = REPLACE(?, '-', '') LIMIT 1"
+            ).bind(targetUsername, targetUsername, targetUsername).first();
+            if (altCreator && altCreator.username) {
+              targetUsername = altCreator.username;
+            } else {
+              const altList = await env.DB.prepare(
+                "SELECT username FROM creator_lists WHERE REPLACE(username, '-', '') = REPLACE(?, '-', '') LIMIT 1"
+              ).bind(targetUsername).first();
+              if (altList && altList.username) {
+                targetUsername = altList.username;
+              }
+            }
+          }
+        } catch (dbErr) {
+          console.error("D1 username resolution error in creator-lists:", dbErr);
         }
-        return {
-          slug,
-          // Same reasoning as the anonymous browse: a record that will not
-          // parse is still reportable, and is exactly the kind an admin most
-          // needs to be able to select and delete.
-          name: data ? (data.name || "(untitled)") : "(unreadable record)",
-          type: data ? (data.type || "mixed") : null,
-          itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
-          likes: data ? (data.likes || 0) : 0,
-          visibility: data ? effectiveListVisibility(data.visibility) : null,
-          updatedAt: data && Number.isFinite(Number(data.updatedAt)) ? Number(data.updatedAt) : null,
-          inOrder: inOrder.has(slug),
-          url: `${url.origin}/lists/${v.normalized}/${slug}`,
-        };
-      }));
+      }
+
+      let order = [];
+      let hasOrderKey = false;
+      if (env.CONFIGS) {
+        try {
+          const orderRaw = await env.CONFIGS.get(`creatorlistorder:${targetUsername}`);
+          if (orderRaw) {
+            hasOrderKey = true;
+            const parsed = JSON.parse(orderRaw);
+            order = Array.isArray(parsed.order) ? parsed.order : [];
+          }
+        } catch {
+          order = [];
+        }
+      }
+      const inOrderSet = new Set(order);
+
+      const listsMap = new Map();
+
+      if (env.DB) {
+        try {
+          const d1Res = await env.DB.prepare(`
+            SELECT id, username, name, type, visibility, likes, created_at, updated_at, sort_order,
+                   CASE WHEN json_valid(items_json) THEN json_array_length(items_json) ELSE 0 END AS item_count
+            FROM creator_lists
+            WHERE username = ?
+            ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END, sort_order ASC, created_at ASC
+          `).bind(targetUsername).all();
+          const rows = (d1Res && d1Res.results) ? d1Res.results : [];
+          for (const r of rows) {
+            const slug = r.id.startsWith(`${targetUsername}:`)
+              ? r.id.slice(targetUsername.length + 1)
+              : (r.id.includes(":") ? r.id.split(":").slice(1).join(":") : r.id);
+            const inOrder = hasOrderKey
+              ? inOrderSet.has(slug)
+              : (r.sort_order !== null && r.sort_order !== undefined);
+            listsMap.set(slug, {
+              slug,
+              name: r.name || "(untitled)",
+              type: r.type || "mixed",
+              itemCount: Number(r.item_count) || 0,
+              likes: Number(r.likes) || 0,
+              visibility: effectiveListVisibility(r.visibility),
+              updatedAt: Number.isFinite(Number(r.updated_at)) && Number(r.updated_at) > 0 ? Number(r.updated_at) : null,
+              inOrder,
+              url: `${url.origin}/lists/${targetUsername}/${slug}`,
+            });
+          }
+        } catch (d1Err) {
+          console.error("D1 creator_lists read error in /admin/api/creator-lists:", d1Err);
+        }
+      }
+
+      if (env.CONFIGS) {
+        const prefix = `creatorlist:${targetUsername}:`;
+        try {
+          const kvListed = await env.CONFIGS.list({ prefix, limit: 1000 });
+          if (kvListed && Array.isArray(kvListed.keys)) {
+            for (const k of kvListed.keys) {
+              const slug = k.name.slice(prefix.length);
+              let data = null;
+              try {
+                const raw = await env.CONFIGS.get(k.name);
+                data = raw ? JSON.parse(raw) : null;
+              } catch {
+                data = null;
+              }
+              const inOrder = hasOrderKey ? inOrderSet.has(slug) : false;
+              if (!listsMap.has(slug)) {
+                listsMap.set(slug, {
+                  slug,
+                  name: data ? (data.name || "(untitled)") : "(unreadable record)",
+                  type: data ? (data.type || "mixed") : null,
+                  itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
+                  likes: data ? (data.likes || 0) : 0,
+                  visibility: data ? effectiveListVisibility(data.visibility) : null,
+                  updatedAt: data && Number.isFinite(Number(data.updatedAt)) ? Number(data.updatedAt) : null,
+                  inOrder,
+                  url: `${url.origin}/lists/${targetUsername}/${slug}`,
+                });
+              } else if (data && typeof data.updatedAt === "number") {
+                const existing = listsMap.get(slug);
+                if (!existing.updatedAt || data.updatedAt > existing.updatedAt) {
+                  existing.name = data.name || existing.name;
+                  existing.type = data.type || existing.type;
+                  existing.visibility = effectiveListVisibility(data.visibility);
+                  if (Array.isArray(data.items)) existing.itemCount = data.items.length;
+                  if (typeof data.likes === "number") existing.likes = data.likes;
+                  existing.updatedAt = data.updatedAt;
+                }
+              }
+            }
+          }
+        } catch (kvErr) {
+          if (!env.DB || listsMap.size === 0) {
+            return json({ ok: false, error: "Could not read this creator's lists right now." }, 500, { "Cache-Control": "no-store" });
+          }
+        }
+      }
+
+      const allLists = Array.from(listsMap.values());
+      const offset = /^\d+$/.test(cursor) ? parseInt(cursor, 10) : 0;
+      const page = allLists.slice(offset, offset + limit);
+      const nextCursor = (offset + limit < allLists.length) ? String(offset + limit) : null;
+      const done = nextCursor === null;
+      const orderCount = hasOrderKey ? inOrderSet.size : allLists.filter((l) => l.inOrder).length;
 
       return json({
         ok: true,
-        username: v.normalized,
-        count: lists.length,
-        lists,
-        // How many the creator's own dashboard would show from the order key,
-        // so a page where the two disagree says so out loud.
-        orderCount: inOrder.size,
-        cursor: listed.list_complete ? null : (listed.cursor || null),
-        done: !!listed.list_complete,
+        username: targetUsername,
+        count: page.length,
+        lists: page,
+        orderCount,
+        cursor: nextCursor,
+        done,
       }, 200, { "Cache-Control": "no-store" });
     }
 
@@ -63759,8 +63866,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // multi-batch cleanup is finished without guessing.
       let remaining = null;
       try {
-        const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
-        remaining = listed.keys.length;
+        if (env.DB) {
+          const countRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM creator_lists WHERE username = ?"
+          ).bind(v.normalized).first();
+          remaining = countRow ? Number(countRow.n) || 0 : 0;
+        } else if (env.CONFIGS) {
+          const listed = await listAllKeys(env.CONFIGS, `creatorlist:${v.normalized}:`, 1000);
+          remaining = listed.keys.length;
+        }
       } catch (e) {
         remaining = null;
       }
@@ -63927,44 +64041,87 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/admin/api/published-lists" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      if (!env || (!env.CONFIGS && !env.DB)) return json({ ok: false, error: "no-storage" });
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
       const cursor = url.searchParams.get("cursor") || "";
-      let listed;
-      try {
-        listed = await env.CONFIGS.list({ prefix: "publishedlist:user:", limit, ...(cursor ? { cursor } : {}) });
-      } catch (e) {
-        return json({ ok: false, error: "Could not read the published lists right now." }, 500, { "Cache-Control": "no-store" });
-      }
-      const lists = await Promise.all((listed.keys || []).map(async (k) => {
-        const slug = k.name.slice("publishedlist:user:".length);
-        let data = null;
+      let listed = null;
+      if (env.CONFIGS) {
         try {
-          const raw = await env.CONFIGS.get(k.name);
-          data = raw ? JSON.parse(raw) : null;
-        } catch {
-          data = null;
+          listed = await env.CONFIGS.list({ prefix: "publishedlist:user:", limit, ...(cursor ? { cursor } : {}) });
+        } catch (e) {
+          if (!env.DB) {
+            return json({ ok: false, error: "Could not read the published lists right now." }, 500, { "Cache-Control": "no-store" });
+          }
         }
-        return {
-          slug,
-          // A record that will not parse is still reportable, and is the kind
-          // an admin most wants to be able to delete.
-          name: data ? (data.name || "(untitled)") : "(unreadable record)",
-          type: data ? (data.type || "mixed") : null,
-          itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
-          likes: data ? (data.likes || 0) : 0,
-          visibility: data ? effectiveListVisibility(data.visibility) : null,
-          publishedAt: data ? (data.publishedAt || null) : null,
-          url: `${url.origin}/lists/user/${slug}`,
-        };
-      }));
-      return json({
-        ok: true,
-        count: lists.length,
-        lists,
-        cursor: listed.list_complete ? null : (listed.cursor || null),
-        done: !!listed.list_complete,
-      }, 200, { "Cache-Control": "no-store" });
+      }
+      if (listed && Array.isArray(listed.keys) && listed.keys.length > 0) {
+        const lists = await Promise.all((listed.keys || []).map(async (k) => {
+          const slug = k.name.slice("publishedlist:user:".length);
+          let data = null;
+          try {
+            const raw = await env.CONFIGS.get(k.name);
+            data = raw ? JSON.parse(raw) : null;
+          } catch {
+            data = null;
+          }
+          return {
+            slug,
+            name: data ? (data.name || "(untitled)") : "(unreadable record)",
+            type: data ? (data.type || "mixed") : null,
+            itemCount: data && Array.isArray(data.items) ? data.items.length : 0,
+            likes: data ? (data.likes || 0) : 0,
+            visibility: data ? effectiveListVisibility(data.visibility) : null,
+            publishedAt: data ? (data.publishedAt || null) : null,
+            url: `${url.origin}/lists/user/${slug}`,
+          };
+        }));
+        return json({
+          ok: true,
+          count: lists.length,
+          lists,
+          cursor: listed.list_complete ? null : (listed.cursor || null),
+          done: !!listed.list_complete,
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      if (env.DB) {
+        try {
+          const offset = /^\d+$/.test(cursor) ? parseInt(cursor, 10) : 0;
+          const d1Res = await env.DB.prepare(`
+            SELECT slug, name, type, visibility, likes, created_at, updated_at,
+                   CASE WHEN json_valid(items_json) THEN json_array_length(items_json) ELSE 0 END AS item_count
+            FROM published_lists
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+          `).bind(limit + 1, offset).all();
+          const rows = (d1Res && d1Res.results) ? d1Res.results : [];
+          const hasMore = rows.length > limit;
+          const pageRows = hasMore ? rows.slice(0, limit) : rows;
+          const lists = pageRows.map((r) => ({
+            slug: r.slug,
+            name: r.name || "(untitled)",
+            type: r.type || "mixed",
+            itemCount: Number(r.item_count) || 0,
+            likes: Number(r.likes) || 0,
+            visibility: effectiveListVisibility(r.visibility),
+            publishedAt: Number(r.created_at) || null,
+            url: `${url.origin}/lists/user/${r.slug}`,
+          }));
+          const nextCursor = hasMore ? String(offset + limit) : null;
+          return json({
+            ok: true,
+            count: lists.length,
+            lists,
+            cursor: nextCursor,
+            done: !hasMore,
+          }, 200, { "Cache-Control": "no-store" });
+        } catch (dbErr) {
+          console.error("D1 published_lists read error:", dbErr);
+          return json({ ok: false, error: "Could not read the published lists right now." }, 500, { "Cache-Control": "no-store" });
+        }
+      }
+
+      return json({ ok: true, count: 0, lists: [], cursor: null, done: true }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/delete-published-list  (POST)  { slug | slugs: [...] }

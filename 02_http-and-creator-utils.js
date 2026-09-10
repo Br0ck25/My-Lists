@@ -2099,19 +2099,24 @@ async function pruneTombstones(env) {
 // say so.
 async function deleteCreatorLists(env, username, slugs) {
   const out = { deleted: [], missing: [], ok: true };
-  if (!env || !env.CONFIGS || !username || !slugs || !slugs.length) return out;
+  if (!env || (!env.CONFIGS && !env.DB) || !username || !slugs || !slugs.length) return out;
 
   for (const slug of slugs) {
     const key = `creatorlist:${username}:${slug}`;
     let existed = false;
-    try {
-      existed = !!(await env.CONFIGS.get(key));
-    } catch {
-      existed = false;
+    if (env.CONFIGS) {
+      try {
+        existed = !!(await env.CONFIGS.get(key));
+      } catch {
+        existed = false;
+      }
     }
     if (env.DB) {
       try {
-        await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+        const d1Res = await env.DB.prepare("DELETE FROM creator_lists WHERE id = ?").bind(`${username}:${slug}`).run();
+        if (d1Res && d1Res.meta && d1Res.meta.changes > 0) {
+          existed = true;
+        }
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`c:${username}:${slug}`).run();
         } catch {}
@@ -2126,18 +2131,20 @@ async function deleteCreatorLists(env, username, slugs) {
     // Unconditional: a D1 DELETE matching zero rows still "succeeds", and
     // skipping the KV delete on that basis leaves the list live in KV -- a
     // delete that reports success and deletes nothing.
-    try {
-      await env.CONFIGS.delete(key);
-    } catch (e) {
-      console.error("deleteCreatorLists: could not delete", key, e);
-      // KV is the authoritative store and the one every public read path
-      // uses, so this is the failure that means the list is still out there.
-      out.ok = false;
-    }
-    try {
-      await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
-    } catch (e) {
-      // A stranded ledger is untidy, not harmful on its own.
+    if (env.CONFIGS) {
+      try {
+        await env.CONFIGS.delete(key);
+      } catch (e) {
+        console.error("deleteCreatorLists: could not delete", key, e);
+        // KV is the authoritative store and the one every public read path
+        // uses, so this is the failure that means the list is still out there.
+        out.ok = false;
+      }
+      try {
+        await env.CONFIGS.delete(`listlikevoters:${username}:${slug}`);
+      } catch (e) {
+        // A stranded ledger is untidy, not harmful on its own.
+      }
     }
     (existed ? out.deleted : out.missing).push(slug);
   }
@@ -2196,19 +2203,24 @@ async function deleteCreatorLists(env, username, slugs) {
 // failure rather than swallowing it -- is shared here explicitly.
 async function deletePublishedLists(env, slugs) {
   const out = { deleted: [], missing: [], ok: true };
-  if (!env || !env.CONFIGS || !slugs || !slugs.length) return out;
+  if (!env || (!env.CONFIGS && !env.DB) || !slugs || !slugs.length) return out;
 
   for (const slug of slugs) {
     const key = `publishedlist:user:${slug}`;
     let existed = false;
-    try {
-      existed = !!(await env.CONFIGS.get(key));
-    } catch {
-      existed = false;
+    if (env.CONFIGS) {
+      try {
+        existed = !!(await env.CONFIGS.get(key));
+      } catch {
+        existed = false;
+      }
     }
     if (env.DB) {
       try {
-        await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
+        const d1Res = await env.DB.prepare("DELETE FROM published_lists WHERE slug = ?").bind(slug).run();
+        if (d1Res && d1Res.meta && d1Res.meta.changes > 0) {
+          existed = true;
+        }
         try {
           await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(`a:${slug}`).run();
         } catch {}
@@ -2217,20 +2229,21 @@ async function deletePublishedLists(env, slugs) {
         } catch {}
       } catch (dbErr) {
         console.error("D1 write error (deletePublishedLists):", dbErr);
+        out.ok = false;
       }
     }
-    try {
-      await env.CONFIGS.delete(key);
-    } catch (e) {
-      console.error("deletePublishedLists: could not delete", key, e);
-      out.ok = false;
-    }
-    // Keyed by the same {user}:{slug} scope /api/lists/like uses, which for an
-    // anonymous list is the literal "user".
-    try {
-      await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
-    } catch (e) {
-      // A stranded ledger is untidy, not harmful on its own.
+    if (env.CONFIGS) {
+      try {
+        await env.CONFIGS.delete(key);
+      } catch (e) {
+        console.error("deletePublishedLists: could not delete", key, e);
+        out.ok = false;
+      }
+      try {
+        await env.CONFIGS.delete(`listlikevoters:user:${slug}`);
+      } catch (e) {
+        // A stranded ledger is untidy, not harmful on its own.
+      }
     }
     (existed ? out.deleted : out.missing).push(slug);
   }

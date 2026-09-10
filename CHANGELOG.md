@@ -49,6 +49,7 @@ the reports now live in `docs/history/`.
 - **Provider writes that were refused are reported as refused**, instead of being shown as success.
 
 ### 🛠️ Admin & operations
+- **D1-authoritative admin creator list & published list browse and delete:** `/admin/api/creator-lists` now queries the D1 `creator_lists` table directly (matching Phase 2 authoritative storage), resolves username aliases and display names (e.g. matching `canadutchy` and `cana-dutchy`), and merges with any unmigrated/phantom KV records. `/admin/api/delete-creator-list` and `deleteCreatorLists` accurately recognize D1 deletions using `meta.changes`, report deleted items under `deleted` rather than `missing`, and accurately report remaining counts from D1. The admin UI automatically refreshes remaining lists upon deletion. `/admin/api/published-lists` also falls back to D1 `published_lists` when KV keys are absent.
 - **Browse a creator's lists.** The delete tool takes exact slugs and nothing could tell an operator what they were — unworkable against an account carrying dozens of copies of one list under unguessable slugs. The admin panel now lists the stored records (including ones missing from the creator's display order, flagged), filters by name, and selects them all.
 - **Anonymously published lists can be removed.** `publishedlist:user:*` had no delete path in any route; there is now a paged browse and a delete that shares the record, ledger and directory sweep with the creator path.
 - **A failed delete says what it removed** before it stopped, instead of only "Failed".
