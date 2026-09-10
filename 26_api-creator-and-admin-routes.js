@@ -4519,7 +4519,7 @@
             const vis = data.visibility || "private";
             const items = Array.isArray(data.items) ? data.items : [];
             const itemsJson = JSON.stringify(items);
-            if (itemsJson.length > D1_ROW_SIZE_WARN_BYTES) {
+            if (utf8ByteLength(itemsJson) > CREATOR_LIST_BYTES_MAX) {
               noteSkipped();
               return;
             }
