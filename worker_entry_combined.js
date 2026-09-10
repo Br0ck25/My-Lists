@@ -7971,6 +7971,7 @@ async function renderAdminDashboard(env) {
 <body>
   <h1>Admin Dashboard</h1>
   <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
+  ${isD1Bound ? '' : '<div style="background:rgba(255,59,48,0.12); border:1px solid #FF3B30; border-radius:8px; padding:12px 16px; margin:0 0 18px; color:#FF3B30; font-size:0.88rem; line-height:1.4;"><strong>Warning: No D1 database bound.</strong> D1 is required for authoritative accounts, lists, full-text search, likes, feedback, and tracking. Please bind your D1 database as <code>DB</code> in the Cloudflare Dashboard (Worker Settings &rarr; Bindings).</div>'}
 
   <!-- Not a tablist: these three buttons do not reveal panels, they choose
        which row of sub-tabs is shown, and it is the sub-tab that selects
@@ -8230,13 +8231,13 @@ async function renderAdminDashboard(env) {
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">D1 database: ${isD1Bound
         ? '<span style="color:#30d158;">bound</span>'
-        : '<span style="color:#8E8E93;">not bound</span>'}</div>
-      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">D1 is entirely optional -- Creator Profiles, Custom Lists, and everything else work fully from KV storage alone with no D1 database at all. ${isD1Bound
-        ? 'This Worker has one bound as <code>DB</code>, so the migration below is available.'
-        : 'This Worker has no D1 database bound (Settings &rarr; Bindings), so there is nothing to migrate -- everything below is inactive until one is added.'}</p>
+        : '<span style="color:#FF3B30;">not bound (required)</span>'}</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">${isD1Bound
+        ? 'This Worker has a D1 database bound as <code>DB</code>. Use the button below to backfill existing KV records into D1.'
+        : 'This Worker has no D1 database bound (Settings &rarr; Bindings). D1 is required for authoritative accounts, lists, search, likes, feedback, and tracking. Bind a D1 database as <code>DB</code> to enable full functionality.'}</p>
       <button type="button" class="admin-select" style="cursor:pointer;" id="migrateD1Btn" onclick="runMigrateD1()" ${isD1Bound ? '' : 'disabled'}>Migrate KV &rarr; D1</button>
       <span id="migrateD1Status" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Copies existing Creator Profiles, Custom Lists, and Source Groups from KV into D1 -- needed once after binding a D1 database that already has KV data behind it (a brand-new site with no accounts yet doesn't need this). KV stays the source of truth throughout; safe to run more than once.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Copies existing Creator Profiles, Custom Lists, likes, feedback, and tracking records from KV into D1. Safe to run more than once.</p>
     </div>
 
     <div class="panel" style="margin:0; padding:14px 16px;">
@@ -8665,7 +8666,9 @@ async function renderAdminDashboard(env) {
           const errCount = (r.errors || []).length;
           status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
             (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
-            (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ' migrated' +
+            (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ', ' +
+            (r.feedback || 0) + ' feedback, ' +
+            (r.tracking || 0) + ' tracking migrated' +
             (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
           if (errCount) console.error('migrate-d1 errors:', r.errors);
           break;
@@ -9082,7 +9085,7 @@ async function renderAdminDashboard(env) {
         }
         if (!data.bound) {
           status.textContent = '';
-          out.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No D1 database is bound, so there is nothing to migrate. This is a supported configuration.</p>' + indexNote;
+          out.innerHTML = '<p style="color:#FF3B30; margin:0; font-size:0.82rem;"><strong>Warning: No D1 database is bound.</strong> D1 is required for authoritative accounts, lists, search, likes, feedback, and tracking. Bind a D1 database as <code>DB</code> in Cloudflare Settings &rarr; Bindings.</p>' + indexNote;
           btn.disabled = false;
           return;
         }

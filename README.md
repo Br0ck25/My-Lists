@@ -190,11 +190,9 @@ The Worker boots and serves the catalog/manifest pages without this, but every s
 
 ---
 
-### Step 4 - (Optional) Enable Cloudflare D1 Storage
+### Step 4 — (Required) Enable Cloudflare D1 Storage
 
-D1 is an accelerator in front of KV, never a replacement for it: every accessor tries D1 first and falls back to KV, so Creator Profiles, Custom Lists, and Source Groups are fully functional with this step skipped -- a single-user install can skip this entire section. Add it if you want relational querying over accounts/lists (e.g. for the admin dashboard's community-list ranking) or to reduce KV read volume at larger scale.
-
-**On a free Workers plan, bind it as soon as anyone but you uses the deployment.** Page-view counters are the app's most frequent KV write, and binding D1 moves them off KV entirely -- measured, two KV writes per page view become zero. Without it, roughly 500 page views spend the free plan's whole 1,000-writes-per-day budget, and after that every KV write in the app fails until the day rolls over. See [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need).
+D1 is the primary authoritative store for Creator Profiles, lists, full-text search (`lists_fts`), likes ledgers, feedback, tracking, and telemetry counters. KV acts as a cache, a hot key-value store for addon configs and provider responses, and temporary storage for rate limits and short-lived tokens.
 
 Every step below is doable entirely from the Cloudflare Dashboard -- nothing here needs `wrangler`, `npx`, or a terminal of any kind, even though D1's own docs (and this file, in an earlier version) usually show the CLI first. A **Wrangler CLI alternative** is noted at the end for anyone who prefers it.
 

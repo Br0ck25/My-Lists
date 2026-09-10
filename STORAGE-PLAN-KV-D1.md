@@ -1,6 +1,6 @@
 # Storage Architecture Plan — Workers KV vs. D1
 
-**Status:** Proposal. No code changes in this document.
+**Status:** Completed. All phases (0 through 4) implemented.
 **Scope:** Every KV and D1 read/write in the Worker.
 **Premise change:** The Cloudflare **free plan is no longer a constraint**. Every storage
 decision in this codebase that was made to survive 1,000 KV writes/day or 50 subrequests
@@ -515,7 +515,7 @@ Each phase is independently shippable and independently revertible. Phases 1–3
 strictly additive to D1 and leave KV writes in place, so a rollback is a code revert with
 no data loss.
 
-### Phase 0 — Make D1 required (prerequisite)
+### Phase 0 — Make D1 required (prerequisite) — Completed
 
 1. Uncomment the `[[d1_databases]]` block in `wrangler.toml`; rewrite its comment.
 2. README Step 4 → Required; move it before Step 3's "every stateful feature" warning.
@@ -526,7 +526,7 @@ no data loss.
 
 **Risk:** low. Nothing changes behaviourally; this only removes the "optional" contract.
 
-### Phase 1 — Kill the public list index
+### Phase 1 — Kill the public list index — Completed
 
 The highest-value, lowest-risk change: it deletes the most code, removes the most
 failure modes, and touches no write path that users can see.
@@ -552,7 +552,7 @@ failure modes, and touches no write path that users can see.
 order, before and after. Worth a fixture test that runs both paths against the same
 dataset and diffs.
 
-### Phase 2 — Identity and lists become D1-authoritative
+### Phase 2 — Identity and lists become D1-authoritative — Completed
 
 1. Invert `getCreator` and `getCreatorList`: read D1 first, fall back to KV only for
    records not yet migrated, and populate the KV cache on the way out.
@@ -568,7 +568,7 @@ dataset and diffs.
 **Risk:** this is the auth path. Ship behind a flag, with the KV fallback retained for
 one full release cycle, and watch the `sync_conflict` / auth-failure counters.
 
-### Phase 3 — Likes, feedback, telemetry
+### Phase 3 — Likes, feedback, telemetry — Completed
 
 1. Add `list_likes`; backfill from `listlikevoters:*`. Rewrite `applyLikeVote` /
    `readLikeVoters` as insert/delete. Keep `creator_lists.likes` as a maintained
@@ -585,7 +585,7 @@ one full release cycle, and watch the `sync_conflict` / auth-failure counters.
    (`DELETE` old + `INSERT` new) so revocation takes effect everywhere at once.
 6. Add the tombstone-only prune and the size monitor from §5.4. **No analytics prune.**
 
-### Phase 4 — Sync blob split (largest, least urgent)
+### Phase 4 — Sync blob split (largest, least urgent) — Completed
 
 Per §4.4: move `watchHistory`, `continueWatching`, `airingNext`, `likedLists`,
 `hiddenLists` into row-per-item tables; leave `config`, `keys`, `collapsedPanels`,

@@ -15,38 +15,20 @@ compatibility_date = "2024-01-01"
 binding = "CONFIGS"
 id = "YOUR_KV_NAMESPACE_ID"
 
-# --- D1 (optional) -----------------------------------------------------------
-# Optional. Every accessor reads KV first and falls back to D1, so the app
-# is fully functional with this block commented out.
+# --- D1 (REQUIRED) -----------------------------------------------------------
+# Required. D1 is the primary authoritative store for Creator Profiles, lists,
+# full-text search (lists_fts), likes ledgers, feedback, tracking, and counters.
 #
-# One thing to know before you add it and then remove it again: the DASHBOARD
-# COUNTERS do not survive that round trip. Accounts, lists and likes are
-# always written to KV, so they are safe either way -- but page views,
-# installs, playback pings and per-provider API usage are written to D1 ALONE
-# once it is bound (see bumpStat, 03_admin.js). That is deliberate: KV has no
-# atomic increment, so twenty concurrent requests used to record as one, and
-# routing counters through D1's upsert is the whole point of
-# migrations/0002. The cost is that unbinding D1 -- or rebuilding it from
-# schema.sql, which DROPs every table -- rolls every counter back to the KV
-# value it had when you first migrated. Everything else is untouched.
-#
-# If you do enable it,
-# run schema.sql first and then use the "Migrate KV -> D1" button under
-# /admin's Management & Tools -> Maintenance tab (or POST
-# /admin/api/migrate-d1 directly) to backfill existing KV accounts -- an
-# account present in KV but missing from D1 will otherwise not be updated
-# correctly by the key-rotation endpoints.
-#
-# This block (and the commands below) is only relevant if you deploy with
-# `wrangler`. Deploying via the Cloudflare Dashboard instead? See
-# README.md's "Step 4 - Enable Cloudflare D1 Storage" -- every step there,
-# including running schema.sql, is doable from the dashboard alone.
+# Create the database, execute schema.sql and all migrations, and fill in the database_id:
 #   npx wrangler d1 create my-lists-db
 #   npx wrangler d1 execute my-lists-db --file=./schema.sql
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "my-lists-db"
-# database_id = "YOUR_DATABASE_ID"
+#
+# If deploying an existing site with data in KV, run the "Migrate KV -> D1"
+# tool in /admin's Maintenance tab to backfill your records into D1.
+[[d1_databases]]
+binding = "DB"
+database_name = "my-lists-db"
+database_id = "YOUR_DATABASE_ID"
 
 # --- Plan tuning (optional) --------------------------------------------------
 # BULK_RESOLVE_SUBREQUEST_BUDGET -- how many outbound fetches /api/bulk-resolve
