@@ -1869,14 +1869,19 @@ async function checkForNewEpisodes(env, fetchBudget) {
     // back to it anyway.
     try {
     await ensureTrackingMigrated(env, username);
-    const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
-    if (!syncRaw) continue;
+    let blob = null;
+    if (env.DB) {
+      blob = await readCreatorTrackingD1(env, username);
+    }
+    if (!blob) {
+      const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+      if (!syncRaw) continue;
 
-    let blob;
-    try {
-      blob = JSON.parse(syncRaw);
-    } catch (e) {
-      continue;
+      try {
+        blob = JSON.parse(syncRaw);
+      } catch (e) {
+        continue;
+      }
     }
 
     const fullyWatched = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -1984,6 +1989,9 @@ async function checkForNewEpisodes(env, fetchBudget) {
       target.fullyWatchedShowIds = stillFullyWatched;
       target.updatedAt = Date.now();
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
+      if (env.DB) {
+        await saveCreatorTrackingD1(env, username, target, false);
+      }
     }
     } catch (accountErr) {
       // See the per-account try above: this account is skipped, the sweep

@@ -340,6 +340,8 @@ const MIGRATE_D1_PREFIXES = [
   "feedback:",
   "evtmeta:",
   "creatorscrobbletoken:",
+  "creatorsynctracking:",
+  "creatorsync:",
 ];
 // This endpoint has its invocation to itself (it is admin-triggered, not
 // ridden along on the cron), so it can claim more of the 1,000 storage
@@ -662,6 +664,50 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0009", kind: "table", name: "event_meta",
     consequence: "Title event display metadata falls back to KV evtmeta.",
+  },
+  {
+    migration: "0010", kind: "table", name: "watch_history",
+    consequence: "Watch history items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_watch_history_user_watched",
+    consequence: "Ordering watch history by date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "continue_watching",
+    consequence: "Continue watching items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_continue_watching_user_updated",
+    consequence: "Ordering continue watching by date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "airing_next",
+    consequence: "Airing next items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_airing_next_user",
+    consequence: "Looking up airing next by air date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_user_lists",
+    consequence: "User list preferences (liked, hidden) fall back to creatorsync:* KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_creator_user_lists_lookup",
+    consequence: "Looking up user list preferences scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_show_states",
+    consequence: "Show states (fully watched / dismissed) fall back to creatorsynctracking:* KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_creator_show_states_fw",
+    consequence: "Querying fully watched shows scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_tracking_meta",
+    consequence: "Tracking metadata and conflict versioning fall back to creatorsynctracking:* KV blob.",
   },
 ];
 
@@ -4970,6 +5016,12 @@ async function purgeCreatorData(env, username, options = {}) {
         await env.DB.prepare("DELETE FROM list_likes WHERE voter_id = ?").bind(`u:${u}`).run();
       }
       await env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM watch_history WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM continue_watching WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM airing_next WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM creator_user_lists WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM creator_show_states WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM creator_tracking_meta WHERE username = ?").bind(u).run();
     } catch (dbErr) {
       console.error("D1 write error (purgeCreatorData lists):", dbErr);
       dataSweepFailed = true;
@@ -5554,6 +5606,378 @@ async function checkD1Schema(env) {
     missing,
     pendingMigrations: [...new Set(missing.map((m) => m.migration))].sort(),
   };
+}
+
+// --- Phase 4: Relational D1 Storage for Sync Tracking & User Lists -----------
+
+async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
+  if (!env || !env.DB || !username || !trackingData) return false;
+  try {
+    const meta = {
+      trackPlayback: trackingData.trackPlayback ? 1 : 0,
+      removeWatchedWatchlist: trackingData.removeWatchedFromWatchlist !== false ? 1 : 0,
+      scrobbleFilterUsers: trackingData.scrobbleFilterUsers ? 1 : 0,
+      scrobbleAllowedUsers: typeof trackingData.scrobbleAllowedUsers === "string" ? trackingData.scrobbleAllowedUsers : "",
+      scrobbleBlockAnonymous: trackingData.scrobbleBlockAnonymous ? 1 : 0,
+      curatedRecommendations: trackingData.curatedRecommendations ? JSON.stringify(trackingData.curatedRecommendations) : null,
+      clientVersion: Number(trackingData.clientVersion) || 0,
+      updatedAt: Number(trackingData.updatedAt) || Date.now(),
+    };
+
+    const stmts = [];
+
+    // 1. Meta
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO creator_tracking_meta (
+          username, track_playback, remove_watched_watchlist, scrobble_filter_users,
+          scrobble_allowed_users, scrobble_block_anonymous, curated_recommendations,
+          client_version, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET
+          track_playback = excluded.track_playback,
+          remove_watched_watchlist = excluded.remove_watched_watchlist,
+          scrobble_filter_users = excluded.scrobble_filter_users,
+          scrobble_allowed_users = excluded.scrobble_allowed_users,
+          scrobble_block_anonymous = excluded.scrobble_block_anonymous,
+          curated_recommendations = excluded.curated_recommendations,
+          client_version = excluded.client_version,
+          updated_at = excluded.updated_at`
+      ).bind(
+        username,
+        meta.trackPlayback,
+        meta.removeWatchedWatchlist,
+        meta.scrobbleFilterUsers,
+        meta.scrobbleAllowedUsers,
+        meta.scrobbleBlockAnonymous,
+        meta.curatedRecommendations,
+        meta.clientVersion,
+        meta.updatedAt
+      )
+    );
+
+    // 2. Show states (fullyWatchedShowIds & dismissedContinueWatching)
+    const fullyWatched = Array.isArray(trackingData.fullyWatchedShowIds) ? trackingData.fullyWatchedShowIds.map(String) : [];
+    const dismissed = trackingData.dismissedContinueWatching && typeof trackingData.dismissedContinueWatching === "object"
+      ? trackingData.dismissedContinueWatching
+      : {};
+
+    if (isIntentionalRemoval) {
+      stmts.push(env.DB.prepare("DELETE FROM creator_show_states WHERE username = ?").bind(username));
+    }
+    const allShows = new Set([...fullyWatched, ...Object.keys(dismissed)]);
+    for (const sid of allShows) {
+      const isFw = fullyWatched.includes(sid) ? 1 : 0;
+      const dis = dismissed[sid];
+      const disSeason = dis && Number.isFinite(Number(dis.seasonNum)) ? Number(dis.seasonNum) : null;
+      const disEpisode = dis && Number.isFinite(Number(dis.episodeNum)) ? Number(dis.episodeNum) : null;
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(username, show_id) DO UPDATE SET
+             is_fully_watched = excluded.is_fully_watched,
+             dismissed_season = excluded.dismissed_season,
+             dismissed_episode = excluded.dismissed_episode,
+             updated_at = excluded.updated_at`
+        ).bind(username, sid, isFw, disSeason, disEpisode, meta.updatedAt)
+      );
+    }
+
+    // 3. Continue Watching: replace whole set
+    if (Array.isArray(trackingData.continueWatching)) {
+      stmts.push(env.DB.prepare("DELETE FROM continue_watching WHERE username = ?").bind(username));
+      for (const item of trackingData.continueWatching) {
+        if (!item) continue;
+        const showId = String(item.showId || item.id || "");
+        if (!showId) continue;
+        const itemId = String(item.id || showId);
+        const name = item.name || null;
+        const poster = item.poster || null;
+        const showTitle = item.showTitle || null;
+        const showPoster = item.showPoster || null;
+        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+        const itemUpdated = Number(item.updatedAt || item.watchedAt) || meta.updatedAt;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO continue_watching (username, show_id, item_id, name, poster, show_title, show_poster, season_num, episode_num, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(username, showId, itemId, name, poster, showTitle, showPoster, seasonNum, episodeNum, itemUpdated)
+        );
+      }
+    }
+
+    // 4. Airing Next: replace whole set
+    if (Array.isArray(trackingData.airingNext)) {
+      stmts.push(env.DB.prepare("DELETE FROM airing_next WHERE username = ?").bind(username));
+      for (const item of trackingData.airingNext) {
+        if (!item) continue;
+        const showId = String(item.showId || item.id || "");
+        if (!showId) continue;
+        const itemId = String(item.id || showId);
+        const name = item.name || null;
+        const poster = item.poster || null;
+        const showTitle = item.showTitle || null;
+        const showPoster = item.showPoster || null;
+        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+        const airDate = item.airDate || null;
+        const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
+        const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
+        const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
+        const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
+        const itemUpdated = Number(item.updatedAt) || meta.updatedAt;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO airing_next (
+              username, show_id, item_id, name, poster, show_title, show_poster,
+              season_num, episode_num, air_date, is_season_premiere, is_season_finale,
+              season_finale_air_date, season_finale_episode_number, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            username, showId, itemId, name, poster, showTitle, showPoster,
+            seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
+            seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
+          )
+        );
+      }
+    }
+
+    // 5. Watch History
+    if (Array.isArray(trackingData.watchHistory)) {
+      if (isIntentionalRemoval) {
+        stmts.push(env.DB.prepare("DELETE FROM watch_history WHERE username = ?").bind(username));
+      }
+      for (const item of trackingData.watchHistory) {
+        if (!item) continue;
+        const itemId = String(item.id || (item.showId ? `${item.showId}:${item.seasonNum}:${item.episodeNum}` : ""));
+        if (!itemId) continue;
+        const itemType = item.type || (item.seasonNum != null ? "episode" : "movie");
+        const title = item.name || item.title || null;
+        const poster = item.poster || null;
+        const showId = item.showId ? String(item.showId) : null;
+        const showTitle = item.showTitle || null;
+        const showPoster = item.showPoster || null;
+        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+        const year = item.year ? String(item.year) : null;
+        const airDate = item.airDate ? String(item.airDate) : null;
+        const watchedAt = Number(item.watchedAt) || meta.updatedAt;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO watch_history (
+              username, item_id, item_type, title, poster, show_id, show_title,
+              show_poster, season_num, episode_num, year, air_date, watched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username, item_id) DO UPDATE SET
+              item_type = excluded.item_type,
+              title = excluded.title,
+              poster = excluded.poster,
+              show_id = excluded.show_id,
+              show_title = excluded.show_title,
+              show_poster = excluded.show_poster,
+              season_num = excluded.season_num,
+              episode_num = excluded.episode_num,
+              year = excluded.year,
+              air_date = excluded.air_date,
+              watched_at = excluded.watched_at`
+          ).bind(
+            username, itemId, itemType, title, poster, showId, showTitle,
+            showPoster, seasonNum, episodeNum, year, airDate, watchedAt
+          )
+        );
+      }
+    }
+
+    const CHUNK_SIZE = 80;
+    for (let i = 0; i < stmts.length; i += CHUNK_SIZE) {
+      const chunk = stmts.slice(i, i + CHUNK_SIZE);
+      await env.DB.batch(chunk);
+    }
+    return true;
+  } catch (err) {
+    console.error("D1 write error (saveCreatorTrackingD1):", err);
+    return false;
+  }
+}
+
+async function readCreatorTrackingD1(env, username) {
+  if (!env || !env.DB || !username) return null;
+  try {
+    const metaRow = await env.DB.prepare(
+      "SELECT * FROM creator_tracking_meta WHERE username = ?"
+    ).bind(username).first();
+    if (!metaRow) return null;
+
+    const [whRows, cwRows, anRows, stateRows] = await Promise.all([
+      env.DB.prepare(
+        "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC"
+      ).bind(username).all().then((r) => r.results || []),
+      env.DB.prepare(
+        "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC"
+      ).bind(username).all().then((r) => r.results || []),
+      env.DB.prepare(
+        "SELECT * FROM airing_next WHERE username = ? ORDER BY air_date ASC"
+      ).bind(username).all().then((r) => r.results || []),
+      env.DB.prepare(
+        "SELECT * FROM creator_show_states WHERE username = ?"
+      ).bind(username).all().then((r) => r.results || []),
+    ]);
+
+    const watchHistory = whRows.map((r) => ({
+      id: r.item_id,
+      type: r.item_type,
+      name: r.title || undefined,
+      title: r.title || undefined,
+      poster: r.poster || undefined,
+      showId: r.show_id || undefined,
+      showTitle: r.show_title || undefined,
+      showPoster: r.show_poster || undefined,
+      seasonNum: r.season_num != null ? r.season_num : undefined,
+      episodeNum: r.episode_num != null ? r.episode_num : undefined,
+      year: r.year || undefined,
+      airDate: r.air_date || undefined,
+      watchedAt: r.watched_at,
+    }));
+
+    const continueWatching = cwRows.map((r) => ({
+      id: r.item_id,
+      showId: r.show_id,
+      type: "episode",
+      name: r.name || undefined,
+      poster: r.poster || undefined,
+      showTitle: r.show_title || undefined,
+      showPoster: r.show_poster || undefined,
+      seasonNum: r.season_num != null ? r.season_num : undefined,
+      episodeNum: r.episode_num != null ? r.episode_num : undefined,
+      updatedAt: r.updated_at,
+    }));
+
+    const airingNext = anRows.map((r) => ({
+      id: r.item_id,
+      showId: r.show_id,
+      type: "episode",
+      name: r.name || undefined,
+      poster: r.poster || undefined,
+      showTitle: r.show_title || undefined,
+      showPoster: r.show_poster || undefined,
+      seasonNum: r.season_num != null ? r.season_num : undefined,
+      episodeNum: r.episode_num != null ? r.episode_num : undefined,
+      airDate: r.air_date || undefined,
+      isSeasonPremiere: r.is_season_premiere ? true : undefined,
+      isSeasonFinale: r.is_season_finale ? true : undefined,
+      seasonFinaleAirDate: r.season_finale_air_date || undefined,
+      seasonFinaleEpisodeNumber: r.season_finale_episode_number != null ? r.season_finale_episode_number : undefined,
+      updatedAt: r.updated_at,
+    }));
+
+    const fullyWatchedShowIds = [];
+    const dismissedContinueWatching = {};
+    for (const s of stateRows) {
+      if (s.is_fully_watched) fullyWatchedShowIds.push(s.show_id);
+      if (s.dismissed_season != null || s.dismissed_episode != null) {
+        dismissedContinueWatching[s.show_id] = {
+          seasonNum: s.dismissed_season != null ? s.dismissed_season : 0,
+          episodeNum: s.dismissed_episode != null ? s.dismissed_episode : 0,
+        };
+      }
+    }
+
+    let curatedRecs = null;
+    if (metaRow.curated_recommendations) {
+      try { curatedRecs = JSON.parse(metaRow.curated_recommendations); } catch {}
+    }
+
+    return {
+      watchHistory,
+      continueWatching,
+      airingNext,
+      fullyWatchedShowIds,
+      dismissedContinueWatching,
+      curatedRecommendations: curatedRecs,
+      trackPlayback: Boolean(metaRow.track_playback),
+      removeWatchedFromWatchlist: Boolean(metaRow.remove_watched_watchlist),
+      scrobbleFilterUsers: Boolean(metaRow.scrobble_filter_users),
+      scrobbleAllowedUsers: metaRow.scrobble_allowed_users || "",
+      scrobbleBlockAnonymous: Boolean(metaRow.scrobble_block_anonymous),
+      clientVersion: Number(metaRow.client_version) || 0,
+      updatedAt: Number(metaRow.updated_at) || 0,
+    };
+  } catch (err) {
+    console.error("D1 read error (readCreatorTrackingD1):", err);
+    return null;
+  }
+}
+
+async function saveCreatorUserListsD1(env, username, likedLists, hiddenLists, hiddenSections) {
+  if (!env || !env.DB || !username) return false;
+  try {
+    const stmts = [
+      env.DB.prepare("DELETE FROM creator_user_lists WHERE username = ?").bind(username),
+    ];
+    const now = Date.now();
+    if (Array.isArray(likedLists)) {
+      for (const id of likedLists) {
+        if (typeof id === "string" && id) {
+          stmts.push(
+            env.DB.prepare("INSERT OR IGNORE INTO creator_user_lists (username, list_id, list_type, created_at) VALUES (?, ?, 'liked', ?)")
+              .bind(username, id, now)
+          );
+        }
+      }
+    }
+    if (Array.isArray(hiddenLists)) {
+      for (const id of hiddenLists) {
+        if (typeof id === "string" && id) {
+          stmts.push(
+            env.DB.prepare("INSERT OR IGNORE INTO creator_user_lists (username, list_id, list_type, created_at) VALUES (?, ?, 'hidden', ?)")
+              .bind(username, id, now)
+          );
+        }
+      }
+    }
+    if (Array.isArray(hiddenSections)) {
+      for (const id of hiddenSections) {
+        if (typeof id === "string" && id) {
+          stmts.push(
+            env.DB.prepare("INSERT OR IGNORE INTO creator_user_lists (username, list_id, list_type, created_at) VALUES (?, ?, 'hidden_section', ?)")
+              .bind(username, id, now)
+          );
+        }
+      }
+    }
+    const CHUNK_SIZE = 80;
+    for (let i = 0; i < stmts.length; i += CHUNK_SIZE) {
+      await env.DB.batch(stmts.slice(i, i + CHUNK_SIZE));
+    }
+    return true;
+  } catch (err) {
+    console.error("D1 write error (saveCreatorUserListsD1):", err);
+    return false;
+  }
+}
+
+async function readCreatorUserListsD1(env, username) {
+  if (!env || !env.DB || !username) return null;
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT list_id, list_type FROM creator_user_lists WHERE username = ?"
+    ).bind(username).all();
+    if (!results || !results.length) return null;
+    const likedLists = [];
+    const hiddenLists = [];
+    const hiddenMyListsSections = [];
+    for (const r of results) {
+      if (r.list_type === "liked") likedLists.push(r.list_id);
+      else if (r.list_type === "hidden") hiddenLists.push(r.list_id);
+      else if (r.list_type === "hidden_section") hiddenMyListsSections.push(r.list_id);
+    }
+    return { likedLists, hiddenLists, hiddenMyListsSections };
+  } catch (err) {
+    console.error("D1 read error (readCreatorUserListsD1):", err);
+    return null;
+  }
 }
 // --- Admin stats (page views, install links generated) -----------------
 //
@@ -10841,31 +11265,86 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   
   try {
     let items;
-    let trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
-    if (!trackingRaw) {
-      // Same one-time creatorsync -> creatorsynctracking migration the
-      // other three tracking-data write paths already trigger defensively
-      // (client save-tracking, the Continue Watching cron, the Auto-Track
-      // Playback subtitle ping -- see ensureTrackingMigrated's own
-      // comment). Without this, an account that hasn't hit any of those
-      // three writes yet would never get migrated just by opening an
-      // autotrack shelf -- it'd keep silently reading the legacy
-      // creatorsync: blob below indefinitely instead. Only called on a
-      // miss above (not unconditionally on every request) so the common
-      // case -- an already-migrated account -- doesn't pay for a second,
-      // redundant read of the same key ensureTrackingMigrated checks
-      // internally before deciding whether there's anything to do.
-      await ensureTrackingMigrated(env, username);
-      trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    if (env && env.DB) {
+      if (slug === 'watch-history') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            type: r.item_type,
+            name: r.title || undefined,
+            title: r.title || undefined,
+            poster: r.poster || undefined,
+            showId: r.show_id || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            year: r.year || undefined,
+            airDate: r.air_date || undefined,
+            watchedAt: r.watched_at,
+          }));
+        }
+      } else if (slug === 'continue-watching') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            showId: r.show_id,
+            type: "episode",
+            name: r.name || undefined,
+            poster: r.poster || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            updatedAt: r.updated_at,
+          }));
+        }
+      } else if (slug === 'airing-next') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM airing_next WHERE username = ? ORDER BY air_date ASC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            showId: r.show_id,
+            type: "episode",
+            name: r.name || undefined,
+            poster: r.poster || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            airDate: r.air_date || undefined,
+            isSeasonPremiere: r.is_season_premiere ? true : undefined,
+            isSeasonFinale: r.is_season_finale ? true : undefined,
+            seasonFinaleAirDate: r.season_finale_air_date || undefined,
+            seasonFinaleEpisodeNumber: r.season_finale_episode_number != null ? r.season_finale_episode_number : undefined,
+            updatedAt: r.updated_at,
+          }));
+        }
+      }
     }
-    if (trackingRaw) {
-      const trackingBlob = JSON.parse(trackingRaw);
-      items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-    } else {
-      const blobStr = await env.CONFIGS.get('creatorsync:' + username);
-      if (!blobStr) return [];
-      const blob = JSON.parse(blobStr);
-      items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+    if (!items) {
+      let trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+      if (!trackingRaw) {
+        await ensureTrackingMigrated(env, username);
+        trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+      }
+      if (trackingRaw) {
+        const trackingBlob = JSON.parse(trackingRaw);
+        items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+      } else {
+        const blobStr = await env.CONFIGS.get('creatorsync:' + username);
+        if (!blobStr) return [];
+        const blob = JSON.parse(blobStr);
+        items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+      }
     }
     if (!items || !items.length) return [];
     
@@ -13972,14 +14451,19 @@ async function checkForNewEpisodes(env, fetchBudget) {
     // back to it anyway.
     try {
     await ensureTrackingMigrated(env, username);
-    const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
-    if (!syncRaw) continue;
+    let blob = null;
+    if (env.DB) {
+      blob = await readCreatorTrackingD1(env, username);
+    }
+    if (!blob) {
+      const syncRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+      if (!syncRaw) continue;
 
-    let blob;
-    try {
-      blob = JSON.parse(syncRaw);
-    } catch (e) {
-      continue;
+      try {
+        blob = JSON.parse(syncRaw);
+      } catch (e) {
+        continue;
+      }
     }
 
     const fullyWatched = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -14087,6 +14571,9 @@ async function checkForNewEpisodes(env, fetchBudget) {
       target.fullyWatchedShowIds = stillFullyWatched;
       target.updatedAt = Date.now();
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
+      if (env.DB) {
+        await saveCreatorTrackingD1(env, username, target, false);
+      }
     }
     } catch (accountErr) {
       // See the per-account try above: this account is skipped, the sweep
@@ -58578,9 +59065,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
           const MAX_ATTEMPTS = 3;
           let alreadyWatched = false;
           for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            const raw = await env.CONFIGS.get(syncKey);
             let blob = null;
-            if (raw) {
+            if (env.DB) {
+              blob = await readCreatorTrackingD1(env, auth.username);
+            }
+            const raw = await env.CONFIGS.get(syncKey);
+            if (!blob && raw) {
               try {
                 blob = JSON.parse(raw);
               } catch {
@@ -58674,6 +59164,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
               continue;
             }
             await env.CONFIGS.put(syncKey, serializedBlob);
+            if (env.DB) {
+              await saveCreatorTrackingD1(env, auth.username, blob, false);
+            }
 
             // Also write a tiny dedicated scrobble-queue key.
             // Cloudflare KV is eventually consistent -- a write from one edge
@@ -59033,12 +59526,29 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       if (authUser) {
         try {
-          let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
-          if (!trackingRaw) {
-            trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          let trackingObj = null;
+          if (env.DB) {
+            const metaRow = await env.DB.prepare(
+              "SELECT scrobble_filter_users, scrobble_allowed_users, scrobble_block_anonymous FROM creator_tracking_meta WHERE username = ?"
+            ).bind(authUser).first();
+            if (metaRow) {
+              trackingObj = {
+                scrobbleFilterUsers: Boolean(metaRow.scrobble_filter_users),
+                scrobbleAllowedUsers: metaRow.scrobble_allowed_users || "",
+                scrobbleBlockAnonymous: Boolean(metaRow.scrobble_block_anonymous),
+              };
+            }
           }
-          if (trackingRaw) {
-            const trackingObj = JSON.parse(trackingRaw);
+          if (!trackingObj) {
+            let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
+            if (!trackingRaw) {
+              trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+            }
+            if (trackingRaw) {
+              trackingObj = JSON.parse(trackingRaw);
+            }
+          }
+          if (trackingObj) {
             if (trackingObj.scrobbleFilterUsers === true || trackingObj.scrobbleFilterUsers === "1" || trackingObj.scrobbleFilterUsers === 1) {
               filterEnabled = true;
             } else if (trackingObj.scrobbleFilterUsers === false || trackingObj.scrobbleFilterUsers === "0" || trackingObj.scrobbleFilterUsers === 0) {
@@ -59140,9 +59650,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
       let matched = "no";
       try {
         const syncKey = `creatorsynctracking:${authUser}`;
-        const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
-        if (raw) {
+        if (env.DB) {
+          blob = await readCreatorTrackingD1(env, authUser);
+        }
+        const raw = await env.CONFIGS.get(syncKey);
+        if (!blob && raw) {
           try { blob = JSON.parse(raw); } catch {}
         }
         if (!blob || typeof blob !== "object") {
@@ -59302,6 +59815,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         blob.updatedAt = Date.now();
         await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+        if (env.DB) {
+          await saveCreatorTrackingD1(env, authUser, blob, false);
+        }
 
         // Also write to creatorscrobblequeue to protect against KV propagation lag
         try {
@@ -60749,6 +61265,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "This account's saved data is too large to store (over the 25MB limit)." });
       }
+      if (env.DB) {
+        await saveCreatorUserListsD1(env, auth.username, blob.likedLists, blob.hiddenLists, blob.hiddenMyListsSections);
+      }
       try {
         await env.CONFIGS.put(`creatorsync:${auth.username}`, serialized);
       } catch (e) {
@@ -60798,11 +61317,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // and the scrobble merge further down both need it, and it used to be
       // read only inside the merge.
       let existingBlob = null;
-      try {
-        const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-        if (existingRaw) existingBlob = JSON.parse(existingRaw);
-      } catch {
-        existingBlob = null;
+      if (env.DB) {
+        existingBlob = await readCreatorTrackingD1(env, auth.username);
+      }
+      if (!existingBlob) {
+        try {
+          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (existingRaw) existingBlob = JSON.parse(existingRaw);
+        } catch {
+          existingBlob = null;
+        }
       }
 
       // Conflict guard, the same one /api/creator/sync/save has carried for a
@@ -61100,6 +61624,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "Your Watch History is too large to store (over the 25MB limit)." });
       }
+      if (env.DB) {
+        await saveCreatorTrackingD1(env, auth.username, blob, !!body.intentionalRemoval);
+      }
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
         if (Array.isArray(body.watchlist)) {
@@ -61352,20 +61879,35 @@ Sitemap: ${url.origin}/sitemap.xml`;
       }
 
       let listsStamp = null;
+      let d1TrackingStamp = null;
+      let d1TrackingExists = false;
       if (env.DB) {
         try {
-          const { results } = await env.DB.prepare("SELECT lists_stamp FROM creators WHERE username = ?").bind(auth.username).all();
-          if (results && results.length > 0 && results[0].lists_stamp != null) {
-            listsStamp = results[0].lists_stamp;
+          const [creatorsRow, metaRow] = await Promise.all([
+            env.DB.prepare("SELECT lists_stamp FROM creators WHERE username = ?").bind(auth.username).first(),
+            env.DB.prepare("SELECT updated_at FROM creator_tracking_meta WHERE username = ?").bind(auth.username).first(),
+          ]);
+          if (creatorsRow && creatorsRow.lists_stamp != null) {
+            listsStamp = creatorsRow.lists_stamp;
+          }
+          if (metaRow) {
+            d1TrackingExists = true;
+            if (metaRow.updated_at != null) {
+              d1TrackingStamp = Number(metaRow.updated_at) || 0;
+            }
           }
         } catch (e) {}
       }
 
+      const trackingUpdatedAt = d1TrackingStamp !== null
+        ? Math.max(d1TrackingStamp, readUpdatedAtFromRaw(trackingRaw))
+        : readUpdatedAtFromRaw(trackingRaw);
+
       return jsonPrivate({
         ok: true,
-        exists: configRaw !== null || trackingRaw !== null,
+        exists: configRaw !== null || trackingRaw !== null || d1TrackingExists,
         config: readUpdatedAtFromRaw(configRaw),
-        tracking: readUpdatedAtFromRaw(trackingRaw),
+        tracking: trackingUpdatedAt,
         presets: readUpdatedAtFromRaw(presetsRaw),
         channels: readUpdatedAtFromRaw(channelsRaw),
         // The fifth stamp. Unlike the four above it is not read out of the
@@ -61402,12 +61944,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // together turns that into one. (ensureTrackingMigrated above still
       // runs first on purpose: it can WRITE the tracking key, so reading it
       // concurrently with that would be a race.)
-      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit] = await Promise.all([
+      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit, d1Tracking, d1UserLists] = await Promise.all([
         env.CONFIGS.get(`creatorsync:${auth.username}`),
         env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
         env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
         env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
         env.CONFIGS.get(`creatorlistorder:${auth.username}`),
+        env.DB ? readCreatorTrackingD1(env, auth.username) : Promise.resolve(null),
+        env.DB ? readCreatorUserListsD1(env, auth.username) : Promise.resolve(null),
       ]);
       let data = null;
       if (raw) {
@@ -61416,6 +61960,14 @@ Sitemap: ${url.origin}/sitemap.xml`;
         } catch {
           data = null;
         }
+      }
+      if (d1UserLists) {
+        if (!data) {
+          data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+        }
+        data.likedLists = d1UserLists.likedLists;
+        data.hiddenLists = d1UserLists.hiddenLists;
+        data.hiddenMyListsSections = d1UserLists.hiddenMyListsSections;
       }
       // Presets live in their own key now (see save-presets above) -- merge
       // them back in here so the client's loadCreatorSync doesn't need to
@@ -61508,7 +62060,37 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // just reads data.watchHistory/data.continueWatching/etc exactly
       // like before, unaware this is a third KV read.
       const trackingRaw = trackingRawInit;
-      if (trackingRaw) {
+      if (d1Tracking) {
+        if (!data) {
+          data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+        }
+        data.watchHistory = Array.isArray(d1Tracking.watchHistory) ? d1Tracking.watchHistory : [];
+        data.continueWatching = Array.isArray(d1Tracking.continueWatching) ? d1Tracking.continueWatching : [];
+        data.airingNext = Array.isArray(d1Tracking.airingNext) ? d1Tracking.airingNext : [];
+        data.curatedRecommendations = (d1Tracking.curatedRecommendations && typeof d1Tracking.curatedRecommendations === "object")
+          ? d1Tracking.curatedRecommendations
+          : null;
+        data.trackingUpdatedAt = d1Tracking.updatedAt || 0;
+        data.trackingClientVersion = Number.isFinite(Number(d1Tracking.clientVersion))
+          ? Number(d1Tracking.clientVersion)
+          : undefined;
+        data.fullyWatchedShowIds = Array.isArray(d1Tracking.fullyWatchedShowIds) ? d1Tracking.fullyWatchedShowIds : [];
+        data.dismissedContinueWatching = d1Tracking.dismissedContinueWatching && typeof d1Tracking.dismissedContinueWatching === "object" ? d1Tracking.dismissedContinueWatching : {};
+        data.trackPlayback = typeof d1Tracking.trackPlayback === "boolean" ? d1Tracking.trackPlayback : false;
+        data.removeWatchedFromWatchlist = typeof d1Tracking.removeWatchedFromWatchlist === "boolean" ? d1Tracking.removeWatchedFromWatchlist : true;
+        data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
+        data.scrobbleAllowedUsers = typeof d1Tracking.scrobbleAllowedUsers === "string" ? d1Tracking.scrobbleAllowedUsers : "";
+        data.scrobbleBlockAnonymous = typeof d1Tracking.scrobbleBlockAnonymous === "boolean" ? d1Tracking.scrobbleBlockAnonymous : false;
+        data.watchlist = [];
+        data.watchlistUpdatedAt = 0;
+        if (trackingRaw) {
+          try {
+            const tb = JSON.parse(trackingRaw);
+            if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
+            if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
+          } catch {}
+        }
+      } else if (trackingRaw) {
         let trackingBlob = null;
         try {
           trackingBlob = JSON.parse(trackingRaw);
@@ -61653,6 +62235,21 @@ Sitemap: ${url.origin}/sitemap.xml`;
       else set.delete(usernameSlug);
       blob.likedLists = [...set];
       blob.updatedAt = Date.now();
+      if (env.DB) {
+        try {
+          if (body.liked) {
+            await env.DB.prepare(
+              "INSERT OR IGNORE INTO creator_user_lists (username, list_id, list_type, created_at) VALUES (?, ?, 'liked', ?)"
+            ).bind(auth.username, usernameSlug, Date.now()).run();
+          } else {
+            await env.DB.prepare(
+              "DELETE FROM creator_user_lists WHERE username = ? AND list_id = ? AND list_type = 'liked'"
+            ).bind(auth.username, usernameSlug).run();
+          }
+        } catch (dbErr) {
+          console.error("D1 write error (/api/creator/sync/like):", dbErr);
+        }
+      }
       await env.CONFIGS.put(key, JSON.stringify(blob));
       return json({ ok: true });
     }
@@ -62532,7 +63129,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, tracking: 0, userlists: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
@@ -62541,7 +63138,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (typeof results.feedback !== "number") results.feedback = 0;
       if (typeof results.eventmeta !== "number") results.eventmeta = 0;
       if (typeof results.tokens !== "number") results.tokens = 0;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0 };
+      if (typeof results.tracking !== "number") results.tracking = 0;
+      if (typeof results.userlists !== "number") results.userlists = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, tracking: 0, userlists: 0, skipped: 0 };
       // A key this sweep looked at and deliberately did not migrate. These
       // used to vanish: `if (!raw) return;`, a key that failed its shape
       // check, a counter whose value was not a number -- each returned with
@@ -62864,6 +63463,44 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (wrote(stRes)) { results.tokens++; thisCall.tokens++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Scrobble token ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 9. Tracking (creatorsynctracking:* -> watch_history, continue_watching, airing_next, creator_show_states, creator_tracking_meta)
+        if (phase === 9) {
+          const username = keyName.slice("creatorsynctracking:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            if (!data || typeof data !== "object") { noteSkipped(); return; }
+            ops += 2;
+            const ok = await saveCreatorTrackingD1(env, username, data, false);
+            if (ok) { results.tracking++; thisCall.tracking++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`Tracking ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 10. Creator user lists (creatorsync:* -> creator_user_lists)
+        if (phase === 10) {
+          const username = keyName.slice("creatorsync:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            if (!data || typeof data !== "object") { noteSkipped(); return; }
+            const likedLists = Array.isArray(data.likedLists) ? data.likedLists : [];
+            const hiddenLists = Array.isArray(data.hiddenLists) ? data.hiddenLists : [];
+            const hiddenSections = Array.isArray(data.hiddenMyListsSections) ? data.hiddenMyListsSections : [];
+            if (!likedLists.length && !hiddenLists.length && !hiddenSections.length) { noteSkipped(); return; }
+            ops += 2;
+            const ok = await saveCreatorUserListsD1(env, username, likedLists, hiddenLists, hiddenSections);
+            if (ok) { results.userlists++; thisCall.userlists++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`User lists ${keyName}: ` + e.message);
           }
           return;
         }
@@ -63231,6 +63868,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
             "feedback",
             "scrobble_tokens",
             "event_meta",
+            "watch_history",
+            "continue_watching",
+            "airing_next",
+            "creator_user_lists",
+            "creator_show_states",
+            "creator_tracking_meta",
           ];
           const rowCounts = {};
           for (const tbl of tables) {

@@ -290,6 +290,8 @@ const MIGRATE_D1_PREFIXES = [
   "feedback:",
   "evtmeta:",
   "creatorscrobbletoken:",
+  "creatorsynctracking:",
+  "creatorsync:",
 ];
 // This endpoint has its invocation to itself (it is admin-triggered, not
 // ridden along on the cron), so it can claim more of the 1,000 storage
@@ -612,6 +614,50 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0009", kind: "table", name: "event_meta",
     consequence: "Title event display metadata falls back to KV evtmeta.",
+  },
+  {
+    migration: "0010", kind: "table", name: "watch_history",
+    consequence: "Watch history items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_watch_history_user_watched",
+    consequence: "Ordering watch history by date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "continue_watching",
+    consequence: "Continue watching items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_continue_watching_user_updated",
+    consequence: "Ordering continue watching by date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "airing_next",
+    consequence: "Airing next items fall back to creatorsynctracking:* monolithic KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_airing_next_user",
+    consequence: "Looking up airing next by air date scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_user_lists",
+    consequence: "User list preferences (liked, hidden) fall back to creatorsync:* KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_creator_user_lists_lookup",
+    consequence: "Looking up user list preferences scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_show_states",
+    consequence: "Show states (fully watched / dismissed) fall back to creatorsynctracking:* KV blob.",
+  },
+  {
+    migration: "0010", kind: "index", name: "idx_creator_show_states_fw",
+    consequence: "Querying fully watched shows scans the table instead of an index.",
+  },
+  {
+    migration: "0010", kind: "table", name: "creator_tracking_meta",
+    consequence: "Tracking metadata and conflict versioning fall back to creatorsynctracking:* KV blob.",
   },
 ];
 

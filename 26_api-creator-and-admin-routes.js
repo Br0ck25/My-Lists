@@ -315,9 +315,12 @@
           const MAX_ATTEMPTS = 3;
           let alreadyWatched = false;
           for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            const raw = await env.CONFIGS.get(syncKey);
             let blob = null;
-            if (raw) {
+            if (env.DB) {
+              blob = await readCreatorTrackingD1(env, auth.username);
+            }
+            const raw = await env.CONFIGS.get(syncKey);
+            if (!blob && raw) {
               try {
                 blob = JSON.parse(raw);
               } catch {
@@ -411,6 +414,9 @@
               continue;
             }
             await env.CONFIGS.put(syncKey, serializedBlob);
+            if (env.DB) {
+              await saveCreatorTrackingD1(env, auth.username, blob, false);
+            }
 
             // Also write a tiny dedicated scrobble-queue key.
             // Cloudflare KV is eventually consistent -- a write from one edge
@@ -770,12 +776,29 @@
 
       if (authUser) {
         try {
-          let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
-          if (!trackingRaw) {
-            trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+          let trackingObj = null;
+          if (env.DB) {
+            const metaRow = await env.DB.prepare(
+              "SELECT scrobble_filter_users, scrobble_allowed_users, scrobble_block_anonymous FROM creator_tracking_meta WHERE username = ?"
+            ).bind(authUser).first();
+            if (metaRow) {
+              trackingObj = {
+                scrobbleFilterUsers: Boolean(metaRow.scrobble_filter_users),
+                scrobbleAllowedUsers: metaRow.scrobble_allowed_users || "",
+                scrobbleBlockAnonymous: Boolean(metaRow.scrobble_block_anonymous),
+              };
+            }
           }
-          if (trackingRaw) {
-            const trackingObj = JSON.parse(trackingRaw);
+          if (!trackingObj) {
+            let trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${authUser}`);
+            if (!trackingRaw) {
+              trackingRaw = await env.CONFIGS.get(`creatorsync:${authUser}`);
+            }
+            if (trackingRaw) {
+              trackingObj = JSON.parse(trackingRaw);
+            }
+          }
+          if (trackingObj) {
             if (trackingObj.scrobbleFilterUsers === true || trackingObj.scrobbleFilterUsers === "1" || trackingObj.scrobbleFilterUsers === 1) {
               filterEnabled = true;
             } else if (trackingObj.scrobbleFilterUsers === false || trackingObj.scrobbleFilterUsers === "0" || trackingObj.scrobbleFilterUsers === 0) {
@@ -877,9 +900,12 @@
       let matched = "no";
       try {
         const syncKey = `creatorsynctracking:${authUser}`;
-        const raw = await env.CONFIGS.get(syncKey);
         let blob = null;
-        if (raw) {
+        if (env.DB) {
+          blob = await readCreatorTrackingD1(env, authUser);
+        }
+        const raw = await env.CONFIGS.get(syncKey);
+        if (!blob && raw) {
           try { blob = JSON.parse(raw); } catch {}
         }
         if (!blob || typeof blob !== "object") {
@@ -1039,6 +1065,9 @@
 
         blob.updatedAt = Date.now();
         await env.CONFIGS.put(syncKey, JSON.stringify(blob));
+        if (env.DB) {
+          await saveCreatorTrackingD1(env, authUser, blob, false);
+        }
 
         // Also write to creatorscrobblequeue to protect against KV propagation lag
         try {
@@ -2486,6 +2515,9 @@
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "This account's saved data is too large to store (over the 25MB limit)." });
       }
+      if (env.DB) {
+        await saveCreatorUserListsD1(env, auth.username, blob.likedLists, blob.hiddenLists, blob.hiddenMyListsSections);
+      }
       try {
         await env.CONFIGS.put(`creatorsync:${auth.username}`, serialized);
       } catch (e) {
@@ -2535,11 +2567,16 @@
       // and the scrobble merge further down both need it, and it used to be
       // read only inside the merge.
       let existingBlob = null;
-      try {
-        const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
-        if (existingRaw) existingBlob = JSON.parse(existingRaw);
-      } catch {
-        existingBlob = null;
+      if (env.DB) {
+        existingBlob = await readCreatorTrackingD1(env, auth.username);
+      }
+      if (!existingBlob) {
+        try {
+          const existingRaw = await env.CONFIGS.get(`creatorsynctracking:${auth.username}`);
+          if (existingRaw) existingBlob = JSON.parse(existingRaw);
+        } catch {
+          existingBlob = null;
+        }
       }
 
       // Conflict guard, the same one /api/creator/sync/save has carried for a
@@ -2837,6 +2874,9 @@
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "Your Watch History is too large to store (over the 25MB limit)." });
       }
+      if (env.DB) {
+        await saveCreatorTrackingD1(env, auth.username, blob, !!body.intentionalRemoval);
+      }
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
         if (Array.isArray(body.watchlist)) {
@@ -3089,20 +3129,35 @@
       }
 
       let listsStamp = null;
+      let d1TrackingStamp = null;
+      let d1TrackingExists = false;
       if (env.DB) {
         try {
-          const { results } = await env.DB.prepare("SELECT lists_stamp FROM creators WHERE username = ?").bind(auth.username).all();
-          if (results && results.length > 0 && results[0].lists_stamp != null) {
-            listsStamp = results[0].lists_stamp;
+          const [creatorsRow, metaRow] = await Promise.all([
+            env.DB.prepare("SELECT lists_stamp FROM creators WHERE username = ?").bind(auth.username).first(),
+            env.DB.prepare("SELECT updated_at FROM creator_tracking_meta WHERE username = ?").bind(auth.username).first(),
+          ]);
+          if (creatorsRow && creatorsRow.lists_stamp != null) {
+            listsStamp = creatorsRow.lists_stamp;
+          }
+          if (metaRow) {
+            d1TrackingExists = true;
+            if (metaRow.updated_at != null) {
+              d1TrackingStamp = Number(metaRow.updated_at) || 0;
+            }
           }
         } catch (e) {}
       }
 
+      const trackingUpdatedAt = d1TrackingStamp !== null
+        ? Math.max(d1TrackingStamp, readUpdatedAtFromRaw(trackingRaw))
+        : readUpdatedAtFromRaw(trackingRaw);
+
       return jsonPrivate({
         ok: true,
-        exists: configRaw !== null || trackingRaw !== null,
+        exists: configRaw !== null || trackingRaw !== null || d1TrackingExists,
         config: readUpdatedAtFromRaw(configRaw),
-        tracking: readUpdatedAtFromRaw(trackingRaw),
+        tracking: trackingUpdatedAt,
         presets: readUpdatedAtFromRaw(presetsRaw),
         channels: readUpdatedAtFromRaw(channelsRaw),
         // The fifth stamp. Unlike the four above it is not read out of the
@@ -3139,12 +3194,14 @@
       // together turns that into one. (ensureTrackingMigrated above still
       // runs first on purpose: it can WRITE the tracking key, so reading it
       // concurrently with that would be a race.)
-      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit] = await Promise.all([
+      const [raw, presetsRawInit, channelsRawInit, trackingRawInit, orderRawInit, d1Tracking, d1UserLists] = await Promise.all([
         env.CONFIGS.get(`creatorsync:${auth.username}`),
         env.CONFIGS.get(`creatorsyncpresets:${auth.username}`),
         env.CONFIGS.get(`creatorsyncchannels:${auth.username}`),
         env.CONFIGS.get(`creatorsynctracking:${auth.username}`),
         env.CONFIGS.get(`creatorlistorder:${auth.username}`),
+        env.DB ? readCreatorTrackingD1(env, auth.username) : Promise.resolve(null),
+        env.DB ? readCreatorUserListsD1(env, auth.username) : Promise.resolve(null),
       ]);
       let data = null;
       if (raw) {
@@ -3153,6 +3210,14 @@
         } catch {
           data = null;
         }
+      }
+      if (d1UserLists) {
+        if (!data) {
+          data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+        }
+        data.likedLists = d1UserLists.likedLists;
+        data.hiddenLists = d1UserLists.hiddenLists;
+        data.hiddenMyListsSections = d1UserLists.hiddenMyListsSections;
       }
       // Presets live in their own key now (see save-presets above) -- merge
       // them back in here so the client's loadCreatorSync doesn't need to
@@ -3245,7 +3310,37 @@
       // just reads data.watchHistory/data.continueWatching/etc exactly
       // like before, unaware this is a third KV read.
       const trackingRaw = trackingRawInit;
-      if (trackingRaw) {
+      if (d1Tracking) {
+        if (!data) {
+          data = { config: [], collapsedPanels: {}, likedLists: [], updatedAt: Date.now() };
+        }
+        data.watchHistory = Array.isArray(d1Tracking.watchHistory) ? d1Tracking.watchHistory : [];
+        data.continueWatching = Array.isArray(d1Tracking.continueWatching) ? d1Tracking.continueWatching : [];
+        data.airingNext = Array.isArray(d1Tracking.airingNext) ? d1Tracking.airingNext : [];
+        data.curatedRecommendations = (d1Tracking.curatedRecommendations && typeof d1Tracking.curatedRecommendations === "object")
+          ? d1Tracking.curatedRecommendations
+          : null;
+        data.trackingUpdatedAt = d1Tracking.updatedAt || 0;
+        data.trackingClientVersion = Number.isFinite(Number(d1Tracking.clientVersion))
+          ? Number(d1Tracking.clientVersion)
+          : undefined;
+        data.fullyWatchedShowIds = Array.isArray(d1Tracking.fullyWatchedShowIds) ? d1Tracking.fullyWatchedShowIds : [];
+        data.dismissedContinueWatching = d1Tracking.dismissedContinueWatching && typeof d1Tracking.dismissedContinueWatching === "object" ? d1Tracking.dismissedContinueWatching : {};
+        data.trackPlayback = typeof d1Tracking.trackPlayback === "boolean" ? d1Tracking.trackPlayback : false;
+        data.removeWatchedFromWatchlist = typeof d1Tracking.removeWatchedFromWatchlist === "boolean" ? d1Tracking.removeWatchedFromWatchlist : true;
+        data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
+        data.scrobbleAllowedUsers = typeof d1Tracking.scrobbleAllowedUsers === "string" ? d1Tracking.scrobbleAllowedUsers : "";
+        data.scrobbleBlockAnonymous = typeof d1Tracking.scrobbleBlockAnonymous === "boolean" ? d1Tracking.scrobbleBlockAnonymous : false;
+        data.watchlist = [];
+        data.watchlistUpdatedAt = 0;
+        if (trackingRaw) {
+          try {
+            const tb = JSON.parse(trackingRaw);
+            if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
+            if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
+          } catch {}
+        }
+      } else if (trackingRaw) {
         let trackingBlob = null;
         try {
           trackingBlob = JSON.parse(trackingRaw);
@@ -3390,6 +3485,21 @@
       else set.delete(usernameSlug);
       blob.likedLists = [...set];
       blob.updatedAt = Date.now();
+      if (env.DB) {
+        try {
+          if (body.liked) {
+            await env.DB.prepare(
+              "INSERT OR IGNORE INTO creator_user_lists (username, list_id, list_type, created_at) VALUES (?, ?, 'liked', ?)"
+            ).bind(auth.username, usernameSlug, Date.now()).run();
+          } else {
+            await env.DB.prepare(
+              "DELETE FROM creator_user_lists WHERE username = ? AND list_id = ? AND list_type = 'liked'"
+            ).bind(auth.username, usernameSlug).run();
+          }
+        } catch (dbErr) {
+          console.error("D1 write error (/api/creator/sync/like):", dbErr);
+        }
+      }
       await env.CONFIGS.put(key, JSON.stringify(blob));
       return json({ ok: true });
     }
@@ -4269,7 +4379,7 @@
           cursor: "",
           pending: [],
           scanned: 0,
-          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0, errors: [] },
+          results: { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, tracking: 0, userlists: 0, skipped: 0, errors: [] },
         };
       }
       const results = state.results;
@@ -4278,7 +4388,9 @@
       if (typeof results.feedback !== "number") results.feedback = 0;
       if (typeof results.eventmeta !== "number") results.eventmeta = 0;
       if (typeof results.tokens !== "number") results.tokens = 0;
-      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, skipped: 0 };
+      if (typeof results.tracking !== "number") results.tracking = 0;
+      if (typeof results.userlists !== "number") results.userlists = 0;
+      const thisCall = { creators: 0, lists: 0, published: 0, sourcegroups: 0, stats: 0, likes: 0, feedback: 0, eventmeta: 0, tokens: 0, tracking: 0, userlists: 0, skipped: 0 };
       // A key this sweep looked at and deliberately did not migrate. These
       // used to vanish: `if (!raw) return;`, a key that failed its shape
       // check, a counter whose value was not a number -- each returned with
@@ -4601,6 +4713,44 @@
             if (wrote(stRes)) { results.tokens++; thisCall.tokens++; } else { noteSkipped(); }
           } catch (e) {
             noteError(`Scrobble token ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 9. Tracking (creatorsynctracking:* -> watch_history, continue_watching, airing_next, creator_show_states, creator_tracking_meta)
+        if (phase === 9) {
+          const username = keyName.slice("creatorsynctracking:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            if (!data || typeof data !== "object") { noteSkipped(); return; }
+            ops += 2;
+            const ok = await saveCreatorTrackingD1(env, username, data, false);
+            if (ok) { results.tracking++; thisCall.tracking++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`Tracking ${keyName}: ` + e.message);
+          }
+          return;
+        }
+
+        // 10. Creator user lists (creatorsync:* -> creator_user_lists)
+        if (phase === 10) {
+          const username = keyName.slice("creatorsync:".length);
+          const raw = await countedKv.get(keyName);
+          if (!raw) { noteSkipped(); return; }
+          try {
+            const data = JSON.parse(raw);
+            if (!data || typeof data !== "object") { noteSkipped(); return; }
+            const likedLists = Array.isArray(data.likedLists) ? data.likedLists : [];
+            const hiddenLists = Array.isArray(data.hiddenLists) ? data.hiddenLists : [];
+            const hiddenSections = Array.isArray(data.hiddenMyListsSections) ? data.hiddenMyListsSections : [];
+            if (!likedLists.length && !hiddenLists.length && !hiddenSections.length) { noteSkipped(); return; }
+            ops += 2;
+            const ok = await saveCreatorUserListsD1(env, username, likedLists, hiddenLists, hiddenSections);
+            if (ok) { results.userlists++; thisCall.userlists++; } else { noteSkipped(); }
+          } catch (e) {
+            noteError(`User lists ${keyName}: ` + e.message);
           }
           return;
         }
@@ -4968,6 +5118,12 @@
             "feedback",
             "scrobble_tokens",
             "event_meta",
+            "watch_history",
+            "continue_watching",
+            "airing_next",
+            "creator_user_lists",
+            "creator_show_states",
+            "creator_tracking_meta",
           ];
           const rowCounts = {};
           for (const tbl of tables) {

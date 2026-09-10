@@ -7042,7 +7042,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });
@@ -8774,6 +8774,12 @@ describe("Phase 3: Likes, feedback, telemetry, tokens, tombstones", () => {
     assert.equal(typeof ds.rowCounts.feedback, "number");
     assert.equal(typeof ds.rowCounts.scrobble_tokens, "number");
     assert.equal(typeof ds.rowCounts.event_meta, "number");
+    assert.equal(typeof ds.rowCounts.watch_history, "number");
+    assert.equal(typeof ds.rowCounts.continue_watching, "number");
+    assert.equal(typeof ds.rowCounts.airing_next, "number");
+    assert.equal(typeof ds.rowCounts.creator_user_lists, "number");
+    assert.equal(typeof ds.rowCounts.creator_show_states, "number");
+    assert.equal(typeof ds.rowCounts.creator_tracking_meta, "number");
   });
 
   it("/admin/api/migrate-d1 backfills likes, feedback, event_meta, scrobble_tokens, and explodes genre/decade stats", async () => {
@@ -8841,3 +8847,354 @@ describe("Phase 3: Likes, feedback, telemetry, tokens, tombstones", () => {
     assert.equal(st.username, "migscrob");
   });
 });
+
+describe("Phase 4: Split sync blobs into relational D1 tables", () => {
+  const {
+    saveCreatorTrackingD1,
+    readCreatorTrackingD1,
+    saveCreatorUserListsD1,
+    readCreatorUserListsD1,
+  } = loadSourceFunctions("02_http-and-creator-utils.js");
+  const { fetchAutoTrackedCatalog } = loadSourceFunctions("05_catalog-core.js");
+
+  it("saveCreatorTrackingD1 and readCreatorTrackingD1 round-trip relational tables", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "p4roundtrip";
+
+    const trackingData = {
+      watchHistory: [
+        { id: "tt001:1:1", type: "episode", name: "Pilot", showId: "tt001", showTitle: "Show One", seasonNum: 1, episodeNum: 1, watchedAt: 1000 },
+        { id: "tt002", type: "movie", title: "Movie One", year: "2024", watchedAt: 900 },
+      ],
+      continueWatching: [
+        { id: "tt001:1:2", showId: "tt001", name: "Episode 2", seasonNum: 1, episodeNum: 2, updatedAt: 1005 },
+      ],
+      airingNext: [
+        { id: "tt001:1:3", showId: "tt001", name: "Episode 3", seasonNum: 1, episodeNum: 3, airDate: "2026-10-01", isSeasonPremiere: false, isSeasonFinale: false, updatedAt: 1010 },
+      ],
+      fullyWatchedShowIds: ["tt999"],
+      dismissedContinueWatching: { tt888: { seasonNum: 2, episodeNum: 5 } },
+      curatedRecommendations: { movies: [{ id: "tt003" }], shows: [] },
+      trackPlayback: true,
+      removeWatchedFromWatchlist: true,
+      scrobbleFilterUsers: true,
+      scrobbleAllowedUsers: "alice,bob",
+      scrobbleBlockAnonymous: true,
+      clientVersion: 12345,
+      updatedAt: 2000,
+    };
+
+    const saved = await saveCreatorTrackingD1(env, u, trackingData, false);
+    assert.equal(saved, true);
+
+    // Verify D1 rows
+    const whRows = db.q("SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC", u);
+    assert.equal(whRows.length, 2);
+    assert.equal(whRows[0].item_id, "tt001:1:1");
+    assert.equal(whRows[0].show_title, "Show One");
+    assert.equal(whRows[1].item_id, "tt002");
+    assert.equal(whRows[1].title, "Movie One");
+
+    const cwRows = db.q("SELECT * FROM continue_watching WHERE username = ?", u);
+    assert.equal(cwRows.length, 1);
+    assert.equal(cwRows[0].show_id, "tt001");
+    assert.equal(cwRows[0].episode_num, 2);
+
+    const anRows = db.q("SELECT * FROM airing_next WHERE username = ?", u);
+    assert.equal(anRows.length, 1);
+    assert.equal(anRows[0].air_date, "2026-10-01");
+
+    const stateRows = db.q("SELECT * FROM creator_show_states WHERE username = ?", u);
+    assert.equal(stateRows.length, 2);
+    const fullyWatched = stateRows.find((r) => r.show_id === "tt999");
+    assert.equal(fullyWatched.is_fully_watched, 1);
+    const dismissed = stateRows.find((r) => r.show_id === "tt888");
+    assert.equal(dismissed.dismissed_season, 2);
+    assert.equal(dismissed.dismissed_episode, 5);
+
+    const metaRows = db.q("SELECT * FROM creator_tracking_meta WHERE username = ?", u);
+    assert.equal(metaRows.length, 1);
+    assert.equal(metaRows[0].client_version, 12345);
+    assert.equal(metaRows[0].scrobble_allowed_users, "alice,bob");
+    assert.equal(metaRows[0].scrobble_block_anonymous, 1);
+
+    // Read back via helper
+    const loaded = JSON.parse(JSON.stringify(await readCreatorTrackingD1(env, u)));
+    assert.ok(loaded);
+    assert.equal(loaded.watchHistory.length, 2);
+    assert.equal(loaded.continueWatching.length, 1);
+    assert.equal(loaded.airingNext.length, 1);
+    assert.deepEqual(loaded.fullyWatchedShowIds, ["tt999"]);
+    assert.deepEqual(loaded.dismissedContinueWatching, { tt888: { seasonNum: 2, episodeNum: 5 } });
+    assert.equal(loaded.clientVersion, 12345);
+    assert.equal(loaded.scrobbleAllowedUsers, "alice,bob");
+    assert.equal(loaded.trackPlayback, true);
+
+    // Intentional removal clears watch history
+    await saveCreatorTrackingD1(env, u, { watchHistory: [] }, true);
+    const whAfter = db.q("SELECT * FROM watch_history WHERE username = ?", u);
+    assert.equal(whAfter.length, 0);
+  });
+
+  it("saveCreatorUserListsD1 and readCreatorUserListsD1 round-trip user lists", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "p4userlists";
+
+    const ok = await saveCreatorUserListsD1(
+      env,
+      u,
+      ["c:alice:favs", "c:bob:watchlist"],
+      ["c:charlie:badlist"],
+      ["section_horror", "section_drama"]
+    );
+    assert.equal(ok, true);
+
+    const rows = db.q("SELECT * FROM creator_user_lists WHERE username = ? ORDER BY list_type, list_id", u);
+    assert.equal(rows.length, 5);
+
+    const loaded = JSON.parse(JSON.stringify(await readCreatorUserListsD1(env, u)));
+    assert.ok(loaded);
+    assert.deepEqual(loaded.likedLists.sort(), ["c:alice:favs", "c:bob:watchlist"].sort());
+    assert.deepEqual(loaded.hiddenLists, ["c:charlie:badlist"]);
+    assert.deepEqual(loaded.hiddenMyListsSections.sort(), ["section_horror", "section_drama"].sort());
+  });
+
+  it("/api/creator/sync/save and /api/creator/sync/like write to creator_user_lists in D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4synclike");
+
+    const saveRes = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: "p4synclike",
+        creatorKey: u.creatorKey,
+        likedLists: ["c:friend:superlist"],
+        hiddenLists: ["c:foe:spamlist"],
+        hiddenMyListsSections: ["collapsed_section"],
+      },
+    });
+    assert.equal(saveRes.status, 200);
+
+    // D1 has rows
+    const d1Lists = db.q("SELECT list_id, list_type FROM creator_user_lists WHERE username = 'p4synclike' ORDER BY list_type");
+    assert.equal(d1Lists.length, 3);
+
+    // Like endpoint
+    const likeRes = await call(env, "/api/creator/sync/like", {
+      method: "POST",
+      json: {
+        creatorName: "p4synclike",
+        creatorKey: u.creatorKey,
+        usernameSlug: "someone:coollist",
+        liked: true,
+      },
+    });
+    assert.equal(likeRes.status, 200);
+
+    const likedD1 = db.q("SELECT list_id FROM creator_user_lists WHERE username = 'p4synclike' AND list_type = 'liked' ORDER BY list_id");
+    assert.deepEqual(likedD1.map((r) => r.list_id), ["c:friend:superlist", "someone:coollist"]);
+
+    // sync/load returns merged lists
+    const loadRes = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "p4synclike", creatorKey: u.creatorKey },
+    });
+    assert.equal(loadRes.status, 200);
+    assert.ok(loadRes.body.data.likedLists.includes("someone:coollist"));
+    assert.ok(loadRes.body.data.hiddenLists.includes("c:foe:spamlist"));
+  });
+
+  it("/api/creator/sync/save-tracking and /api/creator/sync/load work through D1 with conflict detection", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4trackingtest");
+
+    const saveRes = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: "p4trackingtest",
+        creatorKey: u.creatorKey,
+        watchHistory: [
+          { id: "tt101:1:1", type: "episode", showId: "tt101", showTitle: "Show 101", seasonNum: 1, episodeNum: 1, watchedAt: 5000 },
+        ],
+        continueWatching: [
+          { id: "tt101:1:2", showId: "tt101", seasonNum: 1, episodeNum: 2, updatedAt: 5005 },
+        ],
+        airingNext: [
+          { id: "tt101:1:3", showId: "tt101", seasonNum: 1, episodeNum: 3, airDate: "2026-11-15", updatedAt: 5010 },
+        ],
+        trackPlayback: true,
+      },
+    });
+    assert.equal(saveRes.status, 200);
+
+    // Verify D1 rows
+    const whD1 = db.q("SELECT * FROM watch_history WHERE username = 'p4trackingtest'");
+    assert.equal(whD1.length, 1);
+    assert.equal(whD1[0].show_title, "Show 101");
+
+    const metaD1 = db.q("SELECT * FROM creator_tracking_meta WHERE username = 'p4trackingtest'")[0];
+    assert.ok(metaD1);
+    const clientVer = metaD1.client_version;
+    assert.ok(clientVer > 0);
+
+    // sync/meta reports tracking timestamp from D1
+    const metaRes = await call(env, "/api/creator/sync/meta", {
+      method: "POST",
+      json: { creatorName: "p4trackingtest", creatorKey: u.creatorKey },
+    });
+    assert.equal(metaRes.status, 200);
+    assert.equal(metaRes.body.tracking, metaD1.updated_at);
+
+    // Stale expectedClientVersion returns 409 conflict
+    const staleRes = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: "p4trackingtest",
+        creatorKey: u.creatorKey,
+        expectedClientVersion: clientVer - 1,
+        watchHistory: [],
+      },
+    });
+    assert.equal(staleRes.status, 409);
+    assert.equal(staleRes.body.conflict, true);
+
+    // If KV is wiped, sync/load still returns tracking state from D1
+    kv._store.delete("creatorsynctracking:p4trackingtest");
+    const loadRes = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "p4trackingtest", creatorKey: u.creatorKey },
+    });
+    assert.equal(loadRes.status, 200);
+    assert.equal(loadRes.body.data.watchHistory.length, 1);
+    assert.equal(loadRes.body.data.watchHistory[0].id, "tt101:1:1");
+    assert.equal(loadRes.body.data.continueWatching.length, 1);
+    assert.equal(loadRes.body.data.airingNext.length, 1);
+  });
+
+  it("fetchAutoTrackedCatalog queries D1 relational tables directly", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "p4catuser";
+
+    // Insert directly into D1 without KV
+    db.q(
+      `INSERT INTO watch_history (username, item_id, item_type, title, show_id, show_title, season_num, episode_num, watched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201:1:1", "episode", "Pilot", "tt201", "D1 Series", 1, 1, 9000
+    );
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201", "tt201:1:2", "Ep 2", "D1 Series", 1, 2, 9050
+    );
+    db.q(
+      `INSERT INTO airing_next (username, show_id, item_id, name, show_title, season_num, episode_num, air_date, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201", "tt201:1:3", "Ep 3", "D1 Series", 1, 3, "2026-12-01", 9100
+    );
+
+    const whCat = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env);
+    assert.equal(whCat.length, 1);
+    assert.equal(whCat[0].id, "tt201");
+    assert.equal(whCat[0].showTitle, "D1 Series");
+
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env);
+    assert.equal(cwCat.length, 1);
+    assert.equal(cwCat[0].id, "tt201");
+    assert.equal(cwCat[0].episodeNum, 2);
+
+    const anCat = await fetchAutoTrackedCatalog({ url: `autotrack:airing-next:series:${u}` }, env);
+    assert.equal(anCat.length, 1);
+    assert.equal(anCat[0].id, "tt201");
+    assert.equal(anCat[0].airDate, "2026-12-01");
+  });
+
+  it("/admin/api/migrate-d1 backfills tracking and user lists into D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // Seed creator row
+    db.q("INSERT INTO creators (username, display_name, key_hash, created_at) VALUES ('p4mig', 'p4mig', 'hash', 1)");
+
+    // Seed KV keys for phase 9 (tracking) and phase 10 (user lists)
+    kv._store.set("creatorsynctracking:p4mig", JSON.stringify({
+      watchHistory: [{ id: "tt301", type: "movie", title: "Migrated Film", watchedAt: 3000 }],
+      continueWatching: [{ id: "tt302:1:2", showId: "tt302", seasonNum: 1, episodeNum: 2, updatedAt: 3100 }],
+      airingNext: [{ id: "tt302:1:3", showId: "tt302", seasonNum: 1, episodeNum: 3, airDate: "2027-01-01", updatedAt: 3200 }],
+      fullyWatchedShowIds: ["tt303"],
+      clientVersion: 999,
+      updatedAt: 3300,
+    }));
+
+    kv._store.set("creatorsync:p4mig", JSON.stringify({
+      likedLists: ["c:friend:listA"],
+      hiddenLists: ["c:bad:listB"],
+      hiddenMyListsSections: ["sectionC"],
+      updatedAt: 3350,
+    }));
+
+    // Run migrate-d1
+    let last;
+    for (let i = 0; i < 35; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+    assert.ok(last.body.results.tracking >= 1);
+    assert.ok(last.body.results.userlists >= 1);
+
+    // Verify D1 records
+    const whD1 = db.q("SELECT * FROM watch_history WHERE username = 'p4mig'");
+    assert.equal(whD1.length, 1);
+    assert.equal(whD1[0].title, "Migrated Film");
+
+    const cwD1 = db.q("SELECT * FROM continue_watching WHERE username = 'p4mig'");
+    assert.equal(cwD1.length, 1);
+    assert.equal(cwD1[0].show_id, "tt302");
+
+    const anD1 = db.q("SELECT * FROM airing_next WHERE username = 'p4mig'");
+    assert.equal(anD1.length, 1);
+    assert.equal(anD1[0].air_date, "2027-01-01");
+
+    const listsD1 = db.q("SELECT list_id, list_type FROM creator_user_lists WHERE username = 'p4mig' ORDER BY list_type");
+    assert.equal(listsD1.length, 3);
+  });
+
+  it("purgeCreatorData cleans up all 6 Phase 4 tables upon account deletion", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4purgeuser");
+
+    // Seed rows across all 6 tables
+    db.q("INSERT INTO watch_history (username, item_id, item_type, watched_at) VALUES ('p4purgeuser', 'it1', 'movie', 100)");
+    db.q("INSERT INTO continue_watching (username, show_id, item_id, updated_at) VALUES ('p4purgeuser', 'sh1', 'it2', 100)");
+    db.q("INSERT INTO airing_next (username, show_id, item_id, updated_at) VALUES ('p4purgeuser', 'sh1', 'it3', 100)");
+    db.q("INSERT INTO creator_user_lists (username, list_id, list_type, created_at) VALUES ('p4purgeuser', 'l1', 'liked', 100)");
+    db.q("INSERT INTO creator_show_states (username, show_id, is_fully_watched, updated_at) VALUES ('p4purgeuser', 'sh1', 1, 100)");
+    db.q("INSERT INTO creator_tracking_meta (username, client_version, updated_at) VALUES ('p4purgeuser', 1, 100)");
+
+    // Delete account
+    const delRes = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: "p4purgeuser", creatorKey: u.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(delRes.status, 200);
+
+    // Verify all 6 tables are clean
+    for (const tbl of ["watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta"]) {
+      const rows = db.q(`SELECT * FROM ${tbl} WHERE username = 'p4purgeuser'`);
+      assert.equal(rows.length, 0, `${tbl} must have 0 rows after account deletion`);
+    }
+  });
+});
+

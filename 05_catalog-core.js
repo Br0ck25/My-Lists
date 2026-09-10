@@ -1067,31 +1067,86 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   
   try {
     let items;
-    let trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
-    if (!trackingRaw) {
-      // Same one-time creatorsync -> creatorsynctracking migration the
-      // other three tracking-data write paths already trigger defensively
-      // (client save-tracking, the Continue Watching cron, the Auto-Track
-      // Playback subtitle ping -- see ensureTrackingMigrated's own
-      // comment). Without this, an account that hasn't hit any of those
-      // three writes yet would never get migrated just by opening an
-      // autotrack shelf -- it'd keep silently reading the legacy
-      // creatorsync: blob below indefinitely instead. Only called on a
-      // miss above (not unconditionally on every request) so the common
-      // case -- an already-migrated account -- doesn't pay for a second,
-      // redundant read of the same key ensureTrackingMigrated checks
-      // internally before deciding whether there's anything to do.
-      await ensureTrackingMigrated(env, username);
-      trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+    if (env && env.DB) {
+      if (slug === 'watch-history') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            type: r.item_type,
+            name: r.title || undefined,
+            title: r.title || undefined,
+            poster: r.poster || undefined,
+            showId: r.show_id || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            year: r.year || undefined,
+            airDate: r.air_date || undefined,
+            watchedAt: r.watched_at,
+          }));
+        }
+      } else if (slug === 'continue-watching') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            showId: r.show_id,
+            type: "episode",
+            name: r.name || undefined,
+            poster: r.poster || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            updatedAt: r.updated_at,
+          }));
+        }
+      } else if (slug === 'airing-next') {
+        const rows = await env.DB.prepare(
+          "SELECT * FROM airing_next WHERE username = ? ORDER BY air_date ASC LIMIT 100"
+        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        if (rows && rows.length) {
+          items = rows.map(r => ({
+            id: r.item_id,
+            showId: r.show_id,
+            type: "episode",
+            name: r.name || undefined,
+            poster: r.poster || undefined,
+            showTitle: r.show_title || undefined,
+            showPoster: r.show_poster || undefined,
+            seasonNum: r.season_num != null ? r.season_num : undefined,
+            episodeNum: r.episode_num != null ? r.episode_num : undefined,
+            airDate: r.air_date || undefined,
+            isSeasonPremiere: r.is_season_premiere ? true : undefined,
+            isSeasonFinale: r.is_season_finale ? true : undefined,
+            seasonFinaleAirDate: r.season_finale_air_date || undefined,
+            seasonFinaleEpisodeNumber: r.season_finale_episode_number != null ? r.season_finale_episode_number : undefined,
+            updatedAt: r.updated_at,
+          }));
+        }
+      }
     }
-    if (trackingRaw) {
-      const trackingBlob = JSON.parse(trackingRaw);
-      items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-    } else {
-      const blobStr = await env.CONFIGS.get('creatorsync:' + username);
-      if (!blobStr) return [];
-      const blob = JSON.parse(blobStr);
-      items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+    if (!items) {
+      let trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+      if (!trackingRaw) {
+        await ensureTrackingMigrated(env, username);
+        trackingRaw = await env.CONFIGS.get('creatorsynctracking:' + username);
+      }
+      if (trackingRaw) {
+        const trackingBlob = JSON.parse(trackingRaw);
+        items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+      } else {
+        const blobStr = await env.CONFIGS.get('creatorsync:' + username);
+        if (!blobStr) return [];
+        const blob = JSON.parse(blobStr);
+        items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+      }
     }
     if (!items || !items.length) return [];
     

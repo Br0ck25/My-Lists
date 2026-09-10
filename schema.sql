@@ -159,3 +159,94 @@ CREATE TABLE event_meta (
     PRIMARY KEY (event_type, item_id)
 );
 
+DROP TABLE IF EXISTS watch_history;
+CREATE TABLE watch_history (
+    username    TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    item_type   TEXT NOT NULL,
+    title       TEXT,
+    poster      TEXT,
+    show_id     TEXT,
+    show_title  TEXT,
+    show_poster TEXT,
+    season_num  INTEGER,
+    episode_num INTEGER,
+    year        TEXT,
+    air_date    TEXT,
+    watched_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, item_id)
+);
+CREATE INDEX idx_watch_history_user_watched ON watch_history(username, watched_at DESC);
+
+DROP TABLE IF EXISTS continue_watching;
+CREATE TABLE continue_watching (
+    username    TEXT NOT NULL,
+    show_id     TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    name        TEXT,
+    poster      TEXT,
+    show_title  TEXT,
+    show_poster TEXT,
+    season_num  INTEGER,
+    episode_num INTEGER,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_continue_watching_user_updated ON continue_watching(username, updated_at DESC);
+
+DROP TABLE IF EXISTS airing_next;
+CREATE TABLE airing_next (
+    username                     TEXT NOT NULL,
+    show_id                      TEXT NOT NULL,
+    item_id                      TEXT NOT NULL,
+    name                         TEXT,
+    poster                       TEXT,
+    show_title                   TEXT,
+    show_poster                  TEXT,
+    season_num                   INTEGER,
+    episode_num                  INTEGER,
+    air_date                     TEXT,
+    is_season_premiere           INTEGER DEFAULT 0,
+    is_season_finale             INTEGER DEFAULT 0,
+    season_finale_air_date       TEXT,
+    season_finale_episode_number INTEGER,
+    updated_at                   INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_airing_next_user ON airing_next(username, air_date ASC);
+
+DROP TABLE IF EXISTS creator_user_lists;
+CREATE TABLE creator_user_lists (
+    username    TEXT NOT NULL,
+    list_id     TEXT NOT NULL,
+    list_type   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, list_id, list_type)
+);
+CREATE INDEX idx_creator_user_lists_lookup ON creator_user_lists(username, list_type);
+
+DROP TABLE IF EXISTS creator_show_states;
+CREATE TABLE creator_show_states (
+    username           TEXT NOT NULL,
+    show_id            TEXT NOT NULL,
+    is_fully_watched   INTEGER DEFAULT 0,
+    dismissed_season   INTEGER,
+    dismissed_episode  INTEGER,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_creator_show_states_fw ON creator_show_states(username, is_fully_watched);
+
+DROP TABLE IF EXISTS creator_tracking_meta;
+CREATE TABLE creator_tracking_meta (
+    username                   TEXT PRIMARY KEY,
+    track_playback             INTEGER NOT NULL DEFAULT 0,
+    remove_watched_watchlist   INTEGER NOT NULL DEFAULT 1,
+    scrobble_filter_users      INTEGER NOT NULL DEFAULT 0,
+    scrobble_allowed_users     TEXT NOT NULL DEFAULT '',
+    scrobble_block_anonymous   INTEGER NOT NULL DEFAULT 0,
+    curated_recommendations    TEXT,
+    client_version             INTEGER NOT NULL DEFAULT 0,
+    updated_at                 INTEGER NOT NULL
+);
+

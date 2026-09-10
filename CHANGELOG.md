@@ -56,6 +56,13 @@ the reports now live in `docs/history/`.
 - The public list directory is re-derived daily, rebuilt in resumable chunks, and no longer breaks permanently past ~500 lists; making a list private takes it out of the directory immediately, even if the index write fails.
 
 ### ⚙️ Performance & reliability
+- **D1-backed normalized creator sync and tracking tables (Phase 4).**
+  - **Relational tracking tables (`watch_history`, `continue_watching`, `airing_next`, `creator_show_states`, `creator_tracking_meta`):** Split monolithic per-user sync blob `creatorsynctracking:{user}` into 5 relational tables. Endpoints `/api/creator/sync/load`, `/api/creator/sync/save-tracking`, `/api/creator/sync/meta`, `/api/creator/track-status`, `/api/creator/scrobble`, and `handleSubtitlesTrack` read and write through D1 with KV write-through mirroring. Conflict detection compares incoming `client_version` directly against `creator_tracking_meta.client_version`.
+  - **User lists table (`creator_user_lists`):** Extracted `likedLists`, `hiddenLists`, and `hiddenSections` from monolithic `creatorsync:{user}` into relational `creator_user_lists` table with `list_type: 'liked' | 'hidden' | 'hidden_section'`. Read and updated via `/api/creator/sync/load`, `/api/creator/sync/save`, and `/api/creator/sync/like`.
+  - **Auto-tracked catalog queries (`fetchAutoTrackedCatalog`):** Directly queries `watch_history`, `continue_watching`, and `airing_next` using indexed lookups, bypassing monolithic KV blob parsing and pagination.
+  - **Background episode checker (`checkForNewEpisodes`):** Reads and updates Continue Watching and show states directly in D1 with KV write-through.
+  - **Account deletion purge (`purgeCreatorData`):** Drops all rows across all 6 Phase 4 tables upon account reset or deletion.
+  - **Database monitor & backfill:** `/admin/api/schema-status` monitors row counts for all 6 tables. Extended `/admin/api/migrate-d1` with phases 9 (`creatorsynctracking:`) and 10 (`creatorsync:`). Adds migration `0010_add_phase4_sync_tables.sql`.
 - **D1-backed likes ledger, feedback, telemetry metadata, scrobble tokens, and tombstone pruning (Phase 3).**
   - **Likes ledger (`list_likes`):** Rewrote `applyLikeVote` and `readLikeVoters` to use the `list_likes` table with KV fallback, lazy migration on read/vote, and bidirectional mirroring. Maintains denormalized `creator_lists.likes` and `published_lists.likes` counts. Cleared on list deletes and account purges.
   - **Support feedback (`feedback`):** Replaced KV `feedback:*` prefix scans with direct queries against the D1 `feedback` table for admin feedback dashboard, reply, status, edit, and delete endpoints. Client `/api/feedback` and `/api/feedback/threads` write and query D1 with KV mirroring.
@@ -71,7 +78,7 @@ the reports now live in `docs/history/`.
 - The channel image endpoints are bounded and cacheable; the TMDB fan-out endpoints are rate-limited even when the caller supplies their own key.
 
 ### 🧪 Testing & CI
-- The suite went from 106 tests to **357**, and now covers the client: `tests/client-harness.mjs` evaluates the real builder bundle against a DOM stub, so payload shapes, response handling and state transitions can be tested without a browser.
+- The suite went from 106 tests to **389**, and now covers the client: `tests/client-harness.mjs` evaluates the real builder bundle against a DOM stub, so payload shapes, response handling and state transitions can be tested without a browser.
 - The D1 mock was replaced with **real SQLite**, which is what made the whole first adversarial round's findings testable at all — the mock hardcoded one query to return no rows, could never throw, and could not enforce a constraint.
 - `verify.sh` and CI now render and validate the builder page, the admin page and the service worker, check that every inline handler resolves, and fail on `FUNCTION-MAP.md` drift.
 - Mutation testing is part of the record: every fix was verified twice — the probe that demonstrated the defect passes, and the defect reintroduced by mutation makes the suite fail.
