@@ -206,7 +206,35 @@ function importConfigJson() {
     else alert('That is not valid JSON.');
     return;
   }
-  applyImportedConfig(data);
+  runImport(data);
+}
+
+// The one place applyImportedConfig is entered from a user action, so the one
+// place a throw inside it can be caught and shown.
+//
+// It used to be called bare from both entry points. Anything it threw --
+// notably a backup field of the wrong JSON type -- escaped the click handler
+// uncaught, which meant a half-applied import (rows already cleared, the rest
+// never added) and NO message at all: the import report is rendered at the end
+// of applyImportedConfig, so a throw skips it and the failure looks like
+// nothing happened. A backup is often somebody's only copy; a restore that
+// half-runs must say so.
+function runImport(data) {
+  try {
+    applyImportedConfig(data);
+  } catch (e) {
+    const detail = (e && e.message) ? String(e.message) : 'Unknown error.';
+    if (typeof showAppAlert === 'function') {
+      showAppAlert(
+        'Import Failed Part-Way',
+        'Something in that backup could not be read, so the import stopped: ' + detail +
+        ' Your catalogs may be partly changed. Reload the page before trying again, and keep the backup file -- it has not been altered.',
+        false
+      );
+    } else {
+      alert('Import failed part-way: ' + detail);
+    }
+  }
 }
 
 // Shared by importConfigJson (textarea) and uploadConfigFile (file upload) --
@@ -301,6 +329,29 @@ function validateAndRepairBackup(data) {
     }
   });
   if (swapped) warnings.push('Fixed ' + swapped + ' row(s) that had their name and link swapped.');
+
+  // 1b. Fields that are the right field but the wrong JSON type. A name
+  //     written unquoted -- {"name": 2024} -- is a number, not a string, and
+  //     every string method the renderer calls on it throws. addRow coerces
+  //     defensively now, but repairing it HERE is what lets the report say it
+  //     happened instead of silently papering over a file that is subtly
+  //     wrong. Only the text fields: url/type are validated on their own
+  //     terms further down, and enabled is read as a boolean.
+  let retyped = 0;
+  entries.forEach((e) => {
+    if (!e || typeof e !== 'object') return;
+    ['name', 'group'].forEach((f) => {
+      const v = e[f];
+      if (v == null) return;
+      if (typeof v === 'string') return;
+      // An object or array stringifies to "[object Object]"/"a,b", which is
+      // not a name anybody meant -- drop it and let the usual fallback
+      // (guessNameFromUrl, or the 'Custom' group) supply one instead.
+      e[f] = (typeof v === 'number' || typeof v === 'boolean') ? String(v) : '';
+      retyped++;
+    });
+  });
+  if (retyped) warnings.push('Repaired ' + retyped + ' row field(s) stored as a number or object instead of text.');
 
   // 2. API key fields holding something that is not a key. This matters more
   //    than it looks: the Worker only falls back to the shared TMDB key when
@@ -1725,7 +1776,7 @@ function downloadConfigJson() {
 }
 
 function uploadConfigFile(input) {
-  readJsonFile(input, (data) => applyImportedConfig(data));
+  readJsonFile(input, (data) => runImport(data));
 }
 
 function downloadPreset(name) {

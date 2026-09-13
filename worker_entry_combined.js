@@ -19444,6 +19444,19 @@ ${seoHeadHtml}
     gap: 4px;
     flex-shrink: 0;
   }
+  /* The label is what gives way when the banner runs out of room, not the
+     button. The banner is a nowrap flex row capped at calc(100vw - 24px),
+     and a flex item's default min-width:auto will not shrink below its
+     content -- which under white-space:nowrap is the full sentence. So the
+     line overflowed the banner's own box and pushed the button (flex-shrink:0)
+     past it: at 320px only 37px of the 111px "Update Link" button was on
+     screen, with .page's overflow-x:hidden leaving no way to reach the rest.
+     min-width:0 lets the text shrink; the ellipsis keeps it readable. */
+  #unsavedInstallText {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .unsaved-install-banner-btn:hover {
     background: var(--accent-hover);
   }
@@ -19835,7 +19848,7 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
-      <input type="text" id="listFilterInput" placeholder="Filter catalogs by name..." oninput="filterLists()">
+      <input type="text" id="listFilterInput" aria-label="Filter catalogs by name" placeholder="Filter catalogs by name..." oninput="filterLists()">
       <select id="listGroupFilterSelect" aria-label="Filter catalogs by group" onchange="filterLists()" style="flex:none; width:auto;">
         <option value="">All groups</option>
       </select>
@@ -20310,7 +20323,7 @@ if ('serviceWorker' in navigator) {
         </div>
         <div id="channelMergeList"><p style="color:var(--muted); font-size:0.85rem;"><small>No saved channels yet.</small></p></div>
         <div class="row" style="margin-top:8px;">
-          <input type="text" id="channelMergeNameInput" placeholder="Combined catalog name (e.g. Live TV)">
+          <input type="text" id="channelMergeNameInput" aria-label="Combined catalog name" placeholder="Combined catalog name (e.g. Live TV)">
           <button type="button" class="secondary" onclick="mergeChannelsIntoRow()">Merge into catalog</button>
         </div>
       </div>
@@ -20441,7 +20454,7 @@ if ('serviceWorker' in navigator) {
     <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search to find movies, shows and lists to add to your lists.</p>
     
     <div class="row">
-      <input type="text" id="catalogSearchInput" placeholder="Search by title or list name..." oninput="handleCatalogSearchInput(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
+      <input type="text" id="catalogSearchInput" aria-label="Search by title or list name" placeholder="Search by title or list name..." oninput="handleCatalogSearchInput(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
       <button type="button" class="primary" onclick="runCatalogSearch()">Search</button>
     </div>
 
@@ -22081,7 +22094,15 @@ function showModal(innerHtml, extraClass) {
 
 function closeModal() {
   const existing = document.getElementById('activeModalOverlay');
-  if (existing) existing.remove();
+  // Nothing of ours is open, so there is nothing of ours to release. This
+  // used to fall through and call lockBackgroundScroll(false) regardless,
+  // which spent a lock this function never took: showModal opens with a
+  // closeModal(), so raising any dialog over one of the four static modals
+  // (createListModal, selectListModal, addShelfModal, traktDeviceModal)
+  // consumed THAT modal's lock, and dismissing the dialog then let the page
+  // scroll away behind a modal still sitting open on top of it.
+  if (!existing) return;
+  existing.remove();
   document.removeEventListener('keydown', handleModalKeydown, true);
   lockBackgroundScroll(false);
   if (_modalReturnFocus && typeof _modalReturnFocus.focus === 'function') {
@@ -23280,7 +23301,17 @@ function addRow(name, url, type, enabled, group, channelId) {
       : (urlList.length ? urlList : ['']).map((u) => sourceRowHtml(u, isWatchlist)).join('');
 
   // Avatar: first letter of name (or group), coloured by group
-  const avatarLetter = escapeHtml(((name || group || 'L').trim()[0] || 'L'));
+  // String(...) rather than .trim() straight off the value: every other read
+  // in this function coerces (String(url || ''), String(name).trim() above,
+  // String(channelId)) and this one did not. A backup entry whose name is a
+  // JSON number -- a list literally called 2024, which is what a hand-edited
+  // or third-party-generated file produces -- threw
+  // "(name || group || 'L').trim is not a function" here, and the throw
+  // escaped applyImportedConfig and the click handler uncaught: the rows
+  // already cleared stayed cleared, the remaining entries were never added,
+  // and no report modal ever rendered. The restore silently ate the config
+  // it was restoring.
+  const avatarLetter = escapeHtml((String(name || group || 'L').trim()[0] || 'L'));
   const avatarBg = entryAvatarColor(group || name || '');
 
   div.innerHTML =
@@ -31091,8 +31122,16 @@ function openSelectListModal(id, type, title, poster) {
   }
   
   body.innerHTML = html;
+  // Only lock when this open is actually a transition from closed. The
+  // matching close is idempotent (closeSelectListModal returns early when
+  // already hidden, taking no lock off the counter), so an unconditional
+  // lock here meant re-opening an already-open modal pushed the depth to 2
+  // and one close could never bring it back to 0 -- leaving the page
+  // permanently unscrollable with no modal on screen and no way back but a
+  // refresh. Open and close now agree about what a transition is.
+  const wasOpen = modal.style.display && modal.style.display !== 'none';
   modal.style.display = 'flex';
-  lockBackgroundScroll(true);
+  if (!wasOpen) lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {
@@ -43236,7 +43275,16 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
     scheduleCreatorSyncSave(allWatched ? { intentionalRemoval: true } : undefined);
   }
 
-  updateContinueWatchingForBatch(items).catch(() => {});
+  // Handed back to the caller (see the return below) rather than dropped.
+  // markShowWatched commits its OWN Continue Watching state straight after
+  // this returns -- evicting the finished show, queueing or clearing a
+  // storyline companion -- and this reconciliation rewrites exactly the same
+  // two things. Left floating, a toggle that started before it settled lost
+  // to the previous toggle's stale result: the show stayed flagged fully
+  // watched with a phantom companion in Continue Watching while the button
+  // said the opposite, and scheduleCreatorSyncSave then pushed that upstream.
+  // Callers that need the commit to be final await cwUpdate first.
+  const cwUpdate = updateContinueWatchingForBatch(items).catch(() => {});
 
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
@@ -43247,7 +43295,7 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
     }
   });
 
-  return { added: added, removed: removed, nowWatched: !allWatched };
+  return { added: added, removed: removed, nowWatched: !allWatched, cwUpdate: cwUpdate };
 };
 
 // Fetches every aired episode across every season of the show currently
@@ -43337,9 +43385,9 @@ window.markShowWatched = async function(imdbId) {
   await Promise.all(Array(Math.min(CONCURRENCY, seasons.length)).fill(0).map(worker));
 
   if (!btn) return;
-  btn.disabled = false;
 
   if (!allEpisodes.length) {
+    btn.disabled = false;
     if (failedSeasons > 0) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
@@ -43350,6 +43398,19 @@ window.markShowWatched = async function(imdbId) {
 
   const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
+
+  // The button stays disabled until the whole sequence below has settled.
+  // It used to be re-enabled the moment the season fetches finished, which
+  // handed the user a live button while the reconciliation above was still
+  // in flight -- the exact window this function then lost a toggle in.
+  //
+  // Awaited for the same reason: what follows is this function's own
+  // authoritative Continue Watching commit, and it must run AFTER the
+  // reconciliation toggleBatchWatchStatus kicked off, not concurrently
+  // with it. addItemsToWatchHistory already awaited the same promise.
+  if (result && result.cwUpdate && typeof result.cwUpdate.then === 'function') {
+    await result.cwUpdate;
+  }
 
   const allShowAliases = new Set([String(imdbId)]);
   if (d.id) allShowAliases.add(String(d.id));
@@ -43411,6 +43472,7 @@ window.markShowWatched = async function(imdbId) {
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     });
   }
+  btn.disabled = false;
   if (nowWatched) {
     btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
     btn.classList.remove('primary');
@@ -50097,8 +50159,13 @@ function openCreateListModal(presetDestination) {
     btn.innerText = 'Create';
   }
   const modal = document.getElementById('createListModal');
+  // See openSelectListModal: lock only on a real closed -> open transition,
+  // because closeCreateListModal early-returns when already hidden and so
+  // never unlocks twice. Two opens and one close used to leave the page
+  // scroll-locked for good.
+  const wasOpen = !!modal && modal.style.display && modal.style.display !== 'none';
   if (modal) modal.style.display = 'flex';
-  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
+  if (!wasOpen && typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 
@@ -53850,7 +53917,35 @@ function importConfigJson() {
     else alert('That is not valid JSON.');
     return;
   }
-  applyImportedConfig(data);
+  runImport(data);
+}
+
+// The one place applyImportedConfig is entered from a user action, so the one
+// place a throw inside it can be caught and shown.
+//
+// It used to be called bare from both entry points. Anything it threw --
+// notably a backup field of the wrong JSON type -- escaped the click handler
+// uncaught, which meant a half-applied import (rows already cleared, the rest
+// never added) and NO message at all: the import report is rendered at the end
+// of applyImportedConfig, so a throw skips it and the failure looks like
+// nothing happened. A backup is often somebody's only copy; a restore that
+// half-runs must say so.
+function runImport(data) {
+  try {
+    applyImportedConfig(data);
+  } catch (e) {
+    const detail = (e && e.message) ? String(e.message) : 'Unknown error.';
+    if (typeof showAppAlert === 'function') {
+      showAppAlert(
+        'Import Failed Part-Way',
+        'Something in that backup could not be read, so the import stopped: ' + detail +
+        ' Your catalogs may be partly changed. Reload the page before trying again, and keep the backup file -- it has not been altered.',
+        false
+      );
+    } else {
+      alert('Import failed part-way: ' + detail);
+    }
+  }
 }
 
 // Shared by importConfigJson (textarea) and uploadConfigFile (file upload) --
@@ -53945,6 +54040,29 @@ function validateAndRepairBackup(data) {
     }
   });
   if (swapped) warnings.push('Fixed ' + swapped + ' row(s) that had their name and link swapped.');
+
+  // 1b. Fields that are the right field but the wrong JSON type. A name
+  //     written unquoted -- {"name": 2024} -- is a number, not a string, and
+  //     every string method the renderer calls on it throws. addRow coerces
+  //     defensively now, but repairing it HERE is what lets the report say it
+  //     happened instead of silently papering over a file that is subtly
+  //     wrong. Only the text fields: url/type are validated on their own
+  //     terms further down, and enabled is read as a boolean.
+  let retyped = 0;
+  entries.forEach((e) => {
+    if (!e || typeof e !== 'object') return;
+    ['name', 'group'].forEach((f) => {
+      const v = e[f];
+      if (v == null) return;
+      if (typeof v === 'string') return;
+      // An object or array stringifies to "[object Object]"/"a,b", which is
+      // not a name anybody meant -- drop it and let the usual fallback
+      // (guessNameFromUrl, or the 'Custom' group) supply one instead.
+      e[f] = (typeof v === 'number' || typeof v === 'boolean') ? String(v) : '';
+      retyped++;
+    });
+  });
+  if (retyped) warnings.push('Repaired ' + retyped + ' row field(s) stored as a number or object instead of text.');
 
   // 2. API key fields holding something that is not a key. This matters more
   //    than it looks: the Worker only falls back to the shared TMDB key when
@@ -55369,7 +55487,7 @@ function downloadConfigJson() {
 }
 
 function uploadConfigFile(input) {
-  readJsonFile(input, (data) => applyImportedConfig(data));
+  readJsonFile(input, (data) => runImport(data));
 }
 
 function downloadPreset(name) {

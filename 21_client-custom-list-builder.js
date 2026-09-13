@@ -1809,7 +1809,16 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
     scheduleCreatorSyncSave(allWatched ? { intentionalRemoval: true } : undefined);
   }
 
-  updateContinueWatchingForBatch(items).catch(() => {});
+  // Handed back to the caller (see the return below) rather than dropped.
+  // markShowWatched commits its OWN Continue Watching state straight after
+  // this returns -- evicting the finished show, queueing or clearing a
+  // storyline companion -- and this reconciliation rewrites exactly the same
+  // two things. Left floating, a toggle that started before it settled lost
+  // to the previous toggle's stale result: the show stayed flagged fully
+  // watched with a phantom companion in Continue Watching while the button
+  // said the opposite, and scheduleCreatorSyncSave then pushed that upstream.
+  // Callers that need the commit to be final await cwUpdate first.
+  const cwUpdate = updateContinueWatchingForBatch(items).catch(() => {});
 
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
 
@@ -1820,7 +1829,7 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
     }
   });
 
-  return { added: added, removed: removed, nowWatched: !allWatched };
+  return { added: added, removed: removed, nowWatched: !allWatched, cwUpdate: cwUpdate };
 };
 
 // Fetches every aired episode across every season of the show currently
@@ -1910,9 +1919,9 @@ window.markShowWatched = async function(imdbId) {
   await Promise.all(Array(Math.min(CONCURRENCY, seasons.length)).fill(0).map(worker));
 
   if (!btn) return;
-  btn.disabled = false;
 
   if (!allEpisodes.length) {
+    btn.disabled = false;
     if (failedSeasons > 0) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
@@ -1923,6 +1932,19 @@ window.markShowWatched = async function(imdbId) {
 
   const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
+
+  // The button stays disabled until the whole sequence below has settled.
+  // It used to be re-enabled the moment the season fetches finished, which
+  // handed the user a live button while the reconciliation above was still
+  // in flight -- the exact window this function then lost a toggle in.
+  //
+  // Awaited for the same reason: what follows is this function's own
+  // authoritative Continue Watching commit, and it must run AFTER the
+  // reconciliation toggleBatchWatchStatus kicked off, not concurrently
+  // with it. addItemsToWatchHistory already awaited the same promise.
+  if (result && result.cwUpdate && typeof result.cwUpdate.then === 'function') {
+    await result.cwUpdate;
+  }
 
   const allShowAliases = new Set([String(imdbId)]);
   if (d.id) allShowAliases.add(String(d.id));
@@ -1984,6 +2006,7 @@ window.markShowWatched = async function(imdbId) {
       if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     });
   }
+  btn.disabled = false;
   if (nowWatched) {
     btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
     btn.classList.remove('primary');

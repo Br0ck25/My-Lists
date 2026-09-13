@@ -5133,8 +5133,13 @@ function openCreateListModal(presetDestination) {
     btn.innerText = 'Create';
   }
   const modal = document.getElementById('createListModal');
+  // See openSelectListModal: lock only on a real closed -> open transition,
+  // because closeCreateListModal early-returns when already hidden and so
+  // never unlocks twice. Two opens and one close used to leave the page
+  // scroll-locked for good.
+  const wasOpen = !!modal && modal.style.display && modal.style.display !== 'none';
   if (modal) modal.style.display = 'flex';
-  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
+  if (!wasOpen && typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
   if (nameEl) nameEl.focus();
 }
 

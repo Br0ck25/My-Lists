@@ -1080,7 +1080,15 @@ function showModal(innerHtml, extraClass) {
 
 function closeModal() {
   const existing = document.getElementById('activeModalOverlay');
-  if (existing) existing.remove();
+  // Nothing of ours is open, so there is nothing of ours to release. This
+  // used to fall through and call lockBackgroundScroll(false) regardless,
+  // which spent a lock this function never took: showModal opens with a
+  // closeModal(), so raising any dialog over one of the four static modals
+  // (createListModal, selectListModal, addShelfModal, traktDeviceModal)
+  // consumed THAT modal's lock, and dismissing the dialog then let the page
+  // scroll away behind a modal still sitting open on top of it.
+  if (!existing) return;
+  existing.remove();
   document.removeEventListener('keydown', handleModalKeydown, true);
   lockBackgroundScroll(false);
   if (_modalReturnFocus && typeof _modalReturnFocus.focus === 'function') {
@@ -2279,7 +2287,17 @@ function addRow(name, url, type, enabled, group, channelId) {
       : (urlList.length ? urlList : ['']).map((u) => sourceRowHtml(u, isWatchlist)).join('');
 
   // Avatar: first letter of name (or group), coloured by group
-  const avatarLetter = escapeHtml(((name || group || 'L').trim()[0] || 'L'));
+  // String(...) rather than .trim() straight off the value: every other read
+  // in this function coerces (String(url || ''), String(name).trim() above,
+  // String(channelId)) and this one did not. A backup entry whose name is a
+  // JSON number -- a list literally called 2024, which is what a hand-edited
+  // or third-party-generated file produces -- threw
+  // "(name || group || 'L').trim is not a function" here, and the throw
+  // escaped applyImportedConfig and the click handler uncaught: the rows
+  // already cleared stayed cleared, the remaining entries were never added,
+  // and no report modal ever rendered. The restore silently ate the config
+  // it was restoring.
+  const avatarLetter = escapeHtml((String(name || group || 'L').trim()[0] || 'L'));
   const avatarBg = entryAvatarColor(group || name || '');
 
   div.innerHTML =
